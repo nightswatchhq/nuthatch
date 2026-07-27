@@ -1,15 +1,16 @@
 # RFC-0026: Fault quarantine and partial health - a roost survives its sick nests
 
-- Status: **Draft** (2026-07-27) - **slices 1-2 shipped 2026-07-27**.
+- Status: **Implemented** (2026-07-27) - all three slices shipped.
   **Slice 1** (nest fault boundary): the three `?` sites in §1's table now quarantine the nest instead
   of the cursor; `prepare` moved inside the boundary; `TerminalFault` classifies the two no-retry
-  faults; the live/quarantined partition drives the cursor's min/max/union (§3.1).
-  **Slice 2** (cursor fault boundary): `select_all`-aborts-everything is replaced by `supervise_cursors`
-  - a dead cursor is retired and logged, siblings keep indexing, and the roost exits only when every
-  cursor is gone. **Issue #147's headline scenario is closed and tested**: one chain's finality-violation
-  no longer takes another chain's cursor down. **Slice 3** (health surface: live `/nests`, roost-root
-  `/ready`, metrics, `--fail-fast`) pending - until it lands, a quarantined unit is visible in the log
-  but not yet on the API.
+  faults; a `Supervisor` owns the live/quarantined partition that drives the cursor's min/max/union
+  (§3.1). **Slice 2** (cursor fault boundary): `select_all`-aborts-everything replaced by
+  `supervise_cursors` - a dead cursor is retired and logged, siblings keep indexing, and the roost
+  exits only when every cursor is gone. **Slice 3** (health surface): `health::RoostHealth` is the live
+  handle behind `/nests` (per-request health merge), a new roost-root `/ready` (503 on any quarantine),
+  a per-nest `/<name>/ready` that answers for *that* nest, `nuthatch_nest_health` /
+  `nuthatch_nest_quarantine_total` / `nuthatch_cursor_live` metrics, and `--fail-fast`.
+  **Issue #147 is closed**: one chain's finality violation no longer takes another chain's cursor down.
 - Author: Pete (cargopete)
 - Date: 2026-07-27
 - Depends on: RFC-0012 (per-nest isolation of storage/reorg/blast-radius; the shared cursor),

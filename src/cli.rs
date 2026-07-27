@@ -110,6 +110,12 @@ pub struct RoostDevArgs {
     /// Disable the built-in admin UI (`/<name>/_admin/`) entirely for every nest (RFC-0010 Part A).
     #[arg(long)]
     pub no_admin: bool,
+
+    /// Exit on the first fault instead of quarantining it (RFC-0026 §6). By default a failed nest or
+    /// cursor is quarantined and its healthy siblings keep indexing and serving; this restores the old
+    /// fail-stop behaviour for CI, deterministic tests, and operators who prefer it.
+    #[arg(long)]
+    pub fail_fast: bool,
 }
 
 #[derive(Args)]

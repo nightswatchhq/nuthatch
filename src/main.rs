@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
                     a.concurrency,
                     a.window,
                     a.no_admin,
+                    a.fail_fast,
                 )
                 .await
             }

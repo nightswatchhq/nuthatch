@@ -264,6 +264,7 @@ Bring up every nest a `roost.toml` mounts and serve them behind one listener: `/
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches during each nest's seal-direct backfill
 - `--window <WINDOW>` - Override the `eth_getLogs` block-window (the chain default otherwise) for every nest's backfill
 - `--no-admin` - Disable the built-in admin UI (`/<name>/_admin/`) entirely for every nest (RFC-0010 Part A)
+- `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). By default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving; this restores the old fail-stop behaviour for CI, deterministic tests, and operators who prefer it
 
 ## `nuthatch schema`
 

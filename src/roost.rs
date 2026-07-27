@@ -249,6 +249,7 @@ pub async fn dev(
     concurrency: usize,
     window_override: Option<u64>,
     no_admin: bool,
+    fail_fast: bool,
 ) -> Result<()> {
     let roost = Roost::load(&dir)?;
     let meta = &roost.roost;
@@ -289,6 +290,10 @@ pub async fn dev(
     let mut alert_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut roost_total_mb = ROOST_BASE_RSS_MB;
+    // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
+    // per request. Replaces the roster snapshot that was built once at startup and could not express
+    // "partly working".
+    let health = Arc::new(crate::health::RoostHealth::new());
 
     for group in groups {
         let rpc_urls = rpc::merge_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
@@ -326,6 +331,11 @@ pub async fn dev(
         }
         roost_total_mb += cursor_mb;
 
+        // Attribute each nest to this chain's cursor, so a cursor fault marks all of them (§5).
+        for (name, _, _) in &group.nests {
+            health.register(name, &group.endpoint.chain);
+        }
+
         // One source + one shared cursor per chain - per-nest tables stay byte-identical to solo `dev`.
         let source: Arc<dyn Source> = Arc::new(RpcClient::new(rpc_urls)?);
         let (states, ingest, alerts) = indexer::spawn_roost(
@@ -337,6 +347,8 @@ pub async fn dev(
             window_override,
             admin_enabled,
             admin_token.clone(),
+            health.clone(),
+            fail_fast,
         )
         .await
         .with_context(|| {
@@ -382,8 +394,8 @@ pub async fn dev(
     // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
     // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
     let result = tokio::select! {
-        r = crate::serve::run_roost(&listen, roster, all_states) => r,
-        r = supervise_cursors(&mut ingests) => r,
+        r = crate::serve::run_roost(&listen, roster, all_states, health.clone()) => r,
+        r = supervise_cursors(&mut ingests, &health, fail_fast) => r,
     };
     for (_, h) in &ingests {
         h.abort();
@@ -408,6 +420,8 @@ pub async fn dev(
 /// supervisor beats staying up serving permanently-frozen data.
 async fn supervise_cursors(
     ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
+    health: &crate::health::RoostHealth,
+    fail_fast: bool,
 ) -> Result<()> {
     let total = ingests.len();
     let mut failures: Vec<String> = Vec::new();
@@ -430,11 +444,16 @@ async fn supervise_cursors(
                 ingests.len()
             ),
             Err(e) => {
+                if fail_fast {
+                    bail!("--fail-fast: roost cursor on {chain} died: {e:#}");
+                }
                 tracing::error!(
                     "roost cursor on {chain} QUARANTINED: {e:#} - its nests keep serving their last \
                      indexed state; {} sibling cursor(s) continue unaffected",
                     ingests.len()
                 );
+                // Every nest on this cursor is now out of service, however healthy it was itself.
+                health.quarantine_cursor(&chain, format!("{e:#}"));
                 failures.push(format!("{chain}: {e:#}"));
             }
         }
@@ -696,8 +715,14 @@ mod tests {
         ];
         // The supervisor must NOT return while a healthy cursor is still indexing: returning is what
         // ends the roost.
-        let returned =
-            tokio::time::timeout(Duration::from_millis(250), supervise_cursors(&mut ingests)).await;
+        let health = crate::health::RoostHealth::new();
+        health.register("nest-a", "base");
+        health.register("nest-b", "arbitrum-one");
+        let returned = tokio::time::timeout(
+            Duration::from_millis(250),
+            supervise_cursors(&mut ingests, &health, false),
+        )
+        .await;
         assert!(
             returned.is_err(),
             "the roost ended even though a healthy cursor was still indexing"
@@ -714,6 +739,11 @@ mod tests {
             progress.load(Ordering::Relaxed) > 0,
             "the surviving cursor must keep making progress after its sibling died"
         );
+        // The health surface tells the truth about both: the dead chain's nest is quarantined, the
+        // living chain's is not (RFC-0026 §5).
+        assert_eq!(health.json_for("nest-a").0, "quarantined");
+        assert_eq!(health.json_for("nest-b").0, "indexing");
+        assert!(!health.all_indexing(), "a partly-broken roost is not ready");
         ingests[0].1.abort();
     }
 
@@ -729,7 +759,10 @@ mod tests {
         });
         let mut ingests = vec![("base".to_string(), a), ("arbitrum-one".to_string(), b)];
 
-        let err = supervise_cursors(&mut ingests).await.unwrap_err();
+        let health = crate::health::RoostHealth::new();
+        let err = supervise_cursors(&mut ingests, &health, false)
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("base"),

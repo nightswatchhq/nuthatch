@@ -69,6 +69,10 @@ pub struct AppState {
     /// `/table` queries run at once so a burst can't multiply DuckDB's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
     pub sql_gate: Arc<Semaphore>,
+    /// This nest's name and the roost health surface it should answer `/ready` from (RFC-0026 §5).
+    /// `None` for a solo `dev` nest, which has no roost around it and falls back to the global
+    /// poll-freshness check.
+    pub roost_health: Option<(String, Arc<crate::health::RoostHealth>)>,
 }
 
 /// A hot-swappable handle to the `AppState` backing one served endpoint (RFC-0020 slice 2). The router
@@ -195,16 +199,32 @@ pub async fn run_roost(
     listen: &str,
     roster: serde_json::Value,
     nests: Vec<(String, AppState)>,
+    health: Arc<crate::health::RoostHealth>,
 ) -> Result<()> {
     let roster = Arc::new(roster);
+    let roster_health = health.clone();
+    let ready_health = health.clone();
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        // `GET /nests` - the roster (name, chain, registry hash, table count) across mounted nests.
+        // `GET /nests` - the roster (name, chain, registry hash, table count) across mounted nests,
+        // merged per request with each nest's LIVE health (RFC-0026 §5). The static half is computed
+        // once at startup; the health half must not be, or a quarantined nest would keep reporting the
+        // state it had when the process booted.
         .route(
             "/nests",
             get(move || {
                 let r = roster.clone();
-                async move { Json((*r).clone()) }
+                let h = roster_health.clone();
+                async move { Json(merge_roster_health(&r, &h)) }
+            }),
+        )
+        // `GET /ready` at the roost root - the roost-wide readiness a supervisor polls. The per-nest
+        // `/ready` under `/<name>/` answers only for that nest.
+        .route(
+            "/ready",
+            get(move || {
+                let h = ready_health.clone();
+                async move { roost_ready(&h) }
             }),
         );
     for (name, state) in nests {
@@ -213,6 +233,57 @@ pub async fn run_roost(
         app = app.nest(&format!("/{name}"), router(SharedNest::new(state)));
     }
     bind_and_serve(listen, app).await
+}
+
+/// Merge each roster entry's live health into the startup snapshot (RFC-0026 §5). A nest that is
+/// indexing carries `"health": "indexing"` and no `quarantine` key; a quarantined one carries the
+/// reason, class, and retry deadline an operator needs to act on.
+fn merge_roster_health(
+    roster: &serde_json::Value,
+    health: &crate::health::RoostHealth,
+) -> serde_json::Value {
+    let mut out = roster.clone();
+    if let Some(entries) = out.get_mut("nests").and_then(|n| n.as_array_mut()) {
+        for e in entries {
+            let Some(name) = e.get("name").and_then(|n| n.as_str()).map(str::to_string) else {
+                continue;
+            };
+            let (status, quarantine) = health.json_for(&name);
+            if let Some(obj) = e.as_object_mut() {
+                obj.insert("health".into(), json!(status));
+                match quarantine {
+                    Some(q) => obj.insert("quarantine".into(), q),
+                    // Explicitly remove rather than leave a stale entry, so a recovered nest's roster
+                    // row does not keep describing a quarantine that has since been lifted.
+                    None => obj.remove("quarantine"),
+                };
+            }
+        }
+    }
+    out["all_indexing"] = json!(health.all_indexing());
+    out
+}
+
+/// Roost-wide readiness (RFC-0026 §5): **200** while every mounted nest is indexing, **503** as soon as
+/// any nest or cursor is quarantined, with the offenders named.
+///
+/// 503-on-any-quarantine is the deliberately conservative choice. A supervisor should treat a
+/// partly-broken roost as not-ready and fetch a human, while the healthy nests carry on serving reads
+/// to consumers who ask for them directly - readiness is advice to a supervisor, it does not gate
+/// traffic. The healthy/unhealthy split stays visible per nest on `/nests` and `/<name>/ready`.
+fn roost_ready(health: &crate::health::RoostHealth) -> impl IntoResponse {
+    let unhealthy = health.unhealthy();
+    let ready = unhealthy.is_empty();
+    let body = json!({
+        "ready": ready,
+        "quarantined": unhealthy.iter().map(|(n, r)| json!({"nest": n, "reason": r})).collect::<Vec<_>>(),
+    });
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body))
 }
 
 /// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_roost`].
@@ -329,13 +400,20 @@ async fn count_request(
 }
 
 /// `GET /metrics` - Prometheus text exposition (RFC-0005 §6).
-async fn metrics_handler() -> impl IntoResponse {
+async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let mut body = crate::metrics::METRICS.render();
+    // In a roost, append the health series (RFC-0026 §5) so an operator can alert on "anything
+    // quarantined" without polling `/nests`. Like the existing per-nest series, these describe the
+    // whole roost regardless of which nest's `/metrics` is scraped.
+    if let Some((_, health)) = &s.roost_health {
+        body.push_str(&health.render_metrics());
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        crate::metrics::METRICS.render(),
+        body,
     )
 }
 
@@ -353,8 +431,28 @@ fn poll_stalled(last_poll: u64, now: u64, threshold: u64) -> bool {
 /// stays a plain `200 "ok"`. `/ready` answers "is it *healthy*" - still reaching the chain: **200** with
 /// a status body when fresh, **503** when stalled (no successful poll within [`READINESS_STALL_SECS`],
 /// i.e. every RPC endpoint is down). A just-started node that has never polled is *not* stalled (grace).
-async fn ready() -> impl IntoResponse {
+async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     use crate::metrics::{now_unix, METRICS};
+    // In a roost, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
+    // must not be told the roost is unwell because some unrelated co-tenant is quarantined - nor told
+    // all is well when *this* nest is the one that is frozen.
+    if let Some((name, health)) = &s.roost_health {
+        if let Some(q) = health.status(name) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ready": false,
+                    "quarantined": true,
+                    "kind": q.kind,
+                    "class": q.class,
+                    "reason": q.reason,
+                    "since_unixtime": q.since_unixtime,
+                    "next_retry_unixtime": q.next_retry_unixtime,
+                })),
+            )
+                .into_response();
+        }
+    }
     let last_poll = METRICS.last_poll_ok();
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
@@ -1015,7 +1113,85 @@ mod tests {
             admin_enabled: true,
             admin_token: None,
             nest_info: Arc::new(json!({ "name": "t" })),
+            roost_health: None,
         }
+    }
+
+    /// RFC-0026 §5: the roster is a *live* view. The static half is computed at startup, but health is
+    /// merged per request - and a quarantined nest must never come back reported as indexing.
+    #[test]
+    fn the_roster_reports_live_health_per_nest() {
+        use crate::health::RoostHealth;
+        let health = RoostHealth::new();
+        health.register("alpha", "base");
+        health.register("beta", "base");
+        let roster = json!({
+            "roost": "test",
+            "nests": [ {"name": "alpha", "chain": "base"}, {"name": "beta", "chain": "base"} ],
+        });
+
+        // All healthy: every entry says so, and nothing carries a quarantine block.
+        let merged = merge_roster_health(&roster, &health);
+        assert_eq!(merged["nests"][0]["health"], "indexing");
+        assert!(merged["nests"][0].get("quarantine").is_none());
+        assert_eq!(merged["all_indexing"], json!(true));
+
+        // Quarantine one: only that entry changes, and it carries the reason an operator needs.
+        health.quarantine_nest(
+            "alpha",
+            "the balance IVM circuit thread has died".into(),
+            0,
+            None,
+        );
+        let merged = merge_roster_health(&roster, &health);
+        assert_eq!(merged["nests"][0]["health"], "quarantined");
+        assert_eq!(merged["nests"][0]["quarantine"]["class"], "terminal");
+        assert!(merged["nests"][0]["quarantine"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("balance IVM"));
+        assert_eq!(merged["nests"][1]["health"], "indexing");
+        assert_eq!(merged["all_indexing"], json!(false));
+
+        // Recovery clears the quarantine block rather than leaving a stale one behind.
+        health.mark_indexing("alpha");
+        let merged = merge_roster_health(&roster, &health);
+        assert_eq!(merged["nests"][0]["health"], "indexing");
+        assert!(merged["nests"][0].get("quarantine").is_none());
+    }
+
+    /// RFC-0026 §5: roost-root `/ready` is 200 only while **everything** is indexing, and 503 names the
+    /// offenders. Conservative on purpose - a supervisor should treat a partly-broken roost as
+    /// not-ready, while the healthy nests carry on serving anyone who asks for them directly.
+    #[tokio::test]
+    async fn roost_readiness_goes_unavailable_as_soon_as_anything_is_quarantined() {
+        use crate::health::RoostHealth;
+        let health = RoostHealth::new();
+        health.register("alpha", "base");
+        health.register("beta", "arbitrum-one");
+        assert_eq!(
+            roost_ready(&health).into_response().status(),
+            StatusCode::OK
+        );
+
+        // One chain's cursor dies: the roost is no longer ready, even though `beta` is perfectly fine.
+        health.quarantine_cursor(
+            "base",
+            "every nest on this cursor is terminally quarantined".into(),
+        );
+        let resp = roost_ready(&health).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ready"], json!(false));
+        assert_eq!(v["quarantined"][0]["nest"], "alpha");
+        assert_eq!(
+            v["quarantined"].as_array().unwrap().len(),
+            1,
+            "beta is fine"
+        );
     }
 
     /// The RFC-0020 hot-swap mechanism: re-pointing a `SharedNest` atomically changes what serving

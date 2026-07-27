@@ -144,6 +144,10 @@ async fn roost_is_byte_identical_to_solo() {
         Some(2),
         false,
         None,
+        std::sync::Arc::new(nuthatch::health::RoostHealth::new()),
+        // Fail-fast off: this parity run must exercise the same quarantine-capable path an operator
+        // gets by default (RFC-0026), not a fail-stop variant of it.
+        false,
     )
     .await
     .expect("spawn_roost");

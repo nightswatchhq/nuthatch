@@ -21,6 +21,7 @@ pub mod effectful;
 pub mod exposure;
 pub mod factory;
 pub mod flags;
+pub mod health;
 pub mod indexer;
 pub mod labels;
 pub mod lifecycle;
