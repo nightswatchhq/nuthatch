@@ -2193,11 +2193,12 @@ impl NestIngest {
             Ok(Some(hash)) => Some((to, hash)),
             _ => None,
         };
-        self.store.commit_window(
-            &to_store,
-            checkpoint.as_ref().map(|(b, h)| (*b, h.as_str())),
-            to,
-        )?;
+        // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
+        // from the same runtime, so a contended commit here would surface as latency on unrelated
+        // requests. `to_store` is moved rather than borrowed - the work outlives this borrow.
+        self.store
+            .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
+            .await?;
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
         if stored > 0 {

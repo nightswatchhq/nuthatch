@@ -1,5 +1,21 @@
-//! Embedded hot store: redb. Single writer (the indexer), many readers (the API). This is the
-//! tip layer for entity point-reads; Parquet sealing + DuckDB analytics land in slice 2.
+//! Embedded hot store: redb. This is the tip layer for entity point-reads; Parquet sealing + DuckDB
+//! analytics live in `seal`/`analytics`.
+//!
+//! **Writers (audit F-C3 - this used to say "single writer", which was wrong).** Two tasks write here:
+//! the ingestion loop (entities, checkpoints, meta, and the outbox *enqueue*) and the alert-delivery
+//! worker (the outbox *drain*, via `outbox_remove`). They touch disjoint key ranges, and redb
+//! serialises write transactions internally regardless, so integrity holds - but "single writer" was a
+//! claim about the code that the code did not honour, and the next person to reason about concurrency
+//! here deserves the truth.
+//!
+//! What *is* single is the **cursor**: exactly one ingestion task per chain advances the chain state
+//! (RFC-0012/0021). That is the invariant the architecture actually rests on. Readers (the API) are
+//! unbounded and never block writers - redb gives them MVCC snapshots.
+//!
+//! **Blocking.** A redb `commit()` fsyncs, and an fsync on a contended disk can take far longer than a
+//! tokio worker should ever be parked for. Callers on an async task must therefore run commits through
+//! `spawn_blocking` - see [`Store::commit_blocking`]. The methods here are deliberately synchronous:
+//! they are the blocking primitive, and it is the caller's job to place them correctly.
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -178,6 +194,51 @@ impl Store {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// [`Store::commit_window`], off the async runtime's worker threads (audit F-C3).
+    ///
+    /// The commit ends in an fsync. On a contended disk that can park a tokio worker for far longer
+    /// than any async task should hold one - and this process serves the HTTP API from the *same*
+    /// runtime, so a slow ingest commit becomes head-of-line latency on unrelated requests. Moving it
+    /// to the blocking pool makes a long fsync cost a blocking thread instead of a worker.
+    ///
+    /// Takes owned data because the work outlives the caller's borrow. `Store` is an `Arc` handle, so
+    /// the clone is free.
+    pub async fn commit_window_blocking(
+        &self,
+        entities: Vec<(String, String)>,
+        checkpoint: Option<(u64, String)>,
+        last_block: u64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let cp = checkpoint.as_ref().map(|(b, h)| (*b, h.as_str()));
+            store.commit_window(&entities, cp, last_block)
+        })
+        .await
+        .context("the hot-store commit task panicked")?
+    }
+
+    /// [`Store::outbox_remove`] for a batch of sequence numbers, off the runtime's workers (F-C3).
+    ///
+    /// The delivery worker drains the outbox one `outbox_remove` per delivered alert - an fsync each.
+    /// A burst of alerts therefore parked a worker for as many fsyncs as there were deliveries.
+    pub async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            for seq in seqs {
+                // Best-effort per entry, exactly as the caller's loop was: a failed removal means the
+                // alert is redelivered later, which the at-least-once contract already allows.
+                let _ = store.outbox_remove(seq);
+            }
+            Ok(())
+        })
+        .await
+        .context("the outbox drain task panicked")?
     }
 
     pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
