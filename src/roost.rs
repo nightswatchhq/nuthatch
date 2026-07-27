@@ -234,11 +234,11 @@ pub fn group_by_chain(
 
 /// `nuthatch roost dev <dir>`: bring up every mounted nest and serve them behind one listener.
 ///
-/// One shared source drives all nests through a single `indexer::spawn_roost` task (the shared cursor -
-/// one `getLogs` per window fanned out to the owning nests). Before starting it projects the roost's
-/// RSS and refuses a mount that would exceed `max_rss` (§3). The process shares a fate with its nests:
-/// if the ingestion task dies, the whole roost exits non-zero rather than serve stale data as if healthy
-/// (the single-failure-boundary rule, generalised).
+/// One shared source drives all nests through a single `indexer::spawn_roost` task per chain (the
+/// shared cursor - one `getLogs` per window fanned out to the owning nests). Before starting it
+/// projects the roost's RSS and refuses a mount that would exceed `max_rss` (§3). A cursor that dies
+/// is **quarantined, not fatal** (RFC-0026): its siblings keep indexing and serving, and the roost
+/// exits only when every cursor is gone - the per-cursor blast-radius rule, actually held.
 #[allow(clippy::too_many_arguments)]
 pub async fn dev(
     dir: PathBuf,
@@ -283,9 +283,9 @@ pub async fn dev(
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 
     // Bring up one cursor per chain group: its own source + `spawn_roost`, isolated tip/finality/reorg,
-    // and held to the per-cursor RSS budget. A cursor's failure is the whole roost's failure (fate-share).
+    // and held to the per-cursor RSS budget. A cursor's failure quarantines that cursor alone (RFC-0026).
     let mut all_states: Vec<(String, crate::serve::AppState)> = Vec::new();
-    let mut ingests: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+    let mut ingests: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
     let mut alert_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut roost_total_mb = ROOST_BASE_RSS_MB;
@@ -346,7 +346,7 @@ pub async fn dev(
             )
         })?;
         all_states.extend(states);
-        ingests.push(ingest);
+        ingests.push((group.endpoint.chain.clone(), ingest));
         alert_workers.extend(alerts);
     }
 
@@ -379,24 +379,74 @@ pub async fn dev(
         "nests": roster_entries,
     });
 
-    // Fate-share the server with every cursor: whichever ends first decides the exit, and any cursor's
-    // error/panic propagates out (never serve stale data as if healthy) - the single-failure-boundary
-    // rule, held per cursor. `select_all` over `&mut` handles so the rest stay abortable afterwards.
+    // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
+    // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
     let result = tokio::select! {
         r = crate::serve::run_roost(&listen, roster, all_states) => r,
-        (joined, _idx, _rest) = futures::future::select_all(ingests.iter_mut()) => match joined {
-            Ok(inner) => inner,
-            Err(e) if e.is_panic() => Err(anyhow::anyhow!("a roost ingestion loop panicked")),
-            Err(e) => Err(anyhow::anyhow!("a roost ingestion loop task failed: {e}")),
-        },
+        r = supervise_cursors(&mut ingests) => r,
     };
-    for h in &ingests {
+    for (_, h) in &ingests {
         h.abort();
     }
     for w in &alert_workers {
         w.abort();
     }
     result
+}
+
+/// Watch every chain cursor, quarantining the ones that die instead of taking the roost down with them
+/// (RFC-0026 §6, issue #147).
+///
+/// The old behaviour was `select_all` over the cursors: the **first** to finish - success or failure -
+/// aborted every sibling and exited the process. So a reorg below finality on one chain tore down a
+/// perfectly healthy cursor on another, which is precisely what `CLAUDE.md`'s per-cursor blast-radius
+/// rule forbids. Now a dead cursor is retired from the set and logged; its nests keep serving the data
+/// they had (frozen but correct - slice 3 marks them unhealthy so nobody mistakes it for fresh).
+///
+/// This returns - ending the roost - only when **every** cursor is gone, because at that point nothing
+/// will ever advance again and a restart is the only thing that can help. Exiting non-zero under a
+/// supervisor beats staying up serving permanently-frozen data.
+async fn supervise_cursors(
+    ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
+) -> Result<()> {
+    let total = ingests.len();
+    let mut failures: Vec<String> = Vec::new();
+    while !ingests.is_empty() {
+        // Scope the borrow so the finished handle can be removed from the set afterwards.
+        let (joined, idx) = {
+            let (joined, idx, _rest) =
+                futures::future::select_all(ingests.iter_mut().map(|(_, h)| h)).await;
+            (joined, idx)
+        };
+        let (chain, _) = ingests.remove(idx);
+        let outcome = match joined {
+            Ok(inner) => inner,
+            Err(e) if e.is_panic() => Err(anyhow::anyhow!("the ingestion loop panicked")),
+            Err(e) => Err(anyhow::anyhow!("the ingestion loop task failed: {e}")),
+        };
+        match outcome {
+            Ok(()) => tracing::info!(
+                "roost cursor on {chain} finished cleanly; {} cursor(s) still indexing",
+                ingests.len()
+            ),
+            Err(e) => {
+                tracing::error!(
+                    "roost cursor on {chain} QUARANTINED: {e:#} - its nests keep serving their last \
+                     indexed state; {} sibling cursor(s) continue unaffected",
+                    ingests.len()
+                );
+                failures.push(format!("{chain}: {e:#}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        tracing::warn!("every roost cursor ({total}) finished cleanly - nothing left to index");
+        return Ok(());
+    }
+    bail!(
+        "every roost cursor is dead, so nothing will advance again - {}",
+        failures.join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -611,5 +661,84 @@ mod tests {
             estimate_nest_rss_mb(&all, true),
             NEST_BASE_RSS_MB + 3 * NEST_VIEW_RSS_MB
         );
+    }
+
+    /// Issue #147, the headline scenario and the acceptance test for RFC-0026: one chain's cursor dies
+    /// (a reorg below its sealed watermark), and the other chain's cursor must carry on indexing with
+    /// the process still up. Before this, `select_all` returned on the first cursor's death, aborted
+    /// every sibling, and exited - so a Base reorg took down a perfectly healthy Arbitrum cursor.
+    #[tokio::test]
+    async fn a_dead_cursor_does_not_take_its_siblings_down() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let doomed = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!(
+                "reorg to block 100 is below the sealed/finalized watermark 200 - a finality \
+                 violation this indexer cannot repair"
+            ))
+        });
+        // A cursor that keeps working, ticking a counter so "still indexing" is observable rather
+        // than merely "not yet finished".
+        let progress = Arc::new(AtomicU64::new(0));
+        let p = progress.clone();
+        let healthy = tokio::spawn(async move {
+            for _ in 0..10_000 {
+                p.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        });
+
+        let mut ingests = vec![
+            ("base".to_string(), doomed),
+            ("arbitrum-one".to_string(), healthy),
+        ];
+        // The supervisor must NOT return while a healthy cursor is still indexing: returning is what
+        // ends the roost.
+        let returned =
+            tokio::time::timeout(Duration::from_millis(250), supervise_cursors(&mut ingests)).await;
+        assert!(
+            returned.is_err(),
+            "the roost ended even though a healthy cursor was still indexing"
+        );
+
+        // The dead cursor was retired from the set; the healthy one is untouched and still working.
+        assert_eq!(ingests.len(), 1, "only the dead cursor should be retired");
+        assert_eq!(ingests[0].0, "arbitrum-one");
+        assert!(
+            !ingests[0].1.is_finished(),
+            "the surviving cursor must not have been aborted"
+        );
+        assert!(
+            progress.load(Ordering::Relaxed) > 0,
+            "the surviving cursor must keep making progress after its sibling died"
+        );
+        ingests[0].1.abort();
+    }
+
+    /// RFC-0026 §6: the roost exits only once **every** cursor is gone - at that point nothing will
+    /// ever advance again, so exiting non-zero under a supervisor beats serving permanently-frozen
+    /// data. The error must name every dead chain, since that is the operator's starting point.
+    #[tokio::test]
+    async fn the_roost_exits_when_the_last_cursor_dies_and_names_every_chain() {
+        let a =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("finality violation")) });
+        let b = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("a single block exceeds the response cap"))
+        });
+        let mut ingests = vec![("base".to_string(), a), ("arbitrum-one".to_string(), b)];
+
+        let err = supervise_cursors(&mut ingests).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base"),
+            "should name the first dead chain: {msg}"
+        );
+        assert!(
+            msg.contains("arbitrum-one"),
+            "should name the second dead chain: {msg}"
+        );
+        assert!(ingests.is_empty(), "every cursor should have been retired");
     }
 }
