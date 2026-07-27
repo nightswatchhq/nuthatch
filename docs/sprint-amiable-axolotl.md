@@ -45,7 +45,20 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
   `detect_reorg` now refuses to roll back towards genesis when no checkpoint is canonical, terminally,
   instead of returning `Some(0)`. Loopback JSON-RPC mock harness added - **tier 2 item 4's failover
   test can reuse it**.
-- **Next:** tier 2 item 4 (warm-restart rebuild e2e + real RPC failover).
+- **Tier 2, item 4: done (2026-07-27).** Real RPC failover (broken endpoint tried first, call recovers
+  via the next, dead one cooled down; plus the all-broken case) and the warm-restart rebuild e2e.
+  The warm-restart work came with a lesson worth keeping: the obvious version of that test - seal, drop,
+  respawn, compare to a clean replay - **passes even with the sealed-through guard removed**, because
+  pruning makes the watermark redundant on the normal path. Verified by mutation. A second test
+  reconstructs the seal→prune crash window (segments hold [1,5], hot still holds [1,10], watermark
+  stale), which fails 7000-vs-5500 under that mutation. **Tier 2 is complete.**
+- **Next:** tier 3 (F-C3 doc + `spawn_blocking`, the six remaining tests, `utoipa`/`arrow` bumps).
+
+### Standing practice adopted mid-sprint
+
+**Mutation-check any test written to pin a specific bug.** Break the guard, confirm the test goes red,
+restore. A regression test that passes in both states documents behaviour but protects nothing - and
+the difference is invisible from a green run.
 
 ## Tier 1 - start here (blocks other work)
 

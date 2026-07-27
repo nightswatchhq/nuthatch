@@ -485,6 +485,9 @@ fn redact_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
     /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
     /// aborts the handle when done. Real HTTP, so `RpcClient`'s actual request path is exercised -
     /// there is no way to fake a per-endpoint bug like a mixed-chain pool without it.
@@ -496,6 +499,7 @@ mod tests {
             let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let result = match method {
                 "eth_chainId" => json!(format!("0x{chain_id:x}")),
+                "eth_blockNumber" => json!(HEALTHY_TIP_HEX),
                 _ => json!(null),
             };
             Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
@@ -514,6 +518,96 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// The block height the healthy mock reports, so a failover test can prove *which* endpoint
+    /// answered rather than merely that something did.
+    const HEALTHY_TIP_HEX: &str = "0x1234";
+    const HEALTHY_TIP: u64 = 0x1234;
+
+    /// An endpoint that is up but broken: HTTP 500 on everything. Distinct from an unbound port, so
+    /// the test covers a *responding* bad endpoint rather than a refused connection.
+    async fn broken_rpc() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicU64>) {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        let hits = Arc::new(AtomicU64::new(0));
+        async fn handler(State(hits): State<Arc<AtomicU64>>) -> StatusCode {
+            hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// Issue #150: the failover path itself, not just the ordering maths. The first endpoint is broken,
+    /// so the call must still succeed via the second, and the dead one must be marked unhealthy so
+    /// subsequent calls stop paying its timeout. Previously only `endpoint_order`'s sorting was tested -
+    /// which would happily pass even if `call` never retried at all.
+    #[tokio::test]
+    async fn a_failed_call_recovers_via_the_next_endpoint_and_cools_the_dead_one() {
+        let (broken, hb, broken_hits) = broken_rpc().await;
+        let (good, hg) = fake_rpc(1).await;
+        let c = RpcClient::new(vec![broken, good]).unwrap();
+
+        // The cursor starts at 0, so the broken endpoint is tried FIRST - the case under test.
+        let got = c
+            .block_number()
+            .await
+            .expect("the call must survive one dead endpoint");
+        assert_eq!(
+            got, HEALTHY_TIP,
+            "the answer must come from the healthy endpoint"
+        );
+        assert!(
+            broken_hits.load(Ordering::Relaxed) >= 1,
+            "the broken endpoint should actually have been tried"
+        );
+        assert_eq!(c.request_count(), 2, "one failed attempt, then one success");
+
+        // The dead endpoint is in cooldown, so it now sorts last…
+        assert_eq!(
+            *c.endpoint_order().last().unwrap(),
+            0,
+            "the failed endpoint must sink to the back"
+        );
+        // …and the healthy one is not penalised.
+        assert_eq!(c.health[1].load(Ordering::Relaxed), 0);
+
+        // A second call still succeeds, and skips straight to the good endpoint.
+        let before = c.request_count();
+        assert_eq!(c.block_number().await.unwrap(), HEALTHY_TIP);
+        assert_eq!(
+            c.request_count() - before,
+            1,
+            "a cooled-down endpoint must not be retried on every call"
+        );
+
+        hb.abort();
+        hg.abort();
+    }
+
+    /// With every endpoint broken there is nothing to fail over TO, so the call must surface an error
+    /// rather than hang or quietly return a default - the tip loop's stall detection depends on it.
+    #[tokio::test]
+    async fn a_call_fails_when_no_endpoint_can_answer() {
+        let (b1, h1, _) = broken_rpc().await;
+        let (b2, h2, _) = broken_rpc().await;
+        let c = RpcClient::new(vec![b1, b2]).unwrap();
+        assert!(c.block_number().await.is_err());
+        assert_eq!(
+            c.request_count(),
+            2,
+            "every endpoint tried before giving up"
+        );
+        h1.abort();
+        h2.abort();
     }
 
     /// Issue #150: every endpoint is checked individually. `call`-based verification would be useless
