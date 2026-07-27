@@ -337,7 +337,19 @@ pub async fn dev(
         }
 
         // One source + one shared cursor per chain - per-nest tables stay byte-identical to solo `dev`.
-        let source: Arc<dyn Source> = Arc::new(RpcClient::new(rpc_urls)?);
+        // Verify the whole pool is on THIS chain first (issue #150). It matters more in a roost than
+        // solo: with several chains in one runtime, pasting one chain's endpoint under another's
+        // `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
+        let rpc = RpcClient::new(rpc_urls)?;
+        rpc.verify_chain_ids(group.endpoint.chain_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "verifying rpc_urls for roost '{}' cursor on {}",
+                    meta.name, group.endpoint.chain
+                )
+            })?;
+        let source: Arc<dyn Source> = Arc::new(rpc);
         let (states, ingest, alerts) = indexer::spawn_roost(
             source,
             group.nests,

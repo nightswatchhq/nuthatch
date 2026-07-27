@@ -45,7 +45,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // endpoints without touching the nest's config on disk.
     let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
-    let source: Arc<dyn Source> = Arc::new(RpcClient::new(rpc_urls)?);
+    let rpc = RpcClient::new(rpc_urls)?;
+    // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
+    // wrong-network endpoint in the pool corrupts silently, because failover hides it.
+    rpc.verify_chain_ids(config.nest.chain_id).await?;
+    let source: Arc<dyn Source> = Arc::new(rpc);
     // Guard the single-endpoint backfill deadlock (see `safe_backfill_concurrency`).
     let concurrency = safe_backfill_concurrency(endpoint_count, args.concurrency);
     if concurrency < args.concurrency {
@@ -149,7 +153,9 @@ pub async fn upgrade(
     // Neither a compatible nor a breaking update changes chains, so one source feeds both indexers.
     let rpc_urls = crate::rpc::merge_rpcs(&rpc_override, old_config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
-    let source: Arc<dyn Source> = Arc::new(RpcClient::new(rpc_urls)?);
+    let rpc = RpcClient::new(rpc_urls)?;
+    rpc.verify_chain_ids(old_config.nest.chain_id).await?;
+    let source: Arc<dyn Source> = Arc::new(rpc);
     let concurrency = safe_backfill_concurrency(endpoint_count, concurrency);
     let admin_enabled = admin_enabled(no_admin, &listen);
     let admin_token = admin_required_token(admin_enabled, &listen);
@@ -2370,6 +2376,21 @@ async fn detect_reorg(source: &dyn Source, store: &Store, last: u64) -> Result<O
             }
         }
     }
+    // No checkpoint we hold is canonical, so the fork is deeper than our entire recorded history.
+    // Rolling back everything is the CORRECT recovery here: re-indexing from the nest's origin
+    // reconverges on the canonical chain (`e2e_reorg::reorg_converges_to_canonical` asserts exactly
+    // this for a fork below the oldest checkpoint).
+    //
+    // It looks identical to a wrong-network endpoint (issue #150) - both make every stored hash
+    // mismatch - and block hashes alone cannot tell them apart. So the wrong-chain case is caught
+    // *upstream*, by `RpcClient::verify_chain_ids` at startup, and the established-nest case is caught
+    // *downstream*, by `rollback_reorg`'s sealed-watermark bail. Refusing here instead would break the
+    // legitimate deep-reorg recovery, which is a real correctness regression rather than a guard.
+    tracing::warn!(
+        "no checkpoint at or below block {checkpoint} is canonical - rolling back the whole hot store \
+         and re-indexing from origin. If this repeats, check every url in `rpc_urls` is on this \
+         nest's chain (a wrong-network endpoint looks exactly like this)."
+    );
     Ok(Some(0))
 }
 
@@ -3935,6 +3956,101 @@ template = "pool"
             .unwrap()
             .is_empty());
         assert_eq!(sup.live(), vec![1]);
+    }
+
+    /// A fork deeper than every stored checkpoint yields `Some(0)` - roll back the whole hot store and
+    /// re-index from origin. That is the *correct* recovery, and it is deliberately NOT guarded against
+    /// even though it looks identical to a wrong-network endpoint (issue #150): block hashes alone
+    /// cannot distinguish the two, so the wrong-chain case is caught upstream by
+    /// `RpcClient::verify_chain_ids` and the established-nest case downstream by the sealed-watermark
+    /// bail. An earlier attempt to refuse here broke `e2e_reorg::reorg_converges_to_canonical`; this
+    /// test exists so nobody (including me, twice) makes that mistake again.
+    #[tokio::test]
+    async fn a_fork_below_every_checkpoint_rolls_all_the_way_back() {
+        /// Agrees with none of our checkpoints - a fork deeper than our whole history.
+        struct DeepForkSource;
+        #[async_trait::async_trait]
+        impl Source for DeepForkSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("0xtheirs{n}")))
+            }
+            async fn logs(
+                &self,
+                _a: &[String],
+                _t: &[String],
+                _f: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b)).collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in [100u64, 200, 300] {
+            store.set_block_hash(b, &format!("0xours{b}")).unwrap();
+        }
+        assert_eq!(
+            detect_reorg(&DeepForkSource, &store, 300).await.unwrap(),
+            Some(0),
+            "must roll back fully so re-indexing can reconverge on the canonical chain"
+        );
+    }
+
+    /// The counterpart: a *genuine* reorg still resolves normally. The guard above must not have made
+    /// ordinary rollbacks impossible - it only fires when NO checkpoint is canonical.
+    #[tokio::test]
+    async fn detect_reorg_still_finds_a_real_common_ancestor() {
+        /// Canonical below 250, forked at and above it - an ordinary reorg to block 200.
+        struct ForkedSource;
+        #[async_trait::async_trait]
+        impl Source for ForkedSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(if n >= 250 {
+                    format!("0xforked{n}")
+                } else {
+                    format!("0xours{n}")
+                }))
+            }
+            async fn logs(
+                &self,
+                _a: &[String],
+                _t: &[String],
+                _f: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b)).collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in [100u64, 200, 300] {
+            store.set_block_hash(b, &format!("0xours{b}")).unwrap();
+        }
+        assert_eq!(
+            detect_reorg(&ForkedSource, &store, 300).await.unwrap(),
+            Some(200),
+            "the deepest surviving checkpoint below the fork"
+        );
     }
 
     #[test]

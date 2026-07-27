@@ -35,6 +35,18 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
 
 ---
 
+## Progress
+
+- **Tier 1: done (2026-07-27).** [RFC-0026](rfcs/0026-fault-quarantine-and-partial-health.md) written
+  and all 3 slices shipped - **#147 closed**. A nest's error quarantines the nest; a cursor's death
+  quarantines the cursor; nothing quarantined reports itself healthy.
+- **Tier 2, item 3: done (2026-07-27).** `detect_reorg` wrong-chain guard - `verify_chain_ids` checks
+  every endpoint at startup (per-endpoint, because failover hides a mixed-chain pool), and
+  `detect_reorg` now refuses to roll back towards genesis when no checkpoint is canonical, terminally,
+  instead of returning `Some(0)`. Loopback JSON-RPC mock harness added - **tier 2 item 4's failover
+  test can reuse it**.
+- **Next:** tier 2 item 4 (warm-restart rebuild e2e + real RPC failover).
+
 ## Tier 1 - start here (blocks other work)
 
 1. **#147 mini-RFC.** A day, not a week. Settle four things only:
