@@ -52,13 +52,46 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
   pruning makes the watermark redundant on the normal path. Verified by mutation. A second test
   reconstructs the seal→prune crash window (segments hold [1,5], hot still holds [1,10], watermark
   stale), which fails 7000-vs-5500 under that mutation. **Tier 2 is complete.**
-- **Next:** tier 3 (F-C3 doc + `spawn_blocking`, the six remaining tests, `utoipa`/`arrow` bumps).
+- **Tier 3, item 5 (F-C3): done (2026-07-27).** The "single writer" doc corrected (two writer *tasks* -
+  ingest and the alert-outbox drain - serialised by redb; what is single is the **cursor**), and both
+  the window commit and the outbox drain moved to `spawn_blocking` so a contended fsync no longer parks
+  a tokio worker that is also serving the API.
+- **🔴 SECURITY (2026-07-27): `/sql` accepted `;`-stacked statements = arbitrary file write.** Found
+  while writing tier 3's statement-stacking test - the defence that test was meant to confirm did not
+  exist. `conn.prepare` is NOT single-statement on the bundled duckdb-rs: it prepares *and executes*
+  `SELECT 1; INSERT …`. The leading-keyword gate only inspects the first statement, and `COPY … TO` /
+  `ATTACH` write to disk regardless of the in-memory connection. Verified end-to-end through `query()`:
+  both wrote real files. Fixed by `reject_statement_stacking` (our own guard, string-literal aware),
+  with 3 regression tests. **Shipped in 0.6.1 and earlier - see the prod-exposure note below.**
+- **Also measured:** the `allowed_directories` defence-in-depth layer is **not enforced** on the DuckDB
+  we bundle. `reject_file_access` is the only thing stopping a file read. Comments corrected from
+  "enforcement varies by version" to the measured fact, with a tripwire test that fails if a future
+  bump makes the layer real.
+- **Next:** tier 3 remaining (4 more tests, `utoipa`/`arrow` bumps), then tier 4.
 
-### Standing practice adopted mid-sprint
+## 🔴 Open: prod exposure of the `/sql` stacking hole
+
+The fix is on this branch and **not** released. Per session notes (2026-07-22, unverified since): the
+Lodestar box runs **0.6.1** with `/sql` reachable through Caddy behind basic auth, services bound to
+loopback, processes running as the unprivileged `nuthatch` user. So the hole was live but gated by
+basic auth and limited to what `nuthatch` can write (nest dirs, its own home) - not root.
+
+Decisions for Chief, none of them mine to make:
+1. Patch release (0.6.2) and bump the box, or wait for the sprint branch to land whole?
+2. Does this warrant a `SECURITY.md` advisory / GHSA, given a public (if authenticated) endpoint?
+3. Rotate the `lodestar` basic-auth credential as a precaution?
+
+## Standing practice adopted mid-sprint
 
 **Mutation-check any test written to pin a specific bug.** Break the guard, confirm the test goes red,
 restore. A regression test that passes in both states documents behaviour but protects nothing - and
-the difference is invisible from a green run.
+the difference is invisible from a green run. Corollary, learned the hard way twice: **when a test is
+written to confirm a documented defence, confirm the defence exists.** Both of tier 3's security tests
+failed on first run, and neither was a test bug.
+
+**Edit source with anchored replacements, never index arithmetic.** An index-based splice on
+`analytics.rs` silently deleted 19 existing tests; the compiler was happy and the remaining tests were
+green. Only the test *count* dropping gave it away.
 
 ## Tier 1 - start here (blocks other work)
 
