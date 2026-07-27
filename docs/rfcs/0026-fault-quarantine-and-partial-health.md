@@ -1,6 +1,10 @@
 # RFC-0026: Fault quarantine and partial health - a roost survives its sick nests
 
-- Status: **Draft** (2026-07-27)
+- Status: **Draft** (2026-07-27) - **slice 1 shipped 2026-07-27**: the nest fault boundary. The three
+  `?` sites in §1's table now quarantine the nest instead of the cursor; `prepare` moved inside the
+  boundary; `TerminalFault` classifies the two no-retry faults; live/quarantined partition drives the
+  cursor's min/max/union (§3.1). Slices 2 (cursor boundary) and 3 (health surface) pending, so the
+  roost driver still fate-shares cursors - the headline two-chain scenario is not closed until slice 2.
 - Author: Pete (cargopete)
 - Date: 2026-07-27
 - Depends on: RFC-0012 (per-nest isolation of storage/reorg/blast-radius; the shared cursor),

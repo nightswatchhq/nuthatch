@@ -485,6 +485,150 @@ fn union_filter<'a>(
     (addrs, topics)
 }
 
+/// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
+/// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
+/// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
+/// in-process. Retrying either is a busy-loop that spams the log and hides the operator's real job.
+/// Carried through `anyhow` and recognised by downcast, so the bail sites stay one-liners.
+#[derive(Debug)]
+pub struct TerminalFault(pub String);
+
+impl std::fmt::Display for TerminalFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TerminalFault {}
+
+/// Whether any link in the error chain is a [`TerminalFault`] - i.e. a retry is pointless. Everything
+/// else is assumed retryable: a transient store/RPC/webhook error that a later window may well survive.
+fn is_terminal(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<TerminalFault>())
+}
+
+/// First backoff before a quarantined nest is re-admitted, doubling per attempt (RFC-0026 §4).
+const QUARANTINE_BACKOFF_START_SECS: u64 = 5;
+/// Ceiling on that backoff: an operator who restarts a wedged endpoint sees recovery within minutes.
+const QUARANTINE_BACKOFF_MAX_SECS: u64 = 300;
+
+/// Seconds to wait before re-admitting a nest quarantined `attempts` times (0 = the first quarantine).
+/// Doubles from [`QUARANTINE_BACKOFF_START_SECS`], capped at [`QUARANTINE_BACKOFF_MAX_SECS`]. The cap
+/// matters more than the curve: re-admission makes the whole cursor re-fetch the range the quarantined
+/// nest missed (§4), so it is correct but not free.
+fn quarantine_backoff_secs(attempts: u32) -> u64 {
+    QUARANTINE_BACKOFF_START_SECS
+        .saturating_mul(1u64 << attempts.min(6))
+        .min(QUARANTINE_BACKOFF_MAX_SECS)
+}
+
+/// One nest's standing in the shared cursor's working set (RFC-0026 §3).
+enum NestState {
+    /// Driving the cursor: counted in the min/max/union below.
+    Live,
+    /// Removed from the working set. `retry_at` is `None` for a terminal fault (quarantined until
+    /// restart); `Some(t)` for a retryable one, re-admitted once the monotonic clock passes `t`.
+    Quarantined {
+        reason: String,
+        retry_at: Option<std::time::Instant>,
+    },
+}
+
+/// Consecutive quarantines per nest, driving the backoff curve. Deliberately **not** a field of
+/// [`NestState::Quarantined`]: re-admission moves a nest back to `Live`, which would discard the count
+/// and leave a flapping nest forever backing off the opening 5 s. RFC-0026 §4 resets it on a *committed
+/// window* - real progress - not on the mere act of being let back in.
+type QuarantineAttempts = Vec<u32>;
+
+/// The nests still driving the shared cursor.
+///
+/// Quarantine means **removal from the working set**, not a skip-flag on an iteration, and this is the
+/// subtlety the whole design turns on (RFC-0026 §3.1). The cursor derives `global_next` from the *min*
+/// of the live nests' cursors, its reorg reference from the *max*, and its `getLogs` filter from the
+/// *union* of their addresses/topics. A quarantined nest left in the min pins the shared cursor at its
+/// dead position - every healthy sibling stalls while the roost still reports itself alive, which is
+/// strictly worse than the crash this replaces.
+fn live_indices(states: &[NestState]) -> Vec<usize> {
+    states
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, NestState::Live))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Quarantine one nest, logging why. The attempt count carries across repeated faults so the backoff
+/// keeps doubling for a nest that keeps failing; a committed window resets it (§4).
+fn quarantine(
+    states: &mut [NestState],
+    attempts: &mut QuarantineAttempts,
+    i: usize,
+    name: &str,
+    e: &anyhow::Error,
+) {
+    let reason = format!("{e:#}");
+    if is_terminal(e) {
+        tracing::warn!(
+            "nest '{name}' quarantined (terminal - needs an operator, no retry): {reason}"
+        );
+        states[i] = NestState::Quarantined {
+            reason,
+            retry_at: None,
+        };
+    } else {
+        let wait = quarantine_backoff_secs(attempts[i]);
+        tracing::warn!("nest '{name}' quarantined (retrying in {wait}s): {reason}");
+        attempts[i] = attempts[i].saturating_add(1);
+        states[i] = NestState::Quarantined {
+            reason,
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(wait)),
+        };
+    }
+}
+
+/// Re-admit every quarantined nest whose backoff has elapsed. Re-admission is safe by construction
+/// (RFC-0026 §4): the nest rejoins with its cursor *unchanged* - i.e. behind - which pulls `global_next`
+/// back down to it, and the siblings that ran ahead skip the re-fetched windows via the existing
+/// `nexts[i] > to` guard. No nest re-processes a committed window; no nest skips one.
+fn readmit_due(states: &mut [NestState], names: &[String], now: std::time::Instant) {
+    for (i, s) in states.iter_mut().enumerate() {
+        if let NestState::Quarantined {
+            retry_at: Some(t), ..
+        } = s
+        {
+            if now >= *t {
+                tracing::warn!("nest '{}' re-admitted to the shared cursor", names[i]);
+                *s = NestState::Live;
+            }
+        }
+    }
+}
+
+/// Fan one detected reorg out to every live nest, quarantining any that cannot handle it.
+///
+/// A rollback failure is that nest's fault alone - overwhelmingly the finality-violation bail, which
+/// is terminal for the nest whose *own* sealed watermark the fork went under. Co-tenants seal on their
+/// own watermarks (a nest that sealed less far is perfectly repairable), so they roll back and carry
+/// on. This is the headline case from issue #147: before RFC-0026 the first nest to bail here killed
+/// the cursor mid-fan-out, leaving its siblings rolled back but never advanced again.
+#[allow(clippy::too_many_arguments)]
+fn fan_out_rollback(
+    nests: &mut [NestIngest],
+    nexts: &mut [u64],
+    states: &mut [NestState],
+    attempts: &mut QuarantineAttempts,
+    names: &[String],
+    live: &[usize],
+    ancestor: u64,
+) {
+    for &i in live {
+        match nests[i].rollback_reorg(ancestor) {
+            Ok(()) => nexts[i] = nexts[i].min(ancestor + 1),
+            Err(e) => quarantine(states, attempts, i, &names[i], &e),
+        }
+    }
+}
+
 /// The shared cursor (RFC-0012 slice 2a): one poll drives every mounted nest. One `source.tip()`, one
 /// union `getLogs` per window, then each returned log is demuxed to the nest(s) that own it and run
 /// through the SAME [`NestIngest::process_window`] a solo `dev` uses - so per-nest tables are
@@ -503,19 +647,84 @@ async fn roost_index_loop(
     if nests.is_empty() {
         return Ok(());
     }
+    let names: Vec<String> = nests.iter().map(|n| n.name.clone()).collect();
+    let mut states: Vec<NestState> = nests.iter().map(|_| NestState::Live).collect();
+    let mut attempts: QuarantineAttempts = vec![0; nests.len()];
+
     // Phase 0, per nest: each nest backfills its own history to near-tip independently (tip-only
     // coupling - the shared cursor never entangles backfill windows). Each returns its own start cursor.
-    let mut nexts: Vec<u64> = Vec::with_capacity(nests.len());
-    for nest in &mut nests {
-        let next = nest
+    // A failure here quarantines that nest (RFC-0026 §3) rather than stillbirthing the cursor: before,
+    // one nest's backfill error killed the shared task before a single sibling indexed a block.
+    let mut nexts: Vec<u64> = vec![0; nests.len()];
+    // Whether a nest has a *valid* cursor. A nest whose `prepare` failed has `nexts[i] = 0`, which is
+    // not "start at genesis" but "unknown" - it must re-`prepare` before it may rejoin the working set
+    // (see the re-admission step below).
+    let mut prepared: Vec<bool> = vec![false; nests.len()];
+    for (i, nest) in nests.iter_mut().enumerate() {
+        match nest
             .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
-            .await?;
-        nexts.push(next);
+            .await
+        {
+            Ok(next) => {
+                nexts[i] = next;
+                prepared[i] = true;
+            }
+            Err(e) => quarantine(&mut states, &mut attempts, i, &names[i], &e),
+        }
     }
 
     let mut chunker = AdaptiveWindow::for_window(window);
     let mut poll_failures = 0u32;
     loop {
+        // Re-admit anything whose backoff elapsed, then take the live set for this iteration. Every
+        // min/max/union below is derived from it - never from all nests (RFC-0026 §3.1).
+        readmit_due(&mut states, &names, std::time::Instant::now());
+        // A nest quarantined *during* `prepare` never established a cursor, so it re-`prepare`s before
+        // rejoining. Without this it would rejoin at `nexts[i] == 0` and, being the new minimum, drag
+        // the whole shared cursor back to genesis - re-indexing every co-tenant from block 0.
+        for i in 0..nests.len() {
+            if matches!(states[i], NestState::Live) && !prepared[i] {
+                match nests[i]
+                    .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
+                    .await
+                {
+                    Ok(next) => {
+                        nexts[i] = next;
+                        prepared[i] = true;
+                        attempts[i] = 0;
+                    }
+                    Err(e) => quarantine(&mut states, &mut attempts, i, &names[i], &e),
+                }
+            }
+        }
+        let live = live_indices(&states);
+        if live.is_empty() {
+            // Nothing left to advance. If every quarantine is terminal the cursor is dead and says so
+            // (slice 2 turns this into a per-cursor quarantine at the roost driver); if some are
+            // retryable, wait for the backoff rather than spin.
+            if states
+                .iter()
+                .all(|s| matches!(s, NestState::Quarantined { retry_at: None, .. }))
+            {
+                let why: Vec<String> = states
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| match s {
+                        NestState::Quarantined { reason, .. } => {
+                            Some(format!("{}: {reason}", names[i]))
+                        }
+                        NestState::Live => None,
+                    })
+                    .collect();
+                anyhow::bail!(TerminalFault(format!(
+                    "every nest on this cursor is terminally quarantined - {}",
+                    why.join("; ")
+                )));
+            }
+            sleep_secs(3).await;
+            continue;
+        }
+
         let tip = match source.tip().await {
             Ok(t) => {
                 poll_failures = 0;
@@ -536,19 +745,24 @@ async fn roost_index_loop(
         // out to every nest. This is one detection (a handful of block-hash calls) instead of N, and one
         // observable reorg boundary. `rollback_reorg` is a no-op for any nest already at/below the fork
         // (a still-backfilling nest below finality can't be affected), so fanning to all is safe.
-        let max_next = *nexts.iter().max().unwrap();
+        // Only live nests take part: a quarantined nest is not a valid reorg reference (its store
+        // stopped advancing) and must not be rolled back (RFC-0026 §3.1).
+        let max_next = live.iter().map(|&i| nexts[i]).max().unwrap();
         if max_next > 0 {
             // Any caught-up nest is a valid checkpoint reference; use one at the max height.
-            let reference = nexts.iter().position(|&n| n == max_next).unwrap();
+            let reference = *live.iter().find(|&&i| nexts[i] == max_next).unwrap();
             match detect_reorg(source.as_ref(), &nests[reference].store, max_next - 1).await {
                 Ok(Some(ancestor)) => {
-                    tracing::warn!(
-                        "roost reorg to block {ancestor}: rolling back every mounted nest",
+                    tracing::warn!("roost reorg to block {ancestor}: rolling back every live nest");
+                    fan_out_rollback(
+                        &mut nests,
+                        &mut nexts,
+                        &mut states,
+                        &mut attempts,
+                        &names,
+                        &live,
+                        ancestor,
                     );
-                    for (i, nest) in nests.iter_mut().enumerate() {
-                        nest.rollback_reorg(ancestor)?;
-                        nexts[i] = nexts[i].min(ancestor + 1);
-                    }
                     continue;
                 }
                 Ok(None) => {}
@@ -556,18 +770,20 @@ async fn roost_index_loop(
             }
         }
 
-        // The shared cursor advances from the *least* caught-up nest, so no nest ever skips a block.
-        let global_next = *nexts.iter().min().unwrap();
+        // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
+        let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         if global_next > tip {
             sleep_secs(2).await;
             continue;
         }
         let to = (global_next + chunker.window() - 1).min(tip);
 
+        // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
+        // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
+        // whole cursor topic0-only).
         let (u_addrs, u_topics) = union_filter(
-            nests
-                .iter()
-                .map(|n| (n.addresses.as_slice(), n.topic0s.as_slice())),
+            live.iter()
+                .map(|&i| (nests[i].addresses.as_slice(), nests[i].topic0s.as_slice())),
         );
         match source.logs(&u_addrs, &u_topics, global_next, to).await {
             Ok(logs) => {
@@ -576,25 +792,36 @@ async fn roost_index_loop(
                 // through the same per-window path a solo nest runs. A nest already past this window is
                 // skipped; a nest with zero owned logs still advances + checkpoints + seals (identical
                 // to solo - a window with no matching logs still moves the cursor).
-                for (i, nest) in nests.iter_mut().enumerate() {
+                for &i in &live {
                     if nexts[i] > to {
                         continue;
                     }
                     let nest_logs: Vec<crate::rpc::Log> = logs
                         .iter()
-                        .filter(|l| l.block_number >= nexts[i] && nest.owns(l))
+                        .filter(|l| l.block_number >= nexts[i] && nests[i].owns(l))
                         .cloned()
                         .collect();
                     // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
                     // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
                     // iteration re-fetches, and this nest retries while nests that did advance simply
                     // process the forward remainder - never re-processing.
-                    if nest
+                    //
+                    // An `Err` is this nest's fault alone (decode, store, seal, a dead IVM circuit, a
+                    // webhook sink): quarantine it and let its co-tenants finish the window. Before
+                    // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
+                    match nests[i]
                         .process_window(source.as_ref(), &nest_logs, nexts[i], to, tip)
-                        .await?
-                        .is_some()
+                        .await
                     {
-                        nexts[i] = to + 1;
+                        Ok(Some(_)) => {
+                            nexts[i] = to + 1;
+                            // Real progress clears the nest's record, so a nest that fails every
+                            // third window is degraded, not escalating towards permanent quarantine
+                            // (RFC-0026 §4). Re-admission alone must NOT reset this.
+                            attempts[i] = 0;
+                        }
+                        Ok(None) => {}
+                        Err(e) => quarantine(&mut states, &mut attempts, i, &names[i], &e),
                     }
                 }
             }
@@ -849,6 +1076,7 @@ async fn build_nest(
     // starts empty (it is rebuilt/grown by `prepare`). The view handles are cloned here and shared
     // with the `AppState` below - the API must see the same views the loop feeds.
     let nest = NestIngest {
+        name: config.nest.name.clone(),
         dir: dir.clone(),
         store: store.clone(),
         registry: registry.clone(),
@@ -1395,6 +1623,9 @@ pub async fn backfill_direct_factory(
 /// mechanical grouping - the loop's behaviour is unchanged. The `Source` is deliberately NOT a field:
 /// it is shared (`Arc<dyn Source>`) and stays borrowed into the two methods below.
 struct NestIngest {
+    /// The nest's configured name - the label a quarantine is reported under (RFC-0026 §5) and the
+    /// key its metrics are already registered by.
+    name: String,
     dir: PathBuf,
     store: Store,
     registry: Arc<DecodeRegistry>,
@@ -1666,16 +1897,18 @@ impl NestIngest {
     /// surface as a fatal ingest error, never be served over (audit: correctness M1). A disabled view
     /// (no labels / no velocity flag) reports healthy, so this only bites a genuinely crashed circuit.
     fn ensure_views_healthy(&self) -> Result<()> {
+        // Terminal (RFC-0026 §3): a crashed circuit thread cannot be revived in-process, so this nest
+        // is quarantined until restart rather than retried.
         if !self.balances.is_healthy() {
-            anyhow::bail!(
-                "the balance IVM circuit thread has died - refusing to serve a frozen view"
-            );
+            anyhow::bail!(TerminalFault(
+                "the balance IVM circuit thread has died - refusing to serve a frozen view".into()
+            ));
         }
         if !self.exposure.is_healthy() {
-            anyhow::bail!("the exposure IVM circuit thread has died - refusing to serve frozen compliance data");
+            anyhow::bail!(TerminalFault("the exposure IVM circuit thread has died - refusing to serve frozen compliance data".into()));
         }
         if !self.velocity.is_healthy() {
-            anyhow::bail!("the velocity IVM circuit thread has died - refusing to serve frozen compliance data");
+            anyhow::bail!(TerminalFault("the velocity IVM circuit thread has died - refusing to serve frozen compliance data".into()));
         }
         Ok(())
     }
@@ -1703,11 +1936,13 @@ impl NestIngest {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         if ancestor < sealed_through {
-            anyhow::bail!(
+            // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
+            // identically, so this nest is quarantined until an operator raises the finality depth.
+            anyhow::bail!(TerminalFault(format!(
                 "reorg to block {ancestor} is below the sealed/finalized watermark \
                  {sealed_through} - a finality violation this indexer cannot repair; \
                  halting. Raise the chain's finality depth."
-            );
+            )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
         self.balances.apply(retraction_batch(&doomed));
@@ -3451,6 +3686,220 @@ template = "pool"
             behind.store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
             Some("30")
         );
+    }
+
+    /// RFC-0026 §3.1 - the trap the whole design turns on. A quarantined nest must leave the working
+    /// set, not merely be skipped: the shared cursor advances from the *min* of the live cursors, so a
+    /// quarantined nest left in that min pins the cursor at its dead position and stalls every healthy
+    /// sibling - while the roost still reports itself alive. Strictly worse than the crash it replaces.
+    #[test]
+    fn a_quarantined_nest_stops_pinning_the_shared_cursor() {
+        let nexts = [30u64, 100, 120];
+        let mut states = vec![NestState::Live, NestState::Live, NestState::Live];
+
+        // All live: the laggard at 30 rightly holds the cursor - no nest may skip a block.
+        let live = live_indices(&states);
+        assert_eq!(live, vec![0, 1, 2]);
+        assert_eq!(live.iter().map(|&i| nexts[i]).min().unwrap(), 30);
+
+        // Quarantine the laggard: the cursor jumps to the slowest *live* nest and indexing resumes.
+        let boom = anyhow::anyhow!("store write failed");
+        quarantine(&mut states, &mut vec![0; 3], 0, "laggard", &boom);
+        let live = live_indices(&states);
+        assert_eq!(live, vec![1, 2]);
+        assert_eq!(live.iter().map(|&i| nexts[i]).min().unwrap(), 100);
+        // …and the reorg reference is still the most caught-up live nest.
+        assert_eq!(live.iter().map(|&i| nexts[i]).max().unwrap(), 120);
+
+        // Re-admission restores it: the nest rejoins *behind*, pulling the cursor back to re-fetch the
+        // range it missed. Siblings ahead skip those windows via the loop's `nexts[i] > to` guard.
+        readmit_due(
+            &mut states,
+            &["laggard".into(), "b".into(), "c".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        let live = live_indices(&states);
+        assert_eq!(live, vec![0, 1, 2]);
+        assert_eq!(live.iter().map(|&i| nexts[i]).min().unwrap(), 30);
+    }
+
+    /// RFC-0026 §3 - terminal faults are quarantined until restart, never retried: they re-fail
+    /// identically by construction. The classification must survive `anyhow` context wrapping, since
+    /// that is how it reaches the loop.
+    #[test]
+    fn terminal_faults_are_recognised_through_context_and_never_scheduled_for_retry() {
+        let terminal: anyhow::Error = anyhow::anyhow!(TerminalFault("finality violation".into()))
+            .context("processing window");
+        let transient: anyhow::Error =
+            anyhow::anyhow!("connection reset").context("processing window");
+        assert!(is_terminal(&terminal));
+        assert!(!is_terminal(&transient));
+
+        let mut states = vec![NestState::Live, NestState::Live];
+        let mut attempts = vec![0; 2];
+        quarantine(&mut states, &mut attempts, 0, "doomed", &terminal);
+        quarantine(&mut states, &mut attempts, 1, "flaky", &transient);
+
+        // Terminal → no retry deadline at all; a far-future re-admission sweep leaves it quarantined.
+        assert!(matches!(
+            states[0],
+            NestState::Quarantined { retry_at: None, .. }
+        ));
+        assert!(matches!(
+            states[1],
+            NestState::Quarantined {
+                retry_at: Some(_),
+                ..
+            }
+        ));
+        readmit_due(
+            &mut states,
+            &["doomed".into(), "flaky".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(86_400),
+        );
+        assert_eq!(live_indices(&states), vec![1]);
+    }
+
+    /// RFC-0026 §3.1, the nastiest corner: a nest quarantined *during* `prepare` never established a
+    /// cursor, so its `nexts` entry is 0 - meaning "unknown", not "start at genesis". If re-admission
+    /// let it rejoin on that 0 it would become the new minimum and drag the whole shared cursor back to
+    /// block 0, re-indexing every healthy co-tenant from scratch. The loop guards this with `prepared`;
+    /// this test pins the invariant that guard exists to protect.
+    #[test]
+    fn an_unprepared_nest_never_drags_the_shared_cursor_to_genesis() {
+        let nexts = [0u64, 5_000_000];
+        let prepared = [false, true];
+        let mut states = vec![NestState::Live, NestState::Live];
+
+        // Nest 0 failed `prepare` and is quarantined; nest 1 is indexing near the tip.
+        quarantine(
+            &mut states,
+            &mut vec![0; 2],
+            0,
+            "unprepared",
+            &anyhow::anyhow!("backfill RPC died"),
+        );
+        assert_eq!(live_indices(&states), vec![1]);
+
+        // Its backoff elapses and it is re-admitted - the moment the bug would bite.
+        readmit_due(
+            &mut states,
+            &["unprepared".into(), "healthy".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        assert_eq!(live_indices(&states), vec![0, 1]);
+
+        // The loop must re-`prepare` it before deriving the cursor. Any live-but-unprepared nest at
+        // this point is the bug: the cursor would be 0 rather than the healthy nest's 5,000,000.
+        let unprepared_and_live: Vec<usize> = live_indices(&states)
+            .into_iter()
+            .filter(|&i| !prepared[i])
+            .collect();
+        assert_eq!(
+            unprepared_and_live,
+            vec![0],
+            "the guard must have something to catch here"
+        );
+        let cursor_if_unguarded = live_indices(&states)
+            .iter()
+            .map(|&i| nexts[i])
+            .min()
+            .unwrap();
+        assert_eq!(cursor_if_unguarded, 0, "this is the damage being prevented");
+        // With the guard, only prepared nests contribute a cursor.
+        let cursor_guarded = live_indices(&states)
+            .iter()
+            .filter(|&&i| prepared[i])
+            .map(|&i| nexts[i])
+            .min()
+            .unwrap();
+        assert_eq!(cursor_guarded, 5_000_000);
+    }
+
+    /// RFC-0026 §4 - backoff doubles and is capped, so a recovered endpoint is picked up within
+    /// minutes rather than hours.
+    #[test]
+    fn quarantine_backoff_doubles_then_caps() {
+        assert_eq!(quarantine_backoff_secs(0), 5);
+        assert_eq!(quarantine_backoff_secs(1), 10);
+        assert_eq!(quarantine_backoff_secs(2), 20);
+        // Monotonic, and pinned at the ceiling however many attempts pile up.
+        let mut prev = 0;
+        for a in 0..64 {
+            let w = quarantine_backoff_secs(a);
+            assert!(w >= prev, "backoff went backwards at attempt {a}");
+            assert!(w <= QUARANTINE_BACKOFF_MAX_SECS);
+            prev = w;
+        }
+        assert_eq!(quarantine_backoff_secs(63), QUARANTINE_BACKOFF_MAX_SECS);
+    }
+
+    /// Issue #147, the headline scenario, on the real fan-out path: a reorg drops below one nest's
+    /// sealed watermark. That nest cannot repair itself and is terminally quarantined - but its
+    /// co-tenant on the same cursor, whose own watermark is below the fork, rolls back cleanly and
+    /// keeps its cursor. Before RFC-0026 the first nest's `bail!` killed the shared cursor here,
+    /// taking the healthy sibling down with it.
+    #[tokio::test]
+    async fn a_finality_violation_quarantines_one_nest_and_spares_its_co_tenant() {
+        let da = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let doomed = build_test_nest(da.path(), "0x0000000000000000000000000000000000000001").await;
+        let healthy =
+            build_test_nest(db.path(), "0x0000000000000000000000000000000000000002").await;
+        seed_blocks(&doomed, &[10, 20, 30, 40, 50, 60, 80, 100]);
+        seed_blocks(&healthy, &[10, 20, 30, 40, 50, 60, 80, 100]);
+
+        // The doomed nest has sealed past the coming fork (60 > 50) - a finality violation it cannot
+        // repair. Its co-tenant sealed only to 40, so a rollback to 50 is entirely routine for it.
+        doomed.store.set_meta(SEALED_THROUGH_KEY, "60").unwrap();
+        healthy.store.set_meta(SEALED_THROUGH_KEY, "40").unwrap();
+
+        let names = vec!["doomed".to_string(), "healthy".to_string()];
+        let mut nests = vec![doomed, healthy];
+        let mut nexts = vec![101u64, 101];
+        let mut states = vec![NestState::Live, NestState::Live];
+
+        let mut attempts = vec![0; 2];
+        fan_out_rollback(
+            &mut nests,
+            &mut nexts,
+            &mut states,
+            &mut attempts,
+            &names,
+            &[0, 1],
+            50,
+        );
+
+        // The doomed nest: terminally quarantined, with the finality reason recorded for the operator.
+        match &states[0] {
+            NestState::Quarantined { reason, retry_at } => {
+                assert!(
+                    retry_at.is_none(),
+                    "a finality violation must not be retried"
+                );
+                assert!(
+                    reason.contains("finality violation"),
+                    "reason should name the fault: {reason}"
+                );
+            }
+            NestState::Live => {
+                panic!("the nest whose sealed watermark was violated must quarantine")
+            }
+        }
+        // Its cursor is untouched - it claims nothing it did not index.
+        assert_eq!(nexts[0], 101);
+
+        // The co-tenant: rolled back cleanly, cursor moved to the fork, data intact below it. It is
+        // still live, and (§3.1) it alone now drives the shared cursor.
+        assert!(matches!(states[1], NestState::Live));
+        assert_eq!(nexts[1], 51);
+        assert_eq!(nests[1].store.entities_in_range(10, 50).unwrap().len(), 5);
+        assert!(nests[1]
+            .store
+            .entities_in_range(51, 1_000)
+            .unwrap()
+            .is_empty());
+        assert_eq!(live_indices(&states), vec![1]);
     }
 
     #[test]
