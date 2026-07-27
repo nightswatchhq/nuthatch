@@ -1,0 +1,356 @@
+//! Live roost health - which nests and cursors are indexing, and which are quarantined (RFC-0026 §5).
+//!
+//! The `/nests` roster used to be a `serde_json::Value` built once at startup and cloned per request,
+//! so it could not express "partly working" at all. This is the live handle that replaces it: the
+//! ingestion loops write state changes here, the API reads them per request.
+//!
+//! The rule this exists to serve is narrow but absolute: **a quarantined unit must never look healthy.**
+//! Its data is still served - a frozen view of the chain up to its last committed block is correct, just
+//! not fresh - but every surface that describes it says so. `CLAUDE.md` forbids serving stale data *as
+//! if healthy*; it does not forbid serving it.
+
+use crate::metrics::now_unix;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Why a unit is out of service, and whether it is coming back on its own.
+#[derive(Clone, Debug)]
+pub struct QuarantineInfo {
+    /// `"nest"` - this nest alone failed. `"cursor"` - the whole chain cursor died, taking every nest
+    /// mounted on it out of service with it.
+    pub kind: &'static str,
+    /// `"retryable"` - backing off, will be re-admitted. `"terminal"` - needs an operator; no retry.
+    pub class: &'static str,
+    /// The underlying error chain, which is what an operator actually needs in order to act.
+    pub reason: String,
+    pub since_unixtime: u64,
+    /// Consecutive quarantines, driving the backoff curve.
+    pub attempts: u32,
+    /// When re-admission is due; `None` for a terminal fault.
+    pub next_retry_unixtime: Option<u64>,
+}
+
+impl QuarantineInfo {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "class": self.class,
+            "reason": self.reason,
+            "since_unixtime": self.since_unixtime,
+            "attempts": self.attempts,
+            "next_retry_unixtime": self.next_retry_unixtime,
+        })
+    }
+}
+
+/// The roost's live health. Cheap to clone behind an `Arc`; every mutation is a short write lock.
+#[derive(Default)]
+pub struct RoostHealth {
+    /// Nest name → its own quarantine. Absent means indexing.
+    nests: RwLock<HashMap<String, QuarantineInfo>>,
+    /// Chain → the cursor's quarantine. A dead cursor takes all its nests out of service, so this is
+    /// consulted for any nest whose own entry is clear.
+    cursors: RwLock<HashMap<String, QuarantineInfo>>,
+    /// Nest name → the chain whose cursor drives it.
+    chain_of: RwLock<HashMap<String, String>>,
+    /// Nest name → how many times it has ever been quarantined. A monotonic counter, so a nest that
+    /// flaps in and out is visible on a graph even though its *current* state keeps reading healthy.
+    quarantine_count: RwLock<HashMap<String, u64>>,
+}
+
+impl RoostHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `nest` is driven by `chain`'s cursor, so a cursor fault can be attributed to it.
+    pub fn register(&self, nest: &str, chain: &str) {
+        self.chain_of
+            .write()
+            .unwrap()
+            .insert(nest.to_string(), chain.to_string());
+    }
+
+    /// Quarantine one nest. `next_retry_secs` is `None` for a terminal fault (§3).
+    pub fn quarantine_nest(
+        &self,
+        nest: &str,
+        reason: String,
+        attempts: u32,
+        next_retry_secs: Option<u64>,
+    ) {
+        let now = now_unix();
+        *self
+            .quarantine_count
+            .write()
+            .unwrap()
+            .entry(nest.to_string())
+            .or_insert(0) += 1;
+        self.nests.write().unwrap().insert(
+            nest.to_string(),
+            QuarantineInfo {
+                kind: "nest",
+                class: if next_retry_secs.is_some() {
+                    "retryable"
+                } else {
+                    "terminal"
+                },
+                reason,
+                since_unixtime: now,
+                attempts,
+                next_retry_unixtime: next_retry_secs.map(|s| now.saturating_add(s)),
+            },
+        );
+    }
+
+    /// Clear a nest's quarantine - it is indexing again.
+    pub fn mark_indexing(&self, nest: &str) {
+        self.nests.write().unwrap().remove(nest);
+    }
+
+    /// Quarantine a whole chain cursor: every nest mounted on it is out of service until restart.
+    pub fn quarantine_cursor(&self, chain: &str, reason: String) {
+        self.cursors.write().unwrap().insert(
+            chain.to_string(),
+            QuarantineInfo {
+                kind: "cursor",
+                class: "terminal",
+                reason,
+                since_unixtime: now_unix(),
+                attempts: 0,
+                next_retry_unixtime: None,
+            },
+        );
+    }
+
+    /// This nest's effective quarantine: its own if it has one, otherwise its cursor's. A nest that is
+    /// itself fine but whose cursor died is still not indexing, and must not report that it is.
+    pub fn status(&self, nest: &str) -> Option<QuarantineInfo> {
+        if let Some(q) = self.nests.read().unwrap().get(nest) {
+            return Some(q.clone());
+        }
+        let chain = self.chain_of.read().unwrap().get(nest).cloned()?;
+        self.cursors.read().unwrap().get(&chain).cloned()
+    }
+
+    /// `(health, quarantine)` for one nest, ready to merge into a roster entry.
+    pub fn json_for(&self, nest: &str) -> (&'static str, Option<serde_json::Value>) {
+        match self.status(nest) {
+            Some(q) => ("quarantined", Some(q.to_json())),
+            None => ("indexing", None),
+        }
+    }
+
+    /// Every quarantined nest, as `(name, reason)` - the body of a 503 from `/ready`.
+    pub fn unhealthy(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .chain_of
+            .read()
+            .unwrap()
+            .keys()
+            .filter_map(|n| self.status(n).map(|q| (n.clone(), q.reason)))
+            .collect();
+        // Deterministic order so the readiness body is stable between polls.
+        out.sort();
+        out
+    }
+
+    /// Whether every registered nest is indexing. This is what roost-root `/ready` answers.
+    pub fn all_indexing(&self) -> bool {
+        self.unhealthy().is_empty()
+    }
+
+    /// Prometheus lines for the roost's health (RFC-0026 §5) - enough to alert on "anything
+    /// quarantined" and to graph a nest that flaps.
+    pub fn render_metrics(&self) -> String {
+        let chain_of = self.chain_of.read().unwrap();
+        if chain_of.is_empty() {
+            return String::new();
+        }
+        let mut nests: Vec<(&String, &String)> = chain_of.iter().collect();
+        nests.sort();
+        let counts = self.quarantine_count.read().unwrap();
+
+        let mut s = String::new();
+        s.push_str(
+            "# HELP nuthatch_nest_health 1 when the nest is indexing, 0 when quarantined.\n\
+             # TYPE nuthatch_nest_health gauge\n",
+        );
+        for (nest, chain) in &nests {
+            let up = u8::from(self.status(nest).is_none());
+            s.push_str(&format!(
+                "nuthatch_nest_health{{nest=\"{nest}\",chain=\"{chain}\"}} {up}\n"
+            ));
+        }
+        s.push_str(
+            "# HELP nuthatch_nest_quarantine_total Times this nest has been quarantined since start.\n\
+             # TYPE nuthatch_nest_quarantine_total counter\n",
+        );
+        for (nest, _) in &nests {
+            let n = counts.get(*nest).copied().unwrap_or(0);
+            s.push_str(&format!(
+                "nuthatch_nest_quarantine_total{{nest=\"{nest}\"}} {n}\n"
+            ));
+        }
+
+        let cursors = self.cursors.read().unwrap();
+        let mut chains: Vec<&String> = nests.iter().map(|(_, c)| *c).collect();
+        chains.sort();
+        chains.dedup();
+        s.push_str(
+            "# HELP nuthatch_cursor_live 1 while the chain's cursor is running, 0 once it has died.\n\
+             # TYPE nuthatch_cursor_live gauge\n",
+        );
+        for chain in chains {
+            let live = u8::from(!cursors.contains_key(chain));
+            s.push_str(&format!(
+                "nuthatch_cursor_live{{chain=\"{chain}\"}} {live}\n"
+            ));
+        }
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_healthy_nest_reports_indexing_and_a_quarantined_one_never_does() {
+        let h = RoostHealth::new();
+        h.register("alpha", "base");
+        h.register("beta", "base");
+        assert!(h.all_indexing());
+        assert_eq!(h.json_for("alpha").0, "indexing");
+
+        h.quarantine_nest("alpha", "store write failed".into(), 2, Some(20));
+        let (health, q) = h.json_for("alpha");
+        assert_eq!(health, "quarantined");
+        let q = q.unwrap();
+        assert_eq!(q["class"], "retryable");
+        assert_eq!(q["kind"], "nest");
+        assert_eq!(q["attempts"], 2);
+        assert!(
+            q["next_retry_unixtime"].as_u64().unwrap() >= q["since_unixtime"].as_u64().unwrap()
+        );
+
+        // Its co-tenant is untouched - the whole point of per-nest quarantine.
+        assert_eq!(h.json_for("beta").0, "indexing");
+        // …but the roost as a whole is not ready while anything is out.
+        assert!(!h.all_indexing());
+        assert_eq!(h.unhealthy().len(), 1);
+
+        h.mark_indexing("alpha");
+        assert!(h.all_indexing());
+    }
+
+    #[test]
+    fn a_terminal_fault_has_no_retry_deadline() {
+        let h = RoostHealth::new();
+        h.register("alpha", "base");
+        h.quarantine_nest("alpha", "finality violation".into(), 0, None);
+        let q = h.status("alpha").unwrap();
+        assert_eq!(q.class, "terminal");
+        assert!(q.next_retry_unixtime.is_none());
+    }
+
+    /// A dead cursor takes every nest mounted on it out of service - including nests that never
+    /// individually failed. Reporting those as "indexing" would be exactly the lie RFC-0026 forbids.
+    #[test]
+    fn a_dead_cursor_marks_all_its_nests_and_spares_the_other_chains() {
+        let h = RoostHealth::new();
+        h.register("alpha", "base");
+        h.register("beta", "base");
+        h.register("gamma", "arbitrum-one");
+
+        h.quarantine_cursor(
+            "base",
+            "every nest on this cursor is terminally quarantined".into(),
+        );
+
+        for n in ["alpha", "beta"] {
+            let (health, q) = h.json_for(n);
+            assert_eq!(health, "quarantined", "{n} rides the dead cursor");
+            assert_eq!(q.unwrap()["kind"], "cursor");
+        }
+        // The other chain's cursor is untouched - the per-cursor blast-radius rule, visible on the API.
+        assert_eq!(h.json_for("gamma").0, "indexing");
+        assert_eq!(
+            h.unhealthy()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    /// The health surface must be scrapeable: alert on "anything quarantined", graph a flapping nest.
+    #[test]
+    fn metrics_expose_nest_health_cursor_liveness_and_a_flap_counter() {
+        let h = RoostHealth::new();
+        h.register("alpha", "base");
+        h.register("gamma", "arbitrum-one");
+
+        let m = h.render_metrics();
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"alpha\",chain=\"base\"} 1"),
+            "{m}"
+        );
+        assert!(m.contains("nuthatch_cursor_live{chain=\"base\"} 1"), "{m}");
+        assert!(
+            m.contains("nuthatch_nest_quarantine_total{nest=\"alpha\"} 0"),
+            "{m}"
+        );
+
+        // Flap alpha twice: current health returns to 1, but the counter remembers - which is the
+        // whole point, since a nest that recovers between scrapes would otherwise look untroubled.
+        for _ in 0..2 {
+            h.quarantine_nest("alpha", "transient".into(), 0, Some(5));
+            h.mark_indexing("alpha");
+        }
+        let m = h.render_metrics();
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"alpha\",chain=\"base\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_nest_quarantine_total{nest=\"alpha\"} 2"),
+            "{m}"
+        );
+
+        // A dead cursor shows as down, and drags its nest's health with it - the other chain is fine.
+        h.quarantine_cursor("base", "cursor gone".into());
+        let m = h.render_metrics();
+        assert!(m.contains("nuthatch_cursor_live{chain=\"base\"} 0"), "{m}");
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"alpha\",chain=\"base\"} 0"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_cursor_live{chain=\"arbitrum-one\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"gamma\",chain=\"arbitrum-one\"} 1"),
+            "{m}"
+        );
+    }
+
+    /// A nest's own fault outranks its cursor's for reporting: it is the more specific cause, and the
+    /// one the operator must act on.
+    #[test]
+    fn a_nests_own_fault_outranks_its_cursors() {
+        let h = RoostHealth::new();
+        h.register("alpha", "base");
+        h.quarantine_nest(
+            "alpha",
+            "the balance IVM circuit thread has died".into(),
+            0,
+            None,
+        );
+        h.quarantine_cursor("base", "cursor gone".into());
+        let q = h.status("alpha").unwrap();
+        assert_eq!(q.kind, "nest");
+        assert!(q.reason.contains("balance IVM"));
+    }
+}

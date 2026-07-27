@@ -210,6 +210,51 @@ impl RpcClient {
         parse_hex_u64(result.as_str().unwrap_or_default())
     }
 
+    /// Check **every** endpoint reports `expected` from `eth_chainId`, once, at startup (issue #150).
+    ///
+    /// A wrong-network endpoint in the pool is uniquely nasty: failover makes it *look* like a
+    /// redundancy win while it quietly answers `eth_getBlockByNumber` for a chain we are not indexing.
+    /// Every block hash it returns then mismatches our checkpoints, so `detect_reorg` walks the entire
+    /// checkpoint history looking for a common ancestor it can never find. For an established nest the
+    /// sealed-watermark bail contains the damage; a *fresh* nest, with nothing sealed, would happily
+    /// roll itself back towards genesis.
+    ///
+    /// The per-endpoint loop is the point - `call` would failover past the bad one and report success.
+    ///
+    /// A **mismatch is fatal**: it is a configuration error that silently corrupts, and the operator
+    /// must fix it. An endpoint that is merely *unreachable* is not - it is warned about and left in
+    /// the pool, because being offline at startup is a normal condition this indexer tolerates and the
+    /// existing health/cooldown machinery already handles it.
+    pub async fn verify_chain_ids(&self, expected: u64) -> Result<()> {
+        for (j, url) in self.urls.iter().enumerate() {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            match self.call_one(url, "eth_chainId", &json!([])).await {
+                Ok(v) => {
+                    let got = parse_hex_u64(v.as_str().unwrap_or_default()).with_context(|| {
+                        format!("unparseable eth_chainId from {}", redact_url(url))
+                    })?;
+                    if got != expected {
+                        bail!(
+                            "RPC endpoint {} is on chain {got}, but this nest indexes chain {expected} \
+                             - indexing against a mixed-chain endpoint pool silently corrupts state \
+                             (every block hash mismatches, and a fresh nest would roll back towards \
+                             genesis). Fix `rpc_urls`.",
+                            redact_url(url)
+                        );
+                    }
+                    self.mark_healthy(j);
+                }
+                // Unreachable now ≠ wrong chain. Leave it in the pool; failover copes, and it gets
+                // verified the moment it answers a real call with a mismatching block hash.
+                Err(e) => tracing::warn!(
+                    "could not verify chain id of {} at startup ({e:#}) - leaving it in the pool",
+                    redact_url(url)
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// A storage slot's value at `address` (latest block) - used to read the EIP-1967 proxy slot.
     pub async fn get_storage_at(&self, address: &str, slot: &str) -> Result<String> {
         let result = self
@@ -440,6 +485,189 @@ fn redact_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
+    /// aborts the handle when done. Real HTTP, so `RpcClient`'s actual request path is exercised -
+    /// there is no way to fake a per-endpoint bug like a mixed-chain pool without it.
+    async fn fake_rpc(chain_id: u64) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(State(chain_id): State<u64>, Json(req): Json<Value>) -> Json<Value> {
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let result = match method {
+                "eth_chainId" => json!(format!("0x{chain_id:x}")),
+                "eth_blockNumber" => json!(HEALTHY_TIP_HEX),
+                _ => json!(null),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+        }
+
+        // Answer on ANY path, not just `/` - provider URLs carry the API key in the path
+        // (`.../v3/<KEY>`), and a mock that 404s those would read as "endpoint down" and quietly
+        // skip the very check under test.
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(chain_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// The block height the healthy mock reports, so a failover test can prove *which* endpoint
+    /// answered rather than merely that something did.
+    const HEALTHY_TIP_HEX: &str = "0x1234";
+    const HEALTHY_TIP: u64 = 0x1234;
+
+    /// An endpoint that is up but broken: HTTP 500 on everything. Distinct from an unbound port, so
+    /// the test covers a *responding* bad endpoint rather than a refused connection.
+    async fn broken_rpc() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicU64>) {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        let hits = Arc::new(AtomicU64::new(0));
+        async fn handler(State(hits): State<Arc<AtomicU64>>) -> StatusCode {
+            hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// Issue #150: the failover path itself, not just the ordering maths. The first endpoint is broken,
+    /// so the call must still succeed via the second, and the dead one must be marked unhealthy so
+    /// subsequent calls stop paying its timeout. Previously only `endpoint_order`'s sorting was tested -
+    /// which would happily pass even if `call` never retried at all.
+    #[tokio::test]
+    async fn a_failed_call_recovers_via_the_next_endpoint_and_cools_the_dead_one() {
+        let (broken, hb, broken_hits) = broken_rpc().await;
+        let (good, hg) = fake_rpc(1).await;
+        let c = RpcClient::new(vec![broken, good]).unwrap();
+
+        // The cursor starts at 0, so the broken endpoint is tried FIRST - the case under test.
+        let got = c
+            .block_number()
+            .await
+            .expect("the call must survive one dead endpoint");
+        assert_eq!(
+            got, HEALTHY_TIP,
+            "the answer must come from the healthy endpoint"
+        );
+        assert!(
+            broken_hits.load(Ordering::Relaxed) >= 1,
+            "the broken endpoint should actually have been tried"
+        );
+        assert_eq!(c.request_count(), 2, "one failed attempt, then one success");
+
+        // The dead endpoint is in cooldown, so it now sorts last…
+        assert_eq!(
+            *c.endpoint_order().last().unwrap(),
+            0,
+            "the failed endpoint must sink to the back"
+        );
+        // …and the healthy one is not penalised.
+        assert_eq!(c.health[1].load(Ordering::Relaxed), 0);
+
+        // A second call still succeeds, and skips straight to the good endpoint.
+        let before = c.request_count();
+        assert_eq!(c.block_number().await.unwrap(), HEALTHY_TIP);
+        assert_eq!(
+            c.request_count() - before,
+            1,
+            "a cooled-down endpoint must not be retried on every call"
+        );
+
+        hb.abort();
+        hg.abort();
+    }
+
+    /// With every endpoint broken there is nothing to fail over TO, so the call must surface an error
+    /// rather than hang or quietly return a default - the tip loop's stall detection depends on it.
+    #[tokio::test]
+    async fn a_call_fails_when_no_endpoint_can_answer() {
+        let (b1, h1, _) = broken_rpc().await;
+        let (b2, h2, _) = broken_rpc().await;
+        let c = RpcClient::new(vec![b1, b2]).unwrap();
+        assert!(c.block_number().await.is_err());
+        assert_eq!(
+            c.request_count(),
+            2,
+            "every endpoint tried before giving up"
+        );
+        h1.abort();
+        h2.abort();
+    }
+
+    /// Issue #150: every endpoint is checked individually. `call`-based verification would be useless
+    /// here - it fails over past the bad endpoint and reports success, which is exactly how a
+    /// mixed-chain pool hides.
+    #[tokio::test]
+    async fn a_wrong_chain_endpoint_is_rejected_even_when_its_neighbours_are_right() {
+        let (good1, h1) = fake_rpc(42161).await;
+        let (good2, h2) = fake_rpc(42161).await;
+        let (wrong, h3) = fake_rpc(8453).await;
+
+        // All correct → starts.
+        let ok = RpcClient::new(vec![good1.clone(), good2.clone()]).unwrap();
+        assert!(ok.verify_chain_ids(42161).await.is_ok());
+
+        // One wrong endpoint among healthy ones → refuse, naming the chain it is actually on.
+        let mixed = RpcClient::new(vec![good1, good2.clone(), wrong.clone()]).unwrap();
+        let err = mixed.verify_chain_ids(42161).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("8453"), "should name the wrong chain: {msg}");
+        assert!(msg.contains("42161"), "and the expected one: {msg}");
+
+        // Order must not matter - the bad endpoint first is just as fatal.
+        let mixed2 = RpcClient::new(vec![wrong, good2]).unwrap();
+        assert!(mixed2.verify_chain_ids(42161).await.is_err());
+
+        for h in [h1, h2, h3] {
+            h.abort();
+        }
+    }
+
+    /// Offline is not the same as wrong. Nuthatch tolerates an endpoint being down at startup (the
+    /// health/cooldown machinery handles it), so an unreachable URL must warn, not block the boot.
+    #[tokio::test]
+    async fn an_unreachable_endpoint_does_not_block_startup() {
+        let (good, h) = fake_rpc(1).await;
+        // Port 1 on loopback: nothing listens, connection refused immediately.
+        let c = RpcClient::new(vec![good, "http://127.0.0.1:1/".to_string()]).unwrap();
+        assert!(
+            c.verify_chain_ids(1).await.is_ok(),
+            "an endpoint that is merely down must not prevent indexing"
+        );
+        h.abort();
+    }
+
+    /// The error text reaches operator logs, and provider URLs routinely carry the API key in the
+    /// path. It must name the host and nothing more.
+    #[tokio::test]
+    async fn the_mismatch_error_redacts_the_api_key() {
+        let (wrong, h) = fake_rpc(8453).await;
+        let with_key = format!(
+            "{}v3/SUPERSECRETKEY",
+            wrong.trim_end_matches('/').to_string() + "/"
+        );
+        let c = RpcClient::new(vec![with_key]).unwrap();
+        let msg = format!("{:#}", c.verify_chain_ids(1).await.unwrap_err());
+        assert!(!msg.contains("SUPERSECRETKEY"), "leaked the API key: {msg}");
+        h.abort();
+    }
+
     use super::{merge_rpcs, redact_url, RpcClient};
 
     fn v<const N: usize>(xs: [&str; N]) -> Vec<String> {

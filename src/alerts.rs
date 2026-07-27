@@ -156,20 +156,22 @@ pub async fn deliver_pending(
         .collect()
         .await;
 
-    // Phase 2: apply the store mutations (single-writer). Remove delivered + corrupt; leave retries.
+    // Phase 2: apply the store mutations. Remove delivered + corrupt; leave retries to be picked up on
+    // the next pass. Batched into ONE `spawn_blocking` (audit F-C3): each removal fsyncs, so draining a
+    // burst inline parked a tokio worker for one fsync per delivered alert.
     let mut delivered = 0usize;
+    let mut to_remove = Vec::new();
     for (seq, outcome) in outcomes {
         match outcome {
             Outcome::Delivered => {
-                let _ = store.outbox_remove(seq);
+                to_remove.push(seq);
                 delivered += 1;
             }
-            Outcome::Shed => {
-                let _ = store.outbox_remove(seq);
-            }
+            Outcome::Shed => to_remove.push(seq),
             Outcome::Retry => {}
         }
     }
+    let _ = store.outbox_remove_batch_blocking(to_remove).await;
     delivered
 }
 
