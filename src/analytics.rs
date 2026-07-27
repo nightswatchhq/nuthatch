@@ -101,7 +101,10 @@ fn run(
     //   1. this leading-keyword gate rejects a *statement* that opens with INSERT/UPDATE/DELETE/COPY/
     //      ATTACH/PRAGMA/… (a `WITH cte AS (…) INSERT …` is the only way DML could ride a `with`
     //      prefix, and DuckDB won't parse INSERT/COPY *inside* a CTE/subquery);
-    //   2. `conn.prepare` below is single-statement - `;`-stacking a second statement is refused;
+    //   2. `reject_statement_stacking` refuses a `;`-stacked second statement. This used to say
+    //      "`conn.prepare` is single-statement" - it is NOT (the bundled duckdb-rs prepares AND runs
+    //      `SELECT 1; INSERT …`), which made a stacked `COPY … TO` an arbitrary file write. See that
+    //      function's docs;
     //   3. the connection is a fresh in-memory instance whose only tables are read-only views over
     //      Parquet plus an ephemeral hot temp table, so even a hypothetical write has no durable target.
     // `COPY … TO` (a file write) must *lead* the statement, which (1) blocks.
@@ -110,6 +113,7 @@ fn run(
     // process can read (e.g. `nuthatch.toml`'s secrets). This is the primary control; the
     // `allowed_directories` lockdown below is defense-in-depth (its runtime enforcement is
     // version-dependent in the bundled DuckDB).
+    reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
     reject_replacement_scan(sql)?;
 
@@ -120,8 +124,15 @@ fn run(
     .context("failed to configure DuckDB")?;
     // Defense-in-depth for SEC-2 (the query denylist above is the primary control): pin DuckDB's file
     // access to the nest's own data dirs (segments + labels, never the nest root that holds the config)
-    // and `lock_configuration` so a query can't widen it. Runtime enforcement varies by bundled DuckDB
-    // version, so it is NOT relied on alone.
+    // and `lock_configuration` so a query can't widen it.
+    //
+    // MEASURED, not assumed: on the DuckDB we currently bundle, `allowed_directories` does **not**
+    // block an out-of-allowlist read - see
+    // `tests::the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read`. So this layer buys
+    // nothing today beyond `lock_configuration` (which does hold, preventing a query widening the
+    // setting). It is kept because it costs nothing and becomes real if upstream starts enforcing it -
+    // but `reject_file_access` is the control that actually stops a file read, and it must never be
+    // weakened on the belief that this is behind it.
     let allowed: Vec<String> = [crate::seal::SEGMENTS_DIR, "labels"]
         .iter()
         .map(|sub| dir.join(sub))
@@ -340,6 +351,59 @@ fn strip_all_sql_comments(sql: &str) -> String {
 /// name is matched only when it's a real call: a word boundary before it and (after optional
 /// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
 /// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
+/// Refuse a `;`-stacked second statement (SEC-7, and a **real** hole found by the audit-tail test work).
+///
+/// The read-only story used to rest on three layers, and the second one did not exist:
+///   1. the leading-keyword gate inspects only the FIRST statement, so `SELECT 1; COPY …` sails past it;
+///   2. `conn.prepare` was documented as single-statement. **It is not.** The bundled duckdb-rs prepares
+///      `SELECT 1; INSERT INTO t VALUES (99)` happily and *executes the INSERT*;
+///   3. the in-memory connection has no durable tables - but `COPY … TO 'path'` and `ATTACH 'path'`
+///      write to the filesystem regardless of what the connection holds.
+///
+/// Composed, that was an arbitrary **file-write** primitive on an unauthenticated GET surface:
+/// `SELECT 1; COPY (SELECT 1) TO '/home/user/.zshrc'` wrote the file. Verified end-to-end through
+/// `query` before this guard existed.
+///
+/// So statement stacking is now rejected here, in our own code, rather than delegated to a DuckDB
+/// behaviour we do not control. A trailing `;` (with only whitespace after it) is fine - that is how
+/// people habitually end a query - but anything following one is refused.
+///
+/// String-literal aware, because `SELECT ';'` is a perfectly legal query. Single quotes with `''`
+/// escaping and double-quoted identifiers are both tracked. Dollar-quoting is NOT parsed: a `;` inside
+/// a `$$…$$` block is treated as a statement separator and refused, which fails safe.
+fn reject_statement_stacking(sql: &str) -> Result<()> {
+    let cleaned = strip_all_sql_comments(sql);
+    let b = cleaned.as_bytes();
+    let mut i = 0;
+    let (mut in_single, mut in_double) = (false, false);
+    while i < b.len() {
+        match b[i] {
+            b'\'' if !in_double => {
+                // `''` inside a literal is an escaped quote, not a terminator.
+                if in_single && i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => {
+                if cleaned[i + 1..].trim().is_empty() {
+                    return Ok(()); // a trailing semicolon, nothing behind it
+                }
+                bail!(
+                    "the read-only SQL surface accepts a single statement; `;`-stacking is refused \
+                     (only the first statement is checked for read-only-ness, so a stacked second one \
+                     could write files)"
+                );
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn reject_file_access(sql: &str) -> Result<()> {
     let cleaned = strip_all_sql_comments(sql).to_ascii_lowercase();
     let b = cleaned.as_bytes();
@@ -1650,6 +1714,121 @@ template="pool"
         assert_eq!(rows[0]["b"], Value::from(10u64));
         assert_eq!(rows[0]["recip"], Value::from("0xb"));
         assert_eq!(rows[0]["appr"], Value::from("0xd"));
+    }
+
+    /// The regression test for a **real vulnerability** found while writing the audit-tail coverage:
+    /// `/sql` accepted `;`-stacked statements, which was an arbitrary file-write primitive on an
+    /// unauthenticated GET surface.
+    ///
+    /// The leading-keyword gate only inspects the first statement, `conn.prepare` turned out NOT to be
+    /// single-statement (it prepares *and executes* a stacked INSERT), and the "no durable target"
+    /// argument does not apply to `COPY … TO` or `ATTACH`, which write to the filesystem whatever the
+    /// connection holds. Verified end-to-end before the fix: both payloads below wrote real files.
+    #[test]
+    fn the_sql_surface_refuses_stacked_statements_and_writes_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let exfil = dir.path().join("exfil.csv");
+        let evil_db = dir.path().join("evil.db");
+
+        let payloads = [
+            format!("SELECT 1; COPY (SELECT 42 AS x) TO '{}'", exfil.display()),
+            format!("SELECT 1; ATTACH '{}' AS evil", evil_db.display()),
+            "SELECT 1; CREATE TABLE evil (x INTEGER)".to_string(),
+            "SELECT 1; INSERT INTO whatever VALUES (1)".to_string(),
+            // Comments must not smuggle the separator past the scan, as elsewhere in this module.
+            format!(
+                "SELECT 1 /* hi */; COPY (SELECT 1) TO '{}'",
+                exfil.display()
+            ),
+        ];
+        for sql in &payloads {
+            let err = query(dir.path(), sql)
+                .expect_err(&format!("must be refused: {sql}"))
+                .to_string();
+            assert!(err.contains("single statement"), "{sql} -> {err}");
+        }
+
+        // The point of the test: nothing reached the filesystem.
+        assert!(!exfil.exists(), "a stacked COPY wrote a file");
+        assert!(!evil_db.exists(), "a stacked ATTACH created a database");
+    }
+
+    /// The guard must not break legitimate SQL: a semicolon inside a string literal or a quoted
+    /// identifier is data, and a trailing semicolon is how most people end a query.
+    #[test]
+    fn statement_stacking_guard_allows_semicolons_that_are_not_separators() {
+        for ok in [
+            "SELECT ';'",
+            "SELECT 'a;b' AS s",
+            "SELECT 'it''s; fine'",
+            r#"SELECT 1 AS ";""#,
+            "SELECT 1;",
+            "SELECT 1;   ",
+            "SELECT 1; -- trailing comment",
+        ] {
+            assert!(
+                reject_statement_stacking(ok).is_ok(),
+                "legitimate query rejected: {ok}"
+            );
+        }
+        for bad in [
+            "SELECT 1; SELECT 2",
+            "SELECT ';'; DROP TABLE t",
+            "SELECT 1;;SELECT 2",
+        ] {
+            assert!(
+                reject_statement_stacking(bad).is_err(),
+                "stacked query accepted: {bad}"
+            );
+        }
+    }
+
+    /// The `allowed_directories` + `lock_configuration` lockdown is documented as defence-in-depth
+    /// behind the `reject_file_access` denylist. This pins **which of the two actually stops a read**
+    /// on the DuckDB we ship, because the answer turned out not to be "both".
+    ///
+    /// The denylist blocks it. The lockdown, set exactly as `run` sets it, does **not** - an
+    /// out-of-allowlist `read_text` succeeds. That is worth an assertion rather than a hopeful comment:
+    /// if a DuckDB bump ever starts enforcing it, this test fails and tells us the layer became real.
+    #[test]
+    fn the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read() {
+        let allowed = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        let secret_file = secret.path().join("nuthatch.toml");
+        std::fs::write(&secret_file, "[nest]\napi_key = \"hunter2\"\n").unwrap();
+        let sql = format!("SELECT * FROM read_text('{}')", secret_file.display());
+
+        // The primary control refuses it outright - this is the guarantee that actually holds.
+        assert!(
+            reject_file_access(&sql).is_err(),
+            "the denylist must refuse read_text - it is the control we rely on"
+        );
+
+        // The backstop, configured exactly as `run` configures it, does not stop the read on this
+        // build. Documented, not relied upon.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "SET allowed_directories=['{}']; SET lock_configuration=true;",
+            allowed.path().display()
+        ))
+        .unwrap();
+        let read_succeeded = match conn.prepare(&sql) {
+            Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
+            Err(_) => false,
+        };
+        assert!(
+            read_succeeded,
+            "allowed_directories now blocks out-of-allowlist reads - the defence-in-depth layer has \
+             become load-bearing. Good news: update this test and the comments in `run`, which \
+             currently say it is not enforced."
+        );
+
+        // `lock_configuration` does hold, at least: a query cannot widen the setting back.
+        assert!(
+            conn.execute_batch("SET allowed_directories=['/'];")
+                .is_err(),
+            "lock_configuration must prevent widening file access"
+        );
     }
 
     #[test]
