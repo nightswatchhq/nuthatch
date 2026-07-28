@@ -73,30 +73,32 @@ journalctl -u nuthatch -f          # a clean progress line during backfill, then
 
 ### Docker
 
-No image is published yet; build the binary into a slim runtime and mount the nest directory:
-
-```dockerfile
-FROM rust:1.85 AS build
-WORKDIR /src
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-COPY --from=build /src/target/release/nuthatch /usr/local/bin/nuthatch
-ENTRYPOINT ["nuthatch"]
-```
+A container image is published per release:
 
 ```sh
-docker build -t nuthatch .
-# The nest directory is the only state; mount it and expose the API on localhost.
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
   -e NUTHATCH_ADMIN_TOKEN=change-me \
-  nuthatch dev --dir /nest --listen 0.0.0.0:8288 --seal-direct --concurrency 8
+  ghcr.io/nuthatch-indexer/nuthatch:0.6.2
 ```
 
-Bind `0.0.0.0` **inside** the container but publish only to `127.0.0.1` on the host, and put a reverse
-proxy (TLS + auth) in front. `docker stop` sends SIGTERM, which drains and checkpoints cleanly.
+The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
+build, so the two cannot drift. It runs as an unprivileged user (uid 10001), carries only
+`ca-certificates` beyond the binary, and mounts the nest directory at `/nest` - the only writable state.
+
+The default command binds `0.0.0.0:8288` *inside* the container; publish it to `127.0.0.1` on the host
+as above and put a reverse proxy (TLS + auth) in front, the same posture as bare metal. `docker stop`
+sends SIGTERM, which drains and checkpoints cleanly.
+
+`linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
+Pin the version tag rather than `:latest` for anything you care about.
+
+To build it yourself instead:
+
+```sh
+cargo build --release
+cp target/release/nuthatch . && docker build -t nuthatch .
+```
 
 ---
 
