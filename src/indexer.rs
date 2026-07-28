@@ -1314,6 +1314,35 @@ fn fetch_logs_splitting<'a>(
     to: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
 {
+    fetch_logs_splitting_inner(source, addresses, topic0s, from, to, true)
+}
+
+/// The body of [`fetch_logs_splitting`], plus whether a *speculative* split is still allowed for an
+/// error we could not classify (RFC-0028 §3b).
+///
+/// Recognising a cap by its message text only works for providers whose phrasing we have already seen -
+/// and that assumption cost us: `arb1.arbitrum.io`, an endpoint we ship as an Arbitrum default, says
+/// `"logs matched by query exceeds limit of 10000"`, which matched none of the markers, so this
+/// function never recursed and a busy Arbitrum backfill retried the same oversized window forever.
+///
+/// The markers are now wider, but the durable fix is not to depend on them alone: when a multi-block
+/// window fails in a way we cannot classify, **try splitting once**. Splitting is safe by construction -
+/// the halves tile the range exactly and rows are keyed by `(block, log_index)` - so the cost of being
+/// wrong is one extra round trip, while the cost of *not* trying is a stalled backfill against any
+/// provider we have not met.
+///
+/// The speculative split is deliberately **not** recursive: `speculative` is cleared for the halves, so
+/// an endpoint that is simply down produces two extra requests rather than an exponential fan-out. A
+/// genuine size failure re-triggers the *classified* path on the halves anyway, which recurses properly.
+fn fetch_logs_splitting_inner<'a>(
+    source: &'a dyn Source,
+    addresses: &'a [String],
+    topic0s: &'a [String],
+    from: u64,
+    to: u64,
+    speculative: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
+{
     Box::pin(async move {
         match source.logs(addresses, topic0s, from, to).await {
             Ok(logs) => Ok(logs),
@@ -1322,10 +1351,38 @@ fn fetch_logs_splitting<'a>(
                     return Err(e).with_context(|| single_block_over_cap(from));
                 }
                 let mid = from + (to - from) / 2;
-                let mut left = fetch_logs_splitting(source, addresses, topic0s, from, mid).await?;
-                let right = fetch_logs_splitting(source, addresses, topic0s, mid + 1, to).await?;
+                let mut left =
+                    fetch_logs_splitting_inner(source, addresses, topic0s, from, mid, true).await?;
+                let right =
+                    fetch_logs_splitting_inner(source, addresses, topic0s, mid + 1, to, true)
+                        .await?;
                 left.extend(right);
                 Ok(left)
+            }
+            // Unclassifiable, but the window spans more than one block and we have a split to spend.
+            Err(e) if speculative && from < to => {
+                let mid = from + (to - from) / 2;
+                tracing::debug!(
+                    "getLogs {from}..={to} failed unclassifiably ({e:#}); trying one speculative split"
+                );
+                let left =
+                    fetch_logs_splitting_inner(source, addresses, topic0s, from, mid, false).await;
+                let right =
+                    fetch_logs_splitting_inner(source, addresses, topic0s, mid + 1, to, false)
+                        .await;
+                match (left, right) {
+                    (Ok(mut l), Ok(r)) => {
+                        tracing::info!(
+                            "getLogs {from}..={to} succeeded when split - the provider was refusing \
+                             the range without saying so; treating it as a cap"
+                        );
+                        l.extend(r);
+                        Ok(l)
+                    }
+                    // The split did not help, so the failure was never about size. Surface the
+                    // *original* error - the halves' errors are the same fault seen twice.
+                    _ => Err(e).with_context(|| format!("getLogs {from}..={to}")),
+                }
             }
             Err(e) => Err(e).with_context(|| format!("getLogs {from}..={to}")),
         }
@@ -3118,6 +3175,108 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("block 42 alone exceeds"), "got: {err}");
+    }
+
+    /// RFC-0028 §3b: a provider that refuses an oversized range **without saying so in words we
+    /// recognise** must still get split.
+    ///
+    /// This is the measured failure: `arb1.arbitrum.io`, which nuthatch ships as an Arbitrum default,
+    /// answers an oversized `getLogs` with `"logs matched by query exceeds limit of 10000"`. Before
+    /// RFC-0028 that matched none of the cap markers, so this function never recursed and a busy
+    /// Arbitrum backfill retried the same window forever. The marker is recognised now - but the
+    /// durable guarantee is that an *unclassifiable* failure is split once anyway, so a provider whose
+    /// phrasing we have never seen still works.
+    #[tokio::test]
+    async fn an_unclassifiable_wide_range_failure_is_split_speculatively() {
+        use crate::rpc::Log;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        /// Refuses ranges wider than `cap` with a message deliberately unlike anything in CAP_MARKERS.
+        struct InscrutableSource {
+            cap: u64,
+            calls: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl Source for InscrutableSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _a: &[String],
+                _t: &[String],
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<Log>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if to - from + 1 > self.cap {
+                    // No "too large", no "response size", no "limit exceeded" - a provider we have
+                    // never met, refusing in its own words.
+                    anyhow::bail!("request rejected by upstream policy engine (code 7)");
+                }
+                Ok((from..=to)
+                    .map(|b| Log {
+                        address: "0xabc".into(),
+                        topics: vec![],
+                        data: "0x".into(),
+                        block_number: b,
+                        block_hash: "0x".into(),
+                        tx_hash: "0x".into(),
+                        log_index: 0,
+                    })
+                    .collect())
+            }
+        }
+
+        // 10 blocks against a 5-block cap: the whole range fails unclassifiably, but each half fits.
+        let src = InscrutableSource {
+            cap: 5,
+            calls: AtomicU64::new(0),
+        };
+        let logs = fetch_logs_splitting(&src, &[], &[], 1, 10)
+            .await
+            .expect("a speculative split must rescue an unclassifiable range failure");
+        assert_eq!(logs.len(), 10, "every log is returned, none dropped");
+
+        // A genuinely dead endpoint must not fan out exponentially: the speculative split is tried
+        // once (1 whole-range attempt + 2 halves), then the original error is surfaced.
+        struct DeadSource {
+            calls: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl Source for DeadSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _a: &[String],
+                _t: &[String],
+                _f: u64,
+                _t2: u64,
+            ) -> Result<Vec<Log>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("connection reset by peer")
+            }
+        }
+        let dead = DeadSource {
+            calls: AtomicU64::new(0),
+        };
+        let err = fetch_logs_splitting(&dead, &[], &[], 1, 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("getLogs 1..=1024"), "got: {err}");
+        assert_eq!(
+            dead.calls.load(Ordering::Relaxed),
+            3,
+            "one whole-range attempt plus one non-recursive split - not an exponential fan-out"
+        );
     }
 
     /// An address-aware mock source: `logs` respects the address filter (empty = all), so a factory
