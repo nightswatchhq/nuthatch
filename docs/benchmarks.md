@@ -1,4 +1,7 @@
-# Backfill benchmarks (RFC-0004)
+# Benchmarks (RFC-0004)
+
+Two harnesses: **backfill** (the write path - this page's main subject) and **query** (the read path,
+[below](#query-benchmarks-the-read-path)).
 
 **House rule:** every performance number nuthatch publishes traces to a `bench-report.json`
 produced by `nuthatch bench backfill` - with date, provider, hardware, and commit. No hand-typed
@@ -94,3 +97,25 @@ flight - bounded by `K` and well within the 256 MB budget.
 
 _Pending - the full W1-W3 × T1-T3 matrix is populated from archive-node runs (needed for the
 historical ranges) and committed as `bench-report.json` artifacts._
+
+## Query benchmarks (the read path)
+
+The backfill harness measures the write path only, which left entity point-read latency and the `/sql`
+scan cost free to regress silently. `nuthatch bench query` is the guard for both. It runs **offline
+against an already-indexed nest** - stop `dev` first, since the bench opens the store directly.
+
+```sh
+nuthatch bench query --dir <nest> [--sql "<query>"] [--reads N] [--iters N] [--out report.json]
+```
+
+Reports:
+
+- **entity point-read p50/p99** - keys sampled evenly across the hot store.
+- **`/sql` query latency p50/p99 and peak RSS** over the hot ∪ cold union. The default query is a
+  `SELECT count(*)` on the largest hot table: deliberately the full-tip-materialising scan, because
+  that is the **#1 RAM risk on a deep-finality L2** and the number most worth watching.
+
+Same house rule as the backfill matrix: numbers come from a committed `bench-report.json` with date,
+provider, hardware and commit, or they are not quoted. Run it before and after any change to the
+serving or storage path - a persistent DuckDB connection, a bounded hot scan, or a compact row format
+would all show up here first.
