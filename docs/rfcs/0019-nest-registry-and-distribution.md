@@ -1,9 +1,14 @@
 # RFC-0019: The nest registry and distribution - publish, pull, private nests
 
 - Status: **Implemented** (2026-07-21) - all three slices: slice 1 (FsStore + publish/load + refs),
-  slice 2 (S3 `ObjectStore` behind `--features object-store`), slice 3 (private nests + auth: 401/403 →
-  a clear "private / credential rejected" message, distinct from "not found"). Live MinIO/S3 integration
-  verification is a VPS run (in-memory + FS paths are unit-covered).
+  slice 2 (S3 `ObjectStore`, which **ships on by default** since 2026-07-28 - it was feature-gated, so
+  no released binary or image actually had it), slice 3 (private nests + auth: 401/403 → a clear
+  "private / credential rejected" message, distinct from "not found").
+  **Live S3 verification done 2026-07-28** against Hetzner Object Storage: a bundle published as
+  `verify@1`, pulled into a *clean* directory, content address matched under `--expect`, and the decode
+  registry reproduced from the inputs. It also found the backend unusable as documented - `AWS_*` env
+  was passed to `parse_url_opts` raw, which matches keys in lower case, so credentials were silently
+  dropped and the client fell through to EC2 instance metadata. Fixed; the acceptance passes.
 - Author: Pete (cargopete)
 - Date: 2026-07-21
 - Depends on: RFC-0012 (content-addressed `.bundle` - the artifact this distributes; identity,
