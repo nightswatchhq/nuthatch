@@ -78,6 +78,16 @@ impl AdaptiveWindow {
 /// for failures this cannot classify (RFC-0028 §3b) - because any design that needs to have seen a
 /// provider's phrasing in advance will keep failing on providers we have not met.
 pub fn is_result_too_large(err: &anyhow::Error) -> bool {
+    // Prefer the structured classification when the error came from `RpcClient`, which inspected the
+    // HTTP status and the JSON-RPC error object rather than a flattened string (RFC-0028 §3e).
+    //
+    // Two independent classifiers that can disagree about the same error is worse than one: which
+    // answer wins would depend on the code path, and the resulting bug would be unreproducible. So the
+    // text matching below is now the *fallback* - for `Source` implementations that are not the RPC
+    // client (the test tapes, the ExEx source) and raise plain `anyhow!` errors.
+    if let Some(class) = crate::rpc::class_of(err) {
+        return matches!(class, crate::rpc::FailureClass::Narrowable { .. });
+    }
     let s = format!("{err:#}").to_ascii_lowercase();
     const CAP_MARKERS: &[&str] = &[
         "response size",            // Alchemy: "Log response size exceeded"
@@ -178,6 +188,40 @@ mod tests {
         // Infura's phrasing, for completeness alongside the two we measured directly.
         assert!(is_result_too_large(&anyhow!(
             "query returned more than 10000 results"
+        )));
+    }
+
+    /// RFC-0028 §3e: when the RPC client has already classified an error properly - from the HTTP
+    /// status and the JSON-RPC error object, not a flattened string - that answer wins.
+    ///
+    /// Two classifiers that can disagree about the same error is worse than one, because which answer
+    /// applies would depend on the code path and the resulting bug would be unreproducible.
+    #[test]
+    fn the_structured_classification_wins_over_text_matching() {
+        // Narrowable by structure, with wording that matches no marker at all.
+        let structured = anyhow::Error::new(crate::rpc::ClassifiedError {
+            class: crate::rpc::FailureClass::Narrowable { suggested: None },
+            detail: "every endpoint rate-limited this request".into(),
+        });
+        assert!(
+            is_result_too_large(&structured),
+            "a structurally-narrowable error must split even when its text matches nothing"
+        );
+
+        // Terminal by structure, with wording that *would* have matched the text fallback. Splitting
+        // an auth failure would be pointless work against an endpoint that will keep refusing.
+        let terminal = anyhow::Error::new(crate::rpc::ClassifiedError {
+            class: crate::rpc::FailureClass::Terminal,
+            detail: "forbidden: response size limit exceeded for your plan".into(),
+        });
+        assert!(
+            !is_result_too_large(&terminal),
+            "structure must override the text fallback, not merely supplement it"
+        );
+
+        // Unclassified errors (test tapes, the ExEx source) still fall back to text matching.
+        assert!(is_result_too_large(&anyhow!(
+            "logs matched by query exceeds limit of 10000"
         )));
     }
 
