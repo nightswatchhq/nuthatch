@@ -226,10 +226,25 @@ impl RpcClient {
     /// the pool, because being offline at startup is a normal condition this indexer tolerates and the
     /// existing health/cooldown machinery already handles it.
     pub async fn verify_chain_ids(&self, expected: u64) -> Result<()> {
-        for (j, url) in self.urls.iter().enumerate() {
+        // Checked CONCURRENTLY, with a short deadline of its own. This runs before the first block is
+        // fetched, so it sits directly on time-to-first-index: done sequentially at the client's 20 s
+        // timeout, a default pool with a couple of dead endpoints (mainnet ships four) delayed the start
+        // of indexing by over a minute - a regression against the "<2 minutes to first indexed query"
+        // promise, and one that only shows up when a public endpoint is having a bad day. Concurrent +
+        // 5 s bounds the whole check at ~5 s no matter how many endpoints are configured or dead.
+        const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let checks = self.urls.iter().enumerate().map(|(j, url)| async move {
             self.requests.fetch_add(1, Ordering::Relaxed);
-            match self.call_one(url, "eth_chainId", &json!([])).await {
-                Ok(v) => {
+            let r = tokio::time::timeout(
+                VERIFY_TIMEOUT,
+                self.call_one(url, "eth_chainId", &json!([])),
+            )
+            .await;
+            (j, url, r)
+        });
+        for (j, url, outcome) in futures::future::join_all(checks).await {
+            match outcome {
+                Ok(Ok(v)) => {
                     let got = parse_hex_u64(v.as_str().unwrap_or_default()).with_context(|| {
                         format!("unparseable eth_chainId from {}", redact_url(url))
                     })?;
@@ -244,11 +259,17 @@ impl RpcClient {
                     }
                     self.mark_healthy(j);
                 }
-                // Unreachable now ≠ wrong chain. Leave it in the pool; failover copes, and it gets
-                // verified the moment it answers a real call with a mismatching block hash.
-                Err(e) => tracing::warn!(
+                // Unreachable or slow now ≠ wrong chain. Leave it in the pool; failover copes, and a
+                // wrong-chain endpoint that was merely late still gets caught the moment it answers a
+                // real call with a mismatching block hash.
+                Ok(Err(e)) => tracing::warn!(
                     "could not verify chain id of {} at startup ({e:#}) - leaving it in the pool",
                     redact_url(url)
+                ),
+                Err(_) => tracing::warn!(
+                    "chain id check for {} timed out after {}s - leaving it in the pool",
+                    redact_url(url),
+                    VERIFY_TIMEOUT.as_secs()
                 ),
             }
         }
@@ -637,6 +658,44 @@ mod tests {
         for h in [h1, h2, h3] {
             h.abort();
         }
+    }
+
+    /// Startup must not be held hostage by a dead endpoint. `verify_chain_ids` runs before the first
+    /// block is fetched, so its cost lands on time-to-first-index; done sequentially at the client's
+    /// 20 s timeout, a default pool with several unreachable endpoints delayed indexing by over a
+    /// minute (measured - it is what made the CI footprint job start failing).
+    ///
+    /// Four black-holed endpoints alongside one good one must still complete in a few seconds.
+    #[tokio::test]
+    async fn verification_is_bounded_even_when_most_endpoints_hang() {
+        let (good, h) = fake_rpc(1).await;
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737): reserved for documentation, routed nowhere, so
+        // connections hang rather than being refused - the case a per-endpoint timeout exists for.
+        let mut urls: Vec<String> = (1..=4)
+            .map(|i| format!("http://203.0.113.{i}:8545/"))
+            .collect();
+        urls.push(good);
+        let c = RpcClient::new(urls).unwrap();
+
+        let started = std::time::Instant::now();
+        let r =
+            tokio::time::timeout(std::time::Duration::from_secs(20), c.verify_chain_ids(1)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            r.is_ok(),
+            "verification must not hang past its own deadline"
+        );
+        assert!(
+            r.unwrap().is_ok(),
+            "unreachable endpoints must not fail startup"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "four hanging endpoints took {elapsed:?} - the checks are not concurrent/bounded, and \
+             that time is paid before a single block is indexed"
+        );
+        h.abort();
     }
 
     /// Offline is not the same as wrong. Nuthatch tolerates an endpoint being down at startup (the
