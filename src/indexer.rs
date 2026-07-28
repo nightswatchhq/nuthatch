@@ -703,6 +703,21 @@ impl Supervisor {
         );
     }
 
+    /// Admit a newly-mounted nest to the working set (RFC-0027 §3), returning its index.
+    ///
+    /// `prepared` is set: the nest was `prepare`d by the driver before being sent, so it already has a
+    /// valid cursor. Marking it unprepared would make the loop re-`prepare` it and, worse, treat its
+    /// `nexts` entry as "unknown" - which the cursor reads as genesis and would drag every co-tenant
+    /// back with it (the trap RFC-0026 §3.1 documents).
+    fn admit(&mut self, name: &str) -> usize {
+        self.names.push(name.to_string());
+        self.states.push(NestState::Live);
+        self.attempts.push(0);
+        self.prepared.push(true);
+        self.health.mark_indexing(name);
+        self.names.len() - 1
+    }
+
     /// The index of a nest by name, for a lifecycle command naming one.
     fn index_of(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|n| n == name)
@@ -785,7 +800,8 @@ fn fan_out_rollback(
 fn drain_lifecycle(
     lifecycle: &mut Option<CursorCommands>,
     sup: &mut Supervisor,
-    nests: &mut [Option<NestIngest>],
+    nests: &mut Vec<Option<NestIngest>>,
+    nexts: &mut Vec<u64>,
 ) {
     let Some(rx) = lifecycle.as_mut() else {
         return;
@@ -812,6 +828,24 @@ fn drain_lifecycle(
                     let _ = ack.send(());
                 }
             }
+            CursorCommand::Mount { nest, next, ack } => {
+                let name = nest.name.clone();
+                if sup.index_of(&name).is_some() {
+                    // Mounting over a live name is an upgrade, and that is RFC-0020's job. Refusing
+                    // here keeps the two from silently overlapping.
+                    tracing::warn!("nest '{name}' is already on this cursor; ignoring the mount");
+                } else {
+                    // The three arrays stay index-aligned - that invariant is what `live_nest`'s
+                    // `expect` relies on, so they are grown together and never separately.
+                    nests.push(Some(*nest));
+                    nexts.push(next);
+                    sup.admit(&name);
+                    tracing::info!("nest '{name}' mounted onto this cursor at block {next}");
+                }
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
         }
     }
 }
@@ -824,8 +858,7 @@ fn drain_lifecycle(
 /// one of them. Mutating the set underneath that would produce a rollback applied to a nest that was
 /// not present for the roll forward.
 // Not `Clone`/`Eq`: the acknowledgement is a `oneshot::Sender`, which is neither - and should not be.
-// An unmount is consumed exactly once, by exactly one cursor.
-#[derive(Debug)]
+// A lifecycle command is consumed exactly once, by exactly one cursor.
 pub enum CursorCommand {
     /// Retire a nest from this cursor's working set at the operator's request, then **release
     /// everything the cursor holds for it** - its store handle above all.
@@ -842,6 +875,20 @@ pub enum CursorCommand {
         name: String,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Admit a nest to this cursor's working set, already prepared and caught up.
+    ///
+    /// The catch-up happens **before** the command is sent (RFC-0027 §4, phase 1): the driver builds
+    /// and `prepare`s the nest off to one side, so what arrives here is a nest whose cursor is already
+    /// near the shared one. That matters because the cursor advances from the *min* of its live nests -
+    /// splicing in a nest that is a million blocks behind would drag every co-tenant back through
+    /// history with it. Correct, but unusable, which is why phase 1 exists.
+    ///
+    /// `next` is the block the nest resumes at, from its own `prepare`.
+    Mount {
+        nest: Box<NestIngest>,
+        next: u64,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    },
 }
 
 impl CursorCommand {
@@ -851,6 +898,20 @@ impl CursorCommand {
         CursorCommand::Unmount {
             name: name.into(),
             ack: None,
+        }
+    }
+}
+
+// Hand-written rather than derived: a mount carries a whole `NestIngest` (stores, decode registry,
+// view handles), and printing that in a log line would be both enormous and useless. The name is the
+// part anyone debugging a lifecycle command actually wants.
+impl std::fmt::Debug for CursorCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CursorCommand::Unmount { name, .. } => write!(f, "Unmount({name})"),
+            CursorCommand::Mount { nest, next, .. } => {
+                write!(f, "Mount({} at {next})", nest.name)
+            }
         }
     }
 }
@@ -906,7 +967,7 @@ async fn roost_index_loop(
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
         // windows" holds (RFC-0027 §2).
-        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         if sup.all_retired() {
             // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
             // so this returns cleanly rather than bailing, and the roost stays up (RFC-0027 §6).
@@ -1958,7 +2019,7 @@ pub async fn backfill_direct_factory(
 /// argument list so a later change can drive many nests from one cursor (RFC-0012). This is a pure
 /// mechanical grouping - the loop's behaviour is unchanged. The `Source` is deliberately NOT a field:
 /// it is shared (`Arc<dyn Source>`) and stays borrowed into the two methods below.
-struct NestIngest {
+pub struct NestIngest {
     /// The nest's configured name - the label a quarantine is reported under (RFC-0026 §5) and the
     /// key its metrics are already registered by.
     name: String,
@@ -4218,23 +4279,77 @@ template = "pool"
         // lengths must still line up - `drain_lifecycle` indexes by supervisor index deliberately, so
         // a mismatch is a bug rather than something to tolerate.
         let mut nests: Vec<Option<NestIngest>> = vec![None, None];
+        let mut nexts: Vec<u64> = vec![0, 0];
 
         tx.send(CursorCommand::unmount("nest0")).unwrap();
         tx.send(CursorCommand::unmount("not-on-this-cursor"))
             .unwrap();
-        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
 
         assert_eq!(sup.live(), vec![1], "the named nest retired");
         assert!(matches!(sup.states[0], NestState::Retired));
 
         // Idempotent: unmounting twice is not an error, and does not double-count anything.
         tx.send(CursorCommand::unmount("nest0")).unwrap();
-        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         assert_eq!(sup.live(), vec![1]);
 
         // No channel at all (today's `spawn_roost`) is simply a no-op.
         let mut none = None;
-        drain_lifecycle(&mut none, &mut sup, &mut nests);
+        drain_lifecycle(&mut none, &mut sup, &mut nests, &mut nexts);
+        assert_eq!(sup.live(), vec![1]);
+    }
+
+    /// RFC-0027 §3: admitting a nest grows the working set and the parallel arrays **together**.
+    ///
+    /// The index alignment between `names`/`states`/`attempts`/`prepared` and the loop's
+    /// `nests`/`nexts` is what `live_nest`'s `expect` rests on, so a mount that grew one and not the
+    /// others would turn a lifecycle operation into a panic - or worse, into a nest indexing under
+    /// another nest's identity.
+    #[test]
+    fn admitting_a_nest_extends_the_working_set_in_step() {
+        let mut sup = test_supervisor(1);
+        let i = sup.admit("late-arrival");
+
+        assert_eq!(i, 1, "admitted at the next index");
+        assert_eq!(sup.live(), vec![0, 1], "it drives the cursor immediately");
+        assert_eq!(sup.names.len(), 2);
+        assert_eq!(sup.states.len(), 2);
+        assert_eq!(sup.attempts.len(), 2);
+        assert_eq!(sup.prepared.len(), 2);
+        assert!(
+            sup.prepared[i],
+            "a mounted nest arrives already prepared - marking it unprepared would make the cursor \
+             treat its `next` as unknown, i.e. genesis, and drag every co-tenant back with it"
+        );
+        assert_eq!(sup.index_of("late-arrival"), Some(1));
+    }
+
+    /// A mount is applied at a window boundary like any other command, keeps the arrays in step, and
+    /// refuses to mount over a name already on the cursor - that case is an *upgrade* (RFC-0020), and
+    /// letting the two silently overlap would leave two nests writing one store.
+    #[test]
+    fn mounting_over_an_existing_name_is_refused() {
+        let mut sup = test_supervisor(2);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None, None];
+        let mut nexts: Vec<u64> = vec![10, 20];
+
+        // `nest0` is already mounted, so this must be ignored rather than duplicating the entry.
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Unmount {
+            name: "nest0".into(),
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+        assert!(ack_rx.try_recv().is_ok(), "the unmount was acknowledged");
+
+        // Arrays stayed in step through the retirement.
+        assert_eq!(nests.len(), 2);
+        assert_eq!(nexts.len(), 2);
+        assert_eq!(sup.names.len(), 2);
         assert_eq!(sup.live(), vec![1]);
     }
 
