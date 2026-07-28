@@ -7,7 +7,7 @@ see **[backlog.md](../backlog.md)**. For the bar a release must clear before it'
 workload unattended, see the **[production-readiness checklist](../prod-readiness.md)**.
 RFCs **0019-0023** derive from the **[Jul-Aug 2026 roadmap](../high-level-roadmap-jul-aug-2026.md)**
 (strategy agreed 2026-07-21); their decisions log is the authority for the choices they encode.
-Statuses last reconciled against the [progress log](../progress-log.md) on 2026-07-21.
+Statuses last reconciled against the [progress log](../progress-log.md) on 2026-07-28.
 
 | RFC | Title | Depends on | Status |
 |-----|-------|-----------|--------|
@@ -37,6 +37,7 @@ Statuses last reconciled against the [progress log](../progress-log.md) on 2026-
 | [0024](0024-eth-call-execution-engine.md) | The eth_call execution engine - a demand-driven state cache, not an archive node | 0023, 0001, 0013 §3, 0009 | **Draft** (2026-07-22) - the engine RFC-0023 §3/§4 deferred; **accepted design, deferred build** (build derive-first + a simple RPC tier-3 first; revm engine only if the residue is large / archive-RPC-free operation is demanded / 0003 lands) |
 | [0025](0025-adaptive-mcp-tool-advertisement.md) | Adaptive MCP tool advertisement - advertise only the tools a nest can answer | 0016, 0008, 0001 | **Implemented** (2026-07-22) - issue #137 gap 3; `GET /shape` + bridge filtering of `tools/list`/`prompts/list`, fail-open on probe failure |
 | [0026](0026-fault-quarantine-and-partial-health.md) | Fault quarantine and partial health - a roost survives its sick nests | 0012, 0021 | **Implemented** (2026-07-27) - issue #147, the blast-radius conformance gap; all 3 slices: fault taxonomy (nest vs cursor, retryable vs terminal), quarantine + backoff re-admission, live `/nests` health, roost-root `/ready`, per-nest `/ready`, health metrics, `--fail-fast`. A nest's error no longer kills its cursor and a cursor's death no longer kills the roost - **#147 closed** |
+| [0027](0027-the-live-roost.md) | The live roost - mounting and unmounting nests without a restart | 0012, 0021, 0026, 0019, 0020 | **Draft** (2026-07-28) - a roost's nest set is frozen at boot, so onboarding one tenant's nest restarts every co-tenant's. Settles admission + the per-cursor budget check, the two-phase catch-up join, the control surface (admin API + CLI + `roost.toml` as desired state), and drain-not-kill unmount. Amends RFC-0026 §6 (a cursor retired by an operator is not a failure). **The embedded half of RFC-0022 §3** - proves the lifecycle semantics without waiting on Postgres |
 
 ## Conventions
 

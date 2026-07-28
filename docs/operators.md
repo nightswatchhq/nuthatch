@@ -1,99 +1,45 @@
 # Running nuthatch as an operator
 
+Everything needed to run nuthatch on your own infrastructure, or on someone else's behalf: how to
+deploy it, what it demands of you, how it fails, what to scrape, what to back up, and where it is
+still honestly unfinished.
+
+**Two audiences, one document.** If you are putting nuthatch on a box, start at
+[Deploy recipes](#deploy-recipes). If you are a platform team deciding whether to adopt it, read
+[The division of labour](#the-division-of-labour), [Known gaps](#known-gaps), and the
+[Go-live checklist](#go-live-checklist) first.
+
+**Companions:** [`prod-readiness.md`](prod-readiness.md) is the *release* gate - what must be true
+before a build ships. This document is the *run* guide - what must be true in your environment.
+[`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
+
+Written against **0.6.1** (2026-07-28). Read [Known gaps](#known-gaps) before exposing `/sql`.
+
+---
+
+## The division of labour
+
 nuthatch is built to be **fronted**, not exposed raw. The dividing line, stated once and kept:
-**gateways, authentication, metering, and multi-tenancy are the operator's layer**; nuthatch ships
-the *guards* and *signals* that make fronting it safe and billable. The binary has no accounts, no
-tenancy, and phones home to nobody - that stays true.
 
-## Bind posture
+> **The node owns resource safety. The gateway owns access policy.**
 
-The API defaults to `127.0.0.1:8288`. Bind it elsewhere with `--listen`. When bound off-localhost,
-startup logs a loud warning: the `/sql` surface is guarded but **not authenticated** - the operator's
-gateway decides *who* may query; the guards below bound only *how much*. Never expose `/sql` straight
-to the internet.
+**nuthatch provides:** deterministic indexing, isolated per-nest storage, a bounded query surface,
+per-nest health and metrics, and signals rich enough to alert, capacity-plan, and bill against.
 
-## Query guards (`/sql`)
+**Your platform provides:** identity, authentication, authorisation, per-caller rate limits, quotas,
+metering, billing, and TLS. There are no accounts and no tenancy inside the binary, and there will not
+be: `CLAUDE.md` puts hosted-SaaS multi-tenancy out of scope permanently.
 
-Node self-protection against any single query or a burst - not per-caller quotas (that needs identity
-a single-tenant node doesn't have; it's the gateway's job). Current defaults:
+**What it never does:** phone home. No telemetry, no mandatory API tokens, no gated data service.
+Every outbound connection is one you configured - your RPC endpoints, your webhook sinks, and (only
+when you run them by hand) the ABI resolvers and sanctions-list fetchers.
 
-| Guard | Default | What it bounds |
-|---|---|---|
-| statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
-| max result rows | 50,000 | the Rust-side result buffer (outside DuckDB's own memory limit) |
-| max concurrent queries | 2 | the real DoS multiplier - a semaphore; excess returns `503` |
-| max query length | 16 KiB | rejects absurd query strings before the planner |
+---
 
-Rejections are surfaced as HTTP errors (`400`/`503`) and counted in `/metrics`
-(`nuthatch_sql_rejections_total`).
-
-## Metrics (`/metrics`)
-
-Prometheus text exposition - the endpoint to scrape, alert, and bill against. Key series:
-
-- `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` - is it keeping up?
-- `nuthatch_sealed_through` - cold-layer watermark.
-- `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total` - ingestion.
-- `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total`,
-  `nuthatch_rpc_requests_total` - serving + upstream.
-- `nuthatch_rss_bytes` - process memory (the footprint you provision against).
-
-`/metrics` and `/health` are unauthenticated by design; scope them to your internal network at the
-gateway if you don't want them public.
-
-## Lifecycle
-
-- **SIGTERM / SIGINT** (systemd, `docker stop`, Ctrl-C): the API drains in-flight requests and exits
-  **0**; the ingest task's progress is checkpointed, so a restart resumes without gaps or duplicates
-  (rows are keyed by `(block, log_index)` - idempotent).
-- Data lives under the nest directory (`nuthatch.redb`, `segments/`). Back up the directory; sealed
-  segments are content-addressed and safe to copy while running.
-
-## Roosts (many nests, one runtime)
-
-One process can host **many nests on the same chain** - a *roost* - sharing a single cursor, one chain
-read, and one API, instead of a process per nest. Different chains still mean a process each (a second
-chain is a second cursor). See [`examples/roost/`](../examples/roost) for a runnable two-nest example.
-
-```
-roost/
-  roost.toml
-  nests/
-    lodestar/      # a nest dir, exactly as `nuthatch init` produces
-    uniswap-v3/
-```
-
-```toml
-[roost]
-name = "arb-roost"
-chain = "arbitrum-one"
-chain_id = 42161
-rpc_urls = ["https://arb1.example"]   # the roost owns the chain connection
-nests = ["lodestar", "uniswap-v3"]    # dir names under nests/
-# max_rss_mb = 2048                    # per-runtime RSS ceiling; a mount projected over it is refused
-```
-
-Run it with `nuthatch roost dev --dir roost/ --listen …`. Every nest's `[nest].chain`/`chain_id` must
-match the roost's - a mismatch is refused at startup (a different chain needs its own roost).
-
-- **Serving.** `GET /nests` is the roster (each nest's name, chain, registry hash, table count,
-  `estimated_rss_mb`; plus the roost's `projected_rss_mb`, `max_rss_mb`, and real `rss_bytes`). Every
-  nest's full API lives under its prefix - `/<name>/tables`, `/<name>/sql`, `/<name>/_admin/`, … `/sql`
-  stays **per-nest scoped**: a query sees one nest's data.
-- **Isolation.** Stores are per-nest (each keeps its own `nuthatch.redb` + `segments/` under
-  `nests/<name>/`); only the cursor is shared. A bad view or runaway factory in one nest can't touch
-  another's data. A reorg is detected once and rolled back across every nest.
-- **Footprint.** The budget is per-*runtime*, not per-nest. `roost dev` projects RSS before starting
-  and refuses a mount over `max_rss_mb` (default 2 GB). The projection is a rough estimate; `GET /nests`
-  reports the real `rss_bytes` beside it - provision against the measurement. (A two-nest ERC-20 roost
-  measures ~110 MB resident against a ~300 MB projection.)
-- **Mixed nests.** Static and factory nests co-exist in one roost; nests may mount at different heights
-  and each backfills its own history - the cursor only couples them at the tip.
-
-## Deploy recipes (copy-paste)
+## Deploy recipes
 
 `nuthatch dev` **is** the serve command - it backfills, follows the tip, and serves the API in one
-process. "I tried it locally" → "it's running on my box" is just running that under a supervisor.
+process. "I tried it locally" to "it's running on my box" is just running that under a supervisor.
 
 ### systemd
 
@@ -130,7 +76,6 @@ journalctl -u nuthatch -f          # a clean progress line during backfill, then
 No image is published yet; build the binary into a slim runtime and mount the nest directory:
 
 ```dockerfile
-# Dockerfile
 FROM rust:1.85 AS build
 WORKDIR /src
 COPY . .
@@ -151,8 +96,391 @@ docker run -d --name nuthatch --restart unless-stopped \
 ```
 
 Bind `0.0.0.0` **inside** the container but publish only to `127.0.0.1` on the host, and put a reverse
-proxy (TLS + auth) in front - same posture as the bare-metal case. `docker stop` sends SIGTERM, which
-drains and checkpoints cleanly (see Lifecycle).
+proxy (TLS + auth) in front. `docker stop` sends SIGTERM, which drains and checkpoints cleanly.
+
+---
+
+## Deployment model
+
+One static binary. No Postgres, no Docker daemon, no IPFS, no sidecar. State is a directory.
+
+| Topology | Command | Shape |
+|---|---|---|
+| **Nest** (one indexer) | `nuthatch dev --dir <nest>` | one chain, one cursor, one API at `/` |
+| **Roost** (many nests) | `nuthatch roost dev --dir <roost>` | N nests across one **or more** chains, one isolated cursor per chain, each nest's full API under `/<name>/` |
+
+A **cursor** is the unit that matters. It is always single-chain, single-writer, and one observable
+failure boundary. A roost hosting nests on Ethereum and Arbitrum runs two cursors in one process, each
+with its own tip, finality view, reorg handling, and RSS budget. Two chains are never multiplexed
+behind one cursor; the runtime refuses to.
+
+Multichain is a **capability, not a mandate** - one chain per roost stays valid and is the simplest
+default.
+
+```
+roost/
+  roost.toml              # desired state: chains + mounted nest names + budget
+  nests/
+    lodestar/             # a nest dir exactly as `nuthatch init` produces
+      nuthatch.toml       # contracts, events, factories, webhooks, alerts
+      semantic.toml       # what the data means (drives MCP + SQL hints)
+      schema.json         # generated: registry hash + table list
+      abis/               # vendored ABIs (no runtime resolution)
+      views/              # authored SQL views
+      checks/             # invariant/parity checks for `nuthatch check`
+      nuthatch.redb       # hot store (mutable, reorg-affected)
+      segments/           # sealed Parquet, content-addressed, immutable
+      manifest.json       # segment catalogue + sealed watermark
+```
+
+The nest directory is the *entire* state. Move it, copy it, snapshot it.
+
+**Serving in a roost.** `GET /nests` is the roster. Every nest's full API lives under its prefix:
+`/<name>/tables`, `/<name>/sql`, `/<name>/_admin/`. `/sql` stays per-nest scoped - a query sees one
+nest's data. Stores are per-nest; only the cursor is shared. Static and factory nests co-exist, may
+mount at different heights, and each backfills its own history; the cursor only couples them at tip.
+
+Nests live in their own repositories rather than in-tree; see the
+[nest catalogue](nest-catalogue.md) for what ships and what is planned.
+
+> **Scaled mode does not exist yet.** The docker-compose topology with Postgres and DataFusion
+> federation (RFC-0013, RFC-0022) is designed and not built. Today, horizontal scale means more
+> processes on more boxes, each owning its own nests.
+
+---
+
+## Capacity and sizing
+
+**The budget is per active-chain cursor: 2 GB RAM.** A roost's total is the sum of its cursors. This
+is a CI-enforced ceiling, not an aspiration, and `roost dev` **refuses to start** a cursor whose
+projected footprint exceeds `max_rss_mb` (default 2048).
+
+The projection model (deliberately rough):
+
+| Component | MB |
+|---|---|
+| runtime base, paid once per process | 120 |
+| each nest: hot store + decode registry + balance view | 90 |
+| each additional IVM view (exposure, velocity) or factory child registry | 40 |
+
+**Measured reality is far below the projection.** A single-chain ERC-20 nest at tip measures ~37 MB
+resident; a two-nest roost measures ~110 MB against a ~300 MB projection. Provision against the
+measurement (`nuthatch_rss_bytes`, also reported as `rss_bytes` on `GET /nests`) and treat the
+projection as a guard rail rather than a sizing tool.
+
+**What actually drives memory:**
+
+- **Deep-finality chains.** The hot store holds everything between the sealed watermark and the tip.
+- **`/sql` on a hot table.** The current query path materialises the whole tip per query. The single
+  largest RAM risk on a busy nest (see [Known gaps](#known-gaps)).
+- **Factory nests.** A template with many discovered children carries a larger child registry.
+
+**Measure before committing.** `nuthatch bench backfill` reports events/sec, wall clock and peak RSS
+over a pinned range; `nuthatch bench query` reports entity point-read p50/p99 plus the `/sql` hot-scan
+cost and RSS. Run both against a representative nest on your hardware and your RPC before sizing a
+fleet.
+
+**Disk.** Sealed Parquet is Snappy-compressed and content-addressed. Growth is proportional to decoded
+events, not chain history: a nest tracking a few events on a few contracts stays small.
+
+---
+
+## Configuration surface
+
+**Files:** `roost.toml` (chains, mounted nests, budget), `nuthatch.toml` per nest (contracts, events,
+factories, screening, flags, webhooks, alerts), `semantic.toml` per nest (descriptions for the AI and
+SQL surfaces). Full key reference:
+[`config-reference.md`](../skills/nuthatch-builder/config-reference.md).
+
+**Environment:**
+
+| Variable | Purpose |
+|---|---|
+| `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
+
+**Runtime flags that matter operationally** (`dev` and `roost dev`):
+
+| Flag | Use |
+|---|---|
+| `--listen` | bind address. Defaults to `127.0.0.1:8288` |
+| `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain roosts only (ambiguous once a roost spans chains) |
+| `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Much faster from deployment |
+| `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
+| `--window` | override the `eth_getLogs` block window. A *sparse* contract wants a large window (50k) to turn thousands of near-empty requests into a few. Keep under your provider's range cap |
+| `--backfill N` | index only the last N blocks (recent-history mode) |
+| `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
+| `--fail-fast` | exit on first fault instead of quarantining. For CI and operators who prefer fail-stop |
+
+**Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
+(RFC-0019 §4) is that secrets never go into a published bundle. Per-nest secret injection at mount
+time is designed (RFC-0022 §5) and not built. Until then: keep private endpoints in the on-disk
+config, keep the directory `0700` and owned by the service user, and never publish a bundle built from
+a config carrying a credential.
+
+---
+
+## The service surface
+
+Per-nest routes. In a roost they are prefixed: `/<name>/sql`, `/<name>/tables`, and so on.
+
+| Route | Purpose |
+|---|---|
+| `GET /` | summary: nest identity, heights, table count |
+| `GET /health` | liveness. `200 "ok"` while the process serves |
+| `GET /ready` | readiness. Per-nest: `503` if *that* nest is quarantined |
+| `GET /metrics` | Prometheus text exposition |
+| `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold |
+| `GET /schema` | the full data model |
+| `GET /sql?q=…` | read-only analytical SQL over hot and sealed data |
+| `GET /explain` | query plan and cost hints |
+| `GET /entities`, `GET /entity/{id}` | entity point-reads, transparently across the hot/cold seam |
+| `GET /balances`, `GET /balance/{address}` | the derived IVM balance view |
+| `GET /exposure/{address}`, `GET /flags` | compliance surfaces (RFC-0008) |
+| `GET /nest` | nest identity and registry hash |
+| `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
+| `GET /_admin/`, `/_admin/events` | admin UI. Token-gated off-localhost; removable with `--no-admin` |
+
+**Roost root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (roost-wide),
+`GET /health`.
+
+---
+
+## Security posture
+
+**Bind localhost and front it.** The API defaults to `127.0.0.1:8288`. `/sql` is guarded but **not
+authenticated** - the guards below bound *how much*, never *who*. Off-localhost binds log a loud
+warning at startup. Put TLS and authentication in front, always.
+
+**Query guards** - node self-protection against a single runaway query or a burst, not per-caller
+quotas (that needs identity a single-tenant node does not have):
+
+| Guard | Default | What it bounds |
+|---|---|---|
+| statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
+| max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
+| max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503` |
+| max query length | 16 KiB | rejects absurd query strings before the planner |
+
+`/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
+and network table functions are refused, and `;`-stacking a second statement is rejected outright.
+Rejections surface as `400`/`503` and count in `nuthatch_sql_rejections_total`.
+
+**Admin surface.** Off-localhost the admin UI requires `NUTHATCH_ADMIN_TOKEN` on every request; token
+comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
+
+**`/metrics` and `/health` are unauthenticated by design.** Scope them to your internal network at the
+gateway if you do not want them public.
+
+**Run it unprivileged.** A dedicated service user, `0700` on the nest directory, `MemoryMax` set to
+the cursor budget. The binary needs outbound network to your RPC endpoints and webhook sinks, nothing
+else.
+
+**Supply chain.** Nest bundles are content-addressed; `nest load` verifies the manifest format, every
+file's hash, and that the decode registry regenerated from the inputs matches the manifest. A nest
+that does not reproduce its own decode registry is refused. Compliance packs are ed25519-signed
+(`nuthatch pack keygen|build|verify`). AGPL-3.0 core; `cargo-deny` runs in CI.
+
+---
+
+## Observability
+
+### Metrics
+
+Global series (whole process):
+
+| Series | Meaning |
+|---|---|
+| `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
+| `nuthatch_sealed_through` | cold-layer watermark |
+| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total` | ingestion |
+| `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
+| `nuthatch_rpc_requests_total` | upstream load |
+| `nuthatch_rss_bytes` | process memory: the number to provision against |
+| `nuthatch_last_poll_unixtime` | liveness of the ingest loop itself |
+| `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
+
+Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operable:
+`nuthatch_nest_last_block`, `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
+`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_health` (1 indexing /
+0 quarantined), `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
+
+Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,
+`nuthatch_transform_effectful`.
+
+### What to alert on
+
+| Alert | Condition | Why |
+|---|---|---|
+| **Nest quarantined** | `nuthatch_nest_health == 0` | something is broken and a human should look |
+| **Cursor dead** | `nuthatch_cursor_live == 0` | a whole chain stopped advancing |
+| **Tip lag growing** | `nuthatch_tip_lag_blocks` trending up over 15m | RPC trouble or an overloaded box |
+| **Ingest stalled** | `time() - nuthatch_last_poll_unixtime > 300` | the loop is wedged even if the process is alive |
+| **Outbox backing up** | `nuthatch_alert_outbox_depth` rising | a webhook sink is down or slow |
+| **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
+| **Query rejections spiking** | `rate(nuthatch_sql_rejections_total)` | a caller hammering the guards; a gateway job |
+| **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
+
+### Health versus readiness
+
+Get this right in your supervisor and your load balancer:
+
+- **`/health`** is liveness. `200` while the process serves. Restart on failure.
+- **`/ready`** is readiness. Roost root: `200` only when **every** cursor and nest is indexing; `503`
+  with a body naming what is quarantined. Per-nest `/<name>/ready` answers only for that nest.
+
+Readiness is **advice to a supervisor, not a traffic gate**. A roost with one quarantined nest reports
+`503` at the root while its healthy nests keep serving correct data on their own prefixes. Wire root
+readiness to a load balancer and one sick tenant evicts every healthy tenant from rotation. **Route on
+per-nest `/<name>/ready`; page on the root.**
+
+### Logs
+
+Structured `tracing` to stdout. Quarantine and re-admission are `warn!` with nest, chain, fault class
+and the full error chain. Off-localhost binds warn at startup. Backfill prints a progress line; tip
+following is quiet.
+
+---
+
+## The failure model
+
+**The unit that fails alone:**
+
+| Fault | Blast radius |
+|---|---|
+| One nest's decode, store, seal, view or webhook error | that nest is quarantined; siblings on the same cursor keep indexing |
+| One nest's finality violation (reorg below its sealed watermark) | that nest; terminal |
+| A cursor's unrecoverable error | that chain's cursor and its nests; other chains' cursors keep running |
+| RPC endpoint failure | none. Round-robin failover; the dead endpoint is cooled down |
+| Transient RPC errors, tip fetch failures | none. Retried with escalating stall warnings |
+
+**Retry policy.** Retryable faults back off exponentially from 5s, doubling, capped at 5 minutes,
+unbounded attempts - so restarting a wedged RPC provider recovers within minutes without anyone
+typing anything. Terminal faults do not retry and stay quarantined until restart, with the reason on
+`/nests`.
+
+**Re-admission is safe by construction.** A re-admitted nest rejoins behind its siblings, pulls the
+cursor's window position back, and siblings skip windows they already committed. No nest re-processes
+or skips a window. The cost is a re-fetch of the intervening range, which is why the backoff cap is
+minutes rather than seconds.
+
+**The process exits in exactly three cases:** the server stops (bind failure or shutdown signal);
+every cursor has been quarantined (nothing will advance again, so dying honestly under a supervisor
+beats serving frozen data); or `--fail-fast` is set and anything faults. Otherwise it stays up and
+degrades.
+
+**Reorgs** only ever touch the hot store, and only that of the affected chain's cursor. Sealed
+segments are written strictly past finality and are immutable, so the columnar layer never rewinds. A
+reorg deeper than the sealed watermark is a terminal fault by design: finality was violated, and
+silently rewriting sealed history would be worse than stopping.
+
+**Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
+checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
+duplicates.
+
+---
+
+## Runbook
+
+| Symptom | First checks | Action |
+|---|---|---|
+| Root `/ready` is 503 | `GET /nests` - which nest, what `quarantine.reason`, what `class` | retryable: watch for auto re-admission. terminal: fix the cause, restart |
+| Tip lag climbing | `nuthatch_rpc_requests_total` rate, provider status | add or replace endpoints in `rpc_urls`; lower `--concurrency` if rate limited |
+| A nest stuck at a block | its `quarantine.reason` on `/nests`; logs | a `getLogs` provider cap on a busy template usually wants a smaller `--window` |
+| RSS approaching the ceiling | which nest, via `nuthatch_nest_*`; recent `/sql` traffic | the hot-scan is the usual cause. Restrict `/sql` at the gateway, or move the nest to its own cursor |
+| Backfill crawling | `--window` versus contract sparsity; `--concurrency` | a sparse contract wants a *large* window; a dense one wants concurrency against your own node |
+| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | delivery is sequential today; one slow sink throttles others |
+| Chain-id mismatch at startup | the startup error names the endpoint | an endpoint in the pool is on the wrong network. Every endpoint is verified at boot, on purpose |
+| Suspect data | `nuthatch check --dir <nest>` | runs the nest's committed invariant and parity checks against recorded fixtures |
+| Need to prove a compliance result | `nuthatch audit replay --from --to` | re-runs screening over sealed segments and confirms stored hits reproduce exactly |
+
+---
+
+## Data lifecycle
+
+**Backup.** The nest directory is the whole state. Sealed segments are content-addressed and
+immutable, so they are safe to copy while the process runs. The hot store (`nuthatch.redb`) is a live
+redb file: snapshot it at the filesystem level, or stop the process for a consistent copy. Losing the
+hot store costs a re-index of the unsealed window, not history.
+
+**Restore.** Put the directory back and start. Progress resumes from the checkpoint.
+
+**Segment identity across versions.** A segment's hash covers the Parquet file bytes, which include
+the `created_by` string stamped by the arrow-rs build. Same binary means identical bytes and identical
+hashes, so re-running a backfill or running the same release on two boxes produces byte-identical,
+de-duplicating segments. **Across nuthatch versions built on different arrow-rs releases, segment
+identity may differ** even when every decoded row is identical. Do not use a segment hash as a
+cross-version equality proof; compare decoded rows for that.
+
+**Consistency: entity reads versus derived views.** The entity store and the derived (IVM) views
+advance independently, so **a read taken during a reorg window can see transient skew between them**:
+`/balances` (a view) and `/sql` (over stored rows) may briefly disagree about the same block. Both
+converge within a tick; neither is wrong in isolation. This matters if you **join across the two
+surfaces**, because the halves may have been taken either side of a rollback. If that skew would be
+visible to your users:
+
+- prefer a **single surface** per answer (each is individually consistent), or
+- pin the read at or below `sealed_through` (reported on `/ready` and in `/sql` responses' `provenance`
+  block) - sealed data is past finality and never moves.
+
+Tip-following data is inherently provisional; this is the same caveat any indexer carries at the tip,
+stated explicitly rather than left to be discovered.
+
+**Binary upgrades.** Proven in production: a nest upgrade from 0.3.0 to 0.6.0 was a binary swap and a
+restart, with no data migration and no flag changes. Within 0.x the target is in-place-safe upgrades,
+and each release's notes state "in-place safe" or "reseal required" explicitly.
+
+---
+
+## Nest lifecycle operations
+
+The deploy unit is a **content-addressed bundle**: config, ABIs, views, labels and skills, plus a
+manifest pinning the expected decode-registry hash.
+
+```sh
+nuthatch nest bundle <dir>                        # produce a .bundle, prints its content address
+nuthatch nest publish <bundle> --registry <ref>   # publish as name@version, advance latest
+nuthatch nest load <ref> --registry <ref>         # pull and install, hash-verified
+nuthatch nest load <bundle|url|dir> --expect <h>  # or install directly, asserting the hash
+```
+
+The registry is **decoupled** from the binary: a filesystem path or S3-compatible object storage, with
+private-nest authentication. nuthatch pulls; it never becomes the registry, and resolution stays
+local-first. (Live S3 verification against a real bucket is still pending an operator run.)
+
+**Upgrading a nest without the resync tax** (RFC-0020):
+
+```sh
+nuthatch nest diff <old> <new>     # classify: compatible (additive only) or breaking
+nuthatch nest upgrade --dir <old> --to <new> --listen …
+```
+
+- **Compatible** (internal changes, or purely additive schema): the new version indexes alongside the
+  old, then the endpoint atomically flips. The served address never changes and consumers notice
+  nothing. When the decode registry is unchanged, the old version's sealed segments are **reused**
+  rather than re-indexed, so a view-only or semantic-only change costs no backfill at all.
+- **Breaking** (anything a consumer observes as removed, renamed, retyped or semantically changed):
+  both versions run. The old stays at the root carrying a `Deprecation: true` header and a `Link` to
+  its successor; the new is served under `--new-endpoint` (default `/next`). Consumers migrate on
+  their own clock.
+
+**Adding or removing a nest in a running roost currently requires a restart**, which stops every
+co-tenant nest in that runtime. This is the largest operational gap for a team onboarding nests on
+behalf of others, and it is designed in [RFC-0027](rfcs/0027-the-live-roost.md). Until it lands, plan
+nest onboarding as a maintenance window, or give each tenant its own process.
+
+**Compliance operations** (RFC-0008), if you serve regulated customers:
+
+```sh
+nuthatch lists fetch ofac-sdn --dir <nest>      # content-addressed list snapshot
+nuthatch screen --list <hash> --from --to       # replayable screening over sealed segments
+nuthatch audit replay --from --to               # re-prove the stored hits reproduce exactly
+nuthatch audit report --from --to --json        # summarise hits and flags
+nuthatch pack build --key <keypair>             # signed compliance manifest
+```
+
+Screening is deterministic: the same list hash, range and component always produce identical hits.
+
+---
 
 ## AI: point a coding agent at your data
 
@@ -162,19 +490,76 @@ The MCP server is compiled in. Wire a client to a running nest in one step - `nu
 ```sh
 nuthatch dev &                       # the index the agent will query
 nuthatch mcp --print-config          # copy-paste config for Claude Code / any MCP client
-# Claude Code, directly:
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 
 `nuthatch mcp` is a thin, fully-offline stdio bridge to the local `dev` HTTP API - it never contends
-with the single writer and nothing phones home. The client launches it; you ask your contract's data
-in plain English and it writes the SQL. (The semantic layer that makes that first-try-correct is
-RFC-0016.)
+with the single writer and nothing phones home. The client launches it; you ask for your contract's
+data in plain English and it writes the SQL. Tool advertisement is adaptive (RFC-0025): a nest only
+advertises the tools it can actually answer.
+
+---
 
 ## Stability contract (0.x)
 
 - **Config**: `nuthatch.toml` keys and the nest `schema_version` follow a deprecation policy - a key
   removed in 0.(n+1) warns in 0.n first.
-- **Data layout**: redb tables, segment layout, `manifest.json`, and `schema.json` are versioned.
-  The target within 0.x is **in-place-safe upgrades**; each release's notes state "in-place safe" or
-  "reseal required" explicitly.
+- **Data layout**: redb tables, segment layout, `manifest.json` and `schema.json` are versioned. The
+  target within 0.x is **in-place-safe upgrades**; each release states which it is.
+
+---
+
+## Known gaps
+
+Stated plainly, because finding them yourself in production would be worse.
+
+**Before exposing `/sql`:**
+
+- **0.6.1 and earlier accept `;`-stacked SQL statements**, which combined with `COPY … TO` / `ATTACH`
+  is an arbitrary file-write primitive, bounded by the service user's permissions. Fixed but **not yet
+  released** at the time of writing. Do not expose `/sql` on 0.6.1 or earlier, even behind
+  authentication, until the patch release lands.
+
+**Operational gaps:**
+
+- **No hot nest lifecycle.** Restart required to change a roost's nest set (RFC-0027, designed).
+- **`/sql` materialises the whole tip per query.** The largest RAM risk on a deep-finality chain.
+  Bound it at your gateway on busy nests.
+- **Sequential webhook delivery.** One slow sink throttles the others.
+- **No published container image.** Build from the recipe above.
+- **Admin status page polls** (~2 s). Server-sent-events push is deferred.
+- **No scaled mode.** No Postgres hot store, no writer pool, no query-FE tier, no DataFusion
+  federation. All designed (RFC-0013, RFC-0022), none built.
+- **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
+  extraction (RFC-0014) are gated on a synced node - an infrastructure decision, not a coding one.
+
+**Correctness boundaries, documented and accepted:**
+
+- Balances exceeding `i128` base units are omitted from derived views rather than truncated. No real
+  token approaches this.
+- One malformed log fails its whole `getLogs` window and retries against another endpoint rather than
+  being skipped. Deliberate: silently dropping an on-chain event would be a correctness bug.
+- Segment identity may differ across nuthatch versions built on different arrow-rs releases.
+- Entity reads and derived views are eventually consistent within the reorg window.
+
+---
+
+## Go-live checklist
+
+Before pointing real traffic at a nuthatch deployment:
+
+- [ ] Running a release that includes the `/sql` statement-stacking fix (post-0.6.1).
+- [ ] Bound to localhost or an internal interface, with TLS and authentication in front.
+- [ ] `NUTHATCH_ADMIN_TOKEN` set, or `--no-admin` in use.
+- [ ] Running as an unprivileged user; nest directory `0700`; `MemoryMax` set to the cursor budget.
+- [ ] Prometheus scraping `/metrics`; alerts wired for quarantine, cursor death, tip lag, ingest
+      stall and memory.
+- [ ] Load balancer routes on **per-nest** `/<name>/ready`; paging on roost-root `/ready`.
+- [ ] `nuthatch bench backfill` and `nuthatch bench query` run on your hardware and RPC; sizing
+      derived from the measurements, not the projection.
+- [ ] Every `rpc_urls` pool has at least two endpoints on the correct chain (verified at startup).
+- [ ] Backup covering the nest directory, tested by restoring into a clean box.
+- [ ] `nuthatch check` passing for each nest, with parity fixtures committed.
+- [ ] A restart drill performed: SIGTERM, restart, confirm no gaps or duplicates.
+- [ ] A nest upgrade rehearsed with `nest diff` and `nest upgrade` on a non-production copy.
+- [ ] Nest onboarding process agreed, given that adding a nest currently restarts the roost.

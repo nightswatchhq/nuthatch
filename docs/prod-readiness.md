@@ -3,7 +3,7 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [backlog](backlog.md), and [CI](../.github/workflows/ci.yml) on
-**2026-07-19** (repo at `0.4.0`, `0.5` in flight).
+**2026-07-28** (repo at `0.6.1`; `0.6.2` owed - see §4).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
@@ -107,8 +107,16 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 
 ## 4. Security
 
+- [ ] 🔴 **`/sql` `;`-statement-stacking fixed but NOT RELEASED.** A stacked `COPY … TO` / `ATTACH` was
+  an arbitrary file write, bounded by the service user. Present in **0.6.1 and earlier**; the fix
+  (`reject_statement_stacking`) is merged and awaiting a **0.6.2** tag. *No release ships until this
+  does, and any deployment exposing `/sql` on ≤0.6.1 should be treated as affected.*
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
+- [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).
+  `reject_file_access` is the only control stopping a file read, so the file-access defence is one layer
+  deep, not two. A tripwire test fails if a future bump makes the layer real. *Re-check on every duckdb
+  bump.*
 - [ ] ✅ `/sql` surface is structurally read-only (single-writer + read-only attach).
 - [ ] ✅ A security review pass on the **serving surface** (`serve.rs`, `mcp.rs`, `webhooks.rs`,
   `analytics.rs`, `abi.rs`, `rpc.rs`) - *done (0.5.x hardening): no criticals; SQL read-only gate holds
@@ -151,14 +159,21 @@ case.
 
 ## 7. Operability & observability
 
-- [ ] ✅ Metrics surface exists (`metrics.rs`).
+- [ ] ✅ Metrics surface exists (`metrics.rs`), **including per-nest series** - `{nest="…"}`-labelled
+  `nuthatch_nest_*` plus `nuthatch_cursor_live{chain}` (RFC-0026), so a co-tenant roost is attributable
+  per nest rather than only process-globally. *(This closes the old SEC-9 gap.)*
 - [ ] ✅ Health/readiness endpoint suitable for a supervisor. - *0.5.x: `/health` = liveness (plain
   `200 "ok"`); `/ready` = readiness - JSON with tip / last_block / lag / sealed_through / last-poll age,
   `200` when fresh and **`503` when stalled** (no successful source poll within 90 s ⇒ every RPC endpoint
-  down). A just-started node gets grace (never-polled ≠ stalled).*
+  down). A just-started node gets grace (never-polled ≠ stalled). **0.6.x (RFC-0026):** `/ready` is now
+  also mounted at the **roost root** - `200` only when every cursor and nest is indexing, `503` naming
+  what is quarantined - with per-nest `/<name>/ready` answering for that nest alone. Route traffic on
+  the per-nest one and page on the root; wiring a load balancer to the root means one sick nest evicts
+  every healthy sibling.*
 - [ ] 🟡 Structured logs at a sane default level; a clear "we are behind / we are at tip" signal.
-- [ ] 🟡 Documented restart/recovery runbook and a backup/restore story for the redb hot store +
-  sealed segments. - *[operators.md](operators.md) is the home for this; confirm it's complete.*
+- [ ] ✅ Documented restart/recovery runbook and a backup/restore story for the redb hot store +
+  sealed segments. - *[operators.md](operators.md) carries the failure model, the symptom→action
+  runbook, backup/restore, and a go-live checklist (2026-07-28).*
 - [ ] ⛔ SSE **push** for live status (status page polls today). *(0010 small increment)*
 - [ ] 🟡 Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.
 
@@ -171,8 +186,10 @@ case.
   macOS/arm64 install claims should be tested or scoped.)
 - [ ] 🟡 CHANGELOG / release notes discipline per tag (the progress-log is close; formalise for
   consumers).
-- [ ] 🟡 Documented upgrade path / on-disk format stability guarantee across `0.x` bumps (does a
-  `0.4 → 0.5` upgrade preserve existing sealed segments and hot store?).
+- [ ] ✅ Documented upgrade path / on-disk format stability guarantee across `0.x` bumps. - *Proven in
+  production: a `0.3.0 → 0.6.0` nest upgrade was a binary swap plus a restart - no data migration, no
+  flag or unit changes, sealed segments and hot store preserved. Each release states "in-place safe" or
+  "reseal required" explicitly; the contract is in [operators.md](operators.md).*
 
 ## 9. AI-native surface (MCP)
 

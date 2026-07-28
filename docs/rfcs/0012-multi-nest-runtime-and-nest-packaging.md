@@ -362,8 +362,10 @@ is the gateway's identity-shaped job, unchanged from the node-vs-gateway split.
    tampered-file reject, newer-format reject. **Deferred to the roost slices:** installing *into a roost*
    and mounting two nests under one cursor (needs the roost runtime, §2, gated on the §0 CLAUDE.md
    amendment).
-7. **Docs + example. ✅ Done (2026-07-18).** A runnable two-nest roost example at
-   [`examples/roost/`](../../examples/roost) (the ARB token + native USDC, both on Arbitrum One) with a
+7. **Docs + example. ✅ Done (2026-07-18);** the example was later **retired** (`f154351`) when nests
+   moved out of the tree into their own repositories - see the
+   [nest catalogue](../nest-catalogue.md). A runnable two-nest roost example lived at `examples/roost/`
+   (the ARB token + native USDC, both on Arbitrum One) with a
    README covering `roost dev`, the `/nests` roster and `/<name>/…` routing, footprint/`max_rss`, and
    the `nest pack`/`mount` blob flow. The operators page ([`docs/operators.md`](../operators.md)) gains
    a "Roosts" section. **Verified live** against a public Arbitrum RPC: both nests mount under one

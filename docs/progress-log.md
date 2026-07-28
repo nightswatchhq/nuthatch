@@ -2,6 +2,51 @@
 
 Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-order-vertical-slices-each-ends-runnable).
 
+- **2026-07-22 to 2026-07-28 - catch-up entry, reconciled retrospectively (2026-07-28).** The log went
+  quiet for six days across two releases and eleven merges; rather than back-fill eight per-push entries
+  from `git log` at a fidelity the house style does not support, this is one honest summary. Per-push
+  granularity resumes below and after.
+  - **v0.6.0 (#144) + [RFC-0025](rfcs/0025-adaptive-mcp-tool-advertisement.md) adaptive MCP tool
+    advertisement (#143).** A nest now advertises only the tools it can actually answer: `GET /shape`
+    plus bridge filtering of `tools/list`/`prompts/list`, fail-open when the probe fails (issue #137
+    gap 3). **RFC-0025 Implemented.**
+  - **Skill/doc drift gates (#137-#142).** Corrected `config-reference` + `troubleshooting` drift
+    (velocity blocks, factory `watch`/`filter`, alert kinds, `[[chains]]`, metric names), added a
+    **metric-name drift gate**, regenerated a stale `cli-reference`, and swept em/en dashes out of the
+    repo (source, docs, skill, configs) in favour of plain hyphens.
+  - **Audit hardening waves (#146, #148, #149, #151) + v0.6.1 (#152).** Three HIGHs and three MEDIUMs
+    from the full-repo audit, then wave 2a (`/sql` replacement-scan guard, IVM circuit-death health,
+    `object_store` dedup) and wave 2b (abi-path traversal guard, `log_index` overflow guards).
+  - **🔴 SECURITY (#153): `/sql` accepted `;`-stacked statements - an arbitrary file-write primitive.**
+    Found while writing the test that was meant to *confirm* the defence: `conn.prepare` is not
+    single-statement on the bundled duckdb-rs (it prepares *and executes* `SELECT 1; INSERT …`), the
+    leading-keyword gate only inspected the first statement, and `COPY … TO` / `ATTACH` write to disk
+    regardless of the in-memory connection. Verified end-to-end. Fixed by `reject_statement_stacking`
+    (string-literal aware) with 3 regression tests. **Present in 0.6.1 and earlier; the fix is not yet
+    released.** Also measured while there: DuckDB's `allowed_directories` is **not enforced** on the
+    build we bundle, so `reject_file_access` is the only control stopping a file read - the
+    defence-in-depth comments were corrected to the measured fact and a tripwire test now fails if a
+    future bump makes the layer real.
+  - **[RFC-0026](rfcs/0026-fault-quarantine-and-partial-health.md) fault quarantine - issue #147
+    closed** (`a69e74f`). All three slices: the fault taxonomy (nest vs cursor, retryable vs terminal),
+    quarantine with backoff re-admission, and a live health surface (`/nests` per-request health merge,
+    roost-root `/ready`, per-nest `/ready`, `nuthatch_nest_health` /
+    `nuthatch_nest_quarantine_total` / `nuthatch_cursor_live`, `--fail-fast`). A nest's error no longer
+    kills its cursor and a cursor's death no longer kills the roost - the `CLAUDE.md` blast-radius rule
+    is now actually held. **RFC-0026 Implemented.**
+  - **Audit-tail coverage (#155) and deps (#157).** The four remaining #150 tests landed - screen
+    component tamper, `fetch_shape` fail-open, cold-seed i128 overflow parity, and fixture-driven
+    `abi.rs` response parsing - plus `getrandom` alignment and a `deny.toml` cross-version parse fix.
+  - **CI: the footprint job takes its RPC from a secret** (`1ae2182`), with the free public-RPC limits
+    documented in the README.
+  - **Two practices adopted mid-sprint, both learned the hard way.** *Mutation-check any test written to
+    pin a specific bug* - break the guard, confirm the test goes red, restore; a regression test that
+    passes in both states protects nothing. And its corollary: *when a test is written to confirm a
+    documented defence, confirm the defence exists* - both of the sprint's security tests failed on
+    first run, and neither was a test bug. Also: *edit source with anchored replacements, never index
+    arithmetic* - an index-based splice on `analytics.rs` silently deleted 19 tests while leaving the
+    build green.
+
 - **2026-07-22 - RFC-0023 tier 1: derive-first recipes - the eth_call you don't need.** The Foundation
   says >70% of subgraphs use `eth_call`, but most of those reads are *derivable* from the events a nest
   already indexes (subgraphs fetch them only because they have no incremental-view engine - nuthatch
@@ -1583,7 +1628,7 @@ Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-ord
   time tip latency from a colocated reth node - **designed and stubbed** with the push→pull bridge
   (reth's `CanonStateNotification` push → the loop's pull) implemented and tested; the reth wiring
   itself is deferred to a node environment (reth is an enormous compile that needs a synced node).
-  See [`docs/exex-design.md`](docs/exex-design.md). No `#[cfg]` forks of business logic - adding ExEx
+  See [`docs/exex-design.md`](exex-design.md). No `#[cfg]` forks of business logic - adding ExEx
   is one new impl. Verified: 18 default tests + the exex stub's bridge test green; live indexing still
   works through the trait. _Deferred: reth wiring; scaled Postgres mode (a `HotStore` trait, same pattern)._
 - **2026-07-14 - Slice 5: MCP server + AI surface.** `nuthatch mcp` speaks the Model Context
