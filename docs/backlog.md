@@ -22,7 +22,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 3. **Process / ongoing** - non-code: grants (0006), launch (0007), the full graph-network migration
    (0011, parked after the pilot).
 4. **Small increments** - buildable now, low priority (proxy introspection, child-`end` conditions,
-   SSE push, the 0012 live-parity proof).
+   the 0012 live-parity proof).
 
 ## The whole backlog at a glance
 
@@ -37,7 +37,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0007 Launch | Accepted | The actual launch run | process |
 | 0008 Compliance | Implemented | - | - |
 | 0009 Factory | Implemented | Child `end`/expiry conditions (children are forever); wildcard-address decode | - (small / future RFC) |
-| 0010 Admin/webhooks | Implemented | SSE **push** live updates (status page polls today) | - (small) |
+| 0010 Admin/webhooks | Implemented | - (SSE push shipped: `/_admin/events`) | - |
 | 0011 Graph-network nest | **Parked after pilot** | Full migration: Indexer Directory (step 2) + promote the two ad-hoc pilot nests into a published `graph-network-nest` | product decision |
 | 0012 Multi-nest roost | Implemented | One acceptance item: a **sustained** byte-identical-vs-solo table-parity run over a longer range | - (a live run; public RPC ok) |
 | 0013 Storage/query | §3 shipped (DuckDB union) | DataFusion convergence (§2/§4, benchmark-gated, scaled-side first); Turso (§1, triple-gated) | scaled mode + a benchmark |
