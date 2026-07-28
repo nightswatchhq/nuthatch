@@ -192,6 +192,15 @@ who need more - none of it in the way of the happy path:
   chain** - a Base nest and an Arbitrum nest in one runtime. Per-nest isolation, and a footprint budget
   **per active-chain cursor** (≤2 GB). A capability, not a mandate: one-chain-per-roost stays the simple
   default.
+- **The live roost - mount and unmount nests without a restart** (RFC-0027). Changing a roost's nest set
+  used to mean editing `roost.toml` and restarting, which stops every *co-tenant* nest too - so the blast
+  radius of a config change was larger than that of a fault. Now `POST /_admin/nests` mounts one and
+  `DELETE /_admin/nests/<name>` unmounts one, live. A mount is admitted only if it fits the cursor's RAM
+  budget (refused with `507`, never a warning - a budget that can be quietly exceeded is not a budget),
+  catches up *before* it joins so it never drags co-tenants back through history, and only then gets
+  routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
+  the store before anything is torn down. The set is persisted to `roost.toml`, so a restart converges
+  on what you last asked for.
 - **Nest bundles + registry - bundle one, publish it, load it anywhere.** `nuthatch nest bundle` packs
   a nest's authored inputs into one portable, content-addressed `.bundle`; `nest load <bundle-or-url>`
   verifies and installs it - regenerating the decode registry and asserting it matches - so anyone runs
@@ -217,6 +226,13 @@ who need more - none of it in the way of the happy path:
   free, no archive node. It derives what a subgraph pays an archive node to fetch. For the handful of
   reads that *aren't* derivable but never change - `decimals`/`symbol`/`name` - `nuthatch metadata fetch`
   calls once and caches forever.
+- **Ingestion that survives real providers** (RFC-0028). An oversized `eth_getLogs` is split and
+  retried, taking the provider's own suggested range when it offers one; a failure we *cannot* classify
+  is split once anyway, so an endpoint whose phrasing we have never seen still works rather than
+  stalling. Rate limits, transport blips and credential rejections are told apart - a rejected API key
+  is cooled down loudly instead of retried forever. And sealed segments now flush on a boundary derived
+  from the **data**, not from wherever a fetch window happened to stop, so two operators indexing the
+  same range produce byte-identical segments regardless of their RPC tuning.
 - **Metrics.** Prometheus `/metrics` - tip lag, rows decoded/sealed, reorgs, query counts, RSS.
 
 ---
@@ -250,7 +266,7 @@ run this for real rather than after. It covers the questions people actually hit
 
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0027); the north star and the CLI/UX direction are
+- **Design** lives in [RFCs](docs/rfcs/) (0001-0028); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
 - **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
