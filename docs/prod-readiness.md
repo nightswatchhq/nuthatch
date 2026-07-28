@@ -3,7 +3,7 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [backlog](backlog.md), and [CI](../.github/workflows/ci.yml) on
-**2026-07-28** (repo at `0.6.2`, released).
+**2026-07-28** (repo at `0.7.0`).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
