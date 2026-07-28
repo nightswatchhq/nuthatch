@@ -27,6 +27,26 @@ a single-tenant node doesn't have; it's the gateway's job). Current defaults:
 Rejections are surfaced as HTTP errors (`400`/`503`) and counted in `/metrics`
 (`nuthatch_sql_rejections_total`).
 
+`/sql` is **read-only and single-statement**: a query must open with `SELECT`/`WITH`, filesystem and
+network table functions are refused, and `;`-stacking a second statement is rejected outright.
+
+## Consistency: entity reads vs derived views
+
+The entity store and the derived (IVM) views advance independently, so **a read taken during a reorg
+window can see a transient skew between them** - `/balances` (a view) and `/sql` (over stored rows) may
+briefly disagree about the same block. Both converge within a tick; neither is wrong in isolation.
+
+This matters if you **join across the two surfaces** - e.g. reading a balance from `/balances` and
+correlating it with rows from `/sql` - because the two halves may have been taken either side of a
+rollback. If that skew would be visible to your users:
+
+- prefer a **single surface** per answer (both `/balances` and `/sql` are individually consistent), or
+- pin the read to a block at or below `sealed_through` (reported on `/ready` and in `/sql` responses'
+  `provenance` block) - sealed data is past finality and never moves.
+
+Tip-following data is inherently provisional; this is the same caveat any indexer carries at the tip,
+stated explicitly rather than left to be discovered.
+
 ## Metrics (`/metrics`)
 
 Prometheus text exposition - the endpoint to scrape, alert, and bill against. Key series:

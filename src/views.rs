@@ -7,7 +7,15 @@
 //! Balances accumulate in **i128** base units. That matters: an i64 accumulator silently drops any
 //! transfer above ~9.2e18 base units - barely ~9.2 tokens of an 18-decimal token - so large-supply
 //! or high-decimal tokens would under-count. i128 (max ~1.7e38) comfortably holds any real token's
-//! total supply in base units. Values that somehow exceed i128 are skipped by the caller.
+//! total supply in base units.
+//!
+//! **Values exceeding i128 are skipped entirely** - the whole transfer, both legs - rather than
+//! saturated or truncated (audit L4, reviewed and accepted). No real token reaches 1.7e38 base units,
+//! so in practice this only fires on a deliberately absurd value; silently admitting a wrong number
+//! would be worse than omitting a fictional one, and crediting one leg while dropping the other would
+//! invent value. Both the hot replay (`parse::<i128>` → skip) and the cold fold
+//! (`TRY_CAST(… AS HUGEINT)` → NULL) drop it, so a restart cannot change the answer - pinned by
+//! `analytics::tests::an_over_i128_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay`.
 //!
 //! The view is in-memory but not ephemeral: `rebuild` reconstructs it from stored facts on a warm
 //! restart (see `indexer::rebuild_balances`), so balances survive a process bounce.

@@ -321,21 +321,51 @@ struct AdminQuery {
     token: Option<String>,
 }
 
-async fn admin_index(State(s): State<AppState>, Query(q): Query<AdminQuery>) -> impl IntoResponse {
+/// Whether a request may reach the admin surface (SEC-5; header support is audit L7).
+///
+/// On a localhost bind `admin_token` is `None` and the surface is open. Off-localhost a token is
+/// required per request, and may arrive either way:
+///
+/// - **`?token=…`** - the original form, and it has to stay: the admin UI's own live updates use
+///   `EventSource`, which cannot set request headers. It is already constant-time compared and
+///   same-origin.
+/// - **`Authorization: Bearer …`** - preferred wherever the caller *can* set headers, because a query
+///   string leaks into proxy access logs, shell history and `Referer`, and a token in a log file
+///   outlives the request that carried it.
+///
+/// The scheme is matched case-insensitively per RFC 7235; the token compare is constant-time either
+/// way, so a timing side-channel cannot recover it byte-by-byte.
+fn admin_authorized(state: &AppState, q: &AdminQuery, headers: &axum::http::HeaderMap) -> bool {
+    let Some(required) = &state.admin_token else {
+        return true; // localhost bind: open
+    };
+    if q.token.as_deref().is_some_and(|t| ct_eq(t, required)) {
+        return true;
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, rest) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        })
+        .is_some_and(|t| ct_eq(t, required))
+}
+
+async fn admin_index(
+    State(s): State<AppState>,
+    Query(q): Query<AdminQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     if !s.admin_enabled {
         return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
     }
-    // SEC-5: off-localhost the route requires the token per request. On localhost `admin_token` is
-    // `None` and the page is open. The compare is constant-time (SEC review) so a timing side-channel
-    // can't recover the token byte-by-byte.
-    if let Some(required) = &s.admin_token {
-        if !q.token.as_deref().is_some_and(|t| ct_eq(t, required)) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "admin UI requires a valid ?token=",
-            )
-                .into_response();
-        }
+    if !admin_authorized(&s, &q, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "admin UI requires a valid ?token= or Authorization: Bearer token",
+        )
+            .into_response();
     }
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -524,18 +554,20 @@ const SSE_INTERVAL: Duration = Duration::from_secs(2);
 /// the admin page: 404 when the admin UI is disabled, and off-localhost it requires a valid `?token=`.
 /// Each frame is byte-identical to `GET /` (both call [`summary_value`]). Purely a serving-layer read -
 /// nothing here touches the ingest/decode data path.
-async fn admin_events(State(s): State<AppState>, Query(q): Query<AdminQuery>) -> impl IntoResponse {
+async fn admin_events(
+    State(s): State<AppState>,
+    Query(q): Query<AdminQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     if !s.admin_enabled {
         return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
     }
-    if let Some(required) = &s.admin_token {
-        if !q.token.as_deref().is_some_and(|t| ct_eq(t, required)) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "admin events require a valid ?token=",
-            )
-                .into_response();
-        }
+    if !admin_authorized(&s, &q, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "admin events require a valid ?token= or Authorization: Bearer token",
+        )
+            .into_response();
     }
     // `unfold` carries the state and a `first` flag: emit immediately, then once per interval. Cloning
     // `AppState` per frame is cheap - its fields are `Arc`/handle types, not owned data.
@@ -1279,15 +1311,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         let no_tok = || Query(AdminQuery { token: None });
+        let no_hdr = axum::http::HeaderMap::new;
 
         // Localhost (admin_token None): open.
-        let resp = admin_index(State(state.clone()), no_tok())
+        let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK, "admin UI open on localhost");
 
         state.admin_enabled = false;
-        let resp = admin_index(State(state.clone()), no_tok())
+        let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
             .await
             .into_response();
         assert_eq!(
@@ -1313,28 +1346,68 @@ mod tests {
                 token: t.map(str::to_string),
             })
         };
-        // No token → 401.
+        let no_hdr = axum::http::HeaderMap::new;
+        /// An `Authorization` header carrying `value`.
+        fn bearer(value: &str) -> axum::http::HeaderMap {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+            h
+        }
+        let status = |s: AppState, q, h| async move {
+            admin_index(State(s), q, h).await.into_response().status()
+        };
+
+        // --- The query-parameter form (SEC-5), unchanged. ---
         assert_eq!(
-            admin_index(State(state.clone()), tok(None))
-                .await
-                .into_response()
-                .status(),
-            StatusCode::UNAUTHORIZED
+            status(state.clone(), tok(None), no_hdr()).await,
+            StatusCode::UNAUTHORIZED,
+            "no token"
         );
-        // Wrong token → 401.
         assert_eq!(
-            admin_index(State(state.clone()), tok(Some("nope")))
-                .await
-                .into_response()
-                .status(),
-            StatusCode::UNAUTHORIZED
+            status(state.clone(), tok(Some("nope")), no_hdr()).await,
+            StatusCode::UNAUTHORIZED,
+            "wrong token"
         );
-        // Correct token → 200.
         assert_eq!(
-            admin_index(State(state), tok(Some("s3cret")))
-                .await
-                .into_response()
-                .status(),
+            status(state.clone(), tok(Some("s3cret")), no_hdr()).await,
+            StatusCode::OK,
+            "correct token"
+        );
+
+        // --- The header form (audit L7): a caller that can set headers need not put the secret in a
+        // query string, where it would land in proxy logs and `Referer`. ---
+        assert_eq!(
+            status(state.clone(), tok(None), bearer("Bearer s3cret")).await,
+            StatusCode::OK,
+            "Authorization: Bearer must be accepted"
+        );
+        // RFC 7235: the scheme is case-insensitive.
+        assert_eq!(
+            status(state.clone(), tok(None), bearer("bearer s3cret")).await,
+            StatusCode::OK,
+            "the scheme is case-insensitive"
+        );
+        // …but nothing else is loosened.
+        for bad in [
+            "Bearer nope",
+            "Basic s3cret",
+            "s3cret",
+            "Bearer",
+            "Bearer ",
+            "Bearer s3cret extra",
+        ] {
+            assert_eq!(
+                status(state.clone(), tok(None), bearer(bad)).await,
+                StatusCode::UNAUTHORIZED,
+                "must reject Authorization: {bad}"
+            );
+        }
+        // A valid header still wins when the query param is wrong (either channel may authorise).
+        assert_eq!(
+            status(state, tok(Some("nope")), bearer("Bearer s3cret")).await,
             StatusCode::OK
         );
     }
@@ -1382,33 +1455,63 @@ mod tests {
 
         // Localhost, no token required → the stream opens.
         assert_eq!(
-            admin_events(State(state.clone()), tok(None))
-                .await
-                .into_response()
-                .status(),
+            admin_events(
+                State(state.clone()),
+                tok(None),
+                axum::http::HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
             StatusCode::OK
         );
         // Admin disabled → 404, exactly like the page.
         state.admin_enabled = false;
         assert_eq!(
-            admin_events(State(state.clone()), tok(None))
-                .await
-                .into_response()
-                .status(),
+            admin_events(
+                State(state.clone()),
+                tok(None),
+                axum::http::HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
             StatusCode::NOT_FOUND
         );
         // Off-localhost token enforced (SEC-5): missing → 401, correct → 200.
         state.admin_enabled = true;
         state.admin_token = Some("s3cret".into());
         assert_eq!(
-            admin_events(State(state.clone()), tok(None))
-                .await
-                .into_response()
-                .status(),
+            admin_events(
+                State(state.clone()),
+                tok(None),
+                axum::http::HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            admin_events(State(state), tok(Some("s3cret")))
+            admin_events(
+                State(state.clone()),
+                tok(Some("s3cret")),
+                axum::http::HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::OK
+        );
+        // The SSE stream accepts the header form too (audit L7), even though the admin UI's own
+        // `EventSource` cannot send one - a scripted consumer can.
+        let mut hdr = axum::http::HeaderMap::new();
+        hdr.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer s3cret"),
+        );
+        assert_eq!(
+            admin_events(State(state), tok(None), hdr)
                 .await
                 .into_response()
                 .status(),
