@@ -1409,6 +1409,26 @@ fn single_block_over_cap(block: u64) -> String {
 /// against a capped provider would abort the whole run; this makes it self-correct. A single block that
 /// alone exceeds the cap can't be split further, so it fails with a clear message rather than looping
 /// forever (finding H3).
+/// Where to split `[from, to]` when the provider named a range that *would* have worked (RFC-0028 §3c).
+///
+/// Returns the last block of the provider's suggested range, so the first half is exactly what it told
+/// us it can serve and the remainder is retried separately. `None` whenever the hint is unusable, in
+/// which case the caller halves as before.
+///
+/// Validated rather than trusted - this is provider prose, not a contract. A hint is only used when it
+/// starts at our `from` (otherwise it is describing a different request), ends before our `to` (a
+/// "suggestion" no narrower than what we asked for would not make progress, and an equal one would
+/// loop forever), and is not the whole range.
+fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64> {
+    let crate::rpc::FailureClass::Narrowable {
+        suggested: Some((s_from, s_to)),
+    } = crate::rpc::class_of(err)?
+    else {
+        return None;
+    };
+    (s_from == from && s_to >= from && s_to < to).then_some(s_to)
+}
+
 fn fetch_logs_splitting<'a>(
     source: &'a dyn Source,
     addresses: &'a [String],
@@ -1453,11 +1473,17 @@ fn fetch_logs_splitting_inner<'a>(
                 if from >= to {
                     return Err(e).with_context(|| single_block_over_cap(from));
                 }
-                let mid = from + (to - from) / 2;
+                // Take the provider's own answer when it offers one. Alchemy replies to an oversized
+                // range with "…this block range should work: [0x1000000, 0x1007fff]" - authoritative
+                // and exact - so halving toward a number we were just handed wastes round trips
+                // (RFC-0028 §3c). Anything unusable falls back to the midpoint.
+                let split_at =
+                    suggested_split_point(&e, from, to).unwrap_or(from + (to - from) / 2);
                 let mut left =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, from, mid, true).await?;
+                    fetch_logs_splitting_inner(source, addresses, topic0s, from, split_at, true)
+                        .await?;
                 let right =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, mid + 1, to, true)
+                    fetch_logs_splitting_inner(source, addresses, topic0s, split_at + 1, to, true)
                         .await?;
                 left.extend(right);
                 Ok(left)

@@ -54,6 +54,13 @@ pub(crate) enum FailureClass {
     ///
     /// Slice 1 classifies this; acting on it is slice 3.
     Narrowable { suggested: Option<(u64, u64)> },
+    /// A rate limit. Transient in effect - fail over and retry at the same width, because "you asked
+    /// too often" is not "you asked for too much". Tracked as its own variant only so that a
+    /// **pool-wide** 429 on the *same* window can escalate to [`FailureClass::Narrowable`]: when every
+    /// endpoint refuses the same request, that stops being evidence about pacing and starts being
+    /// evidence about the request (RFC-0028 §3d). Narrowing also happens to reduce load, so the
+    /// escalation is benign even when the cause really was pacing.
+    RateLimited,
     /// The request is fine, this endpoint is having a moment. Fail over, retry at the same width.
     Transient,
     /// This endpoint will not serve us until something changes outside the process. Long cooldown,
@@ -77,20 +84,85 @@ impl std::fmt::Display for ClassifiedError {
 
 impl std::error::Error for ClassifiedError {}
 
+/// Re-classify an all-endpoints failure as [`FailureClass::Narrowable`] when **every** attempt was a
+/// rate limit (RFC-0028 §3d).
+///
+/// One endpoint returning 429 says we asked too often. *Every* endpoint returning 429 for the same
+/// request says something about the request. Narrowing is the right response either way - a smaller
+/// window is both a smaller result set and less load - so this escalation cannot make a genuine pacing
+/// problem worse.
+///
+/// Requires at least two attempts: with a single-endpoint pool "every endpoint" is one endpoint, and a
+/// lone 429 is much more likely to be pacing.
+fn escalate_pool_wide_rate_limit(
+    err: anyhow::Error,
+    attempts: usize,
+    rate_limited: usize,
+) -> anyhow::Error {
+    if attempts >= 2 && rate_limited == attempts {
+        return anyhow::Error::new(ClassifiedError {
+            class: FailureClass::Narrowable { suggested: None },
+            detail: format!(
+                "every endpoint ({attempts}) rate-limited this request; treating it as too large: {err}"
+            ),
+        });
+    }
+    err
+}
+
+/// The classification carried by `err`, if it came from the RPC client.
+///
+/// Walks the whole `anyhow` chain rather than only the outermost error, because callers add
+/// `.with_context(…)` as an error travels up (`getLogs 100..=200` and friends) - checking only the top
+/// would silently lose the classification the moment anyone added context, which is exactly the sort of
+/// bug that shows up as "it works in the unit test".
+pub(crate) fn class_of(err: &anyhow::Error) -> Option<FailureClass> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<ClassifiedError>())
+        .map(|c| c.class.clone())
+}
+
 /// Classify an HTTP-level failure. Auth is terminal; a payload-too-large is about the request; the
 /// rest are someone else's problem and worth trying elsewhere.
 ///
-/// `429` is deliberately **transient**, not narrowable: a rate limit usually means "you asked too
-/// often", not "you asked for too much", and shrinking the window would degrade throughput for what is
-/// really a pacing problem. Escalating a pool-wide 429 on the same window to narrowable is slice 3.
+/// `429` maps to [`FailureClass::RateLimited`], which behaves as transient: a rate limit usually means
+/// "you asked too often", not "you asked for too much", and shrinking the window would trade throughput
+/// for nothing on what is really a pacing problem. It is a distinct variant only so that a *pool-wide*
+/// 429 can escalate to narrowable in [`escalate_pool_wide_rate_limit`].
 pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
     match status {
+        // A 403 is not always about *us*. Measured: `arbitrum-one-rpc.publicnode.com` answers an
+        // archive-range request with 403 "Archive requests require a personal token" while serving
+        // recent blocks perfectly well (RFC-0028 §3f). Cooling that endpoint down for five minutes
+        // would sideline a perfectly good tip source over one deep query, so a capability refusal is
+        // transient - it is about the *request*, not the credentials.
+        403 if is_capability_refusal(body) => FailureClass::Transient,
         401 | 403 => FailureClass::Terminal,
         413 => FailureClass::Narrowable {
             suggested: suggested_range(body),
         },
+        429 => FailureClass::RateLimited,
         _ => FailureClass::Transient,
     }
+}
+
+/// Whether a 4xx body says "this *request* needs something you don't have" rather than "*you* are not
+/// authenticated" - an archive query against a free tier, a method behind a paid plan.
+///
+/// The distinction matters because the responses differ: bad credentials mean the endpoint is useless
+/// until an operator acts, while a capability limit means it is useless *for this kind of request* and
+/// fine for everything else.
+pub(crate) fn is_capability_refusal(body: &str) -> bool {
+    let s = body.to_ascii_lowercase();
+    const CAPABILITY: &[&str] = &[
+        "archive",         // publicnode: "Archive requests require a personal token"
+        "personal token",  // ditto
+        "upgrade your",    // plan-gated
+        "not enabled for", // Alchemy: "ETH_MAINNET is not enabled for this app"
+        "requires a paid",
+        "plan does not",
+    ];
+    CAPABILITY.iter().any(|m| s.contains(m))
 }
 
 /// Classify a JSON-RPC `error` object returned with HTTP 200 - which is how most providers actually
@@ -264,7 +336,7 @@ impl RpcClient {
     /// Route a failed call to the right cooldown, per its classification. An unclassified error
     /// (nothing downcasts) is treated as transient, which is the pre-RFC-0028 behaviour.
     fn record_failure(&self, j: usize, method: &str, err: &anyhow::Error) {
-        match err.downcast_ref::<ClassifiedError>().map(|c| &c.class) {
+        match class_of(err) {
             Some(FailureClass::Terminal) => self.mark_terminal(j, method, &err.to_string()),
             _ => {
                 self.mark_unhealthy(j);
@@ -280,44 +352,64 @@ impl RpcClient {
     /// successful one is cleared.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut attempts = 0usize;
+        let mut rate_limited = 0usize;
         for j in self.endpoint_order() {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            attempts += 1;
             match self.call_one(url, method, &params).await {
                 Ok(v) => {
                     self.mark_healthy(j);
                     return Ok(v);
                 }
                 Err(e) => {
+                    if class_of(&e) == Some(FailureClass::RateLimited) {
+                        rate_limited += 1;
+                    }
                     self.record_failure(j, method, &e);
                     last_err = e;
                 }
             }
         }
-        Err(last_err)
+        Err(escalate_pool_wide_rate_limit(
+            last_err,
+            attempts,
+            rate_limited,
+        ))
     }
 
     /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered failover
     /// as `call`, returning the parsed response. Used for batch requests `call` can't express.
     async fn post_with_failover(&self, body: &Value) -> Result<Value> {
         let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut attempts = 0usize;
+        let mut rate_limited = 0usize;
         for j in self.endpoint_order() {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            attempts += 1;
             match self.post_one(url, body).await {
                 Ok(v) => {
                     self.mark_healthy(j);
                     return Ok(v);
                 }
                 Err(e) => {
+                    if class_of(&e) == Some(FailureClass::RateLimited) {
+                        rate_limited += 1;
+                    }
                     self.record_failure(j, "batch", &e);
                     last_err = e;
                 }
             }
         }
-        Err(last_err)
+        Err(escalate_pool_wide_rate_limit(
+            last_err,
+            attempts,
+            rate_limited,
+        ))
     }
 
     /// POST `body` and parse the response, attaching a [`FailureClass`] to any failure (RFC-0028 §3).
@@ -830,14 +922,85 @@ mod tests {
         );
     }
 
+    /// RFC-0028 §3f. Measured: `arbitrum-one-rpc.publicnode.com` answers an archive-range request with
+    /// `403 "Archive requests require a personal token"` while serving recent blocks perfectly well.
+    /// Treating that like a bad API key would sideline a good tip source for five minutes over one deep
+    /// query - the refusal is about the *request*, not the credentials.
     #[test]
-    fn a_rate_limit_is_transient_not_narrowable() {
-        // 429 means "too often", not "too much". Shrinking the window here would trade throughput for
-        // nothing; escalating a pool-wide 429 to narrowable is slice 3's job, not this one's.
+    fn a_capability_403_is_transient_but_a_credentials_403_is_terminal() {
         assert_eq!(
-            super::classify_status(429, ""),
+            super::classify_status(403, "Archive requests require a personal token"),
+            super::FailureClass::Transient,
+            "an archive-tier refusal must not sideline an endpoint that still serves the tip"
+        );
+        assert_eq!(
+            super::classify_status(403, "ETH_MAINNET is not enabled for this app"),
             super::FailureClass::Transient
         );
+        // No capability language: this is about us, and stays terminal.
+        assert_eq!(
+            super::classify_status(403, "Forbidden"),
+            super::FailureClass::Terminal
+        );
+        assert_eq!(
+            super::classify_status(401, "Must be authenticated!"),
+            super::FailureClass::Terminal
+        );
+    }
+
+    /// RFC-0028 §3d: one endpoint rate-limiting says we asked too often; *every* endpoint
+    /// rate-limiting the same request says something about the request.
+    #[test]
+    fn a_pool_wide_rate_limit_escalates_but_a_lone_one_does_not() {
+        let err = || anyhow::anyhow!("HTTP 429");
+        // Every attempt rate-limited, more than one endpoint → narrowable.
+        let escalated = super::escalate_pool_wide_rate_limit(err(), 3, 3);
+        assert!(matches!(
+            super::class_of(&escalated),
+            Some(super::FailureClass::Narrowable { .. })
+        ));
+        // A single-endpoint pool: "every endpoint" is one endpoint, which is far more likely pacing.
+        assert!(super::class_of(&super::escalate_pool_wide_rate_limit(err(), 1, 1)).is_none());
+        // Mixed failures are not evidence about the request.
+        assert!(super::class_of(&super::escalate_pool_wide_rate_limit(err(), 3, 2)).is_none());
+    }
+
+    /// The classification must survive `.with_context(…)`, which callers add as an error travels up
+    /// (`getLogs 100..=200` and friends). Checking only the outermost error would lose it silently the
+    /// moment anyone added context - a bug that passes every unit test and fails in production.
+    #[test]
+    fn the_classification_survives_added_context() {
+        use anyhow::Context;
+        let e = anyhow::Error::new(super::ClassifiedError {
+            class: super::FailureClass::Terminal,
+            detail: "HTTP 401".into(),
+        });
+        let wrapped: anyhow::Error = Err::<(), _>(e)
+            .context("getLogs 100..=200")
+            .context("backfilling window")
+            .unwrap_err();
+        assert_eq!(
+            super::class_of(&wrapped),
+            Some(super::FailureClass::Terminal),
+            "two layers of context must not hide the classification"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_transient_not_narrowable() {
+        // 429 means "too often", not "too much", so it must never narrow the window on its own.
+        // Slice 3 gave it a distinct variant: `RateLimited` behaves as transient (fail over, retry at
+        // the same width) and exists only so a *pool-wide* 429 can escalate - see
+        // `a_pool_wide_rate_limit_escalates_but_a_lone_one_does_not`. The invariant this test protects
+        // is unchanged: a lone 429 is not narrowable.
+        assert_eq!(
+            super::classify_status(429, ""),
+            super::FailureClass::RateLimited
+        );
+        assert!(!matches!(
+            super::classify_status(429, ""),
+            super::FailureClass::Narrowable { .. }
+        ));
         assert_eq!(
             super::classify_status(503, ""),
             super::FailureClass::Transient
