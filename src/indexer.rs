@@ -1204,6 +1204,48 @@ pub struct RoostCursor {
     pub lifecycle: tokio::sync::mpsc::UnboundedSender<CursorCommand>,
 }
 
+/// Build a nest and bring it up to date **off to one side of a running cursor** - phase 1 of the
+/// two-phase mount (RFC-0027 §4).
+///
+/// The catch-up deliberately happens here rather than after the nest joins. A cursor advances from the
+/// *min* of its live nests' positions, so splicing in a nest that is far behind drags every co-tenant
+/// back through history with it - correct, but unusable. By the time the caller sends
+/// [`CursorCommand::Mount`], the returned `next` is already near the shared cursor.
+///
+/// Returns the ingest state to hand the cursor, the serving state to add to the router, its alert
+/// worker (if the nest configures any sinks), and the block it resumes at.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_and_prepare_nest(
+    source: &Arc<dyn Source>,
+    dir: PathBuf,
+    config: &Config,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window_override: Option<u64>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+) -> Result<(
+    NestIngest,
+    serve::AppState,
+    Option<tokio::task::JoinHandle<()>>,
+    u64,
+)> {
+    let (mut nest, state, worker, window) = build_nest(
+        source,
+        dir,
+        config,
+        window_override,
+        admin_enabled,
+        admin_token,
+    )
+    .await?;
+    let next = nest
+        .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
+        .await?;
+    Ok((nest, state, worker, next))
+}
+
 /// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode
 /// registry + IVM views, run the warm-restart rebuilds, and assemble both the [`NestIngest`] the
 /// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
