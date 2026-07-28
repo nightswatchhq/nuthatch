@@ -392,9 +392,35 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .expect("flip timed out")
     .expect("flip");
 
-    // After the flip, the SAME endpoint is now backed by the NEW version, caught up to the tip.
+    // After the flip, the SAME endpoint is now backed by the NEW version.
     assert_eq!(shared.current().dir.as_path(), new_dir.path());
-    assert_eq!(new_store.indexed_head().unwrap(), Some(5));
+
+    // **The guarantee the flip actually makes** (issue #162): at the moment it swaps, the new version
+    // is at least as far along as the old - so no consumer sees the endpoint go backwards. It does
+    // *not* promise the new version has reached the tip.
+    //
+    // Both versions index the same tape concurrently, so the flip fires as soon as they are level -
+    // which may be block 2, not 5. Asserting `Some(5)` here was asserting something the code never
+    // promised, and it duly failed under full-suite parallel load, where both indexers run slower and
+    // the flip catches them level early. That was a bug in the test, not a race in the flip.
+    let (new_head, old_head) = (
+        new_store.indexed_head().unwrap(),
+        old_store.indexed_head().unwrap(),
+    );
+    assert!(
+        new_head >= old_head,
+        "the flip must never move the endpoint backwards: new={new_head:?} old={old_head:?}"
+    );
+
+    // Separately: left alone, the new version does reach the tip. Polled rather than asserted
+    // instantaneously, because *when* it arrives is a matter of scheduling, not of correctness.
+    tokio::time::timeout(POLL_TIMEOUT, async {
+        while new_store.indexed_head().unwrap() != Some(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the new version should reach the tip once it has caught up");
 
     old_rt.ingest.abort();
     new_rt.ingest.abort();
