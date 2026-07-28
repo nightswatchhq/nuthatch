@@ -6,13 +6,14 @@ work isn't scattered across fourteen "Non-goals" and "Open questions" sections. 
 release gate - what must be true before a build is pointed at a real workload unattended - see the
 [production-readiness checklist](prod-readiness.md).
 
-Reconciled against the RFCs + [progress log](progress-log.md) on 2026-07-18.
+Reconciled against the RFCs + [progress log](progress-log.md) on **2026-07-28**.
 
 ## TL;DR
 
 The buildable-on-a-laptop backlog is essentially cleared - RFCs 0001, 0002, 0004, 0005, 0008, 0009,
-0010, 0012 are Implemented, and 0013 §3 (SQL-over-the-tip) shipped. What remains falls into four
-tracks:
+0010, 0012, 0015, 0016, 0017, 0019, 0020, 0025 and 0026 are Implemented; 0013 §3 (SQL-over-the-tip),
+0018 §1 (authored SQL views), 0021 slice 1 (the multichain roost) and 0023 tiers 1-2 (derive-first
+recipes + metadata cache) have shipped. What remains falls into four tracks:
 
 1. **Infra track** - one thing gates a lot: a **colocated reth node**. It unblocks 0003 (ExEx), which
    unblocks 0014 (firehose traces/state). This is provisioning + sync time, not coding.
@@ -43,6 +44,13 @@ tracks:
 | 0014 Firehose | Deferred | State-diff + trace extraction | **0003 → reth node** |
 | 0023 eth_call | Tier 1 building | Tier 2 (metadata cache), a *simple* RPC tier-3 fallback, tier 4 (hosted cache); more recipes (reserves) | - (tiers 1-2 + simple tier-3 buildable) |
 | 0024 eth_call engine | Draft (deferred build) | The revm demand-driven state engine - **accepted design, deferred build** until the residue is measured large / archive-RPC-free operation is demanded / 0003 lands | RFC-0003 (best path) or a `--state-rpc` archive endpoint (Stage 1) |
+| 0019 Registry | Implemented | Live S3 verification against a real bucket | - (a VPS run) |
+| 0020 N-1 upgrade | Implemented | - | - |
+| 0021 Multichain roost | Slice 1 shipped | A live two-chain run (cross-cursor reorg isolation is proven by e2e) | - (a live run) |
+| 0022 Distributed scaled mode | Accepted, design only | The whole build: plane split, writer pool, scheduler, control-plane DB, secret injection | 0013-scaled (Postgres) + 0021 |
+| 0025 Adaptive MCP | Implemented | - | - |
+| 0026 Fault quarantine | Implemented | - | - |
+| 0027 Live roost | Draft | All 4 slices: dynamic dispatch, lifecycle channel + unmount, mount + catch-up join, control surface | - (buildable now; the operator-facing priority) |
 
 ## Track 1 - Infra (the shared blocker)
 
@@ -131,17 +139,26 @@ their churn. These audit items were judged defer-worthy, with rationale:
   under the single-failure-boundary rule), COR-8 i128-band balance drop (exotic amounts), COR-10 `_seq`
   20-bit `log_index` truncation (unreachable under current gas limits; add a debug-assert), SEC-7
   `WITH`-prefixed DML slipping the keyword gate (ephemeral in-memory only), SEC-8 sequential webhook
-  delivery (one slow sink throttles others - `for_each_concurrent`), SEC-9 roost `/metrics` is the
-  process global not per-nest (observability, bigger refactor).
+  delivery (one slow sink throttles others - `for_each_concurrent`).
+- **SEC-9 - resolved (2026-07-27), no longer deferred.** Roost `/metrics` used to be the process global
+  only; RFC-0026 added `{nest="…"}`-labelled series (`nuthatch_nest_last_block`,
+  `…_sealed_through`, `…_rows_decoded_total`, `…_rows_sealed_total`, `…_reorgs_total`, `…_health`,
+  `…_quarantine_total`, plus `nuthatch_cursor_live{chain}`), so a co-tenant roost is now attributable
+  per nest.
 
 ## Suggested sequencing
 
-1. **Decide the infra question** - is a colocated reth node worth provisioning now? It's the single
+1. **[RFC-0027](rfcs/0027-the-live-roost.md) - the live roost.** Buildable now, and the largest
+   operator-facing gap: today a roost's nest set is frozen at boot, so onboarding one tenant's nest
+   restarts every co-tenant's. Also the embedded half of 0022 §3, so it de-risks the distributed plane
+   without waiting on Postgres. Slice 1 (dynamic dispatch) is parity-testable and touches no lifecycle
+   semantics.
+2. **Decide the infra question** - is a colocated reth node worth provisioning now? It's the single
    unlock for 0003 + 0014 (the whole firehose-parity story). If yes, that's an ops track that runs in
    parallel with everything below.
-2. **Free, high-signal now:** the 0014 node-independent slice (calldata decode + `[extract]` config +
+3. **Free, high-signal now:** the 0014 node-independent slice (calldata decode + `[extract]` config +
    schemas + volume guard) - advances the last unstarted RFC without the node, fully testable.
-3. **Cheap wins:** the 0012 live-parity run (public RPC), then the Track-4 small increments as appetite
-   allows.
-4. **When scaled mode is real:** start 0013's DataFusion convergence scaled-side, behind the benchmark
+4. **Cheap wins, all live runs rather than code:** 0012's sustained parity run, 0021's two-chain run,
+   and 0019's S3 verification (public RPC and a VPS suffice), then the Track-4 small increments.
+5. **When scaled mode is real:** start 0013's DataFusion convergence scaled-side, behind the benchmark
    gate. Not before.

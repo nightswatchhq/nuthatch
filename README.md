@@ -199,7 +199,7 @@ default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.m
 
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0025); the north star and the CLI/UX direction are
+- **Design** lives in [RFCs](docs/rfcs/) (0001-0027); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
 - **Governance:** a grant-funded public good (NLnet / EF-ESP), AGPL-3.0. No hosted service, no token, no

@@ -67,7 +67,46 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
   we bundle. `reject_file_access` is the only thing stopping a file read. Comments corrected from
   "enforcement varies by version" to the measured fact, with a tripwire test that fails if a future
   bump makes the layer real.
-- **Next:** tier 3 remaining (4 more tests, `utoipa`/`arrow` bumps), then tier 4.
+- **Tier 3, item 6: done (2026-07-28, #155).** All four remaining tests landed - screen component
+  tamper, `fetch_shape` fail-open, cold-seed i128 overflow parity, and fixture-driven `abi.rs` response
+  parsing.
+- **Tier 3, item 7 + tier 4 item 10: partly done (2026-07-28, #157).** `getrandom` aligned and the
+  `deny.toml` cross-version parse quirk fixed. **Still open:** `utoipa` 4.x → 5.x and the `arrow` 56/58
+  dedupe.
+- **Tier 4, items 8 + 9: done** on `chore/audit-tail-did-and-docs` (L6 outbound-SSRF warn, L7
+  `Authorization: Bearer`, F-D3 segment-hash scope, F-C4 consistency, L4). **Not yet merged** - that
+  branch also edits `operators.md`, which tier 5 below rewrites; take the tier-5 version of that file
+  wholesale rather than reconciling hunks.
+- **CI (2026-07-28).** The footprint job takes its RPC from a secret; free public-RPC limits documented
+  in the README.
+- **Tier 5 (new, see below): in progress (2026-07-28).** Doc reconciliation.
+- **Next:** finish tier 5, cut **0.6.2**, then the two remaining deps bumps.
+
+## Tier 5 - doc reconciliation (added 2026-07-28)
+
+Added to sprint scope because a doc that misinforms is worse than no doc, and these are what an
+external operator reads first. **Ordered above tier 3's remaining deps bumps**: `utoipa` 4→5 is a
+breaking major that may not land inside the window, and docs must not be what slips.
+
+Blocked-on note: **cut 0.6.2 first if possible.** Both `prod-readiness.md` and `operators.md` have to
+state a version truth, and "the fix exists but is unreleased" expires the moment the tag lands.
+
+11. **`operators.md` rewritten and merged** ✅ - absorbed the platform-team material (division of
+    labour, sizing, observability + alerting, failure model, runbook, data lifecycle, known gaps,
+    go-live checklist) alongside the existing deploy recipes, MCP wiring and stability contract. Fixed
+    two wrong facts it had carried since RFC-0021: roosts described as same-chain-only, and the budget
+    described as per-runtime rather than per-cursor. A separate readiness doc was drafted and then
+    folded in - two files would have duplicated the guards table, the metrics list and the roost
+    description, which is exactly how the drift below happened.
+12. **Progress log** ✅ - one labelled catch-up entry for 2026-07-22 → 28 rather than eight
+    retrospectively fabricated per-push entries.
+13. **`backlog.md` + `prod-readiness.md`** ✅ - reconciled to 2026-07-28: RFC rows 0019-0027 added,
+    SEC-9 marked resolved (per-nest metrics landed with RFC-0026), the unreleased `/sql` fix recorded
+    as a release blocker, `/ready` semantics updated for RFC-0026, and the 0.x upgrade-path question
+    answered from the production 0.3.0 → 0.6.0 run.
+14. **Small items** ✅ - README RFC range, `bench query` documented in `benchmarks.md`, and RFC-0012's
+    dead `examples/roost` link (the directory was deliberately retired in `f154351`).
+15. **Still open:** the nest catalogue has no livepeer entry - deferred until that nest is committed.
 
 ## 🔴 Open: prod exposure of the `/sql` stacking hole
 
