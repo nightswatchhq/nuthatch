@@ -494,6 +494,55 @@ mod tests {
         Some(ScreenRuntime::load(wasm).unwrap())
     }
 
+    /// Tampering with a screening component must never be silent (issue #150).
+    ///
+    /// `component_hash` is recorded as the `source` on every compliance annotation the component
+    /// produces, so it is the provenance an auditor checks: "which code decided this address was
+    /// sanctioned?". If a modified component could load under the pristine hash, that record would be
+    /// a lie, and the annotations would be unattributable.
+    ///
+    /// Either outcome is correct - wasmtime refusing a corrupted binary, or the hash coming out
+    /// different - so the test asserts the disjunction. What must never happen is loading *and*
+    /// reporting the original hash.
+    #[test]
+    fn a_tampered_component_is_either_refused_or_visibly_different() {
+        let pristine = ScreenRuntime::embedded().expect("the embedded component must load");
+        let good_hash = pristine.component_hash().to_string();
+        assert_eq!(good_hash.len(), 64, "sha256, hex");
+
+        // The hash is a pure function of the bytes: loading twice agrees. (Determinism is the whole
+        // basis for using it as provenance.)
+        assert_eq!(
+            ScreenRuntime::embedded().unwrap().component_hash(),
+            good_hash
+        );
+
+        // Flip one bit in several places - the header, the middle, the tail - since where the damage
+        // lands decides whether wasmtime rejects it or it merely hashes differently.
+        let n = EMBEDDED_SCREEN.len();
+        for pos in [0, 4, n / 3, n / 2, n - 1] {
+            let mut tampered = EMBEDDED_SCREEN.to_vec();
+            tampered[pos] ^= 0x01;
+            assert_ne!(
+                tampered.as_slice(),
+                EMBEDDED_SCREEN,
+                "the fixture must actually differ"
+            );
+
+            match ScreenRuntime::from_bytes(&tampered) {
+                // Refused outright - wasmtime validated the binary and rejected it.
+                Err(_) => {}
+                // Loaded, so the hash MUST expose the change.
+                Ok(rt) => assert_ne!(
+                    rt.component_hash(),
+                    good_hash,
+                    "a modified component loaded while reporting the pristine hash (byte {pos}) - \
+                     annotations would be attributed to code that did not produce them"
+                ),
+            }
+        }
+    }
+
     /// Golden test (RFC-0008 C2 gate): a fixture list + fixture transfers → the exact hits, in the
     /// exact order. Only runs when the pure component is staged.
     #[test]
