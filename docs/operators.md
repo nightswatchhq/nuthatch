@@ -219,6 +219,59 @@ a config carrying a credential.
 
 ---
 
+## Running an unlisted EVM chain
+
+Ethereum mainnet, Arbitrum One and Base are **built in**: keyless public endpoints, a tuned
+`eth_getLogs` window, chain-appropriate finality, and bytecode probing so `init` can detect which of
+them a contract lives on.
+
+**Any other EVM chain also works** - it just has to be configured by hand. Teams have run nuthatch on
+World Chain (`480`) and Base Sepolia (`84532`) this way. The split is worth knowing exactly:
+
+| Command | Unlisted chain? |
+|---|---|
+| `dev`, `sql`, `bench`, `roost dev` | **yes** - chain-agnostic, falls back to defaults |
+| `init`, `add` | **no** - they refuse an unrecognised `--chain`/config chain with "unknown chain … cannot resolve ABIs" |
+
+So the working recipe is: scaffold nothing, write `nuthatch.toml` yourself, vendor the ABI, and run.
+
+```toml
+[nest]
+name = "my-nest"
+chain = "world-chain"        # any label you like - it is not looked up for an unlisted chain
+chain_id = 480               # MUST match what your endpoints report; verified at startup
+rpc_urls = ["https://your-endpoint.example"]
+schema_version = 1
+
+[[contracts]]
+alias = "router"
+address = "0x…"
+start_block = 1234567        # no bytecode probing here, so supply it yourself
+abi = "abis/router.json"     # vendor the ABI by hand; Sourcify/Etherscan lookup is chain-gated
+events = ["Swapped"]         # optional allowlist
+```
+
+Then `nuthatch dev --dir .` as usual. Everything downstream - decode, sealing, `/sql`, views, MCP,
+roosts, bundles - is chain-agnostic and behaves exactly as it does on a built-in chain.
+
+**Two caveats that are easy to miss:**
+
+1. **You inherit default finality and window.** An unlisted chain gets `Depth(64)` finality and a
+   **20-block** `eth_getLogs` window, because nuthatch has no per-chain policy for it. Depth-64 is the
+   Ethereum-L1-shaped assumption; if your chain finalises differently - a fast L2, or one with deeper
+   reorgs - that default is a guess, and the conservative direction is *deeper*. The 20-block window is
+   deliberately small and will make a long backfill crawl: raise it with `--window` (a sparse contract
+   can often take 50000) up to whatever your provider's range cap allows.
+2. **`chain_id` is enforced.** Every endpoint in `rpc_urls` is checked against it at startup and a
+   mismatch is refused, because indexing against the wrong chain corrupts state silently. Get the id
+   right and the pool stays honest; get it wrong and nuthatch tells you immediately rather than three
+   days into a backfill.
+
+If you are running an unlisted chain in anger, say so - a chain with real usage is a candidate for the
+built-in registry, which is where the tuned window and finality policy come from.
+
+---
+
 ## The service surface
 
 Per-nest routes. In a roost they are prefixed: `/<name>/sql`, `/<name>/tables`, and so on.

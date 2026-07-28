@@ -53,8 +53,17 @@ cargo install --git https://github.com/nuthatch-indexer/nuthatch nuthatch
 ```
 
 Prebuilt binaries (macOS Apple Silicon, Linux x86_64) ship with each release, or install in one line:
-`curl -fsSL https://nuthatch-indexer.com/install.sh | sh`. Chains: Ethereum, Arbitrum One, and Base - **omit `--chain` and nuthatch probes each
-for your contract's bytecode and picks the one it lives on.** Point at your own node with `--rpc`.
+`curl -fsSL https://nuthatch-indexer.com/install.sh | sh`.
+
+**Chains.** Ethereum, Arbitrum One and Base are *built in*, with keyless public endpoints and tuned
+finality settings - **omit `--chain` and nuthatch probes each for your contract's bytecode and picks the
+one it lives on.** Point at your own node with `--rpc`.
+
+**Any other EVM chain works too** - World Chain, Base Sepolia, your own devnet - by supplying the chain
+id and an RPC endpoint yourself. See
+[running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain); the short version is
+that `dev`, `sql` and `bench` are chain-agnostic, while `init` currently only scaffolds the three
+built-in chains, so an unlisted chain means writing `nuthatch.toml` by hand (a dozen lines).
 
 ### A word on the free public RPCs
 
@@ -219,11 +228,23 @@ layer; nuthatch ships the *guards* (query timeout, row cap, result-byte cap, con
 filesystem-access denylist on `/sql`) and *signals* (`/metrics`) that make fronting it safe. It binds `127.0.0.1` by
 default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.md`](docs/operators.md).
 
-- **Footprint:** ≤2 GB RAM single-chain, single static binary, graceful SIGTERM shutdown with
+- **Footprint:** ≤2 GB RAM per active-chain cursor, single static binary, graceful SIGTERM shutdown with
   checkpointed resume.
 - **Durability:** content-addressed segments are safe to copy while running; back up the nest directory.
 - **`dev` is the serve command** - it backfills, follows the tip, and serves in one process.
-  Copy-paste **systemd** and **Docker** recipes are in [`docs/operators.md`](docs/operators.md#deploy-recipes-copy-paste).
+  Copy-paste **systemd** and **Docker** recipes are in [`docs/operators.md`](docs/operators.md#deploy-recipes).
+
+**[`docs/operators.md`](docs/operators.md) is the full operating guide**, and worth reading before you
+run this for real rather than after. It covers the questions people actually hit:
+
+| If you're wondering | Go to |
+|---|---|
+| how do I tune backfill against my RPC's limits? | [configuration surface](docs/operators.md#configuration-surface) - `--window`, `--concurrency`, `--seal-direct` |
+| what do I scrape, and what should page me? | [observability](docs/operators.md#observability) - metrics, alerts, health vs readiness |
+| what happens when something breaks? | [the failure model](docs/operators.md#the-failure-model) and the [runbook](docs/operators.md#runbook) |
+| how do I back this up? | [data lifecycle](docs/operators.md#data-lifecycle) |
+| how do I run an unlisted chain? | [running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain) |
+| what isn't finished yet? | [known gaps](docs/operators.md#known-gaps) - stated plainly |
 
 ---
 
