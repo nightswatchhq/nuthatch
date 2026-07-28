@@ -179,7 +179,7 @@ fn map_io_err(e: std::io::Error, subject: &str, path: &Path) -> anyhow::Error {
 
 /// Open a store from a `--registry` locator by scheme:
 /// - `s3://bucket/prefix` (and `memory://…` for tests) → the object-store backend ([`ObjStore`],
-///   requires a build with `--features object-store`).
+///   built in by default; `--no-default-features` removes it).
 /// - `http(s)://…` → a *remote index* registry, not built yet - refused loudly (a raw `http` URL to a
 ///   `.bundle` is still `nest load <url>`, RFC-0012, not a registry).
 /// - anything else (a path, or `file://…`) → the filesystem store ([`FsStore`]).
@@ -202,8 +202,9 @@ fn open_object_store(locator: &str) -> Result<Box<dyn BundleStore>> {
 #[cfg(not(feature = "object-store"))]
 fn open_object_store(_locator: &str) -> Result<Box<dyn BundleStore>> {
     bail!(
-        "object-store registries (s3://…) need a build with `--features object-store` - the default \
-         binary ships only the filesystem registry"
+        "object-store registries (s3://…) need the `object-store` feature. It ships **on** by \
+         default, so this binary was built with `--no-default-features` (or an explicit feature list \
+         that omits it) - rebuild with the default features, or use a filesystem registry path"
     )
 }
 

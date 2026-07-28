@@ -60,11 +60,18 @@ object_store = { version = "0.12", optional = true, features = ["aws"] }
 url = { version = "2", optional = true }
 
 [features]
+# The S3 registry ships **on**. It was off by default until 2026-07-28, which meant the released
+# binary and the container image answered `--registry s3://…` with "needs a build with
+# `--features object-store`" - so for anyone who did not build from source, the object-store backend
+# the docs advertise simply did not exist. Measured cost of enabling it: **two** lines of dependency
+# tree, because `object_store` is already compiled (via dbsp/feldera-storage) and `url` is already
+# present; the feature only adds the `aws` transport on top of a crate we were building anyway.
+default = ["object-store"]
 # ExEx tip-ingestion source (colocated reth). Stubbed today - see docs/exex-design.md - so the
 # default build never pulls the (enormous) reth dependency.
 exex = []
-# Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Off by default - the FsStore
-# registry needs no extra deps; enable this for the fleet path (`--registry s3://…`).
+# Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Kept as a named feature so a
+# build that genuinely wants it gone can `--no-default-features`.
 object-store = ["dep:object_store", "dep:url"]
 
 [dev-dependencies]

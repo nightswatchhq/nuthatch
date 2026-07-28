@@ -187,7 +187,7 @@ pub enum NestWhat {
     /// Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The
     /// registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage
     /// (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with
-    /// `--features object-store`). A self-built bundle and `nest load <file|dir>` never need one.
+    /// on by default). A self-built bundle and `nest load <file|dir>` never need one.
     /// Prints the content address.
     Publish(NestPublishArgs),
     /// Classify an update between two nests as compatible or breaking (RFC-0020). Compatible = additive
@@ -232,7 +232,7 @@ pub struct NestLoadArgs {
     pub expect: Option<String>,
 
     /// Resolve the positional as a `name[@version]` reference against this registry (RFC-0019). A
-    /// filesystem path, or `s3://bucket/prefix` with `--features object-store`. The pulled blob is
+    /// filesystem path, or `s3://bucket/prefix` (S3/MinIO/R2, via the usual `AWS_*` env). The pulled blob is
     /// hash-verified on install.
     #[arg(long)]
     pub registry: Option<String>,
@@ -244,7 +244,7 @@ pub struct NestPublishArgs {
     pub bundle: String,
 
     /// The registry to publish to (RFC-0019). A filesystem path, or `s3://bucket/prefix` with
-    /// `--features object-store` (configured via the usual `AWS_*` env).
+    /// configured via the usual `AWS_*` env (S3/MinIO/R2).
     #[arg(long)]
     pub registry: String,
 

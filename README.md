@@ -208,7 +208,8 @@ who need more - none of it in the way of the happy path:
   --registry <path|s3://…> --as name@version`, then `nest load name@version --registry …` - a filesystem
   path or any S3-compatible bucket (MinIO/S3/R2, via `AWS_*` env), with **private nests** behind your
   bucket's auth. Self-hosted-first: the registry is decoupled and never mandatory - a self-built bundle
-  and `load <file|dir>` need no registry at all. (S3 backend: build with `--features object-store`.)
+  and `load <file|dir>` need no registry at all. S3/MinIO/R2 is built in - configure it with the usual
+  `AWS_*` env (`AWS_ENDPOINT` for non-AWS), verified live against Hetzner Object Storage.
 - **Safe upgrades - no resync tax** (RFC-0020). `nuthatch nest diff <old> <new>` classifies a nest
   update as *compatible* (additive only) or *breaking* (a consumer-observable change); `nuthatch nest
   upgrade --to <new>` then handles either kind. A **compatible** update is **hot-swapped with zero
