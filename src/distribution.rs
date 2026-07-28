@@ -332,8 +332,18 @@ mod object_store_impl {
             }
             let url = url::Url::parse(locator)
                 .with_context(|| format!("parsing registry URL {locator:?}"))?;
-            // parse_url_opts applies env-based config (region, keys, AWS_ENDPOINT for MinIO/R2).
-            let (store, path) = object_store::parse_url_opts(&url, std::env::vars())
+            // `parse_url_opts` matches option keys **case-sensitively and in lower case**, while every
+            // operator on earth exports the AWS convention in upper case (`AWS_ACCESS_KEY_ID`). Passing
+            // `std::env::vars()` raw therefore matched nothing: credentials were silently ignored and
+            // the S3 client fell through to EC2 instance metadata, spending ~5s on ten retries against
+            // 169.254.169.254 before failing with "Host is down" - an error naming an address the
+            // operator never configured.
+            //
+            // Found by the RFC-0019 live verification against Hetzner Object Storage; the backend was
+            // effectively unusable as documented, including by our own error text ("check your AWS_*
+            // env"). Lower-casing the keys is the whole fix.
+            let opts = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+            let (store, path) = object_store::parse_url_opts(&url, opts)
                 .with_context(|| format!("opening object-store registry {locator:?}"))?;
             Ok(ObjStore {
                 inner: Arc::from(store),
@@ -653,6 +663,45 @@ abi = "abis/c.json"
         assert_eq!(store.get_ref("horizon", "latest").await.unwrap(), hash);
         // Unknown ref fails loudly.
         assert!(store.get_ref("horizon", "9.9.9").await.is_err());
+    }
+
+    /// The AWS convention is **upper case** (`AWS_ACCESS_KEY_ID`), but `object_store::parse_url_opts`
+    /// matches option keys in lower case. Handing it `std::env::vars()` raw therefore matched nothing:
+    /// credentials were silently dropped, the client fell through to EC2 instance metadata, and the
+    /// operator got a five-second stall and "Host is down (os error 64)" naming 169.254.169.254 - an
+    /// address they never configured.
+    ///
+    /// Found by the RFC-0019 live verification against Hetzner Object Storage. Every operator sets the
+    /// upper-case form; our own error text tells them to ("check your AWS_* env"). This pins the
+    /// lower-casing so the backend cannot silently become unusable again.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn upper_case_aws_env_is_recognised_as_object_store_config() {
+        use object_store::aws::AmazonS3ConfigKey;
+        use std::str::FromStr;
+
+        // What we now pass to `parse_url_opts`, in miniature.
+        let lower = |k: &str| k.to_ascii_lowercase();
+
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ENDPOINT",
+            "AWS_REGION",
+        ] {
+            assert!(
+                AmazonS3ConfigKey::from_str(&lower(key)).is_ok(),
+                "{key} must be recognised once lower-cased - it is what every operator exports"
+            );
+            // And the raw upper-case form is *not* recognised, which is the bug this guards.
+            assert!(
+                AmazonS3ConfigKey::from_str(key).is_err(),
+                "{key} parsing upper-case would mean this guard is no longer needed - re-check the fix"
+            );
+        }
+
+        // Unrelated environment (PATH, HOME, …) must stay ignored rather than becoming config.
+        assert!(AmazonS3ConfigKey::from_str(&lower("PATH")).is_err());
     }
 
     #[cfg(not(feature = "object-store"))]
