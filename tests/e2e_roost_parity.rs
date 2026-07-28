@@ -132,7 +132,7 @@ async fn roost_is_byte_identical_to_solo() {
     let rcfg_u = scaffold_nest(roost_u.path(), "usdc", USDC);
     let rcfg_a = scaffold_nest(roost_a.path(), "arb", ARB);
 
-    let (states, roost_ingest, roost_workers) = indexer::spawn_roost(
+    let cursor = indexer::spawn_roost(
         roost_tape.clone(),
         vec![
             ("usdc".to_string(), roost_u.path().to_path_buf(), rcfg_u),
@@ -151,6 +151,8 @@ async fn roost_is_byte_identical_to_solo() {
     )
     .await
     .expect("spawn_roost");
+    let (states, roost_ingest, roost_workers) =
+        (cursor.states, cursor.ingest, cursor.alert_workers);
 
     let store_of = |name: &str| -> Store {
         states
@@ -192,7 +194,7 @@ async fn roost_is_byte_identical_to_solo() {
     rt_u.ingest.abort();
     rt_a.ingest.abort();
     roost_ingest.abort();
-    for w in roost_workers {
+    for (_, w) in roost_workers {
         w.abort();
     }
 }
