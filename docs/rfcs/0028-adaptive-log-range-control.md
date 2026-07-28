@@ -75,6 +75,25 @@ whole design - get it wrong and we shrink on network blips or spin forever on an
 | **Transient** | HTTP `5xx`, connection/timeout errors, and **plain `429` with no size evidence** | current behaviour: fail over to the next endpoint, retry at the same width |
 | **Terminal for that endpoint** | HTTP `401`/`403`, "method not supported", "invalid API key" | mark the endpoint unhealthy and stop sending to it; **never** retry it in a tight loop |
 
+**Measured, not recalled (2026-07-28, Alchemy eth-mainnet).** Two of these classes were probed directly
+rather than assumed:
+
+```
+# oversized range: USDC, 65,536 blocks, no topic filter
+{"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with
+ up to a 10,000 block range and no limit on the response size, or you can request any block range with
+ a cap of 10K logs in the response. Based on your parameters and the response size limit, this block
+ range should work: [0x1000000, 0x1007fff]"}}
+
+# bad api key
+HTTP 401  {"error":{"code":-32600,"message":"Must be authenticated!"}}
+```
+
+Two things fall out. First, **`-32602` is generic "invalid params"** - the code alone cannot classify,
+so message matching is required, which is why the table above lists text patterns rather than codes.
+Second, the auth failure carries **HTTP 401**, so the terminal class is detectable from the HTTP status
+before any JSON parsing. Both classes are cheaply and reliably distinguishable; this is not guesswork.
+
 Two rulings that are not obvious:
 
 **`429` is transient first, narrowable second.** A rate limit usually means "you asked too often", but
@@ -126,8 +145,20 @@ mutation-checked test.
 providers). A window learned against a strict endpoint should not penalise a permissive one. Each
 endpoint carries its own effective window, initialised to the configured ceiling.
 
-**Narrow multiplicatively, widen additively.** Halve on a narrowable error; after `K` consecutive
-successes at the current width, widen by a fixed increment rather than doubling. Multiplicative
+**Take the provider's answer when it gives one.** The measured Alchemy refusal in §3 does not merely say
+"too big" - it says *"this block range should work: [0x1000000, 0x1007fff]"*. That is authoritative and
+precise, and blind halving toward it would waste `log2(n)` round trips rediscovering what we were just
+told. So: **if a narrowable error carries a suggested range, jump straight to it**; fall back to halving
+only when no hint is offered. The hint is parsed defensively (a suggestion wider than what we asked for,
+or malformed, is ignored in favour of halving) because it is provider text, not a contract.
+
+This turns the common case from a shrinking search into a single corrective retry, and it means a
+first-run backfill against a strict provider converges almost immediately rather than after a visible
+stall. It also generalises: any provider that names a workable range gets the same treatment, and any
+that does not still works via halving.
+
+**Narrow multiplicatively, widen additively.** Halve on a narrowable error with no usable hint; after `K`
+consecutive successes at the current width, widen by a fixed increment rather than doubling. Multiplicative
 decrease reacts fast to a wall; additive increase stops the width oscillating between "rejected" and
 "accepted" forever. This is AIMD, for the same reason TCP uses it.
 
@@ -162,8 +193,9 @@ Adaptive behaviour that is invisible is indistinguishable from a mystery slowdow
 
 ## 7. Non-goals
 
-- **Provider-specific pagination APIs.** Some providers offer cursors or block-range hints. Honouring a
-  standard `error.data` hint if one is present is in scope; per-vendor protocols are not.
+- **Provider-specific pagination protocols.** Some providers offer cursor-based log pagination. Parsing
+  a suggested block range out of an error message (§5) is in scope because it is cheap, defensive and
+  vendor-neutral in shape; adopting a vendor's bespoke pagination protocol is not.
 - **Changing the tip loop in the first slices.** COR-5 is real, but the tip loop is sensitive and the
   backfill path carries the reported pain. The tip loop gets the same machinery in a later, deliberate
   slice.
