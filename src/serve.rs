@@ -201,6 +201,21 @@ pub async fn run_roost(
     nests: Vec<(String, AppState)>,
     health: Arc<crate::health::RoostHealth>,
 ) -> Result<()> {
+    let live = LiveRoost::new(compose_roost(roster, nests, health));
+    bind_and_serve(listen, live.service()).await
+}
+
+/// Compose the roost's routes for a given nest set: the root endpoints plus every nest nested under
+/// its `/<name>` prefix.
+///
+/// Split out of [`run_roost`] so the set can be re-composed at runtime (RFC-0027). Routing semantics
+/// are unchanged from the static version - still `Router::nest` - which is what makes the parity test
+/// meaningful rather than a tautology.
+fn compose_roost(
+    roster: serde_json::Value,
+    nests: Vec<(String, AppState)>,
+    health: Arc<crate::health::RoostHealth>,
+) -> Router {
     let roster = Arc::new(roster);
     let roster_health = health.clone();
     let ready_health = health.clone();
@@ -232,7 +247,60 @@ pub async fn run_roost(
         // `/lodestar/sql`, `/lodestar/_admin/` … all resolve to that nest's isolated state.
         app = app.nest(&format!("/{name}"), router(SharedNest::new(state)));
     }
-    bind_and_serve(listen, app).await
+    app
+}
+
+/// A roost's routes behind a swappable handle (RFC-0027 slice 1).
+///
+/// Today a roost's nest set is frozen at boot: `axum::Router` is composed before it is served and has
+/// no insertion point afterwards, so adding or removing a nest means restarting the process - which
+/// stops every *co-tenant* nest too. That makes the blast radius of a configuration change larger than
+/// the blast radius of a fault, which RFC-0026 already fixed.
+///
+/// This holds the composed router in an [`arc_swap::ArcSwap`] and serves a thin outer router that
+/// delegates every request to whatever is current. Swapping the whole composed router - rather than
+/// dispatching on the first path segment by hand - keeps `Router::nest` doing the routing, so the
+/// serving semantics are *identical* to the static path by construction rather than by careful
+/// re-implementation. Re-composition is rare (a mount or unmount), so rebuilding is not a hot path.
+///
+/// **Slice 1 changes no behaviour**: nothing calls [`LiveRoost::swap`] yet. It exists so the lifecycle
+/// slices have somewhere to stand, and so the parity test can prove the indirection is free.
+pub struct LiveRoost {
+    current: Arc<arc_swap::ArcSwap<Router>>,
+}
+
+impl LiveRoost {
+    pub fn new(router: Router) -> Self {
+        Self {
+            current: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
+        }
+    }
+
+    /// Replace the served routes. The next request sees the new set; requests already in flight
+    /// complete against the router they started on.
+    pub fn swap(&self, router: Router) {
+        self.current.store(Arc::new(router));
+    }
+
+    /// The router to serve: a fallback that resolves the current composition per request.
+    pub fn service(&self) -> Router {
+        let current = self.current.clone();
+        Router::new().fallback(move |req: axum::extract::Request| {
+            let current = current.clone();
+            async move {
+                use tower::ServiceExt;
+                // `Router::clone` is cheap (its state is behind an `Arc`), and `oneshot` drives this
+                // request through the composed router exactly as `axum::serve` would have.
+                let router = (**current.load()).clone();
+                match router.oneshot(req).await {
+                    Ok(resp) => resp,
+                    // `Router`'s error type is `Infallible`, so this is unreachable; matching keeps it
+                    // honest rather than unwrapping.
+                    Err(e) => match e {},
+                }
+            }
+        })
+    }
 }
 
 /// Merge each roster entry's live health into the startup snapshot (RFC-0026 §5). A nest that is
@@ -1147,6 +1215,110 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             roost_health: None,
         }
+    }
+
+    /// Drive one GET through a router and return `(status, body bytes)` - the whole observable
+    /// response, so a parity assertion cannot pass on status alone.
+    async fn get(router: Router, path: &str) -> (StatusCode, Vec<u8>) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
+    }
+
+    /// A two-nest roost composition, built the same way `run_roost` builds one.
+    fn two_nest_roost(dir: &std::path::Path, health: Arc<crate::health::RoostHealth>) -> Router {
+        let roster = json!({"roost": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
+        let nests = vec![
+            ("alpha".to_string(), test_state(&dir.join("a"), 4)),
+            ("beta".to_string(), test_state(&dir.join("b"), 4)),
+        ];
+        compose_roost(roster, nests, health)
+    }
+
+    /// RFC-0027 slice 1: serving through the swappable handle must be **indistinguishable** from
+    /// serving the composed router directly.
+    ///
+    /// This is the whole point of slice 1. The lifecycle slices are only safe to build on top of an
+    /// indirection that provably changes nothing, and "it looked fine when I clicked around" is not
+    /// that proof - so every root route, a per-nest route under its prefix, and a 404 are compared
+    /// **status and body bytes**, both ways.
+    #[tokio::test]
+    async fn the_dispatcher_serves_byte_identically_to_the_static_router() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        let health = Arc::new(crate::health::RoostHealth::new());
+        health.register("alpha", "mainnet");
+        health.register("beta", "mainnet");
+
+        for path in [
+            "/health",
+            "/ready",
+            "/nests",
+            "/alpha/health",
+            "/beta/health",
+            "/alpha/ready",
+            "/nope",         // 404 at the root
+            "/alpha/nope",   // 404 within a mounted nest
+            "/gamma/health", // 404 for a nest that isn't mounted
+        ] {
+            let direct = get(two_nest_roost(tmp.path(), health.clone()), path).await;
+            let dispatched = get(
+                LiveRoost::new(two_nest_roost(tmp.path(), health.clone())).service(),
+                path,
+            )
+            .await;
+            assert_eq!(
+                direct, dispatched,
+                "{path} must be identical through the dispatcher; got {direct:?} vs {dispatched:?}"
+            );
+        }
+    }
+
+    /// The capability slice 1 exists to enable, proven now so the lifecycle slices inherit it rather
+    /// than discover it: swapping the composition changes what is served, without rebinding anything.
+    #[tokio::test]
+    async fn swapping_the_composition_changes_what_is_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        let health = Arc::new(crate::health::RoostHealth::new());
+        health.register("alpha", "mainnet");
+        health.register("beta", "mainnet");
+
+        let live = LiveRoost::new(two_nest_roost(tmp.path(), health.clone()));
+        let (status, _) = get(live.service(), "/beta/health").await;
+        assert_eq!(status, StatusCode::OK, "beta is mounted to begin with");
+
+        // Re-compose with beta absent - the shape an unmount will take.
+        //
+        // The replacement `alpha` state opens a *different* store directory, because redb is
+        // single-writer and the original composition still holds `a/t.redb`. That is not a test
+        // artefact: it is exactly why RFC-0027 §6 makes unmount a **drain** - the old nest's store has
+        // to be closed cleanly before anything reopens it, and a half-closed store is the one way a
+        // lifecycle operation could corrupt data that faults never do.
+        std::fs::create_dir_all(tmp.path().join("a2")).unwrap();
+        let roster = json!({"roost": "t", "nests": [{"name": "alpha"}]});
+        let only_alpha = compose_roost(
+            roster,
+            vec![("alpha".to_string(), test_state(&tmp.path().join("a2"), 4))],
+            health.clone(),
+        );
+        live.swap(only_alpha);
+
+        let (alpha, _) = get(live.service(), "/alpha/health").await;
+        let (beta, _) = get(live.service(), "/beta/health").await;
+        assert_eq!(alpha, StatusCode::OK, "alpha keeps serving across the swap");
+        assert_eq!(beta, StatusCode::NOT_FOUND, "beta is gone from the new set");
     }
 
     /// RFC-0026 §5: the roster is a *live* view. The static half is computed at startup, but health is
