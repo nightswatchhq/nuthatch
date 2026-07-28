@@ -34,6 +34,135 @@ pub fn merge_rpcs(preferred: &[String], fallback: impl IntoIterator<Item = Strin
 /// outage fails over fast instead of stalling the tip loop.
 const ENDPOINT_COOLDOWN_MS: u64 = 30_000;
 
+/// A *terminal* failure (bad credentials, endpoint refusing us outright) earns a much longer cooldown
+/// than a transient one: asking again in 30s will get the same 401, and a tight retry loop against a
+/// 403 is exactly how a production nest spent forty minutes logging nothing useful (RFC-0028 §3).
+///
+/// Deliberately a long cooldown rather than permanent removal: an endpoint whose auth blips - a key
+/// rotation, a provider incident - recovers on its own, and degrading beats failing. Five minutes
+/// matches RFC-0026's backoff cap, so the two "something is wrong, back off" policies agree.
+const TERMINAL_COOLDOWN_MS: u64 = 300_000;
+
+/// How an RPC failure should be treated (RFC-0028 §3). The classification is the whole point: treat a
+/// too-large request like a dead endpoint and you fail over pointlessly; treat a bad API key like a
+/// blip and you retry it forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FailureClass {
+    /// The *request* was too big. Retry the same block range at a narrower width. `suggested` carries
+    /// a provider-offered range when one was parsed out of the error - Alchemy, for one, names the
+    /// range that would have worked, which beats halving blindly toward it.
+    ///
+    /// Slice 1 classifies this; acting on it is slice 3.
+    Narrowable { suggested: Option<(u64, u64)> },
+    /// The request is fine, this endpoint is having a moment. Fail over, retry at the same width.
+    Transient,
+    /// This endpoint will not serve us until something changes outside the process. Long cooldown,
+    /// and say so loudly.
+    Terminal,
+}
+
+/// An RPC failure carrying its classification, so `call`/`post_with_failover` can branch on *why* a
+/// call failed instead of treating every failure as a transient blip.
+#[derive(Debug)]
+pub(crate) struct ClassifiedError {
+    pub class: FailureClass,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ClassifiedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for ClassifiedError {}
+
+/// Classify an HTTP-level failure. Auth is terminal; a payload-too-large is about the request; the
+/// rest are someone else's problem and worth trying elsewhere.
+///
+/// `429` is deliberately **transient**, not narrowable: a rate limit usually means "you asked too
+/// often", not "you asked for too much", and shrinking the window would degrade throughput for what is
+/// really a pacing problem. Escalating a pool-wide 429 on the same window to narrowable is slice 3.
+pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
+    match status {
+        401 | 403 => FailureClass::Terminal,
+        413 => FailureClass::Narrowable {
+            suggested: suggested_range(body),
+        },
+        _ => FailureClass::Transient,
+    }
+}
+
+/// Classify a JSON-RPC `error` object returned with HTTP 200 - which is how most providers actually
+/// report both "too many logs" and "authenticate first".
+///
+/// Matching is on the **message**, not the code: the measured Alchemy refusal for an oversized range
+/// carries `-32602`, which is the generic "invalid params" code and cannot distinguish a size refusal
+/// from a genuinely malformed filter (RFC-0028 §3).
+pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    const NARROWABLE: &[&str] = &[
+        "response size exceeded",
+        "query returned more than",
+        "more than 10000 results",
+        "block range is too wide",
+        "block range too large",
+        "exceeds the max",
+        "too many results",
+        "limit exceeded",
+        "query timeout exceeded",
+    ];
+    const TERMINAL: &[&str] = &[
+        "must be authenticated",
+        "authenticate with an api key",
+        "invalid api key",
+        "unauthorized",
+        "forbidden",
+        "project id",
+    ];
+
+    if NARROWABLE.iter().any(|p| msg.contains(p)) {
+        return FailureClass::Narrowable {
+            suggested: suggested_range(
+                err.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default(),
+            ),
+        };
+    }
+    if TERMINAL.iter().any(|p| msg.contains(p)) {
+        return FailureClass::Terminal;
+    }
+    FailureClass::Transient
+}
+
+/// Pull a provider-suggested block range out of an error message.
+///
+/// Alchemy answers an oversized `eth_getLogs` with *"…this block range should work: [0x1000000,
+/// 0x1007fff]"*. That is authoritative and precise, so honouring it turns a shrinking search into one
+/// corrective retry (RFC-0028 §5).
+///
+/// Parsed defensively - this is provider prose, not a contract. A malformed or inverted pair yields
+/// `None` and the caller falls back to halving. Whether the range is actually *narrower* than what we
+/// asked for is the caller's check, since only the caller knows what it asked for.
+pub(crate) fn suggested_range(msg: &str) -> Option<(u64, u64)> {
+    let open = msg.find('[')?;
+    let close = msg[open..].find(']')? + open;
+    let (a, b) = msg[open + 1..close].split_once(',')?;
+    let parse = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+        u64::from_str_radix(s, 16).ok()
+    };
+    let (from, to) = (parse(a)?, parse(b)?);
+    (from <= to).then_some((from, to))
+}
+
 pub struct RpcClient {
     http: reqwest::Client,
     urls: Vec<String>,
@@ -117,6 +246,36 @@ impl RpcClient {
         self.health[j].store(now_millis() + ENDPOINT_COOLDOWN_MS, Ordering::Relaxed);
     }
 
+    /// Cool an endpoint down for the *terminal* interval and say so at `warn!` (RFC-0028 §3).
+    ///
+    /// The log level is the point as much as the interval. Endpoint failures are logged at `debug!`,
+    /// which is right for a blip and wrong for "your credentials are rejected" - the latter is
+    /// actionable, and an operator should not have to raise the log level to discover it.
+    fn mark_terminal(&self, j: usize, method: &str, detail: &str) {
+        self.health[j].store(now_millis() + TERMINAL_COOLDOWN_MS, Ordering::Relaxed);
+        tracing::warn!(
+            "rpc {} refused us on {method} ({detail}) - not a transient failure; \
+             cooling it down for {}s. Check the endpoint's credentials or plan.",
+            redact_url(&self.urls[j]),
+            TERMINAL_COOLDOWN_MS / 1000,
+        );
+    }
+
+    /// Route a failed call to the right cooldown, per its classification. An unclassified error
+    /// (nothing downcasts) is treated as transient, which is the pre-RFC-0028 behaviour.
+    fn record_failure(&self, j: usize, method: &str, err: &anyhow::Error) {
+        match err.downcast_ref::<ClassifiedError>().map(|c| &c.class) {
+            Some(FailureClass::Terminal) => self.mark_terminal(j, method, &err.to_string()),
+            _ => {
+                self.mark_unhealthy(j);
+                tracing::debug!(
+                    "rpc {} failed for {method}: {err:#}",
+                    redact_url(&self.urls[j])
+                );
+            }
+        }
+    }
+
     /// Try endpoints in health order until one answers; a failed endpoint is put into cooldown, a
     /// successful one is cleared.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -131,8 +290,7 @@ impl RpcClient {
                     return Ok(v);
                 }
                 Err(e) => {
-                    self.mark_unhealthy(j);
-                    tracing::debug!("rpc {} failed for {method}: {e:#}", redact_url(url));
+                    self.record_failure(j, method, &e);
                     last_err = e;
                 }
             }
@@ -154,8 +312,7 @@ impl RpcClient {
                     return Ok(v);
                 }
                 Err(e) => {
-                    self.mark_unhealthy(j);
-                    tracing::debug!("rpc {} failed for batch: {e:#}", redact_url(url));
+                    self.record_failure(j, "batch", &e);
                     last_err = e;
                 }
             }
@@ -163,16 +320,39 @@ impl RpcClient {
         Err(last_err)
     }
 
+    /// POST `body` and parse the response, attaching a [`FailureClass`] to any failure (RFC-0028 §3).
+    ///
+    /// Replaces the old `send().await?.error_for_status()?.json().await?` chain, which collapsed every
+    /// failure mode into an indistinguishable `anyhow::Error` - so a bad API key and a momentary 503
+    /// were handled identically, and the former was retried until someone noticed.
+    async fn send_classified(&self, url: &str, body: &Value) -> Result<Value> {
+        let classified = |class: FailureClass, detail: String| {
+            anyhow::Error::new(ClassifiedError { class, detail })
+        };
+        let resp =
+            self.http.post(url).json(body).send().await.map_err(|e| {
+                classified(FailureClass::Transient, format!("transport error: {e}"))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Read the body before classifying: a 413 can carry a suggested range, and the text is
+            // what makes an otherwise opaque status actionable in the log.
+            let text = resp.text().await.unwrap_or_default();
+            let class = classify_status(status.as_u16(), &text);
+            let mut detail = format!("HTTP {status}");
+            if !text.is_empty() {
+                let snippet: String = text.chars().take(300).collect();
+                detail.push_str(&format!(": {snippet}"));
+            }
+            return Err(classified(class, detail));
+        }
+        resp.json::<Value>()
+            .await
+            .map_err(|e| classified(FailureClass::Transient, format!("malformed response: {e}")))
+    }
+
     async fn post_one(&self, url: &str, body: &Value) -> Result<Value> {
-        let resp: Value = self
-            .http
-            .post(url)
-            .json(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp: Value = self.send_classified(url, body).await?;
         // A whole-batch rejection - e.g. a keyless endpoint answering HTTP 200 with
         // `{"error":{"message":"authenticate with an API key"}}` instead of the expected array - comes
         // back as a single object with a top-level `error`. Treat it as an endpoint failure so
@@ -181,24 +361,22 @@ impl RpcClient {
         // confusing non-error. (Per-item errors inside a normal array response stay the caller's to
         // handle.)
         if let Some(err) = resp.get("error") {
-            bail!("rpc error (endpoint rejected the batch): {err}");
+            return Err(anyhow::Error::new(ClassifiedError {
+                class: classify_rpc_error(err),
+                detail: format!("rpc error (endpoint rejected the batch): {err}"),
+            }));
         }
         Ok(resp)
     }
 
     async fn call_one(&self, url: &str, method: &str, params: &Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp: Value = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp: Value = self.send_classified(url, &body).await?;
         if let Some(err) = resp.get("error") {
-            bail!("rpc error: {err}");
+            return Err(anyhow::Error::new(ClassifiedError {
+                class: classify_rpc_error(err),
+                detail: format!("rpc error: {err}"),
+            }));
         }
         resp.get("result")
             .cloned()
@@ -565,6 +743,160 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// An endpoint that rejects our credentials: HTTP 401 with the shape a real provider returns
+    /// (measured against Alchemy, 2026-07-28). Distinct from `broken_rpc`'s 500 precisely because
+    /// RFC-0028 says these two must **not** be treated the same.
+    async fn unauthorized_rpc() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::json;
+        async fn handler() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    json!({"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Must be authenticated!"}}),
+                ),
+            )
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// The measured Alchemy refusal for an oversized `eth_getLogs` (2026-07-28). Kept verbatim so the
+    /// classifier is tested against a real provider's words rather than our paraphrase of them.
+    const ALCHEMY_OVERSIZED: &str =
+        "Log response size exceeded. You can make eth_getLogs requests \
+         with up to a 10,000 block range and no limit on the response size, or you can request any \
+         block range with a cap of 10K logs in the response. Based on your parameters and the \
+         response size limit, this block range should work: [0x1000000, 0x1007fff]";
+
+    #[test]
+    fn a_provider_suggested_range_is_parsed_from_the_error_text() {
+        assert_eq!(
+            super::suggested_range(ALCHEMY_OVERSIZED),
+            Some((0x1000000, 0x1007fff)),
+            "the suggested range is the whole point - halving toward a number we were handed is waste"
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_inverted_suggestion_is_ignored_rather_than_trusted() {
+        // Provider prose, not a contract: anything we cannot read cleanly must fall back to halving.
+        assert_eq!(super::suggested_range("no brackets here"), None);
+        assert_eq!(super::suggested_range("try [0x10, notahex]"), None);
+        assert_eq!(super::suggested_range("try [0x20, 0x10]"), None, "inverted");
+        assert_eq!(
+            super::suggested_range("try [100, 200]"),
+            None,
+            "not hex-prefixed"
+        );
+    }
+
+    #[test]
+    fn an_oversized_range_is_narrowable_and_carries_its_hint() {
+        let err = serde_json::json!({"code": -32602, "message": ALCHEMY_OVERSIZED});
+        assert_eq!(
+            super::classify_rpc_error(&err),
+            super::FailureClass::Narrowable {
+                suggested: Some((0x1000000, 0x1007fff))
+            }
+        );
+    }
+
+    #[test]
+    fn an_auth_rejection_is_terminal_however_it_arrives() {
+        // Over HTTP status…
+        assert_eq!(
+            super::classify_status(401, ""),
+            super::FailureClass::Terminal
+        );
+        assert_eq!(
+            super::classify_status(403, ""),
+            super::FailureClass::Terminal
+        );
+        // …and as a JSON-RPC error on an HTTP 200, which is how several providers do it.
+        let err = serde_json::json!({"code": -32600, "message": "Must be authenticated!"});
+        assert_eq!(
+            super::classify_rpc_error(&err),
+            super::FailureClass::Terminal
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_transient_not_narrowable() {
+        // 429 means "too often", not "too much". Shrinking the window here would trade throughput for
+        // nothing; escalating a pool-wide 429 to narrowable is slice 3's job, not this one's.
+        assert_eq!(
+            super::classify_status(429, ""),
+            super::FailureClass::Transient
+        );
+        assert_eq!(
+            super::classify_status(503, ""),
+            super::FailureClass::Transient
+        );
+    }
+
+    /// RFC-0028 §3: an endpoint that rejects our credentials must not be retried on the ordinary
+    /// 30s rhythm. This is the livepeer incident in miniature - a 403 endpoint retried indefinitely.
+    #[tokio::test]
+    async fn a_rejecting_endpoint_gets_the_long_cooldown_and_a_healthy_one_still_answers() {
+        let (bad, bad_h) = unauthorized_rpc().await;
+        let (good, good_h) = fake_rpc(1).await;
+        let client = RpcClient::new(vec![bad, good]).unwrap();
+
+        let tip = client
+            .block_number()
+            .await
+            .expect("must recover via the healthy endpoint");
+        assert_eq!(tip, HEALTHY_TIP, "the healthy endpoint answered");
+
+        // The rejecting endpoint is cooled down for the *terminal* interval, not the transient one.
+        let until = client.health[0].load(Ordering::Relaxed);
+        let remaining = until.saturating_sub(super::now_millis());
+        assert!(
+            remaining > super::ENDPOINT_COOLDOWN_MS,
+            "a 401 endpoint must earn more than the {}ms transient cooldown, got {remaining}ms",
+            super::ENDPOINT_COOLDOWN_MS
+        );
+        assert!(
+            remaining <= super::TERMINAL_COOLDOWN_MS,
+            "and no more than the terminal one"
+        );
+
+        bad_h.abort();
+        good_h.abort();
+    }
+
+    /// The other half of the contract: a merely-broken endpoint keeps the short cooldown, so a blip
+    /// does not get punished like a credential failure.
+    #[tokio::test]
+    async fn a_transiently_broken_endpoint_keeps_the_short_cooldown() {
+        let (broken, broken_h, _hits) = broken_rpc().await;
+        let (good, good_h) = fake_rpc(1).await;
+        let client = RpcClient::new(vec![broken, good]).unwrap();
+
+        client
+            .block_number()
+            .await
+            .expect("recovers via the healthy endpoint");
+
+        let until = client.health[0].load(Ordering::Relaxed);
+        let remaining = until.saturating_sub(super::now_millis());
+        assert!(
+            remaining <= super::ENDPOINT_COOLDOWN_MS,
+            "a 500 is transient and must keep the short cooldown, got {remaining}ms"
+        );
+
+        broken_h.abort();
+        good_h.abort();
     }
 
     /// Issue #150: the failover path itself, not just the ordering maths. The first endpoint is broken,
