@@ -107,10 +107,12 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 
 ## 4. Security
 
-- [ ] 🔴 **`/sql` `;`-statement-stacking fixed but NOT RELEASED.** A stacked `COPY … TO` / `ATTACH` was
-  an arbitrary file write, bounded by the service user. Present in **0.6.1 and earlier**; the fix
-  (`reject_statement_stacking`) is merged and awaiting a **0.6.2** tag. *No release ships until this
-  does, and any deployment exposing `/sql` on ≤0.6.1 should be treated as affected.*
+- [ ] ✅ **`/sql` `;`-statement-stacking fixed and released in 0.6.2** (2026-07-28). A stacked
+  `COPY … TO` / `ATTACH` was an arbitrary file write, bounded by the service user. Present in **0.6.1
+  and earlier**; fixed by `reject_statement_stacking` with regression tests, released as **v0.6.2**
+  with binaries, and the Lodestar box upgraded and verified the same day. *Any deployment still
+  exposing `/sql` on ≤0.6.1 remains affected and should upgrade.* Advisory GHSA-jvjx-5528-r6mm is
+  drafted and awaiting publication.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
 - [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).
