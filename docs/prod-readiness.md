@@ -43,7 +43,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 - [ ] ✅ **Determinism in the core.** Decode, reorg, entity derivation re-executable; no LLM output in
   the runtime data path. - *Golden tests + the RFC-0016/0017 hard fence. Re-assert on any new
   data-path code.*
-- [ ] ✅ **Licence hygiene (AGPL-3.0).** No AGPL-we-don't-own ports (SQD worker-rs), no Materialize
+- [ ] ✅ **Licence hygiene (`MIT OR Apache-2.0`).** No copyleft-we-don't-own ports (SQD worker-rs), no Materialize
   (BSL), no Envio/HyperSync dep. - *`cargo tree` audit each release; deps stay in the CLAUDE.md
   safe-list.*
 
@@ -129,7 +129,7 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   loudly that the data surface has NO auth (the gateway's job). Confirmed by the review; the one control
   a fronting gateway must enforce is auth on **every** route, not just `/_admin`.*
 - [ ] ✅ Dependency vulnerability scan (`cargo deny`) wired into CI. - *`deny` job runs advisories +
-  licences + bans + sources against `deny.toml`; the AGPL-compatible licence gate is now enforced. Three
+  licences + bans + sources against `deny.toml`; the permissive-only licence gate is now enforced. Three
   transitive advisories ignored with written rationale (quick-xml not-reachable ×2; wasmtime-wasi
   FilePerms tracked for a runtime bump).*
 - [ ] ✅ Effectful (capability-granted) components can only produce **annotations**, never canonical

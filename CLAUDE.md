@@ -23,10 +23,16 @@ non-negotiables below, stop and flag it instead of proceeding.
 4. **Determinism in the core.** ABI decoding, reorg handling, entity derivation, and anything
    feeding stored state must be deterministic and re-executable. LLMs generate code and tests;
    LLM output never sits in the runtime data path.
-5. **AGPL-3.0** for the core. Do not vendor or port code from AGPL projects we don't own
-   (notably SQD's worker-rs) - read for ideas only. Safe dependencies: reth (MIT/Apache),
-   Cryo (permissive), Feldera/DBSP (MIT OR Apache-2.0), DataFusion/Arrow/DuckDB (Apache-2.0).
-   Do NOT add Materialize (BSL) or any Envio/HyperSync dependency.
+5. **`MIT OR Apache-2.0`** for the core - the maximally permissive option, and the Rust-ecosystem
+   norm. Anyone may use, modify, embed or resell it, including in closed products. *(Relicensed from
+   AGPL-3.0 on 2026-07-28. This was a deliberate trade: copyleft was the only thing preventing a
+   hosted competitor from closing and reselling nuthatch, and that protection was given up in
+   exchange for maximal adoption and zero friction for embedders.)*
+   **The dependency rule is now stricter, not looser:** we can no longer consume GPL/AGPL code at
+   all, so do not vendor or port from copyleft projects we don't own (notably SQD's worker-rs) -
+   read for ideas only. Safe dependencies: reth (MIT/Apache), Cryo (permissive), Feldera/DBSP
+   (MIT OR Apache-2.0), DataFusion/Arrow/DuckDB (Apache-2.0). Do NOT add Materialize (BSL) or any
+   Envio/HyperSync dependency. `deny.toml` enforces this in CI.
 
 ## Architecture (two modes, one codebase)
 

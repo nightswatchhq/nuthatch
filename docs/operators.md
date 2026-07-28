@@ -331,7 +331,7 @@ else.
 **Supply chain.** Nest bundles are content-addressed; `nest load` verifies the manifest format, every
 file's hash, and that the decode registry regenerated from the inputs matches the manifest. A nest
 that does not reproduce its own decode registry is refused. Compliance packs are ed25519-signed
-(`nuthatch pack keygen|build|verify`). AGPL-3.0 core; `cargo-deny` runs in CI.
+(`nuthatch pack keygen|build|verify`). Licensed `MIT OR Apache-2.0`; `cargo-deny` runs in CI.
 
 ---
 

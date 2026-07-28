@@ -142,7 +142,7 @@ walled off as a front-end that cannot reach the data path.
 3. **Make a nest a function, not a fork** - parameterizable and composable - via an optional
    Starlark front-end, *without* making Starlark mandatory or letting it into the data path.
 4. **Preserve every non-negotiable**: single binary, ≤2 GB RAM budget, no phone-home, determinism
-   in the core, AGPL-3.0. §1 and §2 are provably outside the deterministic data path; §3 (which
+   in the core, `MIT OR Apache-2.0`. §1 and §2 are provably outside the deterministic data path; §3 (which
    isn't) is deferred precisely because it isn't.
 5. **Keep the whole thing AI-native**: both new surfaces must be things an LLM writes fluently
    (SQL; Python-shaped Starlark) and must be taught by the builder skill (RFC-0017) under its drift
@@ -350,7 +350,7 @@ nests - an interpreter dependency spent to automate the copying of nothing. The 
 order is the day we did §2 before §1.
 
 **The §2 gate (before writing Starlark code):** confirm `starlark-rust`'s license is compatible with
-AGPL-3.0 core and it is not on the CLAUDE.md forbidden list; confirm the binary-size delta is within
+permissively-licensed core and it is not on the CLAUDE.md forbidden list; confirm the binary-size delta is within
 tolerance; confirm the builder skill can teach the closed builtin surface under its drift gate. If
 any fails, §2 parks and §1 still stands alone - they are independently valuable, which is the point
 of the layering.
@@ -479,7 +479,7 @@ and the `checks/` harness makes "we changed nothing observable" a CI fact, not a
 - **Two config front-ends confuse users/agents.** Mitigation: TOML is the default `init` emits and
   the documented norm; Starlark is explicitly opt-in sugar; the builder skill teaches "reach for
   `.star` only when config repeats." One-contract nests never see it.
-- **`starlark-rust` dependency / license / size.** Mitigation: the §4 gate - if it fails AGPL
+- **`starlark-rust` dependency / license / size.** Mitigation: the §4 gate - if it fails licence
   compatibility or the size budget, §2 parks and §1 stands alone.
 - **Cold views mistaken for live-tip state.** A cold view recomputes per query over hot∪cold; it is
   *not* an incrementally-maintained entity. Mitigation: `semantic.toml` view descriptions and the

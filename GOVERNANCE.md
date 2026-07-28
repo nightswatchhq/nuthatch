@@ -1,6 +1,6 @@
 # Governance & scope
 
-nuthatch is a free, AGPL-3.0 public good with a single maintainer and no direct monetization. This
+nuthatch is a free, `MIT OR Apache-2.0` public good with a single maintainer and no direct monetization. This
 document states how it is sustained, what stays out of scope regardless of who's paying, and the
 neutrality guarantees that make it safe to depend on. See [RFC-0006](docs/rfcs/0006-grant-funding.md)
 for the full reasoning.
@@ -19,14 +19,22 @@ Rule 1).
 ## Neutrality (the guarantee you can depend on)
 
 **No operator has exclusivity, a private fork, partner-only features in the core, or roadmap veto.**
-Any operator may host nuthatch under the AGPL; a partner's edge is partnership, being first, and
-priority support of *their own* integration - never a gate on anyone else. The AGPL license makes
-capture structurally impossible: anyone can run, fork, and host the exact same software.
+Any operator may host nuthatch; a partner's edge is partnership, being first, and priority support of
+*their own* integration - never a gate on anyone else. The permissive licence makes capture of *this*
+project impossible: anyone can run, fork, host or embed the exact same software, and the maintainer
+holds no rights over it that anyone else lacks.
+
+Stated plainly, because the relicence changed this and pretending otherwise would be dishonest: a
+permissive licence also allows a **closed** derivative. Someone may take nuthatch, extend it privately
+and sell it without publishing anything. That is a deliberate trade - maximal adoption and zero
+friction for embedders, in exchange for giving up the copyleft protection that would have forbidden it.
+What remains guaranteed is that the upstream project stays open and stays free; what is not guaranteed
+is that every derivative does.
 
 ### Operator-partnership disclosure
 
-> An independent infrastructure operator (GraphOps) is preparing a hosted offering of nuthatch under
-> the AGPL and shares revenue with the maintainer to fund core development. The relationship is
+> An independent infrastructure operator (GraphOps) is preparing a hosted offering of nuthatch and
+> shares revenue with the maintainer to fund core development. The relationship is
 > partnership, not ownership: no exclusivity, no relicensing, no private features, no roadmap veto.
 
 _(Terms are summarised here as existence + shape once agreed; amounts stay private - RFC-0006
@@ -50,7 +58,8 @@ Non-negotiable regardless of who asks or pays:
 
 - **No token**, no decentralised-network features, no staking.
 - **No telemetry / phone-home**; no mandatory API tokens or gated data services in the data path.
-- **No relicensing** of the AGPL core; **no private forks**; **no partner-only features** in core.
+- **The core stays permissively licensed** (`MIT OR Apache-2.0`) and is never relicensed to anything
+  more restrictive or proprietary; **no private forks**; **no partner-only features** in core.
 - **No roadmap veto** for any funder or partner (input is welcome; veto is not).
 - **No auth / metering / multi-tenancy in core** - that is the operator layer, and it is contractual.
 

@@ -7,7 +7,7 @@ distinct milestone ownership (Rule 1: no milestone funded twice)._
 - **Program:** Ethereum Foundation Ecosystem Support Program (ESP), small-grants / inquiry track.
 - **Requested:** $50-90K over 12 months.
 - **Applicant:** Pete (cargopete), sole maintainer.
-- **Project:** nuthatch - https://github.com/nuthatch-indexer/nuthatch (AGPL-3.0-only).
+- **Project:** nuthatch - https://github.com/nuthatch-indexer/nuthatch (`MIT OR Apache-2.0`).
 
 ## The pitch (the TrueBlocks lane)
 
@@ -28,7 +28,7 @@ paths. On crates.io and as prebuilt binaries.
 ## Why now - two facts that de-risk this
 
 1. **Adoption signal.** An independent Ethereum-infrastructure operator (GraphOps, ~8,000 physical
-   cores) is preparing a hosted offering of nuthatch under AGPL and shares revenue with the
+   cores) is preparing a hosted offering of nuthatch and shares revenue with the
    maintainer - the ecosystem-adoption signal ESP weights most, disclosed per RFC-0006 Rule 4. This
    application funds the ecosystem-facing roadmap hosting revenue wouldn't prioritize; nothing here
    depends on that revenue materialising.
@@ -54,5 +54,5 @@ disclosed to both; each milestone has a single owner.
 ## Scope integrity (what we will not do - RFC-0006)
 
 No token, no decentralised-network features, no telemetry, no relicensing, no partner-only features
-in the AGPL core. Verifiability stays deterministic re-execution - no zk/TEE. If any term requires an
+in the permissively-licensed core. Verifiability stays deterministic re-execution - no zk/TEE. If any term requires an
 item on this list, we decline it.

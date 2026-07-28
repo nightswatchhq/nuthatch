@@ -44,7 +44,7 @@ Statuses last reconciled against the [progress log](../progress-log.md) on 2026-
 ## Conventions
 
 All RFCs honor [`CLAUDE.md`](../../CLAUDE.md) non-negotiables: single static binary, ≤2 GB RAM
-CI budget, no phone-home, determinism in the core, AGPL-3.0. Measured numbers are cited from the
+CI budget, no phone-home, determinism in the core, `MIT OR Apache-2.0`. Measured numbers are cited from the
 [README progress log](../../README.md); targets are labeled as targets, never as results.
 
 Each RFC carries: status, author, date, dependencies, what it blocks, and the standard
