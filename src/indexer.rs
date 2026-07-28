@@ -529,6 +529,7 @@ fn quarantine_backoff_secs(attempts: u32) -> u64 {
 }
 
 /// One nest's standing in the shared cursor's working set (RFC-0026 §3).
+#[derive(Debug)]
 enum NestState {
     /// Driving the cursor: counted in the min/max/union below.
     Live,
@@ -538,6 +539,15 @@ enum NestState {
         reason: String,
         retry_at: Option<std::time::Instant>,
     },
+    /// Removed by the **operator**, not by a fault (RFC-0027 §6). Never re-admitted, never counted as
+    /// a failure, and never a reason to report the roost unready.
+    ///
+    /// Kept distinct from `Quarantined` rather than modelled as a terminal fault, because the two mean
+    /// opposite things to anyone watching: a terminal quarantine says "something broke, come and
+    /// look", while a retirement says "you asked for this". Conflating them would page an operator for
+    /// doing exactly what they intended, and - worse - would make a roost whose last nest was unmounted
+    /// exit non-zero as though every nest had died.
+    Retired,
 }
 
 /// The shared cursor's supervision state: who is live, who is quarantined, and what the outside world
@@ -655,10 +665,47 @@ impl Supervisor {
     }
 
     /// Whether every nest is quarantined with no retry pending - the cursor is dead (§6).
+    /// Whether every *remaining* nest is terminally quarantined - i.e. the cursor is dead rather than
+    /// merely idle.
+    ///
+    /// Retired nests are excluded from the question entirely (RFC-0027 §6). A cursor whose nests were
+    /// all unmounted has nothing to do, but nothing has *failed*; treating that as "every nest is
+    /// terminally quarantined" would make the roost exit non-zero the moment an operator removed the
+    /// last nest - killing the process they were about to mount the replacement into.
     fn all_terminal(&self) -> bool {
-        self.states
-            .iter()
-            .all(|s| matches!(s, NestState::Quarantined { retry_at: None, .. }))
+        let mut saw_fault = false;
+        for s in &self.states {
+            match s {
+                NestState::Retired => continue,
+                NestState::Quarantined { retry_at: None, .. } => saw_fault = true,
+                _ => return false,
+            }
+        }
+        saw_fault
+    }
+
+    /// Whether every nest has been retired by an operator - the cursor has no work and no fault.
+    fn all_retired(&self) -> bool {
+        !self.states.is_empty() && self.states.iter().all(|s| matches!(s, NestState::Retired))
+    }
+
+    /// Retire a nest at the operator's request (RFC-0027 §6). Idempotent, and deliberately refuses to
+    /// resurrect: a retired nest is never re-admitted by [`Supervisor::readmit_due`].
+    fn retire(&mut self, i: usize) {
+        if matches!(self.states[i], NestState::Retired) {
+            return;
+        }
+        self.states[i] = NestState::Retired;
+        self.health.retire_nest(&self.names[i]);
+        tracing::info!(
+            "nest '{}' retired from this cursor at the operator's request",
+            self.names[i]
+        );
+    }
+
+    /// The index of a nest by name, for a lifecycle command naming one.
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
     }
 
     /// Every quarantine reason, for the cursor's own death notice.
@@ -670,7 +717,8 @@ impl Supervisor {
                 NestState::Quarantined { reason, .. } => {
                     Some(format!("{}: {reason}", self.names[i]))
                 }
-                NestState::Live => None,
+                // A retirement is not a reason the cursor died - it is a reason it has less to do.
+                NestState::Live | NestState::Retired => None,
             })
             .collect()
     }
@@ -707,6 +755,46 @@ fn fan_out_rollback(
 /// fanned out to every nest (slice 3). Factory nests are supported (slice 2b): if any is mounted the
 /// union fetch goes topic0-only and each nest demuxes by `owns` - address for static, topic0 for factory.
 #[allow(clippy::too_many_arguments)]
+/// Apply every lifecycle command waiting on the channel, without blocking.
+///
+/// Non-blocking on purpose: the cursor's job is to index, and it checks for work rather than waiting
+/// for it. `try_recv` drains whatever arrived since the last window and returns immediately when the
+/// queue is empty, so an idle lifecycle channel costs one atomic load per window.
+///
+/// A command naming a nest this cursor does not host is logged and dropped rather than treated as an
+/// error - with one cursor per chain, a roost-level command may legitimately reach the wrong cursor.
+fn drain_lifecycle(lifecycle: &mut Option<CursorCommands>, sup: &mut Supervisor) {
+    let Some(rx) = lifecycle.as_mut() else {
+        return;
+    };
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            CursorCommand::Unmount(name) => match sup.index_of(&name) {
+                Some(i) => sup.retire(i),
+                None => {
+                    tracing::debug!("unmount for '{name}' is not for this cursor; ignoring")
+                }
+            },
+        }
+    }
+}
+
+/// A lifecycle command for a *running* cursor (RFC-0027 §2).
+///
+/// The cursor owns its nest set; the outside world sends it commands. Every mutation arrives this way
+/// and is applied at a **window boundary**, never from an HTTP handler mid-window - because the cursor
+/// computes `global_next` as a min over its nests, detects reorgs once, and fans rollback out to every
+/// one of them. Mutating the set underneath that would produce a rollback applied to a nest that was
+/// not present for the roll forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorCommand {
+    /// Retire a nest from this cursor's working set at the operator's request.
+    Unmount(String),
+}
+
+pub type CursorCommands = tokio::sync::mpsc::UnboundedReceiver<CursorCommand>;
+
+#[allow(clippy::too_many_arguments)]
 async fn roost_index_loop(
     source: Arc<dyn Source>,
     mut nests: Vec<NestIngest>,
@@ -716,6 +804,7 @@ async fn roost_index_loop(
     window: u64,
     health: Arc<crate::health::RoostHealth>,
     fail_fast: bool,
+    mut lifecycle: Option<CursorCommands>,
 ) -> Result<()> {
     if nests.is_empty() {
         return Ok(());
@@ -747,6 +836,16 @@ async fn roost_index_loop(
     let mut chunker = AdaptiveWindow::for_window(window);
     let mut poll_failures = 0u32;
     loop {
+        // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
+        // only point at which the nest set is quiescent and "every live nest has committed the same
+        // windows" holds (RFC-0027 §2).
+        drain_lifecycle(&mut lifecycle, &mut sup);
+        if sup.all_retired() {
+            // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
+            // so this returns cleanly rather than bailing, and the roost stays up (RFC-0027 §6).
+            tracing::info!("every nest on this cursor has been unmounted; retiring the cursor");
+            return Ok(());
+        }
         // Re-admit anything whose backoff elapsed, then take the live set for this iteration. Every
         // min/max/union below is derived from it - never from all nests (RFC-0026 §3.1).
         sup.readmit_due(std::time::Instant::now());
@@ -936,6 +1035,9 @@ pub async fn spawn_roost(
         }
     }
     let window = window.unwrap_or(DEFAULT_WINDOW);
+    // No lifecycle channel yet: the control surface that sends commands is RFC-0027 slice 4. The
+    // cursor already honours one when given it (`drain_lifecycle`), so slice 4 wires a sender here
+    // rather than reopening the loop.
     let ingest = tokio::spawn(roost_index_loop(
         source,
         ingests,
@@ -945,6 +1047,7 @@ pub async fn spawn_roost(
         window,
         health,
         fail_fast,
+        None,
     ));
     Ok((states, ingest, alert_workers))
 }
@@ -3772,6 +3875,88 @@ template = "pool"
         )
     }
 
+    /// RFC-0027 §6: an operator's unmount is **not** a fault, and the distinction is load-bearing.
+    ///
+    /// A retired nest leaves the working set like a quarantined one, but it must never be re-admitted,
+    /// never appear in the cursor's death notice, and - the one that would actually hurt - never make
+    /// the cursor look terminally dead. Conflating the two would mean unmounting your last nest exits
+    /// the process you were about to mount the replacement into.
+    #[test]
+    fn a_retired_nest_leaves_the_working_set_without_looking_like_a_fault() {
+        let mut sup = test_supervisor(2);
+        sup.retire(0);
+
+        assert_eq!(
+            sup.live(),
+            vec![1],
+            "a retired nest stops driving the cursor"
+        );
+        assert!(
+            !sup.all_terminal(),
+            "one retirement and one live nest is not a dead cursor"
+        );
+        assert!(
+            sup.reasons().is_empty(),
+            "a retirement is not a failure reason"
+        );
+
+        // Re-admission must not resurrect it: the operator asked for it to be gone.
+        sup.readmit_due(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        assert_eq!(sup.live(), vec![1], "a retired nest is never re-admitted");
+
+        // Retiring the last one: no work left, but nothing broken.
+        sup.retire(1);
+        assert!(sup.all_retired());
+        assert!(
+            !sup.all_terminal(),
+            "an all-retired cursor must not report itself terminally dead - that would exit the roost"
+        );
+    }
+
+    /// The mixed case, which is the one that decides whether an operator gets paged: a cursor holding
+    /// one retired nest and one terminally quarantined nest **is** dead, because something did fail.
+    #[test]
+    fn a_retirement_alongside_a_real_fault_still_reports_the_cursor_dead() {
+        let mut sup = test_supervisor(2);
+        sup.retire(0);
+        sup.quarantine(1, &anyhow::anyhow!(TerminalFault("boom".into())))
+            .unwrap();
+        assert!(
+            sup.all_terminal(),
+            "a retired nest must not mask a sibling's terminal fault"
+        );
+        assert!(!sup.all_retired());
+        assert_eq!(sup.reasons().len(), 1, "only the real fault is a reason");
+    }
+
+    /// Commands are applied at the window boundary, and one naming a nest this cursor does not host is
+    /// dropped rather than treated as an error - with one cursor per chain, a roost-level command can
+    /// legitimately reach the wrong cursor.
+    #[test]
+    fn lifecycle_commands_retire_the_named_nest_and_ignore_strangers() {
+        let mut sup = test_supervisor(2);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+
+        tx.send(CursorCommand::Unmount("nest0".into())).unwrap();
+        tx.send(CursorCommand::Unmount("not-on-this-cursor".into()))
+            .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup);
+
+        assert_eq!(sup.live(), vec![1], "the named nest retired");
+        assert!(matches!(sup.states[0], NestState::Retired));
+
+        // Idempotent: unmounting twice is not an error, and does not double-count anything.
+        tx.send(CursorCommand::Unmount("nest0".into())).unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup);
+        assert_eq!(sup.live(), vec![1]);
+
+        // No channel at all (today's `spawn_roost`) is simply a no-op.
+        let mut none = None;
+        drain_lifecycle(&mut none, &mut sup);
+        assert_eq!(sup.live(), vec![1]);
+    }
+
     /// RFC-0026 §3.1 - the trap the whole design turns on. A quarantined nest must leave the working
     /// set, not merely be skipped: the shared cursor advances from the *min* of the live cursors, so a
     /// quarantined nest left in that min pins the cursor at its dead position and stalls every healthy
@@ -3939,8 +4124,10 @@ template = "pool"
                     "reason should name the fault: {reason}"
                 );
             }
-            NestState::Live => {
-                panic!("the nest whose sealed watermark was violated must quarantine")
+            other => {
+                panic!(
+                    "the nest whose sealed watermark was violated must quarantine, got {other:?}"
+                )
             }
         }
         // Its cursor is untouched - it claims nothing it did not index.
