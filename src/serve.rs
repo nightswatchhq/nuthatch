@@ -211,7 +211,7 @@ pub async fn run_roost(
 /// Split out of [`run_roost`] so the set can be re-composed at runtime (RFC-0027). Routing semantics
 /// are unchanged from the static version - still `Router::nest` - which is what makes the parity test
 /// meaningful rather than a tautology.
-fn compose_roost(
+pub fn compose_roost(
     roster: serde_json::Value,
     nests: Vec<(String, AppState)>,
     health: Arc<crate::health::RoostHealth>,

@@ -1081,14 +1081,10 @@ pub async fn spawn_roost(
     admin_token: Option<String>,
     health: Arc<crate::health::RoostHealth>,
     fail_fast: bool,
-) -> Result<(
-    Vec<(String, serve::AppState)>,
-    tokio::task::JoinHandle<Result<()>>,
-    Vec<tokio::task::JoinHandle<()>>,
-)> {
+) -> Result<RoostCursor> {
     let mut ingests = Vec::new();
     let mut states = Vec::new();
-    let mut alert_workers = Vec::new();
+    let mut alert_workers: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut window = None;
     for (name, dir, config) in nests {
         let (nest, state, worker, w) = build_nest(
@@ -1105,15 +1101,15 @@ pub async fn spawn_roost(
         // So `/<name>/ready` answers for THIS nest rather than the process-global poll freshness.
         let mut state = state;
         state.roost_health = Some((name.clone(), health.clone()));
-        states.push((name, state));
         if let Some(worker) = worker {
-            alert_workers.push(worker);
+            alert_workers.push((name.clone(), worker));
         }
+        states.push((name, state));
     }
     let window = window.unwrap_or(DEFAULT_WINDOW);
-    // No lifecycle channel yet: the control surface that sends commands is RFC-0027 slice 4. The
-    // cursor already honours one when given it (`drain_lifecycle`), so slice 4 wires a sender here
-    // rather than reopening the loop.
+    // The cursor's command channel. The control surface that *sends* on it is slice 4; the driver
+    // holds the sender meanwhile so unmount can be driven programmatically and tested.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ingest = tokio::spawn(roost_index_loop(
         source,
         ingests,
@@ -1123,9 +1119,28 @@ pub async fn spawn_roost(
         window,
         health,
         fail_fast,
-        None,
+        Some(rx),
     ));
-    Ok((states, ingest, alert_workers))
+    Ok(RoostCursor {
+        states,
+        ingest,
+        alert_workers,
+        lifecycle: tx,
+    })
+}
+
+/// One chain cursor, plus the handles a driver needs to manage the nests on it (RFC-0027).
+pub struct RoostCursor {
+    /// Per-nest serving state. The driver **retains** these so it can re-compose the router without a
+    /// nest when one is unmounted; previously they were moved straight into the router and lost.
+    pub states: Vec<(String, serve::AppState)>,
+    pub ingest: tokio::task::JoinHandle<Result<()>>,
+    /// Alert delivery workers **keyed by nest**. Each holds its nest's `Store` clone, so unmounting
+    /// one requires aborting exactly that worker - impossible while this was a bare `Vec` of handles
+    /// with nothing tying a handle to a name.
+    pub alert_workers: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Commands to this cursor, applied at window boundaries.
+    pub lifecycle: tokio::sync::mpsc::UnboundedSender<CursorCommand>,
 }
 
 /// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode

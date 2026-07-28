@@ -287,7 +287,12 @@ pub async fn dev(
     // and held to the per-cursor RSS budget. A cursor's failure quarantines that cursor alone (RFC-0026).
     let mut all_states: Vec<(String, crate::serve::AppState)> = Vec::new();
     let mut ingests: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
-    let mut alert_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut alert_workers: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+    // Chain -> that cursor's command channel, so an unmount reaches the cursor hosting the nest.
+    let mut lifecycle: std::collections::HashMap<
+        String,
+        tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
+    > = std::collections::HashMap::new();
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut roost_total_mb = ROOST_BASE_RSS_MB;
     // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
@@ -350,7 +355,7 @@ pub async fn dev(
                 )
             })?;
         let source: Arc<dyn Source> = Arc::new(rpc);
-        let (states, ingest, alerts) = indexer::spawn_roost(
+        let cursor = indexer::spawn_roost(
             source,
             group.nests,
             backfill,
@@ -369,9 +374,12 @@ pub async fn dev(
                 meta.name, group.endpoint.chain
             )
         })?;
-        all_states.extend(states);
-        ingests.push((group.endpoint.chain.clone(), ingest));
-        alert_workers.extend(alerts);
+        // Retain the per-nest handles: the driver needs them to re-compose the router (and abort the
+        // right alert worker) when a nest is unmounted (RFC-0027 §6).
+        lifecycle.insert(group.endpoint.chain.clone(), cursor.lifecycle);
+        all_states.extend(cursor.states);
+        ingests.push((group.endpoint.chain.clone(), cursor.ingest));
+        alert_workers.extend(cursor.alert_workers);
     }
 
     tracing::info!(
@@ -412,7 +420,7 @@ pub async fn dev(
     for (_, h) in &ingests {
         h.abort();
     }
-    for w in &alert_workers {
+    for (_, w) in &alert_workers {
         w.abort();
     }
     result
@@ -478,6 +486,116 @@ async fn supervise_cursors(
         "every roost cursor is dead, so nothing will advance again - {}",
         failures.join("; ")
     )
+}
+
+/// The handles a roost driver keeps so it can change its nest set while running (RFC-0027 §6).
+///
+/// Before this, `roost::dev` moved every `AppState` into the composed router and kept nothing, so the
+/// only way to change the mounted set was to restart the process - which stops every co-tenant nest
+/// too. Retaining them is what makes an unmount possible at all.
+pub struct RoostHandles {
+    /// The swappable composition being served (RFC-0027 slice 1).
+    pub live: crate::serve::LiveRoost,
+    /// Per-nest serving state, in roster order.
+    pub states: Vec<(String, crate::serve::AppState)>,
+    /// Alert delivery workers keyed by nest - each holds that nest's `Store` clone.
+    pub alert_workers: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Chain -> that cursor's command channel.
+    pub lifecycle: std::collections::HashMap<
+        String,
+        tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
+    >,
+    pub health: Arc<crate::health::RoostHealth>,
+    /// The static half of the roster, re-merged with live health per request.
+    pub roster: serde_json::Value,
+}
+
+/// How long to wait for a cursor to acknowledge that it has released a nest.
+///
+/// Generous, because the cursor applies lifecycle commands at a **window boundary** - it may be
+/// mid-window against a slow provider when the command arrives. Timing out is not a failure of the
+/// unmount so much as a refusal to guess: we would rather report that the cursor has not let go than
+/// tear the routes down while it is still writing.
+const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl RoostHandles {
+    /// Unmount a nest: drain its cursor, release every handle to its store, then remove its routes.
+    ///
+    /// The ordering is the contract (RFC-0027 §6). The cursor is asked first and acknowledged before
+    /// anything is torn down, because a route removed while the cursor is still committing a window
+    /// would leave the nest writing data nobody can read - and, worse, would make "the store is
+    /// closed" a race rather than a fact.
+    ///
+    /// Three holders of the nest's `Store` must drop before redb releases the file: the cursor's (via
+    /// the ack), the alert delivery worker's (aborted here), and the serving state's (dropped when the
+    /// router is re-composed without it). Miss any one and the file stays locked - which is exactly
+    /// what the acceptance test checks, by reopening it.
+    ///
+    /// Idempotent: unmounting a nest that is not mounted is a no-op, not an error.
+    pub async fn unmount(&mut self, name: &str) -> Result<()> {
+        let Some(idx) = self.states.iter().position(|(n, _)| n == name) else {
+            tracing::debug!("nest '{name}' is not mounted; nothing to unmount");
+            return Ok(());
+        };
+        let chain = self.states[idx].1.chain.clone();
+
+        // 1. Drain the cursor and wait for it to let go.
+        //
+        // No channel for this nest's chain means we cannot ask the cursor to stop, and tearing the
+        // routes down regardless would leave it writing to a store nobody can read - the exact failure
+        // §6 orders this sequence to prevent. So this is an error, not a skip. (An early draft skipped
+        // silently; the acceptance test then failed on a *held* store, which is how the gap surfaced.)
+        {
+            let tx = self.lifecycle.get(&chain).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no cursor channel for chain '{chain}' hosting '{name}' - refusing to unmount \
+                     without draining it first"
+                )
+            })?;
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(indexer::CursorCommand::Unmount {
+                    name: name.to_string(),
+                    ack: Some(ack_tx),
+                })
+                .is_ok()
+            {
+                match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+                    Ok(Ok(())) => {}
+                    // A closed channel means the cursor is already gone, which is as released as it
+                    // gets. A timeout is not: report it rather than tearing down regardless.
+                    Ok(Err(_)) => tracing::debug!("cursor on {chain} already stopped"),
+                    Err(_) => bail!(
+                        "cursor on {chain} did not acknowledge unmounting '{name}' within {}s - \
+                         refusing to remove its routes while it may still be writing",
+                        UNMOUNT_ACK_TIMEOUT.as_secs()
+                    ),
+                }
+            }
+        }
+
+        // 2. Stop and drop the nest's alert worker - the second holder of its store.
+        if let Some(pos) = self.alert_workers.iter().position(|(n, _)| n == name) {
+            let (_, worker) = self.alert_workers.remove(pos);
+            worker.abort();
+            // `abort()` only *requests* cancellation - the task keeps its `Store` clone until the
+            // runtime actually drops it. Awaiting the handle waits for that to have happened. Skipping
+            // this makes the release a race: the acceptance test caught it on the first run, failing
+            // with "Database already open" a few microseconds after the abort.
+            let _ = worker.await;
+        }
+
+        // 3. Drop the serving state - the third - and re-compose without it. Requests already in
+        //    flight finish against the old composition; new ones 404.
+        self.states.remove(idx);
+        self.live.swap(crate::serve::compose_roost(
+            self.roster.clone(),
+            self.states.clone(),
+            self.health.clone(),
+        ));
+        tracing::info!("nest '{name}' unmounted from the roost");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
