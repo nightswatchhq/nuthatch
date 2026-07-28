@@ -108,6 +108,26 @@ impl RoostHealth {
         self.nests.write().unwrap().remove(nest);
     }
 
+    /// Record a nest as **retired by the operator** (RFC-0027 §6) rather than quarantined by a fault.
+    ///
+    /// Reported with `class: "retired"` so `/nests` can say *why* a nest stopped indexing, and
+    /// deliberately excluded from [`RoostHealth::unhealthy`] - readiness answers "is anything broken?",
+    /// and an intended removal is not. Paging someone because an operator did what they meant to do is
+    /// how alerting gets muted.
+    pub fn retire_nest(&self, nest: &str) {
+        self.nests.write().unwrap().insert(
+            nest.to_string(),
+            QuarantineInfo {
+                kind: "nest",
+                class: "retired",
+                reason: "unmounted by the operator".to_string(),
+                since_unixtime: now_unix(),
+                attempts: 0,
+                next_retry_unixtime: None,
+            },
+        );
+    }
+
     /// Quarantine a whole chain cursor: every nest mounted on it is out of service until restart.
     pub fn quarantine_cursor(&self, chain: &str, reason: String) {
         self.cursors.write().unwrap().insert(
@@ -148,7 +168,13 @@ impl RoostHealth {
             .read()
             .unwrap()
             .keys()
-            .filter_map(|n| self.status(n).map(|q| (n.clone(), q.reason)))
+            // A retired nest is not unhealthy - it is absent on purpose (RFC-0027 §6). Including it
+            // would hold `/ready` at 503 forever after an intended unmount.
+            .filter_map(|n| {
+                self.status(n)
+                    .filter(|q| q.class != "retired")
+                    .map(|q| (n.clone(), q.reason))
+            })
             .collect();
         // Deterministic order so the readiness body is stable between polls.
         out.sort();
