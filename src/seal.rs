@@ -6,6 +6,24 @@
 //! All tables in a nest ingest from the same block stream and seal together per finalized range, so
 //! `sealed_through` stays a single global watermark and the whole range is pruned from hot once every
 //! table's segment is durable (the indexer does the prune).
+//!
+//! ## Scope of the content hash (audit F-D3)
+//!
+//! A segment's hash is taken over the **Parquet file bytes**, and those bytes include the `created_by`
+//! metadata string that `arrow-rs`/`parquet` stamps with its own version. So the guarantee is:
+//!
+//! - **Same binary → identical bytes → identical hash.** This is the property everything relies on:
+//!   re-running a backfill, or two operators running the same release, produce byte-identical segments
+//!   that dedupe against each other. Determinism holds.
+//! - **Across nuthatch versions built on different arrow-rs releases, segment identity may differ**
+//!   even when every decoded row is identical, because `created_by` changed underneath us.
+//!
+//! That is a limit on *segment identity*, not on correctness: the rows are the same, the queries return
+//! the same answers, and re-execution still verifies. What it means practically is that a segment hash
+//! is a strong identity within a release and a weak one across releases - so do not use one as a
+//! cross-version equality proof (compare decoded rows for that), and expect a version bump that moves
+//! arrow-rs to re-seal rather than dedupe. Pinning `created_by` would buy cross-version identity if that
+//! ever becomes worth the coupling to a parquet-rs internal; it is deliberately not pinned today.
 
 use anyhow::{Context, Result};
 use arrow::array::{ArrayRef, StringArray, UInt64Array};

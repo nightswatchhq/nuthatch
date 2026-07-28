@@ -320,6 +320,73 @@ pub async fn load(bundle: &str, target: Option<&Path>, expect: Option<&str>) -> 
     );
 }
 
+/// Whether a URL's host is loopback - the one case that needs no warning, since it cannot reach
+/// anything the operator's own machine cannot already reach. Parsed by hand (no `url` dep): scheme,
+/// then authority up to the first `/`, `?` or `#`, then userinfo and port stripped.
+fn is_loopback_url(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // `user:pass@host:port` → `host:port`
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    // Strip the port, minding IPv6 literals (`[::1]:8080`).
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split_once(']').map(|(h, _)| h).unwrap_or(rest)
+    } else {
+        host_port
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Warn about every non-loopback URL a just-installed nest declares (audit L6). Best-effort: a config
+/// that will not parse is a louder problem the next step reports, so it is silently skipped here.
+fn warn_outbound_urls(dir: &Path) {
+    let Ok(config) = crate::config::Config::load(dir) else {
+        return;
+    };
+    let mut outbound: Vec<(&str, String)> = Vec::new();
+    for w in &config.webhooks {
+        outbound.push(("webhook", w.url.clone()));
+    }
+    for a in &config.alerts {
+        outbound.push(("alert sink", a.url.clone()));
+    }
+    for r in &config.nest.rpc_urls {
+        outbound.push(("rpc", r.clone()));
+    }
+    let external: Vec<_> = outbound
+        .into_iter()
+        .filter(|(_, u)| !is_loopback_url(u))
+        .collect();
+    if external.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        "this nest declares {} non-loopback outbound endpoint(s) - review before running it:",
+        external.len()
+    );
+    for (kind, url) in &external {
+        // Redact any credentials in the URL: this line goes to logs, and provider URLs carry keys.
+        tracing::warn!("  {kind}: {}", crate::rpc::redact_url(url));
+    }
+}
+
 /// Untar a `.bundle` into `dest`. `tar`'s `unpack` refuses entries that would escape `dest` (its own
 /// zip-slip guard); [`install_verified`] then re-checks every *manifest-declared* file with
 /// [`checked_join`], so extraction and install are both bounded - defence in depth on untrusted input.
@@ -397,6 +464,15 @@ pub fn install_verified(
     // matches the manifest. Same inputs + same generator → same decode, verifiably.
     verify_registry_reproduces(&target, &manifest)?;
 
+    // Audit L6 (defence in depth): a freshly-loaded nest is third-party config, and its `nuthatch.toml`
+    // decides where this process makes *outbound* requests - webhook/alert sinks it POSTs decoded rows
+    // to, and RPC endpoints it fetches from. A hostile or careless bundle can therefore point those at
+    // an internal address the operator never intended (SSRF), or exfiltrate indexed data to a third
+    // party. Warn, don't refuse: external sinks are the normal case and only the operator knows which
+    // are wanted. The point is that they see the list once, at load, rather than discovering it in
+    // outbound traffic later.
+    warn_outbound_urls(&target);
+
     println!(
         "loaded nest '{}' → {}",
         manifest.nest_name,
@@ -434,6 +510,38 @@ pub fn verify_registry_reproduces(dir: &Path, manifest: &Manifest) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    /// Audit L6: loopback endpoints need no warning; anything else does. The parser has to cope with
+    /// the shapes real config carries - ports, credentials, paths, IPv6 literals - because a URL
+    /// mis-classified as loopback is a warning the operator never sees.
+    #[test]
+    fn loopback_urls_are_recognised_and_everything_else_is_not() {
+        for local in [
+            "http://localhost:8288/hook",
+            "http://LOCALHOST/hook",
+            "http://127.0.0.1:9000",
+            "https://127.1.2.3/x",
+            "http://[::1]:8288/rpc",
+            "http://user:pass@localhost:8288/hook",
+            "http://localhost",
+        ] {
+            assert!(is_loopback_url(local), "should be loopback: {local}");
+        }
+        for external in [
+            "https://hooks.example.com/abc",
+            "http://10.0.0.5:8080/internal", // private, but NOT loopback - SSRF-relevant
+            "http://169.254.169.254/latest/meta-data", // cloud metadata: the classic SSRF target
+            "https://evil.test/exfil",
+            "http://[2001:db8::1]:80/",
+            "http://user:pass@evil.test/exfil",
+            "https://localhost.evil.test/", // suffix trickery must not read as loopback
+        ] {
+            assert!(
+                !is_loopback_url(external),
+                "should NOT be loopback: {external}"
+            );
+        }
+    }
+
     use super::*;
     use crate::config::CONFIG_FILE;
 

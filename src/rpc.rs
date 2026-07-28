@@ -493,7 +493,7 @@ fn now_millis() -> u64 {
 /// key in the path (`.../v3/<KEY>`) or query string, and the failure log fires on exactly the outages an
 /// operator debugs with `RUST_LOG=debug`. Log *where* it failed, never the key. Returns a slice of the
 /// original (the `scheme://host` prefix), so it is zero-alloc.
-fn redact_url(url: &str) -> &str {
+pub(crate) fn redact_url(url: &str) -> &str {
     match url.split_once("://") {
         // Truncate at the first '/' or '?' after the scheme, i.e. keep scheme://host[:port] only.
         Some((scheme, rest)) => {
