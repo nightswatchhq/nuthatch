@@ -36,6 +36,19 @@ const SQL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on rows materialised from one analytical query - bounds the Rust-side result buffer, which
 /// lives outside DuckDB's own memory limit. Beyond this the result is truncated and flagged.
 const SQL_MAX_ROWS: usize = 50_000;
+
+/// The most unsealed rows `/sql` will materialise for one query.
+///
+/// The hot store holds everything between the sealed watermark and the tip, and every `/sql` call
+/// parses all of it into memory. On a deep-finality chain with a busy contract that is the largest RAM
+/// risk the process carries - and in a roost it is a co-tenant's problem too, because the budget is
+/// per cursor. This is the ceiling that turns "the box fell over" into a `503` naming the reason.
+///
+/// It is generous on purpose: a nest at tip on a normal chain is nowhere near it, so the guard is
+/// invisible until something is genuinely wrong. Under the CLAUDE.md division of labour resource
+/// safety is the node's job, not the gateway's - which is why this is a hard limit here rather than
+/// advice in the docs.
+const SQL_MAX_HOT_ROWS: usize = 2_000_000;
 /// Reject absurdly long query strings before they reach the planner.
 const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
@@ -866,7 +879,13 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
         let _permit = permit; // held for the whole blocking query, released on return
                               // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
-        let hot = store.hot_rows_by_table().unwrap_or_default();
+                              // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
+                              // query would quietly answer from sealed data alone and report a different number.
+        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+            Ok(hot) => hot,
+            Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
+            Err(_) => Default::default(),
+        };
         let sealed_through = store.sealed_through();
         analytics::query_hot_cold(
             &dir,
@@ -896,6 +915,20 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
             },
         }))
         .into_response(),
+        // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
+        // the node is refusing to spend the memory - so a caller should retry later or narrow to
+        // sealed data, not rewrite their SQL.
+        Ok(Err(e)) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => {
+            METRICS.inc_sql_rejected();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!("{e}"),
+                    "sealed_through": s.store.sealed_through(),
+                })),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => {
             // A guard rejection (timeout / interrupt) or a bad query - counted as a rejection.
             METRICS.inc_sql_rejected();
@@ -1439,6 +1472,42 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
+    }
+
+    /// The `/sql` RAM guard (the "node owns resource safety" half of the CLAUDE.md division of
+    /// labour): the unsealed tip is materialised per query, so an unbounded one is the largest RAM
+    /// risk the process carries - and in a roost it is a co-tenant's problem too.
+    ///
+    /// It must **fail**, not truncate. Serving a partial tip would silently change the answer to an
+    /// aggregate, and a `count(*)` quietly missing rows is far worse than a query that refuses.
+    #[tokio::test]
+    async fn an_oversized_hot_tip_is_refused_rather_than_partially_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        // Three rows in the hot store, then a cap of two.
+        for b in 1..=3u64 {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b}).to_string(),
+                )
+                .unwrap();
+        }
+        let err = state
+            .store
+            .hot_rows_by_table_bounded(2)
+            .expect_err("a tip over the cap must refuse");
+        assert!(
+            err.downcast_ref::<crate::store::HotScanTooLarge>().is_some(),
+            "the refusal must be typed so the handler can map it to 503 without matching prose: {err:#}"
+        );
+        // Under the cap it behaves exactly as the unbounded scan does.
+        let ok = state
+            .store
+            .hot_rows_by_table_bounded(3)
+            .expect("at the cap");
+        assert_eq!(ok.get("t").map(|v| v.len()), Some(3));
     }
 
     /// An over-length query string is rejected (400) before it ever reaches the planner.
