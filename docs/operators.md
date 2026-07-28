@@ -581,9 +581,11 @@ Stated plainly, because finding them yourself in production would be worse.
   data. It refuses rather than truncating, because a partial tip would silently change the answer to an
   aggregate. Generous enough to be invisible on a normal chain; it exists so a deep-finality tip turns
   into a clear error instead of an OOM that takes co-tenants with it.
-- **Sequential webhook delivery.** One slow sink throttles the others.
-- **No published container image.** Build from the recipe above.
-- **Admin status page polls** (~2 s). Server-sent-events push is deferred.
+- **No published container image.** Build from the recipe above. For a platform team this is a real
+  gap, not a nicety.
+- **Secrets live in on-disk config.** Private RPC URLs and webhook HMAC secrets sit in the nest's
+  `nuthatch.toml`. Per-nest, per-worker injection is specified (RFC-0022 §5) and not built, so today
+  the mitigation is filesystem permissions: `0700`, owned by the service user.
 - **No scaled mode.** No Postgres hot store, no writer pool, no query-FE tier, no DataFusion
   federation. All designed (RFC-0013, RFC-0022), none built.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
