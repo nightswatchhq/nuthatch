@@ -22,7 +22,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 3. **Process / ongoing** - non-code: grants (0006), launch (0007), the full graph-network migration
    (0011, parked after the pilot).
 4. **Small increments** - buildable now, low priority (proxy introspection, child-`end` conditions,
-   SSE push, the 0012 live-parity proof).
+   the 0012 live-parity proof).
 
 ## The whole backlog at a glance
 
@@ -37,7 +37,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0007 Launch | Accepted | The actual launch run | process |
 | 0008 Compliance | Implemented | - | - |
 | 0009 Factory | Implemented | Child `end`/expiry conditions (children are forever); wildcard-address decode | - (small / future RFC) |
-| 0010 Admin/webhooks | Implemented | SSE **push** live updates (status page polls today) | - (small) |
+| 0010 Admin/webhooks | Implemented | - (SSE push shipped: `/_admin/events`) | - |
 | 0011 Graph-network nest | **Parked after pilot** | Full migration: Indexer Directory (step 2) + promote the two ad-hoc pilot nests into a published `graph-network-nest` | product decision |
 | 0012 Multi-nest roost | Implemented | One acceptance item: a **sustained** byte-identical-vs-solo table-parity run over a longer range | - (a live run; public RPC ok) |
 | 0013 Storage/query | §3 shipped (DuckDB union) | DataFusion convergence (§2/§4, benchmark-gated, scaled-side first); Turso (§1, triple-gated) | scaled mode + a benchmark |
@@ -109,8 +109,8 @@ discipline has been "build only what we can verify live."
   contract's implementation ABI is picked up. Open question; documented workaround exists.
 - **0009 - child lifecycle.** Discovered children are currently forever; `end`/expiry conditions are
   deferred until demand. Also wildcard-address decode (the "future wildcard RFC").
-- **0010 - SSE push.** The admin status page + table counts **poll** (~2 s); a Server-Sent-Events push
-  channel was deferred in slice 5.
+- ~~**0010 - SSE push.**~~ **Shipped**: `/_admin/events` serves a Server-Sent-Events stream
+  (`serve.rs`). This entry also outlived its fix.
 - **0012 - live parity acceptance.** The one open 0012 item: a *sustained* two-nest byte-identical-vs-
   solo table-parity run over a longer range (holds by construction - the roost runs the same per-window
   code as solo `dev` - but the belt-and-braces proof wants a real run; the public-RPC example roost
@@ -139,7 +139,8 @@ their churn. These audit items were judged defer-worthy, with rationale:
   under the single-failure-boundary rule), COR-8 i128-band balance drop (exotic amounts), COR-10 `_seq`
   20-bit `log_index` truncation (unreachable under current gas limits; add a debug-assert), SEC-7
   `WITH`-prefixed DML slipping the keyword gate (ephemeral in-memory only), SEC-8 sequential webhook
-  delivery (one slow sink throttles others - `for_each_concurrent`).
+  delivery - **resolved** in #96 (`buffer_unordered(DELIVERY_CONCURRENCY)`); this entry outlived the fix
+  and was still being quoted as a live gap on 2026-07-28.
 - **SEC-9 - resolved (2026-07-27), no longer deferred.** Roost `/metrics` used to be the process global
   only; RFC-0026 added `{nest="…"}`-labelled series (`nuthatch_nest_last_block`,
   `…_sealed_through`, `…_rows_decoded_total`, `…_rows_sealed_total`, `…_reorgs_total`, `…_health`,

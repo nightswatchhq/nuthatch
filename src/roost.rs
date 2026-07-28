@@ -294,6 +294,8 @@ pub async fn dev(
         tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
     > = std::collections::HashMap::new();
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut sources: std::collections::HashMap<String, Arc<dyn Source>> =
+        std::collections::HashMap::new();
     let mut roost_total_mb = ROOST_BASE_RSS_MB;
     // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
     // per request. Replaces the roster snapshot that was built once at startup and could not express
@@ -355,6 +357,9 @@ pub async fn dev(
                 )
             })?;
         let source: Arc<dyn Source> = Arc::new(rpc);
+        // Retained so a mount can build a nest against the same source its co-tenants use - a nest
+        // mounted at runtime must be indistinguishable from one mounted at boot.
+        sources.insert(group.endpoint.chain.clone(), source.clone());
         let cursor = indexer::spawn_roost(
             source,
             group.nests,
@@ -411,16 +416,50 @@ pub async fn dev(
         "nests": roster_entries,
     });
 
+    // The live handles: what makes the nest set changeable at runtime instead of frozen at boot
+    // (RFC-0027). Everything the driver needs to re-compose the router lives here rather than being
+    // moved into it and forgotten.
+    let live = crate::serve::LiveRoost::new(crate::serve::compose_roost(
+        roster.clone(),
+        all_states.clone(),
+        health.clone(),
+    ));
+    let handles = Arc::new(tokio::sync::Mutex::new(RoostHandles {
+        live,
+        states: all_states,
+        alert_workers: std::mem::take(&mut alert_workers),
+        lifecycle,
+        health: health.clone(),
+        roster,
+        estimates: estimates.clone(),
+        mount_ctx: MountContext {
+            dir: dir.clone(),
+            sources,
+            backfill,
+            seal_direct,
+            concurrency,
+            window_override,
+            admin_enabled,
+            admin_token: admin_token.clone(),
+            max_rss_mb: max_rss,
+        },
+    }));
+
     // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
     // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
+    let service = handles.lock().await.live.service().merge(lifecycle_routes(
+        handles.clone(),
+        admin_enabled,
+        admin_token.clone(),
+    ));
     let result = tokio::select! {
-        r = crate::serve::run_roost(&listen, roster, all_states, health.clone()) => r,
+        r = crate::serve::bind_and_serve(&listen, service) => r,
         r = supervise_cursors(&mut ingests, &health, fail_fast) => r,
     };
     for (_, h) in &ingests {
         h.abort();
     }
-    for (_, w) in &alert_workers {
+    for (_, w) in &handles.lock().await.alert_workers {
         w.abort();
     }
     result
@@ -486,6 +525,134 @@ async fn supervise_cursors(
         "every roost cursor is dead, so nothing will advance again - {}",
         failures.join("; ")
     )
+}
+
+/// The lifecycle control surface (RFC-0027 §5): mount and unmount a nest on a running roost.
+///
+/// Mounted on the **outer** router rather than the composed one, which is what avoids a cycle - the
+/// inner composition is swapped underneath on every change, so routes living there would be replaced
+/// by the very operation that invoked them.
+///
+/// Gated by the same credential as the admin UI via [`crate::serve::token_ok`], deliberately: who may
+/// mount is the operator's gateway's decision, and a second auth concept here would be one more thing
+/// to get subtly wrong. `--no-admin` removes these routes entirely, for operators who front their own
+/// control plane and want the runtime to have no lifecycle surface at all.
+pub fn lifecycle_routes(
+    handles: Arc<tokio::sync::Mutex<RoostHandles>>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+) -> axum::Router {
+    use axum::extract::{Path as AxPath, Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{delete, post};
+    use axum::Json;
+
+    #[derive(serde::Deserialize)]
+    struct TokenQuery {
+        token: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MountBody {
+        name: String,
+    }
+
+    type Shared = (Arc<tokio::sync::Mutex<RoostHandles>>, Option<String>);
+
+    if !admin_enabled {
+        return axum::Router::new();
+    }
+
+    /// Map a refusal to its status code (RFC-0027 §3). Typed rather than string-matched, so the
+    /// mapping cannot drift from the reasons.
+    fn status_for(err: &anyhow::Error) -> StatusCode {
+        match err.downcast_ref::<MountRefusal>() {
+            Some(MountRefusal::AlreadyMounted(_)) | Some(MountRefusal::UndeclaredChain { .. }) => {
+                StatusCode::CONFLICT
+            }
+            Some(MountRefusal::OverBudget { .. }) => StatusCode::INSUFFICIENT_STORAGE,
+            None => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    async fn mount_nest(
+        State((handles, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        Json(body): Json<MountBody>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "admin token required"})),
+            );
+        }
+        let mut h = handles.lock().await;
+        match h.mount(&body.name).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"mounted": body.name})),
+            ),
+            Err(e) => (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            ),
+        }
+    }
+
+    async fn unmount_nest(
+        State((handles, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "admin token required"})),
+            );
+        }
+        let mut h = handles.lock().await;
+        match h.unmount(&name).await {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"unmounted": name}))),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            ),
+        }
+    }
+
+    axum::Router::new()
+        .route("/_admin/nests", post(mount_nest))
+        .route("/_admin/nests/{name}", delete(unmount_nest))
+        .with_state((handles, admin_token))
+}
+
+/// Persist the mounted-nest list to `roost.toml` (RFC-0027 §5).
+///
+/// This is the embedded stand-in for RFC-0022's control-plane DB: desired state lives in the *same*
+/// file the static path reads, so a restart converges on whatever the operator last asked for. Without
+/// it, a mount would silently vanish on the next restart - the worst kind of bug, because it looks
+/// like it worked.
+///
+/// Written temp-then-rename so a crash mid-write cannot leave a roost with a truncated manifest and no
+/// nests at all.
+///
+/// The conflict this creates is named rather than left to be discovered: **at runtime nuthatch owns
+/// this list.** An operator who manages `roost.toml` with configuration management should run
+/// `--no-admin` and restart to change the set, because fighting a config-management tool over a file
+/// is a losing game.
+fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
+    let path = dir.join(ROOST_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
+    let mut roost: Roost = toml::from_str(&raw)
+        .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
+    roost.roost.nests = nests.to_vec();
+    let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 /// The handles a roost driver keeps so it can change its nest set while running (RFC-0027 §6).
@@ -696,8 +863,25 @@ impl RoostHandles {
             self.states.clone(),
             self.health.clone(),
         ));
+        self.persist();
         tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
         Ok(())
+    }
+
+    /// Write the current mounted set to `roost.toml`.
+    ///
+    /// Best-effort by design: the mount or unmount has *already happened* in the running process, and
+    /// failing the operation because the manifest could not be rewritten would leave the caller with a
+    /// reported failure and a completed change - the worst of both. A loud warning is the honest
+    /// outcome, and the operator can fix the file.
+    fn persist(&self) {
+        let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
+        if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names) {
+            tracing::warn!(
+                "the roost's nest set changed but {ROOST_FILE} could not be updated ({e:#}) - the \
+                 change is live now but will not survive a restart"
+            );
+        }
     }
 
     /// Unmount a nest: drain its cursor, release every handle to its store, then remove its routes.
@@ -774,6 +958,7 @@ impl RoostHandles {
             self.states.clone(),
             self.health.clone(),
         ));
+        self.persist();
         tracing::info!("nest '{name}' unmounted from the roost");
         Ok(())
     }
