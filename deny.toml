@@ -29,8 +29,13 @@ confidence-threshold = 0.9
 # OR with a copyleft arm (ittapi = `GPL-2.0-only OR BSD-3-Clause`, r-efi = `MIT OR Apache-2.0 OR
 # LGPL-2.1-or-later`) resolve to their permissive arm here. We deliberately do NOT list GPL-2.0-only or
 # LGPL, so a future GPL/LGPL-*only* dependency fails the build - which is the point.
+# NOTE on the AGPL entry's spelling: written as the bare GNU identifier `AGPL-3.0`, not `AGPL-3.0-only`.
+# cargo-deny 0.18.x parses `allow` entries as bare GNU licence ids and rejects the `-only` suffix here
+# ("expected a `<bare-gnu-license>`"), while older versions accepted `-only`. The bare form is understood
+# by both, so it is the cross-version-robust spelling. Semantics are unchanged: this is AGPL-3.0-only in
+# SPDX terms, and it covers the ROOT CRATE'S OWN licence - there are no AGPL *dependencies*.
 allow = [
-  "AGPL-3.0-only",       # nuthatch itself (the root crate's own licence, exact SPDX). No AGPL *deps*.
+  "AGPL-3.0",       # nuthatch itself (the root crate's own licence). No AGPL *deps*.
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MIT",

@@ -88,7 +88,7 @@ struct KeyFile {
 /// `nuthatch pack keygen --out <file>` - generate a signing keypair into a local JSON file.
 pub fn keygen(out: &Path) -> Result<()> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| anyhow!("OS randomness unavailable: {e}"))?;
+    getrandom::fill(&mut seed).map_err(|e| anyhow!("OS randomness unavailable: {e}"))?;
     let sk = SigningKey::from_bytes(&seed);
     let kf = KeyFile {
         secret: hex::encode(sk.to_bytes()),
