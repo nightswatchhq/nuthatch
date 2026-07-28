@@ -6,7 +6,7 @@ work isn't scattered across fourteen "Non-goals" and "Open questions" sections. 
 release gate - what must be true before a build is pointed at a real workload unattended - see the
 [production-readiness checklist](prod-readiness.md).
 
-Reconciled against the RFCs + [progress log](progress-log.md) on **2026-07-28**.
+Reconciled against the RFCs + [progress log](progress-log.md) on **2026-07-28** (twice - the second pass after RFCs 0027/0028 landed and the three live acceptance runs were done).
 
 ## TL;DR
 
@@ -22,7 +22,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 3. **Process / ongoing** - non-code: grants (0006), launch (0007), the full graph-network migration
    (0011, parked after the pilot).
 4. **Small increments** - buildable now, low priority (proxy introspection, child-`end` conditions,
-   the 0012 live-parity proof).
+   the 0012 live-parity proof - **done 2026-07-28**).
 
 ## The whole backlog at a glance
 
@@ -39,18 +39,18 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0009 Factory | Implemented | Child `end`/expiry conditions (children are forever); wildcard-address decode | - (small / future RFC) |
 | 0010 Admin/webhooks | Implemented | - (SSE push shipped: `/_admin/events`) | - |
 | 0011 Graph-network nest | **Parked after pilot** | Full migration: Indexer Directory (step 2) + promote the two ad-hoc pilot nests into a published `graph-network-nest` | product decision |
-| 0012 Multi-nest roost | Implemented | One acceptance item: a **sustained** byte-identical-vs-solo table-parity run over a longer range | - (a live run; public RPC ok) |
+| 0012 Multi-nest roost | Implemented | - (sustained parity run done 2026-07-28: 20 tables / 17,108 rows byte-identical) | - |
 | 0013 Storage/query | §3 shipped (DuckDB union) | DataFusion convergence (§2/§4, benchmark-gated, scaled-side first); Turso (§1, triple-gated) | scaled mode + a benchmark |
 | 0014 Firehose | Deferred | State-diff + trace extraction | **0003 → reth node** |
 | 0023 eth_call | Tier 1 building | Tier 2 (metadata cache), a *simple* RPC tier-3 fallback, tier 4 (hosted cache); more recipes (reserves) | - (tiers 1-2 + simple tier-3 buildable) |
 | 0024 eth_call engine | Draft (deferred build) | The revm demand-driven state engine - **accepted design, deferred build** until the residue is measured large / archive-RPC-free operation is demanded / 0003 lands | RFC-0003 (best path) or a `--state-rpc` archive endpoint (Stage 1) |
-| 0019 Registry | Implemented | Live S3 verification against a real bucket | - (a VPS run) |
+| 0019 Registry | Implemented | - (live S3 verified 2026-07-28 against Hetzner Object Storage; S3 now ships on by default) | - |
 | 0020 N-1 upgrade | Implemented | - | - |
-| 0021 Multichain roost | Slice 1 shipped | A live two-chain run (cross-cursor reorg isolation is proven by e2e) | - (a live run) |
+| 0021 Multichain roost | Slice 1 shipped | - (live two-chain run done 2026-07-28; it found the per-nest readiness bug, now fixed) | - |
 | 0022 Distributed scaled mode | Accepted, design only | The whole build: plane split, writer pool, scheduler, control-plane DB, secret injection | 0013-scaled (Postgres) + 0021 |
 | 0025 Adaptive MCP | Implemented | - | - |
 | 0026 Fault quarantine | Implemented | - | - |
-| 0027 Live roost | Draft | All 4 slices: dynamic dispatch, lifecycle channel + unmount, mount + catch-up join, control surface | - (buildable now; the operator-facing priority) |
+| 0027 Live roost | **Implemented** | - (all 7 slices shipped 2026-07-28) | - |
 
 ## Track 1 - Infra (the shared blocker)
 

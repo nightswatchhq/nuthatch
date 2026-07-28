@@ -2,6 +2,42 @@
 
 Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-order-vertical-slices-each-ends-runnable).
 
+- **2026-07-28 - RFC-0027 and RFC-0028 complete; three live acceptance runs; relicensed to
+  `MIT OR Apache-2.0`.** A long day; the parts worth remembering:
+  - **[RFC-0027](rfcs/0027-the-live-roost.md) Implemented (all 7 slices).** A roost's nest set is no
+    longer frozen at boot, so onboarding one tenant's nest stops restarting every co-tenant's - the
+    blast radius of a *config* change was larger than that of a *fault*, which RFC-0026 had already
+    fixed. Swappable composition (parity-tested byte-for-byte against the static router), a lifecycle
+    channel drained at window boundaries, retirement as distinct from quarantine, store release across
+    **all three** holders (cursor, alert worker, serving state - redb frees the file only when the last
+    drops), mid-flight admission, mount with the two-phase catch-up join, and the control surface with
+    `roost.toml` persistence.
+  - **[RFC-0028](rfcs/0028-adaptive-log-range-control.md) Implemented** - and §0 records that its
+    original premise was **wrong**: adaptive splitting already existed. The real gap was narrower and
+    worse: `arb1.arbitrum.io`, an endpoint we *ship as an Arbitrum default*, says
+    `"logs matched by query exceeds limit of 10000"`, which matched none of the cap markers - so
+    splitting never fired on our own zero-setup path. Fixed, plus a speculative split for failures we
+    cannot classify, provider-suggested ranges honoured, one error classifier instead of two, terminal
+    auth handling, and **deterministic seal boundaries** (segment identity no longer depends on
+    `--window`/`--concurrency`).
+  - **Three live acceptance runs, written down months ago and never executed. Two found bugs.**
+    RFC-0021's two-chain run: `/<nest>/ready` read process-global metrics, so a mainnet nest reported
+    an Arbitrum tip of 488,677,305 while mainnet was at 25,632,906. RFC-0019's S3 run: `AWS_*` env was
+    passed to `parse_url_opts` raw, which matches keys in lower case - credentials silently dropped,
+    client fell through to EC2 instance metadata, five seconds of retries against 169.254.169.254.
+    RFC-0012's parity run passed clean: **20 tables, 17,108 rows byte-identical** solo vs roost.
+  - **v0.6.2 released** (the `/sql` `;`-stacking arbitrary file write), deployed to the Lodestar box
+    and verified end to end; **relicensed** AGPL-3.0 → `MIT OR Apache-2.0`; `/sql`'s unbounded hot scan
+    **bounded** (refuses at 2M unsealed rows rather than truncating - a partial tip silently changes an
+    aggregate); a **container image** published to ghcr shipping the same binary as the release; the S3
+    registry now **ships on by default** (it cost two dependency-tree lines and had been absent from
+    every released artifact).
+  - **The lesson worth keeping.** Twice today a "known gap" turned out to have been fixed weeks ago and
+    was still being quoted - concurrent webhook delivery and SSE push were both live in the code while
+    `backlog.md` and `operators.md` called them outstanding, and RFC-0028's whole premise came from
+    reading a stale list instead of the source. The deferred list records what was deferred *once*, not
+    what is true now. Read the code before describing a gap to anyone, especially a partner.
+
 - **2026-07-22 to 2026-07-28 - catch-up entry, reconciled retrospectively (2026-07-28).** The log went
   quiet for six days across two releases and eleven merges; rather than back-fill eight per-push entries
   from `git log` at a fidelity the house style does not support, this is one honest summary. Per-push
