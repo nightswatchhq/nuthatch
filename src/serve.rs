@@ -597,10 +597,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
     //
     // A solo `dev` has exactly one nest feeding the globals, so both paths agree there.
-    let nest = s
-        .roost_health
-        .as_ref()
-        .map(|(name, _)| METRICS.nest(name));
+    let nest = s.roost_health.as_ref().map(|(name, _)| METRICS.nest(name));
     let (last_poll, tip, last, sealed) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
@@ -1520,6 +1517,53 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
+    }
+
+    /// A multichain roost runs one cursor per chain, so `/<nest>/ready` must answer from **that
+    /// nest's** counters.
+    ///
+    /// Found by the RFC-0021 live two-chain run rather than by any test: a mainnet nest reported
+    /// `tip: 488677305` - an Arbitrum height - while mainnet was at 25,632,906, next to a mainnet
+    /// `sealed_through`. One body, two chains, and nothing in it to tell an operator which was which.
+    /// Whichever cursor polled last simply overwrote the shared gauge.
+    #[tokio::test]
+    async fn per_nest_readiness_does_not_report_another_chains_tip() {
+        use crate::metrics::METRICS;
+        let tmp = tempfile::tempdir().unwrap();
+        let health = Arc::new(crate::health::RoostHealth::new());
+        health.register("on-mainnet", "mainnet");
+        health.register("on-arbitrum", "arbitrum-one");
+
+        // Two cursors publishing wildly different heights, as two real chains do.
+        let eth = METRICS.nest("on-mainnet");
+        let arb = METRICS.nest("on-arbitrum");
+        eth.set_last_block(25_632_840);
+        eth.set_tip(25_632_906);
+        eth.mark_poll_ok();
+        // Arbitrum polls *after* mainnet, so it is the one that owns the global gauge.
+        arb.set_last_block(488_677_300);
+        arb.set_tip(488_677_305);
+        arb.mark_poll_ok();
+
+        let mut state = test_state(tmp.path(), 1);
+        state.roost_health = Some(("on-mainnet".to_string(), health.clone()));
+        let body = ready(State(state)).await.into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            v["tip"].as_u64(),
+            Some(25_632_906),
+            "the mainnet nest must report mainnet's tip, not whichever cursor polled last: {v}"
+        );
+        assert_eq!(v["last_block"].as_u64(), Some(25_632_840));
+        assert_eq!(
+            v["lag_blocks"].as_u64(),
+            Some(66),
+            "lag computed across two chains is meaningless - it was ~463 million before this fix"
+        );
     }
 
     /// The `/sql` RAM guard (the "node owns resource safety" half of the CLAUDE.md division of
