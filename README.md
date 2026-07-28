@@ -56,6 +56,36 @@ Prebuilt binaries (macOS Apple Silicon, Linux x86_64) ship with each release, or
 `curl -fsSL https://nuthatch-indexer.com/install.sh | sh`. Chains: Ethereum, Arbitrum One, and Base - **omit `--chain` and nuthatch probes each
 for your contract's bytecode and picks the one it lives on.** Point at your own node with `--rpc`.
 
+### A word on the free public RPCs
+
+nuthatch ships with free public endpoints per chain so that `init` → `dev` works with **zero setup** -
+that is the two-minute demo, and it is deliberate. They are fine for trying it out, following the tip of
+a low-traffic contract, or a modest recent-history backfill.
+
+They are **not** fine for real work, and it is better to hear that here than to discover it at 3am:
+
+- **They are rate-limited and shared.** You are queueing behind everyone else using the same free tier
+  from the same IP range. Throughput varies by the hour.
+- **They fail intermittently, and not always loudly.** A rate-limited endpoint may return an empty
+  result rather than an error. nuthatch fails over across the pool and retries, but a window that every
+  endpoint refuses will stall until one recovers - `/ready` reports `stalled` when that happens.
+- **Deep backfills will crawl or stop.** Full history over a busy contract means millions of
+  `eth_getLogs` calls. Expect a free endpoint to throttle you long before that finishes.
+- **No archive guarantees.** Many free endpoints prune old state, so a backfill from a 2020 deploy block
+  can simply fail partway.
+
+**Use your own endpoint for anything you care about** - your own node, or a paid provider:
+
+```sh
+nuthatch init 0xADDR --chain arbitrum-one --rpc https://your-endpoint.example/arbitrum
+nuthatch dev --rpc https://your-endpoint.example/arbitrum   # or set rpc_urls in nuthatch.toml
+```
+
+`--rpc` is repeatable, and nuthatch round-robins across the pool with per-endpoint health tracking, so
+listing two or three endpoints gets you failover as well as throughput. Every endpoint in a pool must be
+on the **same chain** - nuthatch verifies this at startup and refuses to run against a mixed pool, since
+indexing against the wrong chain corrupts state silently.
+
 ---
 
 ## Querying your data - the whole point

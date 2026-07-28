@@ -66,11 +66,23 @@ jobs:
           path: bin
       - name: measure peak RSS
         # Ceiling is 256 MB: generous headroom over the measured ~37 MB, far under the 2 GB product
-        # budget, so public-RPC flakiness in CI never trips a false failure. The script retries once
-        # if the first run indexes nothing. It is NOT continue-on-error - the RAM budget is a real gate.
+        # budget. The script retries once if the first run indexes nothing. It is NOT continue-on-error
+        # - the RAM budget is a real gate.
+        #
+        # FOOTPRINT_RPC is an optional repo secret naming a dedicated endpoint. Without it the job runs
+        # against the free public endpoints nuthatch ships with, which are rate-limited and were
+        # measured returning nothing on roughly half of attempts - enough to flap a required check.
+        # When the secret is set, CHAIN/CONTRACT must name a token on THAT endpoint's chain.
+        #
+        # The URL never reaches the logs: Actions masks the secret's value, the script does not echo it,
+        # and the indexer's own output (which logs endpoint hosts on failure) goes to a file the script
+        # never prints. Secrets are unavailable to fork PRs, which fall back to the public path.
         env:
           BIN: bin/nuthatch
           MAX_RSS_MB: "256"
+          FOOTPRINT_RPC: ${{ secrets.FOOTPRINT_RPC }}
+          CHAIN: ${{ secrets.FOOTPRINT_RPC != '' && 'arbitrum-one' || 'mainnet' }}
+          CONTRACT: ${{ secrets.FOOTPRINT_RPC != '' && '0xaf88d065e77c8cC2239327C5EDb3A432268e5831' || '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' }}
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/footprint.sh
