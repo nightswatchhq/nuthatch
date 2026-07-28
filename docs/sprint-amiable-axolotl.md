@@ -80,7 +80,39 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
 - **CI (2026-07-28).** The footprint job takes its RPC from a secret; free public-RPC limits documented
   in the README.
 - **Tier 5 (new, see below): in progress (2026-07-28).** Doc reconciliation.
-- **Next:** finish tier 5, cut **0.6.2**, then the two remaining deps bumps.
+- **Tier 3, item 7 closed (2026-07-28) - one bump done, one not ours.** `arrow`/`parquet` 56 -> 58
+  dedupes the tree (one `arrow` instead of two, `Cargo.lock` down ~150 net lines) and is **held for
+  0.7.0**, not 0.6.2: it shifts newly-sealed segment hashes (audit F-D3), which is not something to put
+  in a security patch. **`utoipa` is not actionable from this repo** - it arrives transitively via
+  `dbsp -> feldera-ir -> utoipa 4.2.3` with no direct use in our source, so the RUSTSEC-2024-0370
+  advisory (build-time only) stays ignored in `deny.toml` until an upstream dbsp bump. The backlog item
+  was mis-scoped; it should read "re-check on the next dbsp bump".
+- **Tier 5 done (2026-07-28).** Items 11-14 shipped in #160.
+- **0.6.2 cut (2026-07-28)** - security only. Draft advisory **GHSA-jvjx-5528-r6mm** awaits publication
+  once the binaries are up.
+- **Issue [#162](https://github.com/nuthatch-indexer/nuthatch/issues/162) filed** - `e2e_solo::
+  compatible_hot_upgrade_flips_backing_after_catchup` is flaky under full-suite parallel load. Written
+  up as a possible *correctness* question rather than noise: if `await_catchup_and_flip` can return while
+  the new version is genuinely behind, that is the RFC-0020 upgrade guarantee wobbling.
+- **CI gate still flaky.** The footprint job has no `FOOTPRINT_RPC` secret, so it runs against free
+  public endpoints and fails roughly one PR in three with "indexed 0 transfers". Needs a mainnet
+  endpoint; the Alchemy app currently to hand is Arbitrum-only, so either ETH_MAINNET gets enabled on it
+  or the job moves to an Arbitrum contract (which would change what the number means).
+
+## What comes next - and why it is not RFC-0027
+
+Developer feedback from **ETHGlobal Pragma Lisbon 2026** (three teams ran nuthatch, two load-bearing)
+reprioritised the queue. The single piece of glue a team had to write was an **RPC proxy splitting
+oversized `eth_getLogs` requests** - so [RFC-0028](rfcs/0028-adaptive-log-range-control.md) goes ahead
+of [RFC-0027](rfcs/0027-the-live-roost.md). Order:
+
+1. **0.6.2** - security only. *(done)*
+2. **Docs from the feedback** - the any-EVM-chain path (which `dev` supports and `init` refuses) and
+   `operators.md` discoverability. *(#163)*
+3. **RFC-0028 build + a minimal `sql --receipt`** -> **0.7.0**, carrying the arrow dedupe.
+4. **RFC-0027** - the live roost, for the GraphOps operator story.
+
+- **Next:** land #163 and #161, publish the advisory, then start RFC-0028 slice 1 (error taxonomy).
 
 ## Tier 5 - doc reconciliation (added 2026-07-28)
 
