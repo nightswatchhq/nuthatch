@@ -13,7 +13,7 @@ still honestly unfinished.
 before a build ships. This document is the *run* guide - what must be true in your environment.
 [`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
 
-Written against **0.6.1** (2026-07-28). Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **0.6.2** (2026-07-28). Read [Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -569,9 +569,9 @@ Stated plainly, because finding them yourself in production would be worse.
 **Before exposing `/sql`:**
 
 - **0.6.1 and earlier accept `;`-stacked SQL statements**, which combined with `COPY … TO` / `ATTACH`
-  is an arbitrary file-write primitive, bounded by the service user's permissions. Fixed but **not yet
-  released** at the time of writing. Do not expose `/sql` on 0.6.1 or earlier, even behind
-  authentication, until the patch release lands.
+  is an arbitrary file-write primitive, bounded by the service user's permissions. **Fixed in 0.6.2**
+  (released 2026-07-28). If you are on 0.6.1 or earlier, upgrade before exposing `/sql` to anything -
+  authentication in front does not help, because the caller is already past it.
 
 **Operational gaps:**
 
