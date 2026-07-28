@@ -1455,6 +1455,35 @@ async fn build_nest(
 /// from-history backfill regardless of how long the range is.
 const SEAL_DIRECT_BATCH: usize = 20_000;
 
+/// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
+/// window happened to stop (RFC-0028 §4).
+///
+/// Rows arrive in `(block, log_index)` order, so the cut is "everything up to and including the block
+/// that carried the buffer past the threshold". That point is a function of cumulative rows per block -
+/// a property of the chain - so two operators running different `--window`/`--concurrency` produce
+/// **identical** segments. Before this, the segment ended at the fetch window's last block, which made
+/// content-addressing quietly conditional on the operator's RPC tuning and broke the dedup that
+/// RFC-0019 bundles and RFC-0020 segment reuse both rest on.
+///
+/// A block is never split across segments: if one block alone carries the buffer past the threshold,
+/// the whole block goes into this segment and the segment is simply larger.
+///
+/// Returns `(rows, last_block)` and leaves the remainder in `buf`; `None` while the buffer is short.
+fn take_sealable(buf: &mut Vec<(u64, String)>) -> Option<(Vec<String>, u64)> {
+    if buf.len() < SEAL_DIRECT_BATCH {
+        return None;
+    }
+    let cut_block = buf[SEAL_DIRECT_BATCH - 1].0;
+    let n = buf.partition_point(|(b, _)| *b <= cut_block);
+    let rows = buf.drain(..n).map(|(_, j)| j).collect();
+    Some((rows, cut_block))
+}
+
+/// Every buffered row, in order - the final flush when a range ends.
+fn drain_sealable(buf: &mut Vec<(u64, String)>) -> Vec<String> {
+    buf.drain(..).map(|(_, j)| j).collect()
+}
+
 /// Above this many discovered children, the factory backfill flips from an address-list filter to a
 /// topic0-only fetch with local registry-lookup filtering (RFC-0009 §4) - providers cap address-list
 /// size, and a huge list is slower than fetching by topic0 and discarding non-children locally.
@@ -1479,7 +1508,8 @@ pub async fn backfill_direct(
     to: u64,
     window: u64,
 ) -> Result<u64> {
-    let mut buf: Vec<String> = Vec::new();
+    // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
+    let mut buf: Vec<(u64, String)> = Vec::new();
     let mut batch_from = from;
     let mut next = from;
     let mut total = 0u64;
@@ -1528,18 +1558,18 @@ pub async fn backfill_direct(
         let ts = source.block_timestamps(&blocks).await?;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-            buf.push(r.to_json().to_string());
+            buf.push((r.block_number, r.to_json().to_string()));
             total += 1;
         }
         next = chunk_to + 1;
 
-        // Flush a segment once the buffer fills or the range ends. `[batch_from, chunk_to]` covers
-        // every window accumulated since the last flush.
-        if buf.len() >= SEAL_DIRECT_BATCH || next > to {
-            if !buf.is_empty() {
-                seal::seal_range(dir, &buf, batch_from, chunk_to)?;
-                buf.clear();
-            }
+        // Flush on a data-determined boundary (RFC-0028 §4), not on the fetch window's end.
+        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+            seal::seal_range(dir, &rows, batch_from, seal_to)?;
+            batch_from = seal_to + 1;
+        }
+        if next > to && !buf.is_empty() {
+            seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
             batch_from = next;
         }
     }
@@ -1819,18 +1849,21 @@ pub async fn backfill_direct_pipelined(
             // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
             // (and its content address) are identical across providers - see `backfill_direct`.
             rows.sort_by_key(|r| (r.block_number, r.log_index));
-            let json: Vec<String> = rows
+            // Carry each row's block so the consumer can seal on a data-determined boundary
+            // (RFC-0028 §4) instead of at whichever window filled the buffer.
+            let json: Vec<(u64, String)> = rows
                 .iter_mut()
                 .map(|r| {
                     r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-                    r.to_json().to_string()
+                    (r.block_number, r.to_json().to_string())
                 })
                 .collect();
-            Ok::<(u64, Vec<String>), anyhow::Error>((w_to, json))
+            Ok::<(u64, Vec<(u64, String)>), anyhow::Error>((w_to, json))
         })
         .buffered(concurrency.max(1));
 
-    let mut buf: Vec<String> = Vec::new();
+    // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
+    let mut buf: Vec<(u64, String)> = Vec::new();
     let mut batch_from = from;
     let mut total = 0u64;
     while let Some(res) = stream.next().await {
@@ -1839,15 +1872,14 @@ pub async fn backfill_direct_pipelined(
         total += n;
         buf.extend(json);
         on_progress(w_to, n);
-        if buf.len() >= SEAL_DIRECT_BATCH {
-            seal::seal_range(dir, &buf, batch_from, w_to)?;
-            buf.clear();
-            batch_from = w_to + 1;
-            on_seal(w_to)?;
+        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+            seal::seal_range(dir, &rows, batch_from, seal_to)?;
+            batch_from = seal_to + 1;
+            on_seal(seal_to)?;
         }
     }
     if !buf.is_empty() {
-        seal::seal_range(dir, &buf, batch_from, to)?;
+        seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
         on_seal(to)?;
     }
     Ok(total)
@@ -1887,7 +1919,8 @@ pub async fn backfill_direct_factory(
         .collect();
     let empty_ts = std::collections::HashMap::new();
 
-    let mut buf: Vec<String> = Vec::new();
+    // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
+    let mut buf: Vec<(u64, String)> = Vec::new();
     let mut batch_from = from;
     let mut next = from;
     let mut total = 0u64;
@@ -1990,26 +2023,35 @@ pub async fn backfill_direct_factory(
         .await?;
         let rows = decode_window(registry, Some(factory), children, &all_logs, &ts);
         for r in &rows {
-            buf.push(r.to_json().to_string());
+            buf.push((r.block_number, r.to_json().to_string()));
             total += 1;
         }
         next = chunk_to + 1;
         on_progress(chunk_to, rows.len() as u64);
 
-        if buf.len() >= SEAL_DIRECT_BATCH || next > to {
-            if !buf.is_empty() {
-                // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
-                seal::seal_range_with_snapshot(
-                    dir,
-                    &buf,
-                    batch_from,
-                    chunk_to,
-                    Some(&children.hash()),
-                )?;
-                buf.clear();
-                on_seal(chunk_to)?;
-            }
+        // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path.
+        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+            // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
+            seal::seal_range_with_snapshot(
+                dir,
+                &rows,
+                batch_from,
+                seal_to,
+                Some(&children.hash()),
+            )?;
+            batch_from = seal_to + 1;
+            on_seal(seal_to)?;
+        }
+        if next > to && !buf.is_empty() {
+            seal::seal_range_with_snapshot(
+                dir,
+                &drain_sealable(&mut buf),
+                batch_from,
+                to,
+                Some(&children.hash()),
+            )?;
             batch_from = next;
+            on_seal(to)?;
         }
     }
     Ok(total)
