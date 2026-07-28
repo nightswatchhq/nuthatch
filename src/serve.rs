@@ -1295,8 +1295,19 @@ mod tests {
         }
     }
 
-    /// Drive one GET through a router and return `(status, body bytes)` - the whole observable
-    /// response, so a parity assertion cannot pass on status alone.
+    /// Clock-derived fields, which legitimately differ between two calls a moment apart.
+    ///
+    /// `/ready` reports `seconds_since_poll` and `last_poll_unixtime`; comparing those byte-for-byte
+    /// across two sequential requests asserts that no second boundary was crossed between them, which
+    /// is a statement about scheduling rather than about routing. It duly failed in CI on
+    /// `"seconds_since_poll":5` vs `6`.
+    const VOLATILE: &[&str] = &["seconds_since_poll", "last_poll_unixtime"];
+
+    /// Drive one GET through a router and return `(status, body)` - the whole observable response, so
+    /// a parity assertion cannot pass on status alone.
+    ///
+    /// JSON bodies are normalised by dropping [`VOLATILE`] keys, so the comparison stays byte-exact on
+    /// everything the router actually decides and blind only to the wall clock.
     async fn get(router: Router, path: &str) -> (StatusCode, Vec<u8>) {
         use tower::ServiceExt;
         let req = axum::http::Request::builder()
@@ -1309,6 +1320,17 @@ mod tests {
             .await
             .unwrap()
             .to_vec();
+        // Normalise only if it parses as a JSON object; anything else is compared verbatim.
+        let body = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(mut v) if v.is_object() => {
+                let map = v.as_object_mut().unwrap();
+                for k in VOLATILE {
+                    map.remove(*k);
+                }
+                serde_json::to_vec(&v).unwrap()
+            }
+            _ => body,
+        };
         (status, body)
     }
 
