@@ -508,7 +508,80 @@ pub struct RoostHandles {
     pub health: Arc<crate::health::RoostHealth>,
     /// The static half of the roster, re-merged with live health per request.
     pub roster: serde_json::Value,
+    /// Per-nest projected RSS, so a mount can price the cursor it is joining without re-reading
+    /// every co-tenant's config.
+    pub estimates: std::collections::HashMap<String, u64>,
+    /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
+    /// settings a new nest must be built with so it behaves identically to one mounted at boot.
+    pub mount_ctx: MountContext,
 }
+
+/// The context a running roost needs in order to build and admit a nest (RFC-0027 §3).
+///
+/// Deliberately captured at startup rather than re-derived per mount: a nest mounted at 3am must be
+/// built with the same backfill mode, concurrency, window and admin posture as its co-tenants, or two
+/// nests in one roost would behave differently for no reason an operator could see.
+#[derive(Clone)]
+pub struct MountContext {
+    /// The roost directory; a nest lives at `nests/<name>/`.
+    pub dir: PathBuf,
+    /// Chain -> the source driving that chain's cursor. A nest whose chain is absent cannot be mounted.
+    pub sources: std::collections::HashMap<String, Arc<dyn Source>>,
+    pub backfill: Option<u64>,
+    pub seal_direct: bool,
+    pub concurrency: usize,
+    pub window_override: Option<u64>,
+    pub admin_enabled: bool,
+    pub admin_token: Option<String>,
+    /// The per-cursor RSS ceiling a mount must not breach (`CLAUDE.md`; RFC-0021 §0).
+    pub max_rss_mb: u64,
+}
+
+/// Why a mount was refused (RFC-0027 §3). Typed so the control surface can map each to its status
+/// code without parsing strings.
+#[derive(Debug)]
+pub enum MountRefusal {
+    /// Mounting over a live name is an *upgrade*, and that is RFC-0020's job.
+    AlreadyMounted(String),
+    /// The roost declares no cursor for this nest's chain. Adding a chain at runtime is a non-goal.
+    UndeclaredChain { nest: String, chain: String },
+    /// The cursor's projected footprint would exceed its ceiling. A refusal, not a warning - the
+    /// budget stops being a budget the moment it becomes advisory.
+    OverBudget {
+        nest: String,
+        chain: String,
+        projected_mb: u64,
+        ceiling_mb: u64,
+    },
+}
+
+impl std::fmt::Display for MountRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountRefusal::AlreadyMounted(n) => write!(
+                f,
+                "nest '{n}' is already mounted - changing a mounted nest is `nest upgrade`, not a mount"
+            ),
+            MountRefusal::UndeclaredChain { nest, chain } => write!(
+                f,
+                "nest '{nest}' is on {chain}, which this roost declares no cursor for - add it under \
+                 [[chains]] and restart"
+            ),
+            MountRefusal::OverBudget {
+                nest,
+                chain,
+                projected_mb,
+                ceiling_mb,
+            } => write!(
+                f,
+                "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
+                 {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another roost"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MountRefusal {}
 
 /// How long to wait for a cursor to acknowledge that it has released a nest.
 ///
@@ -519,6 +592,114 @@ pub struct RoostHandles {
 const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl RoostHandles {
+    /// Mount a nest into the running roost (RFC-0027 §3-§4).
+    ///
+    /// Admission first, work second: every refusal is decided before a store is opened or a block is
+    /// fetched, so a rejected mount costs nothing and leaves nothing behind.
+    ///
+    /// Then phase 1 - build and `prepare` the nest **outside** the cursor, so it catches up on its own
+    /// before joining. Phase 2 hands it over at a window boundary. Doing it the other way round would
+    /// drag every co-tenant back to the new nest's start block, because the cursor advances from the
+    /// min of its live nests.
+    ///
+    /// Routes appear only after the cursor has acknowledged, so a nest is never reachable before it is
+    /// actually indexing.
+    pub async fn mount(&mut self, name: &str) -> Result<()> {
+        if self.states.iter().any(|(n, _)| n == name) {
+            return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
+        }
+        let dir = Roost::nest_dir(&self.mount_ctx.dir, name);
+        let config = Config::load(&dir)
+            .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
+        let chain = config.nest.chain.clone();
+
+        let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
+            return Err(MountRefusal::UndeclaredChain {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        };
+        let Some(lifecycle) = self.lifecycle.get(&chain).cloned() else {
+            return Err(MountRefusal::UndeclaredChain {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        };
+
+        // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
+        // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
+        // against *this cursor's* current membership, not the whole roost - the ceiling is per cursor.
+        let has_labels = !crate::labels::load(&dir).is_empty();
+        let incoming = estimate_nest_rss_mb(&config, has_labels);
+        let existing: u64 = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.chain == chain)
+            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
+            .sum();
+        let projected = ROOST_BASE_RSS_MB + existing + incoming;
+        if projected > self.mount_ctx.max_rss_mb {
+            return Err(MountRefusal::OverBudget {
+                nest: name.to_string(),
+                chain,
+                projected_mb: projected,
+                ceiling_mb: self.mount_ctx.max_rss_mb,
+            }
+            .into());
+        }
+
+        // Phase 1: build and catch up, off to one side of the cursor.
+        let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
+            &source,
+            dir,
+            &config,
+            self.mount_ctx.backfill,
+            self.mount_ctx.seal_direct,
+            self.mount_ctx.concurrency,
+            self.mount_ctx.window_override,
+            self.mount_ctx.admin_enabled,
+            self.mount_ctx.admin_token.clone(),
+        )
+        .await
+        .with_context(|| format!("preparing nest '{name}' for mount"))?;
+        state.roost_health = Some((name.to_string(), self.health.clone()));
+
+        // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        lifecycle
+            .send(indexer::CursorCommand::Mount {
+                nest: Box::new(nest),
+                next,
+                ack: Some(ack_tx),
+            })
+            .map_err(|_| anyhow::anyhow!("cursor on {chain} is gone; cannot mount '{name}'"))?;
+        tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
+                    UNMOUNT_ACK_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|_| anyhow::anyhow!("cursor on {chain} stopped while mounting '{name}'"))?;
+
+        // Only now do the routes appear.
+        if let Some(worker) = worker {
+            self.alert_workers.push((name.to_string(), worker));
+        }
+        self.estimates.insert(name.to_string(), incoming);
+        self.states.push((name.to_string(), state));
+        self.live.swap(crate::serve::compose_roost(
+            self.roster.clone(),
+            self.states.clone(),
+            self.health.clone(),
+        ));
+        tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
+        Ok(())
+    }
+
     /// Unmount a nest: drain its cursor, release every handle to its store, then remove its routes.
     ///
     /// The ordering is the contract (RFC-0027 §6). The cursor is asked first and acknowledged before

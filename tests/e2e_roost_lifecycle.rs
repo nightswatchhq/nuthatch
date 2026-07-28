@@ -16,6 +16,7 @@ use common::tape::*;
 
 /// A two-nest, one-chain roost over a scripted tape, wrapped in the driver handles a live roost keeps.
 async fn two_nest_roost(
+    roost_dir: &std::path::Path,
     usdc_dir: &std::path::Path,
     arb_dir: &std::path::Path,
 ) -> (roost::RoostHandles, Arc<TapeSource>) {
@@ -82,6 +83,24 @@ async fn two_nest_roost(
         )]),
         health,
         roster,
+        estimates: std::collections::HashMap::from([
+            ("usdc".to_string(), 90),
+            ("arb".to_string(), 90),
+        ]),
+        mount_ctx: roost::MountContext {
+            dir: roost_dir.to_path_buf(),
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            window_override: Some(2),
+            admin_enabled: false,
+            admin_token: None,
+            max_rss_mb: 2048,
+        },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
     // running for the unmount handshake to be answered at a window boundary.
@@ -104,7 +123,8 @@ async fn status(live: &serve::LiveRoost, path: &str) -> axum::http::StatusCode {
 async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
     let usdc_dir = tempfile::tempdir().unwrap();
     let arb_dir = tempfile::tempdir().unwrap();
-    let (mut handles, _tape) = two_nest_roost(usdc_dir.path(), arb_dir.path()).await;
+    let (mut handles, _tape) =
+        two_nest_roost(usdc_dir.path(), usdc_dir.path(), arb_dir.path()).await;
 
     // Both mounted to begin with.
     assert_eq!(
@@ -151,7 +171,8 @@ async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
 async fn unmounting_an_absent_nest_is_a_no_op() {
     let usdc_dir = tempfile::tempdir().unwrap();
     let arb_dir = tempfile::tempdir().unwrap();
-    let (mut handles, _tape) = two_nest_roost(usdc_dir.path(), arb_dir.path()).await;
+    let (mut handles, _tape) =
+        two_nest_roost(usdc_dir.path(), usdc_dir.path(), arb_dir.path()).await;
 
     handles.unmount("not-mounted").await.expect("no-op");
     assert_eq!(handles.states.len(), 2, "nothing was removed");
@@ -159,4 +180,64 @@ async fn unmounting_an_absent_nest_is_a_no_op() {
     handles.unmount("arb").await.expect("first unmount");
     handles.unmount("arb").await.expect("second is idempotent");
     assert_eq!(handles.states.len(), 1);
+}
+
+/// RFC-0027 §3: the three admission refusals, each decided **before** any work is done - no store
+/// opened, no block fetched, nothing left behind by a rejected mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_budget() {
+    let roost_dir = tempfile::tempdir().unwrap();
+    let usdc_dir = roost_dir.path().join("nests/usdc");
+    let arb_dir = roost_dir.path().join("nests/arb");
+    std::fs::create_dir_all(&usdc_dir).unwrap();
+    std::fs::create_dir_all(&arb_dir).unwrap();
+    let (mut handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
+
+    // 1. A name already on the roost. This is an upgrade (RFC-0020), not a mount.
+    let err = handles.mount("usdc").await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<roost::MountRefusal>(),
+            Some(roost::MountRefusal::AlreadyMounted(_))
+        ),
+        "expected AlreadyMounted, got: {err:#}"
+    );
+
+    // 2. A nest whose chain the roost declares no cursor for. Scaffold one on a different chain.
+    let other = roost_dir.path().join("nests/elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut cfg = scaffold_nest(&other, "elsewhere", USDC);
+    cfg.nest.chain = "base".to_string();
+    cfg.nest.chain_id = 8453;
+    cfg.save(&other).unwrap();
+    let err = handles.mount("elsewhere").await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<roost::MountRefusal>(),
+            Some(roost::MountRefusal::UndeclaredChain { .. })
+        ),
+        "expected UndeclaredChain, got: {err:#}"
+    );
+
+    // 3. A mount that would breach the cursor's ceiling. The budget is a refusal, not a warning -
+    //    `CLAUDE.md`'s per-cursor limit stops being a budget the moment a mount may quietly exceed it.
+    let third = roost_dir.path().join("nests/third");
+    std::fs::create_dir_all(&third).unwrap();
+    scaffold_nest(&third, "third", ARB);
+    handles.mount_ctx.max_rss_mb = 100; // below even the base cost, so any mount breaches it
+    let err = handles.mount("third").await.unwrap_err();
+    match err.downcast_ref::<roost::MountRefusal>() {
+        Some(roost::MountRefusal::OverBudget {
+            projected_mb,
+            ceiling_mb,
+            ..
+        }) => assert!(
+            projected_mb > ceiling_mb,
+            "the refusal must carry the numbers an operator needs to act: {projected_mb} vs {ceiling_mb}"
+        ),
+        other => panic!("expected OverBudget, got: {other:?} / {err:#}"),
+    }
+
+    // Every refusal left the roost exactly as it was.
+    assert_eq!(handles.states.len(), 2, "no partial mount was left behind");
 }
