@@ -313,6 +313,7 @@ quotas (that needs identity a single-tenant node does not have):
 | max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503` |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
+| max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
 
 `/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
@@ -575,12 +576,16 @@ Stated plainly, because finding them yourself in production would be worse.
 
 **Operational gaps:**
 
-- **No hot nest lifecycle.** Restart required to change a roost's nest set (RFC-0027, designed).
-- **`/sql` materialises the whole tip per query.** The largest RAM risk on a deep-finality chain.
-  Bound it at your gateway on busy nests.
-- **Sequential webhook delivery.** One slow sink throttles the others.
-- **No published container image.** Build from the recipe above.
-- **Admin status page polls** (~2 s). Server-sent-events push is deferred.
+- **`/sql` materialises the whole tip per query**, now **bounded**: past 2,000,000 unsealed rows the
+  query is refused with `503` and the response names `sealed_through` so a caller can narrow to sealed
+  data. It refuses rather than truncating, because a partial tip would silently change the answer to an
+  aggregate. Generous enough to be invisible on a normal chain; it exists so a deep-finality tip turns
+  into a clear error instead of an OOM that takes co-tenants with it.
+- **No published container image.** Build from the recipe above. For a platform team this is a real
+  gap, not a nicety.
+- **Secrets live in on-disk config.** Private RPC URLs and webhook HMAC secrets sit in the nest's
+  `nuthatch.toml`. Per-nest, per-worker injection is specified (RFC-0022 §5) and not built, so today
+  the mitigation is filesystem permissions: `0700`, owned by the service user.
 - **No scaled mode.** No Postgres hot store, no writer pool, no query-FE tier, no DataFusion
   federation. All designed (RFC-0013, RFC-0022), none built.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class

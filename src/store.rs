@@ -32,6 +32,30 @@ const OUTBOX: TableDefinition<&str, &str> = TableDefinition::new("outbox");
 /// Meta key holding the next outbox sequence number.
 const OUTBOX_SEQ: &str = "outbox_next_seq";
 
+/// The unsealed tip is too large to materialise for one query (the `/sql` RAM guard).
+///
+/// Typed rather than a string so the serving layer can map it to a status code without matching on
+/// prose - the same reasoning as `MountRefusal` and the RPC `FailureClass`. A message-matched guard
+/// silently stops working the day someone rewords the message.
+#[derive(Debug)]
+pub struct HotScanTooLarge {
+    pub cap: usize,
+}
+
+impl std::fmt::Display for HotScanTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the unsealed tip holds more than {} rows, which this node will not materialise for a \
+             single query - query at or below `sealed_through`, or raise the cap if the box has the \
+             memory",
+            self.cap
+        )
+    }
+}
+
+impl std::error::Error for HotScanTooLarge {}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -310,14 +334,37 @@ impl Store {
     pub fn hot_rows_by_table(
         &self,
     ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
+        self.hot_rows_by_table_bounded(usize::MAX)
+    }
+
+    /// As [`Store::hot_rows_by_table`], but refusing to materialise more than `max_rows`.
+    ///
+    /// The unbounded version parses **every unsealed row into memory on every query**, which on a
+    /// deep-finality chain with a busy contract is the largest RAM risk the process carries: the hot
+    /// store holds everything between the sealed watermark and the tip, and a single `/sql` call can
+    /// therefore breach the per-cursor budget and, in a roost, take co-tenants down with it.
+    ///
+    /// It **fails** at the cap rather than truncating. Serving a partial tip would silently change the
+    /// answer to an aggregate - a `count(*)` quietly missing rows is far worse than a query that
+    /// refuses, and it is the same reasoning that makes a malformed log fail its window rather than be
+    /// skipped. The caller turns this into a `503` with the numbers an operator needs.
+    pub fn hot_rows_by_table_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
+        let mut seen = 0usize;
         for row in t.iter()? {
             let (_k, v) = row?;
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(v.value()) {
                 if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
+                    seen += 1;
+                    if seen > max_rows {
+                        return Err(HotScanTooLarge { cap: max_rows }.into());
+                    }
                     out.entry(table.to_string()).or_default().push(json);
                 }
             }
