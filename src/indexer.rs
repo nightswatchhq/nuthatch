@@ -1016,7 +1016,13 @@ async fn roost_index_loop(
         let tip = match source.tip().await {
             Ok(t) => {
                 poll_failures = 0;
-                METRICS.mark_poll_ok();
+                // Publish to **each nest on this cursor**, not only to the process-global gauge. With
+                // one cursor per chain, a single global tip means whichever cursor polled last wins -
+                // and `/<nest>/ready` then answers with another chain's block height. Observed live in
+                // a two-chain roost: the mainnet nest reported an Arbitrum tip.
+                for &i in &live {
+                    live_ref(&nests, i).metrics.mark_poll_ok();
+                }
                 t
             }
             Err(e) => {
@@ -1025,7 +1031,9 @@ async fn roost_index_loop(
                 continue;
             }
         };
-        METRICS.set_tip(tip);
+        for &i in &live {
+            live_ref(&nests, i).metrics.set_tip(tip);
+        }
 
         // Shared reorg detection + fan-out (RFC-0012 slice 3). A reorg is a chain event every nest at
         // the tip is exposed to identically, and all caught-up nests checkpoint the same boundaries with

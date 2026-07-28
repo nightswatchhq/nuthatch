@@ -551,19 +551,41 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     }
-    let last_poll = METRICS.last_poll_ok();
+    // Answer from **this nest's** counters when it is one of several in a roost. The process-global
+    // gauges are shared by every cursor, so in a multichain roost whichever cursor polled last wins -
+    // and this endpoint then reports another chain's block heights. Observed live in a two-chain roost:
+    // the mainnet nest reported `tip: 488677305` (Arbitrum) while mainnet was at 25,632,906, alongside
+    // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
+    //
+    // A solo `dev` has exactly one nest feeding the globals, so both paths agree there.
+    let nest = s
+        .roost_health
+        .as_ref()
+        .map(|(name, _)| METRICS.nest(name));
+    let (last_poll, tip, last, sealed) = match &nest {
+        Some(m) => (
+            m.last_poll_ok(),
+            m.tip(),
+            m.last_block(),
+            m.sealed_through(),
+        ),
+        None => (
+            METRICS.last_poll_ok(),
+            METRICS.tip_height(),
+            METRICS.last_block(),
+            METRICS.sealed_through_val(),
+        ),
+    };
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
     let stalled = poll_stalled(last_poll, now, READINESS_STALL_SECS);
-    let tip = METRICS.tip_height();
-    let last = METRICS.last_block();
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
         "tip": tip,
         "last_block": last,
         "lag_blocks": tip.saturating_sub(last),
-        "sealed_through": METRICS.sealed_through_val(),
+        "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
     });

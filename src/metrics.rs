@@ -20,6 +20,16 @@ pub static METRICS: Metrics = Metrics::new();
 pub struct NestMetrics {
     last_block: AtomicU64,
     sealed_through: AtomicU64,
+    /// The tip of **this nest's chain**, and when its cursor last polled successfully.
+    ///
+    /// Duplicated per nest rather than kept only process-globally because a multichain roost runs one
+    /// cursor per chain: with a single global tip, whichever cursor polled last wins, and
+    /// `/<nest>/ready` reports another chain's block height. Observed live - a mainnet nest reporting
+    /// an Arbitrum tip of 488,677,305 while mainnet was at 25,632,906.
+    ///
+    /// Every nest on the same cursor holds the same value, which is correct: they share a chain.
+    tip: AtomicU64,
+    last_poll_ok: AtomicU64,
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
@@ -29,6 +39,27 @@ impl NestMetrics {
     pub fn set_last_block(&self, v: u64) {
         self.last_block.store(v, Relaxed);
         METRICS.set_last_block(v);
+    }
+    /// This nest's chain tip, and the global aggregate for a solo `dev`.
+    pub fn set_tip(&self, v: u64) {
+        self.tip.store(v, Relaxed);
+        METRICS.set_tip(v);
+    }
+    pub fn tip(&self) -> u64 {
+        self.tip.load(Relaxed)
+    }
+    pub fn mark_poll_ok(&self) {
+        self.last_poll_ok.store(now_unix(), Relaxed);
+        METRICS.mark_poll_ok();
+    }
+    pub fn last_poll_ok(&self) -> u64 {
+        self.last_poll_ok.load(Relaxed)
+    }
+    pub fn last_block(&self) -> u64 {
+        self.last_block.load(Relaxed)
+    }
+    pub fn sealed_through(&self) -> u64 {
+        self.sealed_through.load(Relaxed)
     }
     pub fn set_sealed_through(&self, v: u64) {
         self.sealed_through.store(v, Relaxed);
