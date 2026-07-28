@@ -66,7 +66,17 @@ impl AdaptiveWindow {
 }
 
 /// Whether an RPC error looks like a result-size / range cap (so the caller shrinks and retries the
-/// same range) rather than a transient failure. Matches the phrasings the major providers use.
+/// same range) rather than a transient failure.
+///
+/// **This list is a liability, and it has already cost us.** It was written against Alchemy and Infura,
+/// and `arb1.arbitrum.io` - an endpoint nuthatch *ships as an Arbitrum default* - says
+/// `"logs matched by query exceeds limit of 10000"`, which matched **none** of the original markers. So
+/// splitting never fired on our own zero-setup path, and a busy Arbitrum contract retried the same
+/// oversized window until the operator intervened (RFC-0028 §1, measured 2026-07-28).
+///
+/// Widening the list fixes the providers we have met. The durable fix is the caller's speculative split
+/// for failures this cannot classify (RFC-0028 §3b) - because any design that needs to have seen a
+/// provider's phrasing in advance will keep failing on providers we have not met.
 pub fn is_result_too_large(err: &anyhow::Error) -> bool {
     let s = format!("{err:#}").to_ascii_lowercase();
     const CAP_MARKERS: &[&str] = &[
@@ -79,6 +89,12 @@ pub fn is_result_too_large(err: &anyhow::Error) -> bool {
         "range too large",
         "too large", // catch-all for "* too large"
         "limit exceeded",
+        // arb1.arbitrum.io: "logs matched by query exceeds limit of 10000" - measured, and the reason
+        // this list grew. Two markers because providers phrase the same cap either way round.
+        "exceeds limit of",
+        "exceeds max",
+        "logs matched by query",
+        "exceeds the limit",
     ];
     CAP_MARKERS.iter().any(|m| s.contains(m))
 }
@@ -136,5 +152,52 @@ mod tests {
         assert!(is_result_too_large(&anyhow!("block range is too wide")));
         assert!(!is_result_too_large(&anyhow!("connection reset by peer")));
         assert!(!is_result_too_large(&anyhow!("HTTP status 521")));
+    }
+
+    /// The regression that motivated RFC-0028. These are **measured** provider responses, captured on
+    /// 2026-07-28 by asking each endpoint for a populated 199k-block range of Arbitrum One native USDC
+    /// - not paraphrases. A marker list tested against invented strings tests our imagination.
+    ///
+    /// `arb1.arbitrum.io` is one of the endpoints nuthatch ships as an Arbitrum default, and its
+    /// phrasing matched nothing, so `fetch_logs_splitting` never recursed and the zero-setup path
+    /// stalled on any busy contract.
+    #[test]
+    fn detects_the_measured_cap_errors_of_endpoints_we_ship() {
+        // arb1.arbitrum.io, HTTP 200, code -32000. Matched nothing before this fix.
+        assert!(
+            is_result_too_large(&anyhow!("logs matched by query exceeds limit of 10000")),
+            "arb1.arbitrum.io is a shipped default; its cap message must trigger splitting"
+        );
+        // Alchemy, HTTP 200, code -32602 (generic invalid-params - hence matching on text, not code).
+        assert!(is_result_too_large(&anyhow!(
+            "Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block \
+             range and no limit on the response size, or you can request any block range with a cap \
+             of 10K logs in the response. Based on your parameters and the response size limit, this \
+             block range should work: [0x1000000, 0x1007fff]"
+        )));
+        // Infura's phrasing, for completeness alongside the two we measured directly.
+        assert!(is_result_too_large(&anyhow!(
+            "query returned more than 10000 results"
+        )));
+    }
+
+    /// The other half of the contract: widening the list must not start swallowing failures that are
+    /// nothing to do with size. Shrinking on these would trade throughput for nothing and mask real
+    /// faults - including the auth rejection RFC-0028 slice 1 made terminal.
+    #[test]
+    fn does_not_mistake_other_failures_for_a_cap() {
+        for msg in [
+            "Must be authenticated!",
+            "Archive requests require a personal token",
+            "429 Too Many Requests",
+            "connection reset by peer",
+            "error decoding response body",
+            "HTTP status 503",
+        ] {
+            assert!(
+                !is_result_too_large(&anyhow!("{msg}")),
+                "{msg:?} is not a size cap and must not trigger a shrink"
+            );
+        }
     }
 }
