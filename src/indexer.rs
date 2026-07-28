@@ -731,15 +731,34 @@ impl Supervisor {
 /// own watermarks (a nest that sealed less far is perfectly repairable), so they roll back and carry
 /// on. This is the headline case from issue #147: before RFC-0026 the first nest to bail here killed
 /// the cursor mid-fan-out, leaving its siblings rolled back but never advanced again.
+/// A live nest's ingest state, by index.
+///
+/// A slot is `None` only after the nest was retired (RFC-0027 §6), and retirement removes it from
+/// `Supervisor::live()` in the same breath - so every index derived from the live set is present.
+/// Panicking here would mean those two fell out of step, which is a logic error rather than a
+/// condition to handle: silently skipping would make a nest stop indexing with no diagnosis.
+fn live_nest(nests: &mut [Option<NestIngest>], i: usize) -> &mut NestIngest {
+    nests[i]
+        .as_mut()
+        .expect("a live index must have an ingest state; retirement clears both together")
+}
+
+/// Shared-reference twin of [`live_nest`].
+fn live_ref(nests: &[Option<NestIngest>], i: usize) -> &NestIngest {
+    nests[i]
+        .as_ref()
+        .expect("a live index must have an ingest state; retirement clears both together")
+}
+
 fn fan_out_rollback(
-    nests: &mut [NestIngest],
+    nests: &mut [Option<NestIngest>],
     nexts: &mut [u64],
     sup: &mut Supervisor,
     live: &[usize],
     ancestor: u64,
 ) -> Result<()> {
     for &i in live {
-        match nests[i].rollback_reorg(ancestor) {
+        match live_nest(nests, i).rollback_reorg(ancestor) {
             Ok(()) => nexts[i] = nexts[i].min(ancestor + 1),
             Err(e) => sup.quarantine(i, &e)?,
         }
@@ -763,18 +782,36 @@ fn fan_out_rollback(
 ///
 /// A command naming a nest this cursor does not host is logged and dropped rather than treated as an
 /// error - with one cursor per chain, a roost-level command may legitimately reach the wrong cursor.
-fn drain_lifecycle(lifecycle: &mut Option<CursorCommands>, sup: &mut Supervisor) {
+fn drain_lifecycle(
+    lifecycle: &mut Option<CursorCommands>,
+    sup: &mut Supervisor,
+    nests: &mut [Option<NestIngest>],
+) {
     let Some(rx) = lifecycle.as_mut() else {
         return;
     };
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
-            CursorCommand::Unmount(name) => match sup.index_of(&name) {
-                Some(i) => sup.retire(i),
-                None => {
-                    tracing::debug!("unmount for '{name}' is not for this cursor; ignoring")
+            CursorCommand::Unmount { name, ack } => {
+                match sup.index_of(&name) {
+                    // Retire *and release*: dropping the `NestIngest` drops this cursor's `Store`
+                    // clone, its view handles and its screener. redb only lets go of the file when
+                    // every clone has, so this is one of three that must (RFC-0027 §6).
+                    Some(i) => {
+                        sup.retire(i);
+                        nests[i] = None;
+                    }
+                    None => {
+                        tracing::debug!("unmount for '{name}' is not for this cursor; ignoring")
+                    }
                 }
-            },
+                // Acknowledge either way. A command for another cursor is still "done" as far as this
+                // one is concerned, and leaving the driver waiting on a nest we do not host would
+                // hang the unmount forever.
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
         }
     }
 }
@@ -786,10 +823,36 @@ fn drain_lifecycle(lifecycle: &mut Option<CursorCommands>, sup: &mut Supervisor)
 /// computes `global_next` as a min over its nests, detects reorgs once, and fans rollback out to every
 /// one of them. Mutating the set underneath that would produce a rollback applied to a nest that was
 /// not present for the roll forward.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Clone`/`Eq`: the acknowledgement is a `oneshot::Sender`, which is neither - and should not be.
+// An unmount is consumed exactly once, by exactly one cursor.
+#[derive(Debug)]
 pub enum CursorCommand {
-    /// Retire a nest from this cursor's working set at the operator's request.
-    Unmount(String),
+    /// Retire a nest from this cursor's working set at the operator's request, then **release
+    /// everything the cursor holds for it** - its store handle above all.
+    ///
+    /// `ack` fires once that is done, and the ordering it enforces is the point of the handshake:
+    /// the driver must not remove the nest's routes until the cursor has finished with it (RFC-0027
+    /// §6, drain-then-remove). It also tells the driver *when* the cursor's `Store` clone is gone,
+    /// which matters because redb only releases the file once every clone drops - the cursor's, the
+    /// serving state's, and the alert worker's.
+    ///
+    /// A dropped `ack` sender is not an error: the driver may have stopped caring, and the cursor's
+    /// job is done either way.
+    Unmount {
+        name: String,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+}
+
+impl CursorCommand {
+    /// An unmount with no acknowledgement - for callers that do not need to know when the cursor has
+    /// let go (tests, and any fire-and-forget path).
+    pub fn unmount(name: impl Into<String>) -> Self {
+        CursorCommand::Unmount {
+            name: name.into(),
+            ack: None,
+        }
+    }
 }
 
 pub type CursorCommands = tokio::sync::mpsc::UnboundedReceiver<CursorCommand>;
@@ -797,7 +860,7 @@ pub type CursorCommands = tokio::sync::mpsc::UnboundedReceiver<CursorCommand>;
 #[allow(clippy::too_many_arguments)]
 async fn roost_index_loop(
     source: Arc<dyn Source>,
-    mut nests: Vec<NestIngest>,
+    nests: Vec<NestIngest>,
     backfill: Option<u64>,
     seal_direct: bool,
     concurrency: usize,
@@ -809,18 +872,22 @@ async fn roost_index_loop(
     if nests.is_empty() {
         return Ok(());
     }
-    let mut sup = Supervisor::new(
-        nests.iter().map(|n| n.name.clone()).collect(),
-        health,
-        fail_fast,
-    );
+    let names: Vec<String> = nests.iter().map(|n| n.name.clone()).collect();
+    // Optioned so a retirement can *drop* the nest's ingest state - and with it this cursor's `Store`
+    // clone, which redb needs released before the file is free (RFC-0027 §6).
+    let mut nests: Vec<Option<NestIngest>> = nests.into_iter().map(Some).collect();
+    let mut sup = Supervisor::new(names, health, fail_fast);
 
     // Phase 0, per nest: each nest backfills its own history to near-tip independently (tip-only
     // coupling - the shared cursor never entangles backfill windows). Each returns its own start cursor.
     // A failure here quarantines that nest (RFC-0026 §3) rather than stillbirthing the cursor: before,
     // one nest's backfill error killed the shared task before a single sibling indexed a block.
     let mut nexts: Vec<u64> = vec![0; nests.len()];
-    for (i, nest) in nests.iter_mut().enumerate() {
+    for (i, slot) in nests.iter_mut().enumerate() {
+        // Every slot is `Some` here - nothing has been retired before the loop starts.
+        let nest = slot
+            .as_mut()
+            .expect("no nest can be retired before the cursor begins");
         match nest
             .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
             .await
@@ -839,7 +906,7 @@ async fn roost_index_loop(
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
         // windows" holds (RFC-0027 §2).
-        drain_lifecycle(&mut lifecycle, &mut sup);
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
         if sup.all_retired() {
             // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
             // so this returns cleanly rather than bailing, and the roost stays up (RFC-0027 §6).
@@ -852,9 +919,12 @@ async fn roost_index_loop(
         // A nest quarantined *during* `prepare` never established a cursor, so it re-`prepare`s before
         // rejoining. Without this it would rejoin at `nexts[i] == 0` and, being the new minimum, drag
         // the whole shared cursor back to genesis - re-indexing every co-tenant from block 0.
+        // Indexes four parallel arrays (`nests`, `nexts`, `sup.states`, `sup.prepared`) that must stay
+        // in step, so an index loop says what it means; enumerating one of them would obscure that.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..nests.len() {
             if matches!(sup.states[i], NestState::Live) && !sup.prepared[i] {
-                match nests[i]
+                match live_nest(&mut nests, i)
                     .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
                     .await
                 {
@@ -908,7 +978,13 @@ async fn roost_index_loop(
         if max_next > 0 {
             // Any caught-up nest is a valid checkpoint reference; use one at the max height.
             let reference = *live.iter().find(|&&i| nexts[i] == max_next).unwrap();
-            match detect_reorg(source.as_ref(), &nests[reference].store, max_next - 1).await {
+            match detect_reorg(
+                source.as_ref(),
+                &live_ref(&nests, reference).store,
+                max_next - 1,
+            )
+            .await
+            {
                 Ok(Some(ancestor)) => {
                     tracing::warn!("roost reorg to block {ancestor}: rolling back every live nest");
                     fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor)?;
@@ -930,10 +1006,10 @@ async fn roost_index_loop(
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
         // whole cursor topic0-only).
-        let (u_addrs, u_topics) = union_filter(
-            live.iter()
-                .map(|&i| (nests[i].addresses.as_slice(), nests[i].topic0s.as_slice())),
-        );
+        let (u_addrs, u_topics) = union_filter(live.iter().map(|&i| {
+            let n = live_ref(&nests, i);
+            (n.addresses.as_slice(), n.topic0s.as_slice())
+        }));
         match source.logs(&u_addrs, &u_topics, global_next, to).await {
             Ok(logs) => {
                 chunker.observed(logs.len() as u64);
@@ -947,7 +1023,7 @@ async fn roost_index_loop(
                     }
                     let nest_logs: Vec<crate::rpc::Log> = logs
                         .iter()
-                        .filter(|l| l.block_number >= nexts[i] && nests[i].owns(l))
+                        .filter(|l| l.block_number >= nexts[i] && live_ref(&nests, i).owns(l))
                         .cloned()
                         .collect();
                     // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
@@ -958,7 +1034,7 @@ async fn roost_index_loop(
                     // An `Err` is this nest's fault alone (decode, store, seal, a dead IVM circuit, a
                     // webhook sink): quarantine it and let its co-tenants finish the window. Before
                     // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
-                    match nests[i]
+                    match live_nest(&mut nests, i)
                         .process_window(source.as_ref(), &nest_logs, nexts[i], to, tip)
                         .await
                     {
@@ -4122,23 +4198,28 @@ template = "pool"
         let mut sup = test_supervisor(2);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut lifecycle = Some(rx);
+        // Slots matching the supervisor's nests. Already empty, which is all this test needs: it is
+        // about the retirement bookkeeping, not about what dropping an ingest state releases. The
+        // lengths must still line up - `drain_lifecycle` indexes by supervisor index deliberately, so
+        // a mismatch is a bug rather than something to tolerate.
+        let mut nests: Vec<Option<NestIngest>> = vec![None, None];
 
-        tx.send(CursorCommand::Unmount("nest0".into())).unwrap();
-        tx.send(CursorCommand::Unmount("not-on-this-cursor".into()))
+        tx.send(CursorCommand::unmount("nest0")).unwrap();
+        tx.send(CursorCommand::unmount("not-on-this-cursor"))
             .unwrap();
-        drain_lifecycle(&mut lifecycle, &mut sup);
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
 
         assert_eq!(sup.live(), vec![1], "the named nest retired");
         assert!(matches!(sup.states[0], NestState::Retired));
 
         // Idempotent: unmounting twice is not an error, and does not double-count anything.
-        tx.send(CursorCommand::Unmount("nest0".into())).unwrap();
-        drain_lifecycle(&mut lifecycle, &mut sup);
+        tx.send(CursorCommand::unmount("nest0")).unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests);
         assert_eq!(sup.live(), vec![1]);
 
         // No channel at all (today's `spawn_roost`) is simply a no-op.
         let mut none = None;
-        drain_lifecycle(&mut none, &mut sup);
+        drain_lifecycle(&mut none, &mut sup, &mut nests);
         assert_eq!(sup.live(), vec![1]);
     }
 
@@ -4291,7 +4372,7 @@ template = "pool"
         doomed.store.set_meta(SEALED_THROUGH_KEY, "60").unwrap();
         healthy.store.set_meta(SEALED_THROUGH_KEY, "40").unwrap();
 
-        let mut nests = vec![doomed, healthy];
+        let mut nests = vec![Some(doomed), Some(healthy)];
         let mut nexts = vec![101u64, 101];
         let mut sup = test_supervisor(2);
 
@@ -4322,8 +4403,12 @@ template = "pool"
         // still live, and (§3.1) it alone now drives the shared cursor.
         assert!(matches!(sup.states[1], NestState::Live));
         assert_eq!(nexts[1], 51);
-        assert_eq!(nests[1].store.entities_in_range(10, 50).unwrap().len(), 5);
-        assert!(nests[1]
+        let healthy_nest = nests[1].as_ref().unwrap();
+        assert_eq!(
+            healthy_nest.store.entities_in_range(10, 50).unwrap().len(),
+            5
+        );
+        assert!(healthy_nest
             .store
             .entities_in_range(51, 1_000)
             .unwrap()
