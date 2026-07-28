@@ -355,7 +355,7 @@ fn roost_ready(health: &crate::health::RoostHealth) -> impl IntoResponse {
 }
 
 /// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_roost`].
-async fn bind_and_serve(listen: &str, app: Router) -> Result<()> {
+pub async fn bind_and_serve(listen: &str, app: Router) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
@@ -403,6 +403,32 @@ struct AdminQuery {
 ///
 /// The scheme is matched case-insensitively per RFC 7235; the token compare is constant-time either
 /// way, so a timing side-channel cannot recover it byte-by-byte.
+/// Whether a request carries the admin credential, as `?token=` or `Authorization: Bearer`.
+///
+/// Shared with the roost's lifecycle routes (RFC-0027 §5) so mount/unmount are gated by exactly the
+/// same rule as the admin UI - one credential, one comparison, no second auth concept to get subtly
+/// wrong. `None` means a localhost bind, which is open by design.
+pub fn token_ok(
+    required: Option<&str>,
+    token: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    let Some(required) = required else {
+        return true; // localhost bind: open
+    };
+    if token.is_some_and(|t| ct_eq(t, required)) {
+        return true;
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, rest) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        })
+        .is_some_and(|t| ct_eq(t, required))
+}
+
 fn admin_authorized(state: &AppState, q: &AdminQuery, headers: &axum::http::HeaderMap) -> bool {
     let Some(required) = &state.admin_token else {
         return true; // localhost bind: open
