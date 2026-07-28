@@ -1,5 +1,13 @@
 # RFC-0021: The multichain roost - one runtime, many chains, one cursor each
 
+> **Live two-chain run done (2026-07-28).** A mainnet nest and an Arbitrum nest in one runtime, one
+> isolated cursor each, per-cursor budgets applied separately (~90 MB projected against 2048 each),
+> both chains indexing independently, 56 MB total RSS. It found a real bug: `/<nest>/ready` read
+> **process-global** metrics, so in a multichain roost whichever cursor polled last owned the gauge -
+> the mainnet nest reported an Arbitrum tip of 488,677,305 while mainnet was at 25,632,906, next to a
+> mainnet `sealed_through`. Fixed by publishing tip/poll per nest. The data itself was correctly
+> isolated throughout; only the readiness *reporting* was cross-contaminated.
+
 - Status: **Accepted** (2026-07-21) - §0 brief amendment applied to `CLAUDE.md` 2026-07-21. **Slice 1
   shipped 2026-07-21**: multichain config (`[[chains]]`), `group_by_chain` (one isolated cursor per
   chain), the per-cursor runtime (one `spawn_roost` per chain, fate-shared via `select_all`), and the

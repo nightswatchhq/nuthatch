@@ -58,9 +58,10 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 - [ ] ✅ Property tests: random reorg depths converge to canonical state (`e2e_reorg.rs`).
 - [ ] ✅ Nest invariant/parity checks (`nuthatch check`) run hermetically in CI against committed
   fixtures. *(RFC-0002 §5)*
-- [ ] 🟡 **Sustained** byte-identical multi-nest-vs-solo table parity over a *long* range. - *Short
-  runs pass; the long sustained run is the one outstanding 0012 acceptance item. **Blocked on:** a
-  live run (public RPC fine).*
+- [ ] ✅ **Sustained** byte-identical multi-nest-vs-solo table parity. - *Run live 2026-07-28 on
+  Arbitrum: two nests indexed solo and again behind one shared cursor over the same 2,400-block range,
+  compared table by table - **20 tables, 17,108 rows, byte-identical**, including empty tables and the
+  topic0-disambiguated `weth__transfer_ddf2`/`_e192` pair.*
 - [ ] 🟡 Factory / dynamic-contract discovery correctness at scale. - *Implemented (0009); child
   `end`/expiry conditions and wildcard-address decode still open.*
 

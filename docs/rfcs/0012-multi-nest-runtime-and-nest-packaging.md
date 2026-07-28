@@ -1,5 +1,12 @@
 # RFC-0012: Multi-nest runtime and content-addressed nest packaging
 
+> **Sustained live parity run done (2026-07-28)** - the last outstanding acceptance item. Two nests
+> (Arbitrum USDC and WETH) indexed **solo** and again **behind one shared cursor** over the same
+> 2,400-block range of live Arbitrum, then compared table by table: **20 tables, 17,108 rows,
+> byte-identical**. That includes the empty tables, the topic0-disambiguated `weth__transfer_ddf2` /
+> `_e192` pair, and the busy `usdc__transfer` at 10,831 rows. Co-tenancy costs nothing in fidelity:
+> a nest cannot tell it is sharing a cursor.
+
 - Status: **Implemented (2026-07-18).** All 7 slices shipped: §0 brief amendment; roost layout/serving,
   shared cursor, factory nests, shared reorg fan-out, footprint model; `nest pack`/`mount`; example +
   operators docs. Verified live on Arbitrum (two nests, one cursor, ~110 MB resident). One open
