@@ -61,7 +61,7 @@ Postgres-in-Rust is far too young to carry scaled infra today.
 which §3 delivers *without* a store swap. The hot store already sits behind a
 `HotStore` trait, so Turso can land later as an *alternative backend* and be A/B'd with
 zero drama. Revisit criteria: Turso reaches a production-ready release, its licence
-clears the AGPL/no-BSL rule, and a measured win over redb exists that federation
+clears the permissive/no-BSL rule, and a measured win over redb exists that federation
 doesn't already provide. Until all three, no.
 
 ### §2 - Query engine: converge on DataFusion (as destination)

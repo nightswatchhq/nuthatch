@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Dependency vulnerability scan (RUSTSEC) + AGPL-compatible licence gate + banned-crate check.
+      # Dependency vulnerability scan (RUSTSEC) + permissive-only licence gate + banned-crate check.
       # Config + the honest ignore-list rationale live in deny.toml.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:

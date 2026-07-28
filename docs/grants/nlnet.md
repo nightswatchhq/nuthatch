@@ -8,7 +8,7 @@ anything shipped moves from "budget" to "evidence")._
 - **Requested:** €38,400.
 - **Applicant:** Pete (cargopete), sole maintainer. Routed via Nixum Ltd (see RFC-0006 Q1).
 - **Project:** nuthatch - https://github.com/nuthatch-indexer/nuthatch · https://www.nuthatch-indexer.com
-- **License:** AGPL-3.0-only (core). Free, self-hosted-first public good; no direct monetization.
+- **License:** `MIT OR Apache-2.0` (core). Free, self-hosted-first public good; no direct monetization.
 
 ## Abstract (the sovereignty pitch)
 
@@ -70,12 +70,12 @@ keeps the audit surface small and reviewable.
 ## Disclosure (RFC-0006 Rule 4)
 
 An independent infrastructure operator (GraphOps) is preparing a hosted offering of nuthatch under
-AGPL and shares revenue with the maintainer; **this application funds the commons-facing roadmap that
-hosting revenue would not prioritize.** The project remains neutral - the AGPL license means any
+a hosted offering and shares revenue with the maintainer; **this application funds the commons-facing
+roadmap that hosting revenue would not prioritize.** The project remains neutral - the permissive licence means any
 operator may host it; no partner has exclusivity, a private fork, or roadmap veto.
 
 ## Who
 
 Solo maintainer; the top project risk is bus-factor, mitigated by obsessive architecture docs
-(RFCs 0001-0008 in-repo), the AGPL license, and funder diversity. Grant milestones map 1:1 to public
+(RFCs 0001-0008 in-repo), the permissive licence, and funder diversity. Grant milestones map 1:1 to public
 RFCs so progress is externally checkable.

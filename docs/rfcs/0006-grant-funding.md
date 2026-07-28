@@ -1,5 +1,13 @@
 # RFC-0006: Sustainability - grants (NLnet/NGI, EF ESP) alongside operator revshare
 
+> **Amendment (2026-07-28): the core was relicensed from AGPL-3.0 to `MIT OR Apache-2.0`.** The
+> neutrality argument below is unchanged in substance - no exclusivity, no private forks, no
+> partner-only features, no roadmap veto - but one supporting claim is not: copyleft no longer forbids
+> a **closed** derivative. Anyone may now take nuthatch, extend it privately and sell it without
+> publishing. What the licence still guarantees is that *this* project stays open and that no partner
+> holds rights over it that others lack; what it no longer guarantees is that every downstream fork
+> stays open. Recorded here rather than quietly edited, because funders were told the original.
+
 - Status: Accepted (2026-07-18) - grant drafts + governance shipped; submission/decision process ongoing
 - Author: Pete (cargopete)
 - Date: 2026-07-16 (v1: 2026-07-14)
@@ -12,7 +20,7 @@
 
 ## Abstract
 
-Nuthatch remains a free, AGPL public good with no direct monetization. Sustainability
+Nuthatch remains a free, permissively-licensed (`MIT OR Apache-2.0`) public good with no direct monetization. Sustainability
 now has two independent legs: (1) grants funding the commons-flavored roadmap
 (NLnet/NGI, EF ESP - this RFC's original subject), and (2) revenue share from
 operators who run Nuthatch as a hosted service - concretely, GraphOps, which intends
@@ -53,7 +61,7 @@ Rules:
    budget and substituted (see Budget).
 2. **Milestones must be un-started at submission.** The progress log is public;
    funders can and will check. Anything shipped moves from "budget" to "evidence."
-3. **No exclusivity, ever.** Any operator may host Nuthatch under AGPL; GraphOps's
+3. **No exclusivity, ever.** Any operator may host Nuthatch; GraphOps's
    edge is partnership, priority support of *their* integration questions, and being
    first - not a gate on others. This sentence is quotable to any future partner.
 4. **Disclosure.** Both grant applications disclose the operator partnership in one
@@ -71,7 +79,7 @@ The data-sovereignty pitch stands verbatim. Add to the "what exists already" sec
 measured numbers now include the RFC-0004 progression (~289 → ~5,837 ev/s, ~20×
 stacked, methodology in-repo) and the operator partnership as adoption evidence,
 disclosed per Rule 4: "An independent infrastructure operator (GraphOps) is preparing
-a hosted offering of Nuthatch under AGPL and shares revenue with the maintainer; this
+a hosted offering of Nuthatch and shares revenue with the maintainer; this
 application funds the commons-facing roadmap that hosting revenue would not
 prioritize."
 
@@ -118,7 +126,7 @@ members propose it. Gitcoin/RetroPGF after launch. GitHub Sponsors: enable now.)
 
 v1 list stands: no token, no decentralized-network milestone, no
 enterprise-feature commitments in core, no telemetry, no relicensing. Extended for
-Leg 2: no exclusivity, no private forks, no partner-only features in the AGPL core,
+Leg 2: no exclusivity, no private forks, no partner-only features in the core,
 no roadmap veto, and the RFC-0005 §6 dividing line (auth/metering/tenancy = operator
 layer) is contractual. If any funder or partner requires items on this list, decline
 that term.
@@ -152,7 +160,8 @@ milestone overcommitment - now governed by Rules 1-2), plus:
 - **Revshare never materializes** (platform delays, priorities shift): Leg 1 exists
   precisely for this; nothing in the grant plan depends on Leg 2.
 - **Perceived capture** ("GraphOps's indexer"): Rules 3-4 and the public neutrality
-  sentence are the answer; the AGPL license makes capture structurally impossible
+  sentence are the answer; the permissive licence means anyone can run, fork, host or embed the
+  identical software, so capture of *this* project is impossible
   anyway - worth saying in the FAQ once the partnership is public.
 
 ## Open questions

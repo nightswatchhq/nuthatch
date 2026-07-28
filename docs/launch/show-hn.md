@@ -49,7 +49,7 @@ and they survive a restart.
 
 **Honest limits, because you'll ask:** Ethereum + Arbitrum + Base only; events only (no call/trace
 decoding yet); RPC polling - the reth ExEx in-process path is designed and stubbed, not shipped; no
-GraphQL layer yet (SQL + point-reads + MCP today). It's v0.1.0 and solo-maintained. AGPL-3.0, a
+GraphQL layer yet (SQL + point-reads + MCP today). It's v0.1.0 and solo-maintained. `MIT OR Apache-2.0`, a
 grant-funded public good, not a startup - the sustainability plan and the "what we'll never build"
 list are both in-repo.
 
@@ -69,8 +69,8 @@ single file is the non-negotiable).
   self-host now wants a token for HyperSync (phones home). Nuthatch's wedge: Rust single-binary ops +
   zero mandatory third-party API + IVM correctness + AI-native surface.
 - **"67 MB binary?"** → answered inline above; offer the 5.8 MB no-embed figure.
-- **"Is this a GraphOps product?"** → No. An operator is preparing a hosted offering under AGPL and
-  shares revenue to fund core dev; the AGPL license means anyone can host the identical software. Link
+- **"Is this a GraphOps product?"** → No. An operator is preparing a hosted offering and shares revenue
+  to fund core dev; the permissive licence means anyone can host, fork or embed the identical software. Link
   GOVERNANCE.md - don't argue it, link it.
 - **"Events only is a dealbreaker for me because X"** → thank them, that's exactly the validation
   signal; log it (docs/validation).

@@ -89,7 +89,7 @@ discipline has been "build only what we can verify live."
   to design around: under MSRV 1.85 cargo resolves DataFusion 48 (arrow 55) - clashes with our arrow 56;
   aligning needs an MSRV bump to 1.88 (DataFusion 54) or an arrow downgrade.
 - **Turso hot store (0013 §1).** Deferred, not rejected - behind the existing `HotStore` trait.
-  Triple-gated: a production-ready release, an AGPL/no-BSL-clean licence, and a measured win over redb
+  Triple-gated: a production-ready release, a permissive/no-BSL licence, and a measured win over redb
   that federation doesn't already provide. Until all three, no.
 
 ## Track 3 - Process / ongoing (non-code)

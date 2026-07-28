@@ -1,6 +1,8 @@
 # cargo-deny - dependency vulnerability + licence gate (0.5.x hardening).
-# Runs in CI on every PR. Licence hygiene is a CLAUDE.md non-negotiable: the AGPL-3.0 core means every
-# dependency must offer an AGPL-compatible (permissive, or weak-copyleft-via-OR) licence arm.
+# Runs in CI on every PR. Licence hygiene is a CLAUDE.md non-negotiable: the core is `MIT OR
+# Apache-2.0`, so every dependency must offer a permissive (or weak-copyleft-via-OR) licence arm.
+# Note the constraint got *stricter* with the relicence, not looser: under AGPL we could at least have
+# consumed GPL code in principle. We cannot now, so a GPL/LGPL-only dependency must fail the build.
 
 [advisories]
 version = 2
@@ -25,21 +27,11 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Every permissive licence actually present in the tree - all AGPL-3.0-compatible. Crates that offer an
-# OR with a copyleft arm (ittapi = `GPL-2.0-only OR BSD-3-Clause`, r-efi = `MIT OR Apache-2.0 OR
-# LGPL-2.1-or-later`) resolve to their permissive arm here. We deliberately do NOT list GPL-2.0-only or
-# LGPL, so a future GPL/LGPL-*only* dependency fails the build - which is the point.
-# REQUIRES cargo-deny >= 0.20 (CI runs 0.20.2 via cargo-deny-action@v2). This is a hard requirement, not
-# a preference: the two spellings of the AGPL identifier are mutually exclusive across versions, so there
-# is no config that satisfies both.
-#   - 0.20.x matches `allow` entries against the crate's declared SPDX, which is `AGPL-3.0-only`
-#     (see Cargo.toml). The bare `AGPL-3.0` is rejected there: "license is not explicitly allowed".
-#   - 0.18.x refuses to *parse* `AGPL-3.0-only` in this list at all ("expected a `<bare-gnu-license>`").
-# We spell it the 0.20 way, because that is what CI gates on and it is the correct SPDX for the crate.
-# If `cargo deny` fails locally with a parse error here, your cargo-deny is too old - upgrade it
-# (`cargo install cargo-deny --locked`) rather than editing this line.
+# Every permissive licence actually present in the tree. Crates that offer an OR with a copyleft arm
+# (ittapi = `GPL-2.0-only OR BSD-3-Clause`, r-efi = `MIT OR Apache-2.0 OR LGPL-2.1-or-later`) resolve to
+# their permissive arm here. We deliberately do NOT list GPL-2.0-only or LGPL, so a future GPL/LGPL-*only*
+# dependency fails the build - which is the point.
 allow = [
-  "AGPL-3.0-only",  # nuthatch itself (the root crate's own licence, exact SPDX). No AGPL *deps*.
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
