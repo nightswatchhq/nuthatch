@@ -1831,6 +1831,81 @@ template="pool"
         );
     }
 
+    /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the
+    /// hot replay, or a warm restart would silently change balances.
+    ///
+    /// The two paths reject it by different mechanisms - the cold fold via `TRY_CAST(… AS HUGEINT)`
+    /// yielding NULL, the hot replay via `str::parse::<i128>()` returning `Err` - so their agreement is
+    /// a coincidence of intent, not of code, and worth pinning. Both must drop the *whole transfer*:
+    /// dropping only one leg would invent value out of nowhere, leaving the sender debited and the
+    /// recipient uncredited (or worse).
+    #[test]
+    fn an_over_i128_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay() {
+        // 2^127 - one past i128::MAX, the smallest value that must be refused.
+        const TOO_BIG: &str = "170141183460469231731687303715884105728";
+        assert!(
+            TOO_BIG.parse::<i128>().is_err(),
+            "fixture must overflow i128"
+        );
+
+        let row = |from: &str, to: &str, value: &str, block: u64, li: u64| {
+            format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"{to}","value":"{value}","block_number":{block},"tx_hash":"0x1","log_index":{li}}}"#
+            )
+        };
+
+        // A segment holding one ordinary transfer and one that overflows.
+        let mixed = tempfile::tempdir().unwrap();
+        crate::seal::seal_range(
+            mixed.path(),
+            &[
+                row("0xsender", "0xrecipient", "100", 1, 0),
+                row("0xwhale", "0xrecipient", TOO_BIG, 2, 0),
+            ],
+            1,
+            6,
+        )
+        .unwrap();
+
+        // The reference: the same segment WITHOUT the overflowing row - i.e. what the hot replay
+        // produces, since its parse-or-skip never feeds that transfer to the view at all.
+        let reference = tempfile::tempdir().unwrap();
+        crate::seal::seal_range(
+            reference.path(),
+            &[row("0xsender", "0xrecipient", "100", 1, 0)],
+            1,
+            6,
+        )
+        .unwrap();
+
+        let fold = |dir: &std::path::Path| {
+            let mut v = net_balances(dir, "t__transfer", "from", "to", "value", 6).unwrap();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            fold(mixed.path()),
+            fold(reference.path()),
+            "the cold fold must drop an over-i128 transfer exactly as the hot replay's parse-or-skip does"
+        );
+
+        // Concretely: only the ordinary transfer survives, and both its legs are present.
+        let got = fold(mixed.path());
+        assert_eq!(
+            got,
+            vec![
+                ("0xrecipient".to_string(), 100i128),
+                ("0xsender".to_string(), -100i128),
+            ]
+        );
+        // The whale never appears - neither leg of the dropped transfer leaked through.
+        assert!(
+            !got.iter().any(|(a, _)| a == "0xwhale"),
+            "the sender of a dropped transfer must not be debited: {got:?}"
+        );
+    }
+
     #[test]
     fn cold_fold_respects_the_sealed_through_watermark() {
         // Regression for the warm-restart double-count: the cold fold must be bounded by the persisted

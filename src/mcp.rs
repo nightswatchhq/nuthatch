@@ -535,6 +535,71 @@ fn content(text: &str, is_error: bool) -> Value {
 mod tests {
     use super::*;
 
+    /// A one-endpoint fake nest. `shape` of `None` means "no `/shape` route" - an older nest, which is
+    /// exactly the case the fail-open default exists for.
+    async fn fake_nest(shape: Option<serde_json::Value>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::get, Json, Router};
+        async fn handler(
+            State(shape): State<Option<serde_json::Value>>,
+        ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+            match shape {
+                Some(v) => Ok(Json(v)),
+                None => Err(axum::http::StatusCode::NOT_FOUND),
+            }
+        }
+        let app = Router::new()
+            .route("/shape", get(handler))
+            .with_state(shape);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// RFC-0025 fail-open (issue #150): tool advertisement must **degrade towards showing more**, never
+    /// less. A nest predating `/shape`, an unreachable one, or one answering rubbish must all yield the
+    /// permissive default - hiding a tool because a probe failed would strand an agent with no way to
+    /// discover a capability the nest actually has.
+    #[tokio::test]
+    async fn fetch_shape_fails_open_on_a_missing_unreachable_or_malformed_endpoint() {
+        let client = reqwest::Client::new();
+
+        // No `/shape` route at all - the older-nest case this default encodes.
+        let (base, h) = fake_nest(None).await;
+        let shape = fetch_shape(&client, &base).await;
+        assert!(
+            shape.transfers,
+            "a nest with no /shape must still advertise transfers"
+        );
+        assert!(shape.compliance);
+        h.abort();
+
+        // Unreachable host: nothing listening on this port.
+        let shape = fetch_shape(&client, "http://127.0.0.1:1").await;
+        assert!(shape.transfers, "an unreachable nest must fail open");
+        assert!(shape.compliance);
+
+        // Present but not JSON-shaped as expected: missing keys fall back to true per-field.
+        let (base, h) = fake_nest(Some(serde_json::json!({"unrelated": 1}))).await;
+        let shape = fetch_shape(&client, &base).await;
+        assert!(shape.transfers);
+        assert!(shape.compliance);
+        h.abort();
+
+        // A well-formed negative answer IS honoured - fail-open must not mean "ignore the nest".
+        let (base, h) = fake_nest(Some(serde_json::json!({
+            "transfers": false,
+            "compliance": false
+        })))
+        .await;
+        let shape = fetch_shape(&client, &base).await;
+        assert!(!shape.transfers, "an explicit false must be respected");
+        assert!(!shape.compliance);
+        h.abort();
+    }
+
     #[test]
     fn client_config_launches_this_binary_and_bridges_to_base() {
         let cfg = client_config_json("/usr/local/bin/nuthatch", "http://127.0.0.1:8288");
