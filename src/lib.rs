@@ -19,6 +19,8 @@ pub mod cli;
 pub mod config;
 /// The control plane for scaled mode (RFC-0022 §3): desired state and the worker registry.
 #[cfg(feature = "postgres-store")]
+pub mod control_api;
+#[cfg(feature = "postgres-store")]
 pub mod controlplane;
 pub mod distribution;
 pub mod effectful;

@@ -27,6 +27,11 @@ pub enum Command {
     /// elsewhere is filling, owns no cursor, and never advances one. Scale it independently of
     /// ingestion - that is the entire point of splitting the planes.
     Serve(ServeArgs),
+    /// Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run.
+    ///
+    /// Writes *desired state* only. Workers reconcile against it on their own tick - nothing here
+    /// commands a worker or waits for one.
+    Control(ControlArgs),
     /// Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table.
     Sql(SqlArgs),
     /// Run a WASM transform component over a project's stored transfers.
@@ -701,6 +706,20 @@ pub struct AddArgs {
     /// (repeatable). Point at your own node to dodge public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct ControlArgs {
+    /// Address to bind the control-plane API to. Off-localhost requires NUTHATCH_CONTROL_TOKEN and
+    /// refuses to start without it.
+    #[arg(long, default_value = "127.0.0.1:8290")]
+    pub listen: String,
+
+    /// The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state,
+    /// **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's
+    /// outage are different events.
+    #[arg(long)]
+    pub db: String,
 }
 
 #[derive(Args)]
