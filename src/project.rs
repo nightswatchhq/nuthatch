@@ -46,10 +46,20 @@ pub async fn init(args: InitArgs) -> Result<()> {
     let rpc = RpcClient::new(rpc_urls.clone())?;
     let tip = rpc.block_number().await.ok();
 
+    let overrides = resolve_abi_overrides(&args.abi, addresses.len())?;
+
     let mut contracts = Vec::with_capacity(addresses.len());
-    for (address, alias) in addresses.iter().zip(&aliases) {
-        println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
-        let abi_json = resolve_abi(&rpc, chain.chain_id, address).await?;
+    for (i, (address, alias)) in addresses.iter().zip(&aliases).enumerate() {
+        let abi_json = match &overrides[i] {
+            Some(path) => {
+                println!("→ using local ABI {path} for {alias} ({address})");
+                read_local_abi(path)?
+            }
+            None => {
+                println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
+                resolve_abi(&rpc, chain.chain_id, address).await?
+            }
+        };
         let abi_path = format!("abis/{alias}.json");
         std::fs::write(
             dir.join(&abi_path),
@@ -70,6 +80,15 @@ pub async fn init(args: InitArgs) -> Result<()> {
             },
             None => None,
         };
+
+        // Does the ABI we just vendored actually decode what this address emits? Best-effort and
+        // never fatal - but loud when the answer is no, because the alternative is a nest that
+        // indexes nothing and says nothing about it.
+        report_abi_fit(
+            check_abi_fits(&rpc, address, &abi_json, tip, start_block).await,
+            alias,
+            address,
+        );
 
         contracts.push(Contract {
             alias: alias.clone(),
@@ -170,9 +189,19 @@ pub async fn add(args: AddArgs) -> Result<()> {
     std::fs::create_dir_all(dir.join("abis"))
         .with_context(|| format!("cannot create {}", dir.join("abis").display()))?;
 
-    for (address, alias) in new_addresses.iter().zip(&aliases) {
-        println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
-        let abi_json = resolve_abi(&rpc, chain.chain_id, address).await?;
+    let overrides = resolve_abi_overrides(&args.abi, new_addresses.len())?;
+
+    for (i, (address, alias)) in new_addresses.iter().zip(&aliases).enumerate() {
+        let abi_json = match &overrides[i] {
+            Some(path) => {
+                println!("→ using local ABI {path} for {alias} ({address})");
+                read_local_abi(path)?
+            }
+            None => {
+                println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
+                resolve_abi(&rpc, chain.chain_id, address).await?
+            }
+        };
         let abi_path = format!("abis/{alias}.json");
         std::fs::write(
             dir.join(&abi_path),
@@ -193,6 +222,12 @@ pub async fn add(args: AddArgs) -> Result<()> {
             },
             None => None,
         };
+
+        report_abi_fit(
+            check_abi_fits(&rpc, address, &abi_json, tip, start_block).await,
+            alias,
+            address,
+        );
 
         config.contracts.push(Contract {
             alias: alias.clone(),
@@ -548,6 +583,190 @@ fn impl_from_slot(slot: &str) -> Option<String> {
         return None;
     }
     Some(format!("0x{addr}"))
+}
+
+/// What a sample of the contract's real logs says about the ABI we resolved for it.
+///
+/// The failure this exists to catch is the quietest one nuthatch has: a proxy whose implementation
+/// ABI the public resolvers don't return. Sourcify/Etherscan answer with the *proxy's* ABI, which is
+/// usually two or three administrative events, so `init` succeeds, the schema looks plausible, and
+/// `dev` then indexes **nothing** - no error, no warning, just empty tables. It cost us most of a day
+/// on the Livepeer nest, whose `ManagerProxy` matches no standard proxy slot, and the only reason we
+/// worked it out was noticing the event count looked too small.
+///
+/// Detecting it directly is cheap: fetch a handful of the address's actual logs and see whether the
+/// ABI decodes any of them.
+#[derive(Debug, PartialEq)]
+enum AbiFit {
+    /// At least one sampled log matches an event in the ABI. Says nothing about the other events,
+    /// which is fine - it rules out the total-mismatch case, and that is the one that is silent.
+    Fits,
+    /// Logs exist and **none** of them match. This is the proxy signature.
+    Mismatch { sampled: usize },
+    /// The sample was empty, so there is nothing to conclude. A dormant contract and a wrong ABI look
+    /// identical from here, and claiming otherwise would train people to ignore the warning.
+    NoSample,
+    /// The probe could not be run (RPC down, range refused, rate limited). Never blocks `init` -
+    /// resolution is best-effort by design, like deploy-block detection above it.
+    Unknown,
+}
+
+/// Sample recent logs from `address` and report whether `abi` decodes any of them.
+///
+/// Two probes at most. The tip window catches any active contract - which is what the people who hit
+/// this are indexing - and the deployment window catches a contract that was busy once and has since
+/// gone quiet. A dormant contract yields [`AbiFit::NoSample`] and no claim is made.
+async fn check_abi_fits(
+    rpc: &RpcClient,
+    address: &str,
+    abi: &serde_json::Value,
+    tip: Option<u64>,
+    start_block: Option<u64>,
+) -> AbiFit {
+    // Deliberately narrow. A wide window on a busy contract trips provider result caps and returns an
+    // error, which would make this report `Unknown` for exactly the contracts it is meant to help.
+    const PROBE: u64 = 1_000;
+    let Some(tip) = tip else {
+        return AbiFit::Unknown;
+    };
+
+    let topic0s = abi_event_topic0s(abi);
+    if topic0s.is_empty() {
+        // An ABI with no events at all decodes nothing by construction - the strongest version of the
+        // signal, and worth reporting without spending an RPC call on it.
+        return AbiFit::Mismatch { sampled: 0 };
+    }
+
+    let mut windows = vec![(tip.saturating_sub(PROBE), tip)];
+    if let Some(start) = start_block {
+        if start.saturating_add(PROBE) < tip.saturating_sub(PROBE) {
+            windows.push((start, start + PROBE));
+        }
+    }
+
+    let mut any_error = false;
+    for (from, to) in windows {
+        match rpc.get_logs(&[address.to_string()], &[], from, to).await {
+            Ok(logs) if !logs.is_empty() => {
+                let sample: Vec<Option<&str>> = logs
+                    .iter()
+                    .map(|l| l.topics.first().map(|s| s.as_str()))
+                    .collect();
+                return fit_from_sample(&topic0s, &sample);
+            }
+            Ok(_) => {}
+            Err(_) => any_error = true,
+        }
+    }
+    if any_error {
+        AbiFit::Unknown
+    } else {
+        AbiFit::NoSample
+    }
+}
+
+/// The verdict itself, separated from fetching so it can be tested without a chain. `sample` is each
+/// log's topic0 (`None` for an anonymous event, which has no topic0 and can never match).
+fn fit_from_sample(topic0s: &[String], sample: &[Option<&str>]) -> AbiFit {
+    if sample.is_empty() {
+        return AbiFit::NoSample;
+    }
+    let hit = sample
+        .iter()
+        .flatten()
+        // Case-insensitively: `eth_getLogs` responses are lowercase hex by convention but that is a
+        // convention, not a guarantee, and a case mismatch here would fire the warning on a nest that
+        // is perfectly fine.
+        .any(|t| topic0s.iter().any(|k| k.eq_ignore_ascii_case(t)));
+    if hit {
+        AbiFit::Fits
+    } else {
+        AbiFit::Mismatch {
+            sampled: sample.len(),
+        }
+    }
+}
+
+/// Print the verdict from [`check_abi_fits`]. Only [`AbiFit::Mismatch`] is worth interrupting for;
+/// the other three are silence, because a warning that fires when nothing is wrong gets ignored on
+/// the day it fires when something is.
+fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
+    let AbiFit::Mismatch { sampled } = fit else {
+        return;
+    };
+    let seen = if sampled == 0 {
+        "the resolved ABI declares no events at all".to_string()
+    } else {
+        format!("none of its last {sampled} log(s) match any event in the resolved ABI")
+    };
+    eprintln!();
+    eprintln!("  ⚠ {alias} ({address}): {seen}.");
+    eprintln!("    As configured this contract will index **zero rows**, silently.");
+    eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
+    eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
+    eprintln!("    the standard proxy slots automatically, so this one uses a bespoke pattern.");
+    eprintln!("    Fix: get the implementation's ABI and re-run with");
+    eprintln!("      nuthatch init {address} --abi path/to/implementation.json");
+    eprintln!("    or overwrite abis/{alias}.json and run `nuthatch schema` to regenerate.");
+    eprintln!();
+}
+
+/// Per-address `--abi` overrides, positionally aligned with the addresses like `--alias`. An empty
+/// entry means "resolve this one normally", so overriding the second of three contracts does not
+/// force you to find local ABIs for the other two.
+fn resolve_abi_overrides(provided: &[String], n: usize) -> Result<Vec<Option<String>>> {
+    if provided.is_empty() {
+        return Ok(vec![None; n]);
+    }
+    if provided.len() != n {
+        bail!(
+            "{} --abi path(s) for {n} address(es) - provide one per address (an empty entry resolves \
+             that address normally) or none at all",
+            provided.len()
+        );
+    }
+    Ok(provided
+        .iter()
+        .map(|p| {
+            let t = p.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+        .collect())
+}
+
+/// Read and validate a local ABI file. Parsed as a `JsonAbi` before it is accepted so a wrong file
+/// (a subgraph manifest, a contract artifact wrapping the ABI under `"abi"`) fails here with a clear
+/// message rather than at decode time as an empty registry.
+fn read_local_abi(path: &str) -> Result<serde_json::Value> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read ABI file '{path}'"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("'{path}' is not valid JSON"))?;
+    // Solidity build artifacts (Hardhat/Foundry) wrap the ABI in an object. Accepting that shape is
+    // two lines here and saves everyone a confusing failure later.
+    let abi = match parsed.get("abi") {
+        Some(inner) => inner.clone(),
+        None => parsed,
+    };
+    serde_json::from_value::<alloy_json_abi::JsonAbi>(abi.clone())
+        .with_context(|| format!("'{path}' does not parse as a contract ABI"))?;
+    Ok(abi)
+}
+
+/// `0x`-prefixed topic0 of every event in an ABI. Uses the same `alloy_json_abi` selector the decode
+/// registry keys on, so a match here means a match at decode time - not an approximation of one.
+fn abi_event_topic0s(abi: &serde_json::Value) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_value::<alloy_json_abi::JsonAbi>(abi.clone()) else {
+        return Vec::new();
+    };
+    parsed
+        .events()
+        .map(|e| format!("0x{}", hex::encode(e.selector())))
+        .collect()
 }
 
 /// Aliases from `--alias` (validated, one per address) or defaults c0, c1, ….
@@ -910,5 +1129,133 @@ mod tests {
             "horizon-nest"
         );
         assert_eq!(source_basename("./local/my-nest/"), "my-nest");
+    }
+
+    // ---- The silent-proxy check (RFC-0001 follow-up) --------------------------------------------
+
+    /// The Livepeer shape: a `ManagerProxy` whose own ABI carries two administrative events, in front
+    /// of an implementation that emits everything anyone actually wants. Sourcify returns the former.
+    const PROXY_ABI: &str = r#"[
+      {"type":"event","name":"ParameterUpdate","inputs":[{"name":"param","type":"string","indexed":false}],"anonymous":false},
+      {"type":"event","name":"SetController","inputs":[{"name":"controller","type":"address","indexed":false}],"anonymous":false}
+    ]"#;
+
+    const IMPL_ABI: &str = r#"[
+      {"type":"event","name":"Bond","inputs":[
+        {"name":"newDelegate","type":"address","indexed":true},
+        {"name":"oldDelegate","type":"address","indexed":true}],"anonymous":false}
+    ]"#;
+
+    fn topic0s_of(abi_src: &str) -> Vec<String> {
+        abi_event_topic0s(&serde_json::from_str(abi_src).unwrap())
+    }
+
+    #[test]
+    fn topic0s_come_from_the_same_selector_decode_uses() {
+        let t = topic0s_of(IMPL_ABI);
+        assert_eq!(t.len(), 1);
+        // keccak("Bond(address,address)") - if this ever disagrees with the registry's topic0 the
+        // check would pass on nests that cannot decode and fail on nests that can.
+        let via_registry = {
+            let abi: alloy_json_abi::JsonAbi = serde_json::from_str(IMPL_ABI).unwrap();
+            let ev = abi.events().next().unwrap().clone();
+            format!("0x{}", hex::encode(ev.selector()))
+        };
+        assert_eq!(t[0], via_registry);
+    }
+
+    /// The whole point: logs exist, the ABI decodes none of them.
+    #[test]
+    fn a_proxy_abi_against_implementation_logs_is_a_mismatch() {
+        let bond = topic0s_of(IMPL_ABI)[0].clone();
+        let fit = fit_from_sample(&topic0s_of(PROXY_ABI), &[Some(&bond), Some(&bond)]);
+        assert_eq!(fit, AbiFit::Mismatch { sampled: 2 });
+    }
+
+    #[test]
+    fn one_matching_log_is_enough_to_clear_the_check() {
+        let bond = topic0s_of(IMPL_ABI)[0].clone();
+        let other = "0xdeadbeef".repeat(8);
+        assert_eq!(
+            fit_from_sample(&topic0s_of(IMPL_ABI), &[Some(&other), Some(&bond)]),
+            AbiFit::Fits,
+            "a contract may emit events its ABI omits; only a total miss is the silent failure"
+        );
+    }
+
+    /// A dormant contract and a wrong ABI look identical from an empty sample. Claiming a mismatch
+    /// here would train people to ignore the warning.
+    #[test]
+    fn an_empty_sample_makes_no_claim() {
+        assert_eq!(
+            fit_from_sample(&topic0s_of(IMPL_ABI), &[]),
+            AbiFit::NoSample
+        );
+    }
+
+    #[test]
+    fn topic0_matching_is_case_insensitive() {
+        let upper = topic0s_of(IMPL_ABI)[0].to_uppercase().replace("0X", "0x");
+        assert_eq!(
+            fit_from_sample(&topic0s_of(IMPL_ABI), &[Some(&upper)]),
+            AbiFit::Fits,
+            "lowercase hex is a convention of eth_getLogs, not a guarantee"
+        );
+    }
+
+    #[test]
+    fn anonymous_events_never_match() {
+        assert_eq!(
+            fit_from_sample(&topic0s_of(IMPL_ABI), &[None]),
+            AbiFit::Mismatch { sampled: 1 }
+        );
+    }
+
+    // ---- --abi override -------------------------------------------------------------------------
+
+    #[test]
+    fn abi_overrides_align_positionally_and_allow_gaps() {
+        assert_eq!(
+            resolve_abi_overrides(&[], 3).unwrap(),
+            vec![None, None, None]
+        );
+        assert_eq!(
+            resolve_abi_overrides(&["".into(), "impl.json".into()], 2).unwrap(),
+            vec![None, Some("impl.json".to_string())],
+            "overriding one contract must not force you to find ABIs for the others"
+        );
+        assert!(
+            resolve_abi_overrides(&["a.json".into()], 2).is_err(),
+            "a count mismatch silently applying to the wrong address is the bug this prevents"
+        );
+    }
+
+    #[test]
+    fn a_local_abi_is_validated_and_artifact_wrappers_are_unwrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.json");
+        std::fs::write(&plain, IMPL_ABI).unwrap();
+        let got = read_local_abi(plain.to_str().unwrap()).unwrap();
+        assert_eq!(abi_event_topic0s(&got).len(), 1);
+
+        // A Hardhat/Foundry artifact wraps the ABI under "abi" - the file people reach for first.
+        let wrapped = dir.path().join("artifact.json");
+        std::fs::write(
+            &wrapped,
+            format!(r#"{{"contractName":"X","abi":{IMPL_ABI},"bytecode":"0x"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            abi_event_topic0s(&read_local_abi(wrapped.to_str().unwrap()).unwrap()).len(),
+            1
+        );
+
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, r#"{"schema":"this is a subgraph manifest"}"#).unwrap();
+        assert!(
+            read_local_abi(junk.to_str().unwrap()).is_err(),
+            "a wrong file must fail here, not silently become an empty registry"
+        );
+        assert!(read_local_abi(dir.path().join("nope.json").to_str().unwrap()).is_err());
     }
 }
