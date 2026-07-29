@@ -32,6 +32,35 @@ const BLOCKS: TableDefinition<&str, &str> = TableDefinition::new("blocks");
 const OUTBOX: TableDefinition<&str, &str> = TableDefinition::new("outbox");
 /// Meta key holding the next outbox sequence number.
 const OUTBOX_SEQ: &str = "outbox_next_seq";
+/// Meta key holding the **ownership fence** (RFC-0022 slice 4): a monotonically increasing number
+/// stamped by whichever worker most recently claimed this store.
+pub const OWNER_FENCE: &str = "owner_fence";
+
+/// A write was refused because the store now belongs to a newer holder.
+///
+/// This is the fencing half of the single-owner guarantee, and it is a **distinct** error from I/O
+/// failure on purpose: an I/O error means try again, this means *stop*. A caller that retries here
+/// is a caller racing the worker that legitimately owns the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LostOwnership {
+    /// The fence this holder believed it had.
+    pub held: u64,
+    /// The fence actually recorded in the store.
+    pub current: u64,
+}
+
+impl std::fmt::Display for LostOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lost ownership of this hot store: held fence {} but the store is at {}. Another worker \
+             has claimed this cursor - stop writing, do not retry",
+            self.held, self.current
+        )
+    }
+}
+
+impl std::error::Error for LostOwnership {}
 
 /// The unsealed tip is too large to materialise for one query (the `/sql` RAM guard).
 ///
@@ -130,6 +159,25 @@ pub trait HotStore: Send + Sync {
     fn prune_and_set_meta(&self, from: u64, to: u64, meta_key: &str, meta_val: &str)
         -> Result<u64>;
 
+    // ---- ownership (RFC-0022 slice 4) ---------------------------------------------------------
+    /// Claim this store, returning the new fence.
+    ///
+    /// The fence is **monotonic across all claimants**, which is what makes it useful: a worker that
+    /// stalls, loses its lease, and wakes up still holding fence *N* cannot write once someone else
+    /// has taken fence *N+1*. Enforcement lives in the store rather than the caller, because a worker
+    /// that checks its own lease before writing is checking a fact that can expire between the check
+    /// and the write.
+    ///
+    /// A store nobody has claimed enforces nothing - that is embedded mode, where there is exactly
+    /// one process by construction and a fence would be ceremony.
+    fn claim(&self, owner: &str) -> Result<u64>;
+
+    /// The fence currently recorded in the store, regardless of who holds it.
+    fn current_fence(&self) -> Result<u64>;
+
+    /// The fence *this handle* believes it holds; `0` when it has never claimed.
+    fn held_fence(&self) -> u64;
+
     // ---- delivery outbox --------------------------------------------------------------------
     fn outbox_push(&self, payload: &str) -> Result<u64>;
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>>;
@@ -142,6 +190,9 @@ pub trait HotStore: Send + Sync {
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
+    /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
+    /// the same owner. `0` means unclaimed, which disables enforcement entirely.
+    held: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Store {
@@ -157,13 +208,17 @@ impl Store {
             wtx.open_table(OUTBOX)?;
         }
         wtx.commit()?;
-        Ok(Store { db: Arc::new(db) })
+        Ok(Store {
+            db: Arc::new(db),
+            held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
     }
 
     /// Push a pending alert delivery onto the durable outbox; returns its sequence number. A fast
     /// single redb write - enqueuing never blocks indexing on a slow/dead webhook (RFC-0008 C5).
     pub fn outbox_push(&self, payload: &str) -> Result<u64> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let seq;
         {
             let mut meta = wtx.open_table(META)?;
@@ -202,6 +257,7 @@ impl Store {
     /// Remove a delivered entry (call only after a successful POST - at-least-once semantics).
     pub fn outbox_remove(&self, seq: u64) -> Result<()> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(OUTBOX)?;
             t.remove(Self::outbox_key(seq).as_str())?;
@@ -230,6 +286,7 @@ impl Store {
         }
         let drop = len - max;
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let mut dropped = 0u64;
         {
             let mut t = wtx.open_table(OUTBOX)?;
@@ -266,6 +323,8 @@ impl Store {
 
     pub fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
+        self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(ENTITIES)?;
             t.insert(key, json)?;
@@ -287,6 +346,7 @@ impl Store {
         last_block: u64,
     ) -> Result<()> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(ENTITIES)?;
             for (k, v) in entities {
@@ -478,6 +538,7 @@ impl Store {
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(META)?;
             t.insert(key, value)?;
@@ -489,6 +550,7 @@ impl Store {
     /// Record the canonical hash we indexed a block against (a reorg checkpoint).
     pub fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(BLOCKS)?;
             t.insert(Self::block_key(block).as_str(), hash)?;
@@ -534,6 +596,7 @@ impl Store {
     /// of entities removed. The mutable hot store is the *only* place a reorg ever lands.
     pub fn rollback_to(&self, block: u64) -> Result<u64> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let mut removed = 0u64;
         {
             let mut entities = wtx.open_table(ENTITIES)?;
@@ -584,6 +647,7 @@ impl Store {
         meta_val: &str,
     ) -> Result<u64> {
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let mut removed = 0u64;
         {
             let mut entities = wtx.open_table(ENTITIES)?;
@@ -630,6 +694,7 @@ impl Store {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let mut removed = 0u64;
         {
             let mut t = wtx.open_table(ENTITIES)?;
@@ -663,6 +728,7 @@ impl Store {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
         let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
         let mut removed = 0u64;
         {
             let mut t = wtx.open_table(ENTITIES)?;
@@ -717,6 +783,38 @@ impl Store {
 /// Every method delegates to the inherent one rather than reimplementing it. Deliberately so: the
 /// inherent methods stay directly callable, and a delegating impl cannot drift from the behaviour the
 /// existing suites already pin.
+/// Ownership fencing for the embedded store (RFC-0022 slice 4).
+///
+/// redb is single-process, so in embedded mode this is inert by construction - nothing claims, the
+/// held fence stays `0`, and no write is ever checked. It exists so both backends have the same shape
+/// and the same tests: a guarantee that only one implementation can express is a guarantee nobody
+/// can verify.
+impl Store {
+    /// Read the persisted fence inside an already-open write transaction.
+    fn fence_in_txn(wtx: &redb::WriteTransaction) -> Result<u64> {
+        let t = wtx.open_table(META)?;
+        let fence = t
+            .get(OWNER_FENCE)?
+            .and_then(|v| v.value().parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(fence)
+    }
+
+    /// Refuse the write if this handle has been fenced out. A handle that never claimed is not
+    /// subject to the check - see the note above.
+    fn guard_fence(&self, wtx: &redb::WriteTransaction) -> Result<()> {
+        let held = self.held.load(std::sync::atomic::Ordering::SeqCst);
+        if held == 0 {
+            return Ok(());
+        }
+        let current = Self::fence_in_txn(wtx)?;
+        if current != held {
+            return Err(LostOwnership { held, current }.into());
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl HotStore for Store {
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
@@ -796,6 +894,32 @@ impl HotStore for Store {
     ) -> Result<u64> {
         Store::prune_and_set_meta(self, from, to, meta_key, meta_val)
     }
+    fn claim(&self, owner: &str) -> Result<u64> {
+        // Deliberately unfenced: claiming is how a *new* holder takes over from a stale one, so
+        // requiring the current fence here would make ownership impossible to transfer.
+        let wtx = self.db.begin_write()?;
+        let next = Self::fence_in_txn(&wtx)? + 1;
+        {
+            let mut t = wtx.open_table(META)?;
+            t.insert(OWNER_FENCE, next.to_string().as_str())?;
+            // Recorded for operators reading the store directly; the fence is what enforces.
+            t.insert("owner", owner)?;
+        }
+        wtx.commit()?;
+        self.held.store(next, std::sync::atomic::Ordering::SeqCst);
+        Ok(next)
+    }
+
+    fn current_fence(&self) -> Result<u64> {
+        Ok(Store::get_meta(self, OWNER_FENCE)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    fn held_fence(&self) -> u64 {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         Store::outbox_push(self, payload)
     }
@@ -907,6 +1031,15 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
         meta_val: &str,
     ) -> Result<u64> {
         (**self).prune_and_set_meta(from, to, meta_key, meta_val)
+    }
+    fn claim(&self, owner: &str) -> Result<u64> {
+        (**self).claim(owner)
+    }
+    fn current_fence(&self) -> Result<u64> {
+        (**self).current_fence()
+    }
+    fn held_fence(&self) -> u64 {
+        (**self).held_fence()
     }
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         (**self).outbox_push(payload)
