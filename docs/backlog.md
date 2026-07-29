@@ -21,14 +21,14 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
    DataFusion). Not "todo", "not yet".
 3. **Process / ongoing** - non-code: grants (0006), launch (0007), the full graph-network migration
    (0011, parked after the pilot).
-4. **Small increments** - buildable now, low priority (proxy introspection, child-`end` conditions,
-   the 0012 live-parity proof - **done 2026-07-28**).
+4. **Small increments** - buildable now, low priority (child-`end` conditions; the 0012 live-parity
+   proof **done 2026-07-28**; proxy introspection **done 2026-07-29**).
 
 ## The whole backlog at a glance
 
 | RFC | Status | What's left | Blocked on |
 |-----|--------|-------------|-----------|
-| 0001 Decode/nests | Implemented | Proxy/EIP-1967 impl introspection (follow proxy slots) | - (small, buildable) |
+| 0001 Decode/nests | Implemented | - (proxy slot introspection was already in; the real gap - a *bespoke* proxy resolving to an ABI that decodes nothing, silently - is closed by the init-time fit check + `--abi`, 2026-07-29) | - |
 | 0002 Horizon nest | Implemented | - | - |
 | 0003 ExEx tip mode | Groundwork only | Wire `ExExSource` to a real node; `nuthatch-node` binary; tip-latency measurement | **reth node** |
 | 0004 Backfill | Implemented | - | - |
@@ -105,8 +105,14 @@ discipline has been "build only what we can verify live."
 
 ## Track 4 - Small increments (buildable now, low priority)
 
-- **0001 - proxy / EIP-1967 introspection.** Follow proxy→impl slots (`eth_getStorageAt`) so a proxied
-  contract's implementation ABI is picked up. Open question; documented workaround exists.
+- ~~**0001 - proxy / EIP-1967 introspection.**~~ **Done, and the entry was misdiagnosed.** Slot
+  introspection (EIP-1967 / EIP-1822 / legacy zeppelinos / beacon) was already implemented at `init`;
+  this entry outlived its fix, like the SSE one below. The gap it *should* have described is the one
+  that cost a day on the Livepeer nest: a **bespoke** proxy (`ManagerProxy`) matches no standard slot,
+  so the public resolvers return the proxy's own ABI, `init` succeeds, and the nest then indexes
+  **zero rows without a word of complaint**. Closed 2026-07-29 by sampling the address's real logs at
+  `init` and refusing to be quiet when none of them match the ABI, plus an `--abi` override so the fix
+  is one flag rather than hand-editing files.
 - **0009 - child lifecycle.** Discovered children are currently forever; `end`/expiry conditions are
   deferred until demand. Also wildcard-address decode (the "future wildcard RFC").
 - ~~**0010 - SSE push.**~~ **Shipped**: `/_admin/events` serves a Server-Sent-Events stream
