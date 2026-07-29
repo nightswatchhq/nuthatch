@@ -1236,8 +1236,8 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::store::Store;
     use super::*;
+    use crate::store::Store;
 
     #[test]
     fn readiness_stall_logic() {
