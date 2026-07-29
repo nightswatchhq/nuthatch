@@ -2,13 +2,19 @@
 # needs none of this. This exists for the distributed self-hosted fleet an operator runs across
 # machines, and for the parity suite that proves the Postgres hot store answers identically to redb.
 #
-# Today it brings up the external hot store alone. The writer pool, query-FE tier and control plane
-# arrive with RFC-0022 slices 3+; this file grows with them rather than being written speculatively
+# Slice 2 brought the external hot store; slice 3 adds the **plane split** - one writer that owns the
+# cursor, and query-FE nodes that serve from the shared store and own nothing. The scheduler and
+# control plane arrive with slice 4; this file grows with them rather than being written speculatively
 # for services that do not exist.
 #
-#   docker compose -f docker-compose.scaled.yml up -d postgres
+#   docker compose -f docker-compose.scaled.yml up -d postgres     # just the store (for the tests)
 #   NUTHATCH_TEST_PG=postgres://nuthatch:nuthatch@127.0.0.1:5433/nuthatch \
 #     cargo test --features postgres-store --test pg_parity
+#
+#   docker compose -f docker-compose.scaled.yml --profile fleet up  # writer + 2 FE nodes
+#
+# The fleet profile needs an image built with `--features postgres-store`; the published image is the
+# embedded build and deliberately carries no database driver.
 
 services:
   postgres:
@@ -34,6 +40,39 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # The writer: owns the cursor, ingests, seals. **Exactly one** of these per chain - that is the
+  # single-writer law, and until slice 4's lease exists it is enforced by this file saying so rather
+  # than by the runtime. Scaling `writer` to 2 replicas would be a genuine data-corruption bug, which
+  # is precisely the gap the fencing token in the RFC's slice-4 note closes.
+  writer:
+    profiles: ["fleet"]
+    image: nuthatch-scaled:local
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: >-
+      dev --dir /nest --listen 0.0.0.0:8288 --no-admin
+    volumes:
+      - ./nest:/nest
+    ports:
+      - "127.0.0.1:8288:8288"
+
+  # Query-FE nodes: serve from the shared store, own no cursor, and are interchangeable. Scale this
+  # one freely - `docker compose --profile fleet up --scale fe=5` - because nothing here writes.
+  fe:
+    profiles: ["fleet"]
+    image: nuthatch-scaled:local
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: >-
+      serve --dir /nest --listen 0.0.0.0:8288
+      --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+    # Read-only mount: an FE has no business writing to the nest directory, and saying so here means a
+    # regression that made it try fails loudly instead of quietly diverging from its peers.
+    volumes:
+      - ./nest:/nest:ro
+    ports:
+      - "127.0.0.1:8289-8299:8288"
 
 volumes:
   nuthatch-pg:
