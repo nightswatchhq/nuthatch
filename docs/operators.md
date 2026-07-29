@@ -93,6 +93,11 @@ sends SIGTERM, which drains and checkpoints cleanly.
 `linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
 Pin the version tag rather than `:latest` for anything you care about.
 
+**glibc floor.** The Linux binary is dynamically linked and built against **glibc 2.35**, so it runs on
+Ubuntu 22.04+, Debian 12+, RHEL 9+ and anything newer. It is built on a pinned runner rather than
+`ubuntu-latest` precisely so that floor does not drift upward unnoticed - which it had, to 2.39, until
+the container image's smoke test caught it.
+
 To build it yourself instead:
 
 ```sh
