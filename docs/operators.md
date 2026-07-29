@@ -13,7 +13,7 @@ still honestly unfinished.
 before a build ships. This document is the *run* guide - what must be true in your environment.
 [`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
 
-Written against **0.7.1** (2026-07-29). Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **0.7.2** (2026-07-29). Read [Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -79,7 +79,7 @@ A container image is published per release:
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
   -e NUTHATCH_ADMIN_TOKEN=change-me \
-  ghcr.io/nuthatch-indexer/nuthatch:0.7.1
+  ghcr.io/nuthatch-indexer/nuthatch:0.7.2
 ```
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source

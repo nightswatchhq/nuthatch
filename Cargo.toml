@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Be your own indexer. One Rust binary, one command, live in under two minutes."
