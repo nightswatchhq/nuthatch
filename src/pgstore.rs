@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 
-use crate::store::{HotScanTooLarge, HotStore};
+use crate::store::{HotScanTooLarge, HotStore, LostOwnership, OWNER_FENCE};
 
 /// A unit of work handed to the connection thread. Boxed so the trait methods can post arbitrary
 /// closures rather than an enum of every query shape, which would have to grow with every method.
@@ -133,6 +133,9 @@ pub struct PgStore {
     conn: Conn,
     /// The nest's schema, already validated and quoted-safe.
     schema: String,
+    /// Fence this handle holds (RFC-0022 slice 4); `0` means it has never claimed, which disables
+    /// enforcement. Shared across clones so one nest's handle speaks for one owner.
+    held: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PgStore {
@@ -159,13 +162,21 @@ impl PgStore {
         let conn = Conn::spawn(config)
             .with_context(|| format!("cannot connect to Postgres at '{}'", redact(url)))?;
 
-        let store = PgStore { conn, schema };
+        let store = PgStore {
+            conn,
+            schema,
+            held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
         store.migrate()?;
         Ok(store)
     }
 
     /// Create the schema and the four tables. Idempotent, so a restart or a second worker taking over
     /// a cursor is a no-op rather than an error.
+    ///
+    /// Deliberately **unfenced**: it runs at connect time, before anything has been claimed, and it
+    /// creates the very table the fence is stored in. `IF NOT EXISTS` throughout means a worker that
+    /// has since been fenced out cannot damage anything by running it again.
     fn migrate(&self) -> Result<()> {
         let s = &self.schema;
         let ddl = format!(
@@ -204,15 +215,24 @@ impl PgStore {
             .with(move |c| Ok(c.query_opt(&sql, &[&key])?.map(|r| r.get::<_, String>(0))))
     }
 
+    /// Every single-key write goes through here, so this is where the fence has to bite for
+    /// `put_entity`, `set_meta` and `set_block_hash`. It runs in a transaction purely so the fence
+    /// check and the write are one decision - a bare `execute` would leave a window in which the
+    /// fence moves between the two, which is the race the fence exists to close.
     fn put_kv(&self, table: &str, key: &str, value: &str) -> Result<()> {
         let sql = format!(
             "INSERT INTO \"{}\".{table} (key, value) VALUES ($1, $2) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             self.schema
         );
+        let schema = self.schema.clone();
+        let held = self.held_fence();
         let (key, value) = (key.to_string(), value.to_string());
         self.conn.with(move |c| {
-            c.execute(&sql, &[&key, &value])?;
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            tx.execute(&sql, &[&key, &value])?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -407,6 +427,7 @@ impl HotStore for PgStore {
         last_block: u64,
     ) -> Result<()> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         let entities = entities.to_vec();
         let checkpoint = checkpoint.map(|(b, h)| (b, h.to_string()));
         self.conn.with(move |c| {
@@ -414,6 +435,7 @@ impl HotStore for PgStore {
             // promises and `e2e_crash_safety` pins: rows, checkpoint and watermark land together, so
             // a crash leaves the store at a clean window boundary and never mid-window.
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             let ins = format!(
                 "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
@@ -452,8 +474,10 @@ impl HotStore for PgStore {
 
     fn rollback_to(&self, block: u64) -> Result<u64> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             let removed = rollback_in_tx(&mut tx, &schema, block)?;
             tx.commit()?;
             Ok(removed)
@@ -462,9 +486,11 @@ impl HotStore for PgStore {
 
     fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         let (mk, mv) = (meta_key.to_string(), meta_val.to_string());
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             let removed = rollback_in_tx(&mut tx, &schema, block)?;
             set_meta_in_tx(&mut tx, &schema, &mk, &mv)?;
             tx.commit()?;
@@ -474,8 +500,10 @@ impl HotStore for PgStore {
 
     fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             let removed = prune_in_tx(&mut tx, &schema, from, to)?;
             tx.commit()?;
             Ok(removed)
@@ -490,9 +518,11 @@ impl HotStore for PgStore {
         meta_val: &str,
     ) -> Result<u64> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         let (mk, mv) = (meta_key.to_string(), meta_val.to_string());
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             let removed = prune_in_tx(&mut tx, &schema, from, to)?;
             set_meta_in_tx(&mut tx, &schema, &mk, &mv)?;
             tx.commit()?;
@@ -502,11 +532,47 @@ impl HotStore for PgStore {
 
     // ---- delivery outbox --------------------------------------------------------------------
 
+    fn claim(&self, owner: &str) -> Result<u64> {
+        let schema = self.schema.clone();
+        let owner = owner.to_string();
+        // Deliberately unfenced: claiming is how a new holder takes over from a stale one.
+        // `FOR UPDATE` serialises two workers racing for the same cursor, so exactly one wins and
+        // the loser reads the winner's fence rather than duplicating it.
+        let next = self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR UPDATE");
+            let current: u64 = tx
+                .query_opt(&read, &[&OWNER_FENCE])?
+                .and_then(|r| r.get::<_, String>(0).parse().ok())
+                .unwrap_or(0);
+            let next = current + 1;
+            set_meta_in_tx(&mut tx, &schema, OWNER_FENCE, &next.to_string())?;
+            set_meta_in_tx(&mut tx, &schema, "owner", &owner)?;
+            tx.commit()?;
+            Ok(next)
+        })?;
+        self.held.store(next, std::sync::atomic::Ordering::SeqCst);
+        Ok(next)
+    }
+
+    fn current_fence(&self) -> Result<u64> {
+        Ok(self
+            .get_kv("meta", OWNER_FENCE)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    fn held_fence(&self) -> u64 {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         let schema = self.schema.clone();
+        let held = self.held_fence();
         let payload = payload.to_string();
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             // Read-modify-write of the counter inside the transaction, with `FOR UPDATE` so two
             // writers cannot both read the same seq. The trait says single-writer, but a lost outbox
             // entry is silent and permanent, so this one is belt and braces.
@@ -543,16 +609,24 @@ impl HotStore for PgStore {
 
     fn outbox_remove(&self, seq: u64) -> Result<()> {
         let sql = format!("DELETE FROM \"{}\".outbox WHERE key = $1", self.schema);
+        let schema = self.schema.clone();
+        let held = self.held_fence();
         self.conn.with(move |c| {
-            c.execute(&sql, &[&format!("{seq:020}")])?;
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            tx.execute(&sql, &[&format!("{seq:020}")])?;
+            tx.commit()?;
             Ok(())
         })
     }
 
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
         let sql = format!("DELETE FROM \"{}\".outbox WHERE key = $1", self.schema);
+        let schema = self.schema.clone();
+        let held = self.held_fence();
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
             for seq in seqs {
                 tx.execute(&sql, &[&format!("{seq:020}")])?;
             }
@@ -581,8 +655,36 @@ impl HotStore for PgStore {
              (SELECT key FROM \"{s}\".outbox ORDER BY key LIMIT $1)",
             s = self.schema
         );
-        self.conn.with(move |c| Ok(c.execute(&sql, &[&drop])?))
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            let n = tx.execute(&sql, &[&drop])?;
+            tx.commit()?;
+            Ok(n)
+        })
     }
+}
+
+/// Refuse the write if this handle has been fenced out (RFC-0022 slice 4).
+///
+/// Runs **inside the caller's transaction**, so the check and the write are one atomic decision.
+/// Checking beforehand would leave a window in which the fence moves between the check and the
+/// write - which is exactly the race the fence exists to close.
+fn guard_fence_in_tx(tx: &mut postgres::Transaction<'_>, schema: &str, held: u64) -> Result<()> {
+    if held == 0 {
+        return Ok(());
+    }
+    let sql = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1");
+    let current: u64 = tx
+        .query_opt(&sql, &[&OWNER_FENCE])?
+        .and_then(|r| r.get::<_, String>(0).parse().ok())
+        .unwrap_or(0);
+    if current != held {
+        return Err(LostOwnership { held, current }.into());
+    }
+    Ok(())
 }
 
 /// Upsert one meta key inside an open transaction - shared by every mutation that must land the row

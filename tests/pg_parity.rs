@@ -306,3 +306,89 @@ async fn the_hot_scan_guard_refuses_on_both_backends() {
         "under the cap, both must answer"
     );
 }
+
+/// RFC-0022 slice 4: the two backends must fence **identically**. A backend that enforces ownership
+/// differently is a backend on which the single-owner guarantee means something different, which is
+/// the same as it not being a guarantee.
+#[tokio::test]
+async fn ownership_fencing_behaves_identically_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("fencing") else {
+        return;
+    };
+    let both: [&dyn HotStore; 2] = [redb.as_ref(), pg.as_ref()];
+
+    // Unclaimed: no enforcement anywhere.
+    for s in both {
+        assert_eq!(s.held_fence(), 0);
+        assert_eq!(s.current_fence().unwrap(), 0);
+        s.put_entity(&Store::entity_key(1, 0), "{\"table\":\"t\"}")
+            .expect("an unclaimed store never fences");
+    }
+    assert_agree(redb.as_ref(), pg.as_ref(), "unclaimed writes");
+
+    // Claim: the fence advances the same way on both.
+    let fences: Vec<u64> = both.iter().map(|s| s.claim("worker-a").unwrap()).collect();
+    assert_eq!(fences[0], fences[1], "claim must yield the same fence");
+    assert_eq!(fences[0], 1);
+
+    for s in both {
+        s.commit_window(&[row("t", 2, 0)], Some((2, "0xaa")), 2)
+            .expect("the owner writes normally");
+        // Seed the outbox while still the owner, so `outbox_trim` below has something to trim. It
+        // early-returns `Ok(0)` on an empty outbox - correctly, a no-op needs no fence - and testing
+        // it in that state would assert nothing.
+        for i in 0..3 {
+            s.outbox_push(&format!(r#"{{"n":{i}}}"#)).unwrap();
+        }
+    }
+    assert_agree(redb.as_ref(), pg.as_ref(), "owner write");
+
+    // A rival claims, exactly as another worker would.
+    let held = fences[0];
+    for s in both {
+        s.set_meta(nuthatch::store::OWNER_FENCE, &(held + 1).to_string())
+            .expect("the current owner may still write");
+    }
+
+    // Both must now refuse the stale holder, with the same typed error and the same numbers.
+    for (name, s) in [("redb", redb.as_ref()), ("postgres", pg.as_ref())] {
+        let err = s
+            .commit_window(&[row("t", 3, 0)], None, 3)
+            .expect_err("{name}: a fenced-out holder must not write");
+        let lost = err
+            .downcast_ref::<nuthatch::store::LostOwnership>()
+            .unwrap_or_else(|| panic!("{name} refused for the wrong reason: {err}"));
+        assert_eq!((lost.held, lost.current), (held, held + 1), "{name}");
+    }
+
+    // Every mutating path, on both, so neither backend has a hole the other lacks.
+    for (name, s) in [("redb", redb.as_ref()), ("postgres", pg.as_ref())] {
+        for (what, r) in [
+            ("put_entity", s.put_entity("k", "{}").map(|_| ())),
+            ("set_meta", s.set_meta("x", "y").map(|_| ())),
+            ("set_block_hash", s.set_block_hash(1, "0xbb").map(|_| ())),
+            ("rollback_to", s.rollback_to(0).map(|_| ())),
+            ("prune_range", s.prune_range(0, 10).map(|_| ())),
+            ("outbox_push", s.outbox_push("{}").map(|_| ())),
+            ("outbox_remove", s.outbox_remove(0).map(|_| ())),
+            ("outbox_trim", s.outbox_trim(0).map(|_| ())),
+        ] {
+            let err = match r {
+                Err(e) => e,
+                Ok(()) => panic!("{name}/{what} accepted a write from a fenced-out holder"),
+            };
+            assert!(
+                err.downcast_ref::<nuthatch::store::LostOwnership>()
+                    .is_some(),
+                "{name}/{what} failed for the wrong reason: {err}"
+            );
+        }
+    }
+
+    // Reads survive on both: a fenced-out node may still be serving.
+    for s in both {
+        assert!(s.count().is_ok());
+        assert!(s.recent(10).is_ok());
+    }
+    assert_agree(redb.as_ref(), pg.as_ref(), "fenced-out state");
+}
