@@ -91,18 +91,22 @@ jobs:
       - name: version
         id: v
         run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - name: build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          # x86_64 only, matching the single Linux target the release builds. A multi-arch image would
-          # need an aarch64-linux binary we do not currently produce - stated rather than implied.
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}
-            ghcr.io/${{ github.repository }}:latest
-      - name: smoke-test the pushed image
+      # Build locally, prove it runs, and only then publish - in that order. It used to push first and
+      # smoke-test the pushed tag, which meant a failing test failed the *job* but left the broken image
+      # public: v0.7.0 published a `:0.7.0` and a `:latest` that died with `GLIBC_2.38 not found`, and a
+      # red tick in Actions does not un-pull an image someone already has.
+      #
+      # x86_64 only, matching the single Linux target the release builds. A multi-arch image would need
+      # an aarch64-linux binary we do not currently produce - stated rather than implied.
+      - name: build the image
+        run: docker build --platform linux/amd64 -t nuthatch:candidate .
+      - name: smoke-test before publishing
+        run: docker run --rm nuthatch:candidate --version
+      - name: push the tested image
         run: |
-          # A tag that cannot run `--version` is worse than no tag at all.
-          docker run --rm "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}" --version
+          # `docker tag` of the smoke-tested image, not a rebuild: what ships is the exact thing that
+          # passed above, same digest.
+          for tag in "${{ steps.v.outputs.tag }}" latest; do
+            docker tag nuthatch:candidate "ghcr.io/${{ github.repository }}:$tag"
+            docker push "ghcr.io/${{ github.repository }}:$tag"
+          done
