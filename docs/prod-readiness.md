@@ -115,7 +115,9 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   and earlier**; fixed by `reject_statement_stacking` with regression tests, released as **v0.6.2**
   with binaries, and the Lodestar box upgraded and verified the same day. *Any deployment still
   exposing `/sql` on ≤0.6.1 remains affected and should upgrade.* Advisory GHSA-jvjx-5528-r6mm is
-  drafted and awaiting publication.
+  drafted and **deliberately unpublished as of 2026-07-29** - a decision, not an oversight. The fix
+  shipped in 0.6.2 and 0.7.x, so the remedy is available to anyone who looks; publication is a
+  disclosure call for the maintainer to make, not a task waiting on engineering.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
 - [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).
