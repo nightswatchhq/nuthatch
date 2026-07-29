@@ -47,7 +47,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0019 Registry | Implemented | - (live S3 verified 2026-07-28 against Hetzner Object Storage; S3 now ships on by default) | - |
 | 0020 N-1 upgrade | Implemented | - | - |
 | 0021 Multichain roost | Slice 1 shipped | - (live two-chain run done 2026-07-28; it found the per-nest readiness bug, now fixed) | - |
-| 0022 Distributed scaled mode | Accepted, design only | The whole build: plane split, writer pool, scheduler, control-plane DB, secret injection | 0013-scaled (Postgres) + 0021 |
+| 0022 Distributed scaled mode | **Build started 2026-07-29** | Slice 1: extract the `HotStore` trait (it was assumed to exist and does not - `Store` is concrete redb across 17 modules). Then Postgres, then plane split/pool/scheduler/control-plane | slices 1-2 unblocked; slice 3+ needs **operator infra** (single-owner is not honestly testable on one box) |
 | 0025 Adaptive MCP | Implemented | - | - |
 | 0026 Fault quarantine | Implemented | - | - |
 | 0027 Live roost | **Implemented** | - (all 7 slices shipped 2026-07-28) | - |
@@ -168,5 +168,6 @@ their churn. These audit items were judged defer-worthy, with rationale:
    records the hot-store keyspace collision that the extraction slice must solve first.
 4. **Cheap wins, all live runs rather than code:** 0012's sustained parity run, 0021's two-chain run,
    and 0019's S3 verification (public RPC and a VPS suffice), then the Track-4 small increments.
-5. **When scaled mode is real:** start 0013's DataFusion convergence scaled-side, behind the benchmark
-   gate. Not before.
+5. **Scaled mode, started 2026-07-29.** Slice 1 is the `HotStore` trait extraction - a pure refactor
+   whose acceptance criterion is that the existing suites stay green *unmodified*. 0013's DataFusion
+   convergence still sits behind its benchmark gate; do not skip it because scaled mode is now moving.
