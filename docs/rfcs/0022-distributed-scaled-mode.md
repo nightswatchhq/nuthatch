@@ -170,7 +170,9 @@ of this RFC and this project.
 
 The Implementation section below said to feature-flag the backend "behind the existing `HotStore`
 trait (founding architecture)". **That trait does not exist and never did.** `Store` is a concrete
-redb struct with 31 public methods, referenced by name in 17 modules across roughly 110 call sites.
+redb struct with 31 public methods. The ~110 call sites are *method invocations*, and nearly all of
+them need no edit - `&store` coerces to `&dyn HotStore` once the impl exists. What has to change is
+the places that **name the type**, and there are **14**, in four files.
 `CLAUDE.md` states the trait as a *directive* for when scaled mode is built - correctly - and this RFC
 misread it as a description of something already in the tree.
 
@@ -211,11 +213,32 @@ changes an answer is a failed swap.
 
 ### Slice 3+ - the planes, pool, scheduler and control plane
 
-Everything in §1-§3. **This is where laptop verification stops being honest.** "A cursor is never
-owned by two workers concurrently" is a distributed invariant, and a docker-compose run on one box
-exercises it only weakly - a single host cannot reproduce the partition and clock-skew cases that make
-single-owner hard. Per this RFC's own header, it is verified on operator infra. That makes the GraphOps
-conversation a **dependency of slice 3**, not a courtesy.
+Everything in §1-§3, and **buildable and testable by us** - the Nature line above already says so:
+integration-tested under docker-compose on the MacBook/VPSes, with GraphOps running it *at scale*. The
+declared dependencies are RFC-0013/0019/0021, and an operator is not among them.
+
+An earlier draft of this section called the GraphOps conversation a dependency of slice 3, on the
+grounds that single-owner is not honestly testable on one box. **That was wrong** and is corrected
+here, because it would have parked a buildable slice behind someone else's calendar.
+
+The single-owner invariant is enforced by the control-plane DB, which makes most of it *ordinarily*
+testable:
+
+- **The claim race** - N workers contend for one cursor; exactly one wins. A unique constraint or a
+  lease row decides it, and a deterministic test asserts it.
+- **The fencing case, which is the one that actually bites** - a worker holding a lease stalls (long
+  GC, a paused container), its lease expires, another worker takes the cursor, and the original wakes
+  up still believing it owns the thing. A monotonic fencing token makes the stale writer's writes
+  rejected rather than merely unlikely, and `SIGSTOP` on a container reproduces it exactly.
+- **Partition and skew** - `docker network disconnect` and a faked clock cover the cases worth
+  covering. Not a substitute for a real network, but far from nothing.
+- **A genuinely multi-machine run** on our own VPSes, which is what the Execution-context note means
+  by MacBook/VPSes - it was never "one box".
+
+What an operator provides that we cannot manufacture is **scale validation and workload shape**: many
+cursors across many machines under real traffic, and the placement constraints a scheduler ought to
+respect. That is a reason to talk to them **while** building - their answer may change the scheduler's
+policy - not a reason to wait before starting.
 
 ## Implementation (design-now, build-later)
 

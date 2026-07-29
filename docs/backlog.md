@@ -47,7 +47,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0019 Registry | Implemented | - (live S3 verified 2026-07-28 against Hetzner Object Storage; S3 now ships on by default) | - |
 | 0020 N-1 upgrade | Implemented | - | - |
 | 0021 Multichain roost | Slice 1 shipped | - (live two-chain run done 2026-07-28; it found the per-nest readiness bug, now fixed) | - |
-| 0022 Distributed scaled mode | **Build started 2026-07-29** | Slice 1: extract the `HotStore` trait (it was assumed to exist and does not - `Store` is concrete redb across 17 modules). Then Postgres, then plane split/pool/scheduler/control-plane | slices 1-2 unblocked; slice 3+ needs **operator infra** (single-owner is not honestly testable on one box) |
+| 0022 Distributed scaled mode | **Build started 2026-07-29** | Slice 1: extract the `HotStore` trait (it was assumed to exist and does not - `Store` is concrete redb across 17 modules). Then Postgres, then plane split/pool/scheduler/control-plane | all slices buildable by us (docker-compose + our VPSes); an operator gives **scale validation and placement requirements**, not a build gate |
 | 0025 Adaptive MCP | Implemented | - | - |
 | 0026 Fault quarantine | Implemented | - | - |
 | 0027 Live roost | **Implemented** | - (all 7 slices shipped 2026-07-28) | - |
