@@ -16,6 +16,17 @@
 //! Reconciliation reads ownership from the hot stores, which cannot be stale, because a lease is only
 //! meaningful in the transaction that took it.
 //!
+//! ## Secrets
+//!
+//! Runtime secrets (RFC-0019 §4 credential kind **b**) live here too, keyed by nest. They are stored
+//! **outside** the content-addressed bundle on purpose: baking a credential into a bundle would leak
+//! it *and* break addressing, because two nests differing only in credentials would hash differently.
+//! Rotating a secret is a control-plane write that changes no bundle hash.
+//!
+//! The interface is **write-only**. Values go in and are handed to the worker that mounts the nest;
+//! no method returns one to an operator, and the HTTP surface exposes only key names. A control plane
+//! that can read back every credential it holds is a credential dump with extra steps.
+//!
 //! ## Liveness
 //!
 //! A worker is alive if it has heartbeated within its TTL, measured on the **database's** clock - the
@@ -28,6 +39,7 @@
 //! ingestion, only stop *rescheduling*.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 
 use crate::scheduler::{DesiredNest, Worker};
 
@@ -73,6 +85,18 @@ impl ControlPlane {
                     id            TEXT PRIMARY KEY,
                     budget_mb     BIGINT      NOT NULL,
                     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                -- Runtime secrets (RFC-0019 §4 credential kind (b), mechanism per RFC-0022 §5).
+                -- Deliberately keyed by nest and **never** by bundle: baking a secret into a
+                -- content-addressed bundle would both leak it and break addressing, since two nests
+                -- differing only in credentials would hash differently. Rotating a secret here
+                -- changes no bundle hash at all.
+                CREATE TABLE IF NOT EXISTS "{SCHEMA}".nest_secret (
+                    nest        TEXT        NOT NULL,
+                    key         TEXT        NOT NULL,
+                    value       TEXT        NOT NULL,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (nest, key)
                 );
                 "#
             ))?;
@@ -185,6 +209,92 @@ impl ControlPlane {
                     budget_mb: r.get::<_, i64>(1).max(0) as u64,
                 })
                 .collect())
+        })
+    }
+
+    // ---- runtime secrets (RFC-0022 §5) ---------------------------------------------------------
+
+    /// Store a secret for a nest - a private RPC URL, an enricher API key.
+    ///
+    /// **Write-only by design.** There is no method that returns a single secret's value to an
+    /// operator, and the HTTP API exposes only key *names*. A control plane that can hand back every
+    /// credential it holds is a credential dump with extra steps; the only consumer that needs values
+    /// is the worker that is about to mount the nest.
+    pub fn set_secret(&self, nest: &str, key: &str, value: &str) -> Result<()> {
+        if nest.is_empty() || key.is_empty() {
+            return Err(anyhow!("a secret needs both a nest and a key"));
+        }
+        let (nest, key, value) = (nest.to_string(), key.to_string(), value.to_string());
+        self.conn.with(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO \"{SCHEMA}\".nest_secret (nest, key, value) VALUES ($1, $2, $3) \
+                     ON CONFLICT (nest, key) DO UPDATE \
+                     SET value = EXCLUDED.value, updated_at = now()"
+                ),
+                &[&nest, &key, &value],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a secret. Reports whether it existed, so rotation scripts can tell a real deletion from
+    /// a typo'd key that silently did nothing.
+    pub fn delete_secret(&self, nest: &str, key: &str) -> Result<bool> {
+        let (nest, key) = (nest.to_string(), key.to_string());
+        self.conn.with(move |c| {
+            let n = c.execute(
+                &format!("DELETE FROM \"{SCHEMA}\".nest_secret WHERE nest = $1 AND key = $2"),
+                &[&nest, &key],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// The key *names* held for a nest - never the values. What an operator is allowed to see.
+    pub fn secret_keys(&self, nest: &str) -> Result<Vec<String>> {
+        let nest = nest.to_string();
+        self.conn.with(move |c| {
+            Ok(c.query(
+                &format!("SELECT key FROM \"{SCHEMA}\".nest_secret WHERE nest = $1 ORDER BY key"),
+                &[&nest],
+            )?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect())
+        })
+    }
+
+    /// Secrets for the nests a worker is **actually assigned**, and no others.
+    ///
+    /// The scoping is the point, and it is why this takes a list rather than offering a
+    /// fetch-everything call: a worker running one nest has no business holding another's
+    /// credentials, and the cheapest way to guarantee that is to never send them. `IN`-filtered in
+    /// SQL rather than fetched-then-filtered here, so an over-broad query cannot be introduced later
+    /// by someone refactoring the filter away.
+    pub fn secrets_for(
+        &self,
+        nests: &[String],
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        if nests.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let nests = nests.to_vec();
+        self.conn.with(move |c| {
+            let rows = c.query(
+                &format!(
+                    "SELECT nest, key, value FROM \"{SCHEMA}\".nest_secret \
+                     WHERE nest = ANY($1) ORDER BY nest, key"
+                ),
+                &[&nests],
+            )?;
+            let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for r in rows {
+                out.entry(r.get::<_, String>(0))
+                    .or_default()
+                    .insert(r.get::<_, String>(1), r.get::<_, String>(2));
+            }
+            Ok(out)
         })
     }
 
