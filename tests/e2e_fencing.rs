@@ -209,3 +209,125 @@ fn fences_are_never_reused() {
         "and strictly increasing: {seen:?}"
     );
 }
+
+// ---- RFC-0022 slice 4b: the lease ------------------------------------------------------------
+
+/// A lease is refused, not stolen. This is the difference between `acquire_lease` and `claim`, and
+/// getting it wrong would make every worker a thief the moment it started.
+#[test]
+fn a_live_lease_is_refused_rather_than_stolen() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+
+    let lease = a.acquire_lease("worker-a", 60).unwrap();
+    assert_eq!(lease.owner, "worker-a");
+    assert_eq!(lease.fence, 1);
+
+    // A different worker asking for the same cursor while the lease is live.
+    let err = a
+        .acquire_lease("worker-b", 60)
+        .expect_err("a live lease held by someone else must not be acquirable");
+    let held = err.downcast_ref::<nuthatch::store::LeaseHeld>().expect(
+        "the refusal must be typed - a scheduler backs off on this and drains on the other",
+    );
+    assert_eq!(held.by, "worker-a");
+    assert!(held.expires_in_secs > 0, "and it must say how long to wait");
+}
+
+/// An expired lease is takeable - that is the entire point of a TTL. Uses a zero-second lease rather
+/// than sleeping, so the test is deterministic.
+#[test]
+fn an_expired_lease_is_takeable() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+
+    let first = a.acquire_lease("worker-a", 0).unwrap();
+    let second = a
+        .acquire_lease("worker-b", 60)
+        .expect("an expired lease is free to take");
+    assert_eq!(second.owner, "worker-b");
+    assert!(
+        second.fence > first.fence,
+        "taking over must issue a new fence, or the previous holder's writes would still pass"
+    );
+}
+
+/// Re-acquiring your own lease is a renewal, not a refusal - a worker restarting mid-lease must not
+/// lock itself out of its own cursor.
+#[test]
+fn a_holder_can_reacquire_its_own_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+    let first = a.acquire_lease("worker-a", 60).unwrap();
+    let again = a.acquire_lease("worker-a", 60).expect("its own lease");
+    assert!(again.fence > first.fence);
+}
+
+/// Renewal extends without re-fencing. A new fence on every renewal would invalidate the holder's own
+/// in-flight writes, which is a self-inflicted outage on a heartbeat.
+#[test]
+fn renewal_extends_without_bumping_the_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+    let lease = a.acquire_lease("worker-a", 1).unwrap();
+
+    let renewed = a.renew_lease(120).unwrap();
+    assert_eq!(renewed.fence, lease.fence, "renewal must not re-fence");
+    assert_eq!(renewed.owner, "worker-a");
+
+    let seen = a.current_lease().unwrap().expect("a lease is recorded");
+    assert!(seen.expires_in_secs > 60, "the extension took effect");
+
+    // And the holder can still write, which is the thing a fence bump would have broken.
+    a.commit_window(&row(1), None, 1)
+        .expect("renewing must not invalidate the holder's own writes");
+}
+
+/// Releasing frees the cursor for the next worker but must not rewind the fence - a reused fence
+/// would let a stale holder's number match again.
+#[test]
+fn releasing_frees_the_lease_without_rewinding_the_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+    let lease = a.acquire_lease("worker-a", 600).unwrap();
+    a.release_lease().unwrap();
+
+    let next = a
+        .acquire_lease("worker-b", 60)
+        .expect("a released lease is immediately takeable");
+    assert!(
+        next.fence > lease.fence,
+        "the fence is monotonic across a release, or a stale holder could match it again"
+    );
+}
+
+/// A worker whose lease was taken must not be able to extend it back - otherwise a stalled worker
+/// could resurrect ownership it had already lost.
+#[test]
+fn a_superseded_holder_cannot_renew() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+    a.acquire_lease("worker-a", 0).unwrap();
+    rival_claims(&a);
+    assert!(
+        a.renew_lease(600).is_err(),
+        "renewal is a write and must be fenced like one"
+    );
+}
+
+/// `current_lease` distinguishes "expired" from "never leased" - a scheduler treats those very
+/// differently, and collapsing them into `None` would lose the distinction.
+#[test]
+fn an_expired_lease_still_reports_who_held_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Store::open(&dir.path().join("t.redb")).unwrap();
+    assert!(a.current_lease().unwrap().is_none(), "never leased");
+
+    a.acquire_lease("worker-a", 0).unwrap();
+    let seen = a
+        .current_lease()
+        .unwrap()
+        .expect("expired is not the same as absent");
+    assert_eq!(seen.owner, "worker-a");
+    assert!(seen.expires_in_secs <= 0, "and it reads as expired");
+}

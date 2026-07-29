@@ -35,6 +35,43 @@ const OUTBOX_SEQ: &str = "outbox_next_seq";
 /// Meta key holding the **ownership fence** (RFC-0022 slice 4): a monotonically increasing number
 /// stamped by whichever worker most recently claimed this store.
 pub const OWNER_FENCE: &str = "owner_fence";
+/// Meta key holding the current lease holder's name.
+pub const LEASE_OWNER: &str = "lease_owner";
+/// Meta key holding the lease expiry, unix seconds, **on the store's clock**.
+pub const LEASE_EXPIRES_AT: &str = "lease_expires_at";
+
+/// A held lease on a cursor (RFC-0022 slice 4b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub owner: String,
+    /// The fence issued with this lease. Every write the holder makes carries it.
+    pub fence: u64,
+    /// Seconds until expiry, by the store's clock. Negative means already expired.
+    pub expires_in_secs: i64,
+}
+
+/// Someone else holds the lease and it has not expired.
+///
+/// Distinct from [`LostOwnership`], which is what a *write* fails with: this is what an *acquisition*
+/// fails with. One says "you never got it", the other says "you had it and lost it", and a scheduler
+/// reacts differently to each - back off versus stop and drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseHeld {
+    pub by: String,
+    pub expires_in_secs: i64,
+}
+
+impl std::fmt::Display for LeaseHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cursor is leased to '{}' for another {}s - not acquiring",
+            self.by, self.expires_in_secs
+        )
+    }
+}
+
+impl std::error::Error for LeaseHeld {}
 
 /// A write was refused because the store now belongs to a newer holder.
 ///
@@ -171,6 +208,32 @@ pub trait HotStore: Send + Sync {
     /// A store nobody has claimed enforces nothing - that is embedded mode, where there is exactly
     /// one process by construction and a fence would be ceremony.
     fn claim(&self, owner: &str) -> Result<u64>;
+
+    /// Acquire the lease **if it is free, expired, or already ours**, bumping the fence.
+    ///
+    /// This is what a worker calls for itself, and it is the safe one: it refuses rather than
+    /// stealing. [`claim`](HotStore::claim) is the unconditional form, for a scheduler performing a
+    /// deliberate handover after a drain - it *knows* the previous holder is gone, so asking would be
+    /// theatre. Two verbs because they answer different questions: "may I have this?" and "this is
+    /// now yours".
+    ///
+    /// Expiry is measured on the **store's** clock, never the caller's. Worker clock skew would
+    /// otherwise stretch or shorten leases invisibly, and the failure only shows up as two workers
+    /// each believing they hold one - see RFC-0022's lease-placement note.
+    fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> Result<Lease>;
+
+    /// Extend the lease this handle holds. Does **not** bump the fence: renewing is the same holder
+    /// continuing, and a new fence would invalidate its own in-flight writes.
+    fn renew_lease(&self, ttl_secs: u64) -> Result<Lease>;
+
+    /// Give up the lease. The fence is deliberately left where it is - it is monotonic, and rewinding
+    /// it would let a stale holder's number match again.
+    fn release_lease(&self) -> Result<()>;
+
+    /// The current lease, if any is recorded. Returns it even when expired, with a negative
+    /// `expires_in_secs`, because "expired 40s ago" and "never leased" are different facts to a
+    /// scheduler.
+    fn current_lease(&self) -> Result<Option<Lease>>;
 
     /// The fence currently recorded in the store, regardless of who holds it.
     fn current_fence(&self) -> Result<u64>;
@@ -800,6 +863,24 @@ impl Store {
         Ok(fence)
     }
 
+    /// `(owner, expires_at, fence)` read inside an open write transaction.
+    fn lease_in_txn(wtx: &redb::WriteTransaction) -> Result<(String, i64, u64)> {
+        let t = wtx.open_table(META)?;
+        let owner = t
+            .get(LEASE_OWNER)?
+            .map(|v| v.value().to_string())
+            .unwrap_or_default();
+        let expires_at = t
+            .get(LEASE_EXPIRES_AT)?
+            .and_then(|v| v.value().parse::<i64>().ok())
+            .unwrap_or(0);
+        let fence = t
+            .get(OWNER_FENCE)?
+            .and_then(|v| v.value().parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok((owner, expires_at, fence))
+    }
+
     /// Refuse the write if this handle has been fenced out. A handle that never claimed is not
     /// subject to the check - see the note above.
     fn guard_fence(&self, wtx: &redb::WriteTransaction) -> Result<()> {
@@ -916,6 +997,83 @@ impl HotStore for Store {
             .unwrap_or(0))
     }
 
+    fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> Result<Lease> {
+        let wtx = self.db.begin_write()?;
+        let now = unix_now();
+        let (holder, expires_at, fence) = Self::lease_in_txn(&wtx)?;
+        // Free, expired, or ours - the three cases where taking it is not theft.
+        let takeable = holder.is_empty() || expires_at <= now || holder == owner;
+        if !takeable {
+            return Err(LeaseHeld {
+                by: holder,
+                expires_in_secs: expires_at - now,
+            }
+            .into());
+        }
+        let next = fence + 1;
+        let until = now + ttl_secs as i64;
+        {
+            let mut t = wtx.open_table(META)?;
+            t.insert(OWNER_FENCE, next.to_string().as_str())?;
+            t.insert(LEASE_OWNER, owner)?;
+            t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
+        }
+        wtx.commit()?;
+        self.held.store(next, std::sync::atomic::Ordering::SeqCst);
+        Ok(Lease {
+            owner: owner.to_string(),
+            fence: next,
+            expires_in_secs: ttl_secs as i64,
+        })
+    }
+
+    fn renew_lease(&self, ttl_secs: u64) -> Result<Lease> {
+        let wtx = self.db.begin_write()?;
+        // Renewing is a write by the holder, so it is fenced like any other: a holder that has been
+        // superseded must not be able to extend a lease it no longer has.
+        self.guard_fence(&wtx)?;
+        let (holder, _, fence) = Self::lease_in_txn(&wtx)?;
+        let until = unix_now() + ttl_secs as i64;
+        {
+            let mut t = wtx.open_table(META)?;
+            t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
+        }
+        wtx.commit()?;
+        Ok(Lease {
+            owner: holder,
+            fence,
+            expires_in_secs: ttl_secs as i64,
+        })
+    }
+
+    fn release_lease(&self) -> Result<()> {
+        let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
+        {
+            let mut t = wtx.open_table(META)?;
+            // Expire it rather than deleting the owner: "released by X at T" is a more useful thing
+            // for an operator to find than an empty row.
+            t.insert(LEASE_EXPIRES_AT, "0")?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    fn current_lease(&self) -> Result<Option<Lease>> {
+        let holder = Store::get_meta(self, LEASE_OWNER)?.unwrap_or_default();
+        if holder.is_empty() {
+            return Ok(None);
+        }
+        let expires_at: i64 = Store::get_meta(self, LEASE_EXPIRES_AT)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Ok(Some(Lease {
+            owner: holder,
+            fence: HotStore::current_fence(self)?,
+            expires_in_secs: expires_at - unix_now(),
+        }))
+    }
+
     fn held_fence(&self) -> u64 {
         self.held.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -946,6 +1104,16 @@ impl HotStore for Store {
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
         Store::outbox_remove_batch_blocking(self, seqs).await
     }
+}
+
+/// Wall-clock seconds. redb is single-process, so there is one clock by construction and no skew to
+/// worry about; the Postgres backend reads `now()` from the database instead, which is where skew
+/// would otherwise bite.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// An `Arc<dyn HotStore>` is itself a `HotStore`.
@@ -1037,6 +1205,18 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn current_fence(&self) -> Result<u64> {
         (**self).current_fence()
+    }
+    fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> Result<Lease> {
+        (**self).acquire_lease(owner, ttl_secs)
+    }
+    fn renew_lease(&self, ttl_secs: u64) -> Result<Lease> {
+        (**self).renew_lease(ttl_secs)
+    }
+    fn release_lease(&self) -> Result<()> {
+        (**self).release_lease()
+    }
+    fn current_lease(&self) -> Result<Option<Lease>> {
+        (**self).current_lease()
     }
     fn held_fence(&self) -> u64 {
         (**self).held_fence()

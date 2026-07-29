@@ -392,3 +392,68 @@ async fn ownership_fencing_behaves_identically_on_both_backends() {
     }
     assert_agree(redb.as_ref(), pg.as_ref(), "fenced-out state");
 }
+
+/// RFC-0022 slice 4b: leases must behave identically on both backends. The Postgres one measures
+/// expiry on the **database's** clock and redb on the process clock - different mechanisms that must
+/// produce the same answers, which is exactly the kind of thing that quietly diverges.
+#[tokio::test]
+async fn leases_behave_identically_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("lease") else {
+        return;
+    };
+    let both: [&dyn HotStore; 2] = [redb.as_ref(), pg.as_ref()];
+
+    for s in both {
+        assert!(s.current_lease().unwrap().is_none(), "nothing leased yet");
+    }
+
+    // Acquire: same owner, same fence, on both.
+    let leases: Vec<_> = both
+        .iter()
+        .map(|s| s.acquire_lease("worker-a", 60).unwrap())
+        .collect();
+    assert_eq!(leases[0].owner, leases[1].owner);
+    assert_eq!(leases[0].fence, leases[1].fence);
+    assert_eq!(leases[0].fence, 1);
+
+    // A rival is refused on both, with the same typed error.
+    for (name, s) in [("redb", redb.as_ref()), ("postgres", pg.as_ref())] {
+        let err = match s.acquire_lease("worker-b", 60) {
+            Err(e) => e,
+            Ok(_) => panic!("{name}: a live lease must not be acquirable by another worker"),
+        };
+        let held = err
+            .downcast_ref::<nuthatch::store::LeaseHeld>()
+            .unwrap_or_else(|| panic!("{name} refused for the wrong reason: {err}"));
+        assert_eq!(held.by, "worker-a", "{name}");
+        assert!(
+            held.expires_in_secs > 0,
+            "{name}: must say how long to wait"
+        );
+    }
+
+    // Renewal extends without re-fencing, on both.
+    for (name, s) in [("redb", redb.as_ref()), ("postgres", pg.as_ref())] {
+        let r = s.renew_lease(120).unwrap();
+        assert_eq!(r.fence, 1, "{name}: renewal must not re-fence");
+        assert_eq!(r.owner, "worker-a", "{name}");
+        assert!(
+            s.current_lease().unwrap().unwrap().expires_in_secs > 60,
+            "{name}: the extension took effect"
+        );
+    }
+
+    // Release frees it without rewinding the fence, on both.
+    for (name, s) in [("redb", redb.as_ref()), ("postgres", pg.as_ref())] {
+        s.release_lease().unwrap();
+        let next = s
+            .acquire_lease("worker-b", 60)
+            .unwrap_or_else(|e| panic!("{name}: a released lease must be takeable - {e}"));
+        assert!(
+            next.fence > 1,
+            "{name}: the fence stays monotonic across a release"
+        );
+    }
+
+    assert_agree(redb.as_ref(), pg.as_ref(), "lease lifecycle");
+}
