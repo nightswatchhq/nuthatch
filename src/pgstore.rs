@@ -73,12 +73,12 @@ type Job = Box<dyn FnOnce(&mut postgres::Client) + Send>;
 
 /// Owns the `postgres::Client` on a thread with no tokio runtime above it. See the module docs for
 /// why that is load-bearing rather than fussy.
-struct Conn {
+pub(crate) struct Conn {
     tx: Mutex<Sender<Job>>,
 }
 
 impl Conn {
-    fn spawn(config: postgres::Config) -> Result<Conn> {
+    pub(crate) fn spawn(config: postgres::Config) -> Result<Conn> {
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
@@ -109,7 +109,7 @@ impl Conn {
     }
 
     /// Run `f` on the connection thread and wait for its result.
-    fn with<T: Send + 'static>(
+    pub(crate) fn with<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
     ) -> Result<T> {

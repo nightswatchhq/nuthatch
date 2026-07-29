@@ -17,6 +17,9 @@ pub mod check;
 pub mod chunker;
 pub mod cli;
 pub mod config;
+/// The control plane for scaled mode (RFC-0022 §3): desired state and the worker registry.
+#[cfg(feature = "postgres-store")]
+pub mod controlplane;
 pub mod distribution;
 pub mod effectful;
 pub mod exposure;
@@ -38,6 +41,9 @@ pub mod pgstore;
 pub mod progress;
 pub mod project;
 pub mod recipes;
+/// The reconcile loop for scaled mode (RFC-0022 §2/§3): plan in, leases out.
+#[cfg(feature = "postgres-store")]
+pub mod reconcile;
 pub mod registry;
 pub mod roost;
 pub mod rpc;
