@@ -49,6 +49,12 @@ struct TokenQuery {
 }
 
 #[derive(Deserialize)]
+struct PinBody {
+    version: String,
+    bundle_hash: String,
+}
+
+#[derive(Deserialize)]
 struct SecretBody {
     key: String,
     value: String,
@@ -262,6 +268,67 @@ async fn current_plan(
     )
 }
 
+/// Pin the version an endpoint serves, fleet-wide.
+async fn pin(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    Json(body): Json<PinBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.pin_version(&name, &body.version, &body.bundle_hash) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "endpoint": name,
+                "version": body.version,
+                "bundle_hash": body.bundle_hash,
+                "note": "every FE node now resolves this endpoint to this version",
+            })),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no nest named '{name}' is declared") })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+/// What an endpoint resolves to. The call an FE node makes before serving.
+async fn resolve(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.resolve(&name) {
+        Ok(Some(r)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "endpoint": r.endpoint,
+                "chain": r.chain,
+                "version": r.version,
+                "bundle_hash": r.bundle_hash,
+                "servable": r.is_servable(),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no endpoint named '{name}'") })),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
 /// Store a secret for a nest. **No matching read endpoint exists** - see the module docs on
 /// write-only handling. The response deliberately echoes the key and never the value, so a secret
 /// cannot end up in a shell history, a proxy log or a terminal scrollback by way of the reply.
@@ -343,6 +410,8 @@ pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/nests", get(list_nests).post(declare))
         .route("/nests/{name}", delete(undeclare))
+        .route("/nests/{name}/resolve", get(resolve))
+        .route("/nests/{name}/pin", axum::routing::put(pin))
         .route(
             "/nests/{name}/secrets",
             get(list_secret_keys).put(put_secret),

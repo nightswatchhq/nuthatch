@@ -48,6 +48,27 @@ use crate::scheduler::{DesiredNest, Worker};
 /// the first.
 const SCHEMA: &str = "nuthatch_control";
 
+/// What an endpoint resolves to, fleet-wide (RFC-0022 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// The endpoint asked for. Under RFC-0020 a breaking update is served at a **new** endpoint
+    /// alongside the old, so `usdc` and `usdc-v2` are two rows here, not one row with two versions.
+    pub endpoint: String,
+    pub chain: String,
+    /// `None` when declared but not yet pinned - see [`ControlPlane::resolve`].
+    pub version: Option<String>,
+    pub bundle_hash: Option<String>,
+}
+
+impl Resolution {
+    /// Whether an FE may serve this endpoint. An unpinned endpoint is declared-but-not-ready, and
+    /// serving it would mean each node choosing a version for itself - the inconsistency pinning
+    /// exists to prevent.
+    pub fn is_servable(&self) -> bool {
+        self.version.is_some() && self.bundle_hash.is_some()
+    }
+}
+
 /// A worker's heartbeat TTL. Generous on purpose: rescheduling a cursor is expensive (drain, lease
 /// handover, re-warm), so a worker that pauses for a few seconds should not lose its work. The lease
 /// TTL is the tighter of the two, and it is the one that actually guards correctness.
@@ -81,6 +102,13 @@ impl ControlPlane {
                     estimated_rss_mb  BIGINT      NOT NULL,
                     added_at          TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                -- RFC-0022 §4. Added by ALTER rather than baked above so an existing control plane
+                -- upgrades in place: `CREATE TABLE IF NOT EXISTS` silently does nothing to a table
+                -- that already exists, which would leave an older fleet without these columns and
+                -- with no error to explain why.
+                ALTER TABLE "{SCHEMA}".desired_nest
+                    ADD COLUMN IF NOT EXISTS version     TEXT,
+                    ADD COLUMN IF NOT EXISTS bundle_hash TEXT;
                 CREATE TABLE IF NOT EXISTS "{SCHEMA}".worker (
                     id            TEXT PRIMARY KEY,
                     budget_mb     BIGINT      NOT NULL,
@@ -209,6 +237,61 @@ impl ControlPlane {
                     budget_mb: r.get::<_, i64>(1).max(0) as u64,
                 })
                 .collect())
+        })
+    }
+
+    // ---- resolution (RFC-0022 §4) --------------------------------------------------------------
+
+    /// Pin the version an endpoint serves, fleet-wide.
+    ///
+    /// **Why this exists at all**, since RFC-0019 already has a movable `latest` pointer: a movable
+    /// pointer read independently by N nodes is not a consistent resolution. FE node A reads
+    /// `latest → v2` while node B is still serving v1, and for a window the same endpoint answers
+    /// with two different schemas depending on which node a request lands on. That is invisible to
+    /// every single-box test and obvious the first time a load balancer is involved.
+    ///
+    /// So resolution is *pinned here*, and advancing it is a deliberate control-plane write. `latest`
+    /// remains the registry's convenience for humans and for `init`; it is not what a fleet serves.
+    pub fn pin_version(&self, name: &str, version: &str, bundle_hash: &str) -> Result<bool> {
+        if version.is_empty() || bundle_hash.is_empty() {
+            return Err(anyhow!("pinning needs both a version and a bundle hash"));
+        }
+        let (name, version, hash) = (
+            name.to_string(),
+            version.to_string(),
+            bundle_hash.to_string(),
+        );
+        self.conn.with(move |c| {
+            let n = c.execute(
+                &format!(
+                    "UPDATE \"{SCHEMA}\".desired_nest SET version = $2, bundle_hash = $3 \
+                     WHERE name = $1"
+                ),
+                &[&name, &version, &hash],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// What this endpoint currently serves. `None` if the endpoint is not declared at all;
+    /// `Some` with `version: None` if it is declared but unpinned - which an FE must treat as *not
+    /// ready to serve* rather than as "serve whatever you have lying about".
+    pub fn resolve(&self, name: &str) -> Result<Option<Resolution>> {
+        let name = name.to_string();
+        self.conn.with(move |c| {
+            Ok(c.query_opt(
+                &format!(
+                    "SELECT name, chain, version, bundle_hash FROM \"{SCHEMA}\".desired_nest \
+                     WHERE name = $1"
+                ),
+                &[&name],
+            )?
+            .map(|r| Resolution {
+                endpoint: r.get(0),
+                chain: r.get(1),
+                version: r.get(2),
+                bundle_hash: r.get(3),
+            }))
         })
     }
 
