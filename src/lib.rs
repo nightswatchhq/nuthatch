@@ -41,6 +41,8 @@ pub mod recipes;
 pub mod registry;
 pub mod roost;
 pub mod rpc;
+/// Cursor placement for scaled mode (RFC-0022 §2) - pure decision logic, no I/O.
+pub mod scheduler;
 pub mod screen;
 pub mod seal;
 pub mod semantic;
