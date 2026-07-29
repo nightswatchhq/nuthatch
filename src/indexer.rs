@@ -283,8 +283,8 @@ pub struct NestRuntime {
 /// often the two heads are compared.
 pub async fn await_catchup_and_flip(
     shared: &serve::SharedNest,
-    old_store: &crate::store::Store,
-    new_store: &crate::store::Store,
+    old_store: &dyn crate::store::HotStore,
+    new_store: &dyn crate::store::HotStore,
     new_state: serve::AppState,
     poll: std::time::Duration,
 ) -> Result<()> {
@@ -1448,7 +1448,7 @@ async fn build_nest(
             config.webhooks.len()
         );
         Some(tokio::spawn(alerts::run_delivery_worker(
-            store.clone(),
+            std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::store::HotStore>,
             crate::webhooks::secrets(&config.webhooks),
         )))
     };
@@ -1457,10 +1457,14 @@ async fn build_nest(
     // nests from one cursor (RFC-0012). `source` stays shared and borrowed, not owned; `children`
     // starts empty (it is rebuilt/grown by `prepare`). The view handles are cloned here and shared
     // with the `AppState` below - the API must see the same views the loop feeds.
+    // One `Arc` per nest, shared by the ingest side and the serving side. They must be the *same*
+    // handle: a second `Store::open` on the same file would be a second writer, which the trait's
+    // contract forbids.
+    let shared_store: Arc<dyn crate::store::HotStore> = Arc::new(store.clone());
     let nest = NestIngest {
         name: config.nest.name.clone(),
         dir: dir.clone(),
-        store: store.clone(),
+        store: shared_store.clone(),
         registry: registry.clone(),
         balances: balances.clone(),
         exposure: exposure.clone(),
@@ -1500,7 +1504,7 @@ async fn build_nest(
     });
 
     let app_state = serve::AppState {
-        store: store.clone(),
+        store: shared_store.clone(),
         address: config.primary()?.address.clone(),
         chain: config.nest.chain.clone(),
         dir: dir.clone(),
@@ -2136,7 +2140,7 @@ pub struct NestIngest {
     /// key its metrics are already registered by.
     name: String,
     dir: PathBuf,
-    store: Store,
+    store: Arc<dyn crate::store::HotStore>,
     registry: Arc<DecodeRegistry>,
     balances: BalanceView,
     exposure: ExposureView,
@@ -2794,7 +2798,11 @@ async fn index_loop(
 
 /// If the checkpoint at `last` is no longer canonical, return the deepest checkpoint that still
 /// is (the common ancestor to roll back to); otherwise None. Returns Some(0) if none survive.
-async fn detect_reorg(source: &dyn Source, store: &Store, last: u64) -> Result<Option<u64>> {
+async fn detect_reorg(
+    source: &dyn Source,
+    store: &dyn crate::store::HotStore,
+    last: u64,
+) -> Result<Option<u64>> {
     // Usually `last` itself, but if that boundary's hash couldn't be stored (a transient block_hash
     // failure at checkpoint time), fall back to the newest checkpoint we *do* have at/below `last`, so
     // a reorg is still verified against a real checkpoint instead of giving up entirely - the previous
@@ -2908,7 +2916,7 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
 /// yet, advancing the `sealed_through` watermark and pruning the sealed range from the hot store.
 fn maybe_seal(
     dir: &std::path::Path,
-    store: &Store,
+    store: &dyn crate::store::HotStore,
     finalized_through: u64,
     registry_snapshot: Option<&str>,
     metrics: &crate::metrics::NestMetrics,
@@ -3089,7 +3097,7 @@ fn velocity_retraction_batch(
 /// double-counted; the result is identical to a view grown from genesis.
 fn rebuild_balances(
     dir: &std::path::Path,
-    store: &Store,
+    store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
     balances: &BalanceView,
 ) -> Result<()> {
@@ -3168,7 +3176,7 @@ fn rebuild_balances(
 /// labels imported this is a no-op - there is nothing to be exposed *to*.
 fn rebuild_exposure(
     dir: &std::path::Path,
-    store: &Store,
+    store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
     labels: &LabelSet,
     exposure: &ExposureView,
@@ -3250,7 +3258,7 @@ fn rebuild_exposure(
 /// uses), so cold and hot land in identical buckets.
 fn rebuild_velocity(
     dir: &std::path::Path,
-    store: &Store,
+    store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
     window: u64,
     velocity: &VelocityView,
@@ -3380,7 +3388,7 @@ fn decode_window(
 /// fold, so the reconstructed registry is identical to the one grown live. Best-effort per table.
 fn rebuild_children(
     dir: &std::path::Path,
-    store: &Store,
+    store: &dyn crate::store::HotStore,
     _registry: &DecodeRegistry,
     factory: &FactorySet,
 ) -> ChildRegistry {

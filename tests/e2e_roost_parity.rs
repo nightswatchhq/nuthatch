@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::store::Store;
+use nuthatch::store::HotStore;
 use nuthatch::{analytics, indexer, seal};
 
 use common::tape::*;
@@ -41,7 +41,7 @@ fn build_parity_tape() -> Arc<TapeSource> {
 }
 
 /// Drive `stores` (over `tape`) to index to the tip, then seal `[1,6]`.
-async fn drive_to_seal(tape: &TapeSource, stores: &[Store]) {
+async fn drive_to_seal(tape: &TapeSource, stores: &[std::sync::Arc<dyn HotStore>]) {
     let landed = wait_until(POLL_TIMEOUT, || {
         stores
             .iter()
@@ -154,7 +154,7 @@ async fn roost_is_byte_identical_to_solo() {
     let (states, roost_ingest, roost_workers) =
         (cursor.states, cursor.ingest, cursor.alert_workers);
 
-    let store_of = |name: &str| -> Store {
+    let store_of = |name: &str| -> std::sync::Arc<dyn HotStore> {
         states
             .iter()
             .find(|(n, _)| n == name)

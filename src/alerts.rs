@@ -16,7 +16,7 @@
 //! webhook sink is operator-configured and delivery-guaranteed, so the host owns it.
 
 use crate::config::Alert;
-use crate::store::Store;
+use crate::store::HotStore;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -67,7 +67,7 @@ impl AlertRouter {
 /// Enqueue an alert for every sink that watches `kind`. `event` is `"flag"` or `"flag_retracted"`.
 /// A no-op when nothing is configured or nothing matches. Bounds the outbox after pushing.
 pub fn enqueue(
-    store: &Store,
+    store: &dyn HotStore,
     router: &AlertRouter,
     event: &str,
     kind: &str,
@@ -105,7 +105,7 @@ pub fn enqueue(
 /// delivered entry (2xx) is removed; a failure is left for retry (at-least-once) and doesn't stop the
 /// drain. Returns how many were delivered.
 pub async fn deliver_pending(
-    store: &Store,
+    store: &dyn HotStore,
     client: &reqwest::Client,
     secrets: &std::collections::HashMap<String, String>,
 ) -> usize {
@@ -188,7 +188,10 @@ enum Outcome {
 /// The background delivery worker: drain the outbox, publish the depth gauge, sleep, repeat. Runs
 /// alongside the indexer and API on its own task; enqueuing is decoupled from it so a slow webhook
 /// never blocks indexing. The `POLL_INTERVAL` sleep is also the retry backoff for failed deliveries.
-pub async fn run_delivery_worker(store: Store, secrets: std::collections::HashMap<String, String>) {
+pub async fn run_delivery_worker(
+    store: std::sync::Arc<dyn HotStore>,
+    secrets: std::collections::HashMap<String, String>,
+) {
     let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
@@ -198,7 +201,7 @@ pub async fn run_delivery_worker(store: Store, secrets: std::collections::HashMa
     };
     tracing::info!("alert delivery worker started");
     loop {
-        let delivered = deliver_pending(&store, &client, &secrets).await;
+        let delivered = deliver_pending(store.as_ref(), &client, &secrets).await;
         crate::metrics::METRICS.set_alert_outbox(store.outbox_len());
         if delivered > 0 {
             tracing::debug!(
@@ -213,6 +216,7 @@ pub async fn run_delivery_worker(store: Store, secrets: std::collections::HashMa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
     #[test]
     fn router_matches_kinds() {

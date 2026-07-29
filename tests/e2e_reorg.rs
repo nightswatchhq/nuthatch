@@ -45,7 +45,10 @@ async fn spawn_indexed(
     dir: &std::path::Path,
     tape: Arc<TapeSource>,
     tip: u64,
-) -> (indexer::NestRuntime, nuthatch::store::Store) {
+) -> (
+    indexer::NestRuntime,
+    std::sync::Arc<dyn nuthatch::store::HotStore>,
+) {
     let cfg = scaffold_nest(dir, "usdc", USDC);
     let rt = indexer::spawn_nest(
         tape,

@@ -19,7 +19,6 @@ use std::time::Duration;
 use crate::analytics;
 use crate::exposure::ExposureView;
 use crate::registry::TableSchema;
-use crate::store::Store;
 use crate::velocity::VelocityView;
 use crate::views::BalanceView;
 use std::sync::Arc;
@@ -54,7 +53,10 @@ const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Store,
+    /// The hot store behind [`crate::store::HotStore`] (RFC-0022 slice 1). `Arc<dyn _>` rather than a
+    /// concrete `Store` because serving must not care which backend answers - that is the whole point
+    /// of the seam, and an FE node under RFC-0022 §1 will be handed a Postgres-backed one.
+    pub store: std::sync::Arc<dyn crate::store::HotStore>,
     pub address: String,
     pub chain: String,
     pub dir: PathBuf,
@@ -1234,6 +1236,7 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::store::Store;
     use super::*;
 
     #[test]
@@ -1277,7 +1280,7 @@ mod tests {
     /// harness). `permits` seeds the admission gate so a test can saturate it.
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {
         AppState {
-            store: Store::open(&dir.join("t.redb")).unwrap(),
+            store: std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap()),
             address: "0x0".into(),
             chain: "ethereum".into(),
             dir: dir.to_path_buf(),
