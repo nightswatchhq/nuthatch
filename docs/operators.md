@@ -13,7 +13,7 @@ still honestly unfinished.
 before a build ships. This document is the *run* guide - what must be true in your environment.
 [`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
 
-Written against **0.7.0** (2026-07-28). Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **0.7.1** (2026-07-29). Read [Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -79,7 +79,7 @@ A container image is published per release:
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
   -e NUTHATCH_ADMIN_TOKEN=change-me \
-  ghcr.io/nuthatch-indexer/nuthatch:0.7.0
+  ghcr.io/nuthatch-indexer/nuthatch:0.7.1
 ```
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
@@ -92,6 +92,11 @@ sends SIGTERM, which drains and checkpoints cleanly.
 
 `linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
 Pin the version tag rather than `:latest` for anything you care about.
+
+> **Do not use `:0.7.0`.** It is published but cannot start (`GLIBC_2.38 not found`) - the release job
+> pushed before it smoke-tested, so the failing test failed the job without unpublishing the image.
+> `0.7.1` is the first working tag, and the job now tests before it pushes. `:latest` was broken for the
+> same reason and is fixed by `0.7.1`.
 
 **glibc floor.** The Linux binary is dynamically linked and built against **glibc 2.35**, so it runs on
 Ubuntu 22.04+, Debian 12+, RHEL 9+ and anything newer. It is built on a pinned runner rather than
