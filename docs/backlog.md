@@ -15,8 +15,9 @@ The buildable-on-a-laptop backlog is essentially cleared - RFCs 0001, 0002, 0004
 0018 §1 (authored SQL views), 0021 slice 1 (the multichain roost) and 0023 tiers 1-2 (derive-first
 recipes + metadata cache) have shipped. What remains falls into four tracks:
 
-1. **Infra track** - one thing gates a lot: a **colocated reth node**. It unblocks 0003 (ExEx), which
-   unblocks 0014 (firehose traces/state). This is provisioning + sync time, not coding.
+1. **Infra track** - one thing gates a lot: a **colocated reth node**, which unblocks 0003 (ExEx) and
+   thence 0014's extraction. Provisioning + sync time, not coding, and **deferred by decision on
+   2026-07-29** - see Track 1.
 2. **Deferred engineering** - real code, but gated on infra (0003, 0014) or on a benchmark (0013
    DataFusion). Not "todo", "not yet".
 3. **Process / ongoing** - non-code: grants (0006), launch (0007), the full graph-network migration
@@ -52,19 +53,23 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0026 Fault quarantine | Implemented | - | - |
 | 0027 Live roost | **Implemented** | - (all 7 slices shipped 2026-07-28) | - |
 
-## Track 1 - Infra (the shared blocker)
+## Track 1 - Infra
 
-Almost all the *un-buildable-here* work traces to one missing piece:
+- **A colocated reth node** - **deliberately deferred, 2026-07-29.** Full node for tip; archive for
+  deep backfill/traces. It is the substrate 0003 reads from and 0014 extracts from, and it stays the
+  single unlock for that whole branch of the roadmap. Cost is provisioning + **days** of sync (full)
+  or **TB + longer** (archive) - a hardware/ops job, not a coding session. Deferring it is a decision,
+  not an oversight: **do not re-raise it as a blocker.** What it gates, and what therefore stays
+  parked: **0003** (ExEx wiring) → **0014** *extraction* (slice 0's decode is already built and
+  merged), plus an honest tip-lag benchmark (§3 of prod-readiness) and RFC-0023 tier 3's
+  pinned-block verification.
+- **Scaled-mode infra** is **no longer blocked and no longer un-buildable here.** RFC-0022 slices 1-4
+  turned it into ordinary work: the `HotStore` trait, a Postgres backend with a redb-parity suite, the
+  query-FE role, and ownership fencing - all built and CI-tested on a laptop and a service container.
+  0013's DataFusion convergence remains behind its own benchmark gate.
 
-- **A colocated reth node** (on the Hetzner box). Full node for tip; archive for deep backfill/traces.
-  This is the substrate 0003 reads from and 0014 extracts from. Cost is provisioning + **days** of
-  sync (full) or **TB + longer** (archive) - a hardware/ops job, not a coding session.
-- Once it exists, the engineering unblocks in order: **0003** (ExEx wiring) → **0014** (traces/state).
-- **Scaled-mode infra** (Postgres hot store) is the other greenfield substrate - it's where 0013 says
-  to build DataFusion *first* (zero risk to the working embedded path). Also not started.
-
-Nothing here is verifiable on the dev laptop, which is why it's been deferred all along - the project's
-discipline has been "build only what we can verify live."
+The old framing here - "nothing in this track is verifiable on the dev laptop" - was true when it was
+written and is now only half true. Scaled mode moved out of it; the node did not.
 
 ## Track 2 - Deferred engineering (gated)
 
