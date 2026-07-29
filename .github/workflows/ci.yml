@@ -70,7 +70,7 @@ jobs:
           # rot behind the feature flag.
           cargo test --locked --features postgres-store \
             --test pg_parity --test control_plane --test e2e_reconcile --test control_api \
-            -- --test-threads=1
+            --test secret_isolation -- --test-threads=1
 
   deny:
     name: cargo-deny (vulns · licences · bans)
