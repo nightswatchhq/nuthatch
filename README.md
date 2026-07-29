@@ -201,6 +201,19 @@ who need more - none of it in the way of the happy path:
   routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
   the store before anything is torn down. The set is persisted to `roost.toml`, so a restart converges
   on what you last asked for.
+- **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
+  or when serving and ingestion want to scale independently, the *same crates* run as three roles:
+  a **control plane** holding what should run, a **writer pool** whose members take cursor **leases**,
+  and a **query-FE tier** that serves from shared state and owns nothing. A role flag, never a fork -
+  and opt-in at build time (`--features postgres-store`), so the published binary carries no database
+  driver and embedded mode stays a single file with zero services. The writer pool is safely scalable
+  because ownership is enforced *by the store*: every write carries a fence, and a stalled worker that
+  wakes up finds its writes **refused** rather than merely discouraged. Nests are added and removed
+  over HTTP with no restarts, versions are pinned fleet-wide so two FE nodes can never serve the same
+  endpoint from different schemas, and runtime secrets are injected at mount - scoped to the nests a
+  worker actually holds, write-only, and never baked into a content-addressed bundle. This is the
+  **self-hosted distributed** path for one operator's cooperating nests; per-tenant billing and authz
+  between untrusting paying customers stay firmly out of scope.
 - **Nest bundles + registry - bundle one, publish it, load it anywhere.** `nuthatch nest bundle` packs
   a nest's authored inputs into one portable, content-addressed `.bundle`; `nest load <bundle-or-url>`
   verifies and installs it - regenerating the decode registry and asserting it matches - so anyone runs
@@ -250,6 +263,10 @@ default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.m
 - **Durability:** content-addressed segments are safe to copy while running; back up the nest directory.
 - **`dev` is the serve command** - it backfills, follows the tip, and serves in one process.
   Copy-paste **systemd** and **Docker** recipes are in [`docs/operators.md`](docs/operators.md#deploy-recipes).
+- **Outgrown one machine?** [Scaled mode](docs/operators.md#scaled-mode-a-fleet-across-machines-rfc-0022)
+  spreads cursors across a writer pool with an independently-scaled serving tier. Reach for it when a
+  single box cannot hold your cursors inside its RAM budget - not before, because a roost on one
+  machine is simpler and that simplicity is the point of the embedded path.
 
 **[`docs/operators.md`](docs/operators.md) is the full operating guide**, and worth reading before you
 run this for real rather than after. It covers the questions people actually hit:

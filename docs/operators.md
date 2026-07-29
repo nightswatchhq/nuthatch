@@ -129,6 +129,76 @@ behind one cursor; the runtime refuses to.
 Multichain is a **capability, not a mandate** - one chain per roost stays valid and is the simplest
 default.
 
+### Scaled mode: a fleet across machines (RFC-0022)
+
+Everything above is **embedded mode**, and it is still the primary deliverable: one binary, no
+external services, the thing `curl | sh` gets you. Scaled mode is a different deployment for a
+different problem - one operator running many nests across many machines - and it is **opt-in at
+build time** (`--features postgres-store`). The published binary does not carry a database driver.
+
+Reach for it when a single box can no longer hold your cursors inside its RAM budget, or when serving
+load and ingestion load want to scale independently. Not before: a roost on one machine is simpler,
+and simplicity is the point of the embedded path.
+
+| Role | Command | Owns |
+|---|---|---|
+| **Control plane** | `nuthatch control --db <postgres>` | *desired state* - what should run |
+| **Writer** | `nuthatch dev --dir <nest>` | cursors it holds a **lease** on; ingests, decodes, seals |
+| **Query-FE** | `nuthatch serve --dir <nest> --hot-store <postgres>` | nothing - serves from shared state |
+
+```sh
+docker compose -f docker-compose.scaled.yml --profile fleet up \
+  --scale writer=2 --scale fe=3
+```
+
+**The three ideas worth understanding before you run it:**
+
+**1. The control plane states intent; it commands nothing.** `POST /nests` records that a nest should
+run and returns 200. That does **not** mean it is running - it means the fleet has been told to. A
+writer picks it up on its next tick. There is deliberately no "start this nest on worker w3" endpoint,
+because that would be the one call able to put a cursor somewhere the scheduler did not choose and the
+lease did not arbitrate.
+
+**2. Ownership is a lease, and the store enforces it.** A cursor is held by exactly one writer at a
+time. If a writer stalls - long GC, paused container, a host that goes away - its lease expires and
+another writer takes over. When the original wakes up, its writes are **refused by the store**, not
+merely discouraged: every write carries a fence, and a stale fence is rejected inside the same
+transaction as the write. This is why `--scale writer=N` is safe.
+
+**3. The control plane and the lease are independent, on purpose.** A control-plane outage stops
+*rescheduling*, not *ingestion* - writers keep their leases and keep working. It follows that the two
+can legitimately disagree: a writer whose heartbeat has lapsed but whose lease is live keeps its
+cursor, and the scheduler's wish to rehome it is refused. That is correct, not a bug. A plan is not
+permission.
+
+**Answering "why is my nest not running?"** - `GET /plan` runs the same placement logic the writers
+run and reports what could not be placed *and why*:
+
+```json
+{"assign":[{"chain":"mainnet","worker":"writer-1"}],
+ "unplaceable":[{"chain":"base","rss_mb":2400,"reason":"toolargeforanyworker",
+   "detail":"this cursor alone exceeds the largest worker's budget - adding workers will not help"}]}
+```
+
+The two unplaceable reasons demand different actions: `noroomrightnow` is fixed by adding a worker,
+`toolargeforanyworker` never is. Adding capacity for the second would be money spent on nothing.
+
+**Versions are pinned fleet-wide.** Every FE node resolves an endpoint through the control plane
+(`PUT /nests/<name>/pin`), not through the registry's movable `latest`. If each node read `latest`
+itself, then during an upgrade one node would serve the new schema while another served the old, and
+the same endpoint would answer differently depending on where the load balancer sent the request. A
+declared-but-unpinned endpoint is explicitly **not servable** - an FE refuses rather than guesses.
+
+**Secrets never enter a bundle.** Private RPC URLs and API keys live in the control plane keyed by
+nest (`PUT /nests/<name>/secrets`), and a writer receives only the secrets of the nests it is
+assigned. The interface is **write-only**: you can list which keys exist, never read a value back.
+Rotating a secret changes no bundle hash, so it does not invalidate segment reuse or force a
+re-index.
+
+**What scaled mode does not do**, and will not: per-tenant billing, metering, quotas, or authz between
+mutually-untrusting paying customers. That is a gateway's job in front of nuthatch, and deliberately
+out of scope - see RFC-0022 §6.
+
 ```
 roost/
   roost.toml              # desired state: chains + mounted nest names + budget
@@ -309,6 +379,20 @@ Per-nest routes. In a roost they are prefixed: `/<name>/sql`, `/<name>/tables`, 
 `GET /health`.
 
 ---
+
+### Control-plane endpoints (scaled mode only)
+
+| Route | Purpose |
+|---|---|
+| `GET /nests` · `POST /nests` · `DELETE /nests/{name}` | declare/inspect/remove desired state |
+| `GET /nests/{name}/resolve` · `PUT /nests/{name}/pin` | what an endpoint serves, and pinning it |
+| `GET /nests/{name}/secrets` · `PUT` · `DELETE .../{key}` | key **names** only on read; write-only values |
+| `GET /workers` | live workers and their budgets |
+| `GET /plan` | placement, including what cannot be placed and why |
+| `GET /health` | unauthenticated, for load balancers |
+
+Bound off-localhost the control plane **refuses to start** without `NUTHATCH_CONTROL_TOKEN`. This is a
+refusal rather than a warning because the endpoint decides what an entire fleet runs.
 
 ## Security posture
 
