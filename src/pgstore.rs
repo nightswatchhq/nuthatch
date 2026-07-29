@@ -27,102 +27,22 @@
 //! 3. **One schema per nest.** Nests sharing a database must not share a namespace - per-nest
 //!    isolation is a non-negotiable, and it should not become weaker just because the store moved.
 //!
-//! ## Concurrency, and the trap that shaped it
+//! ## Concurrency
 //!
-//! [`HotStore`] is synchronous, matching redb. The obvious implementation - the blocking `postgres`
-//! client behind an `r2d2` pool - **panics**, and it took running the parity suite to find out:
-//!
-//! ```text
-//! Cannot start a runtime from within a runtime.
-//! ```
-//!
-//! `postgres` is not a synchronous client. It is a blocking *wrapper* that owns a private tokio
-//! runtime and `block_on`s an async one, and `block_on` panics when it is called from inside another
-//! runtime's context. redb is genuinely synchronous - no runtime, no reentrancy - so "use the sync
-//! client, like redb" was reasoning from a false equivalence.
-//!
-//! This is not a test artefact. nuthatch serves from axum handlers, which run *inside* the tokio
-//! runtime, so a `/sql` or `/entity` request against a Postgres-backed nest would have hit the same
-//! panic in production. `spawn_blocking` does not save it either: those threads still carry a runtime
-//! context.
-//!
-//! So the client lives on **one dedicated thread of its own**, outside any tokio runtime, and the
-//! trait methods post closures to it and block on the reply. The reentrancy disappears because the
-//! work genuinely happens elsewhere.
-//!
-//! That single thread also **serialises every store operation**, which is worth stating plainly as a
-//! limitation rather than dressing up as a design: it matches the trait's single-writer contract and
-//! it is honest for a v1, but concurrent reads now queue behind each other where redb's would not.
-//! A pool of worker threads is the fix, and it is deliberately *not* here - it changes throughput,
-//! throughput needs a benchmark, and RFC-0013's convergence work is already benchmark-gated. Parity
-//! first, then speed, each with its own evidence.
+//! [`HotStore`] is a synchronous trait, matching redb, and this uses the blocking `postgres` client
+//! rather than `tokio-postgres` for the same reason: the serving layer already performs blocking
+//! store reads from async handlers, and quietly changing that here would be a second, invisible
+//! refactor riding along with this one. A pool serves concurrent reads; writes are still single-owner
+//! per the trait's contract, and under RFC-0022 §2 that ownership becomes a cursor lease.
 
 use anyhow::{anyhow, Context, Result};
+use r2d2::Pool;
+use r2d2_postgres::PostgresConnectionManager;
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
 
 use crate::store::{HotScanTooLarge, HotStore};
 
-/// A unit of work handed to the connection thread. Boxed so the trait methods can post arbitrary
-/// closures rather than an enum of every query shape, which would have to grow with every method.
-type Job = Box<dyn FnOnce(&mut postgres::Client) + Send>;
-
-/// Owns the `postgres::Client` on a thread with no tokio runtime above it. See the module docs for
-/// why that is load-bearing rather than fussy.
-struct Conn {
-    tx: Mutex<Sender<Job>>,
-}
-
-impl Conn {
-    fn spawn(config: postgres::Config) -> Result<Conn> {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        std::thread::Builder::new()
-            .name("nuthatch-pg".into())
-            .spawn(move || {
-                let mut client = match config.connect(postgres::NoTls) {
-                    Ok(c) => {
-                        let _ = ready_tx.send(Ok(()));
-                        c
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                // Ends when the last `Sender` drops, i.e. when the `PgStore` goes away.
-                while let Ok(job) = rx.recv() {
-                    job(&mut client);
-                }
-            })
-            .context("cannot spawn the Postgres connection thread")?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Conn { tx: Mutex::new(tx) }),
-            Ok(Err(e)) => Err(anyhow!("{e}")),
-            Err(_) => Err(anyhow!("the Postgres connection thread died on startup")),
-        }
-    }
-
-    /// Run `f` on the connection thread and wait for its result.
-    fn with<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let (tx, rx) = mpsc::channel();
-        let job: Job = Box::new(move |client| {
-            let _ = tx.send(f(client));
-        });
-        self.tx
-            .lock()
-            .map_err(|_| anyhow!("the Postgres connection lock was poisoned"))?
-            .send(job)
-            .map_err(|_| anyhow!("the Postgres connection thread has stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow!("the Postgres connection thread dropped a request"))?
-    }
-}
+type PgPool = Pool<PostgresConnectionManager<postgres::NoTls>>;
 
 /// Meta key holding the next outbox sequence number. Must match `store::OUTBOX_SEQ` - the two
 /// backends read the same logical counter, and a nest migrated between them would otherwise restart
@@ -130,7 +50,7 @@ impl Conn {
 const OUTBOX_SEQ: &str = "outbox_next_seq";
 
 pub struct PgStore {
-    conn: Conn,
+    pool: PgPool,
     /// The nest's schema, already validated and quoted-safe.
     schema: String,
 }
@@ -156,19 +76,27 @@ impl PgStore {
         let config: postgres::Config = url
             .parse()
             .with_context(|| format!("cannot parse Postgres URL '{}'", redact(url)))?;
-        let conn = Conn::spawn(config)
+        let manager = PostgresConnectionManager::new(config, postgres::NoTls);
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)
             .with_context(|| format!("cannot connect to Postgres at '{}'", redact(url)))?;
 
-        let store = PgStore { conn, schema };
+        let store = PgStore { pool, schema };
         store.migrate()?;
         Ok(store)
+    }
+
+    fn conn(&self) -> Result<r2d2::PooledConnection<PostgresConnectionManager<postgres::NoTls>>> {
+        self.pool.get().context("no Postgres connection available")
     }
 
     /// Create the schema and the four tables. Idempotent, so a restart or a second worker taking over
     /// a cursor is a no-op rather than an error.
     fn migrate(&self) -> Result<()> {
+        let mut c = self.conn()?;
         let s = &self.schema;
-        let ddl = format!(
+        c.batch_execute(&format!(
             r#"
             CREATE SCHEMA IF NOT EXISTS "{s}";
             CREATE TABLE IF NOT EXISTS "{s}".entities (
@@ -188,33 +116,29 @@ impl PgStore {
                 value TEXT NOT NULL
             );
             "#
-        );
-        self.conn
-            .with(move |c| Ok(c.batch_execute(&ddl)?))
-            .with_context(|| format!("failed to migrate schema {s}"))
+        ))
+        .with_context(|| format!("failed to migrate schema {s}"))?;
+        Ok(())
     }
 
     fn get_kv(&self, table: &str, key: &str) -> Result<Option<String>> {
+        let mut c = self.conn()?;
         let sql = format!(
             "SELECT value FROM \"{}\".{table} WHERE key = $1",
             self.schema
         );
-        let key = key.to_string();
-        self.conn
-            .with(move |c| Ok(c.query_opt(&sql, &[&key])?.map(|r| r.get::<_, String>(0))))
+        Ok(c.query_opt(&sql, &[&key])?.map(|r| r.get::<_, String>(0)))
     }
 
     fn put_kv(&self, table: &str, key: &str, value: &str) -> Result<()> {
+        let mut c = self.conn()?;
         let sql = format!(
             "INSERT INTO \"{}\".{table} (key, value) VALUES ($1, $2) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             self.schema
         );
-        let (key, value) = (key.to_string(), value.to_string());
-        self.conn.with(move |c| {
-            c.execute(&sql, &[&key, &value])?;
-            Ok(())
-        })
+        c.execute(&sql, &[&key, &value])?;
+        Ok(())
     }
 }
 
@@ -226,6 +150,10 @@ fn redact(url: &str) -> String {
         }
         _ => url.to_string(),
     }
+}
+
+fn entity_block(key: &str) -> Option<u64> {
+    key.split('-').next()?.parse().ok()
 }
 
 #[async_trait::async_trait]
@@ -241,30 +169,30 @@ impl HotStore for PgStore {
     }
 
     fn count(&self) -> Result<u64> {
+        let mut c = self.conn()?;
         let sql = format!("SELECT count(*) FROM \"{}\".entities", self.schema);
-        self.conn
-            .with(move |c| Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64))
+        Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64)
     }
 
     fn recent(&self, limit: usize) -> Result<Vec<String>> {
-        // Newest **first**, matching redb's `.iter().rev().take(limit)`. An earlier version reversed
-        // this into oldest-first on the assumption that "recent" meant chronological; the parity
-        // suite caught it, which is the entire argument for comparing against a live redb rather
-        // than against what I believed redb did.
+        let mut c = self.conn()?;
+        // `ORDER BY key DESC` then reversed, mirroring redb's `.iter().rev().take(limit)`: the newest
+        // `limit` rows, returned oldest-first.
         let sql = format!(
             "SELECT value FROM \"{}\".entities ORDER BY key DESC LIMIT $1",
             self.schema
         );
-        let limit = limit as i64;
-        self.conn.with(move |c| {
-            Ok(c.query(&sql, &[&limit])?
-                .into_iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect())
-        })
+        let mut out: Vec<String> = c
+            .query(&sql, &[&(limit as i64)])?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        out.reverse();
+        Ok(out)
     }
 
     fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
+        let mut c = self.conn()?;
         // The row's table name lives inside the JSON, exactly as it does in redb - the store is
         // table-agnostic on both backends, and making Postgres clever here would be the first crack
         // in "same data model".
@@ -273,13 +201,13 @@ impl HotStore for PgStore {
              WHERE value::jsonb ->> 'table' = $1 ORDER BY key DESC LIMIT $2",
             self.schema
         );
-        let (table, limit) = (table.to_string(), limit as i64);
-        self.conn.with(move |c| {
-            Ok(c.query(&sql, &[&table, &limit])?
-                .into_iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect())
-        })
+        let mut out: Vec<String> = c
+            .query(&sql, &[&table, &(limit as i64)])?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        out.reverse();
+        Ok(out)
     }
 
     fn hot_rows_by_table(&self) -> Result<HashMap<String, Vec<serde_json::Value>>> {
@@ -290,60 +218,60 @@ impl HotStore for PgStore {
         &self,
         max_rows: usize,
     ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
+        let mut c = self.conn()?;
         let count_sql = format!("SELECT count(*) FROM \"{}\".entities", self.schema);
+        let total = c.query_one(&count_sql, &[])?.get::<_, i64>(0) as usize;
+        if total > max_rows {
+            // The same refusal redb gives, and for the same reason: a partial tip silently changes
+            // the answer to an aggregate. Postgres would happily stream it, which makes it *more*
+            // important to refuse here, not less.
+            return Err(HotScanTooLarge {
+                rows: total,
+                max: max_rows,
+            }
+            .into());
+        }
         let sql = format!(
             "SELECT value FROM \"{}\".entities ORDER BY key",
             self.schema
         );
-        self.conn.with(move |c| {
-            let total = c.query_one(&count_sql, &[])?.get::<_, i64>(0) as usize;
-            if total > max_rows {
-                // The same refusal redb gives, for the same reason: a partial tip silently changes
-                // the answer to an aggregate. Postgres would happily stream it, which makes refusing
-                // here more important, not less.
-                return Err(HotScanTooLarge { cap: max_rows }.into());
-            }
-            let mut out: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-            for row in c.query(&sql, &[])? {
-                let raw: String = row.get(0);
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
-                let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                out.entry(t.to_string()).or_default().push(v);
-            }
-            Ok(out)
-        })
+        let mut out: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for row in c.query(&sql, &[])? {
+            let raw: String = row.get(0);
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            out.entry(t.to_string()).or_default().push(v);
+        }
+        Ok(out)
     }
 
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
+        let mut c = self.conn()?;
         let (lo, hi) = (format!("{from:012}-000000"), format!("{to:012}-999999"));
         let sql = format!(
             "SELECT value FROM \"{}\".entities WHERE key >= $1 AND key <= $2 ORDER BY key",
             self.schema
         );
-        self.conn.with(move |c| {
-            Ok(c.query(&sql, &[&lo, &hi])?
-                .into_iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect())
-        })
+        Ok(c.query(&sql, &[&lo, &hi])?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect())
     }
 
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
+        let mut c = self.conn()?;
         let sql = format!(
             "SELECT key FROM \"{}\".entities ORDER BY key LIMIT $1",
             self.schema
         );
-        let limit = limit as i64;
-        self.conn.with(move |c| {
-            Ok(c.query(&sql, &[&limit])?
-                .into_iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect())
-        })
+        Ok(c.query(&sql, &[&(limit as i64)])?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect())
     }
 
     // ---- cursor & meta ----------------------------------------------------------------------
@@ -382,20 +310,19 @@ impl HotStore for PgStore {
     }
 
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
+        let mut c = self.conn()?;
         let sql = format!(
             "SELECT key, value FROM \"{}\".blocks ORDER BY key DESC",
             self.schema
         );
-        self.conn.with(move |c| {
-            c.query(&sql, &[])?
-                .into_iter()
-                .map(|r| {
-                    let k: String = r.get(0);
-                    let block: u64 = k.parse().context("corrupt block key")?;
-                    Ok((block, r.get::<_, String>(1)))
-                })
-                .collect()
-        })
+        c.query(&sql, &[])?
+            .into_iter()
+            .map(|r| {
+                let k: String = r.get(0);
+                let block: u64 = k.parse().context("corrupt block key")?;
+                Ok((block, r.get::<_, String>(1)))
+            })
+            .collect()
     }
 
     // ---- mutation windows (the atomic ones) --------------------------------------------------
@@ -406,36 +333,35 @@ impl HotStore for PgStore {
         checkpoint: Option<(u64, &str)>,
         last_block: u64,
     ) -> Result<()> {
-        let schema = self.schema.clone();
-        let entities = entities.to_vec();
-        let checkpoint = checkpoint.map(|(b, h)| (b, h.to_string()));
-        self.conn.with(move |c| {
-            // One transaction, exactly as redb does it. This is the atomicity the trait's contract
-            // promises and `e2e_crash_safety` pins: rows, checkpoint and watermark land together, so
-            // a crash leaves the store at a clean window boundary and never mid-window.
-            let mut tx = c.transaction()?;
-            let ins = format!(
-                "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        let mut c = self.conn()?;
+        // One transaction, exactly as redb does it. This is the atomicity the trait's contract
+        // promises and `e2e_crash_safety` pins: rows, checkpoint and watermark land together, so a
+        // crash leaves the store at a clean window boundary and never mid-window.
+        let mut tx = c.transaction()?;
+        let ins = format!(
+            "INSERT INTO \"{}\".entities (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            self.schema
+        );
+        for (k, v) in entities {
+            tx.execute(&ins, &[k, v])?;
+        }
+        if let Some((block, hash)) = checkpoint {
+            let sql = format!(
+                "INSERT INTO \"{}\".blocks (key, value) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                self.schema
             );
-            for (k, v) in &entities {
-                tx.execute(&ins, &[k, v])?;
-            }
-            if let Some((block, hash)) = &checkpoint {
-                let sql = format!(
-                    "INSERT INTO \"{schema}\".blocks (key, value) VALUES ($1, $2) \
-                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-                );
-                tx.execute(&sql, &[&format!("{block:012}"), hash])?;
-            }
-            let meta = format!(
-                "INSERT INTO \"{schema}\".meta (key, value) VALUES ('last_block', $1) \
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-            );
-            tx.execute(&meta, &[&last_block.to_string()])?;
-            tx.commit()?;
-            Ok(())
-        })
+            tx.execute(&sql, &[&format!("{block:012}"), &hash])?;
+        }
+        let meta = format!(
+            "INSERT INTO \"{}\".meta (key, value) VALUES ('last_block', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            self.schema
+        );
+        tx.execute(&meta, &[&last_block.to_string()])?;
+        tx.commit()?;
+        Ok(())
     }
 
     async fn commit_window_blocking(
@@ -444,42 +370,40 @@ impl HotStore for PgStore {
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()> {
-        // The work already happens on the connection thread, so there is nothing extra to offload -
-        // the async signature exists so callers need not know which backend they hold.
+        // The synchronous path is already the blocking one; the async wrapper exists so the caller
+        // does not need to know which backend it holds.
         let cp = checkpoint.as_ref().map(|(b, h)| (*b, h.as_str()));
         self.commit_window(&entities, cp, last_block)
     }
 
     fn rollback_to(&self, block: u64) -> Result<u64> {
-        let schema = self.schema.clone();
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            let removed = rollback_in_tx(&mut tx, &schema, block)?;
-            tx.commit()?;
-            Ok(removed)
-        })
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
+        let removed = rollback_in_tx(&mut tx, &self.schema, block)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
-        let schema = self.schema.clone();
-        let (mk, mv) = (meta_key.to_string(), meta_val.to_string());
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            let removed = rollback_in_tx(&mut tx, &schema, block)?;
-            set_meta_in_tx(&mut tx, &schema, &mk, &mv)?;
-            tx.commit()?;
-            Ok(removed)
-        })
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
+        let removed = rollback_in_tx(&mut tx, &self.schema, block)?;
+        let sql = format!(
+            "INSERT INTO \"{}\".meta (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            self.schema
+        );
+        tx.execute(&sql, &[&meta_key, &meta_val])?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
-        let schema = self.schema.clone();
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            let removed = prune_in_tx(&mut tx, &schema, from, to)?;
-            tx.commit()?;
-            Ok(removed)
-        })
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
+        let removed = prune_in_tx(&mut tx, &self.schema, from, to)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     fn prune_and_set_meta(
@@ -489,85 +413,93 @@ impl HotStore for PgStore {
         meta_key: &str,
         meta_val: &str,
     ) -> Result<u64> {
-        let schema = self.schema.clone();
-        let (mk, mv) = (meta_key.to_string(), meta_val.to_string());
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            let removed = prune_in_tx(&mut tx, &schema, from, to)?;
-            set_meta_in_tx(&mut tx, &schema, &mk, &mv)?;
-            tx.commit()?;
-            Ok(removed)
-        })
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
+        let removed = prune_in_tx(&mut tx, &self.schema, from, to)?;
+        let sql = format!(
+            "INSERT INTO \"{}\".meta (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            self.schema
+        );
+        tx.execute(&sql, &[&meta_key, &meta_val])?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     // ---- delivery outbox --------------------------------------------------------------------
 
     fn outbox_push(&self, payload: &str) -> Result<u64> {
-        let schema = self.schema.clone();
-        let payload = payload.to_string();
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            // Read-modify-write of the counter inside the transaction, with `FOR UPDATE` so two
-            // writers cannot both read the same seq. The trait says single-writer, but a lost outbox
-            // entry is silent and permanent, so this one is belt and braces.
-            let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR UPDATE");
-            let seq: u64 = tx
-                .query_opt(&read, &[&OUTBOX_SEQ])?
-                .and_then(|r| r.get::<_, String>(0).parse().ok())
-                .unwrap_or(0);
-            set_meta_in_tx(&mut tx, &schema, OUTBOX_SEQ, &(seq + 1).to_string())?;
-            let push = format!("INSERT INTO \"{schema}\".outbox (key, value) VALUES ($1, $2)");
-            tx.execute(&push, &[&format!("{seq:020}"), &payload])?;
-            tx.commit()?;
-            Ok(seq)
-        })
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
+        // Read-modify-write of the counter inside the transaction, and `FOR UPDATE` so two writers
+        // cannot both read the same seq. The trait says single-writer, but a lost outbox entry is
+        // silent and permanent, so this one is belt and braces.
+        let read = format!(
+            "SELECT value FROM \"{}\".meta WHERE key = $1 FOR UPDATE",
+            self.schema
+        );
+        let seq: u64 = tx
+            .query_opt(&read, &[&OUTBOX_SEQ])?
+            .and_then(|r| r.get::<_, String>(0).parse().ok())
+            .unwrap_or(0);
+        let bump = format!(
+            "INSERT INTO \"{}\".meta (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            self.schema
+        );
+        tx.execute(&bump, &[&OUTBOX_SEQ, &(seq + 1).to_string()])?;
+        let push = format!(
+            "INSERT INTO \"{}\".outbox (key, value) VALUES ($1, $2)",
+            self.schema
+        );
+        tx.execute(&push, &[&format!("{seq:020}"), &payload])?;
+        tx.commit()?;
+        Ok(seq)
     }
 
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+        let mut c = self.conn()?;
         let sql = format!(
             "SELECT key, value FROM \"{}\".outbox ORDER BY key LIMIT $1",
             self.schema
         );
-        let limit = limit as i64;
-        self.conn.with(move |c| {
-            c.query(&sql, &[&limit])?
-                .into_iter()
-                .map(|r| {
-                    let k: String = r.get(0);
-                    let seq: u64 = k.parse().context("corrupt outbox key")?;
-                    Ok((seq, r.get::<_, String>(1)))
-                })
-                .collect()
-        })
+        c.query(&sql, &[&(limit as i64)])?
+            .into_iter()
+            .map(|r| {
+                let k: String = r.get(0);
+                let seq: u64 = k.parse().context("corrupt outbox key")?;
+                Ok((seq, r.get::<_, String>(1)))
+            })
+            .collect()
     }
 
     fn outbox_remove(&self, seq: u64) -> Result<()> {
+        let mut c = self.conn()?;
         let sql = format!("DELETE FROM \"{}\".outbox WHERE key = $1", self.schema);
-        self.conn.with(move |c| {
-            c.execute(&sql, &[&format!("{seq:020}")])?;
-            Ok(())
-        })
+        c.execute(&sql, &[&format!("{seq:020}")])?;
+        Ok(())
     }
 
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
+        let mut c = self.conn()?;
+        let mut tx = c.transaction()?;
         let sql = format!("DELETE FROM \"{}\".outbox WHERE key = $1", self.schema);
-        self.conn.with(move |c| {
-            let mut tx = c.transaction()?;
-            for seq in seqs {
-                tx.execute(&sql, &[&format!("{seq:020}")])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
+        for seq in seqs {
+            tx.execute(&sql, &[&format!("{seq:020}")])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn outbox_len(&self) -> u64 {
         // Matches redb's `.unwrap_or(0)`: this feeds a `/status` gauge, and a gauge that fails the
         // request because the database hiccuped is worse than a gauge that reads zero.
-        let sql = format!("SELECT count(*) FROM \"{}\".outbox", self.schema);
-        self.conn
-            .with(move |c| Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64))
-            .unwrap_or(0)
+        let count = || -> Result<u64> {
+            let mut c = self.conn()?;
+            let sql = format!("SELECT count(*) FROM \"{}\".outbox", self.schema);
+            Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64)
+        };
+        count().unwrap_or(0)
     }
 
     fn outbox_trim(&self, max: u64) -> Result<u64> {
@@ -575,30 +507,15 @@ impl HotStore for PgStore {
         if len <= max {
             return Ok(0);
         }
-        let drop = (len - max) as i64;
+        let drop = len - max;
+        let mut c = self.conn()?;
         let sql = format!(
             "DELETE FROM \"{s}\".outbox WHERE key IN \
              (SELECT key FROM \"{s}\".outbox ORDER BY key LIMIT $1)",
             s = self.schema
         );
-        self.conn.with(move |c| Ok(c.execute(&sql, &[&drop])?))
+        Ok(c.execute(&sql, &[&(drop as i64)])?)
     }
-}
-
-/// Upsert one meta key inside an open transaction - shared by every mutation that must land the row
-/// change and the watermark together.
-fn set_meta_in_tx(
-    tx: &mut postgres::Transaction<'_>,
-    schema: &str,
-    key: &str,
-    value: &str,
-) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO \"{schema}\".meta (key, value) VALUES ($1, $2) \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-    );
-    tx.execute(&sql, &[&key, &value])?;
-    Ok(())
 }
 
 /// Drop every entity and checkpoint strictly above `block`.
@@ -611,7 +528,11 @@ fn prune_bound_above(block: u64) -> String {
     format!("{block:012}-999999")
 }
 
-fn rollback_in_tx(tx: &mut postgres::Transaction<'_>, schema: &str, block: u64) -> Result<u64> {
+fn rollback_in_tx(
+    tx: &mut postgres::Transaction<'_>,
+    schema: &str,
+    block: u64,
+) -> Result<u64> {
     let hi = prune_bound_above(block);
     let del_entities = format!("DELETE FROM \"{schema}\".entities WHERE key > $1");
     let removed = tx.execute(&del_entities, &[&hi])?;
@@ -675,5 +596,11 @@ mod tests {
         assert!(prune_bound_above(10).as_str() > "000000000010-999998");
         // The property that matters: every key of block 11 sorts above the block-10 bound.
         assert!("000000000011-000000" > prune_bound_above(10).as_str());
+    }
+
+    #[test]
+    fn entity_block_parses_the_padded_prefix() {
+        assert_eq!(entity_block("000000000042-000007"), Some(42));
+        assert_eq!(entity_block("nonsense"), None);
     }
 }

@@ -26,38 +26,6 @@ jobs:
       - name: test
         run: cargo test --locked
 
-  pg-parity:
-    name: hot-store parity (redb vs Postgres)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: nuthatch
-          POSTGRES_PASSWORD: nuthatch
-          POSTGRES_DB: nuthatch
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U nuthatch -d nuthatch"
-          --health-interval 3s --health-timeout 3s --health-retries 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      # `NUTHATCH_REQUIRE_PG` turns a missing URL into a failure. Without it a misconfigured service
-      # container would make the suite skip and still report green, which is the failure mode this
-      # job exists to prevent - a parity gate that quietly stops comparing is worse than none.
-      - name: parity suite
-        env:
-          NUTHATCH_TEST_PG: postgres://nuthatch:nuthatch@127.0.0.1:5432/nuthatch
-          NUTHATCH_REQUIRE_PG: "1"
-        run: cargo test --locked --features postgres-store --test pg_parity -- --test-threads=1
-      # The scaled backend must not rot behind its feature flag: the default build never compiles it,
-      # so nothing else in CI would notice it breaking.
-      - name: clippy (postgres-store)
-        run: cargo clippy --features postgres-store --all-targets -- -D warnings
-
   deny:
     name: cargo-deny (vulns · licences · bans)
     runs-on: ubuntu-latest

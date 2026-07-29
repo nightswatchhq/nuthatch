@@ -57,11 +57,6 @@ starlark = "0.14"
 # to match dbsp's version so the subtree dedupes (a 0.11 pin duplicated the whole object_store tree).
 # Apache-2.0 (arrow-rs family). `aws` covers S3/MinIO/R2 via env config (AWS_ENDPOINT etc).
 object_store = { version = "0.12", optional = true, features = ["aws"] }
-# RFC-0022 slice 2: the Postgres hot store for scaled mode. The **blocking** client, not
-# tokio-postgres - `HotStore` is a synchronous trait (redb is synchronous) and the serving layer
-# already does blocking store reads from async handlers. Switching that is a separate refactor with
-# its own justification, not something to smuggle in beside a new backend. All MIT/Apache-2.0.
-postgres = { version = "0.19", optional = true }
 url = { version = "2", optional = true }
 
 [features]
@@ -78,10 +73,6 @@ exex = []
 # Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Kept as a named feature so a
 # build that genuinely wants it gone can `--no-default-features`.
 object-store = ["dep:object_store", "dep:url"]
-# Postgres hot store (RFC-0022 slice 2). **Off by default and it must stay that way**: non-negotiable
-# 1 is that embedded mode runs with zero external services, and a default-on Postgres backend would
-# put a database in the dependency tree of the single-binary story. Scaled mode opts in.
-postgres-store = ["dep:postgres"]
 
 [dev-dependencies]
 proptest = "1"
