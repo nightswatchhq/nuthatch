@@ -1,6 +1,6 @@
 # RFC-0014: Firehose-class extraction - traces and state diffs via ExEx
 
-- Status: Draft (v1) - **future / deferred**
+- Status: **Slice 0 implemented (2026-07-29); extraction still deferred on RFC-0003**
 - Author: Pete (cargopete)
 - Date: 2026-07-17
 - Depends on: RFC-0003 (the ExEx execution-time source this reads from - the hard
@@ -118,6 +118,58 @@ State diffs **first** (cheap, straight from the bundle, no inspector). Traces **
 (re-execution pass, dearer, more decode surface). Ship the cheap correct half before the
 expensive half.
 
+## Slice 0 - what shipped without a node (2026-07-29)
+
+The RFC's own §Priority said this exists to keep RFC-0003 forward-compatible. In the course
+of checking that, it became clear a definable slice needed no node at all - and that it was
+the slice carrying most of the *correctness* risk. It is now built and tested.
+
+**What is in.** Calldata decode keyed by 4-byte function selector (`src/calldata.rs`), the
+`[extract]` config block with contract and selector scoping (`src/config.rs`), the
+`traces`/`state_diffs`/`calls_raw` table schemas, and the volume guard of §3. Twenty-one
+tests, of which the two guards were mutation-checked: breaking each one turns a test red.
+
+**What is not.** Extraction. There is still no source, and a nest declaring `[extract]` is
+**refused at startup** rather than started. That is deliberate and worth stating plainly: the
+alternative is `traces` and `state_diffs` existing, answering queries, and returning nothing -
+and an empty table is indistinguishable from "no matching rows" to whoever is querying it.
+Being told the source is missing beats being quietly given zero. The refusal validates the
+whole config on the way past, so a typo'd alias or malformed selector surfaces now rather
+than on the day a node finally appears.
+
+Three decisions worth recording, because they are not obvious from the design above:
+
+1. **A decode miss produces a row.** §2 said undecoded calls get a raw row; implementing it
+   clarified *why* the rule differs from events. An unrecognised topic0 belongs to some other
+   contract and is not our business. An unrecognised selector *on a contract we index* is our
+   business and is information - it usually means the ABI predates an implementation upgrade.
+   Those land in `calls_raw` with selector and raw input, so the gap is visible rather than
+   absent. A selector match with undecodable arguments falls back the same way, because a
+   4-byte selector is cheap to collide with and one odd transaction must not stall a block.
+
+2. **Call tables are `{alias}__call_{fn}`, not `{alias}__{fn}`.** A contract may have both a
+   `Transfer` event and a `transfer` function. `usdc__transfer` has meant the event since
+   0.1.0 and must keep meaning it, so the new surface takes the qualified name rather than
+   renaming a table every existing query depends on.
+
+3. **The guard refuses, it does not warn.** Unscoped extraction is unbounded by *chain
+   traffic* rather than by anything the operator wrote, which is a different thing from a
+   large nest. `unbounded = true` is the escape hatch and has to be typed by a human. This
+   follows RFC-0012's house rule: a budget stops being a budget the moment something may
+   quietly exceed it.
+
+### The trap left for the extraction slice
+
+**The hot store has one key namespace.** `store::entity_key(block, log_index)` keys every row
+by `(block, index)` across all tables, so call ordinal 5 and log index 5 in the same block
+would collide - silently, and only for blocks that have both. Wiring extraction therefore
+requires giving calls their own key namespace *first*.
+
+It is recorded here rather than half-solved in slice 0 because the right answer depends on
+the ordering the ExEx notification actually supplies, which nobody can see yet. Guessing now
+would mean either a scheme that does not match the source, or a `entity_key` variant that no
+test can reach. `CallContext::call_index` carries the same warning at the call site.
+
 ## Implementation plan (when unblocked by RFC-0003)
 
 1. State-diff extraction from the ExEx `BundleState`; `state_diffs` table; determinism
@@ -171,3 +223,14 @@ expensive half.
    volume on very busy contracts? Likely yes for anything DEX-router-adjacent.
 3. Raw-slot vs ABI-aware storage decode - v1 raw; when does layout-aware decode earn its
    complexity? Defer until a nest actually needs mapping/struct decode.
+4. **Row keyspace for calls** - see the trap above. Answer it when the ExEx ordering is
+   visible, not before.
+5. **Top-level calldata over plain RPC?** `eth_getBlockByNumber(full=true)` returns every
+   transaction's `input` without any `debug_*` method, so the calldata decoder built in slice
+   0 could produce real rows today for *top-level* calls - no node, no archive, no
+   rate-limited tracing endpoint. That is strictly less than this RFC promises (it misses
+   every internal call, which is most of the interesting ones) and it would mean two
+   differently-sourced paths feeding one table, which is exactly the sort of thing that
+   produces "why does this row exist for block X but not block Y". Deliberately **not** taken
+   in slice 0. If it is ever wanted it needs its own table and its own honest name, not a
+   quiet second source for `traces`.

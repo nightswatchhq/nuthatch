@@ -9,7 +9,7 @@ use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{Address, B256, I256, U256};
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub enum StorageKind {
 
 impl StorageKind {
     /// Map a Solidity type string (+ indexed flag) to its canonical storage kind.
-    fn from_sol(ty: &str, indexed: bool) -> StorageKind {
+    pub(crate) fn from_sol(ty: &str, indexed: bool) -> StorageKind {
         if indexed && is_hashed_when_indexed(ty) {
             return StorageKind::Hash32;
         }
@@ -165,13 +165,46 @@ pub struct Column {
     pub indexed: bool,
 }
 
+/// What kind of chain data a table holds. Events are the only kind that existed before RFC-0014, so
+/// this defaults to `Event` and is omitted from `schema.json` in that case - an existing nest's
+/// artifact is byte-identical after the field was added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TableKind {
+    #[default]
+    Event,
+    /// A decoded contract call, keyed by 4-byte function selector (RFC-0014).
+    Call,
+    /// Raw storage writes (RFC-0014).
+    State,
+}
+
+impl TableKind {
+    fn is_event(&self) -> bool {
+        matches!(self, TableKind::Event)
+    }
+}
+
 /// A serializable table schema (per-event table + its columns).
+///
+/// `event`/`topic0` and `function`/`selector` are the same idea for different [`TableKind`]s, and
+/// exactly one pair is populated. They are kept as distinct fields rather than one reused pair
+/// because `schema.json` is read by humans and by agents, and a 4-byte selector sitting in a field
+/// called `topic0` would be a lie that costs more than the two extra keys.
 #[derive(Debug, Clone, Serialize)]
 pub struct TableSchema {
     pub table: String,
     pub alias: String,
+    #[serde(default, skip_serializing_if = "TableKind::is_event")]
+    pub kind: TableKind,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub event: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub topic0: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub function: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selector: String,
     pub columns: Vec<ColumnSchema>,
 }
 
@@ -204,7 +237,7 @@ pub struct ColumnSchema {
 /// The implicit columns every table carries (before the event's own params). `_seq` is a single
 /// monotonic per-row ordering key, derived deterministically from (block, log_index) - not a mutable
 /// insertion counter, so it stays re-executable and reorg-stable per the determinism rule.
-fn implicit_columns() -> Vec<ColumnSchema> {
+pub(crate) fn implicit_columns() -> Vec<ColumnSchema> {
     [
         "block_number",
         "block_hash",
@@ -582,8 +615,11 @@ impl DecodeRegistry {
                 TableSchema {
                     table: d.table.clone(),
                     alias: d.alias.clone(),
+                    kind: TableKind::Event,
                     event: d.signature.clone(),
                     topic0: format!("0x{}", hex::encode(d.topic0)),
+                    function: String::new(),
+                    selector: String::new(),
                     columns,
                 }
             })
@@ -667,7 +703,7 @@ fn build_row(dec: &EventDecoder, log: &Log, emitter: Address) -> Result<DecodedR
     })
 }
 
-fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
+pub(crate) fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
     // Indexed dynamic types arrive as the 32-byte topic hash.
     if col.kind == StorageKind::Hash32 {
         if let DynSolValue::FixedBytes(w, _) = dv {
@@ -837,8 +873,11 @@ mod tests {
             TableSchema {
                 table: name.to_string(),
                 alias: "t".to_string(),
+                kind: TableKind::Event,
                 event: "E".to_string(),
                 topic0: "0x00".to_string(),
+                function: String::new(),
+                selector: String::new(),
                 columns: params
                     .iter()
                     .map(|s| ColumnSchema {

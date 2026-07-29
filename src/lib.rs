@@ -11,6 +11,7 @@ pub mod analytics;
 pub mod audit;
 pub mod bench;
 pub mod blob;
+pub mod calldata;
 pub mod chains;
 pub mod check;
 pub mod chunker;

@@ -457,6 +457,9 @@ mod tests {
         TableSchema {
             table: "usdc__transfer".into(),
             alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
             event: "Transfer".into(),
             topic0: "0xddf2".into(),
             columns: vec![
@@ -504,6 +507,9 @@ mod tests {
         let table = TableSchema {
             table: "t__e".into(),
             alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
             event: "E".into(),
             topic0: "0x".into(),
             columns: vec![ColumnSchema {

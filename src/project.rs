@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::abi;
 use crate::chains;
 use crate::cli::{AddArgs, InitArgs};
-use crate::config::{Config, Contract, Nest, CURRENT_SCHEMA_VERSION};
+use crate::config::{Config, Contract, Extract, Nest, CURRENT_SCHEMA_VERSION};
 use crate::rpc::RpcClient;
 
 pub async fn init(args: InitArgs) -> Result<()> {
@@ -95,6 +95,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
         templates: Vec::new(),
         factories: Vec::new(),
         webhooks: Vec::new(),
+        extract: Extract::default(),
     };
     config.save(&dir)?;
 
@@ -239,11 +240,23 @@ pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
 /// call this so the artifacts never drift from `nuthatch.toml`. Returns the table count.
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
     let registry = crate::registry::DecodeRegistry::from_nest(dir, config)?;
-    let schema = registry.schema();
+    let mut schema = registry.schema();
+    // RFC-0014: a nest that declares `[extract]` also declares call/state tables. The decode identity
+    // folds in the call surface, so two nests differing only in what they extract are not mistaken for
+    // the same decode version - the hash is what segment reuse and `check` compare.
+    let mut hash = registry.hash();
+    if config.extract.enabled() {
+        let calls = crate::calldata::CallRegistry::from_nest(dir, config)?;
+        schema.extend(calls.schema(&config.extract));
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, hash);
+        sha2::Digest::update(&mut h, calls.hash());
+        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
+    }
     std::fs::write(
         dir.join("schema.json"),
         serde_json::to_string_pretty(&serde_json::json!({
-            "registry_hash": format!("0x{}", hex::encode(registry.hash())),
+            "registry_hash": format!("0x{}", hex::encode(hash)),
             "tables": &schema,
         }))?,
     )
@@ -817,8 +830,11 @@ mod tests {
         let schema = vec![TableSchema {
             table: "usdc__transfer".into(),
             alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
             event: "Transfer".into(),
             topic0: "0xddf2".into(),
+            function: String::new(),
+            selector: String::new(),
             columns: vec![ColumnSchema {
                 name: "value".into(),
                 sol_type: "uint256".into(),

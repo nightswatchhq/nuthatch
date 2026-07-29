@@ -1277,6 +1277,26 @@ async fn build_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
+    // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
+    // failure mode of starting is the worse one: `traces`/`state_diffs` would exist, answer queries,
+    // and return nothing - and an empty table is indistinguishable from "no matching rows" to whoever
+    // is querying it. Better to be told the source is missing than to be quietly given zero.
+    if config.extract.enabled() {
+        // The volume guard runs first so a nest that is *both* unscoped and unsourced hears about the
+        // scoping, which it will still need once a node exists.
+        config.extract.scope_check()?;
+        // Validate the decode surface anyway: a typo'd alias or malformed selector should surface now
+        // rather than lying dormant until the day extraction is switched on.
+        let _ = crate::calldata::CallRegistry::from_nest(&dir, config)?;
+        anyhow::bail!(
+            "[extract] needs an extraction source, and none is wired yet. Call traces and storage \
+             diffs can only come from a colocated node (RFC-0003 ExEx); they are deliberately not \
+             sourced from `debug_*` RPC. The decode, schema and scoping for them exist and your \
+             config validates - what is missing is the node. Remove [extract] from nuthatch.toml to \
+             start this nest on event decode alone."
+        );
+    }
+
     let store = Store::open(&dir.join(DB_FILE))?;
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.

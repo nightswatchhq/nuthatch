@@ -1678,6 +1678,9 @@ template="pool"
         let schema = vec![crate::registry::TableSchema {
             table: "usdc__transfer".into(),
             alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
             event: "Transfer".into(),
             topic0: "0xddf2".into(),
             columns: vec![],
