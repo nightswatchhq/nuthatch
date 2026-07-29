@@ -89,7 +89,7 @@ pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
 // magnitude estimates for the pre-mount projection, not measurements - the roster reports the real
 // `rss_bytes()` alongside so an operator can calibrate. The shared serving/runtime cost is paid once;
 // each nest adds its hot-store working set + decode registry, plus a chunk per active IVM view.
-const ROOST_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
+pub const ROOST_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
 const NEST_BASE_RSS_MB: u64 = 90; // redb hot store + decode registry + the always-on balance view
 const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity view, or child registry
 
