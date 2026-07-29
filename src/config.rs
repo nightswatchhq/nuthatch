@@ -51,6 +51,13 @@ pub struct Config {
     /// a URL as they seal. Feeds the same host-side delivery engine as the compliance alerts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub webhooks: Vec<Webhook>,
+    /// Optional firehose-class extraction (RFC-0014): call traces and storage diffs beside event
+    /// decode. Absent → events only, which is every nest today. **Declaring this does not make it
+    /// run**: the only extraction source for traces/state is a colocated node (RFC-0003), so a nest
+    /// that asks for it is refused at startup rather than served silently-empty tables. The config,
+    /// decode and schema exist ahead of the source deliberately - see [`Extract`].
+    #[serde(default, skip_serializing_if = "Extract::is_empty")]
+    pub extract: Extract,
 }
 
 /// A user webhook subscription (RFC-0010 Part B): rows of `table` matching `where` are POSTed to `url`.
@@ -150,6 +157,106 @@ pub struct Flags {
     /// (≈ 7200 blocks on 12s-block mainnet). Defaults to [`DEFAULT_VELOCITY_WINDOW`] when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub velocity_window: Option<u64>,
+}
+
+/// Firehose-class extraction config (RFC-0014). Both surfaces are **opt-in per nest and default
+/// off**, because they are the only rows in nuthatch whose volume is unbounded by the nest's own
+/// configuration: events are bounded by "how often does this contract emit", whereas `state = true`
+/// on a busy contract yields a row per `SSTORE` and `traces = true` a row per internal call.
+///
+/// That is why [`Extract::scope_check`] refuses an unscoped nest instead of warning about it. The
+/// house rule is RFC-0012's: a budget stops being a budget the moment something may quietly exceed
+/// it. `unbounded = true` is the deliberate opt-out, and has to be typed by a human.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct Extract {
+    /// Emit a row per **call** (top-level and internal), calldata decoded by 4-byte selector.
+    #[serde(default)]
+    pub traces: bool,
+    /// Emit a row per **storage write**: `(address, slot, prev, new)`, raw slots, no ABI needed.
+    #[serde(default)]
+    pub state: bool,
+    /// Restrict extraction to these contract aliases. Empty means *every address on the chain*,
+    /// which is the unbounded case - not merely "every contract in this nest".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<String>,
+    /// Restrict trace extraction to these 4-byte selectors (`0x` + 8 hex). Empty means every
+    /// function. Ignored when `traces = false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectors: Vec<String>,
+    /// Accept an unscoped extraction nest anyway. Requires a human to have typed it, and is
+    /// reported in the startup log so it is never a silent state.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unbounded: bool,
+}
+
+impl Extract {
+    pub fn is_empty(&self) -> bool {
+        !self.traces
+            && !self.state
+            && self.contracts.is_empty()
+            && self.selectors.is_empty()
+            && !self.unbounded
+    }
+
+    /// Is any extraction surface actually switched on?
+    pub fn enabled(&self) -> bool {
+        self.traces || self.state
+    }
+
+    /// Scoped means "bounded by something the operator named". A selector allowlist bounds traces
+    /// but says nothing about state diffs, so it only counts when `state` is off - otherwise a nest
+    /// could look scoped while its storage half was still chain-wide.
+    pub fn is_scoped(&self) -> bool {
+        if !self.contracts.is_empty() {
+            return true;
+        }
+        !self.state && self.traces && !self.selectors.is_empty()
+    }
+
+    /// The volume guard (RFC-0014 §3). `Ok(())` to proceed, `Err` with a message that says what to
+    /// do about it. Called before any extraction work is scheduled.
+    pub fn scope_check(&self) -> Result<()> {
+        if !self.enabled() || self.is_scoped() || self.unbounded {
+            return Ok(());
+        }
+        let which = match (self.traces, self.state) {
+            (true, true) => "traces and state",
+            (true, false) => "traces",
+            _ => "state",
+        };
+        bail!(
+            "[extract] {which} = true with no `contracts` scope is unbounded by construction: it \
+             extracts every address on the chain, not just this nest's, so its row count is a \
+             property of chain traffic rather than of your config. Add `contracts = [\"alias\", …]` \
+             to scope it{}, or set `unbounded = true` to accept a nest whose footprint nobody can \
+             predict.",
+            if self.traces && !self.state {
+                " (or `selectors = [\"0x…\"]` for traces alone)"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// Normalised selector allowlist as raw 4-byte keys, rejecting anything malformed rather than
+    /// silently ignoring it - a typo'd selector that filtered nothing would look like it worked.
+    pub fn selector_keys(&self) -> Result<Vec<[u8; 4]>> {
+        self.selectors
+            .iter()
+            .map(|s| {
+                let hex_part = s.strip_prefix("0x").unwrap_or(s);
+                let raw = hex::decode(hex_part)
+                    .map_err(|e| anyhow!("[extract] selector `{s}` is not hex: {e}"))?;
+                let four: [u8; 4] = raw.as_slice().try_into().map_err(|_| {
+                    anyhow!(
+                        "[extract] selector `{s}` is {} bytes; a function selector is exactly 4",
+                        raw.len()
+                    )
+                })?;
+                Ok(four)
+            })
+            .collect()
+    }
 }
 
 /// Default velocity window (~24h of 12s mainnet blocks). Documented as a block-count approximation.
@@ -270,6 +377,7 @@ impl Config {
             templates: Vec::new(),
             factories: Vec::new(),
             webhooks: Vec::new(),
+            extract: Extract::default(),
         })
     }
 
@@ -344,6 +452,7 @@ mod tests {
             templates: Vec::new(),
             factories: Vec::new(),
             webhooks: Vec::new(),
+            extract: Extract::default(),
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
@@ -354,5 +463,131 @@ mod tests {
         assert!(back.contracts[0].events.is_empty());
         assert_eq!(back.contracts[1].events, vec!["Transfer".to_string()]);
         assert_eq!(back.primary().unwrap().alias, "usdc");
+    }
+
+    // ---- RFC-0014 `[extract]` and the volume guard ----------------------------------------------
+
+    fn extract_of(toml_src: &str) -> Extract {
+        let cfg: Config = toml::from_str(toml_src).expect("parses");
+        cfg.extract
+    }
+
+    const BASE: &str = r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+"#;
+
+    #[test]
+    fn a_nest_without_extract_has_none_and_serialises_none() {
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert!(cfg.extract.is_empty());
+        assert!(!cfg.extract.enabled());
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !raw.contains("[extract]"),
+            "an unused section must not appear in a nest file: {raw}"
+        );
+    }
+
+    /// The guard's whole point. An unscoped extraction nest is unbounded by *chain traffic*, not by
+    /// anything the operator wrote, so it is refused rather than warned about.
+    #[test]
+    fn unscoped_extraction_is_refused() {
+        for src in [
+            "[extract]\ntraces = true\n",
+            "[extract]\nstate = true\n",
+            "[extract]\ntraces = true\nstate = true\n",
+        ] {
+            let e = extract_of(&format!("{BASE}{src}"));
+            let err = match e.scope_check() {
+                Err(err) => err,
+                Ok(()) => panic!("{src} must not be accepted unscoped"),
+            };
+            assert!(
+                err.to_string().contains("unbounded by construction"),
+                "the refusal must say why: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contract_scope_satisfies_the_guard() {
+        let e = extract_of(&format!(
+            "{BASE}[extract]\ntraces = true\nstate = true\ncontracts = [\"usdc\"]\n"
+        ));
+        assert!(e.is_scoped());
+        assert!(e.scope_check().is_ok());
+    }
+
+    /// A selector allowlist bounds *traces*. It says nothing about storage writes, so it must not be
+    /// accepted as scoping for a nest whose state half is still chain-wide.
+    #[test]
+    fn a_selector_allowlist_scopes_traces_but_not_state() {
+        let traces_only = extract_of(&format!(
+            "{BASE}[extract]\ntraces = true\nselectors = [\"0xa9059cbb\"]\n"
+        ));
+        assert!(traces_only.scope_check().is_ok());
+
+        let with_state = extract_of(&format!(
+            "{BASE}[extract]\ntraces = true\nstate = true\nselectors = [\"0xa9059cbb\"]\n"
+        ));
+        assert!(
+            with_state.scope_check().is_err(),
+            "selectors cannot bound storage writes, so they must not appear to"
+        );
+    }
+
+    #[test]
+    fn unbounded_is_the_deliberate_escape_hatch() {
+        let e = extract_of(&format!(
+            "{BASE}[extract]\ntraces = true\nunbounded = true\n"
+        ));
+        assert!(e.scope_check().is_ok());
+    }
+
+    /// A guard that only fires when extraction is on: an `[extract]` section with both surfaces off
+    /// is inert config, not a refusal.
+    #[test]
+    fn the_guard_is_silent_when_extraction_is_off() {
+        let e = extract_of(&format!("{BASE}[extract]\ncontracts = [\"usdc\"]\n"));
+        assert!(!e.enabled());
+        assert!(e.scope_check().is_ok());
+    }
+
+    #[test]
+    fn selectors_are_validated_rather_than_silently_ignored() {
+        let good = extract_of(&format!(
+            "{BASE}[extract]\ntraces = true\nselectors = [\"0xa9059cbb\", \"095ea7b3\"]\n"
+        ));
+        assert_eq!(
+            good.selector_keys().unwrap(),
+            vec![[0xa9, 0x05, 0x9c, 0xbb], [0x09, 0x5e, 0xa7, 0xb3]],
+            "the 0x prefix is optional, as it is everywhere else in the config"
+        );
+
+        // A typo'd selector that filtered nothing would look like it worked - the worst kind of bug.
+        let short = extract_of(&format!("{BASE}[extract]\nselectors = [\"0xa905\"]\n"));
+        assert!(short.selector_keys().unwrap_err().to_string().contains("4"));
+        let nonhex = extract_of(&format!("{BASE}[extract]\nselectors = [\"0xzzzzzzzz\"]\n"));
+        assert!(nonhex
+            .selector_keys()
+            .unwrap_err()
+            .to_string()
+            .contains("not hex"));
+    }
+
+    #[test]
+    fn extract_survives_a_round_trip() {
+        let src = format!(
+            "{BASE}[extract]\ntraces = true\nstate = true\ncontracts = [\"usdc\"]\nselectors = [\"0xa9059cbb\"]\n"
+        );
+        let cfg: Config = toml::from_str(&src).unwrap();
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(back.extract.traces && back.extract.state);
+        assert_eq!(back.extract.contracts, vec!["usdc".to_string()]);
+        assert_eq!(back.extract.selectors, vec!["0xa9059cbb".to_string()]);
     }
 }

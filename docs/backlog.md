@@ -41,7 +41,7 @@ recipes + metadata cache) have shipped. What remains falls into four tracks:
 | 0011 Graph-network nest | **Parked after pilot** | Full migration: Indexer Directory (step 2) + promote the two ad-hoc pilot nests into a published `graph-network-nest` | product decision |
 | 0012 Multi-nest roost | Implemented | - (sustained parity run done 2026-07-28: 20 tables / 17,108 rows byte-identical) | - |
 | 0013 Storage/query | §3 shipped (DuckDB union) | DataFusion convergence (§2/§4, benchmark-gated, scaled-side first); Turso (§1, triple-gated) | scaled mode + a benchmark |
-| 0014 Firehose | Deferred | State-diff + trace extraction | **0003 → reth node** |
+| 0014 Firehose | **Slice 0 implemented** | State-diff + trace *extraction* (decode, `[extract]` config, schemas and the volume guard shipped 2026-07-29; a nest declaring `[extract]` is refused at startup until a source exists) | **0003 → reth node** |
 | 0023 eth_call | Tier 1 building | Tier 2 (metadata cache), a *simple* RPC tier-3 fallback, tier 4 (hosted cache); more recipes (reserves) | - (tiers 1-2 + simple tier-3 buildable) |
 | 0024 eth_call engine | Draft (deferred build) | The revm demand-driven state engine - **accepted design, deferred build** until the residue is measured large / archive-RPC-free operation is demanded / 0003 lands | RFC-0003 (best path) or a `--state-rpc` archive endpoint (Stage 1) |
 | 0019 Registry | Implemented | - (live S3 verified 2026-07-28 against Hetzner Object Storage; S3 now ships on by default) | - |
@@ -157,8 +157,9 @@ their churn. These audit items were judged defer-worthy, with rationale:
 2. **Decide the infra question** - is a colocated reth node worth provisioning now? It's the single
    unlock for 0003 + 0014 (the whole firehose-parity story). If yes, that's an ops track that runs in
    parallel with everything below.
-3. **Free, high-signal now:** the 0014 node-independent slice (calldata decode + `[extract]` config +
-   schemas + volume guard) - advances the last unstarted RFC without the node, fully testable.
+3. ~~**Free, high-signal now:** the 0014 node-independent slice.~~ **Done 2026-07-29** - calldata
+   decode, `[extract]` config, schemas and the volume guard are in, mutation-checked, and the RFC
+   records the hot-store keyspace collision that the extraction slice must solve first.
 4. **Cheap wins, all live runs rather than code:** 0012's sustained parity run, 0021's two-chain run,
    and 0019's S3 verification (public RPC and a VPS suffice), then the Track-4 small increments.
 5. **When scaled mode is real:** start 0013's DataFusion convergence scaled-side, behind the benchmark

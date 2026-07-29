@@ -267,6 +267,7 @@ fn nest_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] factories: Option<UnpackListOrTuple<Value<'v>>>,
         #[starlark(require = named, default = NoneType)] screening: Value<'v>,
         #[starlark(require = named, default = NoneType)] flags: Value<'v>,
+        #[starlark(require = named, default = NoneType)] extract: Value<'v>,
         #[starlark(require = named)] alerts: Option<UnpackListOrTuple<Value<'v>>>,
         #[starlark(require = named)] webhooks: Option<UnpackListOrTuple<Value<'v>>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -336,6 +337,12 @@ fn nest_builtins(builder: &mut GlobalsBuilder) {
         }
         if !flags.is_none() {
             root.insert("flags".into(), to_json(flags)?);
+        }
+        // RFC-0014. A `nest.star` that cannot express `[extract]` would make the Starlark surface
+        // quietly less capable than the TOML one, which is the sort of asymmetry nobody discovers
+        // until they have already committed to the format.
+        if !extract.is_none() {
+            root.insert("extract".into(), to_json(extract)?);
         }
 
         *collector.config.borrow_mut() = Some(serde_json::Value::Object(root));
