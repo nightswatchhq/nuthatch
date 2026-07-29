@@ -62,7 +62,10 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 
-use crate::store::{HotScanTooLarge, HotStore, LostOwnership, OWNER_FENCE};
+use crate::store::{
+    HotScanTooLarge, HotStore, Lease, LeaseHeld, LostOwnership, LEASE_EXPIRES_AT, LEASE_OWNER,
+    OWNER_FENCE,
+};
 
 /// A unit of work handed to the connection thread. Boxed so the trait methods can post arbitrary
 /// closures rather than an enum of every query shape, which would have to grow with every method.
@@ -560,6 +563,129 @@ impl HotStore for PgStore {
             .get_kv("meta", OWNER_FENCE)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0))
+    }
+
+    fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> Result<Lease> {
+        let schema = self.schema.clone();
+        let owner_s = owner.to_string();
+        let next = self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            // `FOR UPDATE` on the fence row serialises two workers racing for the same cursor, so
+            // exactly one of them evaluates "is it takeable?" at a time. Without it both could read
+            // an expired lease and both conclude yes.
+            let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR UPDATE");
+            let fence: u64 = tx
+                .query_opt(&read, &[&OWNER_FENCE])?
+                .and_then(|r| r.get::<_, String>(0).parse().ok())
+                .unwrap_or(0);
+            let holder: String = tx
+                .query_opt(&read, &[&LEASE_OWNER])?
+                .map(|r| r.get::<_, String>(0))
+                .unwrap_or_default();
+            let expires_at: i64 = tx
+                .query_opt(&read, &[&LEASE_EXPIRES_AT])?
+                .and_then(|r| r.get::<_, String>(0).parse().ok())
+                .unwrap_or(0);
+            // **The database's clock, not the worker's** - the reason the lease lives here at all.
+            let now: i64 = tx
+                .query_one("SELECT extract(epoch from now())::bigint", &[])?
+                .get(0);
+
+            if !(holder.is_empty() || expires_at <= now || holder == owner_s) {
+                return Err(LeaseHeld {
+                    by: holder,
+                    expires_in_secs: expires_at - now,
+                }
+                .into());
+            }
+            let next = fence + 1;
+            set_meta_in_tx(&mut tx, &schema, OWNER_FENCE, &next.to_string())?;
+            set_meta_in_tx(&mut tx, &schema, LEASE_OWNER, &owner_s)?;
+            set_meta_in_tx(
+                &mut tx,
+                &schema,
+                LEASE_EXPIRES_AT,
+                &(now + ttl_secs as i64).to_string(),
+            )?;
+            tx.commit()?;
+            Ok(next)
+        })?;
+        self.held.store(next, std::sync::atomic::Ordering::SeqCst);
+        Ok(Lease {
+            owner: owner.to_string(),
+            fence: next,
+            expires_in_secs: ttl_secs as i64,
+        })
+    }
+
+    fn renew_lease(&self, ttl_secs: u64) -> Result<Lease> {
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            // Fenced like any other write: a superseded holder must not extend a lease it lost.
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            let now: i64 = tx
+                .query_one("SELECT extract(epoch from now())::bigint", &[])?
+                .get(0);
+            let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1");
+            let holder: String = tx
+                .query_opt(&read, &[&LEASE_OWNER])?
+                .map(|r| r.get::<_, String>(0))
+                .unwrap_or_default();
+            let fence: u64 = tx
+                .query_opt(&read, &[&OWNER_FENCE])?
+                .and_then(|r| r.get::<_, String>(0).parse().ok())
+                .unwrap_or(0);
+            set_meta_in_tx(
+                &mut tx,
+                &schema,
+                LEASE_EXPIRES_AT,
+                &(now + ttl_secs as i64).to_string(),
+            )?;
+            tx.commit()?;
+            Ok(Lease {
+                owner: holder,
+                fence,
+                expires_in_secs: ttl_secs as i64,
+            })
+        })
+    }
+
+    fn release_lease(&self) -> Result<()> {
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            set_meta_in_tx(&mut tx, &schema, LEASE_EXPIRES_AT, "0")?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn current_lease(&self) -> Result<Option<Lease>> {
+        let holder = self.get_kv("meta", LEASE_OWNER)?.unwrap_or_default();
+        if holder.is_empty() {
+            return Ok(None);
+        }
+        let expires_at: i64 = self
+            .get_kv("meta", LEASE_EXPIRES_AT)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let schema = self.schema.clone();
+        let now: i64 = self.conn.with(move |c| {
+            let _ = &schema;
+            Ok(
+                c.query_one("SELECT extract(epoch from now())::bigint", &[])?
+                    .get(0),
+            )
+        })?;
+        Ok(Some(Lease {
+            owner: holder,
+            fence: self.current_fence()?,
+            expires_in_secs: expires_at - now,
+        }))
     }
 
     fn held_fence(&self) -> u64 {
