@@ -45,6 +45,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
+      # Clippy runs **first**, deliberately. It compiles `--all-targets` under this feature, which is a
+      # superset of what the test step needs, so running it first warms the shared cache and the test
+      # step reuses it. In the other order both steps did a near-full build of duckdb, wasmtime and
+      # dbsp - the job's first run took ~30 minutes, most of it compiling the same crates twice.
+      #
+      # It also fails faster on the common breakage: a lint error surfaces before a database is
+      # touched, rather than after the longer of the two builds.
+      #
+      # The scaled backend must not rot behind its feature flag either - the default build never
+      # compiles it, so no other job would notice it breaking.
+      - name: clippy (postgres-store)
+        run: cargo clippy --features postgres-store --all-targets -- -D warnings
       # `NUTHATCH_REQUIRE_PG` turns a missing URL into a failure. Without it a misconfigured service
       # container would make the suite skip and still report green, which is the failure mode this
       # job exists to prevent - a parity gate that quietly stops comparing is worse than none.
@@ -53,10 +65,6 @@ jobs:
           NUTHATCH_TEST_PG: postgres://nuthatch:nuthatch@127.0.0.1:5432/nuthatch
           NUTHATCH_REQUIRE_PG: "1"
         run: cargo test --locked --features postgres-store --test pg_parity -- --test-threads=1
-      # The scaled backend must not rot behind its feature flag: the default build never compiles it,
-      # so nothing else in CI would notice it breaking.
-      - name: clippy (postgres-store)
-        run: cargo clippy --features postgres-store --all-targets -- -D warnings
 
   deny:
     name: cargo-deny (vulns · licences · bans)
