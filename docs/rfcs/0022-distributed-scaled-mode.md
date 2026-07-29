@@ -205,6 +205,34 @@ Notes for whoever builds it:
 - Dispatch cost is not expected to matter because the hot path is `commit_window` (per *window*, not
   per row), but the footprint and backfill benches are the check, not the assumption.
 
+### Deviation from §3: the lease lives in the hot store, not the control plane
+
+§3 draws the line as "one holds *what should run*, the other holds *indexed data*". That is right for
+**desired state** and it stands. It is wrong for the **lease**, and the build takes a different route
+here deliberately rather than quietly.
+
+**Two databases can disagree.** If the lease is in the control plane and the fence is in the hot
+store, a worker can hold a valid lease while the hot store has already moved on - or the reverse. That
+disagreement *is* the split brain the fence exists to prevent; splitting the two records across two
+databases manufactures the exact failure the mechanism is for. Keeping them together makes the lease
+and the fence **the same row, taken in the same transaction**: there is no window in which one is true
+and the other is not, because there is only one fact.
+
+**One clock beats N clocks.** Lease expiry needs a time source. If each worker uses its own, clock
+skew silently lengthens or shortens leases, and the failure is invisible until two workers both
+believe they hold one. Reading `now()` from the database that holds the lease measures every worker
+against a single clock. This is the ordinary reason leases live next to the data they protect, and it
+is not a detail that can be retrofitted later - it decides the schema.
+
+**What the control plane keeps.** Desired state, exactly as §3 says: which nests should run, on which
+worker pool, with what budget. The scheduler writes intent there and reads *ownership* from the hot
+stores it is scheduling over - which in scaled mode are rows in the same Postgres it is already
+talking to, so this costs no extra connection and no extra service.
+
+The scope line is unchanged: intent and ownership are still separate concerns. They are just not
+separate *databases*, because one of them is only meaningful in the same transaction as the data it
+guards.
+
 ### Slice 4's constraint on the trait: fencing has to reach the store
 
 Recorded during slice 1 rather than discovered during slice 4, because it **adds to the `HotStore`
