@@ -1,6 +1,6 @@
 # RFC-0022: Distributed scaled mode - read/write planes, a writer pool, dynamic nest placement
 
-- Status: **Accepted - design only, build deferred** (2026-07-21). §0 brief amendment applied to
+- Status: **Build started 2026-07-29** (slice 1: extract the `HotStore` trait - see Build order). Was *accepted, design only* (2026-07-21). §0 brief amendment applied to
   `CLAUDE.md` 2026-07-21. **Nothing is built yet.** The build is **dependency-gated** on RFC-0013's
   scaled-side (external Postgres hot store + DataFusion federation) and on RFC-0021 (the per-chain cursor
   = the unit of placement). **Operator-run by design:** this is the distributed self-hosted fleet
@@ -164,10 +164,87 @@ enforcement between untrusting customers, or customer-facing authz. Those belong
 front. If a feature request only makes sense when the tenants *don't trust each other and pay*, it's out
 of this RFC and this project.
 
+## Build order (revised 2026-07-29, on starting the build)
+
+### Correction: there is no `HotStore` trait
+
+The Implementation section below said to feature-flag the backend "behind the existing `HotStore`
+trait (founding architecture)". **That trait does not exist and never did.** `Store` is a concrete
+redb struct with 31 public methods. The ~110 call sites are *method invocations*, and nearly all of
+them need no edit - `&store` coerces to `&dyn HotStore` once the impl exists. What has to change is
+the places that **name the type**, and there are **14**, in four files.
+`CLAUDE.md` states the trait as a *directive* for when scaled mode is built - correctly - and this RFC
+misread it as a description of something already in the tree.
+
+This is not a blocker; it is the answer to "where does the build start". Nothing in §1-§3 can be
+built first: a writer pool places **cursors**, and a cursor cannot move to another machine while its
+state is welded to a local redb file. The swap point has to be cut before anything can be swapped.
+
+### Slice 1 - extract `HotStore`, redb stays the only implementation
+
+Pure refactor, **no behaviour change**, which gives it an unusually good oracle: the existing lib and
+e2e suites must stay green without modification, because a green suite over unchanged behaviour is the
+entire acceptance criterion. If a test needs editing to pass, the refactor has changed something it
+should not have.
+
+The surface divides into four cohesive groups, sized from real call counts:
+
+| group | methods | call sites |
+|---|---|---|
+| Entities | `put_entity`, `get_entity`, `count`, `recent`, `recent_by_table`, `hot_rows_by_table{,_bounded}`, `entities_in_range`, `entity_keys`, `sample_entity_keys` | ~40 |
+| Cursor & meta | `get_meta`, `set_meta`, `indexed_head`, `sealed_through`, `{get,set}_block_hash`, `checkpoints_desc` | ~48 |
+| Mutation windows | `commit_window{,_blocking}`, `rollback_to{,_and_set_meta}`, `prune_range{,_and_set_meta}` | ~7 |
+| Outbox | `outbox_{push,pending,remove,remove_batch_blocking,len,trim}` | ~20 |
+
+Notes for whoever builds it:
+
+- `entity_key` is an associated function, not a method - it stays a free function rather than joining
+  the trait, and the **call keyspace collision recorded in RFC-0014** lives here too. Solve them
+  together if RFC-0014's extraction slice lands first.
+- Two methods are `async`; `async-trait` is already a dependency and keeps the trait object-safe.
+- Dispatch cost is not expected to matter because the hot path is `commit_window` (per *window*, not
+  per row), but the footprint and backfill benches are the check, not the assumption.
+
+### Slice 2 - the Postgres implementation (RFC-0013 scaled side)
+
+Gated behind slice 1, and its acceptance test is already named in §Testing below: **served results
+under Postgres must match the embedded redb path for the same nest and range**. A backend swap that
+changes an answer is a failed swap.
+
+### Slice 3+ - the planes, pool, scheduler and control plane
+
+Everything in §1-§3, and **buildable and testable by us** - the Nature line above already says so:
+integration-tested under docker-compose on the MacBook/VPSes, with GraphOps running it *at scale*. The
+declared dependencies are RFC-0013/0019/0021, and an operator is not among them.
+
+An earlier draft of this section called the GraphOps conversation a dependency of slice 3, on the
+grounds that single-owner is not honestly testable on one box. **That was wrong** and is corrected
+here, because it would have parked a buildable slice behind someone else's calendar.
+
+The single-owner invariant is enforced by the control-plane DB, which makes most of it *ordinarily*
+testable:
+
+- **The claim race** - N workers contend for one cursor; exactly one wins. A unique constraint or a
+  lease row decides it, and a deterministic test asserts it.
+- **The fencing case, which is the one that actually bites** - a worker holding a lease stalls (long
+  GC, a paused container), its lease expires, another worker takes the cursor, and the original wakes
+  up still believing it owns the thing. A monotonic fencing token makes the stale writer's writes
+  rejected rather than merely unlikely, and `SIGSTOP` on a container reproduces it exactly.
+- **Partition and skew** - `docker network disconnect` and a faked clock cover the cases worth
+  covering. Not a substitute for a real network, but far from nothing.
+- **A genuinely multi-machine run** on our own VPSes, which is what the Execution-context note means
+  by MacBook/VPSes - it was never "one box".
+
+What an operator provides that we cannot manufacture is **scale validation and workload shape**: many
+cursors across many machines under real traffic, and the placement constraints a scheduler ought to
+respect. That is a reason to talk to them **while** building - their answer may change the scheduler's
+policy - not a reason to wait before starting.
+
 ## Implementation (design-now, build-later)
 
-- Feature-flag the storage backend behind the existing `HotStore` trait (founding architecture):
-  `Postgres` for scale mode, `redb` for embedded - no `#[cfg]` forks of business logic.
+- Feature-flag the storage backend behind a `HotStore` trait (see the correction above - it must be
+  *extracted* first): `Postgres` for scale mode, `redb` for embedded - no `#[cfg]` forks of business
+  logic.
 - Writer-worker binary/role and query-FE role from the same crates; a role flag, not a fork.
 - Scheduler + control-plane API + control-plane DB as new components (compose services), watching desired
   state and reconciling cursor assignments.
