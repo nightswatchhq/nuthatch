@@ -27,7 +27,7 @@ jobs:
         run: cargo test --locked
 
   pg-parity:
-    name: hot-store parity (redb vs Postgres)
+    name: scaled mode (parity · control plane · reconcile)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -64,7 +64,12 @@ jobs:
         env:
           NUTHATCH_TEST_PG: postgres://nuthatch:nuthatch@127.0.0.1:5432/nuthatch
           NUTHATCH_REQUIRE_PG: "1"
-        run: cargo test --locked --features postgres-store --test pg_parity -- --test-threads=1
+        run: |
+          # Every Postgres-backed suite, not just parity: the control plane and the reconcile loop
+          # have no coverage anywhere else, and a job named for one of three would let the other two
+          # rot behind the feature flag.
+          cargo test --locked --features postgres-store \
+            --test pg_parity --test control_plane --test e2e_reconcile -- --test-threads=1
 
   deny:
     name: cargo-deny (vulns · licences · bans)
