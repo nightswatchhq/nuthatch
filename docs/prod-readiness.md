@@ -3,7 +3,7 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [backlog](backlog.md), and [CI](../.github/workflows/ci.yml) on
-**2026-07-28** (repo at `0.7.0`).
+**2026-07-29** (repo at `0.7.1`).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
@@ -36,8 +36,9 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   `dev` → live API, no Postgres/Docker/IPFS. - *CI builds the release binary; footprint job runs the
   real `init → dev` path.*
 - [ ] ✅ **Footprint ≤ 2 GB RAM** for a single-chain roost, CI-enforced. - *`footprint.sh` gate, 256 MB
-  ceiling, measured ~37 MB. **Note the gap:** the CI scenario is `--backfill 200` on one nest. A
-  release claim of "≤2 GB" for a *dense multi-nest roost at tip* is not yet measured - see §5.*
+  ceiling, measured ~37 MB. The CI scenario is only `--backfill 200` on one nest, so the *dense
+  multi-nest roost at tip* was measured out-of-band instead: 8 nests on one cursor peaked at 89 MB at
+  tip, 4% of budget - see §5. Wiring that density into the gate itself is still open (§3).*
 - [ ] ✅ **No phone-home.** No telemetry, no mandatory tokens, AI degrades offline. - *Verify per
   release: grep for outbound calls not gated behind explicit user config / BYO-key.*
 - [ ] ✅ **Determinism in the core.** Decode, reorg, entity derivation re-executable; no LLM output in
@@ -102,7 +103,8 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   needs ExEx. **Blocked on:** reth node (0003).*
 - [ ] 🟡 Entity point-read p50/p99 bench tracked across releases (regressions fail the build).
 - [ ] 🟡 Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest
-  `--backfill 200`. - *The 2 GB claim for a real roost density is unmeasured; §0 note.*
+  `--backfill 200`. - *The density itself is now measured (§5); what is missing is the **gate** - a
+  one-off run does not catch the release that regresses it.*
 - [ ] ✅ Regressions fail the build (benchmarks-as-gates principle established). - *Extend coverage as
   the benches above land.*
 
@@ -142,7 +144,14 @@ Called out separately because it's the headline promise and the current gate onl
 case.
 
 - [ ] ✅ Single nest, backfill, single chain: measured ~37 MB, gated at 256 MB.
-- [ ] ⛔ Multiple nests co-located in one roost at tip, sustained, measured against 2 GB.
+- [ ] ✅ Multiple nests co-located in one roost at tip, sustained, measured against 2 GB.
+  **8 nests on one Arbitrum cursor** (2026-07-29): at tip, mean RSS **84 MB**, peak **89 MB** against
+  the 2048 MB per-cursor budget - **4%**. Backfill peaked at **154 MB**, the more demanding phase.
+  Adding a nest costs far less than the first one does: the cursor's RPC buffers and decode machinery
+  are shared, so only the per-nest hot store is additive. The claim is measured rather than asserted -
+  but note what it is *not*. this is a reading over a short run, so it bounds **density**, not
+  longevity. The 24h soak and the high-event-rate contract below are still untested, and a slow leak
+  would not surface at this timescale.
 - [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store
   churn).
 - [ ] ⛔ Long-running soak (24h+) with no RSS creep (leak check).
@@ -245,9 +254,11 @@ Almost everything un-buildable-on-a-laptop traces to one missing box.
 
 **Embedded, single-chain, single-nest:** the core (§0-§2, §6) is genuinely strong - this is the
 column that can go to `1.0` first. The honest gaps before you'd point a stranger's workload at it
-unattended are the operational and load ones: the **dense-roost RAM proof** (§5), the **sustained
-parity run** (§1), **provider-failure resilience** (§2), **safe-exposure defaults + a security pass on
-the serving surface** (§4), and an **unattended-operation runbook** (§7, §10).
+unattended are the operational and load ones. Several have since closed - the **dense-roost RAM proof**
+(§5, measured at 4% of budget), **provider-failure resilience** (§2, RFC-0028), **safe-exposure
+defaults** (§4) and the **unattended-operation runbook** (§7, §10) are done. What is left is time-based
+rather than build-based: a **24h+ soak** for RSS creep and a **sustained parity run** (§1). Neither can
+be shortcut by writing more code, which is the honest reason they are still open.
 
 **Scaled mode and anything node-gated (§11, §12):** not production-ready, and correctly deferred - the
 project's "build only what we can verify live" discipline is why. Don't let a red column here read as
