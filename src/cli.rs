@@ -646,6 +646,13 @@ pub struct InitArgs {
     #[arg(long, value_delimiter = ',')]
     pub alias: Vec<String>,
 
+    /// Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in
+    /// order (comma-separated; use an empty entry to resolve that address normally). The escape
+    /// hatch for a proxy whose implementation ABI the public resolvers don't return - point this at
+    /// the implementation's ABI and the nest decodes the events the proxy actually emits.
+    #[arg(long, value_delimiter = ',')]
+    pub abi: Vec<String>,
+
     /// Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known
     /// chain for the contract's bytecode and picks the one it lives on - you rarely need to say.
     #[arg(long)]
@@ -673,6 +680,12 @@ pub struct AddArgs {
     /// c<N> slots after the nest's existing contracts.
     #[arg(long, value_delimiter = ',')]
     pub alias: Vec<String>,
+
+    /// Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in
+    /// order (comma-separated; an empty entry resolves that address normally). Same proxy escape
+    /// hatch as `init --abi`.
+    #[arg(long, value_delimiter = ',')]
+    pub abi: Vec<String>,
 
     /// The nest directory to grow (must contain a nuthatch.toml). Defaults to the current directory.
     #[arg(long, default_value = ".")]
