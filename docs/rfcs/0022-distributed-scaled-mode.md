@@ -205,6 +205,42 @@ Notes for whoever builds it:
 - Dispatch cost is not expected to matter because the hot path is `commit_window` (per *window*, not
   per row), but the footprint and backfill benches are the check, not the assumption.
 
+### Slice 4's constraint on the trait: fencing has to reach the store
+
+Recorded during slice 1 rather than discovered during slice 4, because it **adds to the `HotStore`
+contract** and it is cheaper to know that before a second backend is written against it.
+
+The single-owner guarantee in §2 is normally implemented as a lease in the control-plane DB: a worker
+claims a cursor, the lease expires, another worker claims it. That alone does not make single-owner
+true. It makes it *likely*. The case it misses:
+
+1. worker A holds the lease on cursor `arbitrum-one` and stalls - a long GC, a paused container, a
+   host that went away for ninety seconds;
+2. the lease expires and worker B claims the cursor, legitimately;
+3. worker A wakes up. Nothing has told it anything happened. It finishes the window it was in the
+   middle of and **writes**.
+
+Both workers now write the same cursor's hot store, which is precisely the thing the whole design
+forbids - and it happens without a partition, without a bug, on a healthy network.
+
+The standard remedy is a **monotonic fence token**: the lease hands out an ever-increasing number, the
+worker carries it on every write, and **the storage layer refuses any write whose fence is lower than
+the highest it has seen**. Enforcement has to be at the store. A worker that checks its own lease
+before writing is checking a fact that can expire between the check and the write.
+
+Consequences to plan for:
+
+- `HotStore` gains an ownership epoch, and the mutating methods can fail with a *lost-ownership* error
+  distinct from an I/O error. Callers must treat it as terminal for that cursor - stop, do not retry,
+  the cursor is someone else's now.
+- The natural home in `PgStore` is inside `commit_window`, which is already the transaction where
+  atomicity is enforced: read the stored fence, compare, abort the transaction if stale. One
+  transaction, one decision, no window between checking and writing.
+- redb keeps a trivial implementation - there is only ever one process - but it should still *store*
+  the epoch so the two backends have the same shape and the same tests.
+- The tests this earns are the ones worth having: the claim race (N workers, one cursor, exactly one
+  wins) and the stalled-wakeup above, which `SIGSTOP` on a container reproduces exactly.
+
 ### Slice 2 - the Postgres implementation (RFC-0013 scaled side)
 
 Gated behind slice 1, and its acceptance test is already named in §Testing below: **served results
