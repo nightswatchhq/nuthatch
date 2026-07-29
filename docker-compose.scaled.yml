@@ -1,0 +1,39 @@
+# Scaled mode (RFC-0022). **Not** the way to run nuthatch - the single binary is, and embedded mode
+# needs none of this. This exists for the distributed self-hosted fleet an operator runs across
+# machines, and for the parity suite that proves the Postgres hot store answers identically to redb.
+#
+# Today it brings up the external hot store alone. The writer pool, query-FE tier and control plane
+# arrive with RFC-0022 slices 3+; this file grows with them rather than being written speculatively
+# for services that do not exist.
+#
+#   docker compose -f docker-compose.scaled.yml up -d postgres
+#   NUTHATCH_TEST_PG=postgres://nuthatch:nuthatch@127.0.0.1:5433/nuthatch \
+#     cargo test --features postgres-store --test pg_parity
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nuthatch
+      POSTGRES_PASSWORD: nuthatch
+      POSTGRES_DB: nuthatch
+      # `--locale-provider=icu` is deliberately NOT used, and the initdb locale is C. The hot store
+      # keys on zero-padded strings whose *byte* order is chain order; a locale-aware default
+      # collation would reorder them. The table DDL pins `COLLATE "C"` per column as well, so this is
+      # belt and braces - but a database whose default disagrees with its columns is a trap for the
+      # next person who adds a table and forgets.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    # 5433 on the host: a developer running the parity suite very likely has a local Postgres on
+    # 5432, and silently connecting to *that* would create schemas in someone's real database.
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - nuthatch-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nuthatch -d nuthatch"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  nuthatch-pg:

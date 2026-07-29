@@ -31,6 +31,10 @@ pub mod mcp;
 pub mod metadata;
 pub mod metrics;
 pub mod pack;
+/// The Postgres hot store (RFC-0022 slice 2). Feature-gated so the default build stays a single
+/// binary with no database in its dependency tree.
+#[cfg(feature = "postgres-store")]
+pub mod pgstore;
 pub mod progress;
 pub mod project;
 pub mod recipes;
