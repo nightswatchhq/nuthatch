@@ -90,7 +90,7 @@ fn balances_of(rt: &indexer::NestRuntime) -> Vec<(String, i128)> {
 }
 
 /// Wait for the nest to reach `last_block == 11`.
-async fn wait_indexed(store: &nuthatch::store::Store) -> bool {
+async fn wait_indexed(store: &dyn nuthatch::store::HotStore) -> bool {
     wait_until(POLL_TIMEOUT, || {
         store.get_meta("last_block").ok().flatten().as_deref() == Some("11")
     })

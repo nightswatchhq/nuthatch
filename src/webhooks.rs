@@ -12,7 +12,7 @@
 //! deliberately.
 
 use crate::config::Webhook;
-use crate::store::Store;
+use crate::store::HotStore;
 use anyhow::Result;
 use serde_json::json;
 
@@ -63,7 +63,7 @@ fn is_sealed(w: &Webhook) -> bool {
 /// Initialise each webhook's cursor on first registration (no stored cursor), per its `since`. Called
 /// once at startup with the current chain `tip`. `"registration"` → tip (suppresses backfill history);
 /// `"genesis"` → 0; a number → that block. Idempotent: a webhook with a stored cursor is left alone.
-pub fn init_cursors(store: &Store, webhooks: &[Webhook], tip: u64) -> Result<()> {
+pub fn init_cursors(store: &dyn HotStore, webhooks: &[Webhook], tip: u64) -> Result<()> {
     for w in webhooks {
         if store.get_meta(&cursor_key(&w.name))?.is_some() {
             continue;
@@ -88,7 +88,7 @@ pub fn init_cursors(store: &Store, webhooks: &[Webhook], tip: u64) -> Result<()>
 /// advance the cursor. Returns the number of deliveries enqueued. Best-effort per webhook - a table
 /// with no sealed segment yet just yields nothing.
 pub fn deliver_sealed(
-    store: &Store,
+    store: &dyn HotStore,
     dir: &std::path::Path,
     webhooks: &[Webhook],
     sealed_to: u64,
@@ -150,6 +150,7 @@ pub fn deliver_sealed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
     /// HMAC-SHA256 known-answer (the standard RFC test vector), so the hand-rolled construction is
     /// provably correct.

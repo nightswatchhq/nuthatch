@@ -19,6 +19,7 @@
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -55,6 +56,88 @@ impl std::fmt::Display for HotScanTooLarge {
 }
 
 impl std::error::Error for HotScanTooLarge {}
+
+/// The hot store, behind a trait (RFC-0022 slice 1).
+///
+/// Everything above finality lives here: decoded rows, the ingest cursor, block-hash checkpoints for
+/// reorg detection, and the delivery outbox. Sealed Parquet is a separate, immutable layer and is not
+/// this trait's business.
+///
+/// **Why it exists.** RFC-0022 places *cursors* on machines, and a cursor cannot move to another
+/// machine while its state is welded to a local redb file. `CLAUDE.md` has always required the
+/// backend to sit behind a trait with no `#[cfg]` forks of business logic; until now it did not, and
+/// every module named redb directly. This is that seam, cut ahead of the Postgres implementation
+/// rather than during it, so the refactor and the new backend can be reviewed - and blamed -
+/// separately.
+///
+/// **The contract a second implementation must honour**, none of which is inferable from the
+/// signatures alone:
+///
+/// - [`commit_window`](HotStore::commit_window) is **atomic**. Rows, checkpoint and cursor advance
+///   land together or not at all, so a crash mid-window leaves the previous window's state intact.
+///   This is what `e2e_crash_safety` pins, and it is not negotiable for a backend claiming parity.
+/// - **Single writer.** Exactly one task mutates a given store. An implementation may assume it and
+///   must not silently repair concurrent writes - under RFC-0022 the assumption becomes a cursor
+///   lease, and a backend that quietly tolerated two writers would hide the very bug the lease
+///   exists to prevent.
+/// - **Keys order by block.** [`Store::entity_key`] is zero-padded so lexicographic order is block
+///   order, and every range scan here depends on it.
+/// - **Reads see committed state only.** No dirty reads; `/sql` attaches read-only against this.
+///
+/// `open` and `entity_key` are deliberately absent: one is a constructor (backends are chosen by
+/// config, not by a trait method) and the other is a pure function of its arguments.
+#[async_trait::async_trait]
+pub trait HotStore: Send + Sync {
+    // ---- entities ---------------------------------------------------------------------------
+    fn put_entity(&self, key: &str, json: &str) -> Result<()>;
+    fn get_entity(&self, key: &str) -> Result<Option<String>>;
+    fn count(&self) -> Result<u64>;
+    fn recent(&self, limit: usize) -> Result<Vec<String>>;
+    fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>>;
+    fn hot_rows_by_table(&self) -> Result<HashMap<String, Vec<serde_json::Value>>>;
+    fn hot_rows_by_table_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Result<HashMap<String, Vec<serde_json::Value>>>;
+    fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
+    fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>>;
+
+    // ---- cursor & meta ----------------------------------------------------------------------
+    fn get_meta(&self, key: &str) -> Result<Option<String>>;
+    fn set_meta(&self, key: &str, value: &str) -> Result<()>;
+    fn indexed_head(&self) -> Result<Option<u64>>;
+    fn sealed_through(&self) -> u64;
+    fn set_block_hash(&self, block: u64, hash: &str) -> Result<()>;
+    fn get_block_hash(&self, block: u64) -> Result<Option<String>>;
+    fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>>;
+
+    // ---- mutation windows (the atomic ones) --------------------------------------------------
+    fn commit_window(
+        &self,
+        entities: &[(String, String)],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> Result<()>;
+    async fn commit_window_blocking(
+        &self,
+        entities: Vec<(String, String)>,
+        checkpoint: Option<(u64, String)>,
+        last_block: u64,
+    ) -> Result<()>;
+    fn rollback_to(&self, block: u64) -> Result<u64>;
+    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64>;
+    fn prune_range(&self, from: u64, to: u64) -> Result<u64>;
+    fn prune_and_set_meta(&self, from: u64, to: u64, meta_key: &str, meta_val: &str)
+        -> Result<u64>;
+
+    // ---- delivery outbox --------------------------------------------------------------------
+    fn outbox_push(&self, payload: &str) -> Result<u64>;
+    fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>>;
+    fn outbox_remove(&self, seq: u64) -> Result<()>;
+    async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()>;
+    fn outbox_len(&self) -> u64;
+    fn outbox_trim(&self, max: u64) -> Result<u64>;
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -626,6 +709,232 @@ impl Store {
             }
         }
         Ok(out)
+    }
+}
+
+/// redb: the embedded implementation, and the only one until RFC-0022 slice 2 adds Postgres.
+///
+/// Every method delegates to the inherent one rather than reimplementing it. Deliberately so: the
+/// inherent methods stay directly callable, and a delegating impl cannot drift from the behaviour the
+/// existing suites already pin.
+#[async_trait::async_trait]
+impl HotStore for Store {
+    fn put_entity(&self, key: &str, json: &str) -> Result<()> {
+        Store::put_entity(self, key, json)
+    }
+    fn get_entity(&self, key: &str) -> Result<Option<String>> {
+        Store::get_entity(self, key)
+    }
+    fn count(&self) -> Result<u64> {
+        Store::count(self)
+    }
+    fn recent(&self, limit: usize) -> Result<Vec<String>> {
+        Store::recent(self, limit)
+    }
+    fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
+        Store::recent_by_table(self, table, limit)
+    }
+    fn hot_rows_by_table(&self) -> Result<HashMap<String, Vec<serde_json::Value>>> {
+        Store::hot_rows_by_table(self)
+    }
+    fn hot_rows_by_table_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
+        Store::hot_rows_by_table_bounded(self, max_rows)
+    }
+    fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
+        Store::entities_in_range(self, from, to)
+    }
+    fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
+        Store::sample_entity_keys(self, limit)
+    }
+    fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        Store::get_meta(self, key)
+    }
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        Store::set_meta(self, key, value)
+    }
+    fn indexed_head(&self) -> Result<Option<u64>> {
+        Store::indexed_head(self)
+    }
+    fn sealed_through(&self) -> u64 {
+        Store::sealed_through(self)
+    }
+    fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
+        Store::set_block_hash(self, block, hash)
+    }
+    fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
+        Store::get_block_hash(self, block)
+    }
+    fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
+        Store::checkpoints_desc(self)
+    }
+    fn commit_window(
+        &self,
+        entities: &[(String, String)],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> Result<()> {
+        Store::commit_window(self, entities, checkpoint, last_block)
+    }
+    fn rollback_to(&self, block: u64) -> Result<u64> {
+        Store::rollback_to(self, block)
+    }
+    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
+        Store::rollback_to_and_set_meta(self, block, meta_key, meta_val)
+    }
+    fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
+        Store::prune_range(self, from, to)
+    }
+    fn prune_and_set_meta(
+        &self,
+        from: u64,
+        to: u64,
+        meta_key: &str,
+        meta_val: &str,
+    ) -> Result<u64> {
+        Store::prune_and_set_meta(self, from, to, meta_key, meta_val)
+    }
+    fn outbox_push(&self, payload: &str) -> Result<u64> {
+        Store::outbox_push(self, payload)
+    }
+    fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+        Store::outbox_pending(self, limit)
+    }
+    fn outbox_remove(&self, seq: u64) -> Result<()> {
+        Store::outbox_remove(self, seq)
+    }
+    fn outbox_len(&self) -> u64 {
+        Store::outbox_len(self)
+    }
+    fn outbox_trim(&self, max: u64) -> Result<u64> {
+        Store::outbox_trim(self, max)
+    }
+    async fn commit_window_blocking(
+        &self,
+        entities: Vec<(String, String)>,
+        checkpoint: Option<(u64, String)>,
+        last_block: u64,
+    ) -> Result<()> {
+        Store::commit_window_blocking(self, entities, checkpoint, last_block).await
+    }
+    async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
+        Store::outbox_remove_batch_blocking(self, seqs).await
+    }
+}
+
+/// An `Arc<dyn HotStore>` is itself a `HotStore`.
+///
+/// Without this, every shared handle needs an explicit `&*store` at each call - noise that says
+/// nothing, and that would only multiply under RFC-0022 where workers and FE nodes hold the store
+/// behind an `Arc` by construction. Sharing a store is not a different capability from having one.
+#[async_trait::async_trait]
+impl<T: HotStore + ?Sized> HotStore for Arc<T> {
+    fn put_entity(&self, key: &str, json: &str) -> Result<()> {
+        (**self).put_entity(key, json)
+    }
+    fn get_entity(&self, key: &str) -> Result<Option<String>> {
+        (**self).get_entity(key)
+    }
+    fn count(&self) -> Result<u64> {
+        (**self).count()
+    }
+    fn recent(&self, limit: usize) -> Result<Vec<String>> {
+        (**self).recent(limit)
+    }
+    fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
+        (**self).recent_by_table(table, limit)
+    }
+    fn hot_rows_by_table(&self) -> Result<HashMap<String, Vec<serde_json::Value>>> {
+        (**self).hot_rows_by_table()
+    }
+    fn hot_rows_by_table_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
+        (**self).hot_rows_by_table_bounded(max_rows)
+    }
+    fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
+        (**self).entities_in_range(from, to)
+    }
+    fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
+        (**self).sample_entity_keys(limit)
+    }
+    fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        (**self).get_meta(key)
+    }
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        (**self).set_meta(key, value)
+    }
+    fn indexed_head(&self) -> Result<Option<u64>> {
+        (**self).indexed_head()
+    }
+    fn sealed_through(&self) -> u64 {
+        (**self).sealed_through()
+    }
+    fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
+        (**self).set_block_hash(block, hash)
+    }
+    fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
+        (**self).get_block_hash(block)
+    }
+    fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
+        (**self).checkpoints_desc()
+    }
+    fn commit_window(
+        &self,
+        entities: &[(String, String)],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> Result<()> {
+        (**self).commit_window(entities, checkpoint, last_block)
+    }
+    fn rollback_to(&self, block: u64) -> Result<u64> {
+        (**self).rollback_to(block)
+    }
+    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
+        (**self).rollback_to_and_set_meta(block, meta_key, meta_val)
+    }
+    fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
+        (**self).prune_range(from, to)
+    }
+    fn prune_and_set_meta(
+        &self,
+        from: u64,
+        to: u64,
+        meta_key: &str,
+        meta_val: &str,
+    ) -> Result<u64> {
+        (**self).prune_and_set_meta(from, to, meta_key, meta_val)
+    }
+    fn outbox_push(&self, payload: &str) -> Result<u64> {
+        (**self).outbox_push(payload)
+    }
+    fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+        (**self).outbox_pending(limit)
+    }
+    fn outbox_remove(&self, seq: u64) -> Result<()> {
+        (**self).outbox_remove(seq)
+    }
+    fn outbox_len(&self) -> u64 {
+        (**self).outbox_len()
+    }
+    fn outbox_trim(&self, max: u64) -> Result<u64> {
+        (**self).outbox_trim(max)
+    }
+    async fn commit_window_blocking(
+        &self,
+        entities: Vec<(String, String)>,
+        checkpoint: Option<(u64, String)>,
+        last_block: u64,
+    ) -> Result<()> {
+        (**self)
+            .commit_window_blocking(entities, checkpoint, last_block)
+            .await
+    }
+    async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
+        (**self).outbox_remove_batch_blocking(seqs).await
     }
 }
 
