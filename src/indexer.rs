@@ -415,6 +415,7 @@ pub async fn spawn_nest(
         window_override,
         admin_enabled,
         admin_token,
+        None,
     )
     .await?;
     // Kick off the indexing loop in the background; serve the API on this task.
@@ -1163,6 +1164,7 @@ pub async fn spawn_roost(
             window_override,
             admin_enabled,
             admin_token.clone(),
+            None,
         )
         .await?;
         window.get_or_insert(w);
@@ -1233,6 +1235,10 @@ pub async fn build_and_prepare_nest(
     window_override: Option<u64>,
     admin_enabled: bool,
     admin_token: Option<String>,
+    // Hot store to use instead of opening this nest's local redb (RFC-0022 slice 3). A query-FE node
+    // is handed the shared store the writer is filling; `None` keeps the embedded behaviour, which is
+    // every existing caller.
+    store_override: Option<Arc<dyn crate::store::HotStore>>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
@@ -1246,6 +1252,7 @@ pub async fn build_and_prepare_nest(
         window_override,
         admin_enabled,
         admin_token,
+        store_override,
     )
     .await?;
     let next = nest
@@ -1271,6 +1278,7 @@ async fn build_nest(
     window_override: Option<u64>,
     admin_enabled: bool,
     admin_token: Option<String>,
+    store_override: Option<Arc<dyn crate::store::HotStore>>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
@@ -1297,6 +1305,9 @@ async fn build_nest(
         );
     }
 
+    // The concrete redb handle is still needed by the view rebuilds below, which take `&Store`; the
+    // override only replaces what the ingest and serving sides *hold*. Slice 3b moves the rebuild
+    // helpers onto the trait so an FE never touches a local file at all.
     let store = Store::open(&dir.join(DB_FILE))?;
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.
@@ -1460,7 +1471,10 @@ async fn build_nest(
     // One `Arc` per nest, shared by the ingest side and the serving side. They must be the *same*
     // handle: a second `Store::open` on the same file would be a second writer, which the trait's
     // contract forbids.
-    let shared_store: Arc<dyn crate::store::HotStore> = Arc::new(store.clone());
+    let shared_store: Arc<dyn crate::store::HotStore> = match store_override {
+        Some(s) => s,
+        None => Arc::new(store.clone()),
+    };
     let nest = NestIngest {
         name: config.nest.name.clone(),
         dir: dir.clone(),
@@ -1523,6 +1537,90 @@ async fn build_nest(
     };
 
     Ok((nest, app_state, alert_worker, window))
+}
+
+/// The **query-FE role** (RFC-0022 §1): serve a nest from a shared hot store without indexing it.
+///
+/// A writer somewhere owns the cursor and fills the store; this process answers reads from it. There
+/// is no ingest loop, no tip poller and no cursor - so an operator scales serving capacity by adding
+/// these, and ingestion throughput by adding writers, without the two being the same dial.
+///
+/// **Why it reuses `build_nest` rather than assembling its own state.** The serving surface depends
+/// on a pile of derived things - the decode registry, the balance/exposure/velocity views, the table
+/// schemas, the nest metadata blob - and a second construction path for them is a second place for
+/// them to drift. `build_nest` already builds all of it *without* starting ingestion (spawning the
+/// loop is the caller's job), so the FE takes the state it returns and simply never spawns anything.
+/// The ingest half is dropped on the floor, which is exactly the semantics wanted.
+///
+/// The one honest seam today: the view rebuilds still read the nest's local redb even when serving a
+/// Postgres store, so an FE currently wants the nest directory on disk. Slice 3b moves those helpers
+/// onto the trait; until then this is a real limitation rather than a rough edge, and it is why the
+/// compose file mounts the nest directory into the FE.
+pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
+    let dir = PathBuf::from(&args.dir);
+    let config = Config::load(&dir)
+        .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
+
+    let store_override: Option<Arc<dyn crate::store::HotStore>> = match &args.hot_store {
+        Some(url) => Some(open_shared_hot_store(url, &config.nest.name)?),
+        None => None,
+    };
+
+    // No `Source` is ever polled on this role; the parameter exists for the ingest half we discard.
+    let source: Arc<dyn Source> =
+        Arc::new(crate::rpc::RpcClient::new(config.nest.rpc_urls.clone())?);
+
+    let admin_token = admin_token_env();
+    let (_ingest, state, alert_worker, _window) = build_nest(
+        &source,
+        dir.clone(),
+        &config,
+        None,
+        args.admin,
+        admin_token,
+        store_override,
+    )
+    .await?;
+
+    // The delivery worker belongs to whoever owns the cursor. Two processes draining one outbox would
+    // deliver the same webhook twice, and at-least-once is a promise about failure, not a licence to
+    // duplicate on the happy path.
+    if let Some(w) = alert_worker {
+        w.abort();
+        let _ = w.await;
+    }
+
+    tracing::info!(
+        nest = %config.nest.name,
+        chain = %config.nest.chain,
+        listen = %args.listen,
+        store = %args.hot_store.as_deref().map(shorten_store).unwrap_or("local redb"),
+        "serving read-only (RFC-0022 query-FE role) - this process owns no cursor"
+    );
+
+    serve::run(&args.listen, state).await
+}
+
+/// Open the shared hot store an FE serves from.
+#[cfg(feature = "postgres-store")]
+fn open_shared_hot_store(url: &str, nest: &str) -> Result<Arc<dyn crate::store::HotStore>> {
+    Ok(Arc::new(crate::pgstore::PgStore::connect(url, nest)?))
+}
+
+#[cfg(not(feature = "postgres-store"))]
+fn open_shared_hot_store(_url: &str, _nest: &str) -> Result<Arc<dyn crate::store::HotStore>> {
+    anyhow::bail!(
+        "--hot-store needs a build with `--features postgres-store`. The default binary is the \
+         embedded one and deliberately carries no database driver (CLAUDE.md non-negotiable 1)."
+    )
+}
+
+/// A connection string minus any password, for logging.
+fn shorten_store(url: &str) -> &str {
+    match url.find("://") {
+        Some(i) => &url[..i],
+        None => "shared",
+    }
 }
 
 /// Batch size (rows) at which `backfill_direct` flushes a sealed segment - bounds RSS during a
@@ -4260,7 +4358,7 @@ template = "pool"
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let (nest, _state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None)
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
                 .await
                 .unwrap();
         if let Some(w) = worker {

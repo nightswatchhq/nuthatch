@@ -828,6 +828,7 @@ impl RoostHandles {
             self.mount_ctx.window_override,
             self.mount_ctx.admin_enabled,
             self.mount_ctx.admin_token.clone(),
+            None,
         )
         .await
         .with_context(|| format!("preparing nest '{name}' for mount"))?;

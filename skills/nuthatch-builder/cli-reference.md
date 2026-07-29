@@ -283,6 +283,15 @@ Screen sealed transfers against a list snapshot, recording `sanction_hit` annota
 - `--to <TO>` - Last block of the range to screen (inclusive)
 - `--dir <DIR>` - Nest directory (must contain a `nuthatch.toml` and sealed segments over the range)
 
+## `nuthatch serve`
+
+Serve a nest **read-only** from a shared hot store, without indexing it (RFC-0022 slice 3)
+
+- `--dir <DIR>` - Project directory (must contain a nuthatch.toml)
+- `--listen <LISTEN>` - Address to bind the HTTP API to
+- `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Omit to serve the nest's local redb, which read-scales a single box but shares a file rather than a service. Requires a build with `--features postgres-store`
+- `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
+
 ## `nuthatch sql`
 
 Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table

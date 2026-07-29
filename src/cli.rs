@@ -21,6 +21,12 @@ pub enum Command {
     Add(AddArgs),
     /// Run the indexer: poll logs, store entities, and serve the API.
     Dev(DevArgs),
+    /// Serve a nest **read-only** from a shared hot store, without indexing it (RFC-0022 slice 3).
+    ///
+    /// The query-FE half of scaled mode: it answers entity reads and SQL from state a *writer*
+    /// elsewhere is filling, owns no cursor, and never advances one. Scale it independently of
+    /// ingestion - that is the entire point of splitting the planes.
+    Serve(ServeArgs),
     /// Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table.
     Sql(SqlArgs),
     /// Run a WASM transform component over a project's stored transfers.
@@ -695,6 +701,28 @@ pub struct AddArgs {
     /// (repeatable). Point at your own node to dodge public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct ServeArgs {
+    /// Project directory (must contain a nuthatch.toml).
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+
+    /// Address to bind the HTTP API to.
+    #[arg(long, default_value = "127.0.0.1:8288")]
+    pub listen: String,
+
+    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Omit to serve the
+    /// nest's local redb, which read-scales a single box but shares a file rather than a service.
+    /// Requires a build with `--features postgres-store`.
+    #[arg(long)]
+    pub hot_store: Option<String>,
+
+    /// Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node
+    /// owns no cursor, so the lifecycle routes it would expose have nothing to act on.
+    #[arg(long)]
+    pub admin: bool,
 }
 
 #[derive(Args)]
