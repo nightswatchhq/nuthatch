@@ -61,8 +61,44 @@ jobs:
             nuthatch-${{ matrix.target }}.tar.gz
             nuthatch-${{ matrix.target }}.tar.gz.sha256
           fail_on_unmatched_files: true
-      # Hand the Linux binary to the container job so the image ships the *same* artifact that is
-      # attached to the release, rather than a second build nobody diffed.
+      # The **scaled-mode** binary: the same source with `--features postgres-store`, which is what a
+      # fleet operator needs (`nuthatch worker`, `nuthatch control`, `serve --hot-store`). Built and
+      # shipped separately rather than folded into the default one, because non-negotiable 1 says the
+      # primary artifact runs with zero external services - and a binary carrying a Postgres driver is
+      # a different promise even if it behaves identically when you do not use it.
+      #
+      # Without this, scaled mode was build-from-source only, which is not a deployment story.
+      - name: build (scaled)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --locked --features postgres-store --target ${{ matrix.target }}
+      - name: package (scaled)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          tarball="nuthatch-scaled-${{ matrix.target }}.tar.gz"
+          tar czf "$tarball" -C "target/${{ matrix.target }}/release" nuthatch
+          shasum -a 256 "$tarball" > "$tarball.sha256"
+          ls -lh "$tarball"
+      - name: attach scaled build to release
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nuthatch-scaled-${{ matrix.target }}.tar.gz
+            nuthatch-scaled-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+      - name: keep the scaled binary for the image
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuthatch-scaled-binary
+          path: target/${{ matrix.target }}/release/nuthatch
+          retention-days: 1
+      # Hand the *default* Linux binary to the container job so the image ships the same artifact that
+      # is attached to the release, rather than a second build nobody diffed. Note this step runs after
+      # the scaled build overwrote the binary, so it re-runs the default build first.
+      - name: rebuild the default binary for the image
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: keep the linux binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@v4
@@ -110,3 +146,23 @@ jobs:
             docker tag nuthatch:candidate "ghcr.io/${{ github.repository }}:$tag"
             docker push "ghcr.io/${{ github.repository }}:$tag"
           done
+      # The scaled-mode image, tagged `-scaled`. Same Dockerfile, different binary. **Not** tagged
+      # `latest`: the default image stays the one you get by not thinking about it, because embedded
+      # mode is the primary deliverable and the scaled one carries a database driver.
+      - name: fetch the scaled binary
+        uses: actions/download-artifact@v4
+        with:
+          name: nuthatch-scaled-binary
+          path: scaled
+      - name: build, test and push the scaled image
+        run: |
+          cp scaled/nuthatch ./nuthatch
+          docker build --platform linux/amd64 -t nuthatch:scaled .
+          # Same ordering discipline as above - prove it runs before publishing it. The extra check
+          # here is that the scaled subcommands actually exist, which is the entire point of the image:
+          # a `-scaled` tag whose binary lacks `worker` would be worse than no tag.
+          docker run --rm nuthatch:scaled --version
+          docker run --rm nuthatch:scaled worker --help > /dev/null
+          docker run --rm nuthatch:scaled control --help > /dev/null
+          docker tag nuthatch:scaled "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
+          docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"

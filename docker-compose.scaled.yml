@@ -13,8 +13,9 @@
 #   docker compose -f docker-compose.scaled.yml --profile fleet up \
 #     --scale writer=2 --scale fe=3        # control plane + a writer pool + an FE tier
 #
-# The fleet profile needs an image built with `--features postgres-store`; the published image is the
-# embedded build and deliberately carries no database driver.
+# The fleet profile needs the **scaled** image - `ghcr.io/nuthatch-indexer/nuthatch:<version>-scaled`.
+# The default published image is the embedded build and deliberately carries no database driver, so
+# `worker` and `control` are not in it. Set `NUTHATCH_IMAGE` to pick a version.
 
 services:
   postgres:
@@ -48,7 +49,7 @@ services:
   # `NUTHATCH_CONTROL_TOKEN` rather than merely warning about it.
   control:
     profiles: ["fleet"]
-    image: nuthatch-scaled:local
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
@@ -73,7 +74,7 @@ services:
   # each believed was its own lease - so it is derived rather than configured.
   writer:
     profiles: ["fleet"]
-    image: nuthatch-scaled:local
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
@@ -87,7 +88,7 @@ services:
   # one freely - `docker compose --profile fleet up --scale fe=5` - because nothing here writes.
   fe:
     profiles: ["fleet"]
-    image: nuthatch-scaled:local
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
