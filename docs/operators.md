@@ -79,7 +79,7 @@ A container image is published per release:
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
   -e NUTHATCH_ADMIN_TOKEN=change-me \
-  ghcr.io/nuthatch-indexer/nuthatch:0.8.2
+  ghcr.io/nightswatchhq/nuthatch:0.8.2
 ```
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
@@ -107,7 +107,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nuthatch-indexer/nuthatch:0.8.2-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:0.8.2-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
