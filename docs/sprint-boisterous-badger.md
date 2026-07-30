@@ -117,6 +117,63 @@ Slice 5 (adaptive windows on the pipelined path) is the remainder of RFC-0029 an
 
 ---
 
+## The road to 1.0 (decided 2026-07-30)
+
+**Goal: close every RFC that does not need a reth node, then decide about 1.0.** Reth is a purchase
+decision (§4), so the pre-1.0 set is defined by what a laptop, a Hetzner **Cloud** token and an archive
+**RPC** can reach - which turns out to be everything else.
+
+Ordered by dependency, not by appeal. Spend is batched deliberately: Hetzner bills hourly, so the
+Cloud items come up together and go down together rather than billing while someone thinks.
+
+| # | Item | Needs | Spend | Gate |
+|---|---|---|---|---|
+| 1 | **0.9.0** - RFC-0029 complete | the timestamped A/B to finish | none | in flight |
+| 2 | **RFC-0022 slice 3b** - view rebuilds onto `HotStore` | nothing - pure code | none | lets the compose FE mount go back to `:ro` |
+| 3 | **Multi-machine verification** | 3 Cloud boxes | ~EUR 0.03/hr | the **last unverified claim** in prod-readiness §11 |
+| 4 | **RFC-0013** - DataFusion | one `ccx63`, hourly | ~EUR 0.30/hr | **the benchmark is the deliverable** |
+| 5 | **RFC-0023 tier 3** | an archive RPC (have one) | none | acceptance test already written |
+| 6 | **GraphOps** | a conversation | none | cheapest item; may reorder 3-5 |
+
+### The quality track (runs alongside 1-6, not after)
+
+Closing RFCs is not the same as being ready to call something 1.0, and this is the half that decides
+it. These are **not** gated on anything and should be interleaved with the items above rather than
+queued behind them - a security finding on day 8 is much cheaper than one on day 1 of 1.0.
+
+| # | Item | What it actually means |
+|---|---|---|
+| 7 | **Security audit** | The untrusted surface is `/sql`, the admin routes, the control-plane API and anything reading a nest bundle. Prior waves found a stacked-`COPY TO` arbitrary file write (#153) and an ABI-path traversal (#149) - assume more. Re-run the full adversary pass, not just the regression tests for known finds. **Also: publish GHSA-jvjx-5528-r6mm**, fixed in 0.6.2 and still unpublished |
+| 8 | **Hardening pass** | Fault quarantine (RFC-0026) covers indexing faults; the gaps are elsewhere. Property-test reorg convergence at depths we have not tried, and fuzz the decode path against malformed ABIs and logs |
+| 9 | **Performance audit** | We now have honest instruments (RFC-0029 §6e) and one real workload. Extend to the RFC-0004 W1/W2/W3 set, publish `bench-report.json` per workload with provider+hardware, and set the CI regression thresholds off *measured* numbers rather than guesses. Includes the still-open `--concurrency 16` vs `1` criterion |
+| 10 | **Docs pass** | The two stale-doc corrections this sprint were not bad luck - five wrong claims surfaced in one week. Verify every claim against a running binary, not against memory. `verification.md`'s "verified by us" table is the honest core; keep it honest |
+| 11 | **Website** | Currently says nothing about OBIB, scaled mode, or the roost. It is the first thing GraphOps and every operator sees, and it is a release behind the product |
+
+**Ordering note:** 10 and 11 should come *after* 1-6, or they will be rewritten twice. 7-9 should start
+immediately and run continuously - they are the ones whose findings change what gets built.
+
+**Parked, and only these:** RFC-0003 (ExEx tip mode), RFC-0014 (extraction), RFC-0024 (eth-call
+execution engine - a research note behind 0023 by its own framing). All three wait on the dedicated
+box in §4. Nothing else is blocked on anything.
+
+**What "1.0" should mean, before anyone assumes:** this list closes the RFCs we *can* close. It does
+not by itself make the version 1.0 - that is a separate judgement about API stability and the §683
+stability contract, and it should be argued on its own terms rather than falling out of a checklist.
+Worth settling explicitly when items 1-6 are done, not before.
+
+### Two corrections that shaped this list
+
+Both were **stale documentation**, not engineering, and both cost real time - which is why the
+standing practice below now includes re-testing gates:
+
+- **RFC-0022 was marked "design only, build deferred"** in the RFC index while it had been shipped
+  (0.8.0/0.8.1) and fleet-verified 10/10 for a week. The index is the first thing an operator reads.
+- **RFC-0023 was marked blocked on "an archive endpoint"**, which got read as "an archive *node*". The
+  RFC asks for an archive **RPC**; a stock Alchemy key serves pinned-block `eth_call`. A buildable item
+  sat blocked for a week over a compressed phrase.
+
+---
+
 ## Carried over, not scope
 
 Small, and worth doing when they block someone rather than on a schedule:
@@ -140,6 +197,17 @@ From amiable-axolotl, reinforced hard by the 0.8.0 → 0.8.1 sequence:
   functions not crossing a subshell. None was reachable by a unit test.
 - **Ask who calls this.** `reconcile::tick` had six passing tests against a live Postgres and no
   caller, so three documents described behaviour that did not exist.
-- **A skip is not a pass**, and a mutation that does not mutate is not a test. Both bit this week.
+- **A skip is not a pass**, and a mutation that does not mutate is not a test. Both bit this week -
+  and again on 2026-07-30, twice in one afternoon: `cargo test --lib "a\|b"` silently matches **nothing**
+  (cargo takes a substring, not a regex), so a mutation run reported "ok" across the board while
+  testing zero tests; and a dense-range test passed against a deliberately broken controller because
+  its range was too short for the runaway to show.
+- **Re-test gates before planning around them.** A gate recorded once and never re-checked becomes
+  folklore, and folklore decides what you build next. Two items in this sprint were mis-blocked by
+  stale notes (see "The road to 1.0"). This is "run it, do not reason about it" applied to the backlog.
+- **Benchmark against a real provider, not a mock.** The OBIB A/B found a backfill-killing defect
+  (`fix/rfc-0029-body-read-timeout-is-narrowable`) that no mock could surface, because mocks do not
+  stream slow multi-megabyte bodies. And **test the confound**: the first OBIB run was 3.9x slower than
+  the second, which looked exactly like provider caching until a shifted-range control ruled it out.
 - **Keep verification.md's "what we have verified" table honest.** Moving a row to ✅ without evidence
   recreates the problem the document exists to solve.
