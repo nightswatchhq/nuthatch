@@ -58,7 +58,7 @@ services:
   # `NUTHATCH_CONTROL_TOKEN` rather than merely warning about it.
   control:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.1-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
@@ -88,7 +88,7 @@ services:
   # each believed was its own lease - so it is derived rather than configured.
   writer:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.1-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     # `worker`, not `dev`. `dev` indexes a nest directory it owns outright and knows nothing about the
@@ -111,7 +111,7 @@ services:
   # one freely - `docker compose --profile fleet up --scale fe=5` - because nothing here writes.
   fe:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.1-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
