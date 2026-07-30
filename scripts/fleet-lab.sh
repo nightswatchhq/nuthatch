@@ -9,8 +9,8 @@
 #   ./scripts/fleet-lab.sh up single    # one box: levels 0-4 + the compose fleet on one host
 #   ./scripts/fleet-lab.sh up multi     # three boxes + a private network: adds 5.4/5.5 across machines
 #   ./scripts/fleet-lab.sh verify
-#   ./scripts/fleet-lab.sh partition    # cut a writer off the control plane, then heal it
-#   ./scripts/fleet-lab.sh skew         # push a writer's clock forward
+#   ./scripts/fleet-lab.sh partition    # cut a writer off the control-plane API, assert it keeps indexing
+#   ./scripts/fleet-lab.sh skew         # push a writer clock forward, assert the lease does not move
 #   ./scripts/fleet-lab.sh down         # destroy everything this script created
 #
 # ## This spends money
@@ -203,27 +203,115 @@ cmd_verify() {
 }
 
 # The two things a single host cannot fake. Both free - firewall rules and a clock.
+# Both of these used to *print* what to expect and leave the operator to squint at logs. That made
+# them unfalsifiable: run it, see no explosion, tick the box - in the one document whose entire job is
+# to be falsifiable. They now assert and exit non-zero, so "verified" means a machine checked it.
+#
+# Writing the assertions surfaced two defects in the tests themselves, which is exactly what an
+# unasserted test hides:
+#
+#   1. `partition` blocked the whole control-plane HOST. In the `multi` shape Postgres runs on that
+#      same box, so it cut the writer off from its **hot store** as well - and a writer that cannot
+#      reach its store cannot index at all. The stated expectation ("the cursor it holds STILL
+#      INDEXING") was therefore impossible to satisfy. It now blocks **only the control-plane API
+#      port**, leaving 5432 reachable, which is the invariant we actually care about: the control
+#      plane schedules, the store serves, and losing the former must not stop ingestion.
+#
+#   2. Both drafts polled the writer's `/metrics`. `worker` serves no HTTP at all and publishes no
+#      port. Progress is instead read from the **shared Postgres**, which is a better signal anyway:
+#      it proves the write landed in the store rather than that a process incremented a counter.
+CONTROL_PORT="${CONTROL_PORT:-8290}"
+
+# Run a query on the control box's Postgres. The lab driver reaches it directly, so this keeps working
+# while a *writer* is partitioned from it - which is what lets us observe the writer during the cut.
+psql_cp() { # psql_cp <control-ip> <sql>
+  ssh -o StrictHostKeyChecking=no "root@$1" \
+    "docker compose -f docker-compose.scaled.yml exec -T postgres psql -U nuthatch -tAc \"$2\"" \
+    2>/dev/null | tr -d '\r'
+}
+
+# The nest schema, discovered rather than assumed - `PgStore` creates one schema per nest.
+nest_schema() { psql_cp "$1" "select table_schema from information_schema.tables where table_name='meta' limit 1" | head -1; }
+
+meta_value() { # meta_value <control-ip> <schema> <key>
+  psql_cp "$1" "select value from \\\"$2\\\".meta where key='$3'" | head -1
+}
+
 cmd_partition() {
   local w; w=$(ips_by_role | awk '$1=="writer"{print $2}' | head -1)
   local cp; cp=$(ips_by_role | awk '$1=="control"{print $2}' | head -1)
   [ -z "$w" ] || [ -z "$cp" ] && { echo "needs the 'multi' shape"; exit 1; }
-  echo "cutting $w off the control plane at $cp for 60s"
-  ssh "root@$w" "iptables -I OUTPUT -d $cp -j DROP"
-  echo "  expect: reconcile ticks failing, and the cursor it holds STILL INDEXING - a control-plane"
-  echo "  outage must stop rescheduling, not ingestion."
-  sleep 60
-  ssh "root@$w" "iptables -D OUTPUT -d $cp -j DROP"
-  echo "healed. expect it to resume reconciling without having lost its lease."
+  local sch; sch=$(nest_schema "$cp")
+  [ -z "$sch" ] && { echo "FAIL: no nest schema in Postgres - is the fleet indexing? run 'verify' first"; exit 1; }
+
+  local before; before=$(meta_value "$cp" "$sch" last_block)
+  [ -z "$before" ] && { echo "FAIL: no last_block in $sch.meta - nothing has indexed yet"; exit 1; }
+  echo "last_block=$before; cutting writer $w off the control-plane API ($cp:$CONTROL_PORT) for 90s"
+  echo "  (Postgres on :5432 stays reachable - this is a control-plane outage, not a store outage)"
+
+  ssh "root@$w" "iptables -I OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"
+  # Heal on any exit, including Ctrl-C: a lab box left firewalled is a confusing bill later.
+  trap "ssh root@$w 'iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP' 2>/dev/null || true" EXIT
+  sleep 90
+  local during; during=$(meta_value "$cp" "$sch" last_block)
+  ssh "root@$w" "iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"; trap - EXIT
+  echo "healed. last_block during the cut: ${during:-none}"
+
+  if [ -z "$during" ] || [ "$during" -le "$before" ]; then
+    echo "FAIL: last_block did not advance during the partition ($before -> ${during:-none})."
+    echo "      Losing the control plane must not stop the cursor. That split is the design:"
+    echo "      the control plane schedules, the writer indexes."
+    exit 1
+  fi
+  echo "PASS: indexed through the partition ($before -> $during) with the control plane unreachable"
+
+  sleep 30
+  local after; after=$(meta_value "$cp" "$sch" last_block)
+  if [ -z "$after" ] || [ "$after" -lt "$during" ]; then
+    echo "FAIL: did not resume cleanly after healing (during=$during after=${after:-none})"
+    exit 1
+  fi
+  echo "PASS: resumed after healing ($during -> $after)"
 }
 
 cmd_skew() {
   local w; w=$(ips_by_role | awk '$1=="writer"{print $2}' | head -1)
-  [ -z "$w" ] && { echo "needs the 'multi' shape"; exit 1; }
-  echo "pushing $w's clock 10 minutes forward"
+  local cp; cp=$(ips_by_role | awk '$1=="control"{print $2}' | head -1)
+  [ -z "$w" ] || [ -z "$cp" ] && { echo "needs the 'multi' shape"; exit 1; }
+  local sch; sch=$(nest_schema "$cp")
+  [ -z "$sch" ] && { echo "FAIL: no nest schema in Postgres - run 'verify' first"; exit 1; }
+
+  # A lease is two rows in the per-nest `meta` table (`lease_owner` / `lease_expires_at`, see
+  # `store.rs`); `expires_at` is unix seconds **on the store's clock**, which is the authority this
+  # test exists to prove. (An earlier draft queried a `cursor_lease` table that does not exist - it
+  # would have returned empty forever and "passed" by never contradicting anything.)
+  local owner_before; owner_before=$(meta_value "$cp" "$sch" lease_owner)
+  local exp_before;   exp_before=$(meta_value "$cp" "$sch" lease_expires_at)
+  [ -z "$owner_before" ] && { echo "FAIL: no lease to observe in $sch.meta"; exit 1; }
+  echo "lease before: owner=$owner_before expires_at=$exp_before"
+
+  echo "pushing writer $w's clock 10 minutes forward"
   ssh "root@$w" 'timedatectl set-ntp false && date -s "+10 minutes" && date'
-  echo "  expect: no change in lease behaviour. Expiry is measured on the DATABASE's clock, so a"
-  echo "  worker with a wrong clock must not gain or lose a lease it should not have."
-  echo "  restore with: ssh root@$w 'timedatectl set-ntp true'"
+  trap "ssh root@$w 'timedatectl set-ntp true' 2>/dev/null || true" EXIT
+  sleep 60
+  local owner_after; owner_after=$(meta_value "$cp" "$sch" lease_owner)
+  local exp_after;   exp_after=$(meta_value "$cp" "$sch" lease_expires_at)
+  ssh "root@$w" 'timedatectl set-ntp true'; trap - EXIT
+  echo "lease after:  owner=${owner_after:-none} expires_at=${exp_after:-none}"
+
+  if [ "$owner_before" != "$owner_after" ]; then
+    echo "FAIL: the lease changed hands ($owner_before -> ${owner_after:-none}) because a worker's"
+    echo "      clock moved. Expiry is evaluated on the database clock; a worker with a wrong clock"
+    echo "      must neither gain nor lose a lease it should not have."
+    exit 1
+  fi
+  # A renewing owner pushes expiry forward on the DB clock - by seconds, never by the 600 it skewed.
+  local delta=$(( ${exp_after:-0} - ${exp_before:-0} ))
+  if [ "$delta" -ge 300 ]; then
+    echo "FAIL: expiry jumped ${delta}s - the worker's skewed clock leaked into the lease deadline"
+    exit 1
+  fi
+  echo "PASS: lease held by $owner_after throughout; expiry moved ${delta}s on the DB clock, not 600s"
 }
 
 cmd_down() {
