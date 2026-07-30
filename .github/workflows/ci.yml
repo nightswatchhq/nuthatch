@@ -74,7 +74,16 @@ jobs:
 
   fleet:
     name: the compose fleet comes up
-    runs-on: ubuntu-latest
+    # **ubuntu-22.04, not ubuntu-latest**, and for the same reason the release job is pinned: a
+    # dynamically-linked binary needs the glibc it was built against *or newer*, and `Dockerfile` is
+    # `debian:bookworm-slim` (glibc 2.36). Building on 24.04 (2.39) produces a binary the image cannot
+    # run - `version GLIBC_2.39 not found`.
+    #
+    # This is the **third** time this exact trap has bitten: the release binary (#189), a local
+    # cross-build against `rust:1.95` (trixie, 2.41), and now this job. The rule is simple and worth
+    # stating so a fourth is avoided: **any job that builds a binary destined for the container image
+    # must build on a base no newer than the Dockerfile's.**
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
