@@ -1,0 +1,22 @@
+{
+  "bench": "backfill",
+  "label": "cold-cache control: range shifted 3 blocks",
+  "nest": "obib-case1",
+  "chain": "mainnet",
+  "from_block": 0,
+  "to_block": 22199997,
+  "blocks": 22199998,
+  "initial_window": 20,
+  "window_adaptive": true,
+  "seal_direct": true,
+  "concurrency": 8,
+  "runs": 1,
+  "events": 294276,
+  "wall_clock_s": 77.0,
+  "events_per_sec": 3821.79,
+  "peak_rss_mb": 310,
+  "rpc_requests": 321,
+  "commit": "707e1af",
+  "provider": "eth-mainnet.g.alchemy.com",
+  "hardware": "11 cores, 18 GB RAM"
+}

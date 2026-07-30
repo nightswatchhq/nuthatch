@@ -1,0 +1,22 @@
+{
+  "bench": "backfill",
+  "label": "OBIB case 1: LBTC Transfer, blocks 0-22,200,000, --no-timestamps",
+  "nest": "obib-case1",
+  "chain": "mainnet",
+  "from_block": 0,
+  "to_block": 22200000,
+  "blocks": 22200001,
+  "initial_window": 20,
+  "window_adaptive": true,
+  "seal_direct": true,
+  "concurrency": 8,
+  "runs": 3,
+  "events": 294278,
+  "wall_clock_s": 74.79,
+  "events_per_sec": 3934.59,
+  "peak_rss_mb": 320,
+  "rpc_requests": 321,
+  "commit": "707e1af",
+  "provider": "eth-mainnet.g.alchemy.com",
+  "hardware": "11 cores, 18 GB RAM"
+}

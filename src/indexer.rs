@@ -2059,18 +2059,42 @@ pub async fn backfill_direct_pipelined(
 ) -> Result<u64> {
     use futures::stream::StreamExt;
 
-    let mut windows = Vec::new();
-    let mut n = from;
-    while n <= to {
-        let chunk_to = (n + window - 1).min(to);
-        windows.push((n, chunk_to));
-        n = chunk_to + 1;
-    }
+    // **Windows are generated lazily, not listed up front** (RFC-0029 §6f). The old code materialised
+    // the whole range at a fixed width, which meant the `AdaptiveWindow` controller that
+    // `backfill_direct` has always used was bypassed on the *concurrent* path - our fast path was the
+    // one that could not adapt. On a long empty prefix (case 1's 0 → 19.89M) a fixed 10,000-block
+    // window costs ~1,989 requests that return nothing, where a controller growing 4× per empty
+    // response reaches the ceiling in a handful of steps.
+    //
+    // **This is only safe because seal boundaries are data-determined** (RFC-0028 §4): `take_sealable`
+    // cuts at a row count and extends to a block boundary, reading nothing about the window width. So
+    // varying the width cannot vary segment identity, and `pipelined_backfill_matches_sequential`
+    // asserts exactly that - the two paths now adapt on *different* feedback sequences (this one
+    // generates windows ahead of the results that would inform them) and must still seal identical
+    // bytes. If that test ever fails, the boundary has stopped being data-determined; do not adjust
+    // the test.
+    // A `Mutex` rather than a `RefCell` because the whole backfill future is `tokio::spawn`ed and must
+    // be `Send`. The generator and the consumer loop are in fact on the same task, so there is never
+    // contention - but the compiler cannot know that, and one uncontended lock per window is free
+    // beside an RPC round trip.
+    let chunker = std::sync::Arc::new(std::sync::Mutex::new(AdaptiveWindow::for_window(window)));
+    // The generator *owns* a handle rather than borrowing one. Borrowing across the generator's await
+    // makes the whole backfill future carry a higher-ranked lifetime that `tokio::spawn` cannot
+    // satisfy - which shows up far from here, as a "one type is more general than the other" error on
+    // the `index_loop` spawn.
+    let windows = futures::stream::unfold((from, chunker.clone()), move |(next, ch)| async move {
+        if next > to {
+            return None;
+        }
+        let w = ch.lock().expect("window controller").window();
+        let chunk_to = (next.saturating_add(w - 1)).min(to);
+        Some(((next, chunk_to), (chunk_to + 1, ch)))
+    });
 
     // Each window future fetches logs + timestamps and returns its decoded rows as JSON. Borrows
     // (`source`, `registry`, filters) are shared across the concurrent futures - fine, they run on
     // one task; `buffered` yields them back in window order.
-    let mut stream = futures::stream::iter(windows)
+    let stream = windows
         .map(|(w_from, w_to)| async move {
             // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
             // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
@@ -2082,6 +2106,13 @@ pub async fn backfill_direct_pipelined(
                 || fetch_logs_splitting(source, addresses, topic0s, w_from, w_to),
             )
             .await?;
+            // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
+            // log that matches no decoder still costs bytes on the wire and still counts against the
+            // provider's result cap. Feeding it `rows.len()` would make a nest with a narrow event
+            // allowlist - `events = ["Transfer"]` on a chatty contract - see almost every window as
+            // empty and grow to the ceiling against genuinely dense history, which is the one place an
+            // oversized window actually hurts.
+            let fetched = logs.len() as u64;
             let mut rows: Vec<_> = logs
                 .iter()
                 .filter_map(|log| match registry.decode(log) {
@@ -2115,16 +2146,24 @@ pub async fn backfill_direct_pipelined(
                     (r.block_number, r.to_json().to_string())
                 })
                 .collect();
-            Ok::<(u64, Vec<(u64, String)>), anyhow::Error>((w_to, json))
+            Ok::<(u64, u64, Vec<(u64, String)>), anyhow::Error>((w_to, fetched, json))
         })
         .buffered(concurrency.max(1));
+    // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
+    // has to be pinned before it can be polled in a loop.
+    let mut stream = std::pin::pin!(stream);
 
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
     let mut buf: Vec<(u64, String)> = Vec::new();
     let mut batch_from = from;
     let mut total = 0u64;
     while let Some(res) = stream.next().await {
-        let (w_to, json) = res?;
+        let (w_to, fetched, json) = res?;
+        // Feedback lags by up to `concurrency` windows - those are already in flight when this one
+        // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
+        // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
+        // (waiting for feedback before generating the next window) is just the sequential path.
+        chunker.lock().expect("window controller").observed(fetched);
         let n = json.len() as u64;
         total += n;
         buf.extend(json);
@@ -5486,6 +5525,151 @@ rpc_urls = ["https://rpc.example"]
         assert!(
             cfg.nest.block_timestamps,
             "absent must mean on, or upgrading silently drops a column from every table"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // RFC-0029 slice 5: adaptive windows on the pipelined path.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Counts `eth_getLogs` calls, which is the cost §6f is trying to remove.
+    struct RequestCountingSource {
+        logs: Vec<crate::rpc::Log>,
+        calls: std::sync::atomic::AtomicUsize,
+        widest: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RequestCountingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _a: &[String],
+            _t: &[String],
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.widest
+                .fetch_max(to - from + 1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+    }
+
+    /// **The RFC-0029 §6f case.** A long empty prefix at a fixed window costs one request per window
+    /// and returns nothing each time. The controller grows 4× per empty response, so the same range
+    /// costs a handful of requests instead.
+    ///
+    /// Asserted as an *order-of-magnitude* reduction rather than an exact count, because the exact
+    /// count is a function of the damping factor and the ceiling - both of which we should be free to
+    /// tune without rewriting this test. What must not regress is that the pipelined path adapts at
+    /// all, which is what it did not do before.
+    #[tokio::test]
+    async fn the_pipelined_path_grows_its_window_across_an_empty_prefix() {
+        let reg = transfer_registry();
+        // 200,000 empty blocks, then two logs at the very end - the shape of a contract deployed late
+        // in a chain's history, which is most of them.
+        let src = RequestCountingSource {
+            logs: ping_logs(&reg, &[199_998, 199_999]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            widest: std::sync::atomic::AtomicU64::new(0),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let addresses = vec!["0x1111111111111111111111111111111111111111".to_string()];
+
+        let rows = backfill_direct_pipelined(
+            &src,
+            &reg,
+            dir.path(),
+            &addresses,
+            &[],
+            0,
+            199_999,
+            1_000, // a fixed 1,000-block window would need 200 requests
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let calls = src.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let widest = src.widest.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(rows, 2, "it must still find the logs it was looking for");
+        assert!(
+            widest > 1_000,
+            "the window must actually have grown past its starting width (widest was {widest})"
+        );
+        assert!(
+            calls < 40,
+            "a fixed 1,000-block window costs 200 requests here; adaptation should cost a small \
+             fraction of that, but took {calls}"
+        );
+    }
+
+    /// Adaptation must not run away on *dense* history - the direction that actually hurts, because an
+    /// oversized window against a busy contract is what trips a provider's result cap.
+    ///
+    /// The controller is fed raw logs rather than decoded rows for exactly this reason: a nest with a
+    /// narrow event allowlist would otherwise see almost every window as empty and grow to the ceiling
+    /// against history that is anything but.
+    #[tokio::test]
+    async fn a_dense_range_does_not_grow_the_window() {
+        let reg = transfer_registry();
+        // 20,000 dense blocks, not 3,000. A short range cannot distinguish a controller that is
+        // behaving from one that is running away: with only three windows the growth has nowhere to
+        // go before `to` clamps it, and the first version of this test passed against a deliberately
+        // broken controller for exactly that reason.
+        let blocks: Vec<u64> = (0..20_000).collect();
+        let src = RequestCountingSource {
+            logs: ping_logs(&reg, &blocks),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            widest: std::sync::atomic::AtomicU64::new(0),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let addresses = vec!["0x1111111111111111111111111111111111111111".to_string()];
+
+        let rows = backfill_direct_pipelined(
+            &src,
+            &reg,
+            dir.path(),
+            &addresses,
+            &[],
+            0,
+            19_999,
+            1_000,
+            1, // sequential, so every window's feedback lands before the next is generated
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows, 20_000);
+        let widest = src.widest.load(std::sync::atomic::Ordering::SeqCst);
+        // One log per block at a 1,000-block window is 1,000 logs against a 2,000 target, so a working
+        // controller settles around 2,000 blocks. A controller that thinks every window came back
+        // empty grows 4× a step and is past 4,000 by the third window - so this bound separates the
+        // two, which the earlier `<= 4_000` over a 3,000-block range did not.
+        assert!(
+            widest <= 2_500,
+            "dense history must not push the window toward the ceiling (widest was {widest})"
         );
     }
 }
