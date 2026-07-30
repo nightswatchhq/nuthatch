@@ -139,9 +139,20 @@ jobs:
         run: |
           docker compose -f docker-compose.scaled.yml --profile fleet up -d \
             --scale writer=2 --scale fe=2
-          # Wait for the control plane rather than sleeping a guessed interval.
+          # Wait for the control plane…
           for i in $(seq 1 30); do
             curl -fsS -m 3 localhost:8290/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          # …and then for a worker to actually register. Waiting only for the control plane is not
+          # enough: workers reconcile on a 5s tick, so a verify run that starts the instant the API is
+          # up sees an empty registry. That made two level-5 checks fail on a *timing* problem and read
+          # as product failures - `5.10` in particular, because with no workers the unplaceable reason
+          # is `noworkers` rather than the budget one it was asserting.
+          for i in $(seq 1 30); do
+            n=$(curl -fsS -m 3 -H 'authorization: Bearer dev-token-change-me' \
+              localhost:8290/workers | python3 -c 'import sys,json;print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)
+            [ "${n:-0}" -ge 1 ] && { echo "workers registered: $n"; break; }
             sleep 2
           done
       - name: every service is running

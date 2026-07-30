@@ -247,8 +247,18 @@ level5() {
   local huge="verify-huge-$$"
   ctl -X POST "$CONTROL_URL/nests" -H 'content-type: application/json' \
     -d "{\"name\":\"$huge\",\"chain\":\"verify-huge-chain-$$\",\"estimated_rss_mb\":9999999}" >/dev/null 2>&1
+  # The claim is "under-scheduling is loud, with a reason you can act on" - not one specific reason.
+  # With workers present an oversized cursor is `toolargeforanyworker`; with none it is `noworkers`,
+  # which is equally actionable and equally loud. Asserting only the former made this fail whenever the
+  # registry happened to be empty, which is a timing artefact rather than a finding.
   check 5.10 "an unplaceable cursor is reported with an actionable reason" \
-    bash -c "ctl $CONTROL_URL/plan | grep -q toolargeforanyworker"
+    bash -c "ctl $CONTROL_URL/plan | grep -qE 'toolargeforanyworker|noroomrightnow|noworkers'"
+  if [ "${workers:-0}" -ge 1 ]; then
+    check 5.10b "with workers present, 'too large for anyone' is distinguished from 'no room'" \
+      bash -c "ctl $CONTROL_URL/plan | grep -q toolargeforanyworker"
+  else
+    skip 5.10b "'too large' is distinguished from 'no room'" "no workers registered yet"
+  fi
 
   # 5.7: one pinned answer per endpoint, fleet-wide.
   check 5.7a "an unpinned endpoint is not servable" \
