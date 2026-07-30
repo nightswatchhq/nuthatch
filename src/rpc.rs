@@ -142,8 +142,57 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
             suggested: suggested_range(body),
         },
         429 => FailureClass::RateLimited,
+        // A 400 carrying cap language is a refusal to serve the *range*, not a malformed request.
+        // Measured on Alchemy: `HTTP 400 {"error":{"code":-32602,"message":"Log response size
+        // exceeded. You can make eth_getLogs requests with up to a 10,000 block range…"}}`.
+        //
+        // This is belt to the body-classification braces above it, and deliberately narrow: a 400 that
+        // does *not* look like a cap is a genuinely bad request and stays transient. RFC-0029 §3b is
+        // explicit that "add 400 to the list" on its own would be the same mistake with a different
+        // number - a status-code list is as much a liability as a marker list.
+        400 if suggested_range(body).is_some() || looks_like_cap(body) => {
+            FailureClass::Narrowable {
+                suggested: suggested_range(body),
+            }
+        }
         _ => FailureClass::Transient,
     }
+}
+
+/// Whether a body carries direct textual evidence of a range/result cap.
+///
+/// Shared by the status classifier and [`crate::chunker::is_result_too_large`] so the two cannot drift
+/// into disagreeing about the same string - which is exactly the failure RFC-0028 §3e consolidated the
+/// classifiers to prevent.
+pub(crate) fn looks_like_cap(body: &str) -> bool {
+    let s = body.to_ascii_lowercase();
+    const CAP: &[&str] = &[
+        "response size",
+        "too many results",
+        "query returned more than",
+        "more than 10000",
+        "result set too large",
+        "range is too",
+        "range too large",
+        "too large",
+        "limit exceeded",
+        "exceeds limit of",
+        "exceeds max",
+        "logs matched by query",
+        "exceeds the limit",
+        "block range",
+    ];
+    CAP.iter().any(|m| s.contains(m))
+}
+
+/// Parse a JSON-RPC error object out of a raw body, if there is one.
+///
+/// Non-2xx responses still carry them - which is the whole point of RFC-0029 §6a.
+fn rpc_error_of(body: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("error")
+        .cloned()
 }
 
 /// Whether a 4xx body says "this *request* needs something you don't have" rather than "*you* are not
@@ -430,7 +479,24 @@ impl RpcClient {
             // Read the body before classifying: a 413 can carry a suggested range, and the text is
             // what makes an otherwise opaque status actionable in the log.
             let text = resp.text().await.unwrap_or_default();
-            let class = classify_status(status.as_u16(), &text);
+            // **The body is classified on a non-2xx too** (RFC-0029 §6a). It used to be inspected only
+            // on a 2xx, on the assumption - measured, and correct for the endpoint it was measured
+            // against - that providers signal an oversized range as HTTP 200 carrying a JSON-RPC error.
+            // Alchemy returns the same refusal as **HTTP 400** with the error object in the body, so
+            // every mechanism built for it was unreachable: the cap markers, and the provider's own
+            // suggested range, which it names and we were discarding into a truncated log line.
+            //
+            // The body wins when it says something definite. `classify_status` alone cannot, because a
+            // status code is a category and the body is the evidence.
+            let class = match rpc_error_of(&text) {
+                Some(e) => match classify_rpc_error(&e) {
+                    // `Transient` from the body is the *absence* of a finding, not a finding - fall
+                    // back to what the status implies rather than letting it overrule.
+                    FailureClass::Transient => classify_status(status.as_u16(), &text),
+                    definite => definite,
+                },
+                None => classify_status(status.as_u16(), &text),
+            };
             let mut detail = format!("HTTP {status}");
             if !text.is_empty() {
                 let snippet: String = text.chars().take(300).collect();
@@ -901,6 +967,70 @@ mod tests {
                 suggested: Some((0x1000000, 0x1007fff))
             }
         );
+    }
+
+    /// The **measured** Alchemy body, verbatim from the run in RFC-0029 §2 that killed a backfill.
+    /// Kept exact rather than paraphrased: RFC-0028's grounding convention is that a classifier test
+    /// carries a response a provider actually sent, because the whole class of bug here is a shape we
+    /// assumed rather than observed.
+    const ALCHEMY_400_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range and no limit on the response size, or you can request any block range with a cap of 10K logs in the response. Based on your parameters and the response size limit, this block range should work: [0x1000000, 0x1007fff]"}}"#;
+
+    /// **The RFC-0029 regression.** Alchemy signals an oversized range as HTTP 400, and 400 was not
+    /// enumerated - so it fell through to `Transient`, the cap markers became unreachable, and a
+    /// splittable window became five same-width retries and a dead backfill.
+    #[test]
+    fn an_http_400_carrying_cap_language_is_narrowable_not_transient() {
+        let class = super::classify_status(400, ALCHEMY_400_BODY);
+        assert!(
+            matches!(class, super::FailureClass::Narrowable { .. }),
+            "a 400 that says the response size was exceeded is a refusal to serve the range, not a \
+             malformed request - got {class:?}"
+        );
+    }
+
+    /// And the provider's own suggestion survives, which is the difference between halving blindly and
+    /// asking for the range it just told us would work.
+    #[test]
+    fn the_suggested_range_survives_a_non_2xx() {
+        assert_eq!(
+            super::classify_status(400, ALCHEMY_400_BODY),
+            super::FailureClass::Narrowable {
+                suggested: Some((0x1000000, 0x1007fff))
+            }
+        );
+    }
+
+    /// The narrowness matters. RFC-0029 §3b: "add 400 to the list" on its own would be the same mistake
+    /// with a different number. A 400 that is genuinely a bad request must stay transient, or every
+    /// malformed call would be answered by pointlessly splitting the range.
+    #[test]
+    fn an_http_400_without_cap_language_stays_transient() {
+        assert_eq!(
+            super::classify_status(
+                400,
+                r#"{"error":{"code":-32602,"message":"invalid argument 0: hex string without 0x prefix"}}"#
+            ),
+            super::FailureClass::Transient
+        );
+        assert_eq!(
+            super::classify_status(400, ""),
+            super::FailureClass::Transient
+        );
+    }
+
+    /// A cap refusal arriving on *any* non-2xx must classify the same way. The bug was not "400 is
+    /// special" - it was that the body stopped being read once the status was unhappy.
+    #[test]
+    fn cap_language_classifies_the_same_whatever_status_carries_it() {
+        for status in [400, 413] {
+            assert!(
+                matches!(
+                    super::classify_status(status, ALCHEMY_400_BODY),
+                    super::FailureClass::Narrowable { .. }
+                ),
+                "HTTP {status} carrying cap language must be narrowable"
+            );
+        }
     }
 
     #[test]
