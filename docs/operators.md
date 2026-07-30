@@ -93,6 +93,19 @@ sends SIGTERM, which drains and checkpoints cleanly.
 `linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
 Pin the version tag rather than `:latest` for anything you care about.
 
+**Scaled mode needs the `-scaled` image**, not this one. The default image is the embedded build and
+carries no database driver, so `nuthatch worker` and `nuthatch control` are not in it:
+
+```sh
+docker run --rm ghcr.io/nuthatch-indexer/nuthatch:0.8.0-scaled worker --help
+```
+
+Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
+services - a binary carrying a Postgres driver is a different promise even when it behaves identically
+unused. `-scaled` is deliberately **not** tagged `latest`: the default image stays the one you get by
+not thinking about it. The release also attaches `nuthatch-scaled-x86_64-unknown-linux-gnu.tar.gz` for
+anyone deploying without containers.
+
 > **Do not use `:0.7.0`.** It is published but cannot start (`GLIBC_2.38 not found`) - the release job
 > pushed before it smoke-tested, so the failing test failed the job without unpublishing the image.
 > `0.7.1` is the first working tag, and the job now tests before it pushes. `:latest` was broken for the
