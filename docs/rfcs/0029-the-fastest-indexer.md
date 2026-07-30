@@ -245,6 +245,38 @@ growing 4× on empty responses reaches the 100,000 ceiling in a handful of steps
 RFC-0028 §4: seal boundaries are now data-determined, so varying the window no longer varies segment
 identity - which is what makes adaptation safe here.
 
+### 6b-i. Amendment: turning timestamps off is a **breaking** schema change
+
+Found while mapping slice 4, and it changes the design rather than merely qualifying it.
+
+`block_timestamp` is one of the seven implicit columns every table carries (`registry.rs`). A nest that
+declares no use of it drops that column from **every table it produces**. RFC-0020's classifier calls a
+dropped column `ColumnRemoved`, which is **breaking** - correctly, since a consumer selecting it gets an
+error rather than a null.
+
+So "turn timestamps off to go 6× faster" is not a tuning flag. On an existing nest it is a breaking
+version: a new endpoint served alongside the old under RFC-0020 slice 3, with the old one kept alive for
+its consumers. That is a much larger ask than the §6b framing implies, and it interacts with the fleet-
+wide pinning in RFC-0022 §4 - both endpoints are separately placed and separately resolved.
+
+Three consequences for the build:
+
+1. **The declaration belongs at `init`, and changing it later must route through the ordinary breaking-
+   update path** rather than being a config edit that silently invalidates every consumer's query. The
+   classifier already refuses to be fooled here, which is a point in favour of the existing machinery.
+2. **Segment identity changes too**, which is the sharper half. Sealed segments are content-addressed
+   over their bytes, and the bytes contain the column. A timestamp-free nest cannot reuse a timestamped
+   nest's segments (RFC-0020 slice 4) even over an identical range - so the switch costs a full
+   re-index, on top of being breaking. Worth stating plainly, because "faster backfill" and "re-index
+   everything once" cancel out for anyone doing it to an existing nest.
+3. **The win is therefore mostly for new nests**, where it is chosen at `init` and no consumer or
+   segment exists yet. That is still a large win - §4 measures ~85% of wall clock - but it is a
+   different, narrower claim than "backfills get 6× faster", and the RFC should not be read as offering
+   the latter to existing deployments.
+
+None of this argues against building it. It argues for building it as an `init`-time declaration with an
+explicit breaking-change path, rather than as the flag the §6b wording could be read to permit.
+
 ## 7. What to change (the path off RPC)
 
 RFC-0003 (reth ExEx) is currently "Accepted - groundwork landed; ExEx mode deferred". §5 argues it is the
