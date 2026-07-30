@@ -86,7 +86,17 @@ pub fn is_result_too_large(err: &anyhow::Error) -> bool {
     // text matching below is now the *fallback* - for `Source` implementations that are not the RPC
     // client (the test tapes, the ExEx source) and raise plain `anyhow!` errors.
     if let Some(class) = crate::rpc::class_of(err) {
-        return matches!(class, crate::rpc::FailureClass::Narrowable { .. });
+        match class {
+            crate::rpc::FailureClass::Narrowable { .. } => return true,
+            // **`Transient` does not mean "not a cap"** (RFC-0029 §3b). It is the fall-through default
+            // of `classify_status` - the *absence* of a classification rather than a positive finding -
+            // so it must never outrank direct textual evidence below. Returning `false` here is what
+            // made the widened marker list unreachable for Alchemy's HTTP 400, and turned a splittable
+            // window into five same-width retries and a dead backfill.
+            crate::rpc::FailureClass::Transient => {}
+            // RateLimited and Terminal *are* positive findings: back off or stop, never split.
+            _ => return false,
+        }
     }
     let s = format!("{err:#}").to_ascii_lowercase();
     const CAP_MARKERS: &[&str] = &[
@@ -111,6 +121,48 @@ pub fn is_result_too_large(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The RFC-0029 regression, at the layer that decides whether to split.**
+    ///
+    /// `class_of` returning `Transient` used to short-circuit to `false`, which made the cap markers
+    /// below it unreachable for any error the status classifier had not recognised. `Transient` is the
+    /// fall-through default - the *absence* of a finding - so it must defer to direct textual evidence
+    /// rather than outrank it.
+    #[test]
+    fn a_transient_classification_does_not_veto_textual_cap_evidence() {
+        let err = anyhow::Error::new(crate::rpc::ClassifiedError {
+            class: crate::rpc::FailureClass::Transient,
+            detail: "HTTP 400: {\"error\":{\"message\":\"Log response size exceeded. You can make \
+                     eth_getLogs requests with up to a 10,000 block range\"}}"
+                .into(),
+        });
+        assert!(
+            is_result_too_large(&err),
+            "a Transient classification carrying cap language must still split - it is the absence of \
+             a finding, not a finding that this is not a cap"
+        );
+    }
+
+    /// The other half of the same rule: a positive finding *does* win. Splitting on a rate limit would
+    /// turn one throttled request into two, and splitting on a terminal auth failure is pointless work
+    /// against an endpoint that will keep refusing.
+    #[test]
+    fn positive_classifications_still_veto_a_split() {
+        for class in [
+            crate::rpc::FailureClass::RateLimited,
+            crate::rpc::FailureClass::Terminal,
+        ] {
+            let err = anyhow::Error::new(crate::rpc::ClassifiedError {
+                class,
+                // Cap language present *and* ignored, deliberately.
+                detail: "response size exceeded".into(),
+            });
+            assert!(
+                !is_result_too_large(&err),
+                "a positive classification must outrank the marker list"
+            );
+        }
+    }
     use super::*;
     use anyhow::anyhow;
 
