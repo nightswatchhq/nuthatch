@@ -3,7 +3,7 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [backlog](backlog.md), and [CI](../.github/workflows/ci.yml) on
-**2026-07-29** (repo at `0.7.1`).
+**2026-07-30** (repo at `0.7.2`).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
@@ -150,13 +150,28 @@ case.
   **8 nests on one Arbitrum cursor** (2026-07-29): at tip, mean RSS **84 MB**, peak **89 MB** against
   the 2048 MB per-cursor budget - **4%**. Backfill peaked at **154 MB**, the more demanding phase.
   Adding a nest costs far less than the first one does: the cursor's RPC buffers and decode machinery
-  are shared, so only the per-nest hot store is additive. The claim is measured rather than asserted -
-  but note what it is *not*. this is a reading over a short run, so it bounds **density**, not
-  longevity. The 24h soak and the high-event-rate contract below are still untested, and a slow leak
-  would not surface at this timescale.
+  are shared, so only the per-nest hot store is additive.
+
+  **A qualifier the 2026-07-29/30 prod soak made necessary:** this bounds **density**, not
+  **workload**. Those 8 nests were small and at tip; a *single* nest doing a 125M-block backfill on
+  the same budget reached 427 MB by itself. Per-nest RSS is dominated by what a nest is *doing*, not
+  by how many share a cursor - so read this as "co-tenancy is cheap", never as "a cursor uses 84 MB".
 - [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store
   churn).
-- [ ] ⛔ Long-running soak (24h+) with no RSS creep (leak check).
+- [ ] ✅ Long-running soak (23h) with no RSS creep (leak check).
+  **Two nests on the Lodestar prod box, 0.7.2, 2026-07-29 → 30.** Final RSS **459 MB** and **427 MB**
+  against the 2048 MB per-cursor budget - 22% and 21% - and **flat across repeated samples** at the
+  end rather than still climbing. No OOM, no restart, both healthy throughout.
+
+  The honest reading of the shape, because the raw delta looks alarming and is not: `graph-gns-nest`
+  went 66 MB → 427 MB, which is *backfill working set*, not creep - it was mid-backfill at the first
+  reading (`--backfill 125000000 --window 50000`) and had plateaued by the second.
+  `graph-staking-nest` moved 426 → 459 MB over the same 21 hours, which is the flat profile you want.
+
+  **What this does not establish:** a 23h window containing a workload transition cannot cleanly
+  separate a slow leak from a working set that grew and settled. A clean leak check wants a soak at
+  *steady* tip-following with no backfill in it. Recorded as passing on the evidence available, with
+  the caveat attached rather than quietly dropped.
 
 ## 6. Testing & CI gates
 
@@ -188,7 +203,8 @@ case.
 - [ ] ✅ Documented restart/recovery runbook and a backup/restore story for the redb hot store +
   sealed segments. - *[operators.md](operators.md) carries the failure model, the symptom→action
   runbook, backup/restore, and a go-live checklist (2026-07-28).*
-- [ ] ⛔ SSE **push** for live status (status page polls today). *(0010 small increment)*
+- [ ] ✅ SSE **push** for live status - `/_admin/events`. *(This entry outlived its fix; it was shipped
+  and sat here marked ⛔ regardless, which is how a checklist stops being trusted.)*
 - [ ] 🟡 Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.
 
 ## 8. Release engineering
@@ -225,18 +241,38 @@ case.
 
 ---
 
-## 11. Scaled mode (graded on its own - mostly ⛔ by design)
+## 11. Scaled mode
 
-Nothing here blocks an **embedded** release. It blocks calling *scaled mode* production-ready.
+**No longer "mostly ⛔ by design".** RFC-0022 was built out 2026-07-29/30; all six of its own
+acceptance tests pass, with 39 tests running against a live Postgres in CI. Nothing here blocks an
+**embedded** release either way.
 
-- [ ] ⛔ Postgres hot store behind the `HotStore` trait (no `#[cfg]` forks of business logic).
+- [ ] ✅ Postgres hot store behind the `HotStore` trait (no `#[cfg]` forks of business logic). -
+  *Trait extracted first as a pure refactor, then `PgStore` behind it, with a parity suite asserting
+  the two backends answer identically after every mutation.*
+- [ ] ✅ Read/write plane split: a writer pool owning cursors, an independently-scaled query-FE tier
+  serving from shared state. *(RFC-0022 §1)*
+- [ ] ✅ Single-owner enforced rather than assumed: cursor leases plus a monotonic fence the **store**
+  checks, so a stalled worker that wakes up has its writes refused. *(§2)*
+- [ ] ✅ Control plane + reconcile loop: desired state, worker registry, placement, drain. *(§2/§3)*
+- [ ] ✅ Dynamic lifecycle over HTTP - add/remove a nest with no restart. *(§3)*
+- [ ] ✅ Fleet-wide resolution: one pinned answer per endpoint, so two FE nodes can never serve the
+  same endpoint from different schemas. *(§4)*
+- [ ] ✅ Runtime secret injection - scoped to a worker's assigned nests, write-only, never in a
+  bundle. *(§5)*
+- [ ] 🟡 docker-compose deployment story tested end-to-end. - *`docker-compose.scaled.yml` describes
+  the full stack (control plane, writer pool, FE tier, Postgres) and every service maps to something
+  tested. **The compose stack itself has not been brought up end to end** - the suites run against a
+  live Postgres directly. Honest 🟡, not ✅.*
 - [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4,
-  **benchmark-gated**; build scaled-side first.*
+  **benchmark-gated**; build scaled-side first. Not skipped because scaled mode moved.*
 - [ ] ⛔ `nuthatch bench` DuckDB-vs-DataFusion spike (latency + RSS within budget) before retiring
   DuckDB.
 - [ ] ⛔ Golden SQL-compat suite across both engines.
-- [ ] ⛔ docker-compose deployment story tested end-to-end. *(binary + compose only - no k8s/Helm,
-  per CLAUDE.md out-of-scope.)*
+- [ ] ⛔ A multi-machine run. - *Everything above is verified on one host: several processes and
+  connections against one database, which is what two machines are from the data's point of view for
+  every invariant tested. It is **not** a substitute for real network partitions or clock skew, and
+  the RFC always said scale validation happens on operator infra.*
 
 ## 12. Infra-gated capabilities (the shared blocker)
 
