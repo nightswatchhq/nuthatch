@@ -728,6 +728,17 @@ Stated plainly, because finding them yourself in production would be worse.
 
 ---
 
+## Proving it works
+
+This guide tells you how to *run* nuthatch. [`verification.md`](verification.md) tells you how to
+**prove it works** - an acceptance runbook where every step has a command, an expected result, what it
+proves, and what a failure means.
+
+Worth walking before go-live, and worth handing to a second operator: a claim someone else confirmed is
+worth more than one we assert. It also states which levels **we** have verified and which we have not -
+scaled mode's compose stack and any multi-machine run are the honest gaps, and the ones where outside
+verification is most valuable.
+
 ## Go-live checklist
 
 Before pointing real traffic at a nuthatch deployment:
@@ -746,4 +757,8 @@ Before pointing real traffic at a nuthatch deployment:
 - [ ] `nuthatch check` passing for each nest, with parity fixtures committed.
 - [ ] A restart drill performed: SIGTERM, restart, confirm no gaps or duplicates.
 - [ ] A nest upgrade rehearsed with `nest diff` and `nest upgrade` on a non-production copy.
-- [ ] Nest onboarding process agreed, given that adding a nest currently restarts the roost.
+- [ ] Nest onboarding process agreed. *(Adding a nest no longer restarts the roost - `POST
+      /_admin/nests` mounts one live, since 0.7.0. This line said otherwise for two releases.)*
+- [ ] **The acceptance runbook walked**, at the levels matching your deployment - see
+      [`verification.md`](verification.md). It is falsifiable step by step, which this checklist is
+      deliberately not: a checklist records a decision, a runbook produces evidence.

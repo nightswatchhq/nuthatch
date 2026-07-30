@@ -270,7 +270,11 @@ default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.m
   machine is simpler and that simplicity is the point of the embedded path.
 
 **[`docs/operators.md`](docs/operators.md) is the full operating guide**, and worth reading before you
-run this for real rather than after. It covers the questions people actually hit:
+run this for real rather than after. **[`docs/verification.md`](docs/verification.md)** is its
+counterpart: an acceptance runbook that *proves* a deployment works, step by falsifiable step, and says
+plainly which levels we have verified ourselves and which we have not.
+
+The guide covers the questions people actually hit:
 
 | If you're wondering | Go to |
 |---|---|
