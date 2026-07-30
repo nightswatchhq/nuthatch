@@ -42,7 +42,19 @@ pub struct BenchReport {
     pub from_block: u64,
     pub to_block: u64,
     pub blocks: u64,
-    pub window: u64,
+    /// The window the backfill *started* from - the chain default (20 on mainnet, deliberately small
+    /// for a dense L1 tip). On the seal-direct paths it is only a starting point: the controller sizes
+    /// every subsequent window from what came back (RFC-0029 §6f), so this number does not describe
+    /// what the run actually did.
+    ///
+    /// It is named for what it is because the old name (`window`) invited exactly the wrong reading.
+    /// This run started at 20 and reached the 100,000 ceiling; a report claiming `"window": 20` reads
+    /// as though 22.2M blocks were fetched 20 at a time, which would be 1,110,000 requests rather than
+    /// the 454 it took. `rpc_requests` is the honest measure of range control, and the reason there is
+    /// no `--window` override here is that there is no longer anything useful to override.
+    pub initial_window: u64,
+    /// Whether the window adapted during the run (true on the seal-direct paths).
+    pub window_adaptive: bool,
     pub seal_direct: bool,
     pub concurrency: usize,
     pub runs: usize,
@@ -193,7 +205,9 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         from_block: args.from,
         to_block: args.to,
         blocks: args.to - args.from + 1,
-        window,
+        initial_window: window,
+        // The hot-store path still fetches at a fixed width; only the seal-direct paths adapt.
+        window_adaptive: args.seal_direct,
         seal_direct: args.seal_direct,
         concurrency: if args.seal_direct {
             args.concurrency

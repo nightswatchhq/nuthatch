@@ -190,6 +190,49 @@ Two defects in our own instrumentation, both flattering nobody:
 
 A harness that libels its own product is worse than none, because it gets believed.
 
+## 4b. Measured: case 1 completes in ~75 seconds (2026-07-30)
+
+Everything above was written from a backfill that **did not finish**. It finishes now. Reports in
+[`docs/bench/`](../bench/); method in §11.1.
+
+| | wall clock | events | RPC requests | peak RSS | retries |
+|---|---|---|---|---|---|
+| median of 3 | **74.8 s** | 294,278 | 321 | 320 MB | 0 |
+| cold control (range shifted 3 blocks) | 77.0 s | 294,276 | 321 | 310 MB | 0 |
+| first run (2026-07-30 15:19) | 289.9 s | 294,278 | 454 | 306 MB | 15 |
+
+**The cold control exists because the first run was 3.9× slower than the second**, and the obvious
+suspect was Alchemy caching the exact `getLogs` queries we had just made - which would have made 74.8 s
+a warm-cache number and any published comparison indefensible. Re-running the same workload over a
+range shifted by three blocks (never fetched before) took **77.0 s**. Caching is not the explanation;
+the first run was degraded by 15 transport errors and their retry backoff, which is also where its
+extra 133 requests came from. The control is kept in `docs/bench/` because a number whose confound was
+tested is worth more than a faster one whose was not.
+
+Two internal consistency checks, both of which had to hold:
+
+- Every run decoded **exactly 294,278** records - the count does not move with cache state, retries, or
+  run order.
+- The 3-block-shorter control found exactly **two fewer** transfers. The counts move precisely as the
+  range does.
+
+**321 requests for 22,200,001 blocks** is the range-control result, and it is the one caching cannot
+flatter. Note what the harness starts from: `bench backfill` has no `--window` override, so it uses the
+chain default - **20** on mainnet, deliberately small for a dense L1 tip. Before §6f the pipelined path
+would have held that width for the whole range: **1,110,000 requests**. The benchmark was not slow
+before this work; it was unable to run at all through the harness, and §2b's "the harness measures code
+no user runs" applied here in a second way we had not noticed.
+
+**On comparing this to anyone.** Envio HyperIndex's 6.94 min and Sentio's 11.02 min are served from
+purpose-built columnar stores, not JSON-RPC - which is *why* OBIB normalises the endpoint (§5). The
+defensible claim is not a placing. It is that a general-purpose-RPC indexer, on a laptop, against a
+commercial endpoint anyone can rent, is in the same conversation as infrastructure built specifically
+to avoid RPC. Publishing it as a head-to-head win would invite a correction we would deserve.
+
+Still unmeasured: the `--concurrency 16` vs `--concurrency 1` ratio (§10), and any figure for a
+*timestamped* nest on this workload - so the cost `--no-timestamps` avoids is quantified here only by
+the RFC's earlier ~85% measurement, not by an A/B on this range.
+
 ## 5. The principle
 
 **You cannot out-run RPC with RPC.**
@@ -346,15 +389,26 @@ in place of it.
 
 ## 11. Open questions
 
-1. **Which count is right?** OBIB's top-level README publishes **294,278** expected records for case 1;
+1. **ANSWERED (2026-07-30): 294,278.** We ran case 1 to completion and decoded **exactly 294,278**
+   `Transfer` records - the top-level README's figure, to the record, with no tuning toward it. The
+   case-1 README's 296,734/296,278 are the ones that do not reconcile. Method, so the claim is
+   checkable: LBTC `0x8236a870…5634494`, blocks 0-22,200,000 inclusive, `events = ["Transfer"]`
+   (topic0-filtered at the RPC), Alchemy mainnet with **no failover endpoints configured**, seal-direct,
+   `--concurrency 8`, commit `707e1af`. Worth raising with them politely - a 2,456-record spread in
+   their own repo is the kind of thing an implementer trips over rather than a rounding difference.
+
+   The original text, kept because the question was the right one to ask:
+
+   ~~**Which count is right?** OBIB's top-level README publishes **294,278** expected records for case 1;~~
    the case-1 README's own table shows **296,734** for five platforms and 296,278 for a sixth. A
    2,456-record spread their repo does not reconcile. We should establish our own figure, state our
    method, and raise it with them politely - rather than quietly matching whichever number flatters us.
-2. **How is non-use of `block_timestamp` detected?** Static analysis of views and the semantic layer is
-   fragile; an explicit per-nest declaration is honest but is one more thing to get wrong. Leaning
-   explicit.
-3. **Should sealed segments carry a null timestamp column or omit it?** Omission changes the schema; nulls
-   keep it stable but cost bytes and invite a silently-wrong `ORDER BY block_timestamp`.
+2. **ANSWERED: explicit declaration** (slice 4, 0.9.0). The lean was right. Static analysis would have
+   had to be *sound* over authored SQL to be worth trusting, and an unsound analysis that silently
+   drops a column is worse than a flag someone has to type.
+3. **ANSWERED: omit** (slice 4, 0.9.0). The nulls option was tempting for schema stability, and its own
+   downside decided it: a silently-wrong `ORDER BY block_timestamp` beats an error only in the short
+   term.
 4. **What is the right concurrency cap** when the endpoint fails at 10-way? Adaptive and per-endpoint,
    learned at runtime - or configured and documented?
 5. **Should the speculative split recurse?** §6(a) proposes one extra level. Unbounded recursion on a dead
