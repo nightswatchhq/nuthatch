@@ -13,6 +13,15 @@
 #   docker compose -f docker-compose.scaled.yml --profile fleet up \
 #     --scale writer=2 --scale fe=3        # control plane + a writer pool + an FE tier
 #
+# **The fleet profile needs a `./nest` directory** - a scaffolded nest (`nuthatch init …`) that the
+# writers and FE nodes mount. Without it the FE containers exit immediately: they load the nest's
+# config, registry and views at startup, and there is nothing to load. The writers survive because
+# they take work from the control plane rather than from disk, which makes the failure asymmetric and
+# confusing if you have not been told.
+#
+# Control-plane calls need the token:
+#   curl -H 'authorization: Bearer dev-token-change-me' localhost:8290/workers
+#
 # The fleet profile needs the **scaled** image - `ghcr.io/nuthatch-indexer/nuthatch:<version>-scaled`.
 # The default published image is the embedded build and deliberately carries no database driver, so
 # `worker` and `control` are not in it. Set `NUTHATCH_IMAGE` to pick a version.
@@ -56,9 +65,14 @@ services:
       control --listen 0.0.0.0:8290
       --db postgres://nuthatch:nuthatch@postgres:5432/nuthatch
     environment:
-      # Set this and the API will demand it. Left unset here because the published port is
-      # 127.0.0.1-only; a real deployment sets it.
-      NUTHATCH_CONTROL_TOKEN: ""
+      # **Required, not optional.** Docker publishes a port by binding 0.0.0.0 *inside* the container,
+      # so the control plane always sees an off-localhost bind and refuses to start without a token -
+      # correctly, since it decides what the whole fleet runs. An earlier version of this file left it
+      # empty with a comment about the host-side 127.0.0.1 mapping, and the stack simply would not come
+      # up: `Error: refusing to serve the control-plane API on '0.0.0.0:8290' without a token`.
+      #
+      # This is a **development default**. Change it, or pass it in from your own environment.
+      NUTHATCH_CONTROL_TOKEN: "${NUTHATCH_CONTROL_TOKEN:-dev-token-change-me}"
     ports:
       - "127.0.0.1:8290:8290"
 
@@ -103,10 +117,15 @@ services:
     command: >-
       serve --dir /nest --listen 0.0.0.0:8288
       --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
-    # Read-only mount: an FE has no business writing to the nest directory, and saying so here means a
-    # regression that made it try fails loudly instead of quietly diverging from its peers.
+    # **Not** read-only, though it ought to be. An earlier version mounted `:ro` on the principle that
+    # an FE has no business writing to a nest directory - and the FE then failed to start with
+    # `Read-only file system (os error 30)`, because it still opens the nest's local redb at startup to
+    # rebuild its serving views. That is the known limitation recorded in RFC-0022 slice 3, and slice 3b
+    # (moving the view rebuilds onto the `HotStore` trait) is what makes `:ro` possible.
+    #
+    # Restore `:ro` when 3b lands - it is a guard worth having, and this comment is the reminder.
     volumes:
-      - ./nest:/nest:ro
+      - ./nest:/nest
     ports:
       - "127.0.0.1:8289-8299:8288"
 

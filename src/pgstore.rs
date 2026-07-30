@@ -203,8 +203,21 @@ impl PgStore {
             );
             "#
         );
+        // Serialised on a per-schema key: `CREATE SCHEMA/TABLE IF NOT EXISTS` are not atomic in
+        // Postgres, and two workers opening the same chain's cursor at startup will both try - one
+        // then dies on a duplicate-key error against `pg_namespace` or `pg_type`. Taken as its own
+        // statement rather than embedded in the batch; see the note in `controlplane::migrate` for why
+        // that distinction matters. Different cursors still migrate in parallel.
+        let key = format!("nuthatch_migrate_{s}");
         self.conn
-            .with(move |c| Ok(c.batch_execute(&ddl)?))
+            .with(move |c| {
+                let lock: i64 = c.query_one("SELECT hashtext($1)::bigint", &[&key])?.get(0);
+                c.execute("SELECT pg_advisory_lock($1)", &[&lock])?;
+                let result = c.batch_execute(&ddl);
+                let _ = c.execute("SELECT pg_advisory_unlock($1)", &[&lock]);
+                result?;
+                Ok(())
+            })
             .with_context(|| format!("failed to migrate schema {s}"))
     }
 

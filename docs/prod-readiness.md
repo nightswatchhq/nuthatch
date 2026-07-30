@@ -260,10 +260,18 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
   same endpoint from different schemas. *(§4)*
 - [ ] ✅ Runtime secret injection - scoped to a worker's assigned nests, write-only, never in a
   bundle. *(§5)*
-- [ ] 🟡 docker-compose deployment story tested end-to-end. - *`docker-compose.scaled.yml` describes
-  the full stack (control plane, writer pool, FE tier, Postgres) and every service maps to something
-  tested. **The compose stack itself has not been brought up end to end** - the suites run against a
-  live Postgres directly. Honest 🟡, not ✅.*
+- [ ] ✅ docker-compose deployment story tested end-to-end (2026-07-30). - *The full stack brought up -
+  Postgres, control plane, 2 writers, 2 FE nodes - and walked through `verification.md` level 5:
+  workers registering, a nest declared over HTTP and picked up within a tick, **exactly one** owner for
+  the cursor, failover to the survivor after killing the owner and waiting out the lease, fleet-wide
+  version pinning, and write-only secrets with a canary absent from disk.*
+
+  **It failed four ways first, and all four are fixed.** A migration race (`CREATE … IF NOT EXISTS` is
+  not atomic in Postgres, and the control plane plus every worker migrate at startup - invisible to
+  every single-process test); the control plane refusing to start because Docker publishes ports by
+  binding `0.0.0.0` inside the container; the FE dying on a `:ro` mount because it still opens the
+  local redb; and an undocumented `./nest` requirement whose failure is asymmetric - writers survive,
+  FE nodes do not. Bringing it up was worth more than any amount of reading it.
 - [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4,
   **benchmark-gated**; build scaled-side first. Not skipped because scaled mode moved.*
 - [ ] ⛔ `nuthatch bench` DuckDB-vs-DataFusion spike (latency + RSS within budget) before retiring

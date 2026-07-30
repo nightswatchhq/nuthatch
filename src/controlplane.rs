@@ -91,9 +91,26 @@ impl ControlPlane {
         Ok(cp)
     }
 
+    /// Create the schema and tables. Idempotent **and concurrency-safe**.
+    ///
+    /// `CREATE SCHEMA IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` are **not atomic** in Postgres:
+    /// two processes running one at the same instant both see it missing, both try, and one dies with
+    /// `duplicate key value violates unique constraint "pg_namespace_nspname_index"` (or
+    /// `pg_type_typname_nsp_index` for a table). Not theoretical - it is what happened the first time
+    /// the compose fleet came up, because the control plane and every worker connect and migrate at
+    /// startup.
+    ///
+    /// The advisory lock is taken as **its own statement**, which matters: embedding
+    /// `BEGIN; SELECT pg_advisory_xact_lock(…); …; COMMIT;` inside a `batch_execute` does not work,
+    /// because the simple query protocol already wraps a multi-statement batch in an implicit
+    /// transaction and the explicit BEGIN/COMMIT fight it. The first attempt did exactly that and the
+    /// race simply moved from `pg_namespace` to `pg_type`.
     fn migrate(&self) -> Result<()> {
         self.conn.with(move |c| {
-            c.batch_execute(&format!(
+            // Arbitrary but fixed: any constant works so long as every migrator uses the same one.
+            const LOCK: i64 = 3_141_592_653_589_793;
+            c.execute("SELECT pg_advisory_lock($1)", &[&LOCK])?;
+            let ddl = format!(
                 r#"
                 CREATE SCHEMA IF NOT EXISTS "{SCHEMA}";
                 CREATE TABLE IF NOT EXISTS "{SCHEMA}".desired_nest (
@@ -115,10 +132,9 @@ impl ControlPlane {
                     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
                 -- Runtime secrets (RFC-0019 §4 credential kind (b), mechanism per RFC-0022 §5).
-                -- Deliberately keyed by nest and **never** by bundle: baking a secret into a
-                -- content-addressed bundle would both leak it and break addressing, since two nests
-                -- differing only in credentials would hash differently. Rotating a secret here
-                -- changes no bundle hash at all.
+                -- Keyed by nest and **never** by bundle: baking a secret into a content-addressed
+                -- bundle would both leak it and break addressing, since two nests differing only in
+                -- credentials would hash differently. Rotating a secret here changes no bundle hash.
                 CREATE TABLE IF NOT EXISTS "{SCHEMA}".nest_secret (
                     nest        TEXT        NOT NULL,
                     key         TEXT        NOT NULL,
@@ -127,7 +143,12 @@ impl ControlPlane {
                     PRIMARY KEY (nest, key)
                 );
                 "#
-            ))?;
+            );
+            let result = c.batch_execute(&ddl);
+            // Released even if the migration failed, so one bad startup cannot wedge every other
+            // process behind a lock nobody is holding for a reason.
+            let _ = c.execute("SELECT pg_advisory_unlock($1)", &[&LOCK]);
+            result?;
             Ok(())
         })
     }

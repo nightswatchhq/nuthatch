@@ -30,7 +30,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check |
-| 5 Scaled mode | **partly** | 41 tests against a live Postgres; **the compose stack has never been brought up, and nothing has run across real machines** |
+| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus the compose fleet brought up and steps 5.1-5.4, 5.7, 5.8 walked live** (2026-07-30, single host, 2 writers + 2 FE nodes). **Nothing has run across real machines** - 5.5's clock-skew case and any partition test are still open. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -256,8 +256,8 @@ curl -s localhost:8290/health     # expect: ok
 curl -s localhost:8290/workers    # expect: 2 workers with their budgets
 ```
 
-*Proves* the topology: control plane reachable, workers registering, FE nodes up. **If this fails,
-please report it** — it is the step we have not run.
+*Proves* the topology: control plane reachable, workers registering, FE nodes up. We have run this on a
+single host; **on separate machines it is still unverified**, and that is where a report helps most.
 
 **5.2 Declaring a nest starts it, without a restart**
 
