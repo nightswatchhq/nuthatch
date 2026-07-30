@@ -1,6 +1,8 @@
 # RFC-0022: Distributed scaled mode - read/write planes, a writer pool, dynamic nest placement
 
-- Status: **Build started 2026-07-29** (slice 1: extract the `HotStore` trait - see Build order). Was *accepted, design only* (2026-07-21). §0 brief amendment applied to
+- Status: **Implemented 2026-07-30.** All six §Testing acceptance items pass; 39 tests run against a
+  live Postgres in CI. Two caveats are recorded honestly rather than closed - see *What was and was
+  not verified*, below. Built 2026-07-29/30; was *accepted, design only* (2026-07-21). §0 brief amendment applied to
   `CLAUDE.md` 2026-07-21. **Nothing is built yet.** The build is **dependency-gated** on RFC-0013's
   scaled-side (external Postgres hot store + DataFusion federation) and on RFC-0021 (the per-chain cursor
   = the unit of placement). **Operator-run by design:** this is the distributed self-hosted fleet
@@ -163,6 +165,40 @@ operator's** cooperating nests. What the core **must not** grow: per-tenant bill
 enforcement between untrusting customers, or customer-facing authz. Those belong to the **gateway** in
 front. If a feature request only makes sense when the tenants *don't trust each other and pay*, it's out
 of this RFC and this project.
+
+## What was and was not verified (2026-07-30)
+
+| §Testing item | Verified by |
+|---|---|
+| Plane split | `e2e_plane_split` - an FE serves what it never indexed; N FE nodes provably never advance a cursor |
+| External-hot-store parity | `pg_parity` - both backends compared after **every** mutation, not just at the end |
+| Placement/rebalance | `e2e_reconcile` - including a live lease refusing a plan that disagrees |
+| Dynamic lifecycle | `control_api` - declare/remove over HTTP, no restarts |
+| Secret isolation | `secret_isolation` - a canary searched for in **actual bytes**, not asserted about |
+| Resolution | `e2e_resolution` - four independent connections resolving identically |
+
+**Two things this does not claim.**
+
+**The compose stack has not been brought up end to end.** `docker-compose.scaled.yml` describes the
+full fleet and every service maps to something tested, but the suites talk to Postgres directly. That
+is a 🟡 in prod-readiness §11, not a ✅.
+
+**Everything is verified on one host.** Several processes and connections against one database, which
+*is* what two machines are from the data's point of view for every invariant tested here - a lease
+race does not care whether the contenders share a kernel. It is **not** a substitute for real network
+partitions or clock skew, and this RFC always said scale validation happens on operator infra.
+
+### Three things the build changed about the design
+
+1. **The lease moved into the hot store**, against a literal reading of §3 - see the deviation note
+   below. Two databases can disagree; a lease and a fence in one row cannot.
+2. **`postgres` is not a synchronous client.** It is a blocking wrapper around a private tokio runtime
+   and panics when called from inside another one - which would have taken down every `/sql` request
+   on a Postgres-backed nest, not merely failed a test. The client now lives on a dedicated thread.
+3. **A movable `latest` pointer is not a fleet-wide resolution.** Each FE node reading it for itself
+   means one endpoint serving two schemas during an upgrade, silently. Resolution is pinned instead.
+
+Every one of those was found by *running* the thing, not by reading it.
 
 ## Build order (revised 2026-07-29, on starting the build)
 
