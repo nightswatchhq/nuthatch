@@ -65,3 +65,6 @@ pub mod transform;
 pub mod velocity;
 pub mod views;
 pub mod webhooks;
+/// The writer-worker role for scaled mode (RFC-0022 §2): the reconcile loop, running.
+#[cfg(feature = "postgres-store")]
+pub mod worker;

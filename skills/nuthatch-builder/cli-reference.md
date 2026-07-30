@@ -315,3 +315,14 @@ Run a WASM transform component over a project's stored transfers
 - `<COMPONENT>` - Path to the transform component (.wasm, wasm32-wasip2)
 - `--dir <DIR>` - Project directory (must contain a nuthatch.redb with indexed transfers)
 - `--limit <LIMIT>` - How many of the most-recent transfers to feed the transform
+
+## `nuthatch worker`
+
+Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane, take cursor leases, index what this worker is assigned
+
+- `--control-db <CONTROL_DB>` - The control-plane Postgres URL - desired state and the worker registry
+- `--hot-store <HOT_STORE>` - The hot-store Postgres URL - where indexed state lives. Usually the same server as the control plane, but a distinct database: one holds *what should run*, the other holds *indexed data*
+- `--chains <CHAINS>` - Chains this worker can host. The scheduler decides which it *should* run and the lease decides which it *does*; this is only what the machine is capable of
+- `--id <ID>` - This worker's identity in the fleet. Defaults to the hostname, which is unique per container under compose. **Two workers sharing an id would look like one to the registry** and could each hold what it believed was its own lease, so this is derived rather than left to chance
+- `--budget-mb <BUDGET_MB>` - RAM ceiling for everything this worker runs, in MB. The scheduler will not commit cursors past it - Σ assigned cursors ≤ this
+- `--no-secrets` - Skip fetching runtime secrets for assigned nests (RFC-0022 §5)

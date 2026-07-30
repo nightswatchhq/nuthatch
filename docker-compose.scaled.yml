@@ -76,8 +76,17 @@ services:
     image: nuthatch-scaled:local
     depends_on:
       postgres: { condition: service_healthy }
+    # `worker`, not `dev`. `dev` indexes a nest directory it owns outright and knows nothing about the
+    # control plane - running two of those against one store is the double-writer bug, not a pool.
+    # `worker` reconciles: it heartbeats, takes a lease for each cursor it is assigned, and indexes
+    # only what it holds. The worker id defaults to the container hostname, which compose makes unique
+    # per replica; two workers sharing an id would look like one to the registry.
     command: >-
-      dev --dir /nest --listen 0.0.0.0:8288 --no-admin
+      worker
+      --control-db postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+      --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+      --chains arbitrum-one
+      --budget-mb 2048
     volumes:
       - ./nest:/nest
     # No host port: with several replicas there is nothing sensible to publish, and a writer's HTTP

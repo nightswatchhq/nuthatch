@@ -27,6 +27,12 @@ pub enum Command {
     /// elsewhere is filling, owns no cursor, and never advances one. Scale it independently of
     /// ingestion - that is the entire point of splitting the planes.
     Serve(ServeArgs),
+    /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
+    /// take cursor leases, index what this worker is assigned.
+    ///
+    /// This is the scaled-mode counterpart of `dev`. `dev` indexes a nest directory it owns outright;
+    /// a worker is told what to run and holds a lease proving it may.
+    Worker(WorkerArgs),
     /// Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run.
     ///
     /// Writes *desired state* only. Workers reconcile against it on their own tick - nothing here
@@ -706,6 +712,38 @@ pub struct AddArgs {
     /// (repeatable). Point at your own node to dodge public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct WorkerArgs {
+    /// The control-plane Postgres URL - desired state and the worker registry.
+    #[arg(long)]
+    pub control_db: String,
+
+    /// The hot-store Postgres URL - where indexed state lives. Usually the same server as the control
+    /// plane, but a distinct database: one holds *what should run*, the other holds *indexed data*.
+    #[arg(long)]
+    pub hot_store: String,
+
+    /// Chains this worker can host. The scheduler decides which it *should* run and the lease decides
+    /// which it *does*; this is only what the machine is capable of.
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub chains: Vec<String>,
+
+    /// This worker's identity in the fleet. Defaults to the hostname, which is unique per container
+    /// under compose. **Two workers sharing an id would look like one to the registry** and could each
+    /// hold what it believed was its own lease, so this is derived rather than left to chance.
+    #[arg(long)]
+    pub id: Option<String>,
+
+    /// RAM ceiling for everything this worker runs, in MB. The scheduler will not commit cursors past
+    /// it - Σ assigned cursors ≤ this.
+    #[arg(long, default_value_t = 2048)]
+    pub budget_mb: u64,
+
+    /// Skip fetching runtime secrets for assigned nests (RFC-0022 §5).
+    #[arg(long)]
+    pub no_secrets: bool,
 }
 
 #[derive(Args)]
