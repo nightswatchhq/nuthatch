@@ -37,6 +37,19 @@ pub trait Source: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Forget any cached per-block data above `block`, because the chain reorganised there.
+    ///
+    /// Default: nothing to forget. A source that caches anything keyed by **block number** must
+    /// implement this, because a number is not an identity - after a reorg the block at that height is
+    /// a different block with a different timestamp, and `block_timestamp` is a sealed column feeding
+    /// the segment's content address. Serving a pre-reorg value for a re-indexed block would seal
+    /// something a re-execution against the canonical chain could not reproduce.
+    ///
+    /// On the trait rather than on `RpcClient` so the reorg path, which holds a `dyn Source`, can call
+    /// it without downcasting - and so any future caching source is *asked* the question rather than
+    /// silently getting it wrong.
+    fn forget_cached_above(&self, _block: u64) {}
+
     /// Logs matching any of `addresses` + any of `topic0s` over the inclusive range `[from, to]`.
     async fn logs(
         &self,
@@ -49,6 +62,10 @@ pub trait Source: Send + Sync {
 
 #[async_trait::async_trait]
 impl Source for RpcClient {
+    fn forget_cached_above(&self, block: u64) {
+        self.forget_timestamps_above(block);
+    }
+
     async fn tip(&self) -> Result<u64> {
         self.block_number().await
     }

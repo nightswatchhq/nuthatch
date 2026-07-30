@@ -2486,6 +2486,12 @@ impl NestIngest {
         }
         match detect_reorg(source, &self.store, next - 1).await {
             Ok(Some(ancestor)) => {
+                // Drop any block-number-keyed cache above the fork (RFC-0029 §6d) *before* rolling
+                // back. The timestamp cache is keyed by height, and every block above `ancestor` has
+                // just been replaced - so a re-index would otherwise re-seal the **pre-reorg**
+                // timestamps and produce segments a re-execution against the canonical chain could not
+                // reproduce.
+                source.forget_cached_above(ancestor);
                 self.rollback_reorg(ancestor)?;
                 Ok(Some(ancestor + 1))
             }
@@ -2594,6 +2600,7 @@ impl NestIngest {
         let removed =
             self.store
                 .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string())?;
+
         self.metrics.inc_reorgs();
         self.metrics.set_last_block(ancestor);
         tracing::warn!(

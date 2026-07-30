@@ -16,6 +16,11 @@ const TIMESTAMP_ATTEMPTS: usize = 4;
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// How many block timestamps to remember (RFC-0029 §6d). Timestamps are 16 bytes of map entry each, so
+/// this is a few hundred KB - trivial next to the requests it removes on retry and split-and-retry,
+/// where we currently re-fetch every timestamp in a range we just split.
+const TIMESTAMP_CACHE_MAX: usize = 262_144;
+
 /// Merge `preferred` RPC endpoints ahead of a `fallback` list, preserving order and dropping
 /// duplicates. Used by `init --rpc` and `dev --rpc` to prefer a user's own node while keeping the
 /// built-in / configured endpoints as fallback. An empty `preferred` leaves `fallback` untouched.
@@ -294,6 +299,15 @@ pub struct RpcClient {
     health: Vec<AtomicU64>,
     /// Total HTTP requests attempted (incl. failover retries) - a benchmark/observability metric.
     requests: AtomicU64,
+    /// Block-number → unix timestamp, remembered across windows (RFC-0029 §6d).
+    ///
+    /// **This is only sound because of [`RpcClient::forget_timestamps_above`].** A block *number* does
+    /// not identify a block - a reorg replaces the block at that height with a different one carrying a
+    /// different timestamp. `block_timestamp` is a sealed column and the segment's content address
+    /// depends on it, so serving a stale timestamp after a reorg would seal a wrong value and break
+    /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
+    /// is the condition that makes it safe, not an optimisation on top.
+    timestamps: std::sync::Mutex<HashMap<u64, u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +340,7 @@ impl RpcClient {
             cursor: AtomicUsize::new(0),
             health,
             requests: AtomicU64::new(0),
+            timestamps: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -646,27 +661,100 @@ impl RpcClient {
     /// map (best-effort; the caller stores 0 for it), but a *whole-batch request failure* is retried a
     /// few times and then returned as `Err` - never silently collapsed into an all-zeros map, which
     /// would bake `block_timestamp = 0` into a permanent segment from a transient blip.
+    /// Forget cached timestamps for blocks above `block` - **called on every reorg**.
+    ///
+    /// A block number is not a block identity. When the chain reorganises, the block at a given height
+    /// is replaced by a different one with a different timestamp, and `block_timestamp` is a sealed
+    /// column whose value feeds the segment's content address. Serving the pre-reorg timestamp for a
+    /// re-indexed block would seal a value that a re-execution against the canonical chain would not
+    /// reproduce - a determinism break, and a silent one.
+    ///
+    /// Entries at or below the ancestor are kept: those blocks are common to both chains, which is what
+    /// makes them the ancestor.
+    pub fn forget_timestamps_above(&self, block: u64) {
+        let mut cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|&b, _| b <= block);
+    }
+
     pub async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         if blocks.is_empty() {
             return Ok(HashMap::new());
         }
         // Fetch in bounded sub-batches (see `MAX_TIMESTAMP_BATCH`) and merge, so a dense window whose
         // distinct-block count exceeds a provider's batch cap doesn't fail wholesale.
+        //
+        // The sub-batches go out **concurrently** (RFC-0029 §6c). They were sequential, which on a
+        // range with many distinct blocks made timestamp acquisition the dominant cost of a backfill -
+        // §4 measured it at roughly 85% of wall clock - while the window fan-out beside it was already
+        // concurrent.
+        //
+        // The cap is deliberately conservative rather than "as wide as the window fan-out". RFC-0029
+        // §6c records 10-way producing 2 failures in 10 on the measured endpoint (`IncompleteRead`), so
+        // widening this trades a real completion risk for throughput on a path where a partial response
+        // is *already* an error by COR-3 below. Four is chosen to be comfortably under that observed
+        // cliff; the RFC's own note that this "should be adaptive rather than a constant we guess"
+        // stands, and is deliberately not attempted here - an adaptive controller needs a failure
+        // signal to steer by, and inventing one alongside a concurrency change would make a regression
+        // impossible to attribute.
+        let requested = blocks.len();
+        // Serve what we already know. On a split-and-retry this is most of the range: the window that
+        // failed had its timestamps fetched, and the halves ask for the same blocks again.
         let mut out = HashMap::new();
-        for chunk in blocks.chunks(MAX_TIMESTAMP_BATCH) {
-            out.extend(self.fetch_timestamp_batch(chunk).await?);
+        let mut missing: Vec<u64> = Vec::new();
+        {
+            let cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
+            for &b in blocks {
+                match cache.get(&b) {
+                    Some(&ts) => {
+                        out.insert(b, ts);
+                    }
+                    None => missing.push(b),
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let blocks = &missing[..];
+
+        const TIMESTAMP_FANOUT: usize = 4;
+        use futures::stream::StreamExt;
+        // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
+        // outlive the stream, and a closure producing them cannot express that.
+        let futures: Vec<_> = blocks
+            .chunks(MAX_TIMESTAMP_BATCH)
+            .map(|c| self.fetch_timestamp_batch(c))
+            .collect();
+        let results: Vec<Result<HashMap<u64, u64>>> = futures::stream::iter(futures)
+            .buffered(TIMESTAMP_FANOUT)
+            .collect()
+            .await;
+        for r in results {
+            out.extend(r?);
+        }
+        {
+            let mut cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
+            // Bounded by clearing rather than evicting an LRU: this is a backfill-shaped access pattern
+            // that moves forward through the chain, so the oldest entries are the least likely to be
+            // asked for again and a precise eviction order buys nothing over starting fresh.
+            if cache.len() + out.len() > TIMESTAMP_CACHE_MAX {
+                cache.clear();
+            }
+            for (&b, &ts) in &out {
+                cache.insert(b, ts);
+            }
         }
         // COR-3: a *partial* response (endpoint answered but a load-balanced/archive-vs-full split
         // returned `null` for some block) must be an error, not a partial map - else the caller defaults
         // the missing block's `block_timestamp` to 0 and *seals it permanently*, breaking determinism
         // (a re-run against a healthy endpoint yields a different timestamp → different content hash).
         // Erroring makes the seal path retry the whole window, exactly like a total failure.
-        if out.len() != blocks.len() {
-            let missing = blocks.iter().filter(|b| !out.contains_key(b)).count();
+        if out.len() != requested {
+            let missing = requested - out.len();
             bail!(
                 "block_timestamps: {missing}/{} block(s) missing from the RPC response - refusing a \
                  partial map (would seal block_timestamp=0)",
-                blocks.len()
+                requested
             );
         }
         Ok(out)
@@ -1031,6 +1119,62 @@ mod tests {
                 "HTTP {status} carrying cap language must be narrowable"
             );
         }
+    }
+
+    /// **The guard that makes the timestamp cache sound at all** (RFC-0029 §6d).
+    ///
+    /// A block *number* is not a block identity. After a reorg the block at a given height is a
+    /// different block with a different timestamp, and `block_timestamp` is a sealed column feeding the
+    /// segment's content address - so a stale entry would seal a value that re-executing against the
+    /// canonical chain could not reproduce. The RFC proposes the cache without noting this; without
+    /// the invalidation it is a determinism bug rather than an optimisation.
+    #[test]
+    fn a_reorg_forgets_cached_timestamps_above_the_fork_and_keeps_the_rest() {
+        let c = super::RpcClient::new(vec!["https://example.invalid".into()]).unwrap();
+        {
+            let mut cache = c.timestamps.lock().unwrap();
+            for b in 98..=103u64 {
+                cache.insert(b, 1_700_000_000 + b);
+            }
+        }
+        c.forget_timestamps_above(100);
+        let cache = c.timestamps.lock().unwrap();
+        // Blocks at or below the ancestor are common to both chains - that is what makes it the
+        // ancestor - so they stay.
+        for b in 98..=100u64 {
+            assert!(
+                cache.contains_key(&b),
+                "block {b} is at/below the fork and must be kept"
+            );
+        }
+        // Everything above was replaced by the reorg.
+        for b in 101..=103u64 {
+            assert!(
+                !cache.contains_key(&b),
+                "block {b} is above the fork and must be forgotten"
+            );
+        }
+    }
+
+    /// The bound is enforced, not merely declared. Unbounded growth over a long backfill would trade an
+    /// RPC saving for an RSS breach, and the per-cursor budget is a non-negotiable.
+    #[test]
+    fn the_timestamp_cache_stops_growing() {
+        let c = super::RpcClient::new(vec!["https://example.invalid".into()]).unwrap();
+        {
+            let mut cache = c.timestamps.lock().unwrap();
+            for b in 0..super::TIMESTAMP_CACHE_MAX as u64 {
+                cache.insert(b, b);
+            }
+            assert_eq!(cache.len(), super::TIMESTAMP_CACHE_MAX);
+        }
+        // The next population past the ceiling clears rather than growing without limit.
+        c.forget_timestamps_above(u64::MAX);
+        let cache = c.timestamps.lock().unwrap();
+        assert!(
+            cache.len() <= super::TIMESTAMP_CACHE_MAX,
+            "the cache must never exceed its ceiling"
+        );
     }
 
     #[test]
