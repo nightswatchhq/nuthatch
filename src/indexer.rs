@@ -29,6 +29,14 @@ use crate::views::{self, BalanceView};
 const DEFAULT_WINDOW: u64 = 20;
 const DEFAULT_FINALITY: Finality = Finality::Depth(64);
 const LAST_BLOCK_KEY: &str = "last_block";
+/// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
+/// not (RFC-0029 §6b). Written on first index and compared on every start.
+///
+/// Without this, flipping `[nest] block_timestamps` on a nest that has already indexed would produce
+/// a store and a segment set in two different schemas, and nothing would notice until a query hit the
+/// half without the column. The declaration is an `init`-time one precisely because it cannot be
+/// changed in place; this key is what enforces that rather than merely documenting it.
+const TIMESTAMPS_KEY: &str = "block_timestamps";
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -1312,6 +1320,7 @@ async fn build_nest(
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
+    guard_timestamp_policy(&store, config.nest.block_timestamps)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -1661,6 +1670,82 @@ fn drain_sealable(buf: &mut Vec<(u64, String)>) -> Vec<String> {
 /// size, and a huge list is slower than fetching by topic0 and discarding non-children locally.
 const FACTORY_FLIP_THRESHOLD: usize = 500;
 
+/// Refuse to start when `[nest] block_timestamps` disagrees with what this nest already indexed.
+///
+/// Flipping the declaration is not a config edit, it is a **breaking schema change** (RFC-0029 §6b-i):
+/// it adds or removes a column on every table, which RFC-0020's classifier calls `ColumnRemoved`, and
+/// it changes the bytes of every sealed segment, so the existing content-addressed segments cannot be
+/// reused even over an identical range. Starting anyway would leave one nest holding two schemas -
+/// rows and segments written before the flip carrying the column and everything after not - and
+/// nothing would notice until a query hit the wrong half and got an error, or worse, a silent gap.
+///
+/// The first index writes the key; a nest predating this (no key) adopts whatever it is declaring,
+/// which is correct because before this existed every nest indexed timestamps and the default is
+/// `true`. A pre-existing nest that *declares* `false` is the one case worth catching, and the
+/// `has_indexed` check below is what catches it: an empty store has nothing to contradict.
+fn guard_timestamp_policy(store: &Store, declared: bool) -> Result<()> {
+    let want = if declared { "1" } else { "0" };
+    match store.get_meta(TIMESTAMPS_KEY)? {
+        Some(found) if found != want => {
+            let (was, now) = if declared {
+                ("without", "with")
+            } else {
+                ("with", "without")
+            };
+            anyhow::bail!(
+                "this nest indexed its stored data {was} `block_timestamp`, but nuthatch.toml now \
+                 declares it {now} it (`[nest] block_timestamps = {declared}`).\n\n\
+                 That is a breaking schema change, not a setting: it {} the column on every table, \
+                 and it changes the bytes of every sealed segment - so this nest's existing segments \
+                 cannot be reused and the data would have to be re-indexed from scratch.\n\n\
+                 Restore `block_timestamps = {}` to start, or `nuthatch init` a new nest with the \
+                 declaration you want and serve it alongside this one until its consumers move \
+                 (RFC-0020 slice 3).",
+                if declared { "adds" } else { "removes" },
+                !declared
+            );
+        }
+        Some(_) => Ok(()),
+        None => {
+            // An untouched nest adopts the declaration; one with rows already in it does not get to
+            // change its mind silently, so record what it actually has rather than what it now says.
+            let has_indexed = store.get_meta(LAST_BLOCK_KEY)?.is_some();
+            let actual = if has_indexed && !declared { "1" } else { want };
+            store.set_meta(TIMESTAMPS_KEY, actual)?;
+            if actual != want {
+                anyhow::bail!(
+                    "this nest has already indexed with `block_timestamp`, so it cannot switch to \
+                     `block_timestamps = false` in place - that removes a column from every table \
+                     and invalidates every sealed segment. `nuthatch init --no-timestamps` a new \
+                     nest instead, and serve it alongside this one (RFC-0020 slice 3)."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Block timestamps for `blocks` - or an empty map, without touching the network, when the nest
+/// declared it doesn't index them (RFC-0029 §6b).
+///
+/// **This is where the win actually is.** Timestamps arrive one `eth_getBlockByNumber` per block over
+/// a round trip `eth_getLogs` does not carry, measured at ~85% of backfill wall clock (RFC-0029 §4).
+/// Every path that stamps rows goes through here so there is exactly one place the decision is made,
+/// and no path can quietly keep paying for a column its nest doesn't have.
+///
+/// Returning an empty map is safe rather than lossy: `DecodedRow::block_timestamp` stays 0 and
+/// `to_json` omits the key entirely, so the zero never reaches the store or a segment.
+async fn fetch_timestamps(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    blocks: &[u64],
+) -> Result<std::collections::HashMap<u64, u64>> {
+    if !registry.timestamps() {
+        return Ok(std::collections::HashMap::new());
+    }
+    source.block_timestamps(blocks).await
+}
+
 /// Stream a *finalized* block range straight to sealed Parquet, bypassing the hot store entirely
 /// (RFC-0004 §1): decode → buffered rows → content-addressed segments. No redb write, no read-back,
 /// no prune - the churn a from-history backfill otherwise pays for every historical row. Rows carry
@@ -1727,7 +1812,7 @@ pub async fn backfill_direct(
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
         blocks.sort_unstable();
         blocks.dedup();
-        let ts = source.block_timestamps(&blocks).await?;
+        let ts = fetch_timestamps(source, registry, &blocks).await?;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
             buf.push((r.block_number, r.to_json().to_string()));
@@ -2015,7 +2100,7 @@ pub async fn backfill_direct_pipelined(
                 &format!("seal-direct block_timestamps {w_from}..={w_to}"),
                 BACKFILL_RETRY_ATTEMPTS,
                 BACKFILL_RETRY_BASE,
-                || source.block_timestamps(&blocks),
+                || fetch_timestamps(source, registry, &blocks),
             )
             .await?;
             // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
@@ -2190,7 +2275,7 @@ pub async fn backfill_direct_factory(
             &format!("factory block_timestamps {next}..={chunk_to}"),
             BACKFILL_RETRY_ATTEMPTS,
             BACKFILL_RETRY_BASE,
-            || source.block_timestamps(&blocks),
+            || fetch_timestamps(source, registry, &blocks),
         )
         .await?;
         let rows = decode_window(registry, Some(factory), children, &all_logs, &ts);
@@ -2628,7 +2713,7 @@ impl NestIngest {
         let mut blocks: Vec<u64> = logs.iter().map(|l| l.block_number).collect();
         blocks.sort_unstable();
         blocks.dedup();
-        let timestamps = match source.block_timestamps(&blocks).await {
+        let timestamps = match fetch_timestamps(source, &self.registry, &blocks).await {
             Ok(t) => t,
             Err(e) => {
                 // Don't store this window with zeroed timestamps - once it finalizes it would
@@ -5039,6 +5124,368 @@ template = "pool"
             hashes(d_seq.path()),
             hashes(d_pipe.path()),
             "concurrency must not change the sealed bytes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // RFC-0029 slice 4: demand-driven timestamps.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Counts the timestamp round trips a backfill makes, which is the thing slice 4 is trying to
+    /// stop paying for. Everything else is the minimum a backfill needs.
+    struct CountingSource {
+        logs: Vec<crate::rpc::Log>,
+        ts_calls: std::sync::atomic::AtomicUsize,
+        ts_blocks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSource {
+        fn new(logs: Vec<crate::rpc::Log>) -> CountingSource {
+            CountingSource {
+                logs,
+                ts_calls: std::sync::atomic::AtomicUsize::new(0),
+                ts_blocks: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for CountingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _a: &[String],
+            _t: &[String],
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.ts_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ts_blocks
+                .fetch_add(blocks.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+    }
+
+    fn transfer_registry() -> DecodeRegistry {
+        use crate::registry::ContractSpec;
+        DecodeRegistry::build(vec![ContractSpec {
+            alias: "tok".into(),
+            address: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            abi: serde_json::from_str(
+                r#"[{"type":"event","name":"Ping","anonymous":false,"inputs":[{"name":"n","type":"uint256","indexed":false}]}]"#,
+            )
+            .unwrap(),
+            events: Vec::new(),
+        }])
+        .unwrap()
+    }
+
+    fn ping_logs(reg: &DecodeRegistry, blocks: &[u64]) -> Vec<crate::rpc::Log> {
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        blocks
+            .iter()
+            .map(|&b| crate::rpc::Log {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                topics: vec![topic0.clone()],
+                data: format!("0x{:064x}", b),
+                block_number: b,
+                block_hash: format!("0x{b:064x}"),
+                log_index: 0,
+                tx_hash: format!("0xaa{b:062x}"),
+            })
+            .collect()
+    }
+
+    /// **The RFC-0029 acceptance criterion for slice 4.** A nest declaring no use of `block_timestamp`
+    /// backfills issuing *zero* timestamp round trips - and the rows it seals are byte-identical to a
+    /// timestamped run modulo that one column.
+    ///
+    /// Both halves matter and neither is sufficient alone. Zero calls without the row comparison could
+    /// be achieved by breaking the backfill; identical rows without the call count could be achieved by
+    /// fetching timestamps and then discarding them, which is the version that saves nothing.
+    #[tokio::test]
+    async fn a_timestamp_free_nest_backfills_without_a_single_timestamp_call() {
+        let reg = transfer_registry();
+        let logs = ping_logs(&reg, &[10, 11, 12, 20, 21]);
+
+        let with_ts = CountingSource::new(logs.clone());
+        let d_with = tempfile::tempdir().unwrap();
+        let n_with = backfill_direct(
+            &with_ts,
+            &reg,
+            d_with.path(),
+            &["0x1111111111111111111111111111111111111111".into()],
+            &[],
+            10,
+            21,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let without_ts = CountingSource::new(logs);
+        let d_without = tempfile::tempdir().unwrap();
+        let reg_off = transfer_registry().with_timestamps(false);
+        let n_without = backfill_direct(
+            &without_ts,
+            &reg_off,
+            d_without.path(),
+            &["0x1111111111111111111111111111111111111111".into()],
+            &[],
+            10,
+            21,
+            100,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(n_with, n_without, "the same rows are indexed either way");
+        assert!(n_with > 0, "the fixture must actually produce rows");
+
+        assert!(
+            with_ts.ts_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "control: a timestamped nest must still fetch timestamps, or this test proves nothing"
+        );
+        assert_eq!(
+            without_ts
+                .ts_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a timestamp-free nest must not issue a single block-header round trip"
+        );
+        assert_eq!(
+            without_ts
+                .ts_blocks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "…and must not ask about a single block"
+        );
+
+        // "Byte-identical modulo that column" - read the sealed Parquet back rather than trusting the
+        // manifest's row counts, which would still match if every value had been mangled.
+        let with_cols = sealed_columns(d_with.path());
+        let without_cols = sealed_columns(d_without.path());
+        assert!(
+            with_cols.contains_key("block_timestamp"),
+            "control: the timestamped run sealed the column"
+        );
+        assert!(
+            !without_cols.contains_key("block_timestamp"),
+            "the timestamp-free run must not seal the column at all: {:?}",
+            without_cols.keys().collect::<Vec<_>>()
+        );
+        let mut expected = with_cols.clone();
+        expected.remove("block_timestamp");
+        assert_eq!(
+            expected, without_cols,
+            "every other column must be identical, values included"
+        );
+    }
+
+    /// Every sealed segment's columns, as `name -> values` in row order, across all of a nest's
+    /// tables. Reads the Parquet the way a consumer would, so a test comparing two runs is comparing
+    /// what was actually written rather than what the manifest claims about it.
+    fn sealed_columns(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<String>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let mut out: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let m = seal::load_manifest(dir).unwrap();
+        for segs in m.tables.values() {
+            for seg in segs {
+                let f = std::fs::File::open(dir.join(crate::seal::SEGMENTS_DIR).join(&seg.file))
+                    .unwrap();
+                let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    for (i, field) in batch.schema().fields().iter().enumerate() {
+                        let col = batch.column(i);
+                        let vals = out.entry(field.name().clone()).or_default();
+                        for r in 0..col.len() {
+                            vals.push(format!(
+                                "{:?}",
+                                arrow::util::display::array_value_to_string(col, r)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The sealed *schema* differs by exactly one column - the column is **absent**, not null.
+    ///
+    /// A null would keep the schema stable and cost only bytes, which is why it is tempting; it also
+    /// makes `ORDER BY block_timestamp` return an arbitrary order rather than an error, and a query
+    /// that silently answers wrongly is worse than one that refuses. This asserts the choice.
+    #[tokio::test]
+    async fn the_timestamp_column_is_absent_from_sealed_rows_not_null() {
+        let reg = transfer_registry().with_timestamps(false);
+        let src = CountingSource::new(ping_logs(&reg, &[5, 6]));
+        let dir = tempfile::tempdir().unwrap();
+        backfill_direct(
+            &src,
+            &reg,
+            dir.path(),
+            &["0x1111111111111111111111111111111111111111".into()],
+            &[],
+            5,
+            6,
+            100,
+        )
+        .await
+        .unwrap();
+
+        // What was actually sealed. The advertised schema is checked below, but this comes first:
+        // the test is named for the sealed rows and must fail if they carry the column, whatever
+        // `/tables` happens to claim.
+        let sealed = sealed_columns(dir.path());
+        assert!(
+            !sealed.contains_key("block_timestamp"),
+            "sealed rows must not carry the column: {:?}",
+            sealed.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sealed.contains_key("block_number"),
+            "control: the segment must have sealed something"
+        );
+
+        // The schema the nest advertises must agree with what it seals - the two disagreeing is the
+        // failure this whole slice is arranged to prevent.
+        let advertised: Vec<String> = reg.schema()[0]
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert!(
+            !advertised.contains(&"block_timestamp".to_string()),
+            "a timestamp-free nest must not advertise the column: {advertised:?}"
+        );
+        assert!(
+            advertised.contains(&"block_number".to_string()),
+            "the other implicit columns are untouched: {advertised:?}"
+        );
+
+        let on = transfer_registry();
+        let advertised_on: Vec<String> = on.schema()[0]
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert!(
+            advertised_on.contains(&"block_timestamp".to_string()),
+            "control: the default nest still advertises it"
+        );
+        assert_eq!(
+            advertised_on.len(),
+            advertised.len() + 1,
+            "exactly one column differs"
+        );
+    }
+
+    /// The declaration is `init`-time: a nest that has already indexed refuses to flip it.
+    ///
+    /// This is the guard that makes the whole design honest. Without it, `block_timestamps = false`
+    /// pasted into an existing `nuthatch.toml` would leave one nest holding two schemas - segments
+    /// written before the edit carrying the column, everything after not - and nothing would say so.
+    #[test]
+    fn flipping_the_timestamp_declaration_on_an_indexed_nest_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+
+        // First start records what the nest is built with.
+        guard_timestamp_policy(&store, true).unwrap();
+        assert_eq!(
+            store.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
+            Some("1")
+        );
+        // Restarting unchanged is fine, repeatedly.
+        guard_timestamp_policy(&store, true).unwrap();
+
+        let err = guard_timestamp_policy(&store, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("breaking schema change"),
+            "the error must name what it is, not just refuse: {err}"
+        );
+        assert!(
+            err.contains("init"),
+            "…and must say what to do instead: {err}"
+        );
+        // The refusal must not have quietly rewritten the record it just refused to honour.
+        assert_eq!(
+            store.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    /// The mirror case, and the one a pure equality check would miss: a nest that indexed *before*
+    /// this key existed has no record at all. It must adopt its declaration when it holds no data, and
+    /// be refused when it does - because "no key" and "no data" are different questions.
+    #[test]
+    fn a_pre_existing_nest_cannot_adopt_a_timestamp_free_declaration() {
+        // Untouched nest: adopts whatever it declares.
+        let fresh = tempfile::tempdir().unwrap();
+        let s1 = Store::open(&fresh.path().join(DB_FILE)).unwrap();
+        guard_timestamp_policy(&s1, false).unwrap();
+        assert_eq!(s1.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("0"));
+
+        // Nest with history but no key - as every nest built before slice 4 will be.
+        let old = tempfile::tempdir().unwrap();
+        let s2 = Store::open(&old.path().join(DB_FILE)).unwrap();
+        s2.set_meta(LAST_BLOCK_KEY, "1234").unwrap();
+        let err = guard_timestamp_policy(&s2, false).unwrap_err().to_string();
+        assert!(
+            err.contains("already indexed"),
+            "must explain it is the existing data that blocks this: {err}"
+        );
+        // It recorded the truth (it *has* timestamps), so the next start gives the same answer rather
+        // than depending on whether `last_block` happens to still be there.
+        assert_eq!(s2.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("1"));
+        assert!(guard_timestamp_policy(&s2, false).is_err());
+        guard_timestamp_policy(&s2, true).unwrap();
+    }
+
+    /// Upgrading an existing nest must be a no-op: `block_timestamps` absent from `nuthatch.toml`
+    /// means `true`, which is what every nest before slice 4 produced.
+    #[test]
+    fn an_older_nest_config_still_indexes_timestamps() {
+        let cfg: Config = toml::from_str(
+            r#"
+[nest]
+name = "old"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.nest.block_timestamps,
+            "absent must mean on, or upgrading silently drops a column from every table"
         );
     }
 }

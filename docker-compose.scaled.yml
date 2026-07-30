@@ -33,7 +33,7 @@
 # Control-plane calls need the token:
 #   curl -H 'authorization: Bearer dev-token-change-me' localhost:8290/workers
 #
-# The fleet profile needs the **scaled** image - `ghcr.io/nuthatch-indexer/nuthatch:<version>-scaled`.
+# The fleet profile needs the **scaled** image - `ghcr.io/nightswatchhq/nuthatch:<version>-scaled`.
 # The default published image is the embedded build and deliberately carries no database driver, so
 # `worker` and `control` are not in it. Set `NUTHATCH_IMAGE` to pick a version.
 
@@ -69,7 +69,7 @@ services:
   # `NUTHATCH_CONTROL_TOKEN` rather than merely warning about it.
   control:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.2-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nightswatchhq/nuthatch:0.8.2-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-
@@ -99,7 +99,7 @@ services:
   # each believed was its own lease - so it is derived rather than configured.
   writer:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.2-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nightswatchhq/nuthatch:0.8.2-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     # `worker`, not `dev`. `dev` indexes a nest directory it owns outright and knows nothing about the
@@ -122,7 +122,7 @@ services:
   # one freely - `docker compose --profile fleet up --scale fe=5` - because nothing here writes.
   fe:
     profiles: ["fleet"]
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-indexer/nuthatch:0.8.2-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nightswatchhq/nuthatch:0.8.2-scaled}
     depends_on:
       postgres: { condition: service_healthy }
     command: >-

@@ -15,10 +15,34 @@ pub const ABI_FILE: &str = "abi.json";
 
 /// The nest-config schema this build understands. A nest declaring a higher version is rejected on
 /// load (it was authored by a newer nuthatch) - the guard that makes `init --from` safe.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
+/// An absent `schema_version` means **1**, not "current".
+///
+/// Every nest written before the field existed is a v1 nest, and treating it as current would mean a
+/// future v3 build silently accepted a file it had no reason to believe it understood. The default is
+/// a statement about the file, not about this binary.
 fn default_schema_version() -> u32 {
-    CURRENT_SCHEMA_VERSION
+    1
+}
+
+/// The lowest config-schema version that can express this nest.
+///
+/// **v2 exists for exactly one reason:** `block_timestamps = false` (RFC-0029 §6b). A pre-0.9 binary
+/// does not know the field, so it would parse such a nest, ignore the declaration, and index
+/// timestamps into a store built without them - the two-schemas-in-one-nest failure the runtime guard
+/// catches locally but an older binary cannot. Stamping v2 makes that binary refuse the nest instead.
+///
+/// A nest that indexes timestamps is stamped **v1 even though this build is v2**, because it is
+/// genuinely a v1 file: nothing in it needs a v2 reader, and gratuitously raising the floor would stop
+/// 0.8.x opening nests it can serve perfectly well. The version records what a *reader* must
+/// understand, not which binary happened to write it.
+pub fn required_schema_version(block_timestamps: bool) -> u32 {
+    if block_timestamps {
+        1
+    } else {
+        2
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -295,6 +319,24 @@ pub struct Nest {
     /// Config schema version (see `CURRENT_SCHEMA_VERSION`). Absent in older nests → treated as 1.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    /// Whether every row carries the implicit `block_timestamp` column (RFC-0029 §6b).
+    ///
+    /// **This is an `init`-time declaration, not a tuning flag**, and the default is `true` because
+    /// that is what every nest before it produced. Turning it off removes a column from *every* table,
+    /// which RFC-0020's classifier calls `ColumnRemoved` - breaking - and it changes the bytes of every
+    /// sealed segment, so a switched nest cannot reuse its own content-addressed segments. Changing it
+    /// on a nest that has already indexed is refused at startup (see `TIMESTAMPS_KEY` in `indexer.rs`)
+    /// and must go through the ordinary breaking-update path: a new nest, served alongside the old one
+    /// for its existing consumers.
+    ///
+    /// What it buys is real - timestamp acquisition measured at ~85% of backfill wall clock - but it is
+    /// a *new-nest* win, which is a narrower claim than "backfills get faster".
+    #[serde(default = "default_block_timestamps")]
+    pub block_timestamps: bool,
+}
+
+fn default_block_timestamps() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -321,7 +363,13 @@ impl Config {
         // file would produce; TOML remains what `init` emits and the default for everyone else.
         let star = dir.join("nest.star");
         if star.exists() {
-            return crate::starlark_config::load_star(&star, dir);
+            let cfg = crate::starlark_config::load_star(&star, dir)?;
+            // A `.star` produces the same `Config` a TOML file would, so it must clear the same
+            // version gates. It used to return straight out of here and skip them - which meant a
+            // computed nest could declare any `schema_version` it liked, including one this build has
+            // no idea how to honour, and be accepted.
+            cfg.check_schema_version()?;
+            return Ok(cfg);
         }
         let path = dir.join(CONFIG_FILE);
         let raw = std::fs::read_to_string(&path).with_context(|| {
@@ -337,14 +385,38 @@ impl Config {
                 anyhow!("nuthatch.toml is neither v2 ({v2_err}) nor v1 ({v1_err})")
             })?,
         };
-        if cfg.nest.schema_version > CURRENT_SCHEMA_VERSION {
+        cfg.check_schema_version()?;
+        Ok(cfg)
+    }
+
+    /// Both gates on `schema_version`, shared by the TOML and Starlark load paths.
+    fn check_schema_version(&self) -> Result<()> {
+        // Too new for us: the nest was authored by a later nuthatch and may mean things by fields we
+        // do not know. This is the guard that makes `init --from` safe.
+        if self.nest.schema_version > CURRENT_SCHEMA_VERSION {
             bail!(
                 "this nest needs config schema v{} but this nuthatch supports up to v{} - upgrade nuthatch",
-                cfg.nest.schema_version,
+                self.nest.schema_version,
                 CURRENT_SCHEMA_VERSION
             );
         }
-        Ok(cfg)
+        // Too *old* for what it declares - the mirror case, and the dangerous one. A file claiming v1
+        // while declaring a v2-only feature is exactly the file an older binary would accept and get
+        // wrong. We cannot fix that binary; we can refuse to be the source of such a file, and anyone
+        // hand-editing `block_timestamps` finds out here rather than from a nest that quietly
+        // disagrees with itself on someone else's machine.
+        let need = required_schema_version(self.nest.block_timestamps);
+        if self.nest.schema_version < need {
+            bail!(
+                "this nest declares `block_timestamps = {}`, which needs `schema_version = {}` \
+                 (it says {}). Older nuthatch builds don't know the field and would index timestamps \
+                 into a nest built without them; the version is what makes them refuse instead.",
+                self.nest.block_timestamps,
+                need,
+                self.nest.schema_version
+            );
+        }
+        Ok(())
     }
 
     fn from_v1(raw: &str) -> Result<Config> {
@@ -363,6 +435,7 @@ impl Config {
                 chain_id: v1.chain_id,
                 rpc_urls: v1.rpc_urls,
                 schema_version: CURRENT_SCHEMA_VERSION,
+                block_timestamps: true,
             },
             contracts: vec![Contract {
                 alias: "c0".to_string(),
@@ -429,6 +502,7 @@ mod tests {
                 chain_id: 1,
                 rpc_urls: vec!["https://rpc.example".into()],
                 schema_version: CURRENT_SCHEMA_VERSION,
+                block_timestamps: true,
             },
             contracts: vec![
                 Contract {
@@ -589,5 +663,120 @@ rpc_urls = ["https://rpc.example"]
         assert!(back.extract.traces && back.extract.state);
         assert_eq!(back.extract.contracts, vec!["usdc".to_string()]);
         assert_eq!(back.extract.selectors, vec!["0xa9059cbb".to_string()]);
+    }
+
+    /// A timestamped nest is stamped **v1**, not "whatever version this build is".
+    ///
+    /// Getting this wrong is invisible until someone tries to open a freshly-scaffolded nest with the
+    /// previous release and is told to upgrade for no reason. The version describes the file's
+    /// requirements; only `block_timestamps = false` actually needs a v2 reader.
+    #[test]
+    fn only_a_timestamp_free_nest_raises_the_schema_version() {
+        assert_eq!(required_schema_version(true), 1);
+        assert_eq!(required_schema_version(false), 2);
+        assert!(
+            required_schema_version(false) <= CURRENT_SCHEMA_VERSION,
+            "this build must be able to read what it writes"
+        );
+    }
+
+    /// A file claiming v1 while declaring a v2-only feature is refused - it is precisely the file an
+    /// older binary would accept and get wrong.
+    #[test]
+    fn a_v1_file_cannot_declare_block_timestamps_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 1
+block_timestamps = false
+"#,
+        )
+        .unwrap();
+        let err = Config::load(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("schema_version = 2"),
+            "must say which version it needs: {err}"
+        );
+
+        // The same file at v2 loads.
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 2
+block_timestamps = false
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(!cfg.nest.block_timestamps);
+    }
+
+    /// A pre-slice-4 nest - no `schema_version`, no `block_timestamps` - still loads as v1 with
+    /// timestamps on. This is every nest in existence today, so it had better keep working.
+    #[test]
+    fn a_nest_written_before_any_of_this_still_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.nest.schema_version, 1);
+        assert!(cfg.nest.block_timestamps);
+    }
+
+    /// A computed nest can make the declaration too, and its `schema_version` is *derived* rather
+    /// than authored - so the mismatch a hand-edited TOML can produce is unrepresentable here.
+    #[test]
+    fn a_starlark_nest_can_be_timestamp_free_and_versions_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |ts: &str| {
+            std::fs::write(
+                dir.path().join("nest.star"),
+                format!(
+                    r#"
+nest(
+    name = "computed",
+    chain = "mainnet",
+    rpc_urls = ["https://rpc.example"],
+    block_timestamps = {ts},
+)
+"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write("False");
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(!cfg.nest.block_timestamps);
+        assert_eq!(
+            cfg.nest.schema_version, 2,
+            "a timestamp-free .star must stamp v2, or an older binary would accept and mis-index it"
+        );
+
+        // The default is on, and stays a v1 file so older builds can still open it.
+        write("True");
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(cfg.nest.block_timestamps);
+        assert_eq!(cfg.nest.schema_version, 1);
     }
 }

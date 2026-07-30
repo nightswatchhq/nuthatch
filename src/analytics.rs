@@ -617,6 +617,20 @@ fn define_children_views(conn: &Connection, dir: &Path) {
     let Ok(fs) = crate::factory::FactorySet::build(&config) else {
         return;
     };
+    // A timestamp-free nest (RFC-0029 §6b) has no `block_timestamp` to project, so the provenance
+    // view drops `discovered_timestamp` rather than selecting a column that doesn't exist. Leaving
+    // the reference in would make the whole view fail to create - and the failure is swallowed as a
+    // `debug!` below, so a factory nest would silently lose `{template}__children` entirely. Omitted
+    // rather than `0 AS discovered_timestamp` for the same reason the column itself is omitted: a
+    // zero that looks like a timestamp is worse than an error.
+    let (ts, cols) = if config.nest.block_timestamps {
+        (
+            "block_timestamp AS discovered_timestamp, ",
+            "discovered_timestamp, ",
+        )
+    } else {
+        ("", "")
+    };
 
     let mut by_template: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
@@ -634,7 +648,7 @@ fn define_children_views(conn: &Connection, dir: &Path) {
             .map(|(table, cp)| {
                 format!(
                     "SELECT lower(\"{cp}\") AS address, block_number AS discovered_block, \
-                     log_index AS discovered_log_index, block_timestamp AS discovered_timestamp, \
+                     log_index AS discovered_log_index, {ts}\
                      lower(address) AS parent_address FROM \"{table}\""
                 )
             })
@@ -642,7 +656,7 @@ fn define_children_views(conn: &Connection, dir: &Path) {
         let union = selects.join(" UNION ALL ");
         let ddl = format!(
             "CREATE VIEW \"{template}__children\" AS \
-             SELECT address, discovered_block, discovered_log_index, discovered_timestamp, parent_address \
+             SELECT address, discovered_block, discovered_log_index, {cols}parent_address \
              FROM ({union}) \
              QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
         );

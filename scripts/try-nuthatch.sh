@@ -3,7 +3,7 @@
 # try-nuthatch.sh - install & smoke-test the Nuthatch indexer, capturing every
 # failure mode so it can be diagnosed afterwards.
 #
-# Nuthatch (https://github.com/nuthatch-indexer/nuthatch) is a self-hosted-first,
+# Nuthatch (https://github.com/nightswatchhq/nuthatch) is a self-hosted-first,
 # AI-native EVM blockchain indexer in one Rust binary. This script installs it,
 # scaffolds the smallest possible nest (a single contract - USDC on mainnet),
 # runs `nuthatch dev` just long enough to prove the local API answers, then shuts

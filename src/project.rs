@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::abi;
 use crate::chains;
 use crate::cli::{AddArgs, InitArgs};
-use crate::config::{Config, Contract, Extract, Nest, CURRENT_SCHEMA_VERSION};
+use crate::config::{Config, Contract, Extract, Nest};
 use crate::rpc::RpcClient;
 
 pub async fn init(args: InitArgs) -> Result<()> {
@@ -105,7 +105,13 @@ pub async fn init(args: InitArgs) -> Result<()> {
             chain: chain.name.to_string(),
             chain_id: chain.chain_id,
             rpc_urls,
-            schema_version: CURRENT_SCHEMA_VERSION,
+            // Not `CURRENT_SCHEMA_VERSION`: a timestamped nest is a v1 file and stays readable by
+            // 0.8.x. See `config::required_schema_version`.
+            schema_version: crate::config::required_schema_version(!args.no_timestamps),
+            // Serialised unconditionally (no `skip_serializing_if`), so every scaffolded nest states
+            // its schema shape in the file. Someone reading `nuthatch.toml` to work out why a table
+            // has no `block_timestamp` finds the answer there rather than in our serde defaults.
+            block_timestamps: !args.no_timestamps,
         },
         contracts,
         screening: crate::config::Screening::default(),

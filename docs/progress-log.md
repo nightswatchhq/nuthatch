@@ -1678,7 +1678,7 @@ Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-ord
   bridged `status`/`sql`/`top_balances` to a running index. _Deferred: the governed semantic layer
   + NL queries, streaming subscribe, Ollama/BYO-key AI authoring._
 - **2026-07-14 - Slice 4 (first cut): WASM transform runtime.** Ported from
-  [liminal](https://github.com/lodestar-team/liminal) with the brief's key change - **the WIT call
+  [liminal](https://github.com/nightswatchhq/liminal) with the brief's key change - **the WIT call
   boundary is a whole batch (Arrow IPC), not one event** (liminal was per-event; that can't keep up
   with backfill). A transform is a `wasm32-wasip2` component exporting `nuthatch:transform/stage`;
   the host (wasmtime 44) loads it with **zero capabilities** - base WASI only, no http/kv/filesystem

@@ -1,4 +1,4 @@
-# The published container image (ghcr.io/nuthatch-indexer/nuthatch).
+# The published container image (ghcr.io/nightswatchhq/nuthatch).
 #
 # It copies the **same** release binary that is attached to the GitHub Release rather than rebuilding
 # from source, so the image and the tarball are byte-identical. A separate build would be a second

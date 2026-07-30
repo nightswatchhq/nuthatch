@@ -52,7 +52,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 1 Single nest | yes | CI + the Lodestar production box |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
-| 4 Guards | yes | CI + a live `/sql` adversary check |
+| 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
 | 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus a full level-5 pass on a clean Hetzner box** (2026-07-30, Ubuntu 24.04, published v0.8.1 artifacts, 2 writers + 2 FE nodes): **10/10, zero skipped**, via `scripts/verify.sh 5`. **Nothing has run across real machines** - the partition and clock-skew cases are still open. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
@@ -252,7 +252,33 @@ Past 2,000,000 unsealed rows expect `503` naming `sealed_through`, rather than t
 memory. *Proves* the largest RAM risk is bounded. It **refuses rather than truncating**, because a
 partial tip would silently change the answer to an aggregate.
 
-**4.4 Admin exposure**
+**4.4 The timestamp declaration cannot be flipped**
+
+```sh
+nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --dir ts-nest
+nuthatch dev --dir ts-nest --backfill 500       # let it index, then stop
+sed -i 's/block_timestamps = true/block_timestamps = false/' ts-nest/nuthatch.toml
+nuthatch dev --dir ts-nest
+```
+
+Expect the last command to **refuse to start**, naming it a breaking schema change. *Proves* a nest
+cannot end up holding two schemas — rows and segments written before the edit carrying
+`block_timestamp` and everything after not, with nothing to say so until a query hits the wrong half.
+
+Then the other direction, which is the one an operator actually wants:
+
+```sh
+nuthatch init 0xA0b8…eB48 --dir fast-nest --no-timestamps
+grep -E 'schema_version|block_timestamps' fast-nest/nuthatch.toml
+nuthatch dev --dir fast-nest --backfill 5000 --seal-direct
+nuthatch sql --dir fast-nest 'SELECT * FROM usdc__transfer LIMIT 1'
+```
+
+Expect `schema_version = 2`, no `block_timestamp` column in the result, and a **visibly faster**
+backfill than the same range with timestamps on. The v2 stamp is what makes a 0.8.x binary refuse this
+nest rather than index timestamps into it — check that too if you have an old binary to hand.
+
+**4.5 Admin exposure**
 
 Bind off-localhost without `NUTHATCH_ADMIN_TOKEN` and expect the admin routes to be unavailable; with a
 token, expect requests lacking it to be refused. *Proves* the admin surface is not reachable

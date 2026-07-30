@@ -270,6 +270,7 @@ fn nest_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneType)] extract: Value<'v>,
         #[starlark(require = named)] alerts: Option<UnpackListOrTuple<Value<'v>>>,
         #[starlark(require = named)] webhooks: Option<UnpackListOrTuple<Value<'v>>>,
+        #[starlark(require = named, default = true)] block_timestamps: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let collector = eval
@@ -304,6 +305,20 @@ fn nest_builtins(builder: &mut GlobalsBuilder) {
             serde_json::Value::from(resolved_chain_id),
         );
         nest_obj.insert("rpc_urls".into(), serde_json::to_value(rpc_urls.items)?);
+        // RFC-0029 §6b, and the same init-time declaration the TOML path makes - a computed nest that
+        // could not express it would be a nest that could not be timestamp-free.
+        nest_obj.insert(
+            "block_timestamps".into(),
+            serde_json::Value::Bool(block_timestamps),
+        );
+        // Derived, never taken from the file. `schema_version` states what a *reader* must
+        // understand, which is a fact about the config rather than a choice - so the host computes it
+        // and a `.star` cannot get it wrong (or claim v1 while declaring a v2-only feature, which is
+        // precisely the file an older binary would accept and mis-index).
+        nest_obj.insert(
+            "schema_version".into(),
+            serde_json::Value::from(crate::config::required_schema_version(block_timestamps)),
+        );
 
         let mut root = serde_json::Map::new();
         root.insert("nest".into(), serde_json::Value::Object(nest_obj));

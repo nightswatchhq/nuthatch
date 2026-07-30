@@ -84,7 +84,7 @@ so. But it means a nest never *shows its reasoning* - the "top holders," the "da
 "delegator exposure" that is the actual reason the nest exists lives only in ad-hoc queries typed at
 a REPL and then lost. There is nowhere in a nest to *say* what it computes.
 
-**The fork problem - measured, not hypothesized.** The `nuthatch-indexer` org today has
+**The fork problem - measured, not hypothesized.** The `nightswatchhq` org today has
 `horizon-nest` and, beside it, `graph-network-nest` whose own description reads *"Seeded from
 horizon-nest, expanding to full parity."* A full diff of the two repos (taken 2026-07-19) shows
 "seeded from" means **byte-identical**: same three contracts at the same addresses, the same six

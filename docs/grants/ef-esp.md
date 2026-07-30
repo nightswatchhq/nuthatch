@@ -7,7 +7,7 @@ distinct milestone ownership (Rule 1: no milestone funded twice)._
 - **Program:** Ethereum Foundation Ecosystem Support Program (ESP), small-grants / inquiry track.
 - **Requested:** $50-90K over 12 months.
 - **Applicant:** Pete (cargopete), sole maintainer.
-- **Project:** nuthatch - https://github.com/nuthatch-indexer/nuthatch (`MIT OR Apache-2.0`).
+- **Project:** nuthatch - https://github.com/nightswatchhq/nuthatch (`MIT OR Apache-2.0`).
 
 ## The pitch (the TrueBlocks lane)
 

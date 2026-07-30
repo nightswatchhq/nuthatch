@@ -103,6 +103,10 @@ pub struct CallRegistry {
     /// Selector allowlist. Empty means every selector.
     allow: Vec<[u8; 4]>,
     hash: [u8; 32],
+    /// Whether call rows carry `block_timestamp` (RFC-0029 §6b). Mirrors `DecodeRegistry::timestamps`:
+    /// a nest declares the policy once and *every* table it produces obeys it, or `/tables` would
+    /// advertise one shape for events and another for calls.
+    timestamps: bool,
 }
 
 impl CallRegistry {
@@ -122,7 +126,13 @@ impl CallRegistry {
                 .map_err(|e| anyhow!("contract {} has an unparseable address: {e}", c.alias))?;
             specs.push((c.alias.clone(), address, abi));
         }
-        Self::build(specs, &config.extract)
+        Ok(Self::build(specs, &config.extract)?.with_timestamps(config.nest.block_timestamps))
+    }
+
+    /// See [`crate::registry::DecodeRegistry::with_timestamps`].
+    pub fn with_timestamps(mut self, timestamps: bool) -> CallRegistry {
+        self.timestamps = timestamps;
+        self
     }
 
     pub fn build(
@@ -165,6 +175,7 @@ impl CallRegistry {
             scope,
             allow,
             hash,
+            timestamps: true,
         })
     }
 
@@ -257,7 +268,7 @@ impl CallRegistry {
             .tables()
             .iter()
             .map(|d| {
-                let mut columns = implicit_columns();
+                let mut columns = implicit_columns(self.timestamps);
                 columns.extend(d.columns.iter().map(|c| ColumnSchema {
                     name: c.name.clone(),
                     sol_type: c.sol_type.clone(),
@@ -277,10 +288,10 @@ impl CallRegistry {
             })
             .collect();
         if extract.traces {
-            out.push(raw_calls_schema());
+            out.push(raw_calls_schema(self.timestamps));
         }
         if extract.state {
-            out.push(state_diffs_schema());
+            out.push(state_diffs_schema(self.timestamps));
         }
         out
     }
@@ -302,6 +313,9 @@ pub struct CallContext {
     /// namespace first. Recorded in RFC-0014 rather than half-solved here, because the right answer
     /// depends on the ordering the ExEx notification actually supplies.
     pub call_index: u64,
+    /// See [`crate::registry::DecodedRow::timestamps`] - carried on the context because every row
+    /// built from one block shares it.
+    pub timestamps: bool,
 }
 
 impl CallContext {
@@ -312,6 +326,7 @@ impl CallContext {
             block_number: self.block_number,
             block_hash: self.block_hash.clone(),
             block_timestamp: self.block_timestamp,
+            timestamps: self.timestamps,
             log_index: self.call_index,
             tx_hash: self.tx_hash.clone(),
             address: format!("0x{}", hex::encode(to)),
@@ -392,8 +407,8 @@ fn registry_hash(by_selector: &HashMap<[u8; 4], Vec<CallDecoder>>) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn raw_calls_schema() -> TableSchema {
-    let mut columns = implicit_columns();
+fn raw_calls_schema(timestamps: bool) -> TableSchema {
+    let mut columns = implicit_columns(timestamps);
     columns.push(ColumnSchema {
         name: "selector".into(),
         sol_type: "bytes4".into(),
@@ -418,8 +433,8 @@ fn raw_calls_schema() -> TableSchema {
     }
 }
 
-fn state_diffs_schema() -> TableSchema {
-    let mut columns = implicit_columns();
+fn state_diffs_schema(timestamps: bool) -> TableSchema {
+    let mut columns = implicit_columns(timestamps);
     for (name, ty) in [("slot", "bytes32"), ("prev", "bytes32"), ("new", "bytes32")] {
         columns.push(ColumnSchema {
             name: name.into(),
@@ -476,6 +491,7 @@ mod tests {
             block_number: 100,
             block_hash: "0xbb".into(),
             block_timestamp: 1_700_000_000,
+            timestamps: true,
             tx_hash: "0xtt".into(),
             call_index: 3,
         }

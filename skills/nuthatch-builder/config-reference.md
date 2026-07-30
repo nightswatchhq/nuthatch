@@ -15,6 +15,7 @@ chain = "mainnet"             # mainnet | arbitrum-one | base
 chain_id = 1
 rpc_urls = ["https://…"]      # tried in order, then round-robin failover
 schema_version = 1            # config/data layout version (managed by nuthatch)
+block_timestamps = true       # init-time only; false drops block_timestamp from every table
 
 [[contracts]]                 # one or more
 alias = "usdc"                # table prefix → usdc__transfer, usdc__approval, …

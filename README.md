@@ -4,11 +4,11 @@
 > One command. One tiny binary. Your box, your data - no subgraph to author, no Postgres to run, no
 > monthly bill, no third-party API.
 
-[![ci](https://github.com/nuthatch-indexer/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nuthatch-indexer/nuthatch/actions/workflows/ci.yml)
+[![ci](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
-cargo install --git https://github.com/nuthatch-indexer/nuthatch nuthatch
+cargo install --git https://github.com/nightswatchhq/nuthatch nuthatch
 
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
 nuthatch dev            # backfills from deployment, follows the tip, serves an API
@@ -49,7 +49,7 @@ tiny*. That combination is the point - not any single feature.
 
 ```sh
 # from source (any platform with a Rust toolchain)
-cargo install --git https://github.com/nuthatch-indexer/nuthatch nuthatch
+cargo install --git https://github.com/nightswatchhq/nuthatch nuthatch
 ```
 
 Prebuilt binaries (macOS Apple Silicon, Linux x86_64) ship with each release, or install in one line:
@@ -101,6 +101,12 @@ indexing against the wrong chain corrupts state silently.
 
 Every declared event becomes a table named `{alias}__{event}` (e.g. `usdc__transfer`), carrying the
 event's fields plus `block_number`, `block_timestamp`, `tx_hash`, `log_index`, `address`.
+
+> `block_timestamp` costs a block-header round trip per block - about 85% of backfill wall clock. A
+> nest that will never ask a time-series question can drop the column with `init --no-timestamps` and
+> skip that entirely. It is an **init-time** choice: changing it later is a breaking schema change and
+> a full re-index, so it is worth a moment's thought and is deliberately not a flag you can flip.
+> [Details](docs/operators.md#configuration-surface).
 
 ```sh
 # one-shot from the terminal (prints an aligned table; --json to pipe to jq)

@@ -99,6 +99,6 @@ compact results with a provenance stamp. Fully offline; nothing phones home.
 ## Run it in production
 
 `dev` is the serve command. Put it under systemd or Docker and a reverse proxy - copy-paste recipes are
-in [`docs/operators.md`](https://github.com/nuthatch-indexer/nuthatch/blob/main/docs/operators.md).
+in [`docs/operators.md`](https://github.com/nightswatchhq/nuthatch/blob/main/docs/operators.md).
 Off-localhost, set `NUTHATCH_ADMIN_TOKEN` and bind behind a gateway (the `/sql` guards bound *how much*,
 never *who* - auth is the operator's layer).

@@ -105,6 +105,7 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--chain <CHAIN>` - Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known chain for the contract's bytecode and picks the one it lives on - you rarely need to say
 - `--rpc <RPC>` - Prefer these RPC URL(s) over the chain defaults (repeatable). They're written first in the nest's `rpc_urls` and also used for ABI/deploy-block resolution during init, with the built-in chain endpoints kept as fallback. Point at your own node to dodge public-RPC limits
 - `--dir <DIR>` - Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the nest's own name)
+- `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
 
 ## `nuthatch labels`
 

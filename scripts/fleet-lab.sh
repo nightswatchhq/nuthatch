@@ -82,19 +82,19 @@ runcmd:
     set -eux
     V="${VERSION}"
     if [ -z "\$V" ]; then
-      V=\$(curl -fsSL https://api.github.com/repos/nuthatch-indexer/nuthatch/releases/latest | jq -r .tag_name)
+      V=\$(curl -fsSL https://api.github.com/repos/nightswatchhq/nuthatch/releases/latest | jq -r .tag_name)
     fi
     cd /opt
     # Two artifacts per release: the default (embedded) one and a -scaled one carrying worker/control.
     for a in nuthatch nuthatch-scaled; do
-      curl -fsSLO "https://github.com/nuthatch-indexer/nuthatch/releases/download/\$V/\${a}-x86_64-unknown-linux-gnu.tar.gz"
-      curl -fsSLO "https://github.com/nuthatch-indexer/nuthatch/releases/download/\$V/\${a}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+      curl -fsSLO "https://github.com/nightswatchhq/nuthatch/releases/download/\$V/\${a}-x86_64-unknown-linux-gnu.tar.gz"
+      curl -fsSLO "https://github.com/nightswatchhq/nuthatch/releases/download/\$V/\${a}-x86_64-unknown-linux-gnu.tar.gz.sha256"
       sha256sum -c "\${a}-x86_64-unknown-linux-gnu.tar.gz.sha256"
       tar xzf "\${a}-x86_64-unknown-linux-gnu.tar.gz"
       mv nuthatch "/usr/local/bin/\${a}"
     done
     ln -sf /usr/local/bin/nuthatch /usr/local/bin/nuthatch-embedded
-    git clone --depth 1 https://github.com/nuthatch-indexer/nuthatch /opt/nuthatch-src
+    git clone --depth 1 https://github.com/nightswatchhq/nuthatch /opt/nuthatch-src
     echo "$role" > /opt/nuthatch-role
     touch /opt/lab-ready
 YAML
