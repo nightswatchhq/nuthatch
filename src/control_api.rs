@@ -49,6 +49,18 @@ struct TokenQuery {
 }
 
 #[derive(Deserialize)]
+struct PinBody {
+    version: String,
+    bundle_hash: String,
+}
+
+#[derive(Deserialize)]
+struct SecretBody {
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
 struct DeclareBody {
     name: String,
     chain: String,
@@ -256,6 +268,134 @@ async fn current_plan(
     )
 }
 
+/// Pin the version an endpoint serves, fleet-wide.
+async fn pin(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    Json(body): Json<PinBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.pin_version(&name, &body.version, &body.bundle_hash) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "endpoint": name,
+                "version": body.version,
+                "bundle_hash": body.bundle_hash,
+                "note": "every FE node now resolves this endpoint to this version",
+            })),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no nest named '{name}' is declared") })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+/// What an endpoint resolves to. The call an FE node makes before serving.
+async fn resolve(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.resolve(&name) {
+        Ok(Some(r)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "endpoint": r.endpoint,
+                "chain": r.chain,
+                "version": r.version,
+                "bundle_hash": r.bundle_hash,
+                "servable": r.is_servable(),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no endpoint named '{name}'") })),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+/// Store a secret for a nest. **No matching read endpoint exists** - see the module docs on
+/// write-only handling. The response deliberately echoes the key and never the value, so a secret
+/// cannot end up in a shell history, a proxy log or a terminal scrollback by way of the reply.
+async fn put_secret(
+    State(api): State<Api>,
+    Path(nest): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    Json(body): Json<SecretBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.set_secret(&nest, &body.key, &body.value) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "nest": nest,
+                "key": body.key,
+                "note": "injected at mount - this changes no bundle hash",
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
+}
+
+/// The key *names* a nest has secrets for. Never the values.
+async fn list_secret_keys(
+    State(api): State<Api>,
+    Path(nest): Path<String>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.secret_keys(&nest) {
+        Ok(keys) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "nest": nest, "keys": keys })),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+async fn drop_secret(
+    State(api): State<Api>,
+    Path((nest, key)): Path<(String, String)>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !authed(&api, &q, &headers) {
+        return unauthorised();
+    }
+    match api.cp.delete_secret(&nest, &key) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": key }))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no secret '{key}' for nest '{nest}'") })),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
 fn internal(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -270,6 +410,13 @@ pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/nests", get(list_nests).post(declare))
         .route("/nests/{name}", delete(undeclare))
+        .route("/nests/{name}/resolve", get(resolve))
+        .route("/nests/{name}/pin", axum::routing::put(pin))
+        .route(
+            "/nests/{name}/secrets",
+            get(list_secret_keys).put(put_secret),
+        )
+        .route("/nests/{name}/secrets/{key}", delete(drop_secret))
         .route("/workers", get(list_workers))
         .route("/plan", get(current_plan))
         .with_state(api)

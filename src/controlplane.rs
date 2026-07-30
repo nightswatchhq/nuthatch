@@ -16,6 +16,17 @@
 //! Reconciliation reads ownership from the hot stores, which cannot be stale, because a lease is only
 //! meaningful in the transaction that took it.
 //!
+//! ## Secrets
+//!
+//! Runtime secrets (RFC-0019 §4 credential kind **b**) live here too, keyed by nest. They are stored
+//! **outside** the content-addressed bundle on purpose: baking a credential into a bundle would leak
+//! it *and* break addressing, because two nests differing only in credentials would hash differently.
+//! Rotating a secret is a control-plane write that changes no bundle hash.
+//!
+//! The interface is **write-only**. Values go in and are handed to the worker that mounts the nest;
+//! no method returns one to an operator, and the HTTP surface exposes only key names. A control plane
+//! that can read back every credential it holds is a credential dump with extra steps.
+//!
 //! ## Liveness
 //!
 //! A worker is alive if it has heartbeated within its TTL, measured on the **database's** clock - the
@@ -28,6 +39,7 @@
 //! ingestion, only stop *rescheduling*.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 
 use crate::scheduler::{DesiredNest, Worker};
 
@@ -35,6 +47,27 @@ use crate::scheduler::{DesiredNest, Worker};
 /// fixed rather than parameterised - a second fleet is a second database, not a second namespace in
 /// the first.
 const SCHEMA: &str = "nuthatch_control";
+
+/// What an endpoint resolves to, fleet-wide (RFC-0022 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// The endpoint asked for. Under RFC-0020 a breaking update is served at a **new** endpoint
+    /// alongside the old, so `usdc` and `usdc-v2` are two rows here, not one row with two versions.
+    pub endpoint: String,
+    pub chain: String,
+    /// `None` when declared but not yet pinned - see [`ControlPlane::resolve`].
+    pub version: Option<String>,
+    pub bundle_hash: Option<String>,
+}
+
+impl Resolution {
+    /// Whether an FE may serve this endpoint. An unpinned endpoint is declared-but-not-ready, and
+    /// serving it would mean each node choosing a version for itself - the inconsistency pinning
+    /// exists to prevent.
+    pub fn is_servable(&self) -> bool {
+        self.version.is_some() && self.bundle_hash.is_some()
+    }
+}
 
 /// A worker's heartbeat TTL. Generous on purpose: rescheduling a cursor is expensive (drain, lease
 /// handover, re-warm), so a worker that pauses for a few seconds should not lose its work. The lease
@@ -69,10 +102,29 @@ impl ControlPlane {
                     estimated_rss_mb  BIGINT      NOT NULL,
                     added_at          TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                -- RFC-0022 §4. Added by ALTER rather than baked above so an existing control plane
+                -- upgrades in place: `CREATE TABLE IF NOT EXISTS` silently does nothing to a table
+                -- that already exists, which would leave an older fleet without these columns and
+                -- with no error to explain why.
+                ALTER TABLE "{SCHEMA}".desired_nest
+                    ADD COLUMN IF NOT EXISTS version     TEXT,
+                    ADD COLUMN IF NOT EXISTS bundle_hash TEXT;
                 CREATE TABLE IF NOT EXISTS "{SCHEMA}".worker (
                     id            TEXT PRIMARY KEY,
                     budget_mb     BIGINT      NOT NULL,
                     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                -- Runtime secrets (RFC-0019 §4 credential kind (b), mechanism per RFC-0022 §5).
+                -- Deliberately keyed by nest and **never** by bundle: baking a secret into a
+                -- content-addressed bundle would both leak it and break addressing, since two nests
+                -- differing only in credentials would hash differently. Rotating a secret here
+                -- changes no bundle hash at all.
+                CREATE TABLE IF NOT EXISTS "{SCHEMA}".nest_secret (
+                    nest        TEXT        NOT NULL,
+                    key         TEXT        NOT NULL,
+                    value       TEXT        NOT NULL,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (nest, key)
                 );
                 "#
             ))?;
@@ -185,6 +237,147 @@ impl ControlPlane {
                     budget_mb: r.get::<_, i64>(1).max(0) as u64,
                 })
                 .collect())
+        })
+    }
+
+    // ---- resolution (RFC-0022 §4) --------------------------------------------------------------
+
+    /// Pin the version an endpoint serves, fleet-wide.
+    ///
+    /// **Why this exists at all**, since RFC-0019 already has a movable `latest` pointer: a movable
+    /// pointer read independently by N nodes is not a consistent resolution. FE node A reads
+    /// `latest → v2` while node B is still serving v1, and for a window the same endpoint answers
+    /// with two different schemas depending on which node a request lands on. That is invisible to
+    /// every single-box test and obvious the first time a load balancer is involved.
+    ///
+    /// So resolution is *pinned here*, and advancing it is a deliberate control-plane write. `latest`
+    /// remains the registry's convenience for humans and for `init`; it is not what a fleet serves.
+    pub fn pin_version(&self, name: &str, version: &str, bundle_hash: &str) -> Result<bool> {
+        if version.is_empty() || bundle_hash.is_empty() {
+            return Err(anyhow!("pinning needs both a version and a bundle hash"));
+        }
+        let (name, version, hash) = (
+            name.to_string(),
+            version.to_string(),
+            bundle_hash.to_string(),
+        );
+        self.conn.with(move |c| {
+            let n = c.execute(
+                &format!(
+                    "UPDATE \"{SCHEMA}\".desired_nest SET version = $2, bundle_hash = $3 \
+                     WHERE name = $1"
+                ),
+                &[&name, &version, &hash],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// What this endpoint currently serves. `None` if the endpoint is not declared at all;
+    /// `Some` with `version: None` if it is declared but unpinned - which an FE must treat as *not
+    /// ready to serve* rather than as "serve whatever you have lying about".
+    pub fn resolve(&self, name: &str) -> Result<Option<Resolution>> {
+        let name = name.to_string();
+        self.conn.with(move |c| {
+            Ok(c.query_opt(
+                &format!(
+                    "SELECT name, chain, version, bundle_hash FROM \"{SCHEMA}\".desired_nest \
+                     WHERE name = $1"
+                ),
+                &[&name],
+            )?
+            .map(|r| Resolution {
+                endpoint: r.get(0),
+                chain: r.get(1),
+                version: r.get(2),
+                bundle_hash: r.get(3),
+            }))
+        })
+    }
+
+    // ---- runtime secrets (RFC-0022 §5) ---------------------------------------------------------
+
+    /// Store a secret for a nest - a private RPC URL, an enricher API key.
+    ///
+    /// **Write-only by design.** There is no method that returns a single secret's value to an
+    /// operator, and the HTTP API exposes only key *names*. A control plane that can hand back every
+    /// credential it holds is a credential dump with extra steps; the only consumer that needs values
+    /// is the worker that is about to mount the nest.
+    pub fn set_secret(&self, nest: &str, key: &str, value: &str) -> Result<()> {
+        if nest.is_empty() || key.is_empty() {
+            return Err(anyhow!("a secret needs both a nest and a key"));
+        }
+        let (nest, key, value) = (nest.to_string(), key.to_string(), value.to_string());
+        self.conn.with(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO \"{SCHEMA}\".nest_secret (nest, key, value) VALUES ($1, $2, $3) \
+                     ON CONFLICT (nest, key) DO UPDATE \
+                     SET value = EXCLUDED.value, updated_at = now()"
+                ),
+                &[&nest, &key, &value],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a secret. Reports whether it existed, so rotation scripts can tell a real deletion from
+    /// a typo'd key that silently did nothing.
+    pub fn delete_secret(&self, nest: &str, key: &str) -> Result<bool> {
+        let (nest, key) = (nest.to_string(), key.to_string());
+        self.conn.with(move |c| {
+            let n = c.execute(
+                &format!("DELETE FROM \"{SCHEMA}\".nest_secret WHERE nest = $1 AND key = $2"),
+                &[&nest, &key],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// The key *names* held for a nest - never the values. What an operator is allowed to see.
+    pub fn secret_keys(&self, nest: &str) -> Result<Vec<String>> {
+        let nest = nest.to_string();
+        self.conn.with(move |c| {
+            Ok(c.query(
+                &format!("SELECT key FROM \"{SCHEMA}\".nest_secret WHERE nest = $1 ORDER BY key"),
+                &[&nest],
+            )?
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect())
+        })
+    }
+
+    /// Secrets for the nests a worker is **actually assigned**, and no others.
+    ///
+    /// The scoping is the point, and it is why this takes a list rather than offering a
+    /// fetch-everything call: a worker running one nest has no business holding another's
+    /// credentials, and the cheapest way to guarantee that is to never send them. `IN`-filtered in
+    /// SQL rather than fetched-then-filtered here, so an over-broad query cannot be introduced later
+    /// by someone refactoring the filter away.
+    pub fn secrets_for(
+        &self,
+        nests: &[String],
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        if nests.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let nests = nests.to_vec();
+        self.conn.with(move |c| {
+            let rows = c.query(
+                &format!(
+                    "SELECT nest, key, value FROM \"{SCHEMA}\".nest_secret \
+                     WHERE nest = ANY($1) ORDER BY nest, key"
+                ),
+                &[&nests],
+            )?;
+            let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for r in rows {
+                out.entry(r.get::<_, String>(0))
+                    .or_default()
+                    .insert(r.get::<_, String>(1), r.get::<_, String>(2));
+            }
+            Ok(out)
         })
     }
 
