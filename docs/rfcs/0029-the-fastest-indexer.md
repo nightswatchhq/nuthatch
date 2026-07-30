@@ -314,7 +314,15 @@ in place of it.
    runtime guard protects this build, the version protects against the previous one; and the factory
    provenance view had a hardcoded `block_timestamp` projection whose failure was swallowed as a
    `debug!`, so a timestamp-free factory nest would have silently lost `{template}__children`.
-5. **Adaptive windows on the pipelined path** (§6f).
+5. **Adaptive windows on the pipelined path** (§6f). **Built (0.9.0).** The window list is generated
+   lazily from an `AdaptiveWindow` rather than materialised up front, so the concurrent path adapts as
+   the sequential one always has. The controller is fed **raw log count**, not decoded rows: it is
+   sizing a *response*, and a log matching no decoder still costs bytes and still counts against the
+   provider's cap - feeding it decoded rows would make a nest with a narrow event allowlist read dense
+   history as empty and grow toward the ceiling, which is the one direction that actually hurts.
+   Feedback lags by up to `concurrency` windows, which is left alone deliberately: the controller is
+   damped to 4× a step, so the lag costs a few steps of convergence, and removing it means waiting for
+   feedback before generating the next window - which is the sequential path.
 
 ## 10. Acceptance
 
@@ -325,6 +333,10 @@ in place of it.
 - The hot-store bench path issues one redb commit per window, not per row. The resulting events/sec jump
   is recorded as a **harness correction, never as a product gain**.
 - On the pinned dense 100k range, `--concurrency 16` beats `--concurrency 1` by **>3×** (today: 1.2×).
+  **Not yet measured** - this needs a real endpoint and a pinned range, not a mock. The unit tests
+  assert the *mechanism* (a long empty prefix costs a small fraction of the fixed-window request
+  count; dense history does not push the window toward the ceiling); they say nothing about the
+  speedup ratio, and no ratio is published until it is run.
 - A nest declaring no use of `block_timestamp` completes case 1 issuing **zero** `eth_getBlockByNumber`
   calls, with rows otherwise byte-identical to a timestamped run modulo that column. **Met** -
   `a_timestamp_free_nest_backfills_without_a_single_timestamp_call` asserts both halves against the
