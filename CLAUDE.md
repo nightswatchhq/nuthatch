@@ -71,7 +71,7 @@ change requires mutating sealed segments, the design is wrong - go back.
   become batch runs of the same circuit.
 - Imperative (escape hatch): WASM component handlers, per the transform layer below.
 
-## The transform layer: lessons from liminal (lodestar-team/liminal)
+## The transform layer: lessons from liminal (nightswatchhq/liminal)
 
 Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`, `wit/`, and
 `liminal-sdk/` before writing any transform-layer code. Port the design, not just the idea.

@@ -10,9 +10,9 @@ other work." Companion to [backlog.md](backlog.md) (RFC leftovers) and the
 
 Scope is the two open GitHub issues:
 
-- **[#147](https://github.com/nuthatch-indexer/nuthatch/issues/147)** - Roost per-cursor failure isolation
+- **[#147](https://github.com/nightswatchhq/nuthatch/issues/147)** - Roost per-cursor failure isolation
   (blast-radius conformance gap).
-- **[#150](https://github.com/nuthatch-indexer/nuthatch/issues/150)** - Audit tail: remaining LOW/DiD items
+- **[#150](https://github.com/nightswatchhq/nuthatch/issues/150)** - Audit tail: remaining LOW/DiD items
   + two feature-sized fixes.
 
 **The cut line is after tier 2.** Everything above it is correctness or conformance; everything below
@@ -94,7 +94,7 @@ Long-standing blockers unchanged, and both are provisioning rather than coding: 
 - **Tier 5 done (2026-07-28).** Items 11-14 shipped in #160.
 - **0.6.2 cut (2026-07-28)** - security only. Draft advisory **GHSA-jvjx-5528-r6mm** awaits publication
   once the binaries are up.
-- **Issue [#162](https://github.com/nuthatch-indexer/nuthatch/issues/162) filed** - `e2e_solo::
+- **Issue [#162](https://github.com/nightswatchhq/nuthatch/issues/162) filed** - `e2e_solo::
   compatible_hot_upgrade_flips_backing_after_catchup` is flaky under full-suite parallel load. Written
   up as a possible *correctness* question rather than noise: if `await_catchup_and_flip` can return while
   the new version is genuinely behind, that is the RFC-0020 upgrade guarantee wobbling.
