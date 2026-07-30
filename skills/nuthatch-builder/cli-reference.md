@@ -74,6 +74,13 @@ Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected 
 - `--dir <DIR>` - Nest directory (must contain a `checks/` folder)
 - `--update` - Record current query results as the expected fixtures (`checks/expected/*.json`) instead of comparing - the authoring mode, run once against known-good sealed data
 
+## `nuthatch control`
+
+Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run
+
+- `--listen <LISTEN>` - Address to bind the control-plane API to. Off-localhost requires NUTHATCH_CONTROL_TOKEN and refuses to start without it
+- `--db <DB>` - The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state, **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's outage are different events
+
 ## `nuthatch dev`
 
 Run the indexer: poll logs, store entities, and serve the API

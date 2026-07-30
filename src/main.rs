@@ -33,6 +33,13 @@ async fn main() -> Result<()> {
         cli::Command::Add(args) => project::add(args).await,
         cli::Command::Dev(args) => indexer::dev(args).await,
         cli::Command::Serve(args) => indexer::serve_role(args).await,
+        #[cfg(feature = "postgres-store")]
+        cli::Command::Control(args) => nuthatch::control_api::run(&args.listen, &args.db).await,
+        #[cfg(not(feature = "postgres-store"))]
+        cli::Command::Control(_) => anyhow::bail!(
+            "the control plane needs a build with `--features postgres-store`. The default binary \
+             is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+        ),
         cli::Command::Sql(args) => run_sql(args).await,
         cli::Command::Transform(args) => run_transform(args),
         cli::Command::Mcp(args) => {
