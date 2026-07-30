@@ -7,6 +7,29 @@ This is deliberately not [`operators.md`](operators.md), which tells you *how to
 tells you *how to prove it works* — for your own sign-off, or so a second operator can independently
 confirm the claims this project makes rather than taking them on trust.
 
+## Run it, don't read it
+
+Most of this document is executable:
+
+```sh
+./scripts/verify.sh 0 1 2      # artifact, single nest, correctness
+./scripts/verify.sh 5          # scaled mode (needs a fleet up)
+./scripts/verify.sh all --strict
+```
+
+Each check maps to a numbered step below, asserts a concrete result, and prints what failed with its
+output. **A skip is not a pass** - steps whose prerequisites are absent are counted separately, because
+a green run that silently skipped the interesting half is worse than a red one. `--strict` turns any
+skip into a failure, which is what CI uses.
+
+The steps that genuinely need a human are marked as skips with the procedure attached rather than
+faked: a restart drill, a deliberate reorg, breaking a nest to watch its co-tenants survive, and
+comparing a row count against an independent source. That last one is the step separating *it ran* from
+*it is correct*, and no script can do it for you.
+
+CI runs the fleet half on every push - `the compose fleet comes up` stands the whole stack up, walks
+level 5, and asserts exactly one worker takes the lease.
+
 ## How to use it
 
 Levels are independent and cumulative. **Run the levels that match what you deploy** — level 5 is
