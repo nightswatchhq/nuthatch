@@ -237,7 +237,7 @@ pub struct ColumnSchema {
 /// The implicit columns every table carries (before the event's own params). `_seq` is a single
 /// monotonic per-row ordering key, derived deterministically from (block, log_index) - not a mutable
 /// insertion counter, so it stays re-executable and reorg-stable per the determinism rule.
-pub(crate) fn implicit_columns() -> Vec<ColumnSchema> {
+pub(crate) fn implicit_columns(timestamps: bool) -> Vec<ColumnSchema> {
     [
         "block_number",
         "block_hash",
@@ -248,6 +248,11 @@ pub(crate) fn implicit_columns() -> Vec<ColumnSchema> {
         "_seq",
     ]
     .iter()
+    // A timestamp-free nest (RFC-0029 §6b) must not *advertise* the column it doesn't produce.
+    // `/tables`, `schema.json`, the MCP schema tool and `llms.txt` all read this, and the whole point
+    // of declaring it at init is that consumers can see the shape before they write a query against
+    // a column that will never arrive.
+    .filter(|n| timestamps || **n != "block_timestamp")
     .map(|n| ColumnSchema {
         name: (*n).to_string(),
         sol_type: "implicit".to_string(),
@@ -344,6 +349,11 @@ pub struct DecodedRow {
     /// Unix seconds from the block header. Set by the indexer after decode (the log doesn't carry
     /// it); 0 until then, and 0 if the source couldn't supply it.
     pub block_timestamp: u64,
+    /// Whether this row's table has a `block_timestamp` column at all (RFC-0029 §6b), copied from the
+    /// registry that decoded it. When false, [`DecodedRow::to_json`] omits the key entirely - the
+    /// column is *absent*, not null: a null would keep the schema stable but invite an `ORDER BY
+    /// block_timestamp` that silently returns arbitrary order, which is worse than an error.
+    pub timestamps: bool,
     pub log_index: u64,
     pub tx_hash: String,
     pub address: String,
@@ -370,7 +380,9 @@ impl DecodedRow {
         obj.insert("table".into(), json!(self.table));
         obj.insert("block_number".into(), json!(self.block_number));
         obj.insert("block_hash".into(), json!(self.block_hash));
-        obj.insert("block_timestamp".into(), json!(self.block_timestamp));
+        if self.timestamps {
+            obj.insert("block_timestamp".into(), json!(self.block_timestamp));
+        }
         obj.insert("tx_hash".into(), json!(self.tx_hash));
         obj.insert("log_index".into(), json!(self.log_index));
         obj.insert("address".into(), json!(self.address));
@@ -450,6 +462,16 @@ pub struct DecodeRegistry {
     templates_by_topic0: HashMap<B256, Vec<EventDecoder>>,
     hash: [u8; 32],
     skipped_anonymous: usize,
+    /// Whether decoded rows carry `block_timestamp` (RFC-0029 §6b) - from `[nest] block_timestamps`.
+    ///
+    /// The registry is already the single source of truth for a nest's table schema, so the policy
+    /// that *changes* that schema belongs here rather than being threaded separately to decode, to
+    /// serialisation and to `/tables` - three places that must never disagree about whether a column
+    /// exists. Deliberately **not** folded into [`DecodeRegistry::hash`]: that hash versions decode
+    /// behaviour and is stamped into every segment's `registry_snapshot`, so mixing a schema flag
+    /// into it would invalidate the snapshots of every existing nest to describe something the
+    /// content-addressed segment bytes already distinguish.
+    timestamps: bool,
 }
 
 impl DecodeRegistry {
@@ -484,7 +506,22 @@ impl DecodeRegistry {
                 abi,
             });
         }
-        Self::build_with_templates(specs, templates)
+        Ok(Self::build_with_templates(specs, templates)?
+            .with_timestamps(config.nest.block_timestamps))
+    }
+
+    /// Set whether decoded rows carry `block_timestamp`. Defaults to `true`; `from_nest` applies the
+    /// nest's declaration. Kept as a builder rather than a `build_with_templates` parameter so the
+    /// dozens of test and tool call sites that don't care keep the behaviour they had.
+    pub fn with_timestamps(mut self, timestamps: bool) -> DecodeRegistry {
+        self.timestamps = timestamps;
+        self
+    }
+
+    /// Whether this nest indexes block timestamps. Callers that would otherwise fetch them (the four
+    /// backfill/tip paths in `indexer.rs`) consult this before spending the round trips.
+    pub fn timestamps(&self) -> bool {
+        self.timestamps
     }
 
     pub fn build(contracts: Vec<ContractSpec>) -> Result<DecodeRegistry> {
@@ -544,6 +581,7 @@ impl DecodeRegistry {
             templates_by_topic0,
             hash,
             skipped_anonymous,
+            timestamps: true,
         })
     }
 
@@ -605,7 +643,7 @@ impl DecodeRegistry {
         self.tables()
             .iter()
             .map(|d| {
-                let mut columns = implicit_columns();
+                let mut columns = implicit_columns(self.timestamps);
                 columns.extend(d.columns.iter().map(|c| ColumnSchema {
                     name: c.name.clone(),
                     sol_type: c.sol_type.clone(),
@@ -641,7 +679,7 @@ impl DecodeRegistry {
         let Some(dec) = decoders.iter().find(|d| d.contract == emitter) else {
             return Ok(None);
         };
-        Ok(Some(build_row(dec, log, emitter)?))
+        Ok(Some(build_row(dec, log, emitter, self.timestamps)?))
     }
 
     /// Decode a log emitted by a discovered child under `template` (RFC-0009). The caller has already
@@ -660,13 +698,18 @@ impl DecodeRegistry {
             return Ok(None);
         };
         let emitter = parse_address(&log.address)?;
-        Ok(Some(build_row(dec, log, emitter)?))
+        Ok(Some(build_row(dec, log, emitter, self.timestamps)?))
     }
 }
 
 /// Decode a log's params against a matched decoder into a [`DecodedRow`]. Shared by contract and
 /// template decode; the emitter address is recorded so template rows are per-child distinguishable.
-fn build_row(dec: &EventDecoder, log: &Log, emitter: Address) -> Result<DecodedRow> {
+fn build_row(
+    dec: &EventDecoder,
+    log: &Log,
+    emitter: Address,
+    timestamps: bool,
+) -> Result<DecodedRow> {
     let topics: Vec<B256> = log
         .topics
         .iter()
@@ -697,6 +740,7 @@ fn build_row(dec: &EventDecoder, log: &Log, emitter: Address) -> Result<DecodedR
         block_number: log.block_number,
         block_hash: log.block_hash.clone(),
         block_timestamp: 0, // filled by the indexer from the block header (see index_loop)
+        timestamps,
         log_index: log.log_index,
         tx_hash: log.tx_hash.clone(),
         address: format!("0x{}", hex::encode(emitter)),

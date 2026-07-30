@@ -303,6 +303,17 @@ in place of it.
 2. **Honest harness** (§6e) - must precede further optimisation, or we cannot tell what worked.
 3. **Timestamp fan-out + cross-window dedup** (§6c, §6d) - pure win, no schema implications.
 4. **Demand-driven timestamps** (§6b) - the big one; schema version bump, determinism review.
+   **Built (0.9.0).** `[nest] block_timestamps`, declared by `init --no-timestamps` and refused as an
+   in-place edit, exactly as §6b-i argued: the column is *omitted* rather than nulled (open question 3,
+   answered - a null keeps the schema stable but makes `ORDER BY block_timestamp` silently arbitrary,
+   and a wrong answer beats an error only in the short term), and non-use is an **explicit
+   declaration** rather than static analysis of views (open question 2, answered - the leaning was
+   right, and the analysis would have had to be sound over authored SQL to be worth trusting).
+   Two things the RFC did not anticipate: a timestamp-free nest is stamped `schema_version = 2` so an
+   *older* binary refuses it instead of indexing timestamps into a store built without them - the
+   runtime guard protects this build, the version protects against the previous one; and the factory
+   provenance view had a hardcoded `block_timestamp` projection whose failure was swallowed as a
+   `debug!`, so a timestamp-free factory nest would have silently lost `{template}__children`.
 5. **Adaptive windows on the pipelined path** (§6f).
 
 ## 10. Acceptance
@@ -315,7 +326,10 @@ in place of it.
   is recorded as a **harness correction, never as a product gain**.
 - On the pinned dense 100k range, `--concurrency 16` beats `--concurrency 1` by **>3×** (today: 1.2×).
 - A nest declaring no use of `block_timestamp` completes case 1 issuing **zero** `eth_getBlockByNumber`
-  calls, with rows otherwise byte-identical to a timestamped run modulo that column.
+  calls, with rows otherwise byte-identical to a timestamped run modulo that column. **Met** -
+  `a_timestamp_free_nest_backfills_without_a_single_timestamp_call` asserts both halves against the
+  sealed Parquet, because either alone is satisfiable by a broken implementation (zero calls by
+  failing to backfill; identical rows by fetching timestamps and discarding them).
 - No regression on the RFC-0004 W1/W2/W3 workloads.
 
 ## 11. Open questions

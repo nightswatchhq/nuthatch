@@ -83,6 +83,20 @@ slice-0 note has to be solved before extraction wires up.
 
 ---
 
+## Landed since this was written
+
+- **RFC-0029 slices 1-3** shipped as **v0.8.2** (2026-07-30): the Alchemy HTTP-400 classifier fix that
+  was killing backfills, an honest benchmark harness, and the concurrent timestamp fan-out with a
+  reorg-invalidated cache.
+- **RFC-0029 slice 4** - demand-driven timestamps, built as §6b-i argued: an `init`-time declaration
+  (`init --no-timestamps`), refused as an in-place edit, with a `schema_version = 2` stamp so an older
+  binary refuses a timestamp-free nest rather than indexing timestamps into it. Breaking schema change
+  → **0.9.0**.
+
+Slice 5 (adaptive windows on the pipelined path) is the remainder of RFC-0029 and is unblocked.
+
+---
+
 ## Carried over, not scope
 
 Small, and worth doing when they block someone rather than on a schedule:

@@ -323,6 +323,36 @@ SQL surfaces). Full key reference:
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
 | `--fail-fast` | exit on first fault instead of quarantining. For CI and operators who prefer fail-stop |
 
+**`block_timestamps` - decide it at `init`, because you cannot change it later.**
+
+Every table carries an implicit `block_timestamp`, and fetching it is the single most expensive thing
+a backfill does: timestamps live in the block header, which `eth_getLogs` does not return, so they
+cost a separate `eth_getBlockByNumber` per distinct block. On the workloads we measured that is
+roughly **85% of backfill wall clock** (RFC-0029 §4). `nuthatch init --no-timestamps` drops the column
+and stops paying for it.
+
+Read the next paragraph before you reach for it.
+
+This is **not a tuning flag**. Turning it off removes a column from every table, which is a breaking
+change for anyone querying it, and it changes the bytes of every sealed segment - segments are
+content-addressed, so a nest that switches **cannot reuse its own history and must re-index from
+scratch**. For an existing nest, "faster backfill" and "re-index everything once" largely cancel out.
+The win is real, but it is a **new-nest** win.
+
+Because of that, the runtime enforces it rather than trusting the file. A nest that has already
+indexed refuses to start if the declaration disagrees with its stored data, and a timestamp-free nest
+is stamped `schema_version = 2` so an older nuthatch refuses it outright instead of quietly indexing
+timestamps into a store built without them. Changing your mind means a *new* nest, served alongside
+the old one until its consumers move - the ordinary breaking-update path (RFC-0020 slice 3).
+
+A nest that indexes timestamps stays `schema_version = 1` and is readable by 0.8.x, so nothing about
+this affects you unless you opt in.
+
+**When it is clearly right:** you know every consumer, none of them ask a time-series question, and
+you are standing up a new nest over a long history. **When it is clearly wrong:** anyone might want
+"per day" or "per hour" later. Blocks give you ordering; only timestamps give you time. If you are
+unsure, keep them - the default is on for a reason.
+
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
 (RFC-0019 §4) is that secrets never go into a published bundle. Per-nest secret injection at mount
 time is designed (RFC-0022 §5) and not built. Until then: keep private endpoints in the on-disk

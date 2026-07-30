@@ -102,6 +102,12 @@ indexing against the wrong chain corrupts state silently.
 Every declared event becomes a table named `{alias}__{event}` (e.g. `usdc__transfer`), carrying the
 event's fields plus `block_number`, `block_timestamp`, `tx_hash`, `log_index`, `address`.
 
+> `block_timestamp` costs a block-header round trip per block - about 85% of backfill wall clock. A
+> nest that will never ask a time-series question can drop the column with `init --no-timestamps` and
+> skip that entirely. It is an **init-time** choice: changing it later is a breaking schema change and
+> a full re-index, so it is worth a moment's thought and is deliberately not a flag you can flip.
+> [Details](docs/operators.md#configuration-surface).
+
 ```sh
 # one-shot from the terminal (prints an aligned table; --json to pipe to jq)
 nuthatch sql 'SELECT "from" AS sender, count(*) AS n FROM usdc__transfer GROUP BY 1 ORDER BY n DESC LIMIT 5'

@@ -685,6 +685,23 @@ pub struct InitArgs {
     /// nest's own name).
     #[arg(long, default_value = ".")]
     pub dir: String,
+
+    /// Don't index block timestamps: drop the implicit `block_timestamp` column from every table.
+    ///
+    /// Fetching timestamps is roughly 85% of backfill wall clock (RFC-0029 §4) because they arrive
+    /// per-block over a separate round trip that `eth_getLogs` doesn't carry - so a nest that never
+    /// needs them backfills dramatically faster.
+    ///
+    /// **Declare it here or not at all.** This is not a flag you can flip later: it removes a column
+    /// from every table (breaking, for anyone querying it) and changes the bytes of every sealed
+    /// segment, so a nest that switches cannot reuse its own segments and must re-index from scratch.
+    /// A nest that has already indexed refuses to start if this disagrees with what it was built
+    /// with; changing your mind means a new nest served alongside the old one (RFC-0020 slice 3).
+    ///
+    /// Say no to this if you are unsure - `block_timestamp` is the column most views end up wanting,
+    /// and time-series questions ("per day", "per hour") cannot be asked without it.
+    #[arg(long)]
+    pub no_timestamps: bool,
 }
 
 #[derive(Args)]
