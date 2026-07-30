@@ -53,6 +53,63 @@ pub struct BenchReport {
     pub peak_rss_mb: u64,
     pub rpc_requests: u64,
     pub commit: Option<String>,
+    /// The RPC endpoint's host, never the full URL - an API key in a committed benchmark report is a
+    /// credential leak, and these get pasted into issues.
+    ///
+    /// RFC-0004's house rule is that every published number traces to provider, hardware, date and
+    /// commit. Three of those were already recorded and this one was a documentation promise. A number
+    /// whose provider is unknown is not comparable to any other number, because provider caps and
+    /// latency dominate backfill throughput far more than anything in this codebase does.
+    pub provider: Option<String>,
+    /// Enough hardware to make two reports comparable: cores and total RAM.
+    pub hardware: Option<String>,
+}
+
+/// The endpoint's host, with any credentials stripped.
+///
+/// Providers put API keys in the path (`/v2/<key>`) as often as in a header, so the path goes too -
+/// host and scheme identify the provider, which is all a report needs.
+fn provider_of(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let host = rest.split('/').next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Cores and total RAM, best-effort. `None` rather than a guess when it cannot be read - an invented
+/// hardware string is worse than an absent one, because it looks authoritative.
+fn hardware_summary() -> Option<String> {
+    let cores = std::thread::available_parallelism().ok()?.get();
+    let ram_gb = total_ram_gb();
+    Some(match ram_gb {
+        Some(gb) => format!("{cores} cores, {gb} GB RAM"),
+        None => format!("{cores} cores"),
+    })
+}
+
+fn total_ram_gb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        return Some((kb + 512 * 1024) / (1024 * 1024));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let bytes: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        return Some(bytes / (1024 * 1024 * 1024));
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
@@ -150,6 +207,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         peak_rss_mb: median_u64(runs.iter().map(|r| r.peak_rss_mb)),
         rpc_requests: median_u64(runs.iter().map(|r| r.rpc_requests)),
         commit: git_commit(),
+        provider: rpc_urls.first().and_then(|u| provider_of(u)),
+        hardware: hardware_summary(),
     };
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -394,12 +453,28 @@ async fn hot_store_backfill(
         blocks.sort_unstable();
         blocks.dedup();
         let ts = source.block_timestamps(&blocks).await.unwrap_or_default();
-        for r in &mut rows {
-            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-            let key = Store::entity_key(r.block_number, r.log_index);
-            store.put_entity(&key, &r.to_json().to_string())?;
-            events += 1;
-        }
+        // **One commit per window, as the real path does** (RFC-0029 §4b).
+        //
+        // This used to call `put_entity` per row, which is one redb write transaction - and one fsync -
+        // per row. `store.rs` PERF-2 records that exact shape as the thing that capped tip-follow
+        // throughput far below the decode rate, and why `commit_window` exists. So the benchmark was
+        // measuring a path the indexer deliberately does not use, and every events/sec figure it has
+        // ever produced was a floor set by fsync rather than by nuthatch.
+        //
+        // **Any improvement from this change is a harness correction, never a product gain.** Recording
+        // it as a speedup would be claiming credit for fixing our own measurement.
+        let batch: Vec<(String, String)> = rows
+            .iter_mut()
+            .map(|r| {
+                r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+                (
+                    Store::entity_key(r.block_number, r.log_index),
+                    r.to_json().to_string(),
+                )
+            })
+            .collect();
+        events += batch.len() as u64;
+        store.commit_window(&batch, None, chunk_to)?;
         next = chunk_to + 1;
     }
     Ok(events)
@@ -511,6 +586,32 @@ fn git_commit() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A benchmark report gets pasted into issues and PRs. An API key in one is a credential leak, and
+    /// providers put keys in the path as often as in a header.
+    #[test]
+    fn the_provider_field_carries_a_host_and_never_a_key() {
+        assert_eq!(
+            provider_of("https://arb-mainnet.g.alchemy.com/v2/SECRETKEY123"),
+            Some("arb-mainnet.g.alchemy.com".into())
+        );
+        assert_eq!(
+            provider_of("https://arb1.arbitrum.io/rpc"),
+            Some("arb1.arbitrum.io".into())
+        );
+        // Whatever it returns, it must never contain the key.
+        assert!(!provider_of("https://x.example/v2/SECRETKEY123")
+            .unwrap()
+            .contains("SECRETKEY123"));
+        assert_eq!(provider_of("not-a-url"), None);
+    }
+
+    /// An invented hardware string is worse than an absent one: it looks authoritative and is not.
+    #[test]
+    fn hardware_is_reported_or_omitted_never_guessed() {
+        let h = hardware_summary().expect("this platform reports core count");
+        assert!(h.contains("cores"), "got {h}");
+    }
     use super::*;
 
     #[test]
