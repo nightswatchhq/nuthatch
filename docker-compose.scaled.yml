@@ -13,11 +13,22 @@
 #   docker compose -f docker-compose.scaled.yml --profile fleet up \
 #     --scale writer=2 --scale fe=3        # control plane + a writer pool + an FE tier
 #
-# **The fleet profile needs a `./nest` directory** - a scaffolded nest (`nuthatch init …`) that the
-# writers and FE nodes mount. Without it the FE containers exit immediately: they load the nest's
-# config, registry and views at startup, and there is nothing to load. The writers survive because
-# they take work from the control plane rather than from disk, which makes the failure asymmetric and
-# confusing if you have not been told.
+# **The fleet profile needs a `./nest` directory**, and it must be **owned by uid 10001**:
+#
+#     nuthatch init 0xYourContract --chain arbitrum-one --dir nest
+#     sudo chown -R 10001:10001 nest
+#
+# Two separate traps live here, both found by running this on a real Linux host:
+#
+# 1. **Without the directory** the FE containers exit immediately - they load the nest's config,
+#    registry and views at startup and there is nothing to load. The writers survive, because they take
+#    work from the control plane rather than from disk. That asymmetry is baffling if nobody warns you.
+#
+# 2. **With a root-owned directory** the FE containers exit with `Permission denied (os error 13)`.
+#    The image runs unprivileged as uid 10001 - deliberately, and worth keeping - so a root-owned bind
+#    mount is unwritable to it. **This works on Docker Desktop and fails on Linux**, because Desktop
+#    fakes mount permissions on macOS. So it passes on a laptop and breaks on every real deployment,
+#    which is the worst possible way for a defect to behave.
 #
 # Control-plane calls need the token:
 #   curl -H 'authorization: Bearer dev-token-change-me' localhost:8290/workers

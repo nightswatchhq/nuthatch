@@ -4,33 +4,6 @@ Successor to [amiable-axolotl](sprint-amiable-axolotl.md), which closed with RFC
 (0.8.0/0.8.1), verified on a real box, and documented. Companion to [backlog.md](backlog.md) and
 [prod-readiness.md](prod-readiness.md).
 
-## 0. RFC-0029 first - the backfill does not finish
-
-**Ahead of everything below, because it is the only item that decides whether a backfill completes at
-all.** [RFC-0029](rfcs/0029-the-fastest-indexer.md) §2: a documented, default-path backfill on Alchemy
-aborts.
-
-The cause is a classification regression, not a performance problem. `classify_status` enumerates 401,
-403, 413 and 429 and falls through to `Transient`; **Alchemy returns its oversized-range refusal as HTTP
-400**. RFC-0028 was grounded on a measured HTTP *200* carrying a JSON-RPC error, so the 400 shape walks
-past every mechanism built for it: the marker list becomes unreachable, the provider's suggested range is
-discarded into a truncated log line, and the window is retried five times *at the same width* before the
-backfill dies.
-
-RFC-0028's speculative split cannot save it either, and the RFC is honest about why: the split is
-deliberately non-recursive because "a genuine size failure re-triggers the classified path on the halves
-anyway" - and here the halves are misclassified too. The safety net was designed against the right
-failure mode and defeated by the wrong classification.
-
-**The durable rule, which matters more than the fix:** RFC-0028 said a marker list is a liability; this
-extends it to status codes. `Transient` is the *absence* of a classification rather than a positive
-finding, so it must never outrank direct textual evidence of a cap. Adding 400 to the list is belt to
-that braces - on its own it would be the same mistake with a different number.
-
-Sequencing follows the RFC's own slices: **the classifier fix (slice 1) is this sprint's first task**,
-then the honest harness (slice 2) *before* any optimisation, because §4b shows the current bench measures
-a strawman. Slices 3-5 are performance and can follow the items below if the window is short.
-
 ## Read this before planning around it
 
 **Three of the four scope items are gated on something other than effort.** That is not an accident of
@@ -44,10 +17,9 @@ Writing it down honestly beats a sprint that reads as a work queue and then stal
 | RFC-0003 / 0014 extraction | a **colocated reth node**, deferred by decision 2026-07-29 | No |
 | GraphOps | a **conversation**, not a dependency | Yes - and it is the cheapest item here |
 
-So the honest ordering is: **RFC-0029 slice 1 first** (§0 - it is a live defect, not an improvement),
-**talk to GraphOps** in parallel since it costs nothing and may reorder everything, **run the DataFusion
-benchmark** as the next unblocked build, and treat the remaining two as staged-and-waiting rather than
-in-flight.
+So the honest ordering is: **talk to GraphOps first** (it costs nothing and may reorder everything
+below it), **run the DataFusion benchmark second** (it is the only unblocked build), and treat the
+other two as staged-and-waiting rather than in-flight.
 
 ---
 
