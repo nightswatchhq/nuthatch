@@ -203,8 +203,9 @@ who need more - none of it in the way of the happy path:
   on what you last asked for.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
-  a **control plane** holding what should run, a **writer pool** whose members take cursor **leases**,
-  and a **query-FE tier** that serves from shared state and owns nothing. A role flag, never a fork -
+  a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
+  cursor **leases**, and a **query-FE tier** (`nuthatch serve`) that serves from shared state and owns
+  nothing. A role flag, never a fork -
   and opt-in at build time (`--features postgres-store`), so the published binary carries no database
   driver and embedded mode stays a single file with zero services. The writer pool is safely scalable
   because ownership is enforced *by the store*: every write carries a fence, and a stalled worker that

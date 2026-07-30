@@ -277,3 +277,66 @@ async fn draining_one_cursor_leaves_the_others_alone() {
     );
     assert!(sa.current_lease().unwrap().unwrap().expires_in_secs > 0);
 }
+
+// ---- the worker role, wired (RFC-0022 §2) -----------------------------------------------------
+
+/// **The claim the docs make and the code did not, until now.** `--scale writer=2` is safe because
+/// ownership is a lease: two workers offering the same chain result in exactly one owner, and the
+/// other simply does not run it.
+///
+/// `reconcile::tick` had six tests and no caller before `worker::run` existed, so this asserts the
+/// property through the same `Hosts` type the binary uses rather than through a bespoke test double.
+#[tokio::test]
+async fn two_workers_offering_one_chain_yield_one_owner() {
+    let Some((cp, scoped)) = fixture("workers") else {
+        return;
+    };
+    let (url, _) = scoped.split_once('|').unwrap();
+    // A chain name unique to this run. `Hosts::from_chains` namespaces the hot store by chain -
+    // correct in production, where one fleet has one cursor per chain - which means a fixed name
+    // would inherit the previous run's lease and this test would assert nothing.
+    let chain = format!("mainnet-{}", std::process::id());
+    cp.declare_nest(&nest("usdc", &chain, 90)).unwrap();
+
+    // Two workers, each built the way the binary builds them: `Hosts::from_chains` against the shared
+    // hot store. Same chain, so the same cursor.
+    let a = nuthatch::worker::Hosts::from_chains(url, std::slice::from_ref(&chain)).unwrap();
+    let b = nuthatch::worker::Hosts::from_chains(url, std::slice::from_ref(&chain)).unwrap();
+
+    let ra = tick(&cp, &a, "writer-1", 2048, 60).unwrap();
+    let rb = tick(&cp, &b, "writer-2", 2048, 60).unwrap();
+
+    assert_eq!(
+        ra.acquired.len() + rb.acquired.len(),
+        1,
+        "exactly one worker may own the cursor - w1={ra:?} w2={rb:?}"
+    );
+    assert!(
+        rb.acquired.is_empty(),
+        "the second worker leaves a healthy cursor alone rather than fighting for it: {rb:?}"
+    );
+}
+
+/// A worker only offers chains it was configured for, so the scheduler cannot hand it a cursor it
+/// cannot host. Placement is a suggestion; capability is a fact.
+#[tokio::test]
+async fn a_worker_ignores_chains_it_does_not_host() {
+    let Some((cp, scoped)) = fixture("capability") else {
+        return;
+    };
+    let (url, _) = scoped.split_once('|').unwrap();
+    let hosted = format!("hosted-{}", std::process::id());
+    let other = format!("other-{}", std::process::id());
+    cp.declare_nest(&nest("usdc", &hosted, 90)).unwrap();
+    cp.declare_nest(&nest("arb", &other, 90)).unwrap();
+
+    // This worker hosts only one of the two chains.
+    let hosts = nuthatch::worker::Hosts::from_chains(url, std::slice::from_ref(&hosted)).unwrap();
+    let r = tick(&cp, &hosts, "writer-1", 4096, 60).unwrap();
+
+    assert_eq!(
+        r.acquired,
+        vec![hosted],
+        "it takes what it can host and nothing else: {r:?}"
+    );
+}

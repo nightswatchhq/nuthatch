@@ -143,7 +143,7 @@ and simplicity is the point of the embedded path.
 | Role | Command | Owns |
 |---|---|---|
 | **Control plane** | `nuthatch control --db <postgres>` | *desired state* - what should run |
-| **Writer** | `nuthatch dev --dir <nest>` | cursors it holds a **lease** on; ingests, decodes, seals |
+| **Writer** | `nuthatch worker --control-db … --hot-store … --chains …` | cursors it holds a **lease** on; ingests, decodes, seals |
 | **Query-FE** | `nuthatch serve --dir <nest> --hot-store <postgres>` | nothing - serves from shared state |
 
 ```sh
@@ -158,6 +158,13 @@ run and returns 200. That does **not** mean it is running - it means the fleet h
 writer picks it up on its next tick. There is deliberately no "start this nest on worker w3" endpoint,
 because that would be the one call able to put a cursor somewhere the scheduler did not choose and the
 lease did not arbitrate.
+
+**`worker` is not `dev`.** `dev` indexes a nest directory it owns outright and knows nothing about a
+control plane; running two of those against one store is the double-writer bug rather than a pool.
+`worker` reconciles - heartbeat, take a lease per assigned cursor, index only what it holds. A worker
+declares the chains it *can* host (`--chains`); the scheduler decides which it *should*, and the lease
+decides which it *does*. Its id defaults to the hostname, and it **refuses to start** if it cannot
+determine one, because two workers sharing an id look like a single worker to the registry.
 
 **2. Ownership is a lease, and the store enforces it.** A cursor is held by exactly one writer at a
 time. If a writer stalls - long GC, paused container, a host that goes away - its lease expires and

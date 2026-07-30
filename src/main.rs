@@ -34,6 +34,21 @@ async fn main() -> Result<()> {
         cli::Command::Dev(args) => indexer::dev(args).await,
         cli::Command::Serve(args) => indexer::serve_role(args).await,
         #[cfg(feature = "postgres-store")]
+        cli::Command::Worker(args) => {
+            let id = match args.id {
+                Some(id) => id,
+                None => hostname_or_bail()?,
+            };
+            let cp = nuthatch::controlplane::ControlPlane::connect(&args.control_db)?;
+            let hosts = nuthatch::worker::Hosts::from_chains(&args.hot_store, &args.chains)?;
+            nuthatch::worker::run(cp, hosts, &id, args.budget_mb, !args.no_secrets).await
+        }
+        #[cfg(not(feature = "postgres-store"))]
+        cli::Command::Worker(_) => anyhow::bail!(
+            "the writer-worker role needs a build with `--features postgres-store`. The default \
+             binary is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+        ),
+        #[cfg(feature = "postgres-store")]
         cli::Command::Control(args) => nuthatch::control_api::run(&args.listen, &args.db).await,
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Control(_) => anyhow::bail!(
@@ -516,4 +531,24 @@ fn run_transform(args: cli::TransformArgs) -> Result<()> {
         println!("    {f}");
     }
     Ok(())
+}
+
+/// A worker's identity, from the hostname.
+///
+/// Bails rather than inventing one: two workers sharing an id look like a single worker to the
+/// registry and could each hold what it believes is its own lease - which is the one failure the whole
+/// lease mechanism exists to prevent. Better to refuse to start than to guess.
+#[cfg(feature = "postgres-store")]
+fn hostname_or_bail() -> anyhow::Result<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot determine this worker's identity - pass --id explicitly. Two workers sharing \
+                 an id would each believe they hold their own lease."
+            )
+        })
 }
