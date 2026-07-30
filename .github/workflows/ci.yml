@@ -72,6 +72,128 @@ jobs:
             --test pg_parity --test control_plane --test e2e_reconcile --test control_api \
             --test secret_isolation --test e2e_resolution -- --test-threads=1
 
+  fleet:
+    name: the compose fleet comes up
+    # **ubuntu-22.04, not ubuntu-latest**, and for the same reason the release job is pinned: a
+    # dynamically-linked binary needs the glibc it was built against *or newer*, and `Dockerfile` is
+    # `debian:bookworm-slim` (glibc 2.36). Building on 24.04 (2.39) produces a binary the image cannot
+    # run - `version GLIBC_2.39 not found`.
+    #
+    # This is the **third** time this exact trap has bitten: the release binary (#189), a local
+    # cross-build against `rust:1.95` (trixie, 2.41), and now this job. The rule is simple and worth
+    # stating so a fourth is avoided: **any job that builds a binary destined for the container image
+    # must build on a base no newer than the Dockerfile's.**
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fleet-postgres-store
+      # This job exists because of four bugs that 41 passing tests never touched, found the first time
+      # the stack was actually brought up: a migration race (`CREATE … IF NOT EXISTS` is not atomic in
+      # Postgres, and the control plane plus every worker migrate at startup), a control plane that
+      # refused to start because Docker publishes ports by binding 0.0.0.0 inside the container, an FE
+      # that died on a `:ro` mount, and an undocumented `./nest` requirement.
+      #
+      # Every one of them is a *composition* failure - the parts were individually correct. Nothing
+      # short of standing the thing up finds those.
+      - name: build the scaled binary
+        run: cargo build --release --locked --features postgres-store
+      - name: build the scaled image
+        run: |
+          mkdir -p .fleet && cp target/release/nuthatch .fleet/ && cp Dockerfile .fleet/
+          docker build -t nuthatch-scaled:ci .fleet
+          docker run --rm nuthatch-scaled:ci worker --help > /dev/null
+          docker run --rm nuthatch-scaled:ci control --help > /dev/null
+      # The fleet mounts ./nest, and its absence is the fourth bug. A minimal nest is enough: this job
+      # verifies the *topology*, not indexing - RPC access from CI would make it flaky for no gain.
+      - name: scaffold a minimal nest
+        run: |
+          mkdir -p nest/abis
+          cat > nest/nuthatch.toml <<'TOML'
+          [nest]
+          name = "ci"
+          chain = "arbitrum-one"
+          chain_id = 42161
+          rpc_urls = ["https://arb1.arbitrum.io/rpc"]
+
+          [[contracts]]
+          alias = "usdc"
+          address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+          abi = "abis/usdc.json"
+          TOML
+          cat > nest/abis/usdc.json <<'JSON'
+          [{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]
+          JSON
+          # uid 10001: the image runs unprivileged, so a root-owned bind mount is unwritable to it.
+          # This passes on Docker Desktop (which fakes mount permissions) and fails on Linux - so a CI
+          # runner is the right place to catch it, and this line is why the job would have.
+          sudo chown -R 10001:10001 nest
+      - name: bring the fleet up
+        env:
+          NUTHATCH_IMAGE: nuthatch-scaled:ci
+        run: |
+          docker compose -f docker-compose.scaled.yml --profile fleet up -d \
+            --scale writer=2 --scale fe=2
+          # Wait for the control plane…
+          for i in $(seq 1 30); do
+            curl -fsS -m 3 localhost:8290/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          # …and then for a worker to actually register. Waiting only for the control plane is not
+          # enough: workers reconcile on a 5s tick, so a verify run that starts the instant the API is
+          # up sees an empty registry. That made two level-5 checks fail on a *timing* problem and read
+          # as product failures - `5.10` in particular, because with no workers the unplaceable reason
+          # is `noworkers` rather than the budget one it was asserting.
+          for i in $(seq 1 30); do
+            n=$(curl -fsS -m 3 -H 'authorization: Bearer dev-token-change-me' \
+              localhost:8290/workers | python3 -c 'import sys,json;print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)
+            [ "${n:-0}" -ge 1 ] && { echo "workers registered: $n"; break; }
+            sleep 2
+          done
+      - name: every service is running
+        run: |
+          # The assertion that would have caught three of the four bugs: nothing exited.
+          exited=$(docker compose -f docker-compose.scaled.yml --profile fleet ps -a \
+            --format '{{.Service}} {{.State}}' | awk '$2 != "running"')
+          if [ -n "$exited" ]; then
+            echo "::error::services are not running:"; echo "$exited"
+            docker compose -f docker-compose.scaled.yml --profile fleet logs --tail 30
+            exit 1
+          fi
+          docker compose -f docker-compose.scaled.yml --profile fleet ps \
+            --format '{{.Service}} {{.State}}'
+      - name: walk verification.md level 5
+        env:
+          NUTHATCH: target/release/nuthatch
+          CONTROL_TOKEN: dev-token-change-me
+        run: ./scripts/verify.sh 5
+      - name: a worker takes a lease and only one does
+        run: |
+          # Declare on a chain a worker hosts, then assert exactly one acquisition. This is the
+          # single-owner invariant, read from the workers' own logs - the control plane records intent,
+          # the lease records ownership, so asking the control plane would prove nothing.
+          curl -fsS -X POST localhost:8290/nests \
+            -H 'authorization: Bearer dev-token-change-me' \
+            -H 'content-type: application/json' \
+            -d '{"name":"ci","chain":"arbitrum-one","estimated_rss_mb":120}'
+          sleep 12
+          n=$(docker compose -f docker-compose.scaled.yml logs writer 2>&1 \
+            | grep -c 'acquired cursors' || true)
+          echo "acquisitions: $n"
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly one worker to acquire the cursor, got $n"
+            docker compose -f docker-compose.scaled.yml logs writer --tail 40
+            exit 1
+          fi
+      - name: teardown
+        if: always()
+        run: docker compose -f docker-compose.scaled.yml --profile fleet down -v
+
   deny:
     name: cargo-deny (vulns · licences · bans)
     runs-on: ubuntu-latest
