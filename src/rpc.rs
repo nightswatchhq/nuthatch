@@ -519,9 +519,41 @@ impl RpcClient {
             }
             return Err(classified(class, detail));
         }
-        resp.json::<Value>()
-            .await
-            .map_err(|e| classified(FailureClass::Transient, format!("malformed response: {e}")))
+        resp.json::<Value>().await.map_err(|e| {
+            // **A body-read timeout is a size signal, not a transient blip** (RFC-0029 §6g). reqwest's
+            // `.timeout()` covers streaming the body, so a response that is large *and* slow to read
+            // fails here rather than at the status line - with the opaque text "error decoding response
+            // body" and no cap marker anywhere in it.
+            //
+            // Measured on OBIB case 1 (2026-07-30): a 25,000-block window over LBTC returns a valid
+            // 3.5 MB body in 2.6 s to `curl`, but under `--concurrency 8` with the timestamp fan-out
+            // (§6c) competing for the same pool, the read exceeded the 20 s budget. Classified
+            // `Transient`, it took the *bounded* speculative-split path (RFC-0028 §3b) instead of the
+            // unbounded classified one, ran out of splits, retried five times at the same width, and
+            // **aborted the backfill**. Same range, twice.
+            //
+            // This is slice 1's lesson in a second costume: `Transient` is the absence of a
+            // classification, not a finding. Halving the range halves the bytes and the read time, so
+            // narrowing is the only thing that can help - where retrying the identical width provably
+            // cannot.
+            //
+            // A *syntax* error stays transient: garbage from a load balancer is no smaller in halves,
+            // and calling it narrowable would split a dead endpoint down to single blocks.
+            let class = if e.is_timeout() {
+                FailureClass::Narrowable { suggested: None }
+            } else {
+                FailureClass::Transient
+            };
+            classified(class, format!("malformed response: {e}"))
+        })
+    }
+
+    /// Single-endpoint POST for tests that need the *classification* of a raw transport failure,
+    /// before failover or the all-endpoints re-classification (`§92`) can rewrite it.
+    #[cfg(test)]
+    pub(crate) async fn post_one_for_test(&self, body: &Value) -> Result<Value> {
+        let url = self.urls[0].clone();
+        self.send_classified(&url, body).await
     }
 
     async fn post_one(&self, url: &str, body: &Value) -> Result<Value> {
@@ -1563,5 +1595,81 @@ mod tests {
         );
         assert_eq!(redact_url("http://localhost:8545"), "http://localhost:8545");
         assert_eq!(redact_url("https://host:8545/"), "https://host:8545");
+    }
+
+    /// **RFC-0029 §6g.** A body-read *timeout* must narrow; a body *syntax* error must not.
+    ///
+    /// This is the distinction the fix turns on, and getting it backwards is worse in both directions:
+    /// classifying every decode failure as narrowable would split a garbage-returning endpoint down to
+    /// single blocks, and classifying every one as transient is what aborted an OBIB case-1 backfill
+    /// five times at the same width.
+    ///
+    /// Driven through a real server rather than a hand-built `reqwest::Error`, because the whole bug
+    /// was that we mis-read what reqwest reports for a slow body - a fake error would encode the same
+    /// assumption that was wrong.
+    #[tokio::test]
+    async fn a_slow_body_narrows_but_a_malformed_one_does_not() {
+        use super::{class_of, FailureClass, RpcClient};
+        use tokio::io::AsyncWriteExt;
+
+        // A server that sends headers and a Content-Length it never satisfies, so the client blocks
+        // reading the body until its own timeout fires - exactly the shape a large-but-slow response
+        // has, without needing to move megabytes.
+        async fn serve(stall: bool) -> String {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = l.accept().await {
+                    let body = if stall {
+                        // Promise 4 MB, send 3 bytes, then hold the connection open.
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4194304\r\n\r\n{\"j"
+                    } else {
+                        // Complete, well-formed HTTP carrying JSON that is not JSON.
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 9\r\n\r\nnot-json!"
+                    };
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    if stall {
+                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    }
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        // The stalling case: the client gives up mid-body. That is a size signal.
+        let url = serve(true).await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let err = c
+            .post_one_for_test(
+                &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}),
+            )
+            .await
+            .expect_err("a stalled body must fail");
+        assert!(
+            matches!(class_of(&err), Some(FailureClass::Narrowable { .. })),
+            "a body-read timeout must be narrowable so the *unbounded* classified split handles it, \
+             not the one-shot speculative one: {err:#}"
+        );
+        assert!(
+            crate::chunker::is_result_too_large(&err),
+            "…and the chunker must agree, since that is what actually triggers the split"
+        );
+
+        // The malformed case: halving buys nothing, so it stays transient.
+        let url = serve(false).await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let err = c
+            .post_one_for_test(
+                &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}),
+            )
+            .await
+            .expect_err("non-JSON must fail");
+        assert!(
+            matches!(class_of(&err), Some(FailureClass::Transient)),
+            "garbage is not smaller in halves - splitting a dead endpoint to single blocks is the \
+             failure RFC-0028 was avoiding: {err:#}"
+        );
+        assert!(!crate::chunker::is_result_too_large(&err));
     }
 }
