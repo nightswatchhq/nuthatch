@@ -13,13 +13,18 @@ Writing it down honestly beats a sprint that reads as a work queue and then stal
 | Item | Gate | Can we start today? |
 |---|---|---|
 | RFC-0013 DataFusion | a **benchmark** we must run and honour | Yes - the benchmark is the work |
-| RFC-0023 tier 3 | an **archive RPC endpoint** | Partly - design and config, not verification |
+| RFC-0023 tier 3 | ~~an archive RPC endpoint~~ **nothing** | **Yes - the gate was wrong** |
 | RFC-0003 / 0014 extraction | a **colocated reth node**, deferred by decision 2026-07-29 | No |
 | GraphOps | a **conversation**, not a dependency | Yes - and it is the cheapest item here |
 
 So the honest ordering is: **talk to GraphOps first** (it costs nothing and may reorder everything
-below it), **run the DataFusion benchmark second** (it is the only unblocked build), and treat the
-other two as staged-and-waiting rather than in-flight.
+below it), then **RFC-0013's DataFusion benchmark** and **RFC-0023 tier 3** - both buildable - with
+only RFC-0003/0014 genuinely staged-and-waiting on hardware.
+
+**On that hardware (2026-07-30):** reth needs a Hetzner *dedicated* box (~2x1.92 TB NVMe). The largest
+Hetzner **Cloud** instance tops out at 960 GB of local disk, and Cloud volumes are network-attached -
+reth's IOPS profile makes syncing on them impractical rather than merely slow. A Cloud API token
+cannot order a dedicated server. Everything else in this sprint runs on Cloud for a few euros.
 
 ---
 
@@ -59,19 +64,34 @@ Two things to hold onto:
 
 ## 3. RFC-0023 tier 3 - pinned-block `eth_call`
 
-**Needs an archive endpoint**, so the verification half cannot start. What *can*: the nest-level
-declaration of irreducible reads, the config surface, and the content-addressing scheme for
-`(chain, block, contract, calldata)`.
+**Correction (2026-07-30): this was never blocked.** The gate was recorded as "an archive endpoint",
+which was read as "an archive *node*". RFC-0023 §11 asks for an operator-supplied archive **RPC**, and
+a stock Alchemy key serves pinned-block `eth_call` today - verified against USDC `totalSupply()` at
+blocks 12,000,000 and 15,000,000, two heights, two correct answers.
 
-Do that much only if it is genuinely useful on its own. RFC-0014 slice 0 was worth building ahead of
-its source because the decode carried most of the correctness risk; **check whether the same is true
-here before assuming it is.** If the risk lives in the verification rather than the declaration, this
-waits.
+So the verification half *can* start, which changes this from "design only, staged and waiting" to a
+buildable item with its acceptance test already written: the same declared call at the same block
+re-executes to a byte-identical result across runs and machines.
+
+The lesson worth keeping: a gate recorded once and never re-tested becomes folklore. This one cost us
+a sprint of treating a buildable item as blocked. **Re-test gates before planning around them** - the
+same standing practice as "run it, don't reason about it", applied to the backlog rather than the code.
 
 Its acceptance test is already written: the same declared call at the same block re-executes to a
 byte-identical result across runs and machines.
 
 ## 4. RFC-0003 / 0014 - extraction
+
+**Re-deferred 2026-07-30**, second time, with the cost now priced rather than vague: reth needs a
+Hetzner **dedicated** box (~EUR 110/mo + setup, 2x1.92 TB NVMe minimum) and **days of sync**. The
+largest Hetzner *Cloud* instance has 960 GB of local disk and Cloud volumes are network-attached, so
+there is no Cloud path to it - a Cloud API token cannot order a dedicated server at all.
+
+Everything else in the pre-1.0 set is reachable without it. This one is a purchase decision, not an
+engineering one, and it is parked until someone makes that purchase. **Do not re-raise it as a
+blocker** and, per §3's lesson, **do not let "blocked on reth" spread to items that are not** - it has
+already happened once to RFC-0023.
+
 
 **Blocked on the reth box, deferred by decision on 2026-07-29. Do not re-raise it as a blocker** - the
 deferral is recorded in [backlog.md](backlog.md) Track 1.
