@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check |
-| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus the compose fleet brought up and steps 5.1-5.4, 5.7, 5.8 walked live** (2026-07-30, single host, 2 writers + 2 FE nodes). **Nothing has run across real machines** - 5.5's clock-skew case and any partition test are still open. |
+| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus a full level-5 pass on a clean Hetzner box** (2026-07-30, Ubuntu 24.04, published v0.8.1 artifacts, 2 writers + 2 FE nodes): **10/10, zero skipped**, via `scripts/verify.sh 5`. **Nothing has run across real machines** - the partition and clock-skew cases are still open. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -269,6 +269,21 @@ the one worth your time.
 
 Needs the **scaled** artifact — `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
 refuses these commands by name.
+
+**5.0 Prerequisites, both of which have bitten us**
+
+```sh
+nuthatch init 0xYourContract --chain arbitrum-one --dir nest
+sudo chown -R 10001:10001 nest
+```
+
+The fleet mounts `./nest`. Without it, FE nodes exit and **writers keep running** - they take work from
+the control plane, not from disk - so the failure looks like an FE bug rather than a missing directory.
+Without the `chown`, FE nodes exit with `Permission denied`: the image runs unprivileged as uid 10001,
+and a root-owned bind mount is unwritable to it.
+
+That second one **passes on Docker Desktop and fails on Linux**, because Desktop fakes mount
+permissions. If you are testing on a Mac and it works, that is not evidence it works.
 
 **5.1 The stack comes up**
 

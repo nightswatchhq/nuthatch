@@ -129,6 +129,10 @@ jobs:
             {"name":"to","type":"address","indexed":true},
             {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]
           JSON
+          # uid 10001: the image runs unprivileged, so a root-owned bind mount is unwritable to it.
+          # This passes on Docker Desktop (which fakes mount permissions) and fails on Linux - so a CI
+          # runner is the right place to catch it, and this line is why the job would have.
+          sudo chown -R 10001:10001 nest
       - name: bring the fleet up
         env:
           NUTHATCH_IMAGE: nuthatch-scaled:ci

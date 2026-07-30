@@ -76,6 +76,13 @@ print(d)' "$1"; }
 
 hr() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# `check` runs each assertion via `bash -c`, which is a *subshell* and does not inherit shell
+# functions. Without exporting these, every check that used `api`/`ctl`/`jget` failed with
+# "command not found" and read as a product failure - which is exactly how a harness starts lying.
+# Found by running level 5 on a real box; level 0 does not use them, so it passed locally.
+export -f api ctl jget have
+export CONTROL_TOKEN NUTHATCH_URL CONTROL_URL
+
 # ---------------------------------------------------------------------------------------------------
 level0() {
   hr "Level 0 — the artifact is what it claims"
