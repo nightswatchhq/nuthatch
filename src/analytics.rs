@@ -2326,5 +2326,4 @@ template="pool"
             assert!(reject_replacement_scan(q).is_ok(), "must be allowed: {q}");
         }
     }
-
 }
