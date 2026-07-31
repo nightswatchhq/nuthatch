@@ -1991,4 +1991,83 @@ template="pool"
             "unguarded trusted queries are not byte-capped"
         );
     }
+
+    /// **Issue #241 items 3 and 4.** On a cold nest an authored view must resolve to zero rows, not
+    /// fail with `Table ... does not exist`.
+    ///
+    /// The reported symptom was every view failing at startup on a fresh nest, then being *absent*
+    /// until a restart - so the documented first run ("`nuthatch dev`, then query") could not use
+    /// views on the run that forms someone's impression of the tool.
+    ///
+    /// The mechanism is subtle and worth pinning: `define_views` already builds an empty **typed**
+    /// view for a table with no sealed segments and no hot rows - but skips it when `cols` is empty,
+    /// and `cols` comes from `schema.json`. A hand-written nest has no schema, so no columns, so **no
+    /// view at all**, and one missing table cascade-fails the whole view file.
+    ///
+    /// That makes cold-start view resolution an *emergent* property of `schema.json` being present and
+    /// `empty_view_ddl` being reached. This test exists because emergent properties stop being true
+    /// quietly.
+    #[test]
+    fn an_authored_view_resolves_on_a_cold_nest_with_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/10-big.sql"),
+            "CREATE VIEW big_transfers AS SELECT \"from\", value_dec FROM tok__transfer WHERE value_dec > 1000;",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let empty = HotRows::new();
+        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_nest_views(&conn, dir.path());
+
+        // The base table exists as an empty typed view…
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM tok__transfer", [], |r| r.get(0))
+            .expect("a declared table with no rows must still resolve");
+        assert_eq!(n, 0);
+
+        // …and so does the authored view built on it, including the derived `_dec` column.
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM big_transfers", [], |r| r.get(0))
+            .expect("an authored view on an empty table must resolve to zero rows, not fail");
+        assert_eq!(n, 0);
+    }
+
+    /// The other half of the same mechanism: **without** a schema there are no columns, so the empty
+    /// typed view is skipped and the authored view cannot resolve. Pinned so the dependency between
+    /// `schema.json` and cold-start views is explicit rather than folklore - it is exactly why
+    /// `refresh_stale_artifacts` regenerates a missing schema before anything reads it.
+    #[test]
+    fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-big.sql"),
+            "CREATE VIEW big_transfers AS SELECT * FROM tok__transfer;",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let empty = HotRows::new();
+        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_nest_views(&conn, dir.path());
+
+        assert!(
+            conn.query_row("SELECT count(*) FROM big_transfers", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "with no schema.json there is no typed empty view, so the authored view cannot resolve - \
+             this is the failure `refresh_stale_artifacts` prevents by regenerating the schema"
+        );
+    }
 }
