@@ -233,6 +233,47 @@ Still unmeasured: the `--concurrency 16` vs `--concurrency 1` ratio (§10), and 
 *timestamped* nest on this workload - so the cost `--no-timestamps` avoids is quantified here only by
 the RFC's earlier ~85% measurement, not by an A/B on this range.
 
+### 4c. The A/B, and a third instance of one defect (2026-07-31)
+
+The same nest, range, endpoint and commit, differing only in `block_timestamps`:
+
+| | wall clock | events | RPC requests | peak RSS |
+|---|---|---|---|---|
+| `--no-timestamps` | **74.8 s** | 294,278 | 321 | 320 MB |
+| with timestamps | **1689.1 s** | 294,278 | 2,099 | 461 MB |
+
+**22.6x**, with byte-identical output modulo the column. §4's ~85%-of-wall-clock estimate is now too
+low - 22.6x implies ~95.6% - and the reason is §6f rather than any regression: adaptive windows cut the
+log half to 321 requests, so the timestamp half went from dominant to overwhelming. **A
+"percentage of wall clock" is only meaningful against the wall clock it was measured on.**
+**6.5x of all requests are timestamps** (2,099 vs 321).
+
+Getting this number took three attempts, because the timestamped run **aborted twice** - and both
+aborts were the same defect this RFC opened with, in new locations:
+
+| # | Where | Trigger | Found by |
+|---|---|---|---|
+| 1 | `getLogs` status codes (§3) | HTTP 400 not enumerated | running OBIB at all |
+| 2 | `getLogs` body read | request timeout covers body streaming | the A/B |
+| 3 | timestamp batch | same, and no narrowing path at all | the A/B again |
+
+Each time the shape was identical: **a failure that halving would fix, reissued at the same size until
+the attempts ran out.** So the rule is worth stating above the three fixes, because patching a fourth
+instance is not a plan:
+
+> **A batched RPC call needs a narrowing path, not just a retry path.**
+
+There is also an interaction §6c and §6f did not account for: `MAX_TIMESTAMP_BATCH` (200) x
+`TIMESTAMP_FANOUT` (4) x `--concurrency` (8) is **up to 32 concurrent large responses**, sharing one
+connection pool and one timeout budget, and nothing bounds that product. §6f sharpened it by growing
+windows to 100,000 blocks. Halving on failure adapts without predicting it, which is better than
+retuning constants whose right values depend on the provider, the contract's density, and the
+concurrency the operator chose.
+
+**Only `--no-timestamps` ships a headline number.** The timestamped path completes but is 22.6x
+slower; that is the honest statement, and it is what makes §6b a *new-nest* decision rather than a
+tuning flag.
+
 ## 5. The principle
 
 **You cannot out-run RPC with RPC.**

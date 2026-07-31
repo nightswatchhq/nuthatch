@@ -1,0 +1,22 @@
+{
+  "bench": "backfill",
+  "label": "OBIB case 1 A/B: WITH block_timestamps",
+  "nest": "obib-case1",
+  "chain": "mainnet",
+  "from_block": 0,
+  "to_block": 22200000,
+  "blocks": 22200001,
+  "initial_window": 20,
+  "window_adaptive": true,
+  "seal_direct": true,
+  "concurrency": 8,
+  "runs": 1,
+  "events": 294278,
+  "wall_clock_s": 1689.09,
+  "events_per_sec": 174.22,
+  "peak_rss_mb": 461,
+  "rpc_requests": 2099,
+  "commit": "36de4a4",
+  "provider": "eth-mainnet.g.alchemy.com",
+  "hardware": "11 cores, 18 GB RAM"
+}

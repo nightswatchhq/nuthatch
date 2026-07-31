@@ -201,6 +201,16 @@ jobs:
       - uses: actions/checkout@v4
       # Dependency vulnerability scan (RUSTSEC) + permissive-only licence gate + banned-crate check.
       # Config + the honest ignore-list rationale live in deny.toml.
+      #
+      # `rust-version` pins the cargo-deny build. On 2026-07-31 the pinned one could not parse a newly
+      # published advisory that uses **CVSS 4.0**, so the whole advisory database failed to load and
+      # the job errored - on every PR. It failed *closed*, which is the right direction, but it also
+      # masked a real finding: once a parsing version ran, RUSTSEC-2026-0220 (`ruint` shift ops) turned
+      # out to be live in our tree, through alloy's decode path.
+      #
+      # The lesson for whoever touches this next: the advisory DB is a live external input whose schema
+      # moves. A scanner that hard-fails on an unknown CVSS version is one upstream change away from
+      # blocking every release - so keep this current rather than pinned-and-forgotten.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
