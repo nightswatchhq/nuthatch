@@ -174,6 +174,40 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
     }
 }
 
+/// Whether a **batch** failure is worth halving the batch for.
+///
+/// Deliberately broader than [`crate::chunker::is_result_too_large`], and the reason is issue #241
+/// item 7: `arbitrum.drpc.org` refuses on **batch count** - "Batch of more than 3 requests are not
+/// allowed on free plan" - which matches no cap marker, classifies `Transient`, and so never reached
+/// the narrowing at all. The observed behaviour was a window walking `781 → 234 → 220 → 218 → 218 …`
+/// and stalling: shrinking the *block range* cannot help when the limit counts *requests*.
+///
+/// Adding "batch of more than" to the marker list would fix this provider and leave the next one
+/// broken. That is the fourth time a marker list has come up short (RFC-0028 §3e, RFC-0029 §3b, §6a,
+/// and now here), so this reasons from the request shape instead:
+///
+/// **Halving a batch always reduces its count**, whatever the provider is objecting to - size, count,
+/// or something it has not named. And it is self-limiting: a batch of 200 bottoms out in ~8 splits,
+/// at which point a single-item request either succeeds or fails for a reason halving was never going
+/// to fix. So the only failures excluded are the ones where retrying differently is *definitely*
+/// pointless.
+///
+/// **Known cost, not yet addressed:** narrowing sits *outside* the retry loop in
+/// `fetch_timestamp_batch_once`, so every level pays a full `TIMESTAMP_ATTEMPTS` cycle with backoff
+/// before it splits. Converging 200 → 3 against a count-capping endpoint therefore burns ~8 retry
+/// cycles. Correct, but slow: for a failure that is *definitely* a cap, retrying at the same width
+/// first is pure waste. Splitting immediately on a definite cap and reserving retries for
+/// unclassifiable errors would fix it, and wants its own change rather than being smuggled in here.
+fn batch_is_narrowable(err: &anyhow::Error) -> bool {
+    match class_of(err) {
+        // Auth and rate limits are positive findings about something other than size: splitting an
+        // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
+        // limit doubles the request count in exactly the wrong direction.
+        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited) => false,
+        _ => true,
+    }
+}
+
 /// Whether a body carries direct textual evidence of a range/result cap.
 ///
 /// Shared by the status classifier and [`crate::chunker::is_result_too_large`] so the two cannot drift
@@ -424,7 +458,10 @@ impl RpcClient {
 
     /// Try endpoints in health order until one answers; a failed endpoint is put into cooldown, a
     /// successful one is cleared.
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// One JSON-RPC call with failover. `pub(crate)` so `doctor` can ask arbitrary probe questions -
+    /// it exists to interrogate an endpoint's limits, which is not expressible through the typed
+    /// helpers.
+    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut last_err = anyhow!("all RPC endpoints failed");
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
@@ -778,6 +815,12 @@ impl RpcClient {
         Ok(out)
     }
 
+    /// Send a raw JSON-RPC batch and return the raw response. For `doctor` only: measuring the
+    /// endpoint's batch ceiling means sending batches of chosen sizes, which no typed helper offers.
+    pub(crate) async fn raw_batch(&self, body: &Value) -> Result<Value> {
+        self.post_with_failover(body).await
+    }
+
     /// Contract bytecode at `address` as of `block`. `"0x"` (empty) means not yet deployed.
     pub async fn get_code(&self, address: &str, block: u64) -> Result<String> {
         let result = self
@@ -917,7 +960,7 @@ impl RpcClient {
                 Ok(v) => Ok(v),
                 // A single block that still fails is a real failure - there is nothing left to halve,
                 // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
-                Err(e) if blocks.len() > 1 && crate::chunker::is_result_too_large(&e) => {
+                Err(e) if blocks.len() > 1 && batch_is_narrowable(&e) => {
                     let mid = blocks.len() / 2;
                     tracing::debug!(
                         "timestamp batch of {} too large ({e:#}); splitting",
@@ -1886,5 +1929,103 @@ mod tests {
             SEEN_MAX.load(Ordering::SeqCst) <= 200,
             "sanity: the server saw the batch it was sent"
         );
+    }
+
+    /// **Issue #241 item 7.** A provider that caps **batch count** must still converge.
+    ///
+    /// `arbitrum.drpc.org` refuses with "Batch of more than 3 requests are not allowed on free plan",
+    /// which matches no cap marker and so classified `Transient` - the narrowing existed and was never
+    /// reached. The reported symptom was a window walking `781 → 234 → 220 → 218 → 218 …` and
+    /// stalling, because shrinking a *block range* cannot satisfy a limit that counts *requests*.
+    ///
+    /// The server here mimics that exactly: it rejects on count, with a message containing no
+    /// size language whatsoever.
+    #[tokio::test]
+    async fn a_batch_count_limit_converges_rather_than_stalling() {
+        use super::RpcClient;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        static SMALLEST: AtomicUsize = AtomicUsize::new(usize::MAX);
+        SMALLEST.store(usize::MAX, Ordering::SeqCst);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1 << 20];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let items = req.matches("eth_getBlockByNumber").count();
+                    if items > 0 {
+                        SMALLEST.fetch_min(items, Ordering::SeqCst);
+                    }
+                    // Free-plan batch cap: **counts requests**, says nothing about size.
+                    let body = if items > 3 {
+                        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"Batch of more than 3 requests are not allowed on free plan"}}"#.to_string()
+                    } else {
+                        let it: Vec<String> = (0..items)
+                            .map(|i| {
+                                format!(
+                                    r#"{{"jsonrpc":"2.0","id":{i},"result":{{"timestamp":"0x2"}}}}"#
+                                )
+                            })
+                            .collect();
+                        format!("[{}]", it.join(","))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+        // 16, not 200: each narrowing level pays a full retry cycle first (see the note on
+        // `batch_is_narrowable`), so a large fixture makes this test minutes long for no extra proof.
+        let blocks: Vec<u64> = (1..=16).collect();
+        let got = c
+            .block_timestamps(&blocks)
+            .await
+            .expect("a batch-count limit must be narrowed into, not retried at the same width");
+
+        assert_eq!(got.len(), 16, "every block must come back after splitting");
+        assert!(
+            SMALLEST.load(Ordering::SeqCst) <= 3,
+            "it must have narrowed to within the provider's count cap - smallest batch seen was {}",
+            SMALLEST.load(Ordering::SeqCst)
+        );
+    }
+
+    /// The exclusions are deliberate: splitting an unauthorised request yields two unauthorised
+    /// requests, and splitting under a rate limit doubles the request count in the wrong direction.
+    #[test]
+    fn auth_and_rate_limits_are_not_narrowed() {
+        use super::{batch_is_narrowable, ClassifiedError, FailureClass};
+        let classified = |c: FailureClass, d: String| {
+            anyhow::Error::new(ClassifiedError {
+                class: c,
+                detail: d,
+            })
+        };
+        let terminal = classified(FailureClass::Terminal, "HTTP 401".into());
+        let limited = classified(FailureClass::RateLimited, "HTTP 429".into());
+        assert!(!batch_is_narrowable(&terminal));
+        assert!(!batch_is_narrowable(&limited));
+
+        // Everything else is worth a halving - including errors naming nothing about size.
+        let odd = classified(
+            FailureClass::Transient,
+            "Batch of more than 3 requests".into(),
+        );
+        assert!(batch_is_narrowable(&odd));
     }
 }

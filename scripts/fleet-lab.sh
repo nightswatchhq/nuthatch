@@ -61,6 +61,16 @@ need curl; need python3; need ssh
 # the reason. A malformed request therefore surfaced as `curl: (56)` followed by a JSON decode
 # traceback from whatever tried to parse the empty output - which is how a 422 on the `networks` field
 # went undiagnosed. Keep the body, print it, and fail.
+# Every ssh into a lab box goes through here.
+#
+# Lab boxes are ephemeral and **Hetzner recycles addresses**, so an IP you used an hour ago comes back
+# attached to a different host key. With the default policy that is a hard `Host key verification
+# failed`, which reads exactly like a provisioning failure and cost an afternoon on 2026-07-31. These
+# are throwaway machines whose fingerprints are meaningless, so they get their own throwaway
+# known-hosts file rather than polluting - and colliding with - the operator's real one.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
+lab_ssh() { ssh "${SSH_OPTS[@]}" "$@"; }
+
 hc() { # hc METHOD PATH [json]
   local m="$1" p="$2" body="${3:-}" out code
   if [ -n "$body" ]; then
@@ -138,6 +148,17 @@ create_server() { # create_server <name> <type> <role> [network-id]
     \"user_data\":$ci$netpart}" | jq_ server.public_net.ipv4.ip
 }
 
+# Private (10.44.x.x) address of a box, by role. The public IP is how *we* reach it; the private one
+# is how the boxes reach each other, and it is what a writer must be given for the store.
+private_ip() { # private_ip <role> [index]
+  hc GET "/servers?label_selector=$LABEL" | python3 -c 'import sys,json
+role, idx = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 0
+hits = [s for s in json.load(sys.stdin)["servers"] if s["labels"].get("role") == role]
+hits.sort(key=lambda s: s["name"])
+nets = hits[idx]["private_net"] if idx < len(hits) else []
+print(nets[0]["ip"] if nets else "")' "$1" "${2:-0}"
+}
+
 ips_by_role() { hc GET "/servers?label_selector=$LABEL" | python3 -c 'import sys,json
 for s in json.load(sys.stdin)["servers"]:
     print(s["labels"].get("role","?"), s["public_net"]["ipv4"]["ip"], s["name"])'; }
@@ -145,7 +166,7 @@ for s in json.load(sys.stdin)["servers"]:
 wait_ready() { # wait_ready <ip>
   echo "  waiting for cloud-init on $1 (installs docker + the release; a few minutes)"
   for _ in $(seq 1 90); do
-    if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "root@$1" \
+    if lab_ssh "root@$1" \
          'test -f /opt/lab-ready' 2>/dev/null; then echo "  ready: $1"; return 0; fi
     sleep 10
   done
@@ -250,27 +271,109 @@ print(n[0]["id"] if n else "")' 2>/dev/null || true)
 cmd_verify() {
   local target; target=$(ips_by_role | head -1 | awk '{print $2}')
   [ -z "$target" ] && { echo "no lab found - run 'up' first"; exit 1; }
+  local n_writers; n_writers=$(ips_by_role | awk '$1=="writer"' | wc -l | tr -d ' ')
+
   echo "== levels 0-4 on $target =="
   # `verify.sh` comes from the checkout on the box, so the lab tests the released binary against the
   # runbook at the version that shipped it - not against whatever is on this laptop.
-  ssh "root@$target" 'cd /opt/nuthatch-src && NUTHATCH=/usr/local/bin/nuthatch ./scripts/verify.sh 0 2 || true'
+  lab_ssh "root@$target" 'cd /opt/nuthatch-src && NUTHATCH=/usr/local/bin/nuthatch ./scripts/verify.sh 0 2 || true'
   echo
-  echo "== the compose fleet, then level 5 =="
-  ssh "root@$target" 'set -eux
+
+  if [ "$n_writers" -gt 0 ]; then
+    cmd_verify_distributed
+  else
+    cmd_verify_single "$target"
+  fi
+}
+
+# Write the lab nest onto a box. Shared by both shapes so the two topologies index the same thing.
+lab_nest() { # lab_nest <ip> [extra-docker-setup]
+  lab_ssh "root@$1" 'set -eu
     cd /opt/nuthatch-src
     mkdir -p nest/abis
     printf "[nest]\nname=\"lab\"\nchain=\"arbitrum-one\"\nchain_id=42161\nrpc_urls=[\"https://arb1.arbitrum.io/rpc\"]\n\n[[contracts]]\nalias=\"usdc\"\naddress=\"0xaf88d065e77c8cC2239327C5EDb3A432268e5831\"\nabi=\"abis/usdc.json\"\n" > nest/nuthatch.toml
     printf "[{\"type\":\"event\",\"name\":\"Transfer\",\"inputs\":[{\"name\":\"from\",\"type\":\"address\",\"indexed\":true},{\"name\":\"to\",\"type\":\"address\",\"indexed\":true},{\"name\":\"value\",\"type\":\"uint256\",\"indexed\":false}],\"anonymous\":false}]" > nest/abis/usdc.json
-    chown -R 10001:10001 nest   # the image runs unprivileged; a root-owned mount is unwritable to it
+    chown -R 10001:10001 nest'
+}
+
+# **The genuinely distributed run.** Control plane, store and FE tier on one box; workers on their own
+# machines, reaching the store over the private network.
+#
+# This is what `multi` always claimed and never did: before 2026-07-31 `verify` brought the entire
+# compose fleet up on the first host and left the writer boxes empty, so `partition` and `skew` were
+# firewalling and clock-skewing machines that ran nothing.
+cmd_verify_distributed() {
+  local cp; cp=$(ips_by_role | awk '$1=="control"{print $2}' | head -1)
+  local cp_priv; cp_priv=$(private_ip control)
+  [ -z "$cp" ] || [ -z "$cp_priv" ] && { echo "need a control box with a private address"; exit 1; }
+  echo "== distributed fleet: control plane on $cp ($cp_priv), workers on their own boxes =="
+
+  lab_nest "$cp"
+  # The control box runs the store, the control plane and the FE tier - and **no writers**. A writer
+  # here would be indistinguishable from a remote one in the registry, which is exactly the confusion
+  # this shape exists to remove.
+  #
+  # PG_BIND/CONTROL_BIND put both surfaces on the private address. They default to 127.0.0.1 in the
+  # compose file; this is a closed 10.44.0.0/16 network, and the credentials are dev defaults.
+  lab_ssh "root@$cp" "set -eux
+    cd /opt/nuthatch-src
+    mkdir -p .img && cp /usr/local/bin/nuthatch-scaled .img/nuthatch && cp Dockerfile .img/
+    docker build -q -t nuthatch-scaled:lab .img
+    PG_BIND=$cp_priv CONTROL_BIND=$cp_priv NUTHATCH_IMAGE=nuthatch-scaled:lab \
+      docker compose -f docker-compose.scaled.yml --profile fleet up -d postgres control fe --scale fe=2
+    for i in \$(seq 1 30); do curl -fsS -m3 $cp_priv:8290/workers -H 'authorization: Bearer dev-token-change-me' >/dev/null 2>&1 && break; sleep 2; done
+    docker compose -f docker-compose.scaled.yml ps -a --format '{{.Service}} {{.State}}'"
+
+  local i=0
+  ips_by_role | awk '$1=="writer"{print $2}' | while read -r w; do
+    echo "-- writer node $w -> store at $cp_priv --"
+    lab_nest "$w"
+    # `docker-compose.writer-node.yml` carries the writer and nothing else - no `depends_on: postgres`,
+    # so no second empty database appears beside it.
+    lab_ssh "root@$w" "set -eux
+      cd /opt/nuthatch-src
+      mkdir -p .img && cp /usr/local/bin/nuthatch-scaled .img/nuthatch && cp Dockerfile .img/
+      docker build -q -t nuthatch-scaled:lab .img
+      CONTROL_HOST=$cp_priv NUTHATCH_IMAGE=nuthatch-scaled:lab \
+        docker compose -f docker-compose.writer-node.yml up -d
+      docker compose -f docker-compose.writer-node.yml ps --format '{{.Service}} {{.State}}'"
+    i=$((i+1))
+  done
+
+  # Workers heartbeat on a timer; checking immediately is how 5.1b failed on 2026-07-31 and passed on
+  # a re-run. Wait for the registry to actually show them before asserting anything about it.
+  echo "-- waiting for workers to register --"
+  for _ in $(seq 1 30); do
+    local n; n=$(lab_ssh "root@$cp" "curl -fsS -m3 localhost:8290/workers -H 'authorization: Bearer dev-token-change-me' 2>/dev/null" \
+      | python3 -c 'import sys,json
+try: print(len(json.load(sys.stdin).get("workers", [])))
+except Exception: print(0)' 2>/dev/null || echo 0)
+    echo "   registered: $n"
+    [ "${n:-0}" -ge 1 ] && break
+    sleep 5
+  done
+
+  echo
+  echo "== level 5 against the distributed fleet =="
+  lab_ssh "root@$cp" 'cd /opt/nuthatch-src && NUTHATCH=/usr/local/bin/nuthatch-scaled ./scripts/verify.sh 5'
+}
+
+# The original one-box run: everything in one compose project. Still the right shape for `single`.
+cmd_verify_single() {
+  local target="$1"
+  echo "== the compose fleet, then level 5 =="
+  lab_nest "$target"
+  lab_ssh "root@$target" 'set -eux
+    cd /opt/nuthatch-src
     mkdir -p .img && cp /usr/local/bin/nuthatch-scaled .img/nuthatch && cp Dockerfile .img/
     docker build -q -t nuthatch-scaled:lab .img
     NUTHATCH_IMAGE=nuthatch-scaled:lab docker compose -f docker-compose.scaled.yml --profile fleet up -d --scale writer=2 --scale fe=2
     for i in $(seq 1 30); do curl -fsS -m3 localhost:8290/health >/dev/null 2>&1 && break; sleep 2; done
+    sleep 20   # workers heartbeat on a timer; 5.1b fails if asserted too early
     docker compose -f docker-compose.scaled.yml --profile fleet ps -a --format "{{.Service}} {{.State}}"
     NUTHATCH=/usr/local/bin/nuthatch-scaled ./scripts/verify.sh 5'
 }
 
-# The two things a single host cannot fake. Both free - firewall rules and a clock.
 # Both of these used to *print* what to expect and leave the operator to squint at logs. That made
 # them unfalsifiable: run it, see no explosion, tick the box - in the one document whose entire job is
 # to be falsifiable. They now assert and exit non-zero, so "verified" means a machine checked it.
@@ -293,13 +396,34 @@ CONTROL_PORT="${CONTROL_PORT:-8290}"
 # Run a query on the control box's Postgres. The lab driver reaches it directly, so this keeps working
 # while a *writer* is partitioned from it - which is what lets us observe the writer during the cut.
 psql_cp() { # psql_cp <control-ip> <sql>
-  ssh -o StrictHostKeyChecking=no "root@$1" \
-    "docker compose -f docker-compose.scaled.yml exec -T postgres psql -U nuthatch -tAc \"$2\"" \
+  # `cd` first: compose resolves its file relative to the working directory, and ssh lands in $HOME.
+  # Without this the query failed silently - stderr is discarded here, so an empty result was
+  # indistinguishable from "nothing to report", and `set -e` turned the precondition check into an
+  # exit with no output at all. Diagnosing that cost more than the fix.
+  lab_ssh "root@$1" \
+    "cd /opt/nuthatch-src && docker compose -f docker-compose.scaled.yml exec -T postgres psql -U nuthatch -tAc \"$2\"" \
     2>/dev/null | tr -d '\r'
 }
 
 # The nest schema, discovered rather than assumed - `PgStore` creates one schema per nest.
-nest_schema() { psql_cp "$1" "select table_schema from information_schema.tables where table_name='meta' limit 1" | head -1; }
+# The schema that actually holds a **cursor** - the one with lease/progress rows.
+#
+# `PgStore` creates a schema per nest *and* per cursor, so several carry a `meta` table: a nest's own
+# schema records things like `block_timestamps`, while the cursor's records the lease and `last_block`.
+# Picking the first `meta` alphabetically found `nest_lab` and reported "no lease to observe" while a
+# lease was sitting in `nest_cursor_arbitrum_one`. Prefer a schema that has lease or progress rows,
+# and fall back to any `meta` so the error message stays about the missing data rather than the query.
+nest_schema() {
+  local s
+  s=$(psql_cp "$1" "select table_schema from information_schema.tables t where table_name='meta' and exists (select 1 from pg_catalog.pg_tables where schemaname=t.table_schema and tablename='meta') order by (table_schema like 'nest_cursor%') desc, table_schema limit 5" | head -5)
+  local pick
+  for pick in $s; do
+    if [ -n "$(psql_cp "$1" "select 1 from \"$pick\".meta where key in ('lease_owner','last_block') limit 1")" ]; then
+      echo "$pick"; return 0
+    fi
+  done
+  echo "$s" | head -1
+}
 
 meta_value() { # meta_value <control-ip> <schema> <key>
   psql_cp "$1" "select value from \\\"$2\\\".meta where key='$3'" | head -1
@@ -317,12 +441,12 @@ cmd_partition() {
   echo "last_block=$before; cutting writer $w off the control-plane API ($cp:$CONTROL_PORT) for 90s"
   echo "  (Postgres on :5432 stays reachable - this is a control-plane outage, not a store outage)"
 
-  ssh "root@$w" "iptables -I OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"
+  lab_ssh "root@$w" "iptables -I OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"
   # Heal on any exit, including Ctrl-C: a lab box left firewalled is a confusing bill later.
-  trap "ssh root@$w 'iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP' 2>/dev/null || true" EXIT
+  trap "lab_ssh root@$w 'iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP' 2>/dev/null || true" EXIT
   sleep 90
   local during; during=$(meta_value "$cp" "$sch" last_block)
-  ssh "root@$w" "iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"; trap - EXIT
+  lab_ssh "root@$w" "iptables -D OUTPUT -d $cp -p tcp --dport $CONTROL_PORT -j DROP"; trap - EXIT
   echo "healed. last_block during the cut: ${during:-none}"
 
   if [ -z "$during" ] || [ "$during" -le "$before" ]; then
@@ -359,12 +483,12 @@ cmd_skew() {
   echo "lease before: owner=$owner_before expires_at=$exp_before"
 
   echo "pushing writer $w's clock 10 minutes forward"
-  ssh "root@$w" 'timedatectl set-ntp false && date -s "+10 minutes" && date'
-  trap "ssh root@$w 'timedatectl set-ntp true' 2>/dev/null || true" EXIT
+  lab_ssh "root@$w" 'timedatectl set-ntp false && date -s "+10 minutes" && date'
+  trap "lab_ssh root@$w 'timedatectl set-ntp true' 2>/dev/null || true" EXIT
   sleep 60
   local owner_after; owner_after=$(meta_value "$cp" "$sch" lease_owner)
   local exp_after;   exp_after=$(meta_value "$cp" "$sch" lease_expires_at)
-  ssh "root@$w" 'timedatectl set-ntp true'; trap - EXIT
+  lab_ssh "root@$w" 'timedatectl set-ntp true'; trap - EXIT
   echo "lease after:  owner=${owner_after:-none} expires_at=${exp_after:-none}"
 
   if [ "$owner_before" != "$owner_after" ]; then

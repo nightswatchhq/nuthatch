@@ -1331,6 +1331,17 @@ async fn build_nest(
     };
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.
+    // Before anything reads `schema.json`: regenerate it if it is missing or stale. A hand-written
+    // `nuthatch.toml` produces no schema, and the failure is silent and expensive - the schema tool
+    // keeps recommending `{col}_dec` companions that the analytics layer never created (issue #241
+    // item 2). Cheap, idempotent, and preserves authored views.
+    match crate::project::refresh_stale_artifacts(&dir, config) {
+        Ok(Some(what)) => tracing::info!("{what}"),
+        Ok(None) => {}
+        // Never fatal: a nest that cannot regenerate its artifacts can still index, and refusing to
+        // start over a derived file would be a worse failure than the one being fixed.
+        Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
+    }
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
 
@@ -3601,7 +3612,9 @@ fn decode_window(
         if let Some(mut r) = decoded {
             r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
             if let Some(fs) = factory {
-                if let Some(child) = fs.discover(&r) {
+                // Every child this event announces, not just the first: one event may name several
+                // (issue #241).
+                for child in fs.discover(&r) {
                     if children.insert(child.clone()) {
                         tracing::info!(
                             "factory discovered {} child {}… at block {}",
@@ -3658,7 +3671,7 @@ fn rebuild_children(
             key(a).cmp(&key(b))
         });
         for v in &rows {
-            if let Some(child) = factory.discover_stored(&table, v) {
+            for child in factory.discover_stored(&table, v) {
                 children.insert(child);
             }
         }

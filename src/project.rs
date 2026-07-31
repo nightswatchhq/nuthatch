@@ -277,6 +277,45 @@ pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     Ok(())
 }
 
+/// Regenerate the derived artifacts **if they are missing or older than `nuthatch.toml`**, returning
+/// what it did so the caller can say so.
+///
+/// A hand-written `nuthatch.toml` has no `schema.json`, and the consequence is worse than a missing
+/// file: `schema.json` is what creates the derived `{col}_dec` columns, while the *advice* to use them
+/// comes from the live registry. So the schema tool confidently recommended `delta → delta_dec` on 196
+/// lines while **zero** `_dec` columns existed, and an agent following that advice got
+/// `Binder Error: Referenced column "delta_dec" not found` (issue #241 item 2).
+///
+/// The AI surface being confidently wrong is the most expensive place to be wrong, so this does not
+/// warn - it fixes. Regenerating is cheap, idempotent, and preserves authored views and semantic
+/// descriptions; `dev` already rebuilds the child registry on startup for the same reason.
+pub fn refresh_stale_artifacts(dir: &Path, config: &Config) -> Result<Option<String>> {
+    let schema = dir.join("schema.json");
+    let toml = dir.join(crate::config::CONFIG_FILE);
+    let why = if !schema.exists() {
+        "schema.json was missing"
+    } else {
+        // Compare mtimes. An unreadable timestamp on either side means "cannot prove it is fresh",
+        // and regenerating costs milliseconds - so the doubt resolves toward correctness.
+        let stale = match (
+            std::fs::metadata(&schema).and_then(|m| m.modified()),
+            std::fs::metadata(&toml).and_then(|m| m.modified()),
+        ) {
+            (Ok(s), Ok(t)) => s < t,
+            _ => true,
+        };
+        if !stale {
+            return Ok(None);
+        }
+        "schema.json was older than nuthatch.toml"
+    };
+    let n = write_nest_artifacts(dir, &config.nest.chain, config)?;
+    Ok(Some(format!(
+        "{why} - regenerated schema.json + AI surface ({n} table(s)). \
+         The `{{col}}_dec` companions the schema tool recommends come from this file."
+    )))
+}
+
 /// Build the registry from the vendored ABIs and (re)write the derived artifacts - `schema.json` and
 /// the AI surface (`llms.txt` + the scaffolded skill). One source of truth: `init` and `add` both
 /// call this so the artifacts never drift from `nuthatch.toml`. Returns the table count.
@@ -1280,5 +1319,110 @@ mod tests {
             "a wrong file must fail here, not silently become an empty registry"
         );
         assert!(read_local_abi(dir.path().join("nope.json").to_str().unwrap()).is_err());
+    }
+
+    /// **Issue #241 item 2.** A hand-written `nuthatch.toml` has no `schema.json`, and the schema tool
+    /// then recommends `{col}_dec` companions that do not exist - `Binder Error: Referenced column
+    /// "delta_dec" not found` for anyone (or any agent) that follows the advice.
+    ///
+    /// The advice comes from the live registry; the columns come from `schema.json`. They can only
+    /// agree if the file is there and current, so startup makes it so.
+    #[test]
+    fn a_missing_schema_is_regenerated_not_merely_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hand_authored_nest(dir.path());
+        assert!(!dir.path().join("schema.json").exists());
+
+        let cfg = Config::load(dir.path()).unwrap();
+        let what = refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        assert!(
+            what.as_deref().unwrap_or("").contains("was missing"),
+            "it must say what it did and why: {what:?}"
+        );
+        assert!(
+            dir.path().join("schema.json").exists(),
+            "the file the _dec columns come from must now exist"
+        );
+
+        // Idempotent: a second call finds nothing to do, so `dev` does not rewrite artifacts on every
+        // restart and churn anyone's git status.
+        assert_eq!(refresh_stale_artifacts(dir.path(), &cfg).unwrap(), None);
+    }
+
+    /// A schema older than the config is the subtler half: `add` a contract by hand, and the file
+    /// exists but describes the previous nest.
+    #[test]
+    fn a_schema_older_than_the_config_is_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hand_authored_nest(dir.path());
+        let cfg = Config::load(dir.path()).unwrap();
+        refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+
+        // Touch the config forward, which is what editing it does.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(crate::config::CONFIG_FILE))
+            .unwrap();
+        f.set_modified(later).unwrap();
+
+        let what = refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        assert!(
+            what.as_deref().unwrap_or("").contains("older than"),
+            "a stale schema must be refreshed, not just a missing one: {what:?}"
+        );
+    }
+
+    /// The regenerated schema must actually carry the big-int columns whose `_dec` companions the
+    /// advice promises - otherwise the file exists and the advice is still wrong, which is the failure
+    /// wearing a hat.
+    #[test]
+    fn the_regenerated_schema_carries_the_columns_the_advice_promises() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hand_authored_nest(dir.path());
+        let cfg = Config::load(dir.path()).unwrap();
+        refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cols: Vec<String> = v["tables"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "value"),
+            "the uint256 column must be described: {cols:?}"
+        );
+    }
+
+    /// A nest written by hand: config + ABI, no derived artifacts. Exactly the POA case from #241.
+    fn write_hand_authored_nest(dir: &Path) {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "hand"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+"#,
+        )
+        .unwrap();
     }
 }

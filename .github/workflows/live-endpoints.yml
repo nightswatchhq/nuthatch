@@ -1,0 +1,65 @@
+# Are the RPC endpoints we *ship* still able to serve a backfill?
+#
+# Everything else in CI tests our code. This tests the world our code depends on, because the built-in
+# endpoint lists in `src/chains.rs` are the zero-setup path - `init 0xAddr --chain mainnet && dev` uses
+# them, and the founding non-negotiable is a live indexed query in under two minutes with no
+# configuration. They are product surface that rots without anyone touching the repo.
+#
+# **This is not hypothetical.** On 2026-07-31 two of the four shipped mainnet defaults were dead:
+# `ethereum-rpc.publicnode.com` had moved archive requests behind a token (so it could not serve a
+# backfill at all, while being listed *first*), and `eth.llamarpc.com` was returning HTTP 521. The
+# comment beside them read "Verified to serve keyless eth_getLogs (2026-07)" - stale within the month.
+# Nothing in CI could have noticed, because nothing in CI talks to a real provider.
+#
+# Weekly, and on demand. Not on push: it is slow, it spends other people's quota, and a provider having
+# a bad afternoon must never redden an unrelated PR.
+name: live endpoints
+
+on:
+  schedule:
+    # Monday morning. A week is short enough to catch a policy change before someone hits it, and long
+    # enough that we are not hammering free tiers we do not pay for.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: shipped defaults can still backfill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build doctor
+        run: cargo build --release --bin nuthatch
+
+      # The check that matters is **address-filtered getLogs a few thousand blocks behind tip** - the
+      # smallest request a real backfill makes. A tip-only probe passes on endpoints that cannot
+      # backfill, which is precisely how the July regression went unnoticed.
+      - name: probe every shipped default
+        run: |
+          set -uo pipefail
+          fail=0
+          probe() {  # probe <chain> <busy-contract>
+            echo "== $1 =="
+            ./target/release/nuthatch doctor --dir . --rpc "$3" --address "$2" 2>&1 | tee /tmp/out
+            # `doctor` reports rather than judges, so the gate is here: an endpoint that cannot serve a
+            # windowed getLogs cannot serve a backfill, whatever else it does well.
+            if grep -q "getLogs window   FAILED" /tmp/out; then
+              echo "::error::$3 cannot serve getLogs - it cannot back a zero-setup nest"
+              fail=1
+            fi
+          }
+          # Contracts chosen for being busy on each chain, so a window that works here works generally.
+          for u in https://eth-pokt.nodies.app https://eth.drpc.org https://eth.api.onfinality.io/public; do
+            probe mainnet 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 "$u"
+          done
+          for u in https://arb1.arbitrum.io/rpc https://arbitrum.drpc.org https://arb-pokt.nodies.app; do
+            probe arbitrum-one 0xaf88d065e77c8cC2239327C5EDb3A432268e5831 "$u"
+          done
+          for u in https://mainnet.base.org https://base.drpc.org https://base-pokt.nodies.app; do
+            probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
+          done
+          # Deliberately fails the job rather than warning. A dead default is a broken promise for
+          # every new user of that chain, and a warning nobody reads is how this one survived a month.
+          exit $fail
