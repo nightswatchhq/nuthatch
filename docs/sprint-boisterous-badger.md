@@ -128,14 +128,40 @@ Cloud items come up together and go down together rather than billing while some
 
 | # | Item | Needs | Spend | Gate |
 |---|---|---|---|---|
-| 1 | **0.9.0** - RFC-0029 complete | the timestamped A/B to finish | none | in flight |
+| 1 | ~~**0.9.0**~~ **done** - RFC-0029 complete | - | - | shipped, plus 0.9.1 and 0.9.2 |
 | 2 | ~~**RFC-0022 slice 3b**~~ **done** (2026-07-31) | - | - | FE mount is `:ro` again |
 | 3 | **Multi-machine verification** | 3 Cloud boxes | ~EUR 0.03/hr | the **last unverified claim** in prod-readiness §11 |
 | 4 | **RFC-0013** - DataFusion | one `ccx63`, hourly | ~EUR 0.30/hr | **the benchmark is the deliverable** |
-| 5 | **RFC-0023 tier 3** | an archive RPC (have one) | none | acceptance test already written |
+| 5 | **RFC-0023 tier 3** - foundation **done** (2026-07-31) | - | - | pinned call + content-addressing + acceptance test **against the real chain**; scheduling/sealing still to come |
 | 6 | **GraphOps** | a conversation | none | cheapest item; may reorder 3-5 |
 
-### The quality track (runs alongside 1-6, not after)
+#### 2026-07-31: a release that described a fix it did not contain
+
+Worth recording in the plan rather than only in a release note, because it changed how releases are cut
+here.
+
+**v0.9.1 shipped notes for a source fix that was not in the binary.** PR #233 was titled "timestamp
+batches narrow on a size failure instead of retrying" and merged with `ci.yml`, `Cargo.lock` and two
+docs files - **no `src/rpc.rs`**. A `git stash` run while switching branches removed the fix *and its
+test*; what remained was committed without the file list being checked. 0.9.2 corrects it.
+
+**CI was green throughout and proved nothing**, because the test that would have failed was in the same
+uncommitted file as the fix. Every check ran against a codebase consistent with neither existing. *A
+green pipeline is only evidence about the code that reached it.*
+
+Two practices, now standing:
+
+- **Verify a release against `git show --stat` for its range, checked against the notes** - not against
+  what the commit messages intend to say. Notes claiming an RPC fix with no `src/` file in the diff is
+  the entire tell, and it takes seconds.
+- **Never `git stash` mid-task; commit to a WIP branch.** This is the mirror of the `git add -A` lesson
+  already recorded - that one silently *adds* work, this one silently *removes* it.
+
+The same day produced a smaller instance of the same class: a `clippy` type-complexity fix whose edit
+script failed its assertion, leaving the warning in place. `grep -c` reported a nonzero count and it was
+not acted on; CI caught it. **A nonzero warning count is a stop, not a note.**
+
+## The quality track (runs alongside 1-6, not after)
 
 Closing RFCs is not the same as being ready to call something 1.0, and this is the half that decides
 it. These are **not** gated on anything and should be interleaved with the items above rather than
