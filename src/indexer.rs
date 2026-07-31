@@ -1331,6 +1331,17 @@ async fn build_nest(
     };
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.
+    // Before anything reads `schema.json`: regenerate it if it is missing or stale. A hand-written
+    // `nuthatch.toml` produces no schema, and the failure is silent and expensive - the schema tool
+    // keeps recommending `{col}_dec` companions that the analytics layer never created (issue #241
+    // item 2). Cheap, idempotent, and preserves authored views.
+    match crate::project::refresh_stale_artifacts(&dir, config) {
+        Ok(Some(what)) => tracing::info!("{what}"),
+        Ok(None) => {}
+        // Never fatal: a nest that cannot regenerate its artifacts can still index, and refusing to
+        // start over a derived file would be a worse failure than the one being fixed.
+        Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
+    }
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
 
