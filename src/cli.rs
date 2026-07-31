@@ -762,6 +762,15 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 2048)]
     pub budget_mb: u64,
 
+    /// Where to find the nests this worker is asked to index. `<root>/<name>` if that exists, else
+    /// `<root>` itself when it is a single nest - which is what the compose topology mounts.
+    ///
+    /// A worker can only index a nest it can *locate*, and the control plane records only
+    /// `(name, chain, estimated_rss_mb)`. Pulling bundles from the registry (RFC-0019) is the intended
+    /// source and is not built; until then the operator places nests on the machine.
+    #[arg(long, default_value = "/nest")]
+    pub nest_root: String,
+
     /// Skip fetching runtime secrets for assigned nests (RFC-0022 §5).
     #[arg(long)]
     pub no_secrets: bool,

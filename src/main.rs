@@ -41,7 +41,15 @@ async fn main() -> Result<()> {
             };
             let cp = nuthatch::controlplane::ControlPlane::connect(&args.control_db)?;
             let hosts = nuthatch::worker::Hosts::from_chains(&args.hot_store, &args.chains)?;
-            nuthatch::worker::run(cp, hosts, &id, args.budget_mb, !args.no_secrets).await
+            nuthatch::worker::run(
+                cp,
+                hosts,
+                &id,
+                args.budget_mb,
+                !args.no_secrets,
+                std::path::PathBuf::from(&args.nest_root),
+            )
+            .await
         }
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Worker(_) => anyhow::bail!(

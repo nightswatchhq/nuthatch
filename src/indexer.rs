@@ -442,6 +442,56 @@ pub async fn spawn_nest(
     })
 }
 
+/// Spawn a nest against an **externally owned hot store** - the writer-pool path (RFC-0022, issue
+/// #250).
+///
+/// Identical to [`spawn_nest`] except the store is supplied rather than opened locally, which is what
+/// makes a worker on one machine index into a Postgres on another. RFC-0022 slice 3b is what allows
+/// it: `build_nest` resolves the store once, so nothing downstream knows or cares which backend it got.
+///
+/// **This is the half of the writer pool that was missing.** `worker::run` acquired cursors and never
+/// called anything like this, so a worker held a lease and indexed nothing - the control plane worked
+/// and the writer pool did not write.
+///
+/// The returned handle is the caller's to abort. A worker **must** abort it when its lease is lost:
+/// the store's fence already refuses writes from a stale holder, so nothing can corrupt, but a task
+/// grinding through RPC for a cursor it no longer owns is pure waste and confusing in logs.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_nest_on_store(
+    source: Arc<dyn Source>,
+    dir: PathBuf,
+    config: Config,
+    store: Arc<dyn crate::store::HotStore>,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+) -> Result<NestRuntime> {
+    let (nest, state, alert_worker, window) = build_nest(
+        &source,
+        dir,
+        &config,
+        None,
+        // A writer owns no admin surface: it serves nothing, and the FE tier is what operators reach.
+        false,
+        None,
+        Some(store),
+    )
+    .await?;
+    let ingest = tokio::spawn(index_loop(
+        source,
+        nest,
+        backfill,
+        seal_direct,
+        concurrency,
+        window,
+    ));
+    Ok(NestRuntime {
+        state,
+        ingest,
+        alert_worker,
+    })
+}
+
 /// Case-insensitive membership: is `addr` in `addresses`? The demux + dedup primitive - a provider may
 /// return checksummed addresses while our filter list is lowercase hex, so never compare raw.
 fn addr_in(addresses: &[String], addr: &str) -> bool {
