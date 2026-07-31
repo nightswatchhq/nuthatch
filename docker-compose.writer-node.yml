@@ -1,0 +1,44 @@
+# A **writer node**: one or more workers on a machine that holds no database and no control plane.
+#
+# `docker-compose.scaled.yml` describes the whole scaled topology on one host, which is the right
+# shape for development and for the compose-fleet CI job. It cannot describe a *distributed* fleet,
+# because its `writer` service `depends_on: postgres` - naming that service on a remote box would
+# start a second, empty database beside the worker and point it at itself.
+#
+# This file is the remote half. It carries the writer and nothing else, and takes the store's address
+# from the environment rather than from a compose service name.
+#
+#   CONTROL_HOST=10.44.1.1 \
+#   docker compose -f docker-compose.writer-node.yml up -d --scale writer=2
+#
+# **Why this is not just an override file.** A `-f a.yml -f b.yml` merge would still inherit
+# `depends_on`, and compose has no syntax for removing one. Being a separate file is what makes "this
+# machine runs workers and nothing else" true by construction rather than by careful merging.
+#
+# The credentials here are the development defaults from `docker-compose.scaled.yml`. They are
+# adequate for a closed private network - which is what the lab uses - and inadequate for anything
+# else. See `docs/operators.md` before pointing this at a store you care about.
+
+services:
+  writer:
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nightswatchhq/nuthatch:0.9.2-scaled}
+    # No `depends_on`: the store lives on another machine and its readiness is not this host's to
+    # judge. A worker that starts before the control plane is reachable retries - that is the
+    # reconcile loop's job, and it is precisely the behaviour the partition test exercises.
+    #
+    # `CONTROL_HOST` is the control box's **private** address. It is required rather than defaulted:
+    # a default of `localhost` would silently produce a worker that connects to nothing on a machine
+    # with no database, and the failure would look like a network problem rather than a missing
+    # variable.
+    command: >-
+      worker
+      --control-db postgres://nuthatch:nuthatch@${CONTROL_HOST:?set CONTROL_HOST to the control box private ip}:5433/nuthatch
+      --hot-store postgres://nuthatch:nuthatch@${CONTROL_HOST}:5433/nuthatch
+      --chains ${CHAINS:-arbitrum-one}
+      --budget-mb ${BUDGET_MB:-2048}
+    volumes:
+      # Read-only: a writer reads the nest's config and ABIs and writes only to the shared store.
+      # Anything that needs this writable is a local-file dependency that should not exist here (see
+      # RFC-0022 slice 3b, which removed the last one on the serving side).
+      - ./nest:/nest:ro
+    restart: unless-stopped

@@ -52,8 +52,14 @@ services:
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     # 5433 on the host: a developer running the parity suite very likely has a local Postgres on
     # 5432, and silently connecting to *that* would create schemas in someone's real database.
+    #
+    # `PG_BIND` defaults to **127.0.0.1** and should stay that way on any machine you do not control
+    # the network of - the credentials in this file are `nuthatch:nuthatch`. The multi-machine lab
+    # overrides it with the control box's **private** address so remote writers can reach the store;
+    # that is a closed 10.44.0.0/16 network, not the internet. Setting this to 0.0.0.0 publishes an
+    # unauthenticated-in-practice database to the world.
     ports:
-      - "127.0.0.1:5433:5432"
+      - "${PG_BIND:-127.0.0.1}:5433:5432"
     volumes:
       - nuthatch-pg:/var/lib/postgresql/data
     healthcheck:
@@ -84,8 +90,10 @@ services:
       #
       # This is a **development default**. Change it, or pass it in from your own environment.
       NUTHATCH_CONTROL_TOKEN: "${NUTHATCH_CONTROL_TOKEN:-dev-token-change-me}"
+    # `CONTROL_BIND` defaults to 127.0.0.1 - see `PG_BIND` above. Binding this off-localhost without
+    # `NUTHATCH_CONTROL_TOKEN` set is refused by the binary itself, which is the guard that matters.
     ports:
-      - "127.0.0.1:8290:8290"
+      - "${CONTROL_BIND:-127.0.0.1}:8290:8290"
 
   # The writer pool: owns cursors, ingests, seals.
   #
