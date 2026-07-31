@@ -756,4 +756,57 @@ abi = "abis/c.json"
             .all(|f| f.path != DB_FILE && !f.path.starts_with("segments/")));
         assert_eq!(m.files.len(), 3, "still just the 3 authored inputs");
     }
+
+    /// **A malicious bundle cannot escape its destination through a symlink.**
+    ///
+    /// `checked_join` is lexical: it rejects `..` and absolute paths in *manifest-declared* names and
+    /// cannot see a symlink at all. A bundle is fetched from a URL (`nest load https://…`), so its tar
+    /// is untrusted, and the classic attack is a symlink entry followed by a file entry written
+    /// *through* it.
+    ///
+    /// We are safe because `tar-rs` refuses the second write - not because of anything in this file.
+    /// That is a dependency's guarantee, which is exactly the kind that disappears in a version bump
+    /// or when someone reaches for `set_overwrite`. Pinned here so it fails loudly if it ever does.
+    #[test]
+    fn a_bundle_cannot_escape_its_destination_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), b"original").unwrap();
+
+        let bundle = tmp.path().join("evil.tar");
+        {
+            let f = std::fs::File::create(&bundle).unwrap();
+            let mut ar = tar::Builder::new(f);
+            // 1. a symlink that points out of the destination
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            ar.append_link(&mut h.clone(), "escape", "../outside")
+                .unwrap();
+            // 2. a regular file written *through* it
+            let data = b"PWNED";
+            let mut h2 = tar::Header::new_gnu();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            ar.append_data(&mut h2, "escape/victim.txt", &data[..])
+                .unwrap();
+            ar.finish().unwrap();
+        }
+
+        let dest = tmp.path().join("unpacked");
+        let r = extract_bundle(&bundle, &dest);
+        let victim = std::fs::read_to_string(outside.join("victim.txt")).unwrap_or_default();
+        assert!(
+            r.is_err(),
+            "unpacking a symlink-escape bundle must fail, not silently write outside"
+        );
+        assert_eq!(
+            victim, "original",
+            "a bundle wrote through a symlink and escaped its destination"
+        );
+    }
 }
