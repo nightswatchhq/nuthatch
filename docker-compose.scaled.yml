@@ -128,15 +128,18 @@ services:
     command: >-
       serve --dir /nest --listen 0.0.0.0:8288
       --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
-    # **Not** read-only, though it ought to be. An earlier version mounted `:ro` on the principle that
-    # an FE has no business writing to a nest directory - and the FE then failed to start with
-    # `Read-only file system (os error 30)`, because it still opens the nest's local redb at startup to
-    # rebuild its serving views. That is the known limitation recorded in RFC-0022 slice 3, and slice 3b
-    # (moving the view rebuilds onto the `HotStore` trait) is what makes `:ro` possible.
+    # **Read-only, and it must stay that way.** An FE owns no cursor and has no business writing to a
+    # nest directory; `:ro` is what makes that structural instead of merely intended.
     #
-    # Restore `:ro` when 3b lands - it is a guard worth having, and this comment is the reminder.
+    # It could not be `:ro` before RFC-0022 **slice 3b**: `build_nest` opened the nest's local redb
+    # unconditionally - even when handed a `store_override` pointing at the shared Postgres - so an FE
+    # created a redb file it never read and died with `Read-only file system (os error 30)`. Slice 3b
+    # resolves the hot store once, so nothing downstream knows or cares which backend it got.
+    #
+    # If this ever needs to become writable again, something has reintroduced a local-file dependency
+    # on the read path. Fix that instead.
     volumes:
-      - ./nest:/nest
+      - ./nest:/nest:ro
     ports:
       - "127.0.0.1:8289-8299:8288"
 

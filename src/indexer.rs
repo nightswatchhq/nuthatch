@@ -1313,14 +1313,26 @@ async fn build_nest(
         );
     }
 
-    // The concrete redb handle is still needed by the view rebuilds below, which take `&Store`; the
-    // override only replaces what the ingest and serving sides *hold*. Slice 3b moves the rebuild
-    // helpers onto the trait so an FE never touches a local file at all.
-    let store = Store::open(&dir.join(DB_FILE))?;
+    // **RFC-0022 slice 3b.** The hot store is resolved once, here, and nothing below this line knows
+    // whether it is a local redb or a shared Postgres.
+    //
+    // It used to `Store::open` unconditionally *and* pass the concrete handle to the view rebuilds -
+    // so a query-FE, which is handed a `store_override` and owns no cursor, still created and opened a
+    // redb file in the nest directory it had no business writing to. That is why the compose FE mount
+    // could not be `:ro`: it failed with `Read-only file system (os error 30)` before serving a single
+    // request. The rebuild helpers already took `&dyn HotStore`; only this call site was concrete.
+    //
+    // One `Arc` per nest, shared by the ingest side and the serving side. They must be the *same*
+    // handle - a second `Store::open` on the same file would be a second writer, which the trait's
+    // contract forbids.
+    let store: Arc<dyn crate::store::HotStore> = match store_override {
+        Some(s) => s,
+        None => Arc::new(Store::open(&dir.join(DB_FILE))?),
+    };
     // The decode registry drives all contracts; the indexer decodes every declared event of every
     // contract in the nest into per-table rows.
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
-    guard_timestamp_policy(&store, config.nest.block_timestamps)?;
+    guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -1364,14 +1376,14 @@ async fn build_nest(
     // Warm restart: the derived views (balances, exposure, velocity) aren't persisted, so rebuild
     // them from stored facts before serving or ingesting. Cold start → nothing stored → no-op.
     if store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-        if let Err(e) = rebuild_balances(&dir, &store, &registry, &balances) {
+        if let Err(e) = rebuild_balances(&dir, store.as_ref(), &registry, &balances) {
             tracing::warn!("balance view rebuild failed (will re-derive as it indexes): {e:#}");
         }
-        if let Err(e) = rebuild_exposure(&dir, &store, &registry, &labels, &exposure) {
+        if let Err(e) = rebuild_exposure(&dir, store.as_ref(), &registry, &labels, &exposure) {
             tracing::warn!("exposure view rebuild failed (will re-derive as it indexes): {e:#}");
         }
         if let Some((_, w)) = velocity_cfg {
-            if let Err(e) = rebuild_velocity(&dir, &store, &registry, w, &velocity) {
+            if let Err(e) = rebuild_velocity(&dir, store.as_ref(), &registry, w, &velocity) {
                 tracing::warn!(
                     "velocity view rebuild failed (will re-derive as it indexes): {e:#}"
                 );
@@ -1477,13 +1489,7 @@ async fn build_nest(
     // nests from one cursor (RFC-0012). `source` stays shared and borrowed, not owned; `children`
     // starts empty (it is rebuilt/grown by `prepare`). The view handles are cloned here and shared
     // with the `AppState` below - the API must see the same views the loop feeds.
-    // One `Arc` per nest, shared by the ingest side and the serving side. They must be the *same*
-    // handle: a second `Store::open` on the same file would be a second writer, which the trait's
-    // contract forbids.
-    let shared_store: Arc<dyn crate::store::HotStore> = match store_override {
-        Some(s) => s,
-        None => Arc::new(store.clone()),
-    };
+    let shared_store = store.clone();
     let nest = NestIngest {
         name: config.nest.name.clone(),
         dir: dir.clone(),
@@ -1683,7 +1689,7 @@ const FACTORY_FLIP_THRESHOLD: usize = 500;
 /// which is correct because before this existed every nest indexed timestamps and the default is
 /// `true`. A pre-existing nest that *declares* `false` is the one case worth catching, and the
 /// `has_indexed` check below is what catches it: an empty store has nothing to contradict.
-fn guard_timestamp_policy(store: &Store, declared: bool) -> Result<()> {
+fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) -> Result<()> {
     let want = if declared { "1" } else { "0" };
     match store.get_meta(TIMESTAMPS_KEY)? {
         Some(found) if found != want => {
