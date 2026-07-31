@@ -49,14 +49,32 @@ need curl; need python3; need ssh
 
 : "${HCLOUD_TOKEN:?set HCLOUD_TOKEN to a Hetzner Cloud API token}"
 
+# `curl -f` makes a 4xx exit non-zero but **discards the response body**, which is where Hetzner puts
+# the reason. A malformed request therefore surfaced as `curl: (56)` followed by a JSON decode
+# traceback from whatever tried to parse the empty output - which is how a 422 on the `networks` field
+# went undiagnosed. Keep the body, print it, and fail.
 hc() { # hc METHOD PATH [json]
-  local m="$1" p="$2" body="${3:-}"
+  local m="$1" p="$2" body="${3:-}" out code
   if [ -n "$body" ]; then
-    curl -fsS -X "$m" "$API$p" -H "Authorization: Bearer $HCLOUD_TOKEN" \
-      -H 'Content-Type: application/json' -d "$body"
+    out=$(curl -sS -w '\n%{http_code}' -X "$m" "$API$p" -H "Authorization: Bearer $HCLOUD_TOKEN" \
+      -H 'Content-Type: application/json' -d "$body")
   else
-    curl -fsS -X "$m" "$API$p" -H "Authorization: Bearer $HCLOUD_TOKEN"
+    out=$(curl -sS -w '\n%{http_code}' -X "$m" "$API$p" -H "Authorization: Bearer $HCLOUD_TOKEN")
   fi
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  case "$code" in
+    2*) printf '%s' "$out" ;;
+    *)  echo "hetzner API $m $p -> HTTP $code" >&2
+        echo "$out" | python3 -c 'import sys,json
+try:
+    e = json.load(sys.stdin).get("error", {})
+    print(f"  {e.get(\"code\",\"?\")}: {e.get(\"message\",\"?\")}", file=sys.stderr)
+    for d in (e.get("details") or {}).get("fields", []):
+        print(f"  field {d.get(\"name\")}: {d.get(\"messages\")}", file=sys.stderr)
+except Exception:
+    print("  " + sys.stdin.read()[:300], file=sys.stderr)' 2>/dev/null || echo "  $out" >&2
+        return 1 ;;
+  esac
 }
 jq_() { python3 -c 'import sys,json;d=json.load(sys.stdin)
 for k in sys.argv[1].split("."):
@@ -170,9 +188,12 @@ TXT
       | jq_ network.id)
     echo "  network $net"
     echo "creating three boxes…"
-    create_server "$LABEL-cp"      "$TYPE_SMALL"  control "{\"network\":$net}" >/dev/null
-    create_server "$LABEL-writer1" "$TYPE_WRITER" writer  "{\"network\":$net}" >/dev/null
-    create_server "$LABEL-writer2" "$TYPE_WRITER" writer  "{\"network\":$net}" >/dev/null
+    # A bare network **id**, not `{"network": id}`. Hetzner's POST /servers takes `networks` as an
+    # array of ids; an array of objects is a 422, which is what this passed for as long as the `multi`
+    # shape went unrun. That is the whole reason it went unnoticed - `single` never touches this path.
+    create_server "$LABEL-cp"      "$TYPE_SMALL"  control "$net" >/dev/null
+    create_server "$LABEL-writer1" "$TYPE_WRITER" writer  "$net" >/dev/null
+    create_server "$LABEL-writer2" "$TYPE_WRITER" writer  "$net" >/dev/null
     ips_by_role | while read -r _ ip _; do wait_ready "$ip"; done
   fi
   echo; echo "hosts:"; ips_by_role | sed 's/^/  /'
