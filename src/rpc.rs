@@ -16,6 +16,11 @@ const TIMESTAMP_ATTEMPTS: usize = 4;
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// Return type of the self-recursive [`RpcClient::eth_call_batch_at`]. Boxed because an `async fn`
+/// cannot recurse into itself without a heap indirection.
+type CallBatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Option<String>>>> + Send + 'a>>;
+
 /// How many block timestamps to remember (RFC-0029 §6d). Timestamps are 16 bytes of map entry each, so
 /// this is a few hundred KB - trivial next to the requests it removes on retry and split-and-retry,
 /// where we currently re-fetch every timestamp in a range we just split.
@@ -717,8 +722,7 @@ impl RpcClient {
         &'a self,
         calls: &'a [(String, String)],
         block: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Option<String>>>> + Send + 'a>>
-    {
+    ) -> CallBatchFuture<'a> {
         Box::pin(async move {
             if calls.is_empty() {
                 return Ok(Vec::new());
