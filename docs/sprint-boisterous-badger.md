@@ -130,7 +130,7 @@ Cloud items come up together and go down together rather than billing while some
 |---|---|---|---|---|
 | 1 | ~~**0.9.0**~~ **done** - RFC-0029 complete | - | - | shipped, plus 0.9.1 and 0.9.2 |
 | 2 | ~~**RFC-0022 slice 3b**~~ **done** (2026-07-31) | - | - | FE mount is `:ro` again |
-| 3 | **Multi-machine verification** - **mis-scoped** | 3 Cloud boxes **+ a build** | ~EUR 0.03/hr | see below: the harness distributes nothing, so this is a build item, not a run item |
+| 3 | **Multi-machine verification** - **built, partly proven** | 3 Cloud boxes | ~EUR 0.03/hr | the lab distributes now; **skew PASSED across machines**, `partition` still blocked on issue #250 |
 | 4 | **RFC-0013** - DataFusion | one `ccx63`, hourly | ~EUR 0.30/hr | **the benchmark is the deliverable** |
 | 5 | **RFC-0023 tier 3** - foundation **done** (2026-07-31) | - | - | pinned call + content-addressing + acceptance test **against the real chain**; scheduling/sealing still to come |
 | 6 | **GraphOps** | a conversation | none | cheapest item; may reorder 3-5 |
@@ -161,7 +161,14 @@ The same day produced a smaller instance of the same class: a `clippy` type-comp
 script failed its assertion, leaving the warning in place. `grep -c` reported a nonzero count and it was
 not acted on; CI caught it. **A nonzero warning count is a stop, not a note.**
 
-### 2026-07-31: item 3 was mis-scoped - multi-machine verification is unbuilt
+### 2026-07-31: item 3 was mis-scoped, then built the same day
+
+**Resolved.** The lab now genuinely distributes - control plane and store on one box, workers on their
+own, reaching it over a private network - and **the clock-skew invariant PASSED across machines**: a
+worker's clock moved 10 minutes and its lease expiry moved 66 s on the *database's* clock. `partition`
+remains blocked, on issue #250 rather than on the harness.
+
+The account below is kept because the diagnosis is the useful part:
 
 Standing the lab up turned a one-hour run into a build item, and the plan was wrong about it in the
 same way two other entries in this sprint were.
