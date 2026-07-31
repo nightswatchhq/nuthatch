@@ -879,13 +879,61 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// you chose to consume; it runs read-only in this ephemeral in-memory DuckDB, same trust as `/sql`.
 fn define_nest_views(conn: &Connection, dir: &Path) {
     for v in nest_view_files(dir) {
-        if let Err(e) = conn.execute_batch(&v.sql) {
-            // Fault-isolated on the *live* query path: one bad view never takes down the others or the
-            // process. Silence ends elsewhere - `validate_nest_views` (RFC-0018 §1) is the loud gate,
-            // surfaced at `dev` startup and by `nuthatch check`. Here we only need to not crash.
-            tracing::debug!("nest view {} skipped: {e}", v.file);
+        // **Per statement, not per file** (issue #241 item 4). `execute_batch` runs the whole file as
+        // one unit, so a single view referencing a table that has never fired - `TaskCancelled`, a
+        // module deployed but not yet used - took down *every* view in that file, including the ones
+        // that would have worked. The reported workaround was commenting out correct views and
+        // uncommenting them once the event fired, which is a poor trade for a fault-isolation gain
+        // that was never needed at this granularity.
+        for stmt in split_sql_statements(&v.sql) {
+            if let Err(e) = conn.execute_batch(&stmt) {
+                tracing::debug!("nest view {} statement skipped: {e}", v.file);
+            }
         }
     }
+}
+
+/// Split authored SQL into individual statements on top-level `;`.
+///
+/// Deliberately small rather than a parser: it tracks single-quoted strings, double-quoted
+/// identifiers, and `--` line comments, which is everything a `;` can hide behind in the SQL a nest
+/// authors. A dollar-quoted body would defeat it - DuckDB has no such syntax, and if that changes this
+/// is the function to revisit rather than a mystery to debug.
+pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut in_s, mut in_d, mut in_c) = (false, false, false);
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_c {
+            if c == '\n' {
+                in_c = false;
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '-' if !in_s && !in_d && chars.peek() == Some(&'-') => {
+                in_c = true;
+                continue;
+            }
+            '\'' if !in_d => in_s = !in_s,
+            '"' if !in_s => in_d = !in_d,
+            ';' if !in_s && !in_d => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
 }
 
 /// One authored view file: its basename (`10-recipients.sql`) and SQL, in load order.
@@ -951,17 +999,58 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
 
     let mut issues = Vec::new();
     for v in &files {
-        if let Err(e) = conn.execute_batch(&v.sql) {
-            let error = format!("{e}");
-            let hint = crate::sql_errors::enrich(&error, &v.sql, schema);
-            issues.push(ViewIssue {
-                file: v.file.clone(),
-                error,
-                hint,
-            });
+        // Per statement, matching the live loader - and **every** failure in the file, not the first.
+        // `execute_batch` stops at the first error, so a file referencing three tables that have never
+        // fired reported one, sent the author to fix it, and revealed the next on the following run
+        // (issue #241 item 4: "fix → restart → next error → repeat"). The whole set is known here in
+        // one pass; withholding it is a choice, and a bad one.
+        let mut errors: Vec<String> = Vec::new();
+        for stmt in split_sql_statements(&v.sql) {
+            if let Err(e) = conn.execute_batch(&stmt) {
+                errors.push(format!("{e}"));
+            }
         }
+        if errors.is_empty() {
+            continue;
+        }
+        // Lead with the missing tables, collected across every failing statement and deduplicated -
+        // that list is the actual work item, and it is what the author would otherwise assemble by
+        // hand over several restarts.
+        let mut missing: Vec<String> = errors
+            .iter()
+            .filter_map(|e| missing_table_of(e))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        missing.dedup();
+        let error = if missing.len() > 1 {
+            format!(
+                "{} statement(s) failed; unresolved tables: {}",
+                errors.len(),
+                missing.join(", ")
+            )
+        } else {
+            errors.join("; ")
+        };
+        let hint = crate::sql_errors::enrich(&errors[0], &v.sql, schema);
+        issues.push(ViewIssue {
+            file: v.file.clone(),
+            error,
+            hint,
+        });
     }
     issues
+}
+
+/// The table name out of a DuckDB catalog error, if that is what this is.
+///
+/// Format-dependent by necessity - DuckDB gives no structured error code for it - so it fails soft:
+/// an unrecognised message simply yields `None` and the raw error is reported instead of a
+/// half-parsed one.
+fn missing_table_of(err: &str) -> Option<String> {
+    let after = err.split("Table with name ").nth(1)?;
+    let name = after.split_whitespace().next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// (table, [(column, storage)]) for every declared table, from the nest's `schema.json`. Empty if
@@ -2083,6 +2172,110 @@ template="pool"
         );
     }
 
+    /// **Issue #241 item 4.** One view referencing a table that has never fired must not take down the
+    /// *other* views in the same file.
+    ///
+    /// The reported case: `TaskCancelled` and a deployed-but-unused voting module. Both views were
+    /// correct, just premature, and the workaround was commenting them out with a note to uncomment
+    /// when the event fires - which is a poor trade for fault isolation nobody needed at file
+    /// granularity.
+    #[test]
+    fn one_premature_view_does_not_kill_the_others_in_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        // Statement 2 references a table this nest never declares. Statements 1 and 3 are fine.
+        std::fs::write(
+            dir.path().join("views/10-mixed.sql"),
+            "CREATE VIEW ok_one AS SELECT block_number FROM tok__transfer;\n\
+             CREATE VIEW premature AS SELECT * FROM task__cancelled;\n\
+             CREATE VIEW ok_two AS SELECT value_dec FROM tok__transfer;",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let empty = HotRows::new();
+        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_nest_views(&conn, dir.path());
+
+        for v in ["ok_one", "ok_two"] {
+            conn.query_row(&format!("SELECT count(*) FROM {v}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|e| panic!("{v} must exist despite a sibling statement failing: {e}"));
+        }
+        assert!(
+            conn.query_row("SELECT count(*) FROM premature", [], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "the genuinely-unresolvable view is still absent, which is correct"
+        );
+    }
+
+    /// And the gate reports **every** unresolved table at once, rather than sending the author round
+    /// a fix-restart-next-error loop.
+    #[test]
+    fn validation_names_all_the_missing_tables_not_just_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-three.sql"),
+            "CREATE VIEW a AS SELECT * FROM alpha__one;\n\
+             CREATE VIEW b AS SELECT * FROM beta__two;\n\
+             CREATE VIEW c AS SELECT * FROM gamma__three;",
+        )
+        .unwrap();
+
+        let issues = validate_nest_views(dir.path(), &[]);
+        assert_eq!(issues.len(), 1, "one file, one issue");
+        let e = &issues[0].error;
+        for t in ["alpha__one", "beta__two", "gamma__three"] {
+            assert!(e.contains(t), "every unresolved table must be named: {e}");
+        }
+        // …and as a *summary*, not three concatenated catalog errors. The author needs the work item
+        // ("these three tables are missing"), not three copies of DuckDB explaining what a catalog is.
+        // Asserted explicitly because a plain join of the errors also happens to contain all three
+        // names - so without this the summary formatting was untested and a mutation of it survived.
+        assert!(
+            e.contains("unresolved tables:"),
+            "the message must summarise, not concatenate: {e}"
+        );
+        assert!(
+            e.contains("3 statement(s) failed"),
+            "it must say how many statements failed: {e}"
+        );
+    }
+
+    /// The splitter must not break on a `;` inside a string or a quoted identifier - splitting there
+    /// would mangle correct SQL into two invalid halves, turning a working view into a failure.
+    #[test]
+    fn semicolons_inside_literals_do_not_split_a_statement() {
+        let one = split_sql_statements("CREATE VIEW v AS SELECT 'a;b' AS x;");
+        assert_eq!(one.len(), 1, "a quoted `;` is not a separator: {one:?}");
+
+        let ident = split_sql_statements("CREATE VIEW \"odd;name\" AS SELECT 1;");
+        assert_eq!(
+            ident.len(),
+            1,
+            "a quoted identifier is not a separator: {ident:?}"
+        );
+
+        let commented = split_sql_statements("SELECT 1; -- trailing ; in a comment\nSELECT 2;");
+        assert_eq!(
+            commented.len(),
+            2,
+            "a `;` in a comment is not a separator: {commented:?}"
+        );
+
+        let two = split_sql_statements("SELECT 1;\nSELECT 2;");
+        assert_eq!(two.len(), 2);
+    }
+
     /// **A quoted function name evaded the `/sql` denylist and read arbitrary files.**
     ///
     /// Found in the pre-1.0 adversary pass. `reject_file_access` matched a forbidden name only when the
@@ -2133,4 +2326,5 @@ template="pool"
             assert!(reject_replacement_scan(q).is_ok(), "must be allowed: {q}");
         }
     }
+
 }
