@@ -130,7 +130,7 @@ Cloud items come up together and go down together rather than billing while some
 |---|---|---|---|---|
 | 1 | ~~**0.9.0**~~ **done** - RFC-0029 complete | - | - | shipped, plus 0.9.1 and 0.9.2 |
 | 2 | ~~**RFC-0022 slice 3b**~~ **done** (2026-07-31) | - | - | FE mount is `:ro` again |
-| 3 | **Multi-machine verification** | 3 Cloud boxes | ~EUR 0.03/hr | the **last unverified claim** in prod-readiness §11 |
+| 3 | **Multi-machine verification** - **mis-scoped** | 3 Cloud boxes **+ a build** | ~EUR 0.03/hr | see below: the harness distributes nothing, so this is a build item, not a run item |
 | 4 | **RFC-0013** - DataFusion | one `ccx63`, hourly | ~EUR 0.30/hr | **the benchmark is the deliverable** |
 | 5 | **RFC-0023 tier 3** - foundation **done** (2026-07-31) | - | - | pinned call + content-addressing + acceptance test **against the real chain**; scheduling/sealing still to come |
 | 6 | **GraphOps** | a conversation | none | cheapest item; may reorder 3-5 |
@@ -160,6 +160,29 @@ Two practices, now standing:
 The same day produced a smaller instance of the same class: a `clippy` type-complexity fix whose edit
 script failed its assertion, leaving the warning in place. `grep -c` reported a nonzero count and it was
 not acted on; CI caught it. **A nonzero warning count is a stop, not a note.**
+
+### 2026-07-31: item 3 was mis-scoped - multi-machine verification is unbuilt
+
+Standing the lab up turned a one-hour run into a build item, and the plan was wrong about it in the
+same way two other entries in this sprint were.
+
+**The `multi` shape provisions three boxes and then runs the whole compose fleet on one of them.** The
+other two are empty. `partition` and `skew` target hosts labelled `writer`, so they would have
+firewalled and clock-skewed idle machines and reported the outcome as a result. Every document here
+described level 5 as "nothing has run across real machines", which reads as *we have not got round to
+it*. The truth is the harness cannot do it.
+
+**What that build needs** (none of it a config tweak): Postgres is published on `127.0.0.1` only, so a
+remote writer cannot reach it over the private network; the writer boxes need role-specific startup
+pointing at the control box's private address; and the compose topology needs splitting per role.
+
+Getting even that far took **four** tooling fixes found only by running it - a 422 network payload that
+meant `multi` had never created a box at all, a missing capacity fallback, a 409 on a leftover network,
+and error handling that reported `curl: (56)` instead of the provider's own reason.
+
+**What did hold:** 10/10 level-5 checks on a clean box against the **published v0.9.2 artifacts**. Plus
+a harness flaw worth knowing: checks run ~23 s after `compose up`, so 5.1b (worker registration) can
+fail on a first pass and pass on a re-run. **Re-run before reporting it.**
 
 ## The quality track (runs alongside 1-6, not after)
 
