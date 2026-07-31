@@ -16,6 +16,11 @@ const TIMESTAMP_ATTEMPTS: usize = 4;
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// Return type of the self-recursive [`RpcClient::fetch_timestamp_batch`]. Boxed because an `async fn`
+/// cannot recurse into itself without a heap indirection.
+type TimestampBatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HashMap<u64, u64>>> + Send + 'a>>;
+
 /// How many block timestamps to remember (RFC-0029 §6d). Timestamps are 16 bytes of map entry each, so
 /// this is a few hundred KB - trivial next to the requests it removes on retry and split-and-retry,
 /// where we currently re-fetch every timestamp in a range we just split.
@@ -795,7 +800,44 @@ impl RpcClient {
     /// One bounded `eth_getBlockByNumber` batch → `{block: timestamp}` (may be partial if the endpoint
     /// omitted blocks; the caller's total-count check turns that into an error). A whole-batch request
     /// failure is retried a few times before erroring.
-    async fn fetch_timestamp_batch(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+    /// One timestamp sub-batch, **narrowing on a size failure instead of retrying the same width**
+    /// (RFC-0029 §6h).
+    ///
+    /// This is the third place the same defect appeared, and the pattern is worth stating rather than
+    /// patched a fourth time: **a batched RPC call needs a narrowing path, not just a retry path.**
+    /// `getLogs` has had one since RFC-0028; this did not, so a batch whose response body was too slow
+    /// to read inside the request timeout was reissued at identical size five times and then killed
+    /// the backfill.
+    ///
+    /// Measured on OBIB case 1 (2026-07-30): `MAX_TIMESTAMP_BATCH` is 200 blocks and `TIMESTAMP_FANOUT`
+    /// is 4 - **per window**. At `--concurrency 8` that is up to 32 concurrent multi-megabyte batch
+    /// responses sharing one connection pool and one timeout budget. The two fan-outs compose
+    /// *multiplicatively* and nothing bounds the product, and §6f made it sharper by growing windows to
+    /// 100,000 blocks, so each window now covers far more distinct blocks than when the batch size was
+    /// chosen. Halving on failure is what adapts to that without having to predict it.
+    fn fetch_timestamp_batch<'a>(&'a self, blocks: &'a [u64]) -> TimestampBatchFuture<'a> {
+        Box::pin(async move {
+            match self.fetch_timestamp_batch_once(blocks).await {
+                Ok(v) => Ok(v),
+                // A single block that still fails is a real failure - there is nothing left to halve,
+                // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
+                Err(e) if blocks.len() > 1 && crate::chunker::is_result_too_large(&e) => {
+                    let mid = blocks.len() / 2;
+                    tracing::debug!(
+                        "timestamp batch of {} too large ({e:#}); splitting",
+                        blocks.len()
+                    );
+                    let (a, b) = blocks.split_at(mid);
+                    let mut out = self.fetch_timestamp_batch(a).await?;
+                    out.extend(self.fetch_timestamp_batch(b).await?);
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    async fn fetch_timestamp_batch_once(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         let batch: Vec<Value> = blocks
             .iter()
             .enumerate()
@@ -1671,5 +1713,82 @@ mod tests {
              failure RFC-0028 was avoiding: {err:#}"
         );
         assert!(!crate::chunker::is_result_too_large(&err));
+    }
+
+    /// **RFC-0029 §6h.** A timestamp batch too large to read must be *halved*, not reissued at the
+    /// same size until the attempts run out.
+    ///
+    /// This is the third appearance of one defect - `getLogs` status codes (slice 1), `getLogs` body
+    /// reads (#230), and now the timestamp batch - so the test asserts the *general* property: a
+    /// batched RPC call narrows on a size failure. A server that refuses anything above a threshold
+    /// stands in for "the body took longer than the timeout to read", which is what actually happens
+    /// on a real endpoint and is impractical to reproduce deterministically.
+    #[tokio::test]
+    async fn a_timestamp_batch_halves_instead_of_retrying_the_same_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Refuses batches larger than 50 with a cap error; serves anything smaller.
+        static SEEN_MAX: AtomicUsize = AtomicUsize::new(0);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        SEEN_MAX.store(0, Ordering::SeqCst);
+        CALLS.store(0, Ordering::SeqCst);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1 << 20];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let n_items = req.matches("eth_getBlockByNumber").count();
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    SEEN_MAX.fetch_max(n_items, Ordering::SeqCst);
+                    let body = if n_items > 50 {
+                        // The shape a provider uses for "your response would be too big".
+                        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Log response size exceeded"}}"#.to_string()
+                    } else {
+                        // `id` is the index within the batch, which is what the client maps back.
+                        let items: Vec<String> = (0..n_items)
+                            .map(|i| {
+                                format!(
+                                    r#"{{"jsonrpc":"2.0","id":{i},"result":{{"timestamp":"0x1"}}}}"#
+                                )
+                            })
+                            .collect();
+                        format!("[{}]", items.join(","))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+        let blocks: Vec<u64> = (1..=200).collect();
+        let got = c
+            .block_timestamps(&blocks)
+            .await
+            .expect("a batch that is merely too large must be split, not fatal");
+
+        assert_eq!(got.len(), 200, "every block must come back after splitting");
+        assert!(
+            CALLS.load(Ordering::SeqCst) > 1,
+            "it must have split at all - one call means it never narrowed"
+        );
+        // 200 -> 100 -> 50: the first size the server accepts. If it had merely retried, the max would
+        // have stayed at 200 and the call would have failed.
+        assert!(
+            SEEN_MAX.load(Ordering::SeqCst) <= 200,
+            "sanity: the server saw the batch it was sent"
+        );
     }
 }
