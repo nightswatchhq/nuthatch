@@ -3601,7 +3601,9 @@ fn decode_window(
         if let Some(mut r) = decoded {
             r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
             if let Some(fs) = factory {
-                if let Some(child) = fs.discover(&r) {
+                // Every child this event announces, not just the first: one event may name several
+                // (issue #241).
+                for child in fs.discover(&r) {
                     if children.insert(child.clone()) {
                         tracing::info!(
                             "factory discovered {} child {}… at block {}",
@@ -3658,7 +3660,7 @@ fn rebuild_children(
             key(a).cmp(&key(b))
         });
         for v in &rows {
-            if let Some(child) = factory.discover_stored(&table, v) {
+            for child in factory.discover_stored(&table, v) {
                 children.insert(child);
             }
         }
