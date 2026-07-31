@@ -11,8 +11,8 @@
 //! just the CLI front door; the engine lives in the library crate.
 
 use nuthatch::{
-    analytics, audit, bench, blob, check, cli, config, distribution, indexer, labels, lifecycle,
-    lists, mcp, pack, project, roost, screen, store, transform,
+    analytics, audit, bench, blob, check, cli, config, distribution, doctor, indexer, labels,
+    lifecycle, lists, mcp, pack, project, roost, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
             cli::BenchWhat::Backfill(a) => bench::backfill(a).await,
             cli::BenchWhat::Query(a) => bench::query(a),
         },
+        cli::Command::Doctor(args) => doctor::run(args).await,
         cli::Command::Labels(args) => run_labels(args),
         cli::Command::Lists(args) => run_lists(args).await,
         cli::Command::Screen(args) => screen::backfill(args),

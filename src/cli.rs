@@ -52,6 +52,10 @@ pub enum Command {
     Schema(SchemaArgs),
     /// Benchmark the indexing pipeline (measure first, optimise second - RFC-0004).
     Bench(BenchArgs),
+    /// Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC
+    /// batch size, and archive depth - and print the largest safe `--window`. Each of those limits
+    /// otherwise surfaces mid-backfill as a retry loop that looks like slowness.
+    Doctor(DoctorArgs),
     /// Manage labeled address sets - the compliance annotation substrate (RFC-0008 C1).
     Labels(LabelsArgs),
     /// Manage sanctions/watch lists as content-addressed snapshots (RFC-0008 C2).
@@ -844,4 +848,21 @@ pub struct DevArgs {
     /// to be set AND each request to present it as `?token=…` (or it self-disables with a log line).
     #[arg(long)]
     pub no_admin: bool,
+}
+
+#[derive(Args)]
+pub struct DoctorArgs {
+    /// Endpoint(s) to probe. Repeatable. Omit to probe whatever the nest in `--dir` is configured to
+    /// use - which is where "my backfill is slow" usually starts.
+    #[arg(long)]
+    pub rpc: Vec<String>,
+
+    /// Nest directory to read `rpc_urls` from when no `--rpc` is given.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+
+    /// Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a
+    /// real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one.
+    #[arg(long)]
+    pub address: Option<String>,
 }
