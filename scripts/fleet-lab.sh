@@ -7,7 +7,15 @@
 #   export HCLOUD_SSH_KEY="my-key"     # the *name* of an SSH key already in that project
 #
 #   ./scripts/fleet-lab.sh up single    # one box: levels 0-4 + the compose fleet on one host
-#   ./scripts/fleet-lab.sh up multi     # three boxes + a private network: adds 5.4/5.5 across machines
+#   ./scripts/fleet-lab.sh up multi     # three boxes + a private network
+#
+#   !! `multi` PROVISIONS three boxes but `verify` STILL RUNS EVERYTHING ON ONE OF THEM. The compose
+#   !! fleet (postgres + control + writers + FEs) comes up on the first host; the other two sit idle.
+#   !! `partition` and `skew` then target boxes labelled `writer` that are running nothing, so their
+#   !! results would be meaningless. Distributing the roles is unbuilt work, not a config tweak:
+#   !! Postgres is published on 127.0.0.1 only, so a remote writer cannot reach it over the private
+#   !! network, and the writer boxes need role-specific startup pointing at the control box.
+#   !! Verified empty on 2026-07-31. Until that is built, `multi` buys you nothing over `single`.
 #   ./scripts/fleet-lab.sh verify
 #   ./scripts/fleet-lab.sh partition    # cut a writer off the control-plane API, assert it keeps indexing
 #   ./scripts/fleet-lab.sh skew         # push a writer clock forward, assert the lease does not move
@@ -204,17 +212,56 @@ TXT
     wait_ready "$ip"
   else
     echo "creating a private network…"
-    local net; net=$(hc POST /networks \
+    # Reuse an existing lab network rather than failing with a 409. A previous run that could not place
+    # its boxes leaves the network behind (it is free, and `down` only runs if someone runs it), and a
+    # hard failure there sends the operator hunting for a resource that costs nothing and is safe to
+    # share. Idempotent `up` beats a tidy-first rule nobody remembers.
+    local net; net=$(hc GET "/networks?label_selector=$LABEL" 2>/dev/null | python3 -c 'import sys,json
+n=json.load(sys.stdin).get("networks") or []
+print(n[0]["id"] if n else "")' 2>/dev/null || true)
+    if [ -n "$net" ]; then
+      echo "  reusing network $net"
+    else
+    net=$(hc POST /networks \
       "{\"name\":\"$LABEL-net\",\"ip_range\":\"10.44.0.0/16\",\"subnets\":[{\"type\":\"cloud\",\"network_zone\":\"eu-central\",\"ip_range\":\"10.44.1.0/24\"}],\"labels\":{\"$LABEL\":\"true\"}}" \
       | jq_ network.id)
-    echo "  network $net"
+      echo "  network $net"
+    fi
     echo "creating three boxes…"
     # A bare network **id**, not `{"network": id}`. Hetzner's POST /servers takes `networks` as an
     # array of ids; an array of objects is a 422, which is what this passed for as long as the `multi`
     # shape went unrun. That is the whole reason it went unnoticed - `single` never touches this path.
-    create_server "$LABEL-cp"      "$TYPE_SMALL"  control "$net" >/dev/null
-    create_server "$LABEL-writer1" "$TYPE_WRITER" writer  "$net" >/dev/null
-    create_server "$LABEL-writer2" "$TYPE_WRITER" writer  "$net" >/dev/null
+    #
+    # **And the same capacity fallback `single` has.** `resource_unavailable: error during placement`
+    # is transient and regional: on 2026-07-31 a `cx33` in hel1 succeeded from one call and 412'd from
+    # the next, minutes apart. Without a retry the whole lab dies on someone else's capacity planning -
+    # and worse, dies *partway*, leaving boxes billing (see the cleanup trap below).
+    #
+    # Every box must land in the **same network zone** as the private network (eu-central), so the
+    # fallback walks locations within that zone only. Falling back to a smaller type is fine here: the
+    # cross-machine cases test lease and reconcile *semantics*, not throughput.
+    local made=""
+    make_box() { # make_box <name> <role> <preferred-type>
+      local name="$1" role="$2" want="$3" ip=""
+      for loc in "$LOCATION" fsn1 nbg1 hel1; do
+        for t in "$want" "$TYPE_SMALL"; do
+          ip=$(LOCATION="$loc" create_server "$name" "$t" "$role" "$net" 2>/dev/null) || ip=""
+          if [ -n "$ip" ]; then echo "  $name: $t in $loc -> $ip"; made="$made $ip"; return 0; fi
+        done
+      done
+      echo "  $name: no capacity for $want or $TYPE_SMALL anywhere in eu-central" >&2
+      return 1
+    }
+    # A half-built lab is worse than none: it bills, and `hosts` shows a fleet that cannot be verified.
+    # Tear down whatever was created if any box cannot be placed.
+    if ! ( make_box "$LABEL-cp" control "$TYPE_SMALL" \
+        && make_box "$LABEL-writer1" writer "$TYPE_WRITER" \
+        && make_box "$LABEL-writer2" writer "$TYPE_WRITER" ); then
+      echo
+      echo "could not place all three boxes - removing what was created so nothing bills." >&2
+      yes y | cmd_down >/dev/null 2>&1 || true
+      exit 1
+    fi
     ips_by_role | while read -r _ ip _; do wait_ready "$ip"; done
   fi
   echo; echo "hosts:"; ips_by_role | sed 's/^/  /'

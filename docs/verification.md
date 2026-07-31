@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus a full level-5 pass on a clean Hetzner box** (2026-07-30, Ubuntu 24.04, published v0.8.1 artifacts, 2 writers + 2 FE nodes): **10/10, zero skipped**, via `scripts/verify.sh 5`. **Nothing has run across real machines** - the partition and clock-skew cases are still open. |
+| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, plus **10/10 level-5 checks on a clean Hetzner box against the published v0.9.2 artifacts** (2026-07-31, re-confirmed after a settling delay - see below). **Multi-machine is NOT implemented**, not merely unrun: the lab's `multi` shape provisions three boxes and runs the whole fleet on one of them. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -315,6 +315,12 @@ unauthenticated off-localhost.
 > leftover network, error handling that hid all three behind `curl: (56)`, inconsistent SSH host-key
 > policy against recycled IPs, and a `psql` helper that never `cd`'d to its compose file.
 
+>
+> **A first-run 5.1b failure should be re-run before it is reported.** The harness runs its level-5
+> checks ~23 s after `compose up`, before workers have heartbeated, so worker-registration can fail
+> once and pass immediately after. That is a readiness-gating flaw in the harness, not a product
+> fault - and it is why the distributed path now waits for registration rather than sleeping and
+> hoping.
 > **2026-07-30 - the two cross-machine cases were repaired before ever being run.** `partition` and
 > `skew` printed their expectations for a human to read and asserted nothing, which hid two defects in
 > the tests themselves: `partition` blocked the whole control-plane *host*, and since Postgres runs on
