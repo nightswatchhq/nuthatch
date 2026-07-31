@@ -405,7 +405,19 @@ fn reject_statement_stacking(sql: &str) -> Result<()> {
 }
 
 fn reject_file_access(sql: &str) -> Result<()> {
-    let cleaned = strip_all_sql_comments(sql).to_ascii_lowercase();
+    // **Double quotes are removed before scanning.** DuckDB accepts a quoted function name and calls
+    // it exactly as the bare form, so `"read_csv"('/etc/passwd')` executed while sailing past a check
+    // that looked for `(` after optional *whitespace* - a quote is not whitespace. Verified against a
+    // live DuckDB during the pre-1.0 adversary pass: the quoted form returned the file's contents.
+    //
+    // Stripping is the robust fix rather than "also skip quotes when seeking `(`", because it
+    // normalises every placement at once - `"read_csv"(`, `read"_"csv(`, and anything else quoting can
+    // do to break a name into pieces. It can only ever make the denylist match *more*, and a denylist
+    // that over-refuses is the safe direction: the cost is a rejected query with a bizarre quoted
+    // identifier, and the alternative cost is reading /etc/passwd.
+    let cleaned = strip_all_sql_comments(sql)
+        .to_ascii_lowercase()
+        .replace('"', "");
     let b = cleaned.as_bytes();
     let is_ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
     for name in FORBIDDEN_FNS {
@@ -2069,5 +2081,56 @@ template="pool"
             "with no schema.json there is no typed empty view, so the authored view cannot resolve - \
              this is the failure `refresh_stale_artifacts` prevents by regenerating the schema"
         );
+    }
+
+    /// **A quoted function name evaded the `/sql` denylist and read arbitrary files.**
+    ///
+    /// Found in the pre-1.0 adversary pass. `reject_file_access` matched a forbidden name only when the
+    /// next non-space character was `(` - and DuckDB accepts a *quoted* function name, where the next
+    /// character is `"`. So `SELECT * FROM "read_csv"('/etc/passwd')` passed both guards and DuckDB
+    /// executed it, confirmed against a live connection (it returned the contents of `/etc/hosts`).
+    ///
+    /// Same class as the stacked-`COPY TO` arbitrary *write* found earlier (#153): the guard was
+    /// correct about the shape it imagined and the shape had another spelling.
+    ///
+    /// The cases below are spellings of one idea - break the name away from its parens, or from
+    /// itself - and each must stay refused.
+    #[test]
+    fn a_quoted_function_name_cannot_evade_the_denylist() {
+        for q in [
+            "SELECT * FROM read_csv('/etc/passwd')",
+            r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
+            r#"SELECT * FROM "READ_CSV"('/etc/passwd')"#,
+            // Quoting a *fragment* of the name is the same trick with a smaller hammer.
+            r#"SELECT * FROM read"_"csv('/etc/passwd')"#,
+            "SELECT * FROM main.read_csv('/etc/passwd')",
+            "SELECT * FROM read_csv\n('/etc/passwd')",
+            "SELECT * FROM READ_CSV('/etc/passwd')",
+            // The other file-reaching functions deserve the same treatment.
+            r#"SELECT * FROM "read_parquet"('/etc/passwd')"#,
+            r#"SELECT * FROM "read_json_auto"('/etc/passwd')"#,
+        ] {
+            assert!(
+                reject_file_access(q).is_err() || reject_replacement_scan(q).is_err(),
+                "must be refused: {q}"
+            );
+        }
+    }
+
+    /// The fix must not refuse legitimate queries. Stripping quotes before the scan can only make the
+    /// denylist match more, so the risk is false positives - pinned here so a later "tidy-up" that
+    /// widens it further has to break a test rather than a user's dashboard.
+    #[test]
+    fn ordinary_quoted_identifiers_still_work() {
+        for q in [
+            // Reserved-word columns are quoted constantly in this product - `from`/`to` on transfers.
+            r#"SELECT "from", "to" FROM usdc__transfer"#,
+            r#"SELECT count(*) FROM "usdc__transfer""#,
+            // A column whose name merely contains a forbidden name is not a call.
+            r#"SELECT my_read_csv_flag FROM t"#,
+        ] {
+            assert!(reject_file_access(q).is_ok(), "must be allowed: {q}");
+            assert!(reject_replacement_scan(q).is_ok(), "must be allowed: {q}");
+        }
     }
 }
