@@ -1,6 +1,12 @@
 # RFC-0022: Distributed scaled mode - read/write planes, a writer pool, dynamic nest placement
 
-- Status: **Implemented 2026-07-30.** All six §Testing acceptance items pass; 39 tests run against a
+- Status: **Control plane implemented; ingestion NOT implemented** (corrected 2026-07-31, issue #250).
+  `worker::run` registers, takes leases, loads secrets and reports - and **contains no indexing code
+  at all**: no `index_loop`, no `build_nest`, no backfill path. A worker acquires a cursor and does
+  nothing with it, so **the writer pool does not write**. The control-plane half below is real and is
+  now proven across machines (registration, scheduling, leases with a store-enforced fence, and
+  clock-skew safety measured on a three-box fleet). The ingestion half is unbuilt.
+  *Previously, and wrongly, marked "Implemented 2026-07-30":* All six §Testing acceptance items pass; 39 tests run against a
   live Postgres in CI. Two caveats are recorded honestly rather than closed - see *What was and was
   not verified*, below. Built 2026-07-29/30; was *accepted, design only* (2026-07-21). §0 brief amendment applied to
   `CLAUDE.md` 2026-07-21. **Nothing is built yet.** The build is **dependency-gated** on RFC-0013's

@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, **plus a full level-5 pass on a clean Hetzner box** (2026-07-30, Ubuntu 24.04, published v0.8.1 artifacts, 2 writers + 2 FE nodes): **10/10, zero skipped**, via `scripts/verify.sh 5`. **Nothing has run across real machines** - the partition and clock-skew cases are still open. |
+| 5 Scaled mode | **control plane only** | 10/10 level-5 checks pass on published artifacts. **But every level-5 check tests the control plane** - grep that section for `last_block`/`indexed`/`rows`/`entities` and it returns 0 - and the writer pool **never indexes** (issue #250). Cursors are assigned and owned correctly; owning one causes nothing to happen. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -289,6 +289,20 @@ unauthenticated off-localhost.
 ## Level 5 — scaled mode (a fleet)
 
 **This is the level we most want independently verified.**
+
+> **2026-07-31 - the writer pool does not write (issue #250), and it re-reads everything below.**
+>
+> `worker::run` registers, takes leases, loads secrets and reports. It contains **no indexing code** -
+> no `index_loop`, no `build_nest`, no backfill path. A worker acquires a cursor and does nothing with
+> it, so `last_block` never moves.
+>
+> **The 10/10 was true and meant less than it read.** Those checks are real and they passed: they
+> exercise registration, planning, unplaceable reporting, lease fencing, fleet-wide version pinning
+> and write-only secrets. **Not one asserts that a row appears.** That is the shape of the failure -
+> a suite that verifies the machinery *around* a thing rather than the thing - and a level-5 check
+> that asserts indexed data is part of the fix, or it recurs.
+>
+> The embedded path (`dev`, `roost`) is unaffected; this is scaled mode only.
 
 > **2026-07-30 - the two cross-machine cases were repaired before ever being run.** `partition` and
 > `skew` printed their expectations for a human to read and asserted nothing, which hid two defects in
