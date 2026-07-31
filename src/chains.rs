@@ -1,4 +1,24 @@
 //! Tiny chain registry. Ships sensible public-RPC defaults with round-robin failover - the
+//!
+//! ## These endpoint lists have an expiry date
+//!
+//! They are the **zero-setup path**: `init 0xAddr --chain mainnet && dev` uses them, and the founding
+//! non-negotiable is a live indexed query in under two minutes with no configuration. That makes them
+//! product surface, not constants - and they rot without anyone touching this file.
+//!
+//! On 2026-07-31, **two of the four mainnet defaults were dead**: `ethereum-rpc.publicnode.com` had
+//! moved archive requests behind a token (so it could not serve a backfill *at all*, while being
+//! listed first), and `eth.llamarpc.com` was returning HTTP 521. The comment beside them said
+//! "Verified to serve keyless eth_getLogs (2026-07)" - within the same month.
+//!
+//! **Re-measure before trusting this list**, with the smallest request a real backfill makes - a
+//! 10-block address-filtered `eth_getLogs` a few thousand blocks behind tip:
+//!
+//! ```sh
+//! nuthatch doctor --rpc <url> --address <a-busy-contract>
+//! ```
+//!
+//! A tip-only check passes on endpoints that cannot backfill, which is exactly how this went unnoticed.
 //! first-run killer is RPC friction, so out of the box you should not need to bring a key.
 //! (The "no third-party" upgrade is to colocate with a reth node; that path comes later.)
 //!
@@ -34,11 +54,16 @@ const MAINNET: Chain = Chain {
     name: "mainnet",
     chain_id: 1,
     rpc_urls: &[
-        // Verified to serve keyless eth_getLogs (2026-07). Round-robin across them.
-        "https://ethereum-rpc.publicnode.com",
-        "https://eth.drpc.org",
+        // **Ordered by measured backfill capability, best first** - see the module note above on why
+        // this list has an expiry date. Re-measured 2026-07-31 with a 10-block address-filtered
+        // `eth_getLogs` 5,000 blocks behind tip, which is the smallest request a real backfill makes.
         "https://eth-pokt.nodies.app",
-        "https://eth.llamarpc.com",
+        "https://eth.drpc.org",
+        "https://eth.api.onfinality.io/public",
+        // Removed 2026-07-31: `ethereum-rpc.publicnode.com` now answers
+        // `Archive requests require a personal token` for anything more than ~100 blocks behind tip,
+        // so it cannot serve a backfill at all - and it was listed *first*. `eth.llamarpc.com` was
+        // returning HTTP 521 (origin down). Both had been "verified" in 2026-07.
     ],
     // ~2 epochs; real finality signals arrive with the ExEx mode. The `finalized` tag exists
     // post-merge but Depth keeps a single conservative policy until ExEx lands.
@@ -52,9 +77,10 @@ const ARBITRUM_ONE: Chain = Chain {
     rpc_urls: &[
         // Keyless Arbitrum One endpoints (2026-07). The official sequencer RPC first.
         "https://arb1.arbitrum.io/rpc",
-        "https://arbitrum-one-rpc.publicnode.com",
         "https://arbitrum.drpc.org",
         "https://arb-pokt.nodies.app",
+        // `arbitrum-one-rpc.publicnode.com` removed 2026-07-31 - same archive-token policy as its
+        // mainnet sibling; it cannot serve a backfill.
     ],
     // True finality is L1 confirmation of the batch (~10-20 min). Prefer the node's `finalized`
     // tag; else ~7.5 min at 250 ms blocks. Horizon is sparse, so the extra hot window is cheap.
@@ -71,9 +97,9 @@ const BASE: Chain = Chain {
     rpc_urls: &[
         // Keyless Base mainnet endpoints (2026-07). The official RPC first.
         "https://mainnet.base.org",
-        "https://base-rpc.publicnode.com",
         "https://base.drpc.org",
         "https://base-pokt.nodies.app",
+        // `base-rpc.publicnode.com` removed 2026-07-31 - same archive-token policy.
     ],
     // OP-stack L2: true finality is L1 confirmation. Base exposes the L1-aware `finalized` tag, so
     // prefer it (same policy as Arbitrum); the fallback (~30 min at 2 s blocks) only bites if an
