@@ -44,7 +44,15 @@ struct FactoryRule {
 #[derive(Debug, Default, Clone)]
 pub struct FactorySet {
     /// announcing table (`{watch}__{event_snake}`) → rule.
-    rules: HashMap<String, FactoryRule>,
+    /// Announcing table → **every** rule fired by that event.
+    ///
+    /// A `Vec`, not a single rule, because one event legitimately announces several children. The
+    /// motivating shape from issue #241 is `OrgDeployed`, which carries ten module addresses in ten
+    /// named params; the obvious encoding is ten factory rules on one event. This was a
+    /// `HashMap<String, FactoryRule>` keyed by `{watch}__{event}`, so those ten silently collapsed to
+    /// **one** - last declaration wins, ordering-dependent, and the startup log still reported the
+    /// full count. Every other template got tables and a `__children` view and stayed empty forever.
+    rules: HashMap<String, Vec<FactoryRule>>,
     /// Every declared template name (a factory's `template` must be one of these).
     template_names: HashSet<String>,
     /// True if any template requests the topic0-only backfill filter (RFC-0009 §4 override).
@@ -94,16 +102,29 @@ impl FactorySet {
                 );
             }
             let table = format!("{}__{}", f.watch, snake_case(&f.event));
-            rules.insert(
-                table,
-                FactoryRule {
-                    child_param: f.child_param.clone(),
-                    template: f.template.clone(),
-                    start: f.start,
-                    // Filled once all sources' depths are known (below).
-                    watch_depth: 0,
-                },
-            );
+            // A duplicate `(watch, event, child_param, template)` is a copy-paste error rather than a
+            // second child, and silently indexing it twice would double every discovery.
+            let entry = rules.entry(table).or_insert_with(Vec::new);
+            if entry
+                .iter()
+                .any(|r: &FactoryRule| r.child_param == f.child_param && r.template == f.template)
+            {
+                bail!(
+                    "two identical factory rules watch '{}' event '{}' for child_param '{}' → \
+                     template '{}' - remove the duplicate",
+                    f.watch,
+                    f.event,
+                    f.child_param,
+                    f.template
+                );
+            }
+            entry.push(FactoryRule {
+                child_param: f.child_param.clone(),
+                template: f.template.clone(),
+                start: f.start,
+                // Filled once all sources' depths are known (below).
+                watch_depth: 0,
+            });
         }
 
         // Resolve template depths: a template watched by a factory whose source has depth d gets
@@ -133,8 +154,10 @@ impl FactorySet {
                     src_depth + 1
                 );
             }
-            if let Some(rule) = rules.get_mut(&table) {
-                rule.watch_depth = src_depth;
+            if let Some(rs) = rules.get_mut(&table) {
+                for rule in rs.iter_mut().filter(|r| r.template == f.template) {
+                    rule.watch_depth = src_depth;
+                }
             }
         }
 
@@ -174,72 +197,88 @@ impl FactorySet {
     pub fn view_sources(&self) -> Vec<(String, String, String)> {
         self.rules
             .iter()
-            .map(|(table, r)| (r.template.clone(), table.clone(), r.child_param.clone()))
+            .flat_map(|(table, rs)| {
+                rs.iter()
+                    .map(move |r| (r.template.clone(), table.clone(), r.child_param.clone()))
+            })
             .collect()
     }
 
     /// Discover a child from a *stored* factory-event row (JSON), for the warm-restart rebuild. Same
     /// semantics as [`discover`] but reading the persisted columns rather than a live `DecodedRow`.
-    pub fn discover_stored(&self, table: &str, row: &serde_json::Value) -> Option<ChildEntry> {
-        let rule = self.rules.get(table)?;
-        let block = row.get("block_number")?.as_u64()?;
-        if let Some(start) = rule.start {
-            if block < start {
-                return None;
-            }
-        }
-        let address = row.get(&rule.child_param)?.as_str()?.to_ascii_lowercase();
-        if !address.starts_with("0x") || address.len() != 42 {
-            return None;
-        }
-        Some(ChildEntry {
-            template: rule.template.clone(),
-            address,
-            discovered_block: block,
-            discovered_log_index: row
-                .get("log_index")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            discovered_timestamp: row
-                .get("block_timestamp")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            parent_address: row
-                .get("address")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .to_string(),
-            depth: rule.watch_depth + 1,
-        })
+    /// Returns **every** child this row announces - one event may name several (issue #241).
+    pub fn discover_stored(&self, table: &str, row: &serde_json::Value) -> Vec<ChildEntry> {
+        let Some(rules) = self.rules.get(table) else {
+            return Vec::new();
+        };
+        let Some(block) = row.get("block_number").and_then(serde_json::Value::as_u64) else {
+            return Vec::new();
+        };
+        rules
+            .iter()
+            .filter(|r| r.start.is_none_or(|s| block >= s))
+            .filter_map(|rule| {
+                let address = row.get(&rule.child_param)?.as_str()?.to_ascii_lowercase();
+                // A param that is absent, or not an address, means *this* rule did not fire - it must
+                // not stop the sibling rules on the same event from firing.
+                if !address.starts_with("0x") || address.len() != 42 {
+                    return None;
+                }
+                Some(ChildEntry {
+                    template: rule.template.clone(),
+                    address,
+                    discovered_block: block,
+                    discovered_log_index: row
+                        .get("log_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    discovered_timestamp: row
+                        .get("block_timestamp")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    parent_address: row
+                        .get("address")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    depth: rule.watch_depth + 1,
+                })
+            })
+            .collect()
     }
 
     /// If `row` is a factory-announcement event, the child contract it discovers - else `None`. A
     /// pure function of the decoded row and the rule set (the fold step the registry is built from).
-    pub fn discover(&self, row: &DecodedRow) -> Option<ChildEntry> {
-        let rule = self.rules.get(&row.table)?;
-        if let Some(start) = rule.start {
-            if row.block_number < start {
-                return None;
-            }
-        }
-        let address = row.params.iter().find_map(|(name, v)| {
-            if name != &rule.child_param {
-                return None;
-            }
-            match v {
-                Value::Address(a) => Some(format!("0x{}", hex::encode(a))),
-                _ => None,
-            }
-        })?;
-        Some(ChildEntry {
-            template: rule.template.clone(),
-            address,
-            discovered_block: row.block_number,
-            discovered_log_index: row.log_index,
-            discovered_timestamp: row.block_timestamp,
-            parent_address: row.address.clone(),
-            depth: rule.watch_depth + 1,
-        })
+    /// Every child this row announces - a `Vec`, because one event may name several (issue #241).
+    /// Empty when the row is not a factory announcement, which is the common case.
+    pub fn discover(&self, row: &DecodedRow) -> Vec<ChildEntry> {
+        let Some(rules) = self.rules.get(&row.table) else {
+            return Vec::new();
+        };
+        rules
+            .iter()
+            .filter(|r| r.start.is_none_or(|s| row.block_number >= s))
+            .filter_map(|rule| {
+                let address = row.params.iter().find_map(|(name, v)| {
+                    if name != &rule.child_param {
+                        return None;
+                    }
+                    match v {
+                        Value::Address(a) => Some(format!("0x{}", hex::encode(a))),
+                        _ => None,
+                    }
+                })?;
+                Some(ChildEntry {
+                    template: rule.template.clone(),
+                    address,
+                    discovered_block: row.block_number,
+                    discovered_log_index: row.log_index,
+                    discovered_timestamp: row.block_timestamp,
+                    parent_address: row.address.clone(),
+                    depth: rule.watch_depth + 1,
+                })
+            })
+            .collect()
     }
 }
 
@@ -482,7 +521,7 @@ template = "pool"
     fn discovers_child_from_factory_event() {
         let fs = FactorySet::build(&cfg(UNIV3)).unwrap();
         let pool = "0xaaaabbbbccccddddeeeeffff0000111122223333";
-        let child = fs.discover(&pool_created_row(100, 3, pool)).unwrap();
+        let child = fs.discover(&pool_created_row(100, 3, pool)).remove(0);
         assert_eq!(child.template, "pool");
         assert_eq!(child.address, pool);
         assert_eq!(child.discovered_block, 100);
@@ -496,7 +535,7 @@ template = "pool"
         // A non-factory row discovers nothing.
         let mut other = pool_created_row(100, 3, pool);
         other.table = "factory__other_event".into();
-        assert!(fs.discover(&other).is_none());
+        assert!(fs.discover(&other).is_empty());
     }
 
     #[test]
@@ -506,12 +545,12 @@ template = "pool"
         let a = "0x00000000000000000000000000000000000000a1";
         let b = "0x00000000000000000000000000000000000000b2";
 
-        assert!(reg.insert(fs.discover(&pool_created_row(10, 0, a)).unwrap()));
+        assert!(reg.insert(fs.discover(&pool_created_row(10, 0, a)).remove(0)));
         assert_eq!(reg.version(), 1);
         // Re-discovering the same child is idempotent - no version bump.
-        assert!(!reg.insert(fs.discover(&pool_created_row(11, 0, a)).unwrap()));
+        assert!(!reg.insert(fs.discover(&pool_created_row(11, 0, a)).remove(0)));
         assert_eq!(reg.version(), 1);
-        assert!(reg.insert(fs.discover(&pool_created_row(12, 0, b)).unwrap()));
+        assert!(reg.insert(fs.discover(&pool_created_row(12, 0, b)).remove(0)));
         assert_eq!(reg.version(), 2);
         assert_eq!(reg.len(), 2);
         assert!(reg.contains(a));
@@ -527,15 +566,15 @@ template = "pool"
 
         // Registry built by folding two discoveries (blocks 10, 20), then reorg to block 15.
         let mut reorged = ChildRegistry::new();
-        reorged.insert(fs.discover(&pool_created_row(10, 0, a)).unwrap());
-        reorged.insert(fs.discover(&pool_created_row(20, 0, b)).unwrap());
+        reorged.insert(fs.discover(&pool_created_row(10, 0, a)).remove(0));
+        reorged.insert(fs.discover(&pool_created_row(20, 0, b)).remove(0));
         assert_eq!(reorged.rollback_to(15), 1); // child b (block 20) dropped
         assert!(reorged.contains(a) && !reorged.contains(b));
 
         // A registry built canonically (only the surviving discovery) has the identical content hash
         // - reorg convergence: registry state at B is a pure fold over factory events ≤ B.
         let mut canonical = ChildRegistry::new();
-        canonical.insert(fs.discover(&pool_created_row(10, 0, a)).unwrap());
+        canonical.insert(fs.discover(&pool_created_row(10, 0, a)).remove(0));
         assert_eq!(reorged.hash(), canonical.hash());
     }
 
@@ -561,6 +600,153 @@ template = "pool"
             tx_hash: "0xtx".into(),
             address: "0xpool".into(),
         };
-        assert_eq!(fs.discover(&row).unwrap().depth, 2);
+        assert_eq!(fs.discover(&row).remove(0).depth, 2);
+    }
+
+    /// **Issue #241 item 1.** One event announcing several children must produce **all** of them.
+    ///
+    /// This is not a hypothetical shape: `OrgDeployed` on the POA stack carries ten module addresses
+    /// in ten named params, and ten factory rules on one event is the obvious encoding. Before this,
+    /// `rules` was a `HashMap` keyed by `{watch}__{event}`, so all ten collapsed to **one** - last
+    /// declaration wins, ordering-dependent - while startup still logged the full rule count. Every
+    /// other template got tables and a `__children` view and stayed empty forever, with no warning.
+    const MULTI: &str = r#"
+[nest]
+name = "poa"
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "org_registry"
+address = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+abi = "abis/registry.json"
+
+[[templates]]
+name = "switchable_beacon"
+abi = "abis/beacon.json"
+
+[[templates]]
+name = "module_proxy"
+abi = "abis/proxy.json"
+
+[[factories]]
+watch = "org_registry"
+event = "ContractRegistered"
+child_param = "beacon"
+template = "switchable_beacon"
+
+[[factories]]
+watch = "org_registry"
+event = "ContractRegistered"
+child_param = "proxy"
+template = "module_proxy"
+"#;
+
+    fn registered_row(block: u64, beacon: &str, proxy: &str) -> DecodedRow {
+        DecodedRow {
+            table: "org_registry__contract_registered".into(),
+            params: vec![
+                (
+                    "beacon".into(),
+                    Value::Address(
+                        hex::decode(beacon.trim_start_matches("0x"))
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                    ),
+                ),
+                (
+                    "proxy".into(),
+                    Value::Address(
+                        hex::decode(proxy.trim_start_matches("0x"))
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                    ),
+                ),
+            ],
+            block_number: block,
+            block_hash: "0xbb".into(),
+            block_timestamp: 1,
+            timestamps: true,
+            log_index: 0,
+            tx_hash: "0xtt".into(),
+            address: "0x1f98431c8ad98523631ae4a59f267346ea31f984".into(),
+        }
+    }
+
+    #[test]
+    fn one_event_can_announce_several_children() {
+        let fs = FactorySet::build(&cfg(MULTI)).unwrap();
+        let beacon = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let proxy = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let mut found = fs.discover(&registered_row(100, beacon, proxy));
+        found.sort_by(|a, b| a.template.cmp(&b.template));
+        assert_eq!(
+            found.len(),
+            2,
+            "both rules on this event must fire - got {found:?}"
+        );
+        assert_eq!(found[0].template, "module_proxy");
+        assert_eq!(found[0].address, proxy);
+        assert_eq!(found[1].template, "switchable_beacon");
+        assert_eq!(found[1].address, beacon);
+
+        // The `{template}__children` views must have a source per rule, or the second template's view
+        // is created and stays empty - which is how this bug presented.
+        let mut srcs: Vec<String> = fs.view_sources().into_iter().map(|(t, _, _)| t).collect();
+        srcs.sort();
+        assert_eq!(srcs, vec!["module_proxy", "switchable_beacon"]);
+    }
+
+    /// The stored-row path (warm restart) must agree with the live path, or a restart silently loses
+    /// the children it discovered before.
+    #[test]
+    fn the_warm_restart_path_also_finds_every_child() {
+        let fs = FactorySet::build(&cfg(MULTI)).unwrap();
+        let row = serde_json::json!({
+            "block_number": 100,
+            "log_index": 0,
+            "address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+            "beacon": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "proxy": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        let found = fs.discover_stored("org_registry__contract_registered", &row);
+        assert_eq!(found.len(), 2, "warm restart must match live discovery");
+    }
+
+    /// A rule whose param is missing must not suppress its siblings - each rule stands alone.
+    #[test]
+    fn a_rule_whose_param_is_absent_does_not_block_the_others() {
+        let fs = FactorySet::build(&cfg(MULTI)).unwrap();
+        let row = serde_json::json!({
+            "block_number": 100,
+            "log_index": 0,
+            "address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+            "proxy": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        let found = fs.discover_stored("org_registry__contract_registered", &row);
+        assert_eq!(found.len(), 1, "the rule that *can* fire still fires");
+        assert_eq!(found[0].template, "module_proxy");
+    }
+
+    /// A genuinely identical rule is a copy-paste error, and indexing it twice would double every
+    /// discovery. Refused, loudly - which is the one case where the old silent-overwrite was benign
+    /// and is now the only case that errors.
+    #[test]
+    fn an_identical_duplicate_rule_is_refused() {
+        let dup = MULTI.replace(
+            r#"child_param = "proxy"
+template = "module_proxy""#,
+            r#"child_param = "beacon"
+template = "switchable_beacon""#,
+        );
+        let err = FactorySet::build(&cfg(&dup)).unwrap_err().to_string();
+        assert!(
+            err.contains("identical factory rules"),
+            "must name the problem: {err}"
+        );
     }
 }
