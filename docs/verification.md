@@ -288,7 +288,15 @@ unauthenticated off-localhost.
 
 ## Level 5 — scaled mode (a fleet)
 
-**This is the level we most want independently verified.** Our 41 automated tests run against a live
+**This is the level we most want independently verified.**
+
+> **2026-07-30 - the two cross-machine cases were repaired before ever being run.** `partition` and
+> `skew` printed their expectations for a human to read and asserted nothing, which hid two defects in
+> the tests themselves: `partition` blocked the whole control-plane *host*, and since Postgres runs on
+> that box in the `multi` shape it cut the writer off from its **hot store** too - making its own
+> stated expectation ("the cursor STILL INDEXING") impossible to satisfy. Both now assert against the
+> shared Postgres and exit non-zero on failure. **Neither has been run yet**; this table moves only
+> when they have. Our 41 automated tests run against a live
 Postgres and cover every invariant below, but **the compose stack has never been brought up end to
 end**, and nothing has run across real machines. If you verify one level from this document, this is
 the one worth your time.
