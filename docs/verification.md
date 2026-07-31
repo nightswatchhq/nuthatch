@@ -290,6 +290,31 @@ unauthenticated off-localhost.
 
 **This is the level we most want independently verified.**
 
+> **2026-07-31 - a genuinely distributed fleet ran, and the clock-skew invariant PASSED.**
+>
+> Control plane + store + FE tier on one box (`10.44.1.1`), **two workers on their own machines**
+> reaching the store over a private network. Both registered -
+> `{"count":2,"workers":[{"id":"59e57b46be66"},{"id":"928d24d4d604"}]}` - and the scheduler assigned
+> the `arbitrum-one` cursor to a **named remote worker**, which took the lease with a fence.
+>
+> **skew: PASS.** The holding worker's clock was pushed **10 minutes** forward on its own machine. It
+> neither lost the lease nor extended it by ten minutes: `expires_at` advanced **66 s**, the renewal
+> cadence on the *database's* clock. RFC-0022's claim - expiry is evaluated by the store, so a wrong
+> clock on a worker can neither win nor lose it a cursor - is now demonstrated across machines rather
+> than argued.
+>
+> **partition: BLOCKED, and the blocker is itself a finding.** It needs `last_block` to advance, and
+> the assigned worker never indexed: it logs `acquired cursors chains=["arbitrum-one"]` and then
+> `runtime secrets injected for held cursors nests=0`. **A declared nest plus an assigned cursor did
+> not produce indexing in the distributed topology.** The lease machinery demonstrably works across
+> machines; the *ingestion* half remains unproven, and that gap should be chased before anyone claims
+> the writer pool works end to end.
+>
+> Getting this far took six tooling fixes, every one found by running it rather than reading it: a 422
+> network payload (so `multi` had never created a box), a missing capacity fallback, a 409 on a
+> leftover network, error handling that hid all three behind `curl: (56)`, inconsistent SSH host-key
+> policy against recycled IPs, and a `psql` helper that never `cd`'d to its compose file.
+
 > **2026-07-30 - the two cross-machine cases were repaired before ever being run.** `partition` and
 > `skew` printed their expectations for a human to read and asserted nothing, which hid two defects in
 > the tests themselves: `partition` blocked the whole control-plane *host*, and since Postgres runs on
