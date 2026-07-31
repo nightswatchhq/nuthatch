@@ -25,6 +25,7 @@ pub mod control_api;
 #[cfg(feature = "postgres-store")]
 pub mod controlplane;
 pub mod distribution;
+pub mod doctor;
 pub mod effectful;
 pub mod exposure;
 pub mod factory;

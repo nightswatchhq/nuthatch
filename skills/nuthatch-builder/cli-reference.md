@@ -94,6 +94,14 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--window <WINDOW>` - Override the `eth_getLogs` block-window (the chain default otherwise). For a *sparse* contract over a long backfill - few events across many blocks - a large window (e.g. 50000) turns tens of thousands of near-empty requests into a few, so a from-history backfill finishes in minutes. Keep it under your provider's max block-range for `getLogs` (many allow 100k+ when the result set is small); the concurrent backfill fails the range rather than auto-shrinking it
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
 
+## `nuthatch doctor`
+
+Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC batch size, and archive depth - and print the largest safe `--window`. Each of those limits otherwise surfaces mid-backfill as a retry loop that looks like slowness
+
+- `--rpc <RPC>` - Endpoint(s) to probe. Repeatable. Omit to probe whatever the nest in `--dir` is configured to use - which is where "my backfill is slow" usually starts
+- `--dir <DIR>` - Nest directory to read `rpc_urls` from when no `--rpc` is given
+- `--address <ADDRESS>` - Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one
+
 ## `nuthatch init`
 
 Scaffold an indexer for a contract: resolve its ABI and write a project here

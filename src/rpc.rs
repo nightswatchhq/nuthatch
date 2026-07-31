@@ -458,7 +458,10 @@ impl RpcClient {
 
     /// Try endpoints in health order until one answers; a failed endpoint is put into cooldown, a
     /// successful one is cleared.
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// One JSON-RPC call with failover. `pub(crate)` so `doctor` can ask arbitrary probe questions -
+    /// it exists to interrogate an endpoint's limits, which is not expressible through the typed
+    /// helpers.
+    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut last_err = anyhow!("all RPC endpoints failed");
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
@@ -810,6 +813,12 @@ impl RpcClient {
                 .map(str::to_string);
         }
         Ok(out)
+    }
+
+    /// Send a raw JSON-RPC batch and return the raw response. For `doctor` only: measuring the
+    /// endpoint's batch ceiling means sending batches of chosen sizes, which no typed helper offers.
+    pub(crate) async fn raw_batch(&self, body: &Value) -> Result<Value> {
+        self.post_with_failover(body).await
     }
 
     /// Contract bytecode at `address` as of `block`. `"0x"` (empty) means not yet deployed.
