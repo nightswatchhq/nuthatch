@@ -334,4 +334,5 @@ Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the co
 - `--chains <CHAINS>` - Chains this worker can host. The scheduler decides which it *should* run and the lease decides which it *does*; this is only what the machine is capable of
 - `--id <ID>` - This worker's identity in the fleet. Defaults to the hostname, which is unique per container under compose. **Two workers sharing an id would look like one to the registry** and could each hold what it believed was its own lease, so this is derived rather than left to chance
 - `--budget-mb <BUDGET_MB>` - RAM ceiling for everything this worker runs, in MB. The scheduler will not commit cursors past it - Σ assigned cursors ≤ this
+- `--nest-root <NEST_ROOT>` - Where to find the nests this worker is asked to index. `<root>/<name>` if that exists, else `<root>` itself when it is a single nest - which is what the compose topology mounts
 - `--no-secrets` - Skip fetching runtime secrets for assigned nests (RFC-0022 §5)
