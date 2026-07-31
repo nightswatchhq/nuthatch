@@ -129,7 +129,7 @@ Cloud items come up together and go down together rather than billing while some
 | # | Item | Needs | Spend | Gate |
 |---|---|---|---|---|
 | 1 | **0.9.0** - RFC-0029 complete | the timestamped A/B to finish | none | in flight |
-| 2 | **RFC-0022 slice 3b** - view rebuilds onto `HotStore` | nothing - pure code | none | lets the compose FE mount go back to `:ro` |
+| 2 | ~~**RFC-0022 slice 3b**~~ **done** (2026-07-31) | - | - | FE mount is `:ro` again |
 | 3 | **Multi-machine verification** | 3 Cloud boxes | ~EUR 0.03/hr | the **last unverified claim** in prod-readiness §11 |
 | 4 | **RFC-0013** - DataFusion | one `ccx63`, hourly | ~EUR 0.30/hr | **the benchmark is the deliverable** |
 | 5 | **RFC-0023 tier 3** | an archive RPC (have one) | none | acceptance test already written |
@@ -181,9 +181,11 @@ Small, and worth doing when they block someone rather than on a schedule:
 - **Multi-machine verification** (`fleet-lab.sh up multi`, then `partition` and `skew`). Not listed
   above because it is an hour and a few euros, not a sprint item - but it is the last unverified claim
   in prod-readiness §11, so do it before telling anyone RFC-0022 is proven across machines.
-- **RFC-0022 slice 3b** - move the view rebuilds onto the `HotStore` trait so an FE stops opening a
-  local redb. That is what lets the compose FE mount go back to `:ro`, and the comment in
-  `docker-compose.scaled.yml` is the reminder.
+- ~~**RFC-0022 slice 3b**~~ **done 2026-07-31.** Smaller than it looked: the rebuild helpers already
+  took `&dyn HotStore`, and the only concrete dependency was `build_nest` calling `Store::open`
+  *unconditionally* - so a query-FE handed a `store_override` still created a redb file it never read.
+  The hot store is now resolved once and nothing downstream knows which backend it got. FE mount is
+  `:ro`.
 - **Operator-side, not ours:** rotating the credentials that went through the 2026-07-29/30 session
   transcript, and publishing GHSA-jvjx-5528-r6mm if it is to be public - the fix shipped in 0.6.2.
 
