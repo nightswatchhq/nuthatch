@@ -82,6 +82,19 @@ pub struct Config {
     /// decode and schema exist ahead of the source deliberately - see [`Extract`].
     #[serde(default, skip_serializing_if = "Extract::is_empty")]
     pub extract: Extract,
+    /// Optional irreducible `eth_call` reads (RFC-0023 tier 3). Each is resolved at **pinned
+    /// historical blocks** and content-addressed by `(chain, block, contract, calldata)`.
+    ///
+    /// Reach for this **last**. Tier 1's recipes derive most contract state from events already
+    /// indexed - no RPC, no archive node, deterministic and free - and tier 2 caches immutable
+    /// metadata. A `[[calls]]` entry is for what genuinely cannot be derived: an oracle read, an
+    /// ungoverned parameter, a view on a contract whose events the nest does not fully cover.
+    ///
+    /// Declaring any of these means the nest **needs an archive RPC** for the range it backfills.
+    /// That is the one external dependency tier 3 introduces, and it is why the derive-first tiers
+    /// exist: they keep the zero-dependency default intact for everyone who does not need this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<crate::calls::CallDecl>,
 }
 
 /// A user webhook subscription (RFC-0010 Part B): rows of `table` matching `where` are POSTed to `url`.
@@ -386,6 +399,11 @@ impl Config {
             })?,
         };
         cfg.check_schema_version()?;
+        // Declarations are validated at load, not at the first round trip: a typo'd address would
+        // otherwise surface thousands of blocks into a backfill as a wall of identical failures.
+        for c in &cfg.calls {
+            c.validate()?;
+        }
         Ok(cfg)
     }
 
@@ -451,6 +469,7 @@ impl Config {
             factories: Vec::new(),
             webhooks: Vec::new(),
             extract: Extract::default(),
+            calls: Vec::new(),
         })
     }
 
@@ -527,6 +546,7 @@ mod tests {
             factories: Vec::new(),
             webhooks: Vec::new(),
             extract: Extract::default(),
+            calls: Vec::new(),
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();

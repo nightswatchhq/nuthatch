@@ -670,11 +670,103 @@ impl RpcClient {
     /// A read-only `eth_call` at latest block: send `data` (a selector + args) to `to`, returning the
     /// raw hex result. Used at init to ask a beacon proxy's beacon for its `implementation()`; never on
     /// the ingest path.
+    /// `eth_call` at **`latest`** - for one-shot, out-of-band reads only.
+    ///
+    /// **Never use this in the data path.** `latest` is not re-executable: the same call answers
+    /// differently tomorrow, so anything it produced could not be re-derived and would break the
+    /// determinism non-negotiable. RFC-0023 §3 is explicit about it. Its legitimate users are proxy
+    /// detection at `init` and the immutable-metadata fetch (`decimals`/`symbol`/`name`, which by
+    /// definition cannot change). For anything that gets stored, use [`RpcClient::eth_call_at`].
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<String> {
         let result = self
             .call("eth_call", json!([{ "to": to, "data": data }, "latest"]))
             .await?;
         Ok(result.as_str().unwrap_or("0x").to_string())
+    }
+
+    /// `eth_call` **pinned to a historical block** - the tier-3 data-path primitive (RFC-0023 §3).
+    ///
+    /// Determinism comes from the pin: `result = f(code, storage, block, calldata)`, so re-executing
+    /// the same call at the same block on any machine, at any later date, returns the same bytes. That
+    /// is what makes a call result safe to seal into an immutable segment and content-address.
+    ///
+    /// Needs an archive endpoint for blocks past the pruning window - which is the *only* thing tier 3
+    /// asks an operator for, and only for the irreducible residue the tier-1 recipes cannot derive.
+    pub async fn eth_call_at(&self, to: &str, data: &str, block: u64) -> Result<String> {
+        let result = self
+            .call(
+                "eth_call",
+                json!([{ "to": to, "data": data }, format!("0x{block:x}")]),
+            )
+            .await?;
+        Ok(result.as_str().unwrap_or("0x").to_string())
+    }
+
+    /// Many pinned calls at one block in a single JSON-RPC batch (RFC-0023 §3: "batched, the same
+    /// batched-boundary discipline as log extraction").
+    ///
+    /// Returns results **positionally**, so a caller can zip them back against its declarations. A
+    /// call that reverted or that the endpoint declined yields `None` in that slot rather than failing
+    /// the batch: a revert is a legitimate answer about chain state at that block (the function may not
+    /// have existed yet), and collapsing it into a whole-batch error would make one unlucky
+    /// declaration poison every other call at the same block.
+    ///
+    /// Like the timestamp batch, this **narrows on a size failure instead of retrying the same width**
+    /// - see RFC-0029 §4c, where the same defect appeared three times in a row.
+    pub fn eth_call_batch_at<'a>(
+        &'a self,
+        calls: &'a [(String, String)],
+        block: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Option<String>>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if calls.is_empty() {
+                return Ok(Vec::new());
+            }
+            match self.eth_call_batch_once(calls, block).await {
+                Ok(v) => Ok(v),
+                Err(e) if calls.len() > 1 && crate::chunker::is_result_too_large(&e) => {
+                    let mid = calls.len() / 2;
+                    let (a, b) = calls.split_at(mid);
+                    let mut out = self.eth_call_batch_at(a, block).await?;
+                    out.extend(self.eth_call_batch_at(b, block).await?);
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    async fn eth_call_batch_once(
+        &self,
+        calls: &[(String, String)],
+        block: u64,
+    ) -> Result<Vec<Option<String>>> {
+        let batch: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (to, data))| {
+                json!({ "jsonrpc": "2.0", "id": i, "method": "eth_call",
+                        "params": [{ "to": to, "data": data }, format!("0x{block:x}")] })
+            })
+            .collect();
+        let resp = self.post_with_failover(&Value::Array(batch)).await?;
+        let mut out = vec![None; calls.len()];
+        for item in resp.as_array().into_iter().flatten() {
+            let Some(idx) = item.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(slot) = out.get_mut(idx as usize) else {
+                continue;
+            };
+            // `error` here is a revert or an unsupported call at that block - a fact about chain
+            // state, not a transport failure, so it stays `None` rather than aborting the batch.
+            *slot = item
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        Ok(out)
     }
 
     /// Contract bytecode at `address` as of `block`. `"0x"` (empty) means not yet deployed.

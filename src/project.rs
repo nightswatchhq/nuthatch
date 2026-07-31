@@ -121,6 +121,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
         factories: Vec::new(),
         webhooks: Vec::new(),
         extract: Extract::default(),
+        calls: Vec::new(),
     };
     config.save(&dir)?;
 
