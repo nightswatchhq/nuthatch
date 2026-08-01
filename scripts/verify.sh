@@ -260,6 +260,44 @@ level5() {
     skip 5.10b "'too large' is distinguished from 'no room'" "no workers registered yet"
   fi
 
+  # 5.11: **the writer pool actually writes.**
+  #
+  # Every other level-5 check tests the control plane - registration, planning, leases, fencing,
+  # pinning, secrets - and for a long time all of them passed while `worker::run` contained no
+  # indexing code at all (issue #250). "10/10, zero skipped" was true and meant less than it read: a
+  # cursor was assigned and owned correctly, and owning one caused nothing to happen.
+  #
+  # So this asserts the product rather than the machinery around it: a worker holding a cursor moves
+  # `last_block` in the shared store. It is the one check that could not have passed before the fix,
+  # and the one whose absence let the gap survive a release.
+  #
+  # Generous timeout: a cold nest backfills before its first checkpoint, and a slow public endpoint is
+  # not a product failure. A *skip* here is worth more than a flaky pass - the point is to be honest
+  # about whether indexing was observed, not to go green.
+  if [ -n "${HOT_STORE_PSQL:-}" ]; then
+    check 5.11 "a held cursor actually indexes - last_block advances in the shared store" \
+      bash -c '
+        deadline=$(( $(date +%s) + 180 ))
+        first=""
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          v=$($HOT_STORE_PSQL -tAc "select value from information_schema.tables t
+                join lateral (select value from meta_all where key='"'"'last_block'"'"') m on true
+                limit 1" 2>/dev/null | head -1)
+          # Fall back to scanning cursor schemas directly - schema names vary by chain.
+          [ -z "$v" ] && v=$($HOT_STORE_PSQL -tAc "select m.value from pg_tables t
+                cross join lateral (select value from meta where key='"'"'last_block'"'"') m
+                where t.schemaname like '"'"'cursor_%'"'"' limit 1" 2>/dev/null | head -1)
+          if [ -n "$v" ]; then
+            [ -z "$first" ] && first="$v"
+            [ "$v" -gt "$first" ] 2>/dev/null && exit 0
+          fi
+          sleep 5
+        done
+        exit 1'
+  else
+    skip 5.11 "a held cursor actually indexes" "set HOT_STORE_PSQL to a psql command against the shared store"
+  fi
+
   # 5.7: one pinned answer per endpoint, fleet-wide.
   check 5.7a "an unpinned endpoint is not servable" \
     bash -c "[ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = False ]"

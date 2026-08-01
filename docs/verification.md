@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **mostly** | 41 tests against a live Postgres, plus **10/10 level-5 checks on a clean Hetzner box against the published v0.9.2 artifacts** (2026-07-31, re-confirmed after a settling delay - see below). **Multi-machine is NOT implemented**, not merely unrun: the lab's `multi` shape provisions three boxes and runs the whole fleet on one of them. |
+| 5 Scaled mode | **control plane only** | 10/10 level-5 checks pass on published artifacts. **But every level-5 check tests the control plane** - grep that section for `last_block`/`indexed`/`rows`/`entities` and it returns 0 - and the writer pool **never indexes** (issue #250). Cursors are assigned and owned correctly; owning one causes nothing to happen. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -314,6 +314,20 @@ unauthenticated off-localhost.
 > network payload (so `multi` had never created a box), a missing capacity fallback, a 409 on a
 > leftover network, error handling that hid all three behind `curl: (56)`, inconsistent SSH host-key
 > policy against recycled IPs, and a `psql` helper that never `cd`'d to its compose file.
+>
+> **2026-07-31 - the writer pool does not write (issue #250), and it re-reads everything below.**
+>
+> `worker::run` registers, takes leases, loads secrets and reports. It contains **no indexing code** -
+> no `index_loop`, no `build_nest`, no backfill path. A worker acquires a cursor and does nothing with
+> it, so `last_block` never moves.
+>
+> **The 10/10 was true and meant less than it read.** Those checks are real and they passed: they
+> exercise registration, planning, unplaceable reporting, lease fencing, fleet-wide version pinning
+> and write-only secrets. **Not one asserts that a row appears.** That is the shape of the failure -
+> a suite that verifies the machinery *around* a thing rather than the thing - and a level-5 check
+> that asserts indexed data is part of the fix, or it recurs.
+>
+> The embedded path (`dev`, `roost`) is unaffected; this is scaled mode only.
 
 >
 > **A first-run 5.1b failure should be re-run before it is reported.** The harness runs its level-5
