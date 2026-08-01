@@ -514,12 +514,29 @@ fn init_from(source: &str, dir_arg: &str) -> Result<()> {
 }
 
 /// Whether `--from` names a git remote (vs. a local directory).
+/// Transports git will accept from us. Anything else is not a git source, whatever it is named.
+///
+/// **Audit finding 6.** The `.git` suffix used to be sufficient on its own, so `ext::sh -c … .git`
+/// reached `git clone` - and git's `ext::` transport *executes the command*. It is refused today only
+/// by git's own `protocol.ext.allow=never` default (git >= 2.12). An operator with
+/// `protocol.ext.allow=always` in their gitconfig - not unheard of in CI images - would have turned
+/// `nuthatch init --from <url>` into remote code execution.
+///
+/// Being safe by someone else's default is not the same as being safe. The scheme is now checked here,
+/// so the guarantee is ours: a `.git` suffix qualifies a source only when its transport is one we
+/// named. `ext::`, `file::`, `transport-helper::` and anything else are simply not git sources.
+const GIT_SCHEMES: &[&str] = &["http://", "https://", "ssh://", "git://"];
+
 fn is_git_source(source: &str) -> bool {
-    source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-        || source.starts_with("ssh://")
-        || source.ends_with(".git")
+    if source.starts_with("git@") {
+        return true; // scp-like syntax: user@host:path, no scheme to check
+    }
+    if GIT_SCHEMES.iter().any(|p| source.starts_with(p)) {
+        return true;
+    }
+    // A `.git` suffix alone is not enough: it must still look like a plain path or scp-like target,
+    // never a transport helper. `::` is the marker git uses for those (`ext::`, `transport::`).
+    source.ends_with(".git") && !source.contains("::")
 }
 
 /// The nest's own name: the last path component, minus a trailing `.git` or slash.
@@ -1424,5 +1441,45 @@ abi = "abis/tok.json"
 "#,
         )
         .unwrap();
+    }
+
+    /// **Audit finding 6.** A `.git` suffix must not qualify a transport helper as a git source.
+    ///
+    /// `git clone 'ext::sh -c <cmd>'` executes the command. Before this, `ext::sh -c … .git` passed
+    /// `is_git_source` and reached `git clone`, and was refused only by git's own
+    /// `protocol.ext.allow=never` default. An operator who has set that to `always` - CI images do -
+    /// would have had remote code execution from `init --from`.
+    #[test]
+    fn a_transport_helper_is_not_a_git_source() {
+        for hostile in [
+            "ext::sh -c touch /tmp/pwned .git",
+            "ext::sh -c id",
+            "transport-helper::whatever.git",
+            "file::/etc/passwd.git",
+        ] {
+            assert!(
+                !is_git_source(hostile),
+                "must not be treated as a git source: {hostile}"
+            );
+        }
+    }
+
+    /// …and the real ones still are, or `init --from` stops working for everyone.
+    #[test]
+    fn ordinary_git_sources_still_qualify() {
+        for ok in [
+            "https://github.com/nightswatchhq/poa-nest",
+            "https://github.com/nightswatchhq/poa-nest.git",
+            "http://internal.example/nest.git",
+            "ssh://git@github.com/x/y.git",
+            "git@github.com:nightswatchhq/poa-nest.git",
+            "git://legacy.example/x.git",
+            "/srv/nests/mine.git",
+        ] {
+            assert!(is_git_source(ok), "must still be a git source: {ok}");
+        }
+        // A plain local directory is not a git source and must still load as a directory.
+        assert!(!is_git_source("./my-nest"));
+        assert!(!is_git_source("/srv/nests/mine"));
     }
 }
