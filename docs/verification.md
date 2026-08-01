@@ -329,6 +329,12 @@ unauthenticated off-localhost.
 >
 > The embedded path (`dev`, `roost`) is unaffected; this is scaled mode only.
 
+>
+> **A first-run 5.1b failure should be re-run before it is reported.** The harness runs its level-5
+> checks ~23 s after `compose up`, before workers have heartbeated, so worker-registration can fail
+> once and pass immediately after. That is a readiness-gating flaw in the harness, not a product
+> fault - and it is why the distributed path now waits for registration rather than sleeping and
+> hoping.
 > **2026-07-30 - the two cross-machine cases were repaired before ever being run.** `partition` and
 > `skew` printed their expectations for a human to read and asserted nothing, which hid two defects in
 > the tests themselves: `partition` blocked the whole control-plane *host*, and since Postgres runs on
