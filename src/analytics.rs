@@ -2545,13 +2545,18 @@ template="pool"
     /// unreachable is the same failure as `reconcile::tick` having six passing tests and no caller, and
     /// as the writer pool holding leases with no indexing code behind them.
     ///
-    /// `read_xlsx` is the probe on purpose: it is **not** in `FORBIDDEN_FNS`, so a refusal here can
-    /// only come from the allowlist. If someone removes the call, this fails.
+    /// The probe must be a name `FORBIDDEN_FNS` genuinely does **not** list, or the denylist answers
+    /// first and this proves nothing about the allowlist. `read_xlsx` was the original probe and
+    /// stopped being valid the moment audit finding 4 added it to the denylist - this test caught its
+    /// own obsolescence, which is the behaviour worth having.
     #[test]
     fn the_allowlist_is_reachable_from_the_public_query_path() {
         let dir = tempfile::tempdir().unwrap();
-        let err = query(dir.path(), "SELECT * FROM read_xlsx('/etc/passwd')")
-            .expect_err("a function the denylist does not list must still be refused");
+        let err = query(
+            dir.path(),
+            "SELECT * FROM read_some_future_format('/etc/passwd')",
+        )
+        .expect_err("a function the denylist does not list must still be refused");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not permitted") || msg.contains("tables and views only"),
@@ -2561,7 +2566,7 @@ template="pool"
         // And the guarded surface, which is the one actually exposed over HTTP.
         let err = query_guarded(
             dir.path(),
-            "SELECT * FROM read_xlsx('/etc/passwd')",
+            "SELECT * FROM read_some_future_format('/etc/passwd')",
             QueryGuard {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
