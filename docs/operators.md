@@ -13,7 +13,7 @@ still honestly unfinished.
 before a build ships. This document is the *run* guide - what must be true in your environment.
 [`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
 
-Written against **0.9.3** (2026-07-30). Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **1.0.0** (2026-08-02). Read [Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -79,7 +79,7 @@ A container image is published per release:
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
   -e NUTHATCH_ADMIN_TOKEN=change-me \
-  ghcr.io/nightswatchhq/nuthatch:0.9.3
+  ghcr.io/nightswatchhq/nuthatch:1.0.0
 ```
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
@@ -93,11 +93,9 @@ sends SIGTERM, which drains and checkpoints cleanly.
 `linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
 Pin the version tag rather than `:latest` for anything you care about.
 
-> **Scaled mode's writer pool does not yet index (issue #250).** The control plane works - workers
-> register, cursors are scheduled and leased with a store-enforced fence, secrets are injected - but a
-> worker that acquires a cursor runs no ingestion loop, so no rows appear. Use **embedded mode**
-> (`nuthatch dev`, or `roost` for many nests) for anything real until that lands. Everything below
-> describes the topology accurately; it is the ingestion half that is missing.
+> **The writer pool indexes as of 0.9.3.** Until then it did not: a worker registered, took a lease
+> and reported, and ran no ingestion loop, so no rows appeared (issue #250). If you are on 0.9.2 or
+> earlier, scaled mode does not write - upgrade, or use embedded mode.
 
 **Scaled mode needs the `-scaled` image**, not this one. The default image is the embedded build and
 carries no database driver. `nuthatch worker` and `nuthatch control` are still *listed* in its `--help`
@@ -113,7 +111,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:0.9.3-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:1.0.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external

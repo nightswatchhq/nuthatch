@@ -505,7 +505,7 @@ and `last_block` to advance in the shared store.
 
 *Proves* the half of scaled mode that RFC-0022 named and did not build: an operator declares a nest
 centrally, and the machine that ends up holding that cursor may have nothing on disk. `desired_nest`
-recorded a `version` and a `bundle_hash` from the beginning; until v0.9.4 nothing on the worker side
+recorded a `version` and a `bundle_hash` from the beginning; until v1.0.0 nothing on the worker side
 read them, which is why a worker could be assigned a nest it had no way to locate (issue #250).
 
 Two details are the point rather than incidental:

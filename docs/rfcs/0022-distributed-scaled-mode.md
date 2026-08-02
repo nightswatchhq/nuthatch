@@ -1,6 +1,6 @@
 # RFC-0022: Distributed scaled mode - read/write planes, a writer pool, dynamic nest placement
 
-- Status: **Implemented, control plane and ingestion both** (v0.9.3 wired ingestion, v0.9.4 the
+- Status: **Implemented, control plane and ingestion both** (v0.9.3 wired ingestion, v1.0.0 the
   registry pull). Proven across machines rather than argued: registration, scheduling, leases with a
   store-enforced fence, clock-skew safety, indexing into the shared store, and 377 blocks indexed
   through a 90-second control-plane outage.

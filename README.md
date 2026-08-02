@@ -55,6 +55,10 @@ cargo install --git https://github.com/nightswatchhq/nuthatch nuthatch
 Prebuilt binaries (macOS Apple Silicon, Linux x86_64) ship with each release, or install in one line:
 `curl -fsSL https://nuthatch-indexer.com/install.sh | sh`.
 
+**Container images** are published per release to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for
+embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
+release*, so the two cannot drift.
+
 **Chains.** Ethereum, Arbitrum One and Base are *built in*, with keyless public endpoints and tuned
 finality settings - **omit `--chain` and nuthatch probes each for your contract's bytecode and picks the
 one it lives on.** Point at your own node with `--rpc`.
@@ -82,6 +86,14 @@ They are **not** fine for real work, and it is better to hear that here than to 
   `eth_getLogs` calls. Expect a free endpoint to throttle you long before that finishes.
 - **No archive guarantees.** Many free endpoints prune old state, so a backfill from a 2020 deploy block
   can simply fail partway.
+
+**Check an endpoint before you trust a backfill to it.** `nuthatch doctor` probes one and reports the
+largest `getLogs` window it will actually serve, its batch limit, and whether it has archive history -
+measured, not taken from the provider's documentation:
+
+```sh
+nuthatch doctor --rpc https://your-endpoint.example --address 0xADDR
+```
 
 **Use your own endpoint for anything you care about** - your own node, or a paid provider:
 
@@ -124,6 +136,38 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   `SUM(value_dec)` just works.
 - **AI-native.** A Model Context Protocol server is compiled in (`nuthatch mcp`) - point Claude (or any
   MCP client) at your indexer and ask your contract's data in plain English, fully offline.
+
+---
+
+## How fast is it
+
+We ran **someone else's** benchmark rather than writing our own: Sentio's
+[OBIB](https://github.com/sentioxyz/open-blockchain-indexer-benchmark). Case 1 indexes `Transfer` from
+LBTC across 22.2M Ethereum blocks.
+
+| | |
+|---|---|
+| wall clock | **74.8 s** |
+| events | **294,278** (matches Sentio's own README exactly) |
+| RPC requests | **321** |
+| peak RSS | **320 MB** |
+
+Against a real provider (Alchemy), on an 11-core laptop. The artifact is
+[`docs/bench/obib-case1.json`](docs/bench/obib-case1.json); `nuthatch bench backfill` re-runs it.
+
+Two things that number is worth knowing about:
+
+- **It did not finish at all before v0.9.0.** Alchemy returns its oversized-range refusal as HTTP
+  **400**, which our status classifier did not enumerate — so a window that needed splitting was
+  retried unchanged, forever. Running an outside benchmark found a defect that our own testing had not.
+- **~85% of the original wall clock was buying `block_timestamp`** — one serial round trip per block,
+  for a column that workload never stores. Timestamps are now demand-driven and the log window adapts
+  to what an endpoint will actually serve. See [RFC-0029](docs/rfcs/0029-the-fastest-indexer.md).
+
+**Analytical queries** run on DuckDB over sealed Parquet. We benchmark-gated the alternative rather
+than arguing about it: DataFusion measured **1.6–2.7× slower** on the fold that matters, with the gap
+widening as segments grow, at exact result parity —
+[RFC-0013 §5](docs/rfcs/0013-storage-and-query-engine-direction.md).
 
 ---
 
@@ -218,7 +262,10 @@ who need more - none of it in the way of the happy path:
   wakes up finds its writes **refused** rather than merely discouraged. Nests are added and removed
   over HTTP with no restarts, versions are pinned fleet-wide so two FE nodes can never serve the same
   endpoint from different schemas, and runtime secrets are injected at mount - scoped to the nests a
-  worker actually holds, write-only, and never baked into a content-addressed bundle. This is the
+  worker actually holds, write-only, and never baked into a content-addressed bundle. A worker **pulls
+  the nests it is assigned** from a registry, because the machine the scheduler picks may have nothing
+  on disk; with a `bundle_hash` pinned the fetch is by **content address**, so re-tagging a version in
+  a registry cannot change what a fleet runs. This is the
   **self-hosted distributed** path for one operator's cooperating nests; per-tenant billing and authz
   between untrusting paying customers stay firmly out of scope.
 - **Nest bundles + registry - bundle one, publish it, load it anywhere.** `nuthatch nest bundle` packs
@@ -293,9 +340,45 @@ The guide covers the questions people actually hit:
 
 ---
 
+## What 1.0 means here
+
+1.0 is a promise about **stability**, not a claim of completeness.
+
+- **Semantic versioning.** Within 1.x we do not rename or remove a CLI flag, an HTTP route, a config
+  key, or a generated column without a major bump. The one thing that has never needed a promise is
+  on-disk state: a newer binary has always read an older release's hot store and sealed segments as
+  they are, and that stays true.
+- **Upgrades are a binary swap.** No data migration, no re-backfill, no conversion step. Proven on a
+  production box across 0.3.0 → 0.6.0 → 0.7.2, and in CI on every release since.
+- **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
+  build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
+  command. A version nobody tests is not a promise.)
+- **Embedded mode is the production path.** `dev` and `roost` run in production today. **Scaled mode
+  is built and verified across real machines, but younger** - and until 0.9.3 its writer pool did not
+  index at all. If one process per box is enough, that is still the shape to reach for.
+
+**What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains, or any
+deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
+
+## Security
+
+nuthatch binds `127.0.0.1` by default and is built to be **fronted**. Before you expose `/sql` to
+anyone you do not trust, read [`SECURITY.md`](SECURITY.md) - and be on a current release:
+
+- **v0.9.3** fixes an **arbitrary file read** on `/sql`. DuckDB accepts a *quoted* function name and
+  the guard only matched an unquoted one, so `SELECT * FROM "read_csv"('/etc/passwd')` executed. Every
+  earlier release is affected.
+- **v0.6.2** fixes an **arbitrary file write** on `/sql` via `;`-stacked `COPY … TO`.
+
+Both have published advisories on the repo's Security tab. The full pre-1.0 adversary pass, including
+the findings we closed as *not ours to fix* and why, is in
+[`docs/security-audit-2026-07-31.md`](docs/security-audit-2026-07-31.md).
+
+---
+
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0028); the north star and the CLI/UX direction are
+- **Design** lives in [RFCs](docs/rfcs/) (0001-0029); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
 - **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no

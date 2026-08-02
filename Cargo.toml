@@ -1,8 +1,12 @@
 [package]
 name = "nuthatch"
-version = "0.9.3"
+version = "1.0.0"
 edition = "2021"
-rust-version = "1.85"
+# **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
+# 1.94, actix 1.88 - so the 1.85 this declared until 1.0 was a promise nothing could keep. 1.95 is what
+# `rust-toolchain.toml`, CI, and the release build all use, so it is the only version we can honestly
+# claim. Raising it needs a reason; lowering it needs a green build on the lower toolchain.
+rust-version = "1.95"
 description = "Be your own indexer. One Rust binary, one command, live in under two minutes."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nightswatchhq/nuthatch"

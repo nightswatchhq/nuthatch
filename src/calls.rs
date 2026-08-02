@@ -146,7 +146,7 @@ impl CallDecl {
                 self.calldata
             );
         }
-        if d.len() % 2 != 0 {
+        if !d.len().is_multiple_of(2) {
             bail!(
                 "call `{}`: `calldata` has an odd number of hex digits ({}) - it is not whole bytes",
                 self.name,
