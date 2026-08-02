@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Roost | yes | live two-chain run, 8-nest density run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **control plane only** | 10/10 level-5 checks pass on published artifacts. **But every level-5 check tests the control plane** - grep that section for `last_block`/`indexed`/`rows`/`entities` and it returns 0 - and the writer pool **never indexes** (issue #250). Cursors are assigned and owned correctly; owning one causes nothing to happen. |
+| 5 Scaled mode | **verified across machines** | A distributed fleet on published v0.9.3 artifacts indexed for real: a worker on its own box, holding a leased cursor, advanced `last_block` in a Postgres on another box (490,332,652 → 490,338,764). Clock-skew safety proven earlier the same way. `partition` is now unblocked and still unrun. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -314,6 +314,22 @@ unauthenticated off-localhost.
 > network payload (so `multi` had never created a box), a missing capacity fallback, a 409 on a
 > leftover network, error handling that hid all three behind `curl: (56)`, inconsistent SSH host-key
 > policy against recycled IPs, and a `psql` helper that never `cd`'d to its compose file.
+>
+> **2026-08-02 - RESOLVED, and measured.** A distributed fleet on the **published v0.9.3 artifacts**
+> indexed for real: control plane and store on one box, workers on their own, and the cursor schema
+> went from lease-keys-only to carrying `start_block`, `block_timestamps` and a climbing `last_block`
+> (490,332,652 → 490,338,764). Those keys are written by `build_nest`/`index_loop` - code a worker
+> never reached before. **The writer pool writes.**
+>
+> Two things worth keeping from the run. A cursor handover mid-test incremented `owner_fence` to 2 and
+> moved `lease_owner`, so the fence was exercised by a real handover rather than a simulated one. And
+> the first attempt stalled on `HTTP 429` from a free public endpoint - the batch narrowing correctly
+> *refused* to split there, since halving under a rate limit doubles requests in the wrong direction.
+>
+> **5.11 initially failed for want of a precondition it never established**: it asserts a held cursor
+> indexes, and no nest was declared, so there was nothing to index. The lab now declares one first. A
+> check that asserts an outcome without arranging its cause is the same shape as the bug it was written
+> to catch.
 >
 > **2026-07-31 - the writer pool does not write (issue #250), and it re-reads everything below.**
 >
