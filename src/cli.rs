@@ -663,6 +663,24 @@ pub struct InitArgs {
     #[arg(long, conflicts_with = "addresses")]
     pub from: Option<String>,
 
+    /// Scaffold from a Graph Protocol subgraph manifest: an IPFS CID (`QmVPhL…`, `ipfs://QmVPhL…`)
+    /// or a URL to a `subgraph.yaml`. Maps `dataSources` → `[[contracts]]` and `templates` →
+    /// `[[templates]]`, vendors every ABI from its pinned CID, and carries `startBlock` across.
+    ///
+    /// The ABIs a manifest pins are strictly better than Sourcify for proxy-heavy codebases:
+    /// Sourcify returns the proxy ABI, which declares none of the events the contract emits.
+    ///
+    /// Which template a factory creates lives in the mapping WASM, not the manifest, so factory
+    /// rules are inferred only where a parameter unambiguously names a template. Everything else is
+    /// reported by name with candidates for you to resolve - never guessed.
+    #[arg(long, conflicts_with_all = ["addresses", "from"], value_name = "CID_OR_URL")]
+    pub from_subgraph: Option<String>,
+
+    /// IPFS gateway(s) to try, in order, when resolving `--from-subgraph` (repeatable). Each is a
+    /// URL prefix that a CID is appended to. Defaults to The Graph's gateway, then ipfs.io.
+    #[arg(long, value_name = "URL_PREFIX")]
+    pub ipfs: Vec<String>,
+
     /// Optional aliases, one per address in order (comma-separated). Defaults to c0, c1, ….
     #[arg(long, value_delimiter = ',')]
     pub alias: Vec<String>,

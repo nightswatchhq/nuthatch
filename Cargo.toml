@@ -29,6 +29,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Subgraph manifests are YAML (`init --from-subgraph`). yaml-rust2 rather than
+# serde_yaml, which is archived (RUSTSEC-2024-0320) and would trip the
+# `unmaintained = "workspace"` gate in deny.toml on a direct dependency.
+# MIT OR Apache-2.0, so it clears the licence allow-list unchanged.
+yaml-rust2 = "0.11"
 toml = "0.8"
 redb = "2"
 arrow = { version = "58", features = ["ipc"] }
