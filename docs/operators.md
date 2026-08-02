@@ -261,9 +261,12 @@ mount at different heights, and each backfills its own history; the cursor only 
 Nests live in their own repositories rather than in-tree; see the
 [nest catalogue](nest-catalogue.md) for what ships and what is planned.
 
-> **Scaled mode does not exist yet.** The docker-compose topology with Postgres and DataFusion
-> federation (RFC-0013, RFC-0022) is designed and not built. Today, horizontal scale means more
-> processes on more boxes, each owning its own nests.
+> **Scaled mode exists** (RFC-0022): a Postgres hot store, a writer pool taking one lease per cursor,
+> a query-FE tier, and a control plane holding desired state — see *Scaled mode* below. DataFusion
+> federation (RFC-0013) is a separate question and remains DuckDB today.
+>
+> It is newer and less exercised than embedded mode, which runs in production. If one process per box
+> is enough for you, that remains the recommended shape.
 
 ---
 
@@ -360,10 +363,13 @@ you are standing up a new nest over a long history. **When it is clearly wrong:*
 unsure, keep them - the default is on for a reason.
 
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
-(RFC-0019 §4) is that secrets never go into a published bundle. Per-nest secret injection at mount
-time is designed (RFC-0022 §5) and not built. Until then: keep private endpoints in the on-disk
-config, keep the directory `0700` and owned by the service user, and never publish a bundle built from
-a config carrying a credential.
+(RFC-0019 §4) is that secrets never go into a published bundle — so keep the directory `0700` and
+owned by the service user, and never publish a bundle built from a config carrying a credential.
+
+In **scaled** mode, per-nest secret injection at mount time is built (RFC-0022 §5): secrets live in the
+control plane and a worker receives only those of the nests it is actually assigned. The interface is
+write-only — you can list which keys exist and never read a value back — and rotating one changes no
+bundle hash, so it neither invalidates segment reuse nor forces a re-index.
 
 ---
 
@@ -743,13 +749,19 @@ Stated plainly, because finding them yourself in production would be worse.
   data. It refuses rather than truncating, because a partial tip would silently change the answer to an
   aggregate. Generous enough to be invisible on a normal chain; it exists so a deep-finality tip turns
   into a clear error instead of an OOM that takes co-tenants with it.
-- **No published container image.** Build from the recipe above. For a platform team this is a real
-  gap, not a nicety.
-- **Secrets live in on-disk config.** Private RPC URLs and webhook HMAC secrets sit in the nest's
-  `nuthatch.toml`. Per-nest, per-worker injection is specified (RFC-0022 §5) and not built, so today
-  the mitigation is filesystem permissions: `0700`, owned by the service user.
-- **No scaled mode.** No Postgres hot store, no writer pool, no query-FE tier, no DataFusion
-  federation. All designed (RFC-0013, RFC-0022), none built.
+- **Container images are published** to `ghcr.io/nightswatchhq/nuthatch` — `:<version>` for embedded,
+  `:<version>-scaled` for the scaled build. The recipe above still works if you would rather build one.
+- **Secrets live in on-disk config *in embedded mode*.** Private RPC URLs and webhook HMAC secrets sit
+  in the nest's `nuthatch.toml`, so the mitigation there is filesystem permissions: `0700`, owned by
+  the service user. In **scaled** mode they live in the control plane and are injected per nest, per
+  worker, scoped to the cursors that worker actually holds (RFC-0022 §5, built) — write-only, so you
+  can list which keys exist and never read a value back.
+- **Scaled mode is built but young.** The control plane, the writer pool, cursor leases with a
+  store-enforced fence, the query-FE tier and the registry pull all exist and are verified across real
+  machines (runbook level 5). It has not run a production workload for anyone, and until 0.9.3 the
+  writer pool did not index at all (#250) — a defect a suite of ten passing checks did not catch,
+  because every one of them tested the control plane rather than the data. Weigh it accordingly.
+  DataFusion federation (RFC-0013) is separate and still unbuilt; both modes use DuckDB.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
   extraction (RFC-0014) are gated on a synced node - an infrastructure decision, not a coding one.
 

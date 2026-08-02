@@ -181,7 +181,8 @@ case.
 - [ ] ✅ e2e harness exists (`TapeSource`) and covers solo, reorg, crash-safety, roost parity.
 - [ ] 🟡 MSRV is honest. - *`Cargo.toml` declares `rust-version = 1.85`, but CI pins the toolchain to
   `1.95.0`. Either test against 1.85 in CI or bump the declared MSRV; right now the claim is
-  unverified. (Also the DataFusion-48/arrow-56 MSRV tension noted in the backlog.)*
+  unverified. The declared MSRV is not cosmetic: it silently selected DataFusion 48 over 54 during the
+  RFC-0013 spike, and cargo reports that as a one-line warning nobody reads.*
 - [ ] 🟡 Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup, subscribe) with
   the RFC-0016 eval harness. - *S1 eval harness gates the semantic-layer work; wire it in.*
 - [ ] 🟡 `--offline` / no-network test path proving AI features degrade gracefully.
@@ -272,11 +273,16 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
   binding `0.0.0.0` inside the container; the FE dying on a `:ro` mount because it still opens the
   local redb; and an undocumented `./nest` requirement whose failure is asymmetric - writers survive,
   FE nodes do not. Bringing it up was worth more than any amount of reading it.
-- [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4,
-  **benchmark-gated**; build scaled-side first. Not skipped because scaled mode moved.*
-- [ ] ⛔ `nuthatch bench` DuckDB-vs-DataFusion spike (latency + RSS within budget) before retiring
-  DuckDB.
-- [ ] ⛔ Golden SQL-compat suite across both engines.
+- [x] ✅ DuckDB-vs-DataFusion spike (latency + RSS). - *Run 2026-08-02 on `net_balances` over sealed
+  segments at 2M/8M/20M rows, each size in both engine orders to defeat the page-cache confound.
+  **DataFusion is 1.6-2.7x slower and the gap widens with size**, at exact result parity. RFC-0013 §5;
+  artifact in `docs/bench/rfc-0013-datafusion-gate.json`.*
+- [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4. **The gate
+  said no for 1.0** - DuckDB stays in both modes. Reopen if a DataFusion release closes the aggregate
+  gap, or if a scaled-mode query genuinely needs one plan spanning Postgres hot and Parquet cold,
+  which is the case DuckDB cannot serve and the real point of §2.*
+- [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike
+  already showed parity on the fold that matters.*
 - [ ] ⛔ A multi-machine run. - *Everything above is verified on one host: several processes and
   connections against one database, which is what two machines are from the data's point of view for
   every invariant tested. It is **not** a substitute for real network partitions or clock skew, and
