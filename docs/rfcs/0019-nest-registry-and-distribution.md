@@ -155,7 +155,7 @@ nest load foo@1.2.0
 this same resolution (a breaking version resolves to a *different endpoint*, a compatible one hot-swaps
 behind the same one). RFC-0022's scheduler calls exactly this flow on whichever worker it places `foo`.
 
-**Built, and with one correction to the sketch above (v0.9.4).** A worker given `--registry` pulls any
+**Built, and with one correction to the sketch above (v1.0.0).** A worker given `--registry` pulls any
 declared nest it cannot find under `--nest-root`. Two things this RFC did not say, both learned from
 wiring it:
 
