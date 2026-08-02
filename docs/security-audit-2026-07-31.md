@@ -14,13 +14,18 @@ write is one you can lose in a version bump without noticing.
 
 | # | Finding | Severity | State |
 |---|---|---|---|
-| 1 | Arbitrary file read via `/sql` — a **quoted function name** evaded the denylist | **High** | **Fixed** |
-| 2 | `duckdb_settings()` / `duckdb_extensions()` disclose absolute paths incl. OS username | Low–Medium | Open |
-| 3 | The `allowed_directories` lockdown is **empty** — the documented second layer is not engaged | Informational | Open |
-| 4 | Extension-gated file readers are absent from the denylist | Latent | Open |
-| 5 | The denylist is an allowlist-shaped problem | Design | Open |
-| 6 | `init --from` relies on git's `protocol.ext.allow` default | Defence-in-depth | Open |
-| 7 | Bundle outbound-URL warning does not distinguish link-local / metadata targets | Hardening | Open |
+| 1 | Arbitrary file read via `/sql` — a **quoted function name** evaded the denylist | **High** | **Fixed** (0.9.3) |
+| 2 | `duckdb_settings()` / `duckdb_extensions()` disclose absolute paths incl. OS username | Low–Medium | **Fixed** (0.9.3) |
+| 3 | The `allowed_directories` lockdown is **empty** — the documented second layer is not engaged | Informational | **Won't fix, measured** |
+| 4 | Extension-gated file readers are absent from the denylist | Latent | **Fixed** (0.9.3) |
+| 5 | The denylist is an allowlist-shaped problem | Design | **Addressed** (0.9.3) |
+| 6 | `init --from` relies on git's `protocol.ext.allow` default | Defence-in-depth | **Fixed** (0.9.3) |
+| 7 | Bundle outbound-URL warning does not distinguish link-local / metadata targets | Hardening | **Fixed** (0.9.3) |
+
+All seven are closed. Three of the fixes are worth reading past their status, because *how* they were
+closed differs: finding 3 is closed as **not ours to fix** rather than fixed, finding 5 by a new control
+alongside the old one rather than replacing it, and finding 4 by a rule that immediately caught its own
+test being obsolete. Details below.
 
 ### 1. Arbitrary file read via `/sql` — **fixed**
 
@@ -59,6 +64,11 @@ allowed_directories = "[]"
 An untrusted `/sql` caller learns the **absolute home path and OS username**, and the exact state of
 the sandbox. Not a file read; free reconnaissance for anyone looking for one.
 
+**Fixed.** Both, plus `getenv`, are in the denylist, and the AST allowlist of finding 5 refuses them a
+second time as unrecognised table functions. Reconnaissance is the cheap half of an attack and the half
+that leaves no trace; there is no analytical query over blockchain data that needs to know our
+`secret_directory`.
+
 ### 3. The second layer is not engaged
 
 `allowed_directories = "[]"` confirms what the code only suspected. `analytics.rs` says the directory
@@ -67,12 +77,28 @@ It is **not enforcing at all**, so the denylist is not the primary control — i
 
 That matters mostly for how finding 1 should be read: there was no second layer to catch it.
 
+**Closed as "not ours to fix", not as fixed** — the distinction is the point. The setting is passed to
+DuckDB correctly; the bundled build does not enforce it. We cannot make it work from here, and quietly
+dropping it would remove the free upgrade if upstream ever starts enforcing.
+
+What *was* wrong was the belief attached to it. `the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read`
+now pins which control does the work, so nobody can weaken the denylist on the assumption that something
+sits behind it. `lock_configuration` is real and does hold — a query cannot widen the setting — but an
+empty allowlist that nothing enforces is a comment, not a control. A defence-in-depth layer nobody has
+measured is worse than none, because it is budgeted for in decisions about the layer in front of it.
+
 ### 4. Extension-gated readers are absent from the denylist
 
 `read_xlsx`, `st_read`, `iceberg_scan`, `delta_scan`, `postgres_scan`, `sqlite_scan` all pass the
 guards. They fail today only because those extensions are not in the bundled build — i.e. we are safe
 by build configuration, not by policy. Bundling any extension, or a DuckDB release that promotes one to
 core, converts this to a live file read with no code change on our side.
+
+**Fixed**, and the fix promptly demonstrated the finding it came from. A reachability test probed the
+guard using `read_xlsx` — chosen *because the denylist did not list it* — and adding it here made that
+test fail. The probe was right and the vocabulary had moved underneath it, in a single afternoon,
+which is finding 5 in miniature. It now probes `read_some_future_format`, a name DuckDB will never
+have, so it tests the guard rather than the list.
 
 ### 5. The denylist is an allowlist-shaped problem
 
@@ -84,6 +110,22 @@ function that touches the filesystem or network. The failure mode is silent and 
 Worth considering before 1.0 whether the guard should invert — parse the statement and permit only
 known-safe table references, rather than enumerating the unsafe ones. That is a larger change than a
 fix and should be argued on its own terms, but it is the finding with the longest tail.
+
+**Addressed, by adding the allowlist rather than replacing the denylist.** `reject_unknown_table_refs`
+asks DuckDB's own parser (`json_serialize_sql`) what a statement references and refuses anything it does
+not recognise: a table function must be one of three (`generate_series`, `range`, `unnest`), and a base
+table must be named like an identifier — which is what catches a *replacement scan*, `FROM
+'/x.parquet'`, that the AST otherwise reports as an ordinary table whose name happens to be a path.
+
+Finding 1 is not expressible against it: `read_csv(…)` and `"read_csv"(…)` parse to the same
+`TABLE_FUNCTION` node, so quoting collapses for free instead of needing to be normalised. Finding 4 is
+not expressible either — a new DuckDB file reader is unrecognised by default rather than permitted by
+default, which inverts the failure mode from silent to loud.
+
+**Both controls remain.** The allowlist fails *open* when a parse is unavailable, because
+`json_serialize_sql` is a DuckDB feature and this is the newer of the two: a parse failure must not take
+down `/sql` while the denylist that has guarded this surface since RFC-0008 is still in front of it. Two
+controls with different failure modes, not one replacing the other. The denylist's tail is now finite.
 
 ### 6. `init --from` relies on git's default
 
@@ -97,6 +139,12 @@ nothing and removes the dependence.
 
 Option injection (`--upload-pack=…`) is separately blocked by clap refusing leading-`-` values.
 
+**Fixed.** `is_git_source` now requires one of four transports (`http://`, `https://`, `ssh://`,
+`git://`) and rejects anything carrying `::`, so a transport helper is not a git source regardless of
+what the operator's gitconfig permits. Depending on someone else's default for the difference between
+"clones a repository" and "executes a command" was the whole problem; the check costs one string
+comparison.
+
 ### 7. Outbound-URL warning does not rank its targets
 
 `warn_outbound_urls` lists every non-loopback webhook, alert sink and RPC URL a freshly installed
@@ -106,6 +154,12 @@ and it is warn-and-proceed with no way to refuse.
 
 A bundle is fetched from a URL, so this is untrusted input; "the endpoint is the allowlist" holds only
 as far as the operator reads the warning. Today's other findings suggest that is not far.
+
+**Fixed.** `classify_outbound` ranks each URL and link-local/metadata targets are logged at `error`
+while ordinary ones stay at `warn`, so the one line that matters is not the twelfth of twelve. Still
+warn-and-proceed: refusing a bundle outright is a policy decision an operator should make, and a nest
+legitimately pointing at a metadata address is imaginable. Classification is returned rather than only
+logged, so a test asserts the ranking instead of asserting that a log line was formatted.
 
 ## Verified safe (and why that is not the same as "we made it safe")
 
