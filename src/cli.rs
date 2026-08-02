@@ -673,7 +673,7 @@ pub struct InitArgs {
     /// Which template a factory creates lives in the mapping WASM, not the manifest, so factory
     /// rules are inferred only where a parameter unambiguously names a template. Everything else is
     /// reported by name with candidates for you to resolve - never guessed.
-    #[arg(long, conflicts_with_all = ["addresses", "from"], value_name = "CID_OR_URL")]
+    #[arg(long, conflicts_with_all = ["addresses", "from", "alias", "abi"], value_name = "CID_OR_URL")]
     pub from_subgraph: Option<String>,
 
     /// IPFS gateway(s) to try, in order, when resolving `--from-subgraph` (repeatable). Each is a

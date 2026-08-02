@@ -136,10 +136,25 @@ pub enum Origin {
     Manifest,
 }
 
+/// The most sources one manifest may declare.
+///
+/// Every dataSource and template costs a gateway fetch and a file under `abis/`, and the
+/// manifest - not the operator - decides how many there are. A 16 MiB document (the
+/// [`MAX_FETCH_BYTES`] ceiling) holds on the order of 100k minimal entries, which is 100k
+/// requests issued from the operator's address. Real manifests are tens; the POA DAO stack
+/// that motivated this feature has 19.
+const MAX_SOURCES: usize = 512;
+
 /// A CID is base58btc or base32 - alphanumeric throughout. Anything else is a path, a query, a
-/// scheme, or an attempt at one, and none of those belong in a gateway URL we build by concatenation.
+/// scheme, or an attempt at one, and none of those belong in a gateway URL we build by
+/// concatenation. The upper bound matters for the same reason: shape alone would accept a
+/// multi-megabyte alphanumeric run, which we would then concatenate into three gateway URLs and
+/// echo back inside an error message. CIDv0 is 46 characters, CIDv1 base32 is 59; 80 leaves room
+/// for longer multihashes. There is deliberately no lower bound - a short string is merely a
+/// 404 at the gateway, and inventing a minimum would reject identifiers that are legitimately
+/// short without buying anything.
 fn is_cid_shaped(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+    !s.is_empty() && s.len() <= 80 && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Accepts a bare CID, `ipfs://<cid>` or `/ipfs/<cid>` from anywhere, and a full http(s) URL only
@@ -256,6 +271,30 @@ fn link_cid(y: &Yaml) -> Option<String> {
     )
 }
 
+/// Make a manifest-supplied string safe to print, and bounded.
+///
+/// The import's report is the deliverable as much as the config is - an operator reads it to
+/// decide which warnings to act on. Names come from the manifest, so a `\r` can erase the line
+/// above and a `\x1b[` sequence can repaint it: a source that was skipped can be made to look
+/// like one that was imported. Controls become their escape form, and the length is capped so a
+/// single name cannot scroll the rest of the report off the screen.
+fn sanitise(s: &str) -> String {
+    const MAX: usize = 120;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+        if out.len() >= MAX {
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
 fn parse_source(y: &Yaml) -> ManifestSource {
     let source = get(y, "source");
     let mapping = get(y, "mapping");
@@ -268,7 +307,7 @@ fn parse_source(y: &Yaml) -> ManifestSource {
                 .iter()
                 .filter_map(|e| {
                     Some(AbiRef {
-                        name: get_str(e, "name")?,
+                        name: sanitise(&get_str(e, "name")?),
                         cid: get(e, "file").and_then(link_cid)?,
                     })
                 })
@@ -292,8 +331,9 @@ fn parse_source(y: &Yaml) -> ManifestSource {
         .unwrap_or_default();
 
     ManifestSource {
-        kind: get_str(y, "kind").unwrap_or_default(),
-        name: get_str(y, "name").unwrap_or_default(),
+        // Sanitised at the boundary, so no unescaped copy exists downstream to be printed.
+        kind: sanitise(&get_str(y, "kind").unwrap_or_default()),
+        name: sanitise(&get_str(y, "name").unwrap_or_default()),
         network: get_str(y, "network"),
         address: source.and_then(|s| get_str(s, "address")),
         start_block: source
@@ -331,6 +371,15 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     if manifest.data_sources.is_empty() && manifest.templates.is_empty() {
         bail!("manifest declares neither dataSources nor templates - is this a subgraph manifest?");
     }
+    let declared = manifest.data_sources.len() + manifest.templates.len();
+    if declared > MAX_SOURCES {
+        bail!(
+            "manifest declares {declared} sources, more than the {MAX_SOURCES} this import will \
+             follow. Each one costs a gateway fetch and a file on disk, and the manifest chooses \
+             how many there are - a hostile one would have your machine make the requests. If a \
+             real subgraph is this large, import it in pieces with `nuthatch init` per contract."
+        );
+    }
     Ok(manifest)
 }
 
@@ -366,14 +415,32 @@ pub fn to_alias(name: &str) -> String {
 }
 
 /// Make `alias` unique against `taken`, appending `_2`, `_3`, … as needed.
+///
+/// Every name this hands out is recorded, not just the base it was derived from. Counting only
+/// bases is not enough, because the suffix form is itself a name a manifest can ask for:
+/// `Pool`, `Pool`, `Pool 2` aliases to `pool`, `pool_2`, and then — with a base-only counter —
+/// `pool_2` again, because `pool_2` had never been counted. Two contracts would own
+/// `abis/pool_2.json` and the second write would silently clobber the first, leaving a real
+/// contract decoded against another contract's ABI. The manifest chooses these names, so the
+/// collision is arranged, not stumbled into.
 pub fn dedupe_alias(alias: &str, taken: &mut BTreeMap<String, u32>) -> String {
-    let n = taken.entry(alias.to_string()).or_insert(0);
-    *n += 1;
-    if *n == 1 {
+    let mut n = *taken
+        .entry(alias.to_string())
+        .and_modify(|n| *n += 1)
+        .or_insert(1);
+    let mut candidate = if n == 1 {
         alias.to_string()
     } else {
         format!("{alias}_{n}")
+    };
+    // Walk past anything already issued under a different base.
+    while taken.contains_key(&candidate) && candidate != *alias {
+        n += 1;
+        candidate = format!("{alias}_{n}");
     }
+    taken.insert(alias.to_string(), n);
+    taken.entry(candidate.clone()).or_insert(1);
+    candidate
 }
 
 // ── Factory inference ────────────────────────────────────────────────────
@@ -931,6 +998,68 @@ dataSources:
         }
         assert!(candidate_urls(
             "QmVPhLwuv9zn2c761Ua7eJ",
+            &["https://gw/".into()],
+            Origin::Manifest
+        )
+        .is_ok());
+    }
+
+    #[test]
+    /// The alias a manifest can arrange to collide with. `Pool`, `Pool`, `Pool 2` walks the
+    /// base counter to `pool_2` and then asks for `pool_2` directly - which a base-only counter
+    /// hands out a second time, putting two contracts on one `abis/pool_2.json`.
+    #[test]
+    fn a_manifest_cannot_arrange_two_sources_onto_one_alias() {
+        let mut taken = BTreeMap::new();
+        let issued: Vec<String> = ["Pool", "Pool", "Pool 2", "Pool_2", "Pool"]
+            .iter()
+            .map(|n| dedupe_alias(&to_alias(n), &mut taken))
+            .collect();
+        let unique: std::collections::BTreeSet<&String> = issued.iter().collect();
+        assert_eq!(
+            unique.len(),
+            issued.len(),
+            "every alias must be unique, got {issued:?}"
+        );
+        assert_eq!(issued[0], "pool");
+        assert_eq!(issued[1], "pool_2");
+    }
+
+    /// A manifest that declares more sources than we will follow is refused before the first
+    /// fetch, because each source is a request issued from the operator's address.
+    #[test]
+    fn an_oversized_manifest_is_refused_before_any_fetch() {
+        let mut m = String::from("specVersion: 0.0.5\ndataSources:\n");
+        for i in 0..(MAX_SOURCES + 1) {
+            m.push_str(&format!(
+                "  - kind: ethereum/contract\n    name: C{i}\n    network: mainnet\n    source:\n      address: \"0x0000000000000000000000000000000000000001\"\n"
+            ));
+        }
+        let err = format!("{:#}", parse_manifest(&m).expect_err("must refuse"));
+        assert!(err.contains("more than the"), "explain the limit: {err}");
+    }
+
+    /// A name is manifest-chosen and ends up in the report an operator reads to decide what to
+    /// act on. Escape sequences there can erase or repaint lines that were already printed.
+    #[test]
+    fn manifest_names_cannot_repaint_the_report() {
+        let m = "specVersion: 0.0.5\ndataSources:\n  - kind: ethereum/contract\n    name: \"Good\\r\\u001b[2KEvil\"\n    network: mainnet\n    source:\n      address: \"0x0000000000000000000000000000000000000001\"\n";
+        let parsed = parse_manifest(m).unwrap();
+        let name = &parsed.data_sources[0].name;
+        assert!(
+            !name.contains('\r') && !name.contains('\u{1b}'),
+            "controls must not survive parsing: {name:?}"
+        );
+    }
+
+    /// Shape without size still lets a manifest hand us a multi-megabyte "CID" to concatenate
+    /// into three gateway URLs and echo back in an error.
+    #[test]
+    fn an_absurdly_long_cid_is_refused() {
+        let huge = "Q".repeat(100_000);
+        assert!(candidate_urls(&huge, &["https://gw/".into()], Origin::Manifest).is_err());
+        assert!(candidate_urls(
+            "QmVPhLwuv9zn2c761Ua7eJAFXBmrNsW32XUYsj1GKtNX4X",
             &["https://gw/".into()],
             Origin::Manifest
         )

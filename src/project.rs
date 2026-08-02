@@ -452,6 +452,9 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
 
     // ── templates → [[templates]] ────────────────────────────────────────
     let mut templates: Vec<crate::config::Template> = Vec::new();
+    // Manifest name → the alias it actually settled on, so factory rules can be emitted
+    // against the same name the `[[templates]]` entry carries.
+    let mut template_alias: BTreeMap<String, String> = BTreeMap::new();
     for t in &manifest.templates {
         if !t.is_evm() {
             notes.push(format!("skipped template `{}` (kind `{}`)", t.name, t.kind));
@@ -463,20 +466,23 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         };
         let alias = sg::dedupe_alias(&sg::to_alias(&t.name), &mut taken);
         fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes).await?;
+        // Both the entry and its ABI path must use the *settled* alias. Recomputing
+        // `to_alias(&t.name)` here would name the file the template was never written to:
+        // a dataSource `Vault` plus a template `Vault` — the canonical factory shape — makes
+        // the template point at the dataSource's ABI. Nothing errors, because that file
+        // exists; every discovered child is just decoded against the wrong contract.
+        template_alias.insert(t.name.clone(), alias.clone());
         templates.push(crate::config::Template {
-            name: alias,
-            abi: format!("abis/{}.json", sg::to_alias(&t.name)),
+            name: alias.clone(),
+            abi: format!("abis/{alias}.json"),
             filter: None,
         });
     }
 
     // ── factory inference ────────────────────────────────────────────────
-    let template_names: Vec<String> = manifest
-        .templates
-        .iter()
-        .filter(|t| t.is_evm())
-        .map(|t| t.name.clone())
-        .collect();
+    // Inference runs on the manifest's own names, so the rules it returns have to be mapped
+    // back through the same settled aliases before they are written out.
+    let template_names: Vec<String> = template_alias.keys().cloned().collect();
     let (inferred, unresolved) = sg::infer_factories(&template_names, &address_params);
 
     let factories: Vec<crate::config::Factory> = inferred
@@ -485,7 +491,12 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             watch: f.watch.clone(),
             event: f.event.clone(),
             child_param: f.child_param.clone(),
-            template: sg::to_alias(&f.template),
+            // The settled alias, not a fresh `to_alias` of the manifest name — see the
+            // template loop above. A recomputed alias names a template that may not exist.
+            template: template_alias
+                .get(&f.template)
+                .cloned()
+                .unwrap_or_else(|| sg::to_alias(&f.template)),
             start: None,
         })
         .collect();
@@ -556,7 +567,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
              adding [[factories]] rules to nuthatch.toml."
         );
     }
-    println!("\n  Next: nuthatch dev");
+    println!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
     Ok(())
 }
 
