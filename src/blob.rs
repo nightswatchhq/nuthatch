@@ -354,26 +354,78 @@ fn is_loopback_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Whether a URL points at the link-local range - `169.254.0.0/16` or `fe80::/10`, which includes
+/// every cloud provider's instance-metadata endpoint (`169.254.169.254`, `fd00:ec2::254`).
+///
+/// String-matched on the host rather than resolved: resolving would itself be a request, and a name
+/// that resolves to link-local is a DNS-rebinding problem this warning cannot solve anyway. This
+/// catches the literal form, which is what a bundle would carry.
+fn is_link_local_url(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .trim_start_matches('[');
+    let host = host.split(']').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_link_local();
+    }
+    if let Ok(v6) = url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or("")
+        .parse::<std::net::Ipv6Addr>()
+    {
+        // fe80::/10 link-local, plus the fd00:ec2::/32 metadata range AWS uses.
+        let seg = v6.segments();
+        return (seg[0] & 0xffc0) == 0xfe80 || (seg[0] == 0xfd00 && seg[1] == 0x0ec2);
+    }
+    false
+}
+
 /// Warn about every non-loopback URL a just-installed nest declares (audit L6). Best-effort: a config
 /// that will not parse is a louder problem the next step reports, so it is silently skipped here.
-fn warn_outbound_urls(dir: &Path) {
+/// The outbound endpoints a nest declares, classified. Returned rather than only logged so the
+/// classification is *reachable from a test* - a mutation that stopped ranking link-local targets
+/// survived a test that called `is_link_local_url` directly, which proved the helper worked and
+/// nothing about whether anything used it. Same defect as a control that is unit-tested and unwired.
+fn classify_outbound(dir: &Path) -> Vec<(&'static str, String, bool)> {
     let Ok(config) = crate::config::Config::load(dir) else {
-        return;
+        return Vec::new();
     };
-    let mut outbound: Vec<(&str, String)> = Vec::new();
+    let mut out: Vec<(&'static str, String)> = Vec::new();
     for w in &config.webhooks {
-        outbound.push(("webhook", w.url.clone()));
+        out.push(("webhook", w.url.clone()));
     }
     for a in &config.alerts {
-        outbound.push(("alert sink", a.url.clone()));
+        out.push(("alert sink", a.url.clone()));
     }
     for r in &config.nest.rpc_urls {
-        outbound.push(("rpc", r.clone()));
+        out.push(("rpc", r.clone()));
     }
-    let external: Vec<_> = outbound
-        .into_iter()
+    out.into_iter()
         .filter(|(_, u)| !is_loopback_url(u))
-        .collect();
+        .map(|(k, u)| {
+            let ll = is_link_local_url(&u);
+            (k, u, ll)
+        })
+        .collect()
+}
+
+fn warn_outbound_urls(dir: &Path) {
+    let external = classify_outbound(dir);
     if external.is_empty() {
         return;
     }
@@ -381,9 +433,22 @@ fn warn_outbound_urls(dir: &Path) {
         "this nest declares {} non-loopback outbound endpoint(s) - review before running it:",
         external.len()
     );
-    for (kind, url) in &external {
+    for (kind, url, link_local) in &external {
         // Redact any credentials in the URL: this line goes to logs, and provider URLs carry keys.
-        tracing::warn!("  {kind}: {}", crate::rpc::redact_url(url));
+        let shown = crate::rpc::redact_url(url);
+        // **Audit finding 7**: rank the targets. A bundle is fetched from a URL, so these endpoints
+        // are untrusted input, and "non-loopback" flattens a cloud-metadata address into the same
+        // line as a Slack webhook. The link-local range is where an SSRF actually pays - instance
+        // credentials live there - so it gets its own line rather than being one of twelve to skim.
+        if *link_local {
+            tracing::error!(
+                "  {kind}: {shown}  <-- LINK-LOCAL/METADATA ADDRESS. A nest has no legitimate reason \
+                 to reach this; on a cloud host it is where instance credentials are served. Do not \
+                 run this nest unless you know exactly why it is there."
+            );
+        } else {
+            tracing::warn!("  {kind}: {shown}");
+        }
     }
 }
 
@@ -807,6 +872,78 @@ abi = "abis/c.json"
         assert_eq!(
             victim, "original",
             "a bundle wrote through a symlink and escaped its destination"
+        );
+    }
+
+    /// **Audit finding 7.** A link-local target must be called out, not listed among a dozen ordinary
+    /// endpoints. That range is where instance credentials are served, and a bundle is untrusted input.
+    #[test]
+    fn link_local_targets_are_recognised() {
+        for hostile in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://169.254.169.254",
+            "https://user:pw@169.254.1.1/x",
+            "http://[fd00:ec2::254]/latest/meta-data",
+            "http://[fe80::1]/x",
+        ] {
+            assert!(is_link_local_url(hostile), "must be flagged: {hostile}");
+        }
+        for ordinary in [
+            "https://hooks.slack.com/services/x",
+            "https://eth.drpc.org",
+            "http://192.168.1.5:8080/hook",
+            "http://10.44.1.1:5433",
+        ] {
+            assert!(
+                !is_link_local_url(ordinary),
+                "must not be flagged - a private LAN address is normal for a self-hosted fleet: {ordinary}"
+            );
+        }
+    }
+
+    /// The ranking must be **reachable from the nest**, not merely implemented.
+    ///
+    /// Written after a mutation that stopped ranking link-local targets survived a test calling
+    /// `is_link_local_url` directly - proving the helper worked and nothing about whether anything
+    /// used it. This goes from a nest directory on disk through the real classification path.
+    #[test]
+    fn a_nest_declaring_a_metadata_endpoint_is_ranked_from_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(dir.path().join("abis/t.json"), "[]").unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "hostile"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://eth.drpc.org"]
+
+[[contracts]]
+alias = "t"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/t.json"
+
+[[alerts]]
+kinds = ["sanction_hit"]
+url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+"#,
+        )
+        .unwrap();
+
+        let found = classify_outbound(dir.path());
+        let metadata: Vec<_> = found.iter().filter(|(_, _, ll)| *ll).collect();
+        assert_eq!(
+            metadata.len(),
+            1,
+            "the metadata endpoint must be ranked as link-local: {found:?}"
+        );
+        assert_eq!(metadata[0].0, "alert sink");
+        // …and the ordinary RPC endpoint alongside it must not be.
+        assert!(
+            found.iter().any(|(k, _, ll)| *k == "rpc" && !*ll),
+            "a normal rpc endpoint must not be flagged: {found:?}"
         );
     }
 }

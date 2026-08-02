@@ -118,6 +118,21 @@ fn run(
     reject_replacement_scan(sql)?;
 
     let conn = Connection::open_in_memory().context("failed to open DuckDB")?;
+    // **The allowlist, and the control that is meant to outlive the others** (audit finding 5).
+    //
+    // Everything above enumerates what is *forbidden*, over a vocabulary DuckDB grows every release.
+    // That approach has now been wrong twice: about spelling (`"read_csv"(…)` slipped past a check
+    // that expected `(` after whitespace) and about coverage (`read_xlsx`, `st_read`, `iceberg_scan`
+    // and friends were never listed and are inert only because those extensions are not bundled).
+    // Both failures are silent, and the feedback loop is "someone exploits it".
+    //
+    // So this asks DuckDB's own parser what the query actually references and permits only what we
+    // recognise. A new file-reading function added upstream tomorrow is refused by default, because it
+    // is not on the list of things we allow - which is the property the denylist can never have.
+    //
+    // Kept *beside* the denylist rather than replacing it: two independent controls that must both
+    // pass, so a gap in either is covered while this one earns trust.
+    reject_unknown_table_refs(&conn, sql)?;
     conn.execute_batch(&format!(
         "SET memory_limit='{MEM_LIMIT}'; SET threads={MAX_THREADS};"
     ))
@@ -318,6 +333,30 @@ const FORBIDDEN_FNS: &[&str] = &[
     "csv_scan",
     "glob",
     "sniff_csv",
+    // **Audit finding 4**: extension-gated readers. Inert today only because those extensions are not
+    // in the bundled build - i.e. safe by build configuration rather than by policy. Bundling one, or
+    // DuckDB promoting one to core, would turn each into a live file read with no change on our side.
+    // The AST allowlist already refuses them; listing them keeps the two controls agreeing.
+    "read_xlsx",
+    "st_read",
+    "st_readosm",
+    "iceberg_scan",
+    "delta_scan",
+    "postgres_scan",
+    "postgres_query",
+    "sqlite_scan",
+    "mysql_scan",
+    "mysql_query",
+    // **Audit finding 2**: environment disclosure. Measured on an untrusted `/sql`, these return the
+    // absolute `secret_directory` (which embeds the OS username), the temp and extension directories,
+    // and the exact state of the sandbox. Not a file read - free reconnaissance for someone looking
+    // for one, and there is no legitimate reason a nest query needs them.
+    "duckdb_settings",
+    "duckdb_extensions",
+    "duckdb_secrets",
+    "duckdb_databases",
+    "duckdb_temporary_files",
+    "getenv",
 ];
 
 /// Strip all SQL comments (line `--…` and block `/* … */`) so a function call can't be split or hidden
@@ -402,6 +441,106 @@ fn reject_statement_stacking(sql: &str) -> Result<()> {
         i += 1;
     }
     Ok(())
+}
+
+/// Table functions a query may legitimately call. Everything else is refused.
+///
+/// Deliberately tiny. Nuthatch's data reaches a query through views *we* define, so a user query needs
+/// no table function at all to do its job - these exist because ordinary analytical SQL uses them for
+/// generating rows, not for reaching data. Adding to this list means asserting a function cannot read a
+/// file, open a socket, or leak the environment.
+const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
+
+/// Ask DuckDB's parser what the statement references, and refuse anything unrecognised.
+///
+/// Two rules, both derived from what the AST actually looks like (measured, not assumed):
+///
+/// - A **table function** must be in [`ALLOWED_TABLE_FNS`]. Quoting collapses here for free:
+///   `read_csv(…)` and `"read_csv"(…)` both parse to `TABLE_FUNCTION` with the same name, so the
+///   evasion that defeated the textual denylist is not expressible.
+/// - A **base table** must be named like an identifier. A DuckDB *replacement scan* - `FROM
+///   '/x.parquet'` - parses as a `BASE_TABLE` whose name is the path, so the AST alone does not
+///   distinguish it; requiring `[A-Za-z0-9_]` does, and no legitimate view of ours is named otherwise.
+///
+/// Fails **open** if the parse is unavailable: `json_serialize_sql` is a DuckDB feature and this is the
+/// newer of two controls. A parse failure must not take down `/sql` while the denylist - which has
+/// guarded this surface since RFC-0008 - is still in front of it.
+fn reject_unknown_table_refs(conn: &Connection, sql: &str) -> Result<()> {
+    let literal = format!("'{}'", sql.replace('\'', "''"));
+    let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+        r.get::<_, String>(0)
+    }) else {
+        return Ok(());
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&ast) else {
+        return Ok(());
+    };
+    if v.get("error").and_then(Value::as_bool) == Some(true) {
+        // DuckDB could not parse it. Let it say so itself, with its own error message.
+        return Ok(());
+    }
+    let mut bad: Option<String> = None;
+    walk_table_refs(&v, &mut |kind, name| {
+        if bad.is_some() {
+            return;
+        }
+        match kind {
+            "TABLE_FUNCTION" => {
+                let f = name.to_ascii_lowercase();
+                if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
+                    bad = Some(format!("table function `{name}` is not permitted here"));
+                }
+            }
+            // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose name is
+            // the path, so the AST alone cannot tell it from a real table - the name has to be checked.
+            "BASE_TABLE"
+                if name.is_empty()
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                bad = Some(format!(
+                    "`{name}` is not a table name - a quoted path in table position reads a file"
+                ));
+            }
+            _ => {}
+        }
+    });
+    match bad {
+        Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
+        None => Ok(()),
+    }
+}
+
+/// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
+fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(t)) = map.get("type") {
+                if t == "TABLE_FUNCTION" {
+                    // The callee's name lives on the nested function expression.
+                    if let Some(name) = map
+                        .get("function")
+                        .and_then(|fun| fun.get("function_name"))
+                        .and_then(Value::as_str)
+                    {
+                        f("TABLE_FUNCTION", name);
+                    }
+                } else if t == "BASE_TABLE" {
+                    if let Some(name) = map.get("table_name").and_then(Value::as_str) {
+                        f("BASE_TABLE", name);
+                    }
+                }
+            }
+            for child in map.values() {
+                walk_table_refs(child, f);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                walk_table_refs(child, f);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn reject_file_access(sql: &str) -> Result<()> {
@@ -2325,5 +2464,115 @@ template="pool"
             assert!(reject_file_access(q).is_ok(), "must be allowed: {q}");
             assert!(reject_replacement_scan(q).is_ok(), "must be allowed: {q}");
         }
+    }
+
+    /// **Audit finding 5: the allowlist must refuse what the denylist has never heard of.**
+    ///
+    /// The denylist enumerates forbidden names over a vocabulary DuckDB grows every release, and has
+    /// been wrong twice - about spelling and about coverage. This asks the parser what the query
+    /// references and permits only what we recognise, so a file-reading function added upstream
+    /// tomorrow is refused *by default*.
+    ///
+    /// The cases below are deliberately ones the denylist does **not** list: if this test passes, the
+    /// allowlist is carrying weight of its own rather than shadowing the older control.
+    #[test]
+    fn the_allowlist_refuses_functions_the_denylist_never_heard_of() {
+        let conn = Connection::open_in_memory().unwrap();
+        for q in [
+            // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
+            "SELECT * FROM read_xlsx('/etc/passwd')",
+            "SELECT * FROM st_read('/etc/passwd')",
+            "SELECT * FROM iceberg_scan('/tmp')",
+            "SELECT * FROM postgres_scan('host=x','public','t')",
+            // A plausible future name nobody has listed anywhere.
+            "SELECT * FROM read_totally_new_format('/etc/passwd')",
+            // And the ones it does list, by every spelling.
+            "SELECT * FROM read_csv('/etc/passwd')",
+            r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
+        ] {
+            assert!(
+                reject_unknown_table_refs(&conn, q).is_err(),
+                "the allowlist must refuse: {q}"
+            );
+        }
+    }
+
+    /// A replacement scan parses as a `BASE_TABLE` whose name is the path - the AST alone does not
+    /// distinguish it from a real table, so the name has to be checked.
+    #[test]
+    fn a_path_in_table_position_is_not_a_table_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        for q in [
+            "SELECT * FROM '/etc/passwd'",
+            "SELECT * FROM '/x.parquet'",
+            "SELECT * FROM 'https://evil.example/x.parquet'",
+        ] {
+            assert!(
+                reject_unknown_table_refs(&conn, q).is_err(),
+                "a path in table position must be refused: {q}"
+            );
+        }
+    }
+
+    /// And it must not break ordinary analytical SQL - the risk of an allowlist is false refusals,
+    /// which is a broken dashboard rather than a breach, but still a bug.
+    #[test]
+    fn ordinary_analytical_sql_still_passes_the_allowlist() {
+        let conn = Connection::open_in_memory().unwrap();
+        for q in [
+            "SELECT * FROM usdc__transfer",
+            r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
+            "WITH t AS (SELECT * FROM usdc__transfer) SELECT count(*) FROM t",
+            "SELECT a.block_number FROM usdc__transfer a JOIN weth__transfer b USING (tx_hash)",
+            // Row-generating functions analytics legitimately uses.
+            "SELECT * FROM generate_series(1, 10)",
+            "SELECT * FROM range(10)",
+            // Inline VALUES references no table at all.
+            "SELECT * FROM (VALUES (1),(2)) t(x)",
+            "SELECT count(*) FROM usdc__transfer GROUP BY \"from\" ORDER BY 1 DESC LIMIT 5",
+        ] {
+            assert!(
+                reject_unknown_table_refs(&conn, q).is_ok(),
+                "legitimate query must be allowed: {q}"
+            );
+        }
+    }
+
+    /// **The allowlist must be wired into the real query path, not merely exist.**
+    ///
+    /// Written because a mutation exposed the gap: deleting `reject_unknown_table_refs` from `run()`
+    /// broke *no test*, since the three tests above call it directly. A control that is unit-tested and
+    /// unreachable is the same failure as `reconcile::tick` having six passing tests and no caller, and
+    /// as the writer pool holding leases with no indexing code behind them.
+    ///
+    /// The probe must be a name `FORBIDDEN_FNS` genuinely does **not** list, or the denylist answers
+    /// first and this proves nothing about the allowlist. `read_xlsx` was the original probe and
+    /// stopped being valid the moment audit finding 4 added it to the denylist - this test caught its
+    /// own obsolescence, which is the behaviour worth having.
+    #[test]
+    fn the_allowlist_is_reachable_from_the_public_query_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = query(
+            dir.path(),
+            "SELECT * FROM read_some_future_format('/etc/passwd')",
+        )
+        .expect_err("a function the denylist does not list must still be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not permitted") || msg.contains("tables and views only"),
+            "the refusal must come from the allowlist, not from DuckDB failing later: {msg}"
+        );
+
+        // And the guarded surface, which is the one actually exposed over HTTP.
+        let err = query_guarded(
+            dir.path(),
+            "SELECT * FROM read_some_future_format('/etc/passwd')",
+            QueryGuard {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+        )
+        .expect_err("the guarded surface must refuse it too");
+        assert!(format!("{err:#}").contains("not permitted"));
     }
 }
