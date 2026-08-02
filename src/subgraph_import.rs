@@ -7,6 +7,12 @@
 //! the events the contract actually emits. The manifest is the only good
 //! source, and it is already content-addressed.
 //!
+//! Content-addressed, but **not verified here**: nothing recomputes the multihash over the bytes
+//! a gateway returns, so a hostile or compromised gateway can serve any document for any CID and
+//! this module will vendor it. The CID buys a stable name to ask for, not proof of what came
+//! back. Verifying it is worth doing and is not done yet — say so rather than let the phrase
+//! "pinned by CID" imply a guarantee the code does not provide.
+//!
 //! What the manifest **cannot** tell us is which template a factory creates:
 //! that lives in the mapping WASM, as a `Template.create(address)` call. So
 //! this module infers what it defensibly can and reports the rest by name,
@@ -29,7 +35,11 @@ use yaml_rust2::{Yaml, YamlLoader};
 pub const DEFAULT_IPFS_GATEWAYS: &[&str] = &[
     "https://ipfs.thegraph.com/api/v0/cat?arg=",
     "https://ipfs.io/ipfs/",
-    "https://cloudflare-ipfs.com/ipfs/",
+    // Cloudflare retired `cloudflare-ipfs.com` - it no longer resolves at all, so it was a
+    // guaranteed-dead third try. Pinata's public gateway answers the path-prefix form, which is
+    // what this list needs: `dweb.link` and `w3s.link` redirect to a `<cid>.ipfs.<host>` subdomain
+    // that prefix concatenation cannot express.
+    "https://gateway.pinata.cloud/ipfs/",
 ];
 
 /// One ABI referenced by a manifest, pinned by CID.
@@ -52,8 +62,19 @@ pub struct ManifestSource {
     /// Which entry of `mapping.abis` is *this* source's own ABI.
     pub abi_name: Option<String>,
     pub abis: Vec<AbiRef>,
-    /// Event signatures as written in the manifest, e.g.
-    /// `Transfer(indexed address,indexed address,uint256)`.
+    /// `source.endBlock`, where the subgraph stops. A nest has no way to express one, so this
+    /// exists to be *reported* - diverging from the manifest silently is the thing this module
+    /// is not allowed to do.
+    pub end_block: Option<u64>,
+    /// True when the source declares `blockHandlers` or `callHandlers`. nuthatch indexes logs,
+    /// so those handlers have no equivalent - and a source carrying only them parses to an empty
+    /// event list, which in `[[contracts]]` means "index every event in the ABI", the opposite of
+    /// what the subgraph did.
+    pub has_non_event_handlers: bool,
+    /// Event signatures with whitespace removed, e.g.
+    /// `Transfer(indexedaddress,indexedaddress,uint256)` - folded scalars are collapsed so the
+    /// signature matches the ABI-derived one character for character. Only [`event_name`] reads
+    /// this, and it stops at the first `(`.
     pub events: Vec<String>,
 }
 
@@ -66,6 +87,9 @@ impl ManifestSource {
     }
 
     /// The CID of this source's own ABI, resolved through `mapping.abis`.
+    ///
+    /// Falls back to the first entry when the named one is absent. See [`Self::abi_is_fallback`]:
+    /// the fallback is a guess, and a guess this module makes has to be reported.
     pub fn own_abi(&self) -> Option<&AbiRef> {
         match &self.abi_name {
             Some(want) => self
@@ -80,6 +104,17 @@ impl ManifestSource {
                 .iter()
                 .find(|a| a.name == self.name)
                 .or_else(|| self.abis.first()),
+        }
+    }
+
+    /// True when `source.abi` names an entry `mapping.abis` does not contain, so [`Self::own_abi`]
+    /// fell back to the first one. The manifest asked for a specific ABI and we vendored a
+    /// different one; that is exactly the kind of divergence this module is supposed to say out
+    /// loud rather than absorb.
+    pub fn abi_is_fallback(&self) -> bool {
+        match &self.abi_name {
+            Some(want) => !self.abis.iter().any(|a| &a.name == want) && !self.abis.is_empty(),
+            None => false,
         }
     }
 }
@@ -344,6 +379,21 @@ fn parse_source(y: &Yaml) -> ManifestSource {
             }),
         abi_name: source.and_then(|s| get_str(s, "abi")),
         abis,
+        end_block: source
+            .and_then(|s| get(s, "endBlock"))
+            .and_then(|b| match b {
+                Yaml::Integer(i) if *i >= 0 => Some(*i as u64),
+                other => as_str(other).and_then(|s| s.parse().ok()),
+            }),
+        has_non_event_handlers: mapping
+            .map(|m| {
+                ["blockHandlers", "callHandlers"].iter().any(|k| {
+                    get(m, k)
+                        .and_then(|h| h.as_vec())
+                        .is_some_and(|v| !v.is_empty())
+                })
+            })
+            .unwrap_or(false),
         events,
     }
 }
@@ -1004,7 +1054,6 @@ dataSources:
         .is_ok());
     }
 
-    #[test]
     /// The alias a manifest can arrange to collide with. `Pool`, `Pool`, `Pool 2` walks the
     /// base counter to `pool_2` and then asks for `pool_2` directly - which a base-only counter
     /// hands out a second time, putting two contracts on one `abis/pool_2.json`.
@@ -1023,6 +1072,49 @@ dataSources:
         );
         assert_eq!(issued[0], "pool");
         assert_eq!(issued[1], "pool_2");
+    }
+
+    /// Three ways the import can quietly diverge from the manifest, each of which has to reach
+    /// the operator as a note rather than being absorbed: an `endBlock` a nest cannot express,
+    /// handlers nuthatch has no equivalent for, and a `source.abi` naming an entry that is not
+    /// there. Asserted on the parse, which is what the reporting reads.
+    #[test]
+    fn divergences_from_the_manifest_are_visible() {
+        let m = r#"
+specVersion: 0.0.5
+dataSources:
+  - kind: ethereum/contract
+    name: Blocky
+    network: mainnet
+    source:
+      address: "0x0000000000000000000000000000000000000001"
+      startBlock: 1
+      endBlock: 500
+      abi: NotListed
+    mapping:
+      abis:
+        - name: Actual
+          file:
+            /: QmAbc
+      blockHandlers:
+        - handler: handleBlock
+"#;
+        let ds = &parse_manifest(m).unwrap().data_sources[0];
+        assert_eq!(
+            ds.end_block,
+            Some(500),
+            "endBlock must be carried to report it"
+        );
+        assert!(ds.has_non_event_handlers, "blockHandlers must be noticed");
+        assert!(
+            ds.events.is_empty(),
+            "no eventHandlers means an empty allowlist"
+        );
+        assert!(
+            ds.abi_is_fallback(),
+            "`abi: NotListed` is absent from mapping.abis, so own_abi() guessed"
+        );
+        assert_eq!(ds.own_abi().unwrap().name, "Actual");
     }
 
     /// A manifest that declares more sources than we will follow is refused before the first

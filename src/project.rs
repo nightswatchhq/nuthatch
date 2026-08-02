@@ -374,6 +374,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
 
     let mut notes: Vec<String> = Vec::new();
     let mut taken: BTreeMap<String, u32> = BTreeMap::new();
+    // CID -> ABI body, so a shared ABI is downloaded once however many sources pin it.
+    let mut fetched: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut contracts: Vec<Contract> = Vec::new();
     let mut address_params: Vec<sg::AddressParam> = Vec::new();
 
@@ -403,6 +405,17 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             notes.push(format!("skipped `{}` - address is {address}", ds.name));
             continue;
         }
+        // Normalise before anything is fetched or written. This is the one check that used to
+        // abort the whole import, and it fired after the ABI was already on disk and the alias
+        // already consumed - a malformed address is the manifest's mistake, and every other
+        // malformed field here is a note and a `continue`.
+        let address = match normalise_address(&address) {
+            Ok(a) => a,
+            Err(e) => {
+                notes.push(format!("skipped `{}` - {e}", ds.name));
+                continue;
+            }
+        };
         let Some(abi_ref) = ds.own_abi().cloned() else {
             notes.push(format!(
                 "skipped `{}` - the manifest pins no ABI for it, so there is nothing to decode",
@@ -410,9 +423,20 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ));
             continue;
         };
+        if ds.abi_is_fallback() {
+            notes.push(format!(
+                "`{}` asks for ABI `{}`, which `mapping.abis` does not contain - vendored `{}` \
+                 instead; check it decodes what you expect",
+                ds.name,
+                ds.abi_name.as_deref().unwrap_or("?"),
+                abi_ref.name
+            ));
+        }
 
         let alias = sg::dedupe_alias(&sg::to_alias(&ds.name), &mut taken);
-        let abi_json = fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes).await?;
+        let abi_json =
+            fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched)
+                .await?;
         address_params.extend(sg::address_params(&alias, &abi_json));
 
         // Carry the manifest's event allowlist: a subgraph that handles only
@@ -422,6 +446,24 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             .iter()
             .map(|sig| sg::event_name(sig).to_string())
             .collect();
+        // An empty allowlist means "every event in the ABI" (see `config::Contract::events`),
+        // so a source whose handlers are all block/call handlers lands in exactly the state the
+        // comment above says it should not - silently, unless we say so.
+        if events.is_empty() && ds.has_non_event_handlers {
+            notes.push(format!(
+                "`{}` declares only block/call handlers, which nuthatch has no equivalent for - \
+                 it indexes logs. This contract will index **every** event its ABI defines; \
+                 narrow it with `events = [...]` in nuthatch.toml if that is not what you want",
+                ds.name
+            ));
+        }
+        if let Some(end) = ds.end_block {
+            notes.push(format!(
+                "`{}` stops at block {end} in the subgraph; a nest has no end block, so it will \
+                 keep indexing past it",
+                ds.name
+            ));
+        }
 
         println!(
             "  ✓ {alias:<28} {address}  start={}  {} event(s)",
@@ -432,7 +474,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         );
         contracts.push(Contract {
             alias,
-            address: normalise_address(&address)?,
+            address,
             start_block: ds.start_block,
             abi: String::new(), // filled below, once the alias is final
             events,
@@ -465,7 +507,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             continue;
         };
         let alias = sg::dedupe_alias(&sg::to_alias(&t.name), &mut taken);
-        fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes).await?;
+        fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched).await?;
         // Both the entry and its ABI path must use the *settled* alias. Recomputing
         // `to_alias(&t.name)` here would name the file the template was never written to:
         // a dataSource `Vault` plus a template `Vault` — the canonical factory shape — makes
@@ -578,7 +620,16 @@ async fn fetch_and_vendor_abi(
     abi_ref: &crate::subgraph_import::AbiRef,
     gateways: &[String],
     notes: &mut Vec<String>,
+    fetched: &mut std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value> {
+    // One CID, one download. Sharing an ABI across dataSources is the normal shape - every
+    // proxy in a beacon codebase pins the same implementation ABI - and re-fetching it per
+    // source multiplies gateway load by a factor the manifest chooses. Each source still gets
+    // its own file, because the alias is what the config points at.
+    if let Some(cached) = fetched.get(&abi_ref.cid) {
+        write_abi(dir, alias, cached)?;
+        return Ok(cached.clone());
+    }
     // From the manifest, so CID only - see `subgraph_import::Origin`.
     let raw = crate::subgraph_import::fetch_ipfs(
         &abi_ref.cid,
@@ -595,12 +646,18 @@ async fn fetch_and_vendor_abi(
             abi_ref.name
         ));
     }
+    write_abi(dir, alias, &parsed)?;
+    fetched.insert(abi_ref.cid.clone(), parsed.clone());
+    Ok(parsed)
+}
+
+/// Vendor one ABI under its settled alias.
+fn write_abi(dir: &Path, alias: &str, abi: &serde_json::Value) -> Result<()> {
     std::fs::write(
         dir.join(format!("abis/{alias}.json")),
-        serde_json::to_string_pretty(&parsed).context("failed to serialise ABI")?,
+        serde_json::to_string_pretty(abi).context("failed to serialise ABI")?,
     )
-    .with_context(|| format!("failed to write abis/{alias}.json"))?;
-    Ok(parsed)
+    .with_context(|| format!("failed to write abis/{alias}.json"))
 }
 
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
