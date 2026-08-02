@@ -69,7 +69,10 @@ need curl; need python3; need ssh
 # are throwaway machines whose fingerprints are meaningless, so they get their own throwaway
 # known-hosts file rather than polluting - and colliding with - the operator's real one.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
-lab_ssh() { ssh "${SSH_OPTS[@]}" "$@"; }
+# `-n` is not optional: without it ssh reads from stdin, and an ssh inside a `while read` loop
+# swallows the remaining input - so a loop over three hosts silently visits one. That is exactly how
+# the second writer node "failed to start" for three runs while the first worked perfectly.
+lab_ssh() { ssh -n "${SSH_OPTS[@]}" "$@"; }
 
 hc() { # hc METHOD PATH [json]
   local m="$1" p="$2" body="${3:-}" out code
@@ -330,12 +333,22 @@ cmd_verify_distributed() {
     lab_nest "$w"
     # `docker-compose.writer-node.yml` carries the writer and nothing else - no `depends_on: postgres`,
     # so no second empty database appears beside it.
+    #
+    # CONTROL_HOST is **exported, not prefixed onto one command**: compose interpolates the whole file
+    # for *every* subcommand, so even a bare `ps` needs it, and the `:?` default makes its absence a
+    # hard error. Prefixing only the `up` made the following `ps` fail, which under `set -e` aborted
+    # this loop before the second writer started and before level 5 ran.
+    #
+    # **Keep prose out of the quoted script below.** These comments live here, outside the double
+    # quotes, because backticks inside a double-quoted string are command substitution - an earlier
+    # version of this note put `ps` in backticks inside the remote script, which executed the *local*
+    # ps and spliced its output into the commands sent to the box.
     lab_ssh "root@$w" "set -eux
       cd /opt/nuthatch-src
       mkdir -p .img && cp /usr/local/bin/nuthatch-scaled .img/nuthatch && cp Dockerfile .img/
       docker build -q -t nuthatch-scaled:lab .img
-      CONTROL_HOST=$cp_priv NUTHATCH_IMAGE=nuthatch-scaled:lab \
-        docker compose -f docker-compose.writer-node.yml up -d
+      export CONTROL_HOST=$cp_priv NUTHATCH_IMAGE=nuthatch-scaled:lab
+      docker compose -f docker-compose.writer-node.yml up -d
       docker compose -f docker-compose.writer-node.yml ps --format '{{.Service}} {{.State}}'"
     i=$((i+1))
   done
@@ -344,7 +357,9 @@ cmd_verify_distributed() {
   # a re-run. Wait for the registry to actually show them before asserting anything about it.
   echo "-- waiting for workers to register --"
   for _ in $(seq 1 30); do
-    local n; n=$(lab_ssh "root@$cp" "curl -fsS -m3 localhost:8290/workers -H 'authorization: Bearer dev-token-change-me' 2>/dev/null" \
+    # The control plane binds to the **private** address (CONTROL_BIND), so `localhost` refuses -
+    # which made this read 0 forever while the registry was in fact populated.
+    local n; n=$(lab_ssh "root@$cp" "curl -fsS -m3 http://$cp_priv:8290/workers -H 'authorization: Bearer dev-token-change-me' 2>/dev/null" \
       | python3 -c 'import sys,json
 try: print(len(json.load(sys.stdin).get("workers", [])))
 except Exception: print(0)' 2>/dev/null || echo 0)
@@ -353,9 +368,24 @@ except Exception: print(0)' 2>/dev/null || echo 0)
     sleep 5
   done
 
+  # **Declare a nest before asserting that anything indexes.** 5.11 asks whether a held cursor moves
+  # `last_block`; a cursor with no declared nest has nothing to index, so the check failed for want of
+  # a precondition it never established. Measured 2026-08-02: `desired_nest` was empty at 5.11 time
+  # because the level-5 checks that declare a nest clean up after themselves.
+  echo "-- declaring a nest so there is something to index --"
+  lab_ssh "root@$cp" "curl -s -X POST http://$cp_priv:8290/nests \
+    -H 'authorization: Bearer dev-token-change-me' -H 'content-type: application/json' \
+    -d '{\"name\":\"lab\",\"chain\":\"arbitrum-one\",\"estimated_rss_mb\":512}' >/dev/null" || true
+
   echo
   echo "== level 5 against the distributed fleet =="
-  lab_ssh "root@$cp" 'cd /opt/nuthatch-src && NUTHATCH=/usr/local/bin/nuthatch-scaled ./scripts/verify.sh 5'
+  # `HOT_STORE_PSQL` is what lets **5.11** run at all - the check that asserts a held cursor actually
+  # indexes. Without it 5.11 skips, which is how a runbook can report a healthy fleet while the writer
+  # pool writes nothing (issue #250). Postgres lives in compose on this box, so the psql command is a
+  # `compose exec`.
+  lab_ssh "root@$cp" 'cd /opt/nuthatch-src \
+    && export HOT_STORE_PSQL="docker compose -f docker-compose.scaled.yml exec -T postgres psql -U nuthatch" \
+    && NUTHATCH=/usr/local/bin/nuthatch-scaled ./scripts/verify.sh 5'
 }
 
 # The original one-box run: everything in one compose project. Still the right shape for `single`.
