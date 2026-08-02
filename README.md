@@ -348,8 +348,8 @@ The guide covers the questions people actually hit:
   key, or a generated column without a major bump. The one thing that has never needed a promise is
   on-disk state: a newer binary has always read an older release's hot store and sealed segments as
   they are, and that stays true.
-- **Upgrades are a binary swap.** No data migration, no re-backfill, no conversion step. Proven in
-  production across 0.3.0 → 0.6.0 → 0.9.x.
+- **Upgrades are a binary swap.** No data migration, no re-backfill, no conversion step. Proven on a
+  production box across 0.3.0 → 0.6.0 → 0.7.2, and in CI on every release since.
 - **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
   build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
   command. A version nobody tests is not a promise.)
