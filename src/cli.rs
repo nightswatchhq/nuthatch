@@ -765,11 +765,30 @@ pub struct WorkerArgs {
     /// Where to find the nests this worker is asked to index. `<root>/<name>` if that exists, else
     /// `<root>` itself when it is a single nest - which is what the compose topology mounts.
     ///
-    /// A worker can only index a nest it can *locate*, and the control plane records only
-    /// `(name, chain, estimated_rss_mb)`. Pulling bundles from the registry (RFC-0019) is the intended
-    /// source and is not built; until then the operator places nests on the machine.
+    /// What is here wins over the registry: a nest an operator placed on the machine is a deliberate
+    /// act, and this mount is read-only in the writer-node topology. Anything not here is pulled from
+    /// `--registry` into `--nest-cache`.
     #[arg(long, default_value = "/nest")]
     pub nest_root: String,
+
+    /// Registry to pull declared nests from when they are not under `--nest-root` (RFC-0019).
+    ///
+    /// A locator the bundle store understands - a local directory, or `s3://…` for a shared registry.
+    /// When the control plane has pinned a `bundle_hash`, the fetch goes **by that hash** and the
+    /// registry's mutable index is never consulted: re-tagging a version cannot change what a worker
+    /// runs. Unpinned, a worker is exactly as trustworthy as its registry - so pin.
+    ///
+    /// Without this, a worker can only run nests an operator has already placed on the machine.
+    #[arg(long)]
+    pub registry: Option<String>,
+
+    /// Where pulled nests are cached. Written to; keep it off the read-only `--nest-root` mount.
+    ///
+    /// Laid out `<cache>/<name>/<bundle-hash>`, so a re-pinned fleet resolves to a different
+    /// directory and re-pulls, while an unchanged pin costs no download. Safe to delete: everything
+    /// in it is re-fetchable, and a worker rebuilds what it needs on the next tick.
+    #[arg(long, default_value = "/var/lib/nuthatch/nests")]
+    pub nest_cache: String,
 
     /// Skip fetching runtime secrets for assigned nests (RFC-0022 §5).
     #[arg(long)]

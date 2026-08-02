@@ -289,9 +289,42 @@ pub async fn load_from_registry(
     reference: &str,
     target: Option<&Path>,
 ) -> Result<()> {
+    load_pinned_from_registry(registry, reference, None, target).await
+}
+
+/// [`load_from_registry`], but honouring a **content address the caller already decided on**.
+///
+/// The distinction matters and is not cosmetic. `pull` asks the registry's *mutable index* which hash
+/// `name@version` means today; `blob::load` then checks the bytes against that answer. That is
+/// internal consistency, not authenticity - it proves the registry served the blob it named, and a
+/// registry that re-points `v1.2.3` at different bytes passes it every time.
+///
+/// When the control plane has pinned a `bundle_hash`, that pin - not the index - is the authority:
+/// we fetch **by hash**, so the index is not consulted at all and cannot be used to substitute a
+/// different nest. Retagging a version in the registry then changes nothing on any worker until an
+/// operator changes the pin, which is the entire point of recording one.
+///
+/// With no pin we fall back to resolving the reference, and are exactly as trustworthy as the
+/// registry - which is why RFC-0022 §4 asks fleets to pin.
+pub async fn load_pinned_from_registry(
+    registry: &str,
+    reference: &str,
+    pinned_hash: Option<&str>,
+    target: Option<&Path>,
+) -> Result<()> {
     let store = open(registry)?;
-    let r = NestRef::parse(reference)?;
-    let (hash, bytes) = pull(store.as_ref(), &r).await?;
+    let (hash, bytes) = match pinned_hash {
+        Some(h) => {
+            let bytes = store.get_blob(h).await.with_context(|| {
+                format!("fetching pinned bundle {h} (the pin names a bundle this registry does not have)")
+            })?;
+            (h.to_string(), bytes)
+        }
+        None => {
+            let r = NestRef::parse(reference)?;
+            pull(store.as_ref(), &r).await?
+        }
+    };
     let tmp = tempfile::tempdir().context("temp dir for pulled bundle")?;
     let bundle_file = tmp.path().join("pulled.bundle");
     std::fs::write(&bundle_file, &bytes).context("writing pulled bundle")?;
@@ -543,6 +576,12 @@ abi = "abis/c.json"
         );
     }
 
+    /// The marker `write_bundle_fixture` baked into an installed nest, so a test can say *which*
+    /// bundle it got rather than merely that it got one.
+    fn marker_of(installed: &std::path::Path) -> String {
+        std::fs::read_to_string(installed.join("llms.txt")).expect("installed nest has llms.txt")
+    }
+
     #[tokio::test]
     async fn publish_then_pull_and_load_round_trips() {
         let reg = tempfile::tempdir().unwrap();
@@ -576,6 +615,102 @@ abi = "abis/c.json"
             .unwrap();
         assert!(installed.join(crate::config::CONFIG_FILE).exists());
         assert!(installed.join("abis/c.json").exists());
+    }
+
+    /// The property that makes a pin worth recording: **a re-pointed index cannot change what a
+    /// pinned worker runs.**
+    ///
+    /// `pull` asks the registry's mutable index what `name@version` means *today*, and `blob::load`
+    /// then checks the bytes against that answer - internal consistency, not authenticity. A registry
+    /// that moves `1.0.0` onto different bytes passes that check every time. So this re-points the
+    /// version, exactly as a compromised or merely careless registry would, and asserts the two
+    /// callers diverge: the unpinned one follows the move, the pinned one does not.
+    #[tokio::test]
+    async fn a_pinned_hash_beats_a_registry_that_repoints_the_version() {
+        let reg = tempfile::tempdir().unwrap();
+        let registry = reg.path().to_str().unwrap();
+        let store = open(registry).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let honest_file = dir.path().join("honest.bundle");
+        let swapped_file = dir.path().join("swapped.bundle");
+        let honest = write_bundle_fixture(&honest_file, "the-nest-the-operator-pinned");
+        let swapped = write_bundle_fixture(&swapped_file, "something-else-entirely");
+        assert_ne!(honest, swapped);
+
+        publish(store.as_ref(), &honest_file, Some("horizon"), Some("1.0.0"))
+            .await
+            .unwrap();
+        // Both blobs exist in the registry; only the *pointer* is moved. That is the whole attack:
+        // no blob is tampered with, so every content-address check downstream still passes.
+        publish(
+            store.as_ref(),
+            &swapped_file,
+            Some("horizon"),
+            Some("9.9.9"),
+        )
+        .await
+        .unwrap();
+        store.set_ref("horizon", "1.0.0", &swapped).await.unwrap();
+
+        // Unpinned: trusts the index, and gets whatever it now says.
+        let unpinned_root = tempfile::tempdir().unwrap();
+        let unpinned = unpinned_root.path().join("nest");
+        load_pinned_from_registry(registry, "horizon@1.0.0", None, Some(&unpinned))
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_of(&unpinned),
+            "something-else-entirely",
+            "without a pin the index is the authority - if this ever stops following the move, the \
+             fallback path has quietly changed meaning"
+        );
+
+        // Pinned: fetches by content address, so the moved pointer is never consulted.
+        let pinned_root = tempfile::tempdir().unwrap();
+        let pinned = pinned_root.path().join("nest");
+        load_pinned_from_registry(registry, "horizon@1.0.0", Some(&honest), Some(&pinned))
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_of(&pinned),
+            "the-nest-the-operator-pinned",
+            "a pinned worker ran what the registry pointed at, not what the operator pinned"
+        );
+    }
+
+    /// A pin naming a bundle the registry does not hold must fail *closed* - never fall back to
+    /// resolving the reference, which would silently reinstate the hole the pin exists to close.
+    #[tokio::test]
+    async fn a_pin_the_registry_cannot_serve_fails_rather_than_falling_back() {
+        let reg = tempfile::tempdir().unwrap();
+        let registry = reg.path().to_str().unwrap();
+        let store = open(registry).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.bundle");
+        write_bundle_fixture(&f, "present");
+        publish(store.as_ref(), &f, Some("horizon"), Some("1.0.0"))
+            .await
+            .unwrap();
+
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path().join("nest");
+        let err = load_pinned_from_registry(
+            registry,
+            "horizon@1.0.0",
+            Some(&"a".repeat(64)),
+            Some(&target),
+        )
+        .await
+        .expect_err("a pin the registry cannot serve must not resolve the reference instead");
+        assert!(
+            format!("{err:#}").contains("pinned"),
+            "the error should say the pin is the thing that failed; got: {err:#}"
+        );
+        assert!(
+            !target.join(crate::config::CONFIG_FILE).exists(),
+            "nothing may be installed when the pinned bundle is unavailable"
+        );
     }
 
     #[tokio::test]

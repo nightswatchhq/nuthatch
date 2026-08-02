@@ -225,6 +225,23 @@ itself, then during an upgrade one node would serve the new schema while another
 the same endpoint would answer differently depending on where the load balancer sent the request. A
 declared-but-unpinned endpoint is explicitly **not servable** - an FE refuses rather than guesses.
 
+**Workers pull the nests they are assigned.** A worker indexes what is under `--nest-root` and pulls
+anything else from `--registry` (a directory, or `s3://bucket/prefix`). Without this a worker could
+only run nests you had already copied onto that exact machine - and since the scheduler decides *which*
+box holds a cursor, that meant declaring a nest centrally and then discovering the assigned worker had
+nothing to run. Local always wins: a nest you placed on a box is a deliberate act, often a hand-edited
+view, and is never silently replaced by the registry's copy.
+
+**Pin the bundle, not just the version.** With a `bundle_hash` pinned, a worker fetches **by content
+address** and never consults the registry's index, so re-tagging `1.0.0` in the registry cannot change
+what any worker runs. Unpinned, your fleet is exactly as trustworthy as your registry. Pulled bundles
+are cached at `<--nest-cache>/<name>/<hash>`, which is why re-pinning actually re-pulls instead of
+quietly reusing what is already on disk - and why that cache is safe to delete at any time.
+
+Keep `--nest-cache` off the `--nest-root` mount. The writer-node compose mounts nests read-only, on
+purpose: nests are input, pulled bundles are runtime state, and mixing them is how a re-pinned fleet
+would end up running the old bundle with nothing reporting an error.
+
 **Secrets never enter a bundle.** Private RPC URLs and API keys live in the control plane keyed by
 nest (`PUT /nests/<name>/secrets`), and a writer receives only the secrets of the nests it is
 assigned. The interface is **write-only**: you can list which keys exist, never read a value back.

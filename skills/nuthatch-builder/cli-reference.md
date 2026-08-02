@@ -335,4 +335,6 @@ Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the co
 - `--id <ID>` - This worker's identity in the fleet. Defaults to the hostname, which is unique per container under compose. **Two workers sharing an id would look like one to the registry** and could each hold what it believed was its own lease, so this is derived rather than left to chance
 - `--budget-mb <BUDGET_MB>` - RAM ceiling for everything this worker runs, in MB. The scheduler will not commit cursors past it - Σ assigned cursors ≤ this
 - `--nest-root <NEST_ROOT>` - Where to find the nests this worker is asked to index. `<root>/<name>` if that exists, else `<root>` itself when it is a single nest - which is what the compose topology mounts
+- `--registry <REGISTRY>` - Registry to pull declared nests from when they are not under `--nest-root` (RFC-0019)
+- `--nest-cache <NEST_CACHE>` - Where pulled nests are cached. Written to; keep it off the read-only `--nest-root` mount
 - `--no-secrets` - Skip fetching runtime secrets for assigned nests (RFC-0022 §5)

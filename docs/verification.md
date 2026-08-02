@@ -493,6 +493,33 @@ Declare a nest whose cursor exceeds every worker's budget. Expect `GET /plan` to
 that cannot run what it was asked never looks healthy. Note the distinction from `noroomrightnow`:
 adding a worker fixes the latter and never the former.
 
+**5.12 A worker runs a nest it has never seen** *(needs a registry; the lab automates it)*
+
+```sh
+./scripts/fleet-lab.sh pull
+```
+
+Publish the nest to a registry, pin it (`PUT /nests/<name>/pin`), then **delete it from the writer
+box** and restart the writer with `--registry`. Expect the writer to log `pulling from the registry`
+and `last_block` to advance in the shared store.
+
+*Proves* the half of scaled mode that RFC-0022 named and did not build: an operator declares a nest
+centrally, and the machine that ends up holding that cursor may have nothing on disk. `desired_nest`
+recorded a `version` and a `bundle_hash` from the beginning; until v0.9.4 nothing on the worker side
+read them, which is why a worker could be assigned a nest it had no way to locate (issue #250).
+
+Two details are the point rather than incidental:
+
+- **Deleting the nest first.** A run that leaves it in place passes whether or not the pull works,
+  because operator-placed nests win over the registry.
+- **Pinning.** With a `bundle_hash` the fetch is by content address and the registry's mutable index
+  is never consulted, so re-tagging `1.0.0` in the registry cannot change what a worker runs.
+  Unpinned, a worker is exactly as trustworthy as its registry.
+
+Pulled nests are cached at `<--nest-cache>/<name>/<hash>` — content-addressed so that re-pinning
+resolves to a different directory and re-pulls, rather than silently reusing the bundle it already
+has. Deleting that cache costs one download.
+
 ---
 
 ## Reporting

@@ -47,7 +47,11 @@ async fn main() -> Result<()> {
                 &id,
                 args.budget_mb,
                 !args.no_secrets,
-                std::path::PathBuf::from(&args.nest_root),
+                nuthatch::worker::NestPaths {
+                    root: std::path::PathBuf::from(&args.nest_root),
+                    cache: std::path::PathBuf::from(&args.nest_cache),
+                    registry: args.registry.clone(),
+                },
             )
             .await
         }

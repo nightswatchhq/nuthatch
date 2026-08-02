@@ -9,17 +9,16 @@
 #   ./scripts/fleet-lab.sh up single    # one box: levels 0-4 + the compose fleet on one host
 #   ./scripts/fleet-lab.sh up multi     # three boxes + a private network
 #
-#   !! `multi` PROVISIONS three boxes but `verify` STILL RUNS EVERYTHING ON ONE OF THEM. The compose
-#   !! fleet (postgres + control + writers + FEs) comes up on the first host; the other two sit idle.
-#   !! `partition` and `skew` then target boxes labelled `writer` that are running nothing, so their
-#   !! results would be meaningless. Distributing the roles is unbuilt work, not a config tweak:
-#   !! Postgres is published on 127.0.0.1 only, so a remote writer cannot reach it over the private
-#   !! network, and the writer boxes need role-specific startup pointing at the control box.
-#   !! Verified empty on 2026-07-31. Until that is built, `multi` buys you nothing over `single`.
-#   ./scripts/fleet-lab.sh verify
+#   ./scripts/fleet-lab.sh verify       # `multi` genuinely distributes: control plane + store + FE on
+#                                       # one box, writers on their own, talking over the private net
 #   ./scripts/fleet-lab.sh partition    # cut a writer off the control-plane API, assert it keeps indexing
 #   ./scripts/fleet-lab.sh skew         # push a writer clock forward, assert the lease does not move
+#   ./scripts/fleet-lab.sh pull         # delete a writer's nest, assert it pulls one from the registry
 #   ./scripts/fleet-lab.sh down         # destroy everything this script created
+#
+# Until 2026-07-31 `multi` provisioned three boxes and then ran the whole compose fleet on the first,
+# leaving the other two idle - so `partition` and `skew` were firewalling and clock-skewing machines
+# that ran nothing, and passed. Fixed; the warning that used to live here is gone because the defect is.
 #
 # ## This spends money
 #
@@ -496,6 +495,94 @@ cmd_partition() {
   echo "PASS: resumed after healing ($during -> $after)"
 }
 
+# **A worker runs a nest it has never seen** (RFC-0019, issue #250).
+#
+# Every other check here starts from a nest the lab already placed on each box, which quietly assumes
+# away the hardest part of a distributed fleet: an operator declares a nest *centrally*, and the
+# machine that ends up holding the cursor may have nothing on disk. That was true of nuthatch until
+# now - `desired_nest` recorded a `version` and a `bundle_hash` that nothing on the worker side read.
+#
+# So this deletes the nest from the writer box entirely, publishes it to a registry only the control
+# box serves, pins it, and asserts the writer indexes anyway. Deleting is the point: a check that
+# leaves the nest in place would pass whether or not the pull works.
+cmd_pull() {
+  local w; w=$(ips_by_role | awk '$1=="writer"{print $2}' | head -1)
+  local cp; cp=$(ips_by_role | awk '$1=="control"{print $2}' | head -1)
+  local cp_priv; cp_priv=$(private_ip control)
+  { [ -z "$w" ] || [ -z "$cp" ] || [ -z "$cp_priv" ]; } && { echo "needs the 'multi' shape"; exit 1; }
+
+  # MinIO rather than a real S3: the registry has to be reachable from another machine (a local
+  # directory would make this a single-box test and prove nothing), and a self-contained one keeps
+  # long-lived cloud credentials out of a lab that gets destroyed and rebuilt.
+  local key=labuser sec=labpassword123
+  local s3env="AWS_ACCESS_KEY_ID=$key AWS_SECRET_ACCESS_KEY=$sec AWS_ENDPOINT=http://$cp_priv:9000 AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true"
+  echo "== registry pull: publishing to MinIO on $cp_priv:9000, writer $w starts with no nest =="
+
+  lab_ssh "root@$cp" "set -eu
+    docker rm -f minio >/dev/null 2>&1 || true
+    docker run -d --name minio -p $cp_priv:9000:9000 \
+      -e MINIO_ROOT_USER=$key -e MINIO_ROOT_PASSWORD=$sec quay.io/minio/minio server /data >/dev/null
+    for i in \$(seq 1 30); do curl -fsS -m2 http://$cp_priv:9000/minio/health/live >/dev/null 2>&1 && break; sleep 2; done
+    docker run --rm --network host quay.io/minio/mc alias set lab http://$cp_priv:9000 $key $sec >/dev/null
+    docker run --rm --network host quay.io/minio/mc mb -p lab/nests >/dev/null"
+
+  # Publish from the control box, which is the only machine that has the nest.
+  local hash
+  hash=$(lab_ssh "root@$cp" "set -eu
+    cd /opt/nuthatch-src
+    /usr/local/bin/nuthatch-scaled nest bundle nest --out /tmp/lab.bundle >/dev/null
+    env $s3env /usr/local/bin/nuthatch-scaled nest publish /tmp/lab.bundle \
+      --registry s3://nests/registry --as lab@1.0.0" | awk '/^ *hash:/{print $2; exit}' | tr -d '\r')
+  [ -z "$hash" ] && { echo "FAIL: nothing published - no hash in the publish output"; exit 1; }
+  echo "published lab@1.0.0 -> $hash"
+
+  # Pin it fleet-wide. Without this the worker would resolve through the registry's mutable index;
+  # with it, the fetch is by content address and the index is never consulted.
+  lab_ssh "root@$cp" "curl -fsS -X PUT $cp_priv:$CONTROL_PORT/nests/lab/pin \
+    -H 'authorization: Bearer dev-token-change-me' -H 'content-type: application/json' \
+    -d '{\"version\":\"1.0.0\",\"bundle_hash\":\"$hash\"}'" >/dev/null \
+    || { echo "FAIL: could not pin lab@1.0.0 - is the control plane up? run 'verify' first"; exit 1; }
+
+  local sch; sch=$(nest_schema "$cp")
+  local before; before=$(meta_value "$cp" "$sch" last_block)
+  echo "last_block before: ${before:-none}"
+
+  # **Take the nest away.** Everything below has to come from the registry.
+  lab_ssh "root@$w" "set -eu
+    cd /opt/nuthatch-src
+    docker compose -f docker-compose.writer-node.yml down >/dev/null 2>&1 || true
+    rm -rf nest && mkdir -p nest && chown -R 10001:10001 nest
+    CONTROL_HOST=$cp_priv REGISTRY=s3://nests/registry NUTHATCH_IMAGE=nuthatch-scaled:lab \
+      docker compose -f docker-compose.writer-node.yml up -d >/dev/null
+    docker compose -f docker-compose.writer-node.yml ps --format '{{.Service}} {{.State}}'"
+
+  echo "waiting 120s for the writer to pull and index..."
+  sleep 120
+
+  local logs
+  logs=$(lab_ssh "root@$w" "cd /opt/nuthatch-src && REGISTRY=s3://nests/registry CONTROL_HOST=$cp_priv \
+    docker compose -f docker-compose.writer-node.yml logs --no-color --tail 400" 2>/dev/null)
+  echo "$logs" | grep -q "pulling from the registry" \
+    || { echo "FAIL: the writer never tried to pull. Recent log:"; echo "$logs" | tail -20; exit 1; }
+  echo "PASS: the writer pulled a nest it did not have"
+
+  # A pull that lands but never indexes is the same silence #250 was: assert the store moved.
+  local after; after=$(meta_value "$cp" "$sch" last_block)
+  if [ -z "$after" ] || { [ -n "$before" ] && [ "$after" -le "$before" ]; }; then
+    echo "FAIL: last_block did not advance after the pull (${before:-none} -> ${after:-none})."
+    echo "      Locating a nest is only half of it - the cursor has to actually write."
+    echo "$logs" | tail -20
+    exit 1
+  fi
+  echo "PASS: indexed from a pulled nest (${before:-none} -> $after)"
+
+  # The cache is content-addressed, which is what makes a re-pin re-pull rather than silently reuse.
+  lab_ssh "root@$w" "docker compose -f docker-compose.writer-node.yml exec -T writer ls /var/lib/nuthatch/nests/lab 2>/dev/null" \
+    | tr -d '\r' | grep -q "$hash" \
+    && echo "PASS: cached at its content address (/var/lib/nuthatch/nests/lab/$hash)" \
+    || echo "NOTE: could not list the cache directory - the pull and the indexing both passed"
+}
+
 cmd_skew() {
   local w; w=$(ips_by_role | awk '$1=="writer"{print $2}' | head -1)
   local cp; cp=$(ips_by_role | awk '$1=="control"{print $2}' | head -1)
@@ -558,6 +645,7 @@ case "${1:-}" in
   verify)    cmd_verify ;;
   partition) cmd_partition ;;
   skew)      cmd_skew ;;
+  pull)      cmd_pull ;;
   down)      cmd_down ;;
   hosts)     ips_by_role ;;
   *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
