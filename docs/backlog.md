@@ -90,9 +90,12 @@ written and is now only half true. Scaled mode moved out of it; the node did not
   The *destination* - one Arrow-native engine across both modes, redb/Postgres/Parquet as
   `TableProvider`s - is deferred and **benchmark-gated** (§4): build scaled-side first, then a
   `nuthatch bench` spike of DataFusion vs DuckDB over the same segments (latency + RSS within the ≤2 GB
-  budget), then a golden SQL-compat suite, then decide whether to retire DuckDB. A dependency reality
-  to design around: under MSRV 1.85 cargo resolves DataFusion 48 (arrow 55) - clashes with our arrow 56;
-  aligning needs an MSRV bump to 1.88 (DataFusion 54) or an arrow downgrade.
+  budget), then a golden SQL-compat suite, then decide whether to retire DuckDB. **The gate was run on
+  2026-08-02 and DataFusion did not meet it** - 1.6-2.7x DuckDB's latency, widening with segment size,
+  at exact result parity. DuckDB stays for 1.0; see RFC-0013 §5. Note the dependency picture recorded
+  here previously was wrong in both particulars: measured, DataFusion 54 shares our arrow 58 (no clash,
+  no duplicate arrow) and costs +56 crates, not 70. The only real blocker was our MSRV - 1.85 silently
+  resolves DataFusion 48 instead of 54.
 - **Turso hot store (0013 §1).** Deferred, not rejected - behind the existing `HotStore` trait.
   Triple-gated: a production-ready release, a permissive/no-BSL licence, and a measured win over redb
   that federation doesn't already provide. Until all three, no.

@@ -1,0 +1,22 @@
+{
+  "bench": "rfc-0013-gate",
+  "label": "RFC-0013 §4: DataFusion vs DuckDB on net_balances over one sealed segment",
+  "date": "2026-08-02",
+  "query": "net_balances - the i128 signed fold over a string-typed uint256 value column",
+  "duckdb": "1.10504.0 (bundled)",
+  "datafusion": "54.1.0",
+  "arrow": "58.3.0",
+  "hardware": "11 cores, 18 GB RAM (darwin)",
+  "note": "each size run twice, reversing engine order, because the first engine warms the page cache",
+  "runs": [
+    {"rows": 2000000,  "duckdb_ms": 41,  "datafusion_ms": 76,  "ratio": 1.85, "order": "duckdb-first", "parity": true},
+    {"rows": 2000000,  "duckdb_ms": 40,  "datafusion_ms": 65,  "ratio": 1.62, "order": "datafusion-first", "parity": true},
+    {"rows": 8000000,  "duckdb_ms": 95,  "datafusion_ms": 244, "ratio": 2.57, "order": "duckdb-first", "parity": true},
+    {"rows": 8000000,  "duckdb_ms": 98,  "datafusion_ms": 251, "ratio": 2.56, "order": "datafusion-first", "parity": true},
+    {"rows": 20000000, "duckdb_ms": 229, "datafusion_ms": 606, "ratio": 2.65, "order": "duckdb-first", "parity": true},
+    {"rows": 20000000, "duckdb_ms": 223, "datafusion_ms": 596, "ratio": 2.67, "order": "datafusion-first", "parity": true}
+  ],
+  "parity": "identical results at every size, in both orders",
+  "verdict": "gate not met - DataFusion is 1.6-2.7x DuckDB's latency and the gap widens with segment size",
+  "decision": "keep DuckDB in embedded; do not adopt DataFusion for 1.0"
+}

@@ -1,8 +1,10 @@
 # RFC-0013: Storage and query-engine direction - DataFusion convergence, Turso deferred
 
 - Status: Accepted (2026-07-18) - direction recorded; **§3 (SQL-over-the-tip) shipped**, but via a
-  DuckDB hot+cold `UNION` rather than a DataFusion `TableProvider` (see the §3 note below). DataFusion
-  convergence (§2) stays the deferred, benchmark-gated destination.
+  DuckDB hot+cold `UNION` rather than a DataFusion `TableProvider` (see the §3 note below). **§4's
+  benchmark gate was run on 2026-08-02 and DataFusion did not meet it** - 1.6-2.7x DuckDB's latency
+  with the gap widening as segments grow, at exact result parity. DuckDB stays in both modes for 1.0;
+  the §2 destination is unmet, not repudiated. See §5.
 - Author: Pete (cargopete)
 - Date: 2026-07-17
 - Depends on: RFC-0001 (Implemented - decode registry, per-table model), RFC-0004
@@ -123,6 +125,56 @@ DataFusion decision (§2) *also* satisfies the wish that motivated Turso-for-emb
    DuckDB → one engine. If DuckDB's OLAP edge matters more than the consistency win,
    keep it in embedded and pay the two-engine tax with a shared SQL-compat/golden test
    suite (the same query, same result, both engines). Let the data decide.
+
+### §5 - The gate, run (2026-08-02)
+
+**Outcome: DataFusion does not meet §4's acceptance criterion. DuckDB stays, in both modes, for 1.0.**
+
+Measured rather than argued, on the fold that actually matters — `net_balances`, the signed i128
+aggregate the compliance path depends on — over one sealed segment written by our own writer.
+Artifact: [`docs/bench/rfc-0013-datafusion-gate.json`](../bench/rfc-0013-datafusion-gate.json).
+
+| rows | DuckDB | DataFusion | ratio | parity |
+|---|---|---|---|---|
+| 2 M | 41 ms | 76 ms | 1.85× | identical |
+| 8 M | 95 ms | 244 ms | 2.57× | identical |
+| 20 M | 229 ms | 606 ms | 2.65× | identical |
+
+Each size was run twice with the engine order reversed, because whichever engine goes first pays to
+warm the page cache and the second gets it free — the confound that made the first OBIB run look 3.9×
+slower than the second. The ratio survived reversal at every size (1.62× / 2.56× / 2.67×), so this is
+about the engines and not about the disk.
+
+**Result parity held everywhere**, which is the genuinely encouraging half: identical addresses and
+identical i128 sums at every size, in both orders. Correctness is not what fails the gate.
+
+**What fails it is that the gap widens with segment size** — 1.8× at 2 M rows, 2.6× at 20 M — and
+segments only ever grow. A constant multiple could be argued away as the price of one Arrow-native
+engine; a multiple that scales against us cannot be, because it is worst exactly where analytical
+queries are worth having.
+
+**Two corrections to what this RFC and the backlog previously assumed**, both from running it:
+
+- **There is no arrow-version clash.** DataFusion 54 and our tree share one arrow 58.3.0; no duplicate
+  arrow, no type-boundary problem. The backlog said DataFusion 48/arrow 55 clashed with "our arrow 56";
+  we are on 58, and 54 fits.
+- **The cost is +56 crates, not 70** — and the *only* structural blocker is our MSRV. At `rust-version
+  = "1.85"` cargo silently resolves DataFusion **48** while never mentioning 54; the bump to 1.88 makes
+  54 resolve, build and run. So "we cannot try DataFusion yet" was never true. It was untested.
+
+**Dialect differences are real but small at this scale.** DataFusion has no `HUGEINT`; `DECIMAL(38,0)`
+is the equivalent 128-bit width and `TRY_CAST` carries the same NULL-on-overflow semantics our fold
+relies on. Parquet strings arrive as `Utf8View` rather than `Utf8`. Both are ordinary migration work,
+not blockers — worth recording because the risk section above rated them higher than they measured.
+
+**What would reopen this.** A DataFusion release that closes the aggregate gap; or federation becoming
+load-bearing rather than aesthetic — a scaled-mode query genuinely spanning Postgres hot and Parquet
+cold in one plan, which is the case DuckDB cannot serve and the one thing this RFC's §2 was really
+about. Neither is a 1.0 concern. Re-run the spike before relitigating; it is one example and an MSRV
+bump away.
+
+**Not changed:** the destination in §2 is not repudiated, only unmet. This is measure-then-switch
+working as designed — the measurement said don't.
 
 ## Non-goals
 
