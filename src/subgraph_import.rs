@@ -120,22 +120,52 @@ impl Manifest {
 
 // ── Fetching ─────────────────────────────────────────────────────────────
 
-/// Accepts a bare CID, `ipfs://<cid>`, `/ipfs/<cid>`, or a full http(s) URL.
-/// Returns the list of URLs to try in order.
-pub fn candidate_urls(source: &str, gateways: &[String]) -> Result<Vec<String>> {
+/// Who supplied a reference - which decides whether it may be a URL at all.
+///
+/// **This distinction is the security boundary of subgraph import.** The argument an operator types
+/// is theirs to point anywhere they like. Every other reference - the ABI links inside the manifest -
+/// arrives from a document fetched off a public gateway, and is therefore attacker-controlled input
+/// that happens to be handed to an HTTP client. Letting those be URLs turns `init --from-subgraph`
+/// into a request forgery: a manifest carrying `file: {"/": "http://169.254.169.254/…"}` would make
+/// the operator's own machine fetch cloud-instance credentials and write the reply into `abis/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The `--from-subgraph` argument. May be a CID or a URL; the operator chose it.
+    Operator,
+    /// A link read out of a manifest. **CID only** - never a URL, whatever it claims to be.
+    Manifest,
+}
+
+/// A CID is base58btc or base32 - alphanumeric throughout. Anything else is a path, a query, a
+/// scheme, or an attempt at one, and none of those belong in a gateway URL we build by concatenation.
+fn is_cid_shaped(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Accepts a bare CID, `ipfs://<cid>` or `/ipfs/<cid>` from anywhere, and a full http(s) URL only
+/// from the operator (see [`Origin`]). Returns the list of URLs to try in order.
+pub fn candidate_urls(source: &str, gateways: &[String], origin: Origin) -> Result<Vec<String>> {
     let s = source.trim();
     if s.is_empty() {
         bail!("empty subgraph source");
     }
     if s.starts_with("http://") || s.starts_with("https://") {
-        return Ok(vec![s.to_string()]);
+        return match origin {
+            Origin::Operator => Ok(vec![s.to_string()]),
+            Origin::Manifest => bail!(
+                "this manifest asks us to fetch a URL rather than a CID: {s:?}. Refusing - a \
+                 manifest comes from a public gateway, so honouring that would let whoever wrote it \
+                 choose what your machine connects to. Only the --from-subgraph argument you type \
+                 may be a URL."
+            ),
+        };
     }
     let cid = s
         .strip_prefix("ipfs://")
         .or_else(|| s.strip_prefix("/ipfs/"))
         .unwrap_or(s)
         .trim_matches('/');
-    if cid.is_empty() || cid.contains('/') || cid.contains(' ') {
+    if !is_cid_shaped(cid) {
         bail!("'{source}' is not a CID or URL - expected e.g. QmVPhL… or ipfs://QmVPhL…");
     }
     Ok(gateways.iter().map(|g| format!("{g}{cid}")).collect())
@@ -144,8 +174,8 @@ pub fn candidate_urls(source: &str, gateways: &[String]) -> Result<Vec<String>> 
 /// Fetch a document, trying each gateway until one answers. Gateways fail
 /// often and individually, so a single failure is never fatal; only running
 /// out of them is, and then we say which ones we tried.
-pub async fn fetch_ipfs(source: &str, gateways: &[String]) -> Result<String> {
-    let urls = candidate_urls(source, gateways)?;
+pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Result<String> {
+    let urls = candidate_urls(source, gateways, origin)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -154,7 +184,7 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String]) -> Result<String> {
     let mut failures = Vec::new();
     for url in &urls {
         match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(resp) if resp.status().is_success() => match read_capped(resp).await {
                 Ok(body) if !body.trim().is_empty() => return Ok(body),
                 Ok(_) => failures.push(format!("{url}: empty body")),
                 Err(e) => failures.push(format!("{url}: {e}")),
@@ -167,6 +197,33 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String]) -> Result<String> {
         "could not fetch '{source}' from any gateway:\n  {}",
         failures.join("\n  ")
     ))
+}
+
+/// The most we will hold in memory for one manifest or ABI.
+///
+/// A gateway is a third party, and the reply size is its choice rather than ours. Streaming with a
+/// ceiling means a hostile or broken one costs a bounded amount of RAM instead of whatever it feels
+/// like sending - the same reasoning as the `/sql` result cap, applied to the one place `init`
+/// trusts someone else's server. Real manifests are kilobytes; the largest ABI we have seen is far
+/// under a megabyte.
+const MAX_FETCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a response body, refusing past [`MAX_FETCH_BYTES`] rather than buffering whatever arrives.
+async fn read_capped(resp: reqwest::Response) -> Result<String> {
+    use futures::StreamExt;
+    let mut out: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading response body")?;
+        if out.len() + chunk.len() > MAX_FETCH_BYTES {
+            bail!(
+                "response exceeds {} MiB - refusing to buffer it",
+                MAX_FETCH_BYTES / 1024 / 1024
+            );
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out).context("response is not UTF-8")
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────
@@ -810,29 +867,104 @@ templates:
         assert_eq!(got[1].event, "PoolCreated");
     }
 
+    /// **The one that matters.** A manifest is fetched from a public gateway, so its ABI links are
+    /// attacker-controlled strings handed to an HTTP client. Before the `Origin` split they were
+    /// passed through verbatim whenever they looked like a URL, which made
+    /// `init --from-subgraph <hostile-cid>` fetch whatever the manifest's author chose - including
+    /// `169.254.169.254`, where a cloud host serves instance credentials - and write the reply into
+    /// `abis/`. Reproduced end to end from the manifest, not asserted against the helper in isolation.
+    #[test]
+    fn a_manifest_cannot_make_us_fetch_a_url() {
+        let m = r#"
+specVersion: 0.0.5
+dataSources:
+  - kind: ethereum/contract
+    name: Evil
+    network: mainnet
+    source:
+      address: "0x0000000000000000000000000000000000000001"
+      startBlock: 1
+    mapping:
+      abis:
+        - name: Evil
+          file:
+            /: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+      eventHandlers:
+        - event: Transfer(address,address,uint256)
+"#;
+        let man = parse_manifest(m).unwrap();
+        let link = &man.data_sources[0].abis[0].cid;
+        let err = candidate_urls(link, &["https://gw/".into()], Origin::Manifest)
+            .expect_err("a manifest link that is a URL must be refused");
+        let err = format!("{err:#}");
+        assert!(err.contains("169.254.169.254"), "name the target: {err}");
+        assert!(
+            err.contains("--from-subgraph"),
+            "say which reference may be a URL: {err}"
+        );
+    }
+
+    /// The operator's own argument is theirs to point anywhere - that is the whole difference.
+    #[test]
+    fn the_operator_may_still_pass_a_url() {
+        let urls = candidate_urls("https://example.com/subgraph.yaml", &[], Origin::Operator)
+            .expect("an operator-supplied URL is intentional");
+        assert_eq!(urls, vec!["https://example.com/subgraph.yaml"]);
+    }
+
+    /// A CID is concatenated onto a gateway prefix, so anything that is not alphanumeric can reach
+    /// outside the path the gateway meant to serve - `../`, a query, a second scheme.
+    #[test]
+    fn a_cid_that_is_not_cid_shaped_is_refused() {
+        for bad in [
+            "../../etc/passwd",
+            "Qm..%2f..%2fadmin",
+            "Qm?redirect=http://evil",
+            "Qm#frag",
+            "Qm x",
+            "",
+        ] {
+            assert!(
+                candidate_urls(bad, &["https://gw/".into()], Origin::Manifest).is_err(),
+                "{bad:?} should not be accepted as a CID"
+            );
+        }
+        assert!(candidate_urls(
+            "QmVPhLwuv9zn2c761Ua7eJ",
+            &["https://gw/".into()],
+            Origin::Manifest
+        )
+        .is_ok());
+    }
+
     #[test]
     fn cid_urls_are_built_for_every_gateway() {
         let gws: Vec<String> = DEFAULT_IPFS_GATEWAYS
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let urls = candidate_urls("QmVPhLwuv9zn2c761Ua7eJAFXBmrNsW32XUYsj1GKtNX4X", &gws).unwrap();
+        let urls = candidate_urls(
+            "QmVPhLwuv9zn2c761Ua7eJAFXBmrNsW32XUYsj1GKtNX4X",
+            &gws,
+            Origin::Manifest,
+        )
+        .unwrap();
         assert_eq!(urls.len(), gws.len());
         assert!(urls[0].ends_with("QmVPhLwuv9zn2c761Ua7eJAFXBmrNsW32XUYsj1GKtNX4X"));
 
         // ipfs:// and /ipfs/ prefixes resolve to the same CID.
         for form in ["ipfs://QmAbc", "/ipfs/QmAbc", "QmAbc"] {
             assert!(
-                candidate_urls(form, &gws).unwrap()[0].ends_with("QmAbc"),
+                candidate_urls(form, &gws, Origin::Manifest).unwrap()[0].ends_with("QmAbc"),
                 "{form}"
             );
         }
-        // A full URL is used verbatim, not gatewayed.
+        // A full URL is used verbatim, not gatewayed - but only when the operator supplied it.
         assert_eq!(
-            candidate_urls("https://example.com/subgraph.yaml", &gws).unwrap(),
+            candidate_urls("https://example.com/subgraph.yaml", &gws, Origin::Operator).unwrap(),
             vec!["https://example.com/subgraph.yaml".to_string()]
         );
-        assert!(candidate_urls("", &gws).is_err());
-        assert!(candidate_urls("not a cid", &gws).is_err());
+        assert!(candidate_urls("", &gws, Origin::Operator).is_err());
+        assert!(candidate_urls("not a cid", &gws, Origin::Operator).is_err());
     }
 }

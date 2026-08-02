@@ -349,7 +349,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     };
 
     println!("→ fetching subgraph manifest {source}…");
-    let raw = sg::fetch_ipfs(source, &gateways).await?;
+    // The operator typed this one, so it may be a URL.
+    let raw = sg::fetch_ipfs(source, &gateways, sg::Origin::Operator).await?;
     let manifest = sg::parse_manifest(&raw)?;
 
     let network = manifest.network()?;
@@ -567,9 +568,14 @@ async fn fetch_and_vendor_abi(
     gateways: &[String],
     notes: &mut Vec<String>,
 ) -> Result<serde_json::Value> {
-    let raw = crate::subgraph_import::fetch_ipfs(&abi_ref.cid, gateways)
-        .await
-        .with_context(|| format!("fetching ABI `{}` ({})", abi_ref.name, abi_ref.cid))?;
+    // From the manifest, so CID only - see `subgraph_import::Origin`.
+    let raw = crate::subgraph_import::fetch_ipfs(
+        &abi_ref.cid,
+        gateways,
+        crate::subgraph_import::Origin::Manifest,
+    )
+    .await
+    .with_context(|| format!("fetching ABI `{}` ({})", abi_ref.name, abi_ref.cid))?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("ABI `{}` ({}) is not JSON", abi_ref.name, abi_ref.cid))?;
     if !parsed.is_array() {
