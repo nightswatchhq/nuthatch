@@ -93,11 +93,9 @@ sends SIGTERM, which drains and checkpoints cleanly.
 `linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
 Pin the version tag rather than `:latest` for anything you care about.
 
-> **Scaled mode's writer pool does not yet index (issue #250).** The control plane works - workers
-> register, cursors are scheduled and leased with a store-enforced fence, secrets are injected - but a
-> worker that acquires a cursor runs no ingestion loop, so no rows appear. Use **embedded mode**
-> (`nuthatch dev`, or `roost` for many nests) for anything real until that lands. Everything below
-> describes the topology accurately; it is the ingestion half that is missing.
+> **The writer pool indexes as of 0.9.3.** Until then it did not: a worker registered, took a lease
+> and reported, and ran no ingestion loop, so no rows appeared (issue #250). If you are on 0.9.2 or
+> earlier, scaled mode does not write - upgrade, or use embedded mode.
 
 **Scaled mode needs the `-scaled` image**, not this one. The default image is the embedded build and
 carries no database driver. `nuthatch worker` and `nuthatch control` are still *listed* in its `--help`
