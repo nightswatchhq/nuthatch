@@ -1,11 +1,16 @@
 # RFC-0022: Distributed scaled mode - read/write planes, a writer pool, dynamic nest placement
 
-- Status: **Control plane implemented; ingestion NOT implemented** (corrected 2026-07-31, issue #250).
-  `worker::run` registers, takes leases, loads secrets and reports - and **contains no indexing code
-  at all**: no `index_loop`, no `build_nest`, no backfill path. A worker acquires a cursor and does
-  nothing with it, so **the writer pool does not write**. The control-plane half below is real and is
-  now proven across machines (registration, scheduling, leases with a store-enforced fence, and
-  clock-skew safety measured on a three-box fleet). The ingestion half is unbuilt.
+- Status: **Implemented, control plane and ingestion both** (v0.9.3 wired ingestion, v0.9.4 the
+  registry pull). Proven across machines rather than argued: registration, scheduling, leases with a
+  store-enforced fence, clock-skew safety, indexing into the shared store, and 377 blocks indexed
+  through a 90-second control-plane outage.
+  *Corrected 2026-07-31 (issue #250), when this read "implemented" and the writer pool did not write:*
+  `worker::run` registered, took leases, loaded secrets and reported - and contained **no indexing code
+  at all**. A worker acquired a cursor and did nothing with it. The half named here as RFC-0019's job
+  ("the registry workers pull nests from") was the reason: `desired_nest` recorded a `version` and a
+  `bundle_hash` that nothing on the worker side read, so an assigned nest that was not already on the
+  box could not be located, let alone run. Both halves are built; §4's pin now decides what a worker
+  *fetches*, not only what an FE *serves*.
   *Previously, and wrongly, marked "Implemented 2026-07-30":* All six §Testing acceptance items pass; 39 tests run against a
   live Postgres in CI. Two caveats are recorded honestly rather than closed - see *What was and was
   not verified*, below. Built 2026-07-29/30; was *accepted, design only* (2026-07-21). §0 brief amendment applied to

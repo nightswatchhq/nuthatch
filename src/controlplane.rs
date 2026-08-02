@@ -214,6 +214,33 @@ impl ControlPlane {
         })
     }
 
+    /// What a worker needs to **fetch** a nest it does not have: see [`crate::worker::NestSource`].
+    ///
+    /// Separate from [`ControlPlane::desired`] because the scheduler only needs a footprint to place a
+    /// cursor, while a worker needs to know *which bundle* to pull. Those columns already existed for
+    /// RFC-0022 §4's fleet-wide pinning; nothing was reading them on the worker side, which is why a
+    /// worker could be assigned a nest it had no way to locate (issue #250).
+    pub fn desired_sources(&self) -> Result<Vec<crate::worker::NestSource>> {
+        self.conn.with(move |c| {
+            let rows = c.query(
+                &format!(
+                    "SELECT name, chain, version, bundle_hash FROM \"{SCHEMA}\".desired_nest \
+                     ORDER BY name"
+                ),
+                &[],
+            )?;
+            Ok(rows
+                .into_iter()
+                .map(|r| crate::worker::NestSource {
+                    name: r.get(0),
+                    chain: r.get(1),
+                    version: r.get(2),
+                    bundle_hash: r.get(3),
+                })
+                .collect())
+        })
+    }
+
     // ---- worker registry -----------------------------------------------------------------------
 
     /// Register or heartbeat a worker. One call for both: a worker that has been away long enough to

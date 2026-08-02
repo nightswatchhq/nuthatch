@@ -268,7 +268,12 @@ async fn current_plan(
     )
 }
 
-/// Pin the version an endpoint serves, fleet-wide.
+/// Pin the version an endpoint serves, fleet-wide - **and the bundle any worker pulls**.
+///
+/// The second half arrived with RFC-0019's worker-side pull. A pinned `bundle_hash` is fetched by
+/// content address, so the registry's mutable index is bypassed entirely: re-tagging a version cannot
+/// redirect a worker. Pinning is therefore the difference between "the fleet runs what we chose" and
+/// "the fleet runs whatever the registry says today".
 async fn pin(
     State(api): State<Api>,
     Path(name): Path<String>,
@@ -286,7 +291,8 @@ async fn pin(
                 "endpoint": name,
                 "version": body.version,
                 "bundle_hash": body.bundle_hash,
-                "note": "every FE node now resolves this endpoint to this version",
+                "note": "every FE node resolves this endpoint to this version, and any worker \
+                         pulling this nest fetches exactly this bundle",
             })),
         ),
         Ok(false) => (

@@ -11,6 +11,10 @@
 #   CONTROL_HOST=10.44.1.1 \
 #   docker compose -f docker-compose.writer-node.yml up -d --scale writer=2
 #
+# Set `REGISTRY` to a bundle store (a shared directory, or `s3://…`) and a worker fetches the nests it
+# is assigned rather than requiring you to have placed them on every box. Pin `bundle_hash` in the
+# control plane and the fetch is by content address, so the registry's index cannot redirect it.
+#
 # **Why this is not just an override file.** A `-f a.yml -f b.yml` merge would still inherit
 # `depends_on`, and compose has no syntax for removing one. Being a separate file is what makes "this
 # machine runs workers and nothing else" true by construction rather than by careful merging.
@@ -36,9 +40,23 @@ services:
       --hot-store postgres://nuthatch:nuthatch@${CONTROL_HOST}:5433/nuthatch
       --chains ${CHAINS:-arbitrum-one}
       --budget-mb ${BUDGET_MB:-2048}
+      ${REGISTRY:+--registry ${REGISTRY}}
     volumes:
       # Read-only: a writer reads the nest's config and ABIs and writes only to the shared store.
       # Anything that needs this writable is a local-file dependency that should not exist here (see
       # RFC-0022 slice 3b, which removed the last one on the serving side).
+      #
+      # With a `REGISTRY` set, this mount can be empty or absent entirely: a worker pulls the nests it
+      # is assigned and does not need an operator to have placed them here. What *is* here still wins,
+      # which is how you pin one box to a local build without touching the fleet's desired state.
       - ./nest:/nest:ro
+      # Writable, and deliberately **not** the mount above: pulled bundles are runtime artifacts, not
+      # operator input. Keeping them apart is what lets a re-pinned fleet actually re-pull - a pulled
+      # copy living in `/nest` would satisfy the local-wins rule forever and silently outrank the pin.
+      # Named rather than bind-mounted so it survives `up -d` and is thrown away with `down -v`.
+      - nest-cache:/var/lib/nuthatch/nests
     restart: unless-stopped
+
+volumes:
+  # Everything in here is re-fetchable from the registry; losing it costs one download per nest.
+  nest-cache:

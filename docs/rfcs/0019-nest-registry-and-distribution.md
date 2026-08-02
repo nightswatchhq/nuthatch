@@ -155,6 +155,20 @@ nest load foo@1.2.0
 this same resolution (a breaking version resolves to a *different endpoint*, a compatible one hot-swaps
 behind the same one). RFC-0022's scheduler calls exactly this flow on whichever worker it places `foo`.
 
+**Built, and with one correction to the sketch above (v0.9.4).** A worker given `--registry` pulls any
+declared nest it cannot find under `--nest-root`. Two things this RFC did not say, both learned from
+wiring it:
+
+- **A pinned `bundle_hash` bypasses the index entirely.** The flow above - resolve, then verify the blob
+  against what the index said - proves the registry served the blob it *named*, which is internal
+  consistency rather than authenticity. A registry that re-points `foo@1.2.0` at other bytes passes it
+  every time. Where the control plane has pinned a hash (RFC-0022 §4), the fetch goes straight to that
+  content address and step one is skipped. The index is a convenience for humans; the pin is authority.
+- **Pulled bundles must not land in the nest directory.** They live in a content-addressed cache
+  (`<--nest-cache>/<name>/<hash>`) because operator-placed nests outrank the registry - so a pulled copy
+  sitting in `--nest-root` would satisfy that rule forever and make a re-pinned fleet silently keep
+  running the old bundle. Keyed by hash, a changed pin is a different directory and re-pulls for free.
+
 ## Implementation
 
 - New `src/registry.rs` client (distinct from the existing decode `registry.rs` - name TBD, likely
