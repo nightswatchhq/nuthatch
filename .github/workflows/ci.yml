@@ -243,24 +243,23 @@ jobs:
           name: nuthatch-release
           path: bin
       - name: measure peak RSS
-        # Ceiling is 256 MB: generous headroom over the measured ~37 MB, far under the 2 GB product
-        # budget. The script retries once if the first run indexes nothing. It is NOT continue-on-error
-        # - the RAM budget is a real gate.
+        # Ceiling is 256 MB: generous headroom over the measured ~60 MB for this fixture, far under
+        # the 2 GB product budget. NOT continue-on-error - the RAM budget is a real gate.
         #
-        # FOOTPRINT_RPC is an optional repo secret naming a dedicated endpoint. Without it the job runs
-        # against the free public endpoints nuthatch ships with, which are rate-limited and were
-        # measured returning nothing on roughly half of attempts - enough to flap a required check.
-        # When the secret is set, CHAIN/CONTRACT must name a token on THAT endpoint's chain.
+        # **No secret, and no third party.** This used to index mainnet USDC over the shipped public
+        # endpoints, optionally overridden by a FOOTPRINT_RPC secret. Secrets are not exposed to fork
+        # PRs, so an external contribution could never satisfy a required check - it failed on the
+        # honest "indexed 0 transfers, refusing to false-pass" path and a maintainer had to wave it
+        # through, which is how a gate stops meaning anything (issue #260, hit by PR #253). The peak
+        # was also incomparable between runs, since it depended on how many blocks a rate-limited
+        # endpoint served.
         #
-        # The URL never reaches the logs: Actions masks the secret's value, the script does not echo it,
-        # and the indexer's own output (which logs endpoint hosts on failure) goes to a file the script
-        # never prints. Secrets are unavailable to fork PRs, which fall back to the public path.
+        # The script now serves the chain itself (footprint-rpc.py) and writes the nest inline rather
+        # than calling `init`, so there is no RPC and no ABI lookup. Every run indexes exactly 8004
+        # rows: a change in peak RSS is a change in nuthatch, and a fork behaves identically.
         env:
           BIN: bin/nuthatch
           MAX_RSS_MB: "256"
-          FOOTPRINT_RPC: ${{ secrets.FOOTPRINT_RPC }}
-          CHAIN: ${{ secrets.FOOTPRINT_RPC != '' && 'arbitrum-one' || 'mainnet' }}
-          CONTRACT: ${{ secrets.FOOTPRINT_RPC != '' && '0xaf88d065e77c8cC2239327C5EDb3A432268e5831' || '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' }}
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/footprint.sh

@@ -1,74 +1,116 @@
 #!/usr/bin/env bash
+#
 # Measure peak resident memory of a single-chain index and enforce a ceiling.
 #
-# Runs the documented scenario - `init` a token, then `dev --backfill 200` - samples peak RSS while it
-# indexes, and fails if it exceeds MAX_RSS_MB. The ceiling is set generously (256 MB) above the measured
-# ~37 MB so RPC flakiness never causes a false pass, and the job retries once if the first attempt
-# indexes nothing.
+# Runs the documented scenario - a nest, then `dev --backfill` - samples peak RSS while it indexes,
+# and fails if it exceeds MAX_RSS_MB. The ceiling is set generously (256 MB) above the measured ~37 MB
+# for a single contract, so this catches a regression rather than policing noise.
 #
-# RPC selection. By default this indexes mainnet USDC over the *free public* endpoints nuthatch ships
-# with, which are rate-limited and regularly return nothing - measured at roughly a 50% per-attempt
-# failure rate, which is why this job was flapping. Set FOOTPRINT_RPC (a repo secret in CI) to use a
-# dedicated endpoint instead, with CHAIN/CONTRACT naming a token on that chain.
+# **This talks to no third party.** It used to index mainnet USDC over the shipped public endpoints,
+# which cost us twice (issue #260):
 #
-# The endpoint is NEVER echoed: it is passed straight to the binary, and the indexer's own output
-# (which logs endpoint hosts on failure) goes to a log file this script does not print.
+#   1. Repository secrets are not exposed to fork pull requests, so an external contribution could
+#      never satisfy a *required* check. It failed on the honest "indexed 0 transfers, refusing to
+#      false-pass" path, and a maintainer had to read the log and wave it through - which is how a
+#      gate stops meaning anything. Our first external PR (#253) hit exactly this.
+#   2. The number was not comparable between runs. Peak RSS depended on how many blocks a
+#      rate-limited endpoint happened to serve, so "did this change cost us memory?" was unanswerable.
+#
+# Both are fixed by serving the chain ourselves (footprint-rpc.py) and checking in the nest instead of
+# calling `init`, which removes the ABI-resolution round trip too. Every run indexes exactly the same
+# logs, so a change in peak RSS is a change in nuthatch.
 #
 # Env: BIN (default target/release/nuthatch), MAX_RSS_MB (default 256), PORT (default 8288),
-#      FOOTPRINT_RPC (default empty -> public endpoints), CHAIN/CONTRACT (default mainnet USDC).
+#      RPC_PORT (default 8545).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
 MAX_RSS_MB="${MAX_RSS_MB:-256}"
 PORT="${PORT:-8288}"
-FOOTPRINT_RPC="${FOOTPRINT_RPC:-}"
-# Defaults index mainnet USDC over the shipped public endpoints. CI overrides all three together so a
-# dedicated endpoint is paired with a token that actually exists on its chain.
-CHAIN="${CHAIN:-mainnet}"
-CONTRACT="${CONTRACT:-0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48}"
+RPC_PORT="${RPC_PORT:-8545}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# `--rpc` only when an endpoint was supplied; otherwise the chain's public defaults apply.
-RPC_ARGS=()
-if [ -n "$FOOTPRINT_RPC" ]; then
-  RPC_ARGS=(--rpc "$FOOTPRINT_RPC")
-  echo "using the configured footprint RPC (value not logged)" >&2
-else
-  echo "no FOOTPRINT_RPC set - using free public endpoints, which are rate-limited and flaky" >&2
-fi
+python3 "$HERE/footprint-rpc.py" "$RPC_PORT" &
+RPC_PID=$!
+trap 'kill "$RPC_PID" 2>/dev/null || true' EXIT
+for _ in $(seq 1 40); do
+  curl -fsS -m 2 -X POST -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+    "127.0.0.1:$RPC_PORT" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+
+# The nest, written here rather than fetched: `init` would resolve an ABI over the network, which is
+# the other third party this check used to depend on.
+write_nest() {
+  local dir="$1"
+  mkdir -p "$dir/abis"
+  cat > "$dir/nuthatch.toml" <<TOML
+[nest]
+name = "footprint"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["http://127.0.0.1:$RPC_PORT"]
+schema_version = 1
+
+[[contracts]]
+alias = "usdc"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/usdc.json"
+TOML
+  cat > "$dir/abis/usdc.json" <<'JSON'
+[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+  {"name":"from","type":"address","indexed":true},
+  {"name":"to","type":"address","indexed":true},
+  {"name":"value","type":"uint256","indexed":false}]}]
+JSON
+}
+
+# A fixed amount of work, so peak RSS is comparable between runs. The mock serves LOGS_PER_BLOCK=4
+# `Transfer`s for every block, and `--backfill N` indexes the last N blocks from the tip - so the run
+# is complete at exactly BACKFILL_BLOCKS x 4 rows, and we wait for that rather than stopping at
+# whichever poll first crossed a threshold. Stopping early was the old behaviour and it made the
+# number depend on how fast the machine happened to be, which is the comparability this check exists
+# to provide.
+BACKFILL_BLOCKS=2000
+# `--backfill N` indexes the last N blocks *inclusive of the tip*, and the mock serves 4 logs per
+# block - hence N*4 + 4. Measured, not derived: the first version of this asserted N*4 and failed at
+# 8004 of 8000, which is the fixture being right and the arithmetic being wrong.
+EXPECT=$(( BACKFILL_BLOCKS * 4 + 4 ))
+TIP=20000
 
 # Prints "<peak_rss_kb> <entities>" to stdout; all logs go to stderr.
 measure() {
-  local dir peak=0 rss entities=0 pid
+  local dir peak=0 rss last rows pid
   dir="$(mktemp -d)"
-  if ! "$BIN" init "$CONTRACT" --chain "$CHAIN" --dir "$dir" "${RPC_ARGS[@]}" >/dev/null 2>&1; then
-    echo "0 0"; return 0
-  fi
-  # stdout+stderr to a file, deliberately never printed: the indexer logs endpoint hosts on failure.
-  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill 200 "${RPC_ARGS[@]}" >"$dir/dev.log" 2>&1 &
+  write_nest "$dir"
+  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$dir/dev.log" 2>&1 &
   pid=$!
-  for _ in $(seq 1 40); do
-    sleep 1.5
+  for _ in $(seq 1 80); do
+    sleep 1
     kill -0 "$pid" 2>/dev/null || break
     rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
     if [ -n "$rss" ] && [ "$rss" -gt "$peak" ]; then peak="$rss"; fi
-    entities="$(curl -s "127.0.0.1:$PORT/" 2>/dev/null | grep -o '"entities":[0-9]*' | grep -o '[0-9]*' || true)"
-    entities="${entities:-0}"
-    if [ "$entities" -gt 100 ]; then break; fi
+    # `entities` on `/` counts *derived* entities, not rows - asserting on it measured the balances
+    # view rather than the backfill. Completion is the cursor reaching the mock's tip.
+    last="$(curl -s "127.0.0.1:$PORT/" 2>/dev/null | grep -o '"last_block":"[0-9]*"' | grep -o '[0-9]*' || true)"
+    if [ -n "$last" ] && [ "$last" -ge "$TIP" ]; then break; fi
   done
+  # The row count is the number that has to be identical run to run.
+  rows="$(curl -s -G "127.0.0.1:$PORT/sql" --data-urlencode \
+    'q=SELECT count(*) n FROM usdc__transfer' 2>/dev/null \
+    | grep -o '"n":[0-9]*' | grep -o '[0-9]*' || true)"
+  rows="${rows:-0}"
   kill "$pid" 2>/dev/null || true
-  echo "$peak $entities"
+  if [ "$rows" -lt "$EXPECT" ]; then tail -30 "$dir/dev.log" >&2 || true; fi
+  echo "$peak $rows"
 }
 
 out="$(measure || echo "0 0")"
 peak="${out%% *}"; entities="${out##* }"
-if [ "${entities:-0}" -lt 1 ]; then
-  echo "no transfers indexed (public RPC flaky?); retrying once..." >&2
-  out="$(measure || echo "0 0")"
-  peak="${out%% *}"; entities="${out##* }"
-fi
 
 peak_mb=$(( (${peak:-0} + 1023) / 1024 ))
-echo "peak RSS: ${peak_mb} MB over ${entities:-0} transfers (ceiling ${MAX_RSS_MB} MB)"
+echo "peak RSS: ${peak_mb} MB over ${entities:-0}/${EXPECT} transfers (ceiling ${MAX_RSS_MB} MB)"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     echo "### footprint"
@@ -76,12 +118,10 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "${entities:-0}" -lt 1 ]; then
-  echo "FAIL: indexed 0 transfers after retry - cannot measure; failing rather than false-passing"
-  if [ -z "$FOOTPRINT_RPC" ]; then
-    echo "hint: no FOOTPRINT_RPC configured, so this ran against free public endpoints - they are"
-    echo "      rate-limited and often return nothing. Set the secret to make this deterministic."
-  fi
+if [ "${entities:-0}" -lt "$EXPECT" ]; then
+  echo "FAIL: indexed ${entities:-0} of $EXPECT transfers - the run did not complete, so the peak is"
+  echo "      not comparable and this is not a pass. The chain is served locally, so this is a"
+  echo "      nuthatch or fixture fault rather than a flaky endpoint; the indexer's log is above."
   exit 1
 fi
 if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then
