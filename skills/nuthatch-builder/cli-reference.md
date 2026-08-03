@@ -108,6 +108,8 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 
 - `<ADDRESSES>` - One or more contract addresses to index, e.g. 0xA0b8…eB48 (USDC). Omit when using `--from`
 - `--from <FROM>` - Initialise from a published nest instead of addresses: a git URL or a local directory. The nest is self-contained (ABIs vendored), so nothing is resolved - just cloned/copied + validated
+- `--from-subgraph <FROM_SUBGRAPH>` - Scaffold from a Graph Protocol subgraph manifest: an IPFS CID (`QmVPhL…`, `ipfs://QmVPhL…`) or a URL to a `subgraph.yaml`. Maps `dataSources` → `[[contracts]]` and `templates` → `[[templates]]`, vendors every ABI from its pinned CID, and carries `startBlock` across
+- `--ipfs <IPFS>` - IPFS gateway(s) to try, in order, when resolving `--from-subgraph` (repeatable). Each is a URL prefix that a CID is appended to. Defaults to The Graph's gateway, then ipfs.io
 - `--alias <ALIAS>` - Optional aliases, one per address in order (comma-separated). Defaults to c0, c1, …
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; use an empty entry to resolve that address normally). The escape hatch for a proxy whose implementation ABI the public resolvers don't return - point this at the implementation's ABI and the nest decodes the events the proxy actually emits
 - `--chain <CHAIN>` - Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known chain for the contract's bytecode and picks the one it lives on - you rarely need to say
