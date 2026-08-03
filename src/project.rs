@@ -11,12 +11,16 @@ use crate::config::{Config, Contract, Extract, Nest};
 use crate::rpc::RpcClient;
 
 pub async fn init(args: InitArgs) -> Result<()> {
-    // Two ways to start a nest: clone/copy a published one (`--from`), or resolve from addresses.
+    // Three ways to start a nest: clone/copy a published one (`--from`), port a subgraph
+    // (`--from-subgraph`), or resolve from addresses.
     if let Some(source) = args.from.clone() {
         return init_from(&source, &args.dir);
     }
+    if let Some(source) = args.from_subgraph.clone() {
+        return init_from_subgraph(&source, &args).await;
+    }
     if args.addresses.is_empty() {
-        bail!("provide one or more contract addresses, or --from <git-url|dir>");
+        bail!("provide one or more contract addresses, --from <git-url|dir>, or --from-subgraph <cid>");
     }
     // Chain identity: honour an explicit `--chain`, otherwise detect it. The first-run friction we
     // most want to delete is making the user know (and correctly spell) which chain their contract
@@ -319,6 +323,343 @@ pub fn refresh_stale_artifacts(dir: &Path, config: &Config) -> Result<Option<Str
 /// Build the registry from the vendored ABIs and (re)write the derived artifacts - `schema.json` and
 /// the AI surface (`llms.txt` + the scaffolded skill). One source of truth: `init` and `add` both
 /// call this so the artifacts never drift from `nuthatch.toml`. Returns the table count.
+/// `nuthatch init --from-subgraph <cid|url>` (#241 item 5).
+///
+/// Ports a subgraph manifest into a nest: `dataSources` become `[[contracts]]`,
+/// `templates` become `[[templates]]`, ABIs are vendored from the CIDs the
+/// manifest pins, and `startBlock` carries across so the backfill starts where
+/// the subgraph did rather than at genesis.
+///
+/// The report at the end is the point as much as the config is. A manifest
+/// cannot say which template a factory creates — that lives in the mapping
+/// WASM — so this states plainly what it mapped, what it skipped, and which
+/// templates still need a creating event, rather than emitting a config that
+/// looks complete and indexes nothing.
+async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
+    use crate::subgraph_import as sg;
+    use std::collections::BTreeMap;
+
+    let gateways: Vec<String> = if args.ipfs.is_empty() {
+        sg::DEFAULT_IPFS_GATEWAYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        args.ipfs.clone()
+    };
+
+    println!("→ fetching subgraph manifest {source}…");
+    // The operator typed this one, so it may be a URL.
+    let raw = sg::fetch_ipfs(source, &gateways, sg::Origin::Operator).await?;
+    let manifest = sg::parse_manifest(&raw)?;
+
+    let network = manifest.network()?;
+    // `--chain` wins if given: a manifest's network name and ours can disagree
+    // (and a user porting to a fork needs the override).
+    let chain = match &args.chain {
+        Some(name) => chains::lookup(name).with_context(|| {
+            format!("unknown chain '{name}' (try: mainnet, arbitrum-one, base)")
+        })?,
+        None => chains::lookup(&network).with_context(|| {
+            format!(
+                "the manifest indexes '{network}', which nuthatch has no built-in chain for - \
+                 re-run with --chain <name> --rpc <url> to point at it yourself"
+            )
+        })?,
+    };
+
+    let dir = PathBuf::from(&args.dir);
+    std::fs::create_dir_all(dir.join("abis"))
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut taken: BTreeMap<String, u32> = BTreeMap::new();
+    // CID -> ABI body, so a shared ABI is downloaded once however many sources pin it.
+    let mut fetched: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut contracts: Vec<Contract> = Vec::new();
+    let mut address_params: Vec<sg::AddressParam> = Vec::new();
+
+    // ── dataSources → [[contracts]] ──────────────────────────────────────
+    for ds in &manifest.data_sources {
+        if !ds.is_evm() {
+            notes.push(format!(
+                "skipped `{}` (kind `{}`) - nuthatch indexes EVM logs, and stores a content \
+                 hash as a column value rather than fetching what it points at",
+                ds.name, ds.kind
+            ));
+            continue;
+        }
+        let Some(address) = ds.address.clone() else {
+            notes.push(format!(
+                "skipped `{}` - an EVM dataSource with no `source.address`",
+                ds.name
+            ));
+            continue;
+        };
+        // A subgraph may legitimately declare a placeholder it never indexes.
+        if address
+            .trim_start_matches("0x")
+            .trim_matches('0')
+            .is_empty()
+        {
+            notes.push(format!("skipped `{}` - address is {address}", ds.name));
+            continue;
+        }
+        // Normalise before anything is fetched or written. This is the one check that used to
+        // abort the whole import, and it fired after the ABI was already on disk and the alias
+        // already consumed - a malformed address is the manifest's mistake, and every other
+        // malformed field here is a note and a `continue`.
+        let address = match normalise_address(&address) {
+            Ok(a) => a,
+            Err(e) => {
+                notes.push(format!("skipped `{}` - {e}", ds.name));
+                continue;
+            }
+        };
+        let Some(abi_ref) = ds.own_abi().cloned() else {
+            notes.push(format!(
+                "skipped `{}` - the manifest pins no ABI for it, so there is nothing to decode",
+                ds.name
+            ));
+            continue;
+        };
+        if ds.abi_is_fallback() {
+            notes.push(format!(
+                "`{}` asks for ABI `{}`, which `mapping.abis` does not contain - vendored `{}` \
+                 instead; check it decodes what you expect",
+                ds.name,
+                ds.abi_name.as_deref().unwrap_or("?"),
+                abi_ref.name
+            ));
+        }
+
+        let alias = sg::dedupe_alias(&sg::to_alias(&ds.name), &mut taken);
+        let abi_json =
+            fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched)
+                .await?;
+        address_params.extend(sg::address_params(&alias, &abi_json));
+
+        // Carry the manifest's event allowlist: a subgraph that handles only
+        // `Transfer` should not silently grow every other event's table.
+        let events: Vec<String> = ds
+            .events
+            .iter()
+            .map(|sig| sg::event_name(sig).to_string())
+            .collect();
+        // An empty allowlist means "every event in the ABI" (see `config::Contract::events`),
+        // so a source whose handlers are all block/call handlers lands in exactly the state the
+        // comment above says it should not - silently, unless we say so.
+        if events.is_empty() && ds.has_non_event_handlers {
+            notes.push(format!(
+                "`{}` declares only block/call handlers, which nuthatch has no equivalent for - \
+                 it indexes logs. This contract will index **every** event its ABI defines; \
+                 narrow it with `events = [...]` in nuthatch.toml if that is not what you want",
+                ds.name
+            ));
+        }
+        if let Some(end) = ds.end_block {
+            notes.push(format!(
+                "`{}` stops at block {end} in the subgraph; a nest has no end block, so it will \
+                 keep indexing past it",
+                ds.name
+            ));
+        }
+
+        println!(
+            "  ✓ {alias:<28} {address}  start={}  {} event(s)",
+            ds.start_block
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "-".into()),
+            events.len()
+        );
+        contracts.push(Contract {
+            alias,
+            address,
+            start_block: ds.start_block,
+            abi: String::new(), // filled below, once the alias is final
+            events,
+        });
+        // `abi` path mirrors the alias; set it now that the alias is settled.
+        let last = contracts.last_mut().expect("just pushed");
+        last.abi = format!("abis/{}.json", last.alias);
+    }
+
+    if contracts.is_empty() {
+        bail!(
+            "no indexable dataSources in this manifest - {} source(s) were all skipped:\n  {}",
+            manifest.data_sources.len(),
+            notes.join("\n  ")
+        );
+    }
+
+    // ── templates → [[templates]] ────────────────────────────────────────
+    let mut templates: Vec<crate::config::Template> = Vec::new();
+    // Manifest name → the alias it actually settled on, so factory rules can be emitted
+    // against the same name the `[[templates]]` entry carries.
+    let mut template_alias: BTreeMap<String, String> = BTreeMap::new();
+    for t in &manifest.templates {
+        if !t.is_evm() {
+            notes.push(format!("skipped template `{}` (kind `{}`)", t.name, t.kind));
+            continue;
+        }
+        let Some(abi_ref) = t.own_abi().cloned() else {
+            notes.push(format!("skipped template `{}` - no ABI pinned", t.name));
+            continue;
+        };
+        let alias = sg::dedupe_alias(&sg::to_alias(&t.name), &mut taken);
+        fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched).await?;
+        // Both the entry and its ABI path must use the *settled* alias. Recomputing
+        // `to_alias(&t.name)` here would name the file the template was never written to:
+        // a dataSource `Vault` plus a template `Vault` — the canonical factory shape — makes
+        // the template point at the dataSource's ABI. Nothing errors, because that file
+        // exists; every discovered child is just decoded against the wrong contract.
+        template_alias.insert(t.name.clone(), alias.clone());
+        templates.push(crate::config::Template {
+            name: alias.clone(),
+            abi: format!("abis/{alias}.json"),
+            filter: None,
+        });
+    }
+
+    // ── factory inference ────────────────────────────────────────────────
+    // Inference runs on the manifest's own names, so the rules it returns have to be mapped
+    // back through the same settled aliases before they are written out.
+    let template_names: Vec<String> = template_alias.keys().cloned().collect();
+    let (inferred, unresolved) = sg::infer_factories(&template_names, &address_params);
+
+    let factories: Vec<crate::config::Factory> = inferred
+        .iter()
+        .map(|f| crate::config::Factory {
+            watch: f.watch.clone(),
+            event: f.event.clone(),
+            child_param: f.child_param.clone(),
+            // The settled alias, not a fresh `to_alias` of the manifest name — see the
+            // template loop above. A recomputed alias names a template that may not exist.
+            template: template_alias
+                .get(&f.template)
+                .cloned()
+                .unwrap_or_else(|| sg::to_alias(&f.template)),
+            start: None,
+        })
+        .collect();
+
+    let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
+    let config = Config {
+        nest: Nest {
+            name: nest_name(&dir),
+            chain: chain.name.to_string(),
+            chain_id: chain.chain_id,
+            rpc_urls,
+            schema_version: crate::config::required_schema_version(!args.no_timestamps),
+            block_timestamps: !args.no_timestamps,
+        },
+        contracts,
+        screening: crate::config::Screening::default(),
+        flags: crate::config::Flags::default(),
+        alerts: Vec::new(),
+        templates,
+        factories,
+        webhooks: Vec::new(),
+        extract: Extract::default(),
+        calls: Vec::new(),
+    };
+    config.save(&dir)?;
+    let table_count = write_nest_artifacts(&dir, chain.name, &config)?;
+
+    // ── the honest report ────────────────────────────────────────────────
+    println!(
+        "\n✓ scaffolded nest '{}' from subgraph {source}",
+        config.nest.name
+    );
+    println!(
+        "    {} contract(s), {} template(s), {} table(s) on {}",
+        config.contracts.len(),
+        config.templates.len(),
+        table_count,
+        chain.name
+    );
+    for f in &inferred {
+        println!(
+            "  ✓ factory: {}.{} → {} via `{}` ({})",
+            f.watch, f.event, f.template, f.child_param, f.because
+        );
+    }
+    for u in &unresolved {
+        if u.candidates.is_empty() {
+            println!(
+                "  ⚠ template `{}` has no creating event in this manifest - it will index \
+                 nothing until you add a [[factories]] rule",
+                u.template
+            );
+        } else {
+            println!(
+                "  ⚠ template `{}` needs a creating event; candidates:\n      {}",
+                u.template,
+                u.candidates.join("\n      ")
+            );
+        }
+    }
+    for n in &notes {
+        println!("  ⚠ {n}");
+    }
+    if !unresolved.is_empty() || !notes.is_empty() {
+        println!(
+            "\n  The warnings above are work the manifest cannot do for us: which template a \
+             factory creates lives in the mapping WASM, not in the manifest. Resolve them by \
+             adding [[factories]] rules to nuthatch.toml."
+        );
+    }
+    println!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
+    Ok(())
+}
+
+/// Fetch one ABI by CID and vendor it into `abis/<alias>.json`.
+async fn fetch_and_vendor_abi(
+    dir: &Path,
+    alias: &str,
+    abi_ref: &crate::subgraph_import::AbiRef,
+    gateways: &[String],
+    notes: &mut Vec<String>,
+    fetched: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value> {
+    // One CID, one download. Sharing an ABI across dataSources is the normal shape - every
+    // proxy in a beacon codebase pins the same implementation ABI - and re-fetching it per
+    // source multiplies gateway load by a factor the manifest chooses. Each source still gets
+    // its own file, because the alias is what the config points at.
+    if let Some(cached) = fetched.get(&abi_ref.cid) {
+        write_abi(dir, alias, cached)?;
+        return Ok(cached.clone());
+    }
+    // From the manifest, so CID only - see `subgraph_import::Origin`.
+    let raw = crate::subgraph_import::fetch_ipfs(
+        &abi_ref.cid,
+        gateways,
+        crate::subgraph_import::Origin::Manifest,
+    )
+    .await
+    .with_context(|| format!("fetching ABI `{}` ({})", abi_ref.name, abi_ref.cid))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("ABI `{}` ({}) is not JSON", abi_ref.name, abi_ref.cid))?;
+    if !parsed.is_array() {
+        notes.push(format!(
+            "ABI `{}` is not a JSON array - vendored as-is, but the registry may reject it",
+            abi_ref.name
+        ));
+    }
+    write_abi(dir, alias, &parsed)?;
+    fetched.insert(abi_ref.cid.clone(), parsed.clone());
+    Ok(parsed)
+}
+
+/// Vendor one ABI under its settled alias.
+fn write_abi(dir: &Path, alias: &str, abi: &serde_json::Value) -> Result<()> {
+    std::fs::write(
+        dir.join(format!("abis/{alias}.json")),
+        serde_json::to_string_pretty(abi).context("failed to serialise ABI")?,
+    )
+    .with_context(|| format!("failed to write abis/{alias}.json"))
+}
+
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
     let registry = crate::registry::DecodeRegistry::from_nest(dir, config)?;
     let mut schema = registry.schema();
