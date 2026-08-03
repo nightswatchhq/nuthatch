@@ -404,7 +404,38 @@ impl Config {
         for c in &cfg.calls {
             c.validate()?;
         }
+        cfg.refuse_unwired_calls()?;
         Ok(cfg)
+    }
+
+    /// Refuse a `[[calls]]` block while RFC-0023 tier 3 has no executor (issue #262).
+    ///
+    /// Everything around this is built - `CallKey`, `CallDecl::validate`, `resolve_at`, and the
+    /// content addressing - and nothing calls it. So a declared call was **accepted, validated, and
+    /// then ignored forever**: no rows, no warning, no error. That is the same shape as the writer
+    /// pool that took leases and never indexed (#250), and it is the failure mode this project can
+    /// least afford, because the config looks like it worked.
+    ///
+    /// Refusing costs an operator one clear message. Accepting costs them a silent wrong answer, and
+    /// they find out from a consumer. Delete this the moment an executor exists - the test named
+    /// after it will fail loudly and tell you to.
+    fn refuse_unwired_calls(&self) -> Result<()> {
+        if self.calls.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "this nest declares {} `[[calls]]` entr{}, and nuthatch cannot run {} yet.\n\n\
+             RFC-0023 tier 3 (pinned-block `eth_call`) has the decoding, validation and content \
+             addressing in place but no executor, so a declared call would be accepted and then \
+             silently produce nothing - see issue #262.\n\n\
+             Remove the `[[calls]]` block. Most contract state is *derivable* from events you already \
+             index, which is faster, free, and needs no archive node: try `nuthatch recipe add \
+             total_supply` (also `balances`, `holder_count`, `reserves`), or `nuthatch metadata fetch` \
+             for immutable `decimals`/`symbol`/`name`.",
+            self.calls.len(),
+            if self.calls.len() == 1 { "y" } else { "ies" },
+            if self.calls.len() == 1 { "it" } else { "them" },
+        )
     }
 
     /// Both gates on `schema_version`, shared by the TOML and Starlark load paths.
@@ -702,6 +733,74 @@ rpc_urls = ["https://rpc.example"]
 
     /// A file claiming v1 while declaring a v2-only feature is refused - it is precisely the file an
     /// older binary would accept and get wrong.
+    /// A declared call must be **refused**, not accepted and ignored (issue #262).
+    #[test]
+    fn a_declared_call_is_refused_rather_than_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 1
+
+[[contracts]]
+alias = "c"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+
+[[calls]]
+name = "price"
+contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+calldata = "0x1234abcd"
+every = 100
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(err.contains("#262"), "point at the issue: {err}");
+        assert!(
+            err.contains("recipe add") || err.contains("metadata fetch"),
+            "a refusal should name the thing to do instead: {err}"
+        );
+    }
+
+    /// **Delete `refuse_unwired_calls` when this fails.**
+    ///
+    /// The refusal above exists only because nothing executes a declared call. The day someone wires
+    /// `resolve_at` into the indexer, that refusal silently becomes a bug of its own - a working
+    /// feature rejected at config load - and nothing else would catch it, because every test of the
+    /// refusal would still pass. So this watches for the executor rather than the refusal.
+    #[test]
+    fn the_calls_refusal_must_go_when_an_executor_appears() {
+        let mut callers = Vec::new();
+        for entry in std::fs::read_dir("src").expect("src/ is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|f| f != "calls.rs")
+            {
+                // Built at runtime so this file never contains the string it searches for. Written
+                // as a literal, the test matched *itself* and reported `config.rs` as the executor -
+                // twice, once per spelling. A scanner that scans its own source has to say the thing
+                // it is looking for without ever spelling it.
+                let needle = format!("{}::{}(", "calls", "resolve_at");
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                if src.contains(&needle) {
+                    callers.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "the tier-3 executor now has a caller ({}), so tier 3 is wired - delete \
+             `Config::refuse_unwired_calls` and this test, and close issue #262",
+            callers.join(", ")
+        );
+    }
+
     #[test]
     fn a_v1_file_cannot_declare_block_timestamps_false() {
         let dir = tempfile::tempdir().unwrap();
