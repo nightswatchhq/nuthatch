@@ -662,9 +662,10 @@ visible to your users:
 Tip-following data is inherently provisional; this is the same caveat any indexer carries at the tip,
 stated explicitly rather than left to be discovered.
 
-**Binary upgrades.** Proven in production: a nest upgrade from 0.3.0 to 0.6.0 was a binary swap and a
-restart, with no data migration and no flag changes. Within 0.x the target is in-place-safe upgrades,
-and each release's notes state "in-place safe" or "reseal required" explicitly.
+**Binary upgrades.** Proven in production across 0.3.0 → 0.6.0 → 0.6.2 → 1.0.0 on a box serving public
+traffic throughout: each was a binary swap and a restart, with no data migration and no flag changes.
+In-place-safe upgrades are the target, and each release's notes state "in-place safe" or "reseal
+required" explicitly.
 
 ---
 
@@ -737,12 +738,22 @@ advertises the tools it can actually answer.
 
 ---
 
-## Stability contract (0.x)
+## Stability contract
 
 - **Config**: `nuthatch.toml` keys and the nest `schema_version` follow a deprecation policy - a key
-  removed in 0.(n+1) warns in 0.n first.
-- **Data layout**: redb tables, segment layout, `manifest.json` and `schema.json` are versioned. The
-  target within 0.x is **in-place-safe upgrades**; each release states which it is.
+  is warned about for a release before it is removed, never removed from under you.
+- **Data layout**: redb tables, segment layout, `manifest.json` and `schema.json` are versioned.
+  **In-place-safe upgrades** are the target and each release states which it is; the record so far is
+  four consecutive in-place upgrades in production (see [Data lifecycle](#data-lifecycle)).
+- **CLI flags**: `dev`'s flags and the unit files that depend on them are treated as an interface. A
+  release does not silently rename a flag your systemd unit references.
+
+**What is not yet promised, stated plainly because a platform team will ask.** This section described a
+`0.x` policy until 1.0.1 and was not rewritten when 1.0 shipped. A **published semver commitment for
+1.x** - what specifically may change in a minor, what is reserved for a major, and how long a
+deprecation window runs - is a decision that deserves to be made on its own terms rather than inferred
+from a checklist, and it has not been made yet. Tracked as an open question; until it is published,
+treat the three bullets above as the observed practice rather than a guarantee.
 
 ---
 
