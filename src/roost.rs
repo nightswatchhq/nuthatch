@@ -33,7 +33,28 @@ pub const ROOST_FILE: &str = "roost.toml";
 
 /// Where mounted nests live under the roost dir: `nests/<name>/` is a nest directory, exactly as a
 /// standalone nest is today.
+///
+/// **Pre-2.0 layout.** RFC-0032 replaces it with [`DATA_DIR`] keyed by nest identity; this constant
+/// stays for un-migrated roosts and for `migrate`'s source side.
 pub const NESTS_DIR: &str = "nests";
+
+/// Where a nest's inputs and data live once addressed by identity: `data/<nid>/` (RFC-0032 §4).
+///
+/// The directory does not know what it is called or who mounted it - [`Mount`] records hold all of
+/// that. That separation is the whole point: it is what lets two mounts name one dataset.
+pub const DATA_DIR: &str = "data";
+
+/// One mount record: an alias, and the identity of the nest whose dataset it serves (RFC-0032 §4).
+///
+/// **Slice 1 carries `alias` and `nid` only.** The `tenant` column and refcount semantics land on
+/// this struct in slices 2-3 rather than beside it, so the growth is additive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Mount {
+    /// The name this mount is served under. Free-form, and *not* part of the nest's identity.
+    pub alias: String,
+    /// The nest identity ([`crate::blob::Manifest::nid`]) - the dataset key.
+    pub nid: String,
+}
 
 /// A roost manifest: the mounted nests plus the chain(s) they follow. A roost may host nests across
 /// **one or more chains** (RFC-0021) - one isolated cursor per distinct chain. The single-chain form
@@ -47,6 +68,10 @@ pub struct Roost {
     /// exclusive with the top-level `chain`/`chain_id`. Empty → the single-chain top-level form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chains: Vec<ChainEndpoint>,
+    /// Mount records (RFC-0032 §4): which alias serves which nest identity. Empty means this roost
+    /// has not been migrated and still resolves nests by name under [`NESTS_DIR`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
 }
 
 /// One chain a roost follows, plus how to reach it - a cursor's substrate (RFC-0021).
@@ -145,12 +170,62 @@ impl Roost {
                 bail!("nest '{n}' is mounted more than once");
             }
         }
+        roost.validate_mounts()?;
         Ok(roost)
     }
 
-    /// The on-disk directory of a mounted nest, relative to the roost dir.
+    /// Validate the mount records (RFC-0032 §4).
+    ///
+    /// A NID is a **filesystem path segment**, exactly as a nest name is, so it gets the same SEC-10
+    /// treatment: hex only, fixed length, no `..`, no separators. The records are written by
+    /// `migrate` rather than by hand, but a roost dir is an operator-editable file and a bundle
+    /// roster is untrusted input, so the check is on load, not on write.
+    fn validate_mounts(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for m in &self.mounts {
+            if m.nid.len() != 64 || !m.nid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!(
+                    "mount '{}' has an invalid nest identity '{}' (expected 64 hex characters)",
+                    m.alias,
+                    m.nid
+                );
+            }
+            if !self.roost.nests.contains(&m.alias) {
+                bail!(
+                    "mount '{}' names no mounted nest (it is absent from the `nests` list)",
+                    m.alias
+                );
+            }
+            if !seen.insert(&m.alias) {
+                bail!("nest '{}' has more than one mount record", m.alias);
+            }
+        }
+        Ok(())
+    }
+
+    /// The on-disk directory of a mounted nest, in the pre-2.0 name-keyed layout.
+    ///
+    /// Prefer [`Roost::dir_for`], which consults the mount records first. This stays for un-migrated
+    /// roosts and as `migrate`'s source side.
     pub fn nest_dir(dir: &Path, name: &str) -> PathBuf {
         dir.join(NESTS_DIR).join(name)
+    }
+
+    /// A dataset's directory, keyed by nest identity (RFC-0032 §4).
+    pub fn data_dir(dir: &Path, nid: &str) -> PathBuf {
+        dir.join(DATA_DIR).join(nid)
+    }
+
+    /// Where `alias` is served from: `data/<nid>` when a mount record exists, else the pre-2.0
+    /// `nests/<alias>`.
+    ///
+    /// Both layouts resolve through this one function so a half-migrated roost - some nests adopted,
+    /// a new one dropped into `nests/` - is a supported state rather than an accident.
+    pub fn dir_for(&self, dir: &Path, alias: &str) -> PathBuf {
+        match self.mounts.iter().find(|m| m.alias == alias) {
+            Some(m) => Self::data_dir(dir, &m.nid),
+            None => Self::nest_dir(dir, alias),
+        }
     }
 
     /// The chains this roost serves, each with its RPC endpoints (RFC-0021). A single-chain roost
@@ -190,8 +265,11 @@ pub struct ChainGroup {
 }
 
 /// Load a mounted nest's config (chain grouping is validated by [`group_by_chain`], not here).
-fn load_mounted_nest(roost_dir: &Path, name: &str) -> Result<(PathBuf, Config)> {
-    let dir = Roost::nest_dir(roost_dir, name);
+///
+/// Resolution goes through [`Roost::dir_for`], so a migrated nest is read from `data/<nid>` and an
+/// un-migrated one from `nests/<name>` with no other difference.
+fn load_mounted_nest(roost: &Roost, roost_dir: &Path, name: &str) -> Result<(PathBuf, Config)> {
+    let dir = roost.dir_for(roost_dir, name);
     let config = Config::load(&dir)
         .with_context(|| format!("loading mounted nest '{name}' from {}", dir.display()))?;
     Ok((dir, config))
@@ -258,7 +336,7 @@ pub async fn dev(
     // Load every mounted nest, then group by chain - one isolated cursor per distinct chain (RFC-0021).
     let mut mounted = Vec::with_capacity(meta.nests.len());
     for name in &meta.nests {
-        let (nest_path, config) = load_mounted_nest(&dir, name)?;
+        let (nest_path, config) = load_mounted_nest(&roost, &dir, name)?;
         mounted.push((name.clone(), nest_path, config));
     }
     let groups = group_by_chain(&endpoints, mounted)?;
@@ -434,6 +512,7 @@ pub async fn dev(
         estimates: estimates.clone(),
         mount_ctx: MountContext {
             dir: dir.clone(),
+            mounts: roost.mounts.clone(),
             sources,
             backfill,
             seal_direct,
@@ -648,6 +727,11 @@ fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
     let mut roost: Roost = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
     roost.roost.nests = nests.to_vec();
+    // Drop mount records for nests that are no longer mounted, or the next `load` refuses the file
+    // it just wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5
+    // makes collection explicit, because re-backfilling is precisely the cost this design exists to
+    // avoid and an accidental unmount must not trigger one.
+    roost.mounts.retain(|m| nests.contains(&m.alias));
     let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
@@ -690,8 +774,12 @@ pub struct RoostHandles {
 /// nests in one roost would behave differently for no reason an operator could see.
 #[derive(Clone)]
 pub struct MountContext {
-    /// The roost directory; a nest lives at `nests/<name>/`.
+    /// The roost directory; a nest lives at `data/<nid>/`, or `nests/<name>/` if un-migrated.
     pub dir: PathBuf,
+    /// The mount records as of startup (RFC-0032 §4), so a live mount resolves its dataset the same
+    /// way the static path does. A runtime mount of a nest with no record still resolves through
+    /// the pre-2.0 layout - a half-migrated roost is a supported state, not an accident.
+    pub mounts: Vec<Mount>,
     /// Chain -> the source driving that chain's cursor. A nest whose chain is absent cannot be mounted.
     pub sources: std::collections::HashMap<String, Arc<dyn Source>>,
     pub backfill: Option<u64>,
@@ -775,7 +863,10 @@ impl RoostHandles {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
-        let dir = Roost::nest_dir(&self.mount_ctx.dir, name);
+        let dir = match self.mount_ctx.mounts.iter().find(|m| m.alias == name) {
+            Some(m) => Roost::data_dir(&self.mount_ctx.dir, &m.nid),
+            None => Roost::nest_dir(&self.mount_ctx.dir, name),
+        };
         let config = Config::load(&dir)
             .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
         let chain = config.nest.chain.clone();
@@ -1010,7 +1101,8 @@ mod tests {
     }
 
     fn mounted(roost_dir: &Path, name: &str) -> (String, PathBuf, Config) {
-        let (p, c) = load_mounted_nest(roost_dir, name).unwrap();
+        let roost = Roost::load(roost_dir).unwrap();
+        let (p, c) = load_mounted_nest(&roost, roost_dir, name).unwrap();
         (name.to_string(), p, c)
     }
 

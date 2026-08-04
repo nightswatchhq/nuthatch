@@ -121,3 +121,22 @@ rpc_urls = ["https://…"]
 
 Exactly one form: top-level `chain` **or** `[[chains]]`, never both (ambiguous) or neither. The
 single-cursor law holds per chain - never multiplex two chains behind one cursor.
+
+### `[[mounts]]` - where a nest's data actually lives (RFC-0032)
+
+**Runtime state, not authored config. Do not hand-write it.** `nuthatch migrate` writes it, and the
+runtime keeps it in step.
+
+```toml
+[[mounts]]
+alias = "usdc"                  # the name in `nests` and the route prefix `/usdc/…`
+nid = "9f2c…"                   # 64 hex chars: the nest's identity, and its dataset key
+```
+
+Without mount records a roost resolves each nest at `nests/<name>/`, the pre-2.0 layout. With them,
+the nest is read from `data/<nid>/` - addressed by *what the nest is* rather than by what an operator
+called it. Both resolve, so a partly-migrated roost is a supported state.
+
+Run `nuthatch migrate --dir <roost> --dry-run` to see the plan before applying it. The migration
+moves data and never re-indexes; if two aliases turn out to be the same nest, it says so and merges
+them onto one dataset.

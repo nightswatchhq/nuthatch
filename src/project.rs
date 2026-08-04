@@ -906,7 +906,7 @@ fn clone_repo(url: &str, target: &Path) -> Result<()> {
 }
 
 /// Recursively copy a local nest directory (skipping any `.git`).
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("cannot create {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;

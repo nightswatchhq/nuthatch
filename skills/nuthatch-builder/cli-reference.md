@@ -174,6 +174,13 @@ Fetch + cache immutable metadata for every contract in the nest (skips already-c
 - `--dir <DIR>` - The nest directory
 - `--rpc <RPC>` - Override `rpc_urls` at runtime (repeatable); tried ahead of the configured endpoints
 
+## `nuthatch migrate`
+
+Move a roost to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/` (RFC-0032)
+
+- `--dir <DIR>` - Roost directory (must contain a roost.toml)
+- `--dry-run` - Print the plan - every nest, its identity, and where it would land - without changing anything
+
 ## `nuthatch nest`
 
 Package a nest as a content-addressed blob - the deploy unit (RFC-0012)
