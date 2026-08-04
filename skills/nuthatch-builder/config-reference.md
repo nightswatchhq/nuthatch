@@ -162,3 +162,28 @@ alias's `estimated_rss_mb` is `0` because the footprint was charged once to the 
 
 Sharing is by *identity*, so it survives nothing and forks on anything: edit either nest's inputs and
 the NID changes, the mounts stop matching, and the edited one gets its own dataset automatically.
+
+### Tenants (RFC-0032)
+
+A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No
+authz, no quotas, no metering - identity is the gateway's job. Omit it and you get `default`
+(configurable per roost with `[roost] default_tenant`).
+
+```toml
+[[mounts]]
+tenant = "acme"
+alias = "usdc"
+nid = "9f2c…"
+
+[[mounts]]
+tenant = "globex"
+alias = "usdc"        # the same alias is fine - it is unique WITHIN a tenant
+nid = "9f2c…"         # same nest, one dataset, one backfill
+```
+
+**Routes carry the tenant only when there is more than one.** One tenant → `/usdc/…`, exactly as
+today. Two or more → `/acme/usdc/…` and `/globex/usdc/…`. Nobody running a single-tenant roost ever
+types the word, and their URLs never move.
+
+Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
+Opaque means nuthatch does not interpret it, not that it may contain `..`.
