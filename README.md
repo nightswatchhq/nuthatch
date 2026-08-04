@@ -142,8 +142,9 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
 ## How fast is it
 
 We ran **someone else's** benchmark rather than writing our own: Sentio's
-[OBIB](https://github.com/sentioxyz/open-blockchain-indexer-benchmark). Case 1 indexes `Transfer` from
-LBTC across 22.2M Ethereum blocks.
+[OBIB](https://github.com/sentioxyz/open-blockchain-indexer-benchmark).
+
+**Case 1** indexes `Transfer` from LBTC across 22.2M Ethereum blocks.
 
 | | |
 |---|---|
@@ -152,8 +153,37 @@ LBTC across 22.2M Ethereum blocks.
 | RPC requests | **321** |
 | peak RSS | **320 MB** |
 
-Against a real provider (Alchemy), on an 11-core laptop. The artifact is
-[`docs/bench/obib-case1.json`](docs/bench/obib-case1.json); `nuthatch bench backfill` re-runs it.
+**Case 6** is the factory-template case: the Uniswap V2 factory over blocks 19,000,000-19,010,000,
+discovering pairs from `PairCreated` and indexing `Swap` on every child it finds. No per-child config,
+no redeploy, one rule.
+
+| | |
+|---|---|
+| wall clock | **49.5 s** (median of 5) |
+| events | **35,271** = **35,039** swaps, matching OBIB's expected count exactly, plus the 232 `PairCreated` rows |
+| children discovered | **232** |
+| RPC requests | **16** |
+| peak RSS | **247 MB** |
+
+For scale, OBIB's own published figures for case 6 differ between its two tables: the January 2026
+results table gives Envio HyperIndex **1.92 min**, Subsquid 5.34 min and Sentio 14.36 min, while the
+case-6 page reports Envio at **30 s** from an earlier round. We are quoting both rather than the
+flattering one; on the second, Envio is faster than us. Note too that Envio and Subsquid serve this
+from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
+
+Both against a real provider (Alchemy), on an 11-core laptop. The artifacts are
+[`docs/bench/obib-case1.json`](docs/bench/obib-case1.json) and
+[`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs either.
+The case-6 nest is published at [`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6)
+so the run can be reproduced rather than believed, and is submitted upstream as
+[sentioxyz/open-blockchain-indexer-benchmark#3](https://github.com/sentioxyz/open-blockchain-indexer-benchmark/pull/3).
+
+**Wall clock on a shared endpoint is the provider's number as much as ours.** The same case-6 range on
+the same commit measured anywhere from 17 s to 57 s depending on when it ran. We checked whether the
+fast runs were provider caching by re-running against an adjacent, never-fetched range
+([`obib-case6-cold-control.json`](docs/bench/obib-case6-cold-control.json)): it landed in the same
+band, so caching is not the explanation. The event count and the **16 RPC requests** are invariant
+across every run, and they are the honest measure of range control.
 
 Two things that number is worth knowing about:
 
@@ -163,6 +193,11 @@ Two things that number is worth knowing about:
 - **~85% of the original wall clock was buying `block_timestamp`** — one serial round trip per block,
   for a column that workload never stores. Timestamps are now demand-driven and the log window adapts
   to what an endpoint will actually serve. See [RFC-0029](docs/rfcs/0029-the-fastest-indexer.md).
+
+Case 6 found a defect too, in the harness rather than the indexer: `bench backfill` fetched a fixed
+address list, so a **factory nest was measured without its children** — 232 events in 2.6 s against an
+expected 35,039, reported as a success. Running an outside benchmark has now found two things our own
+testing did not.
 
 **Analytical queries** run on DuckDB over sealed Parquet. We benchmark-gated the alternative rather
 than arguing about it: DataFusion measured **1.6–2.7× slower** on the fold that matters, with the gap

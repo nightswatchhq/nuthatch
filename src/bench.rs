@@ -18,10 +18,41 @@ use std::time::{Duration, Instant};
 use crate::chains;
 use crate::cli::BackfillBenchArgs;
 use crate::config::Config;
+use crate::factory::{ChildRegistry, FactorySet};
 use crate::registry::DecodeRegistry;
 use crate::rpc::RpcClient;
 use crate::source::Source;
 use crate::store::Store;
+
+/// Which backfill path a run takes. Extracted from `one_run`'s `if` chain so the choice is testable
+/// without a network: the factory-nest bug this exists to prevent was a *dispatch* bug, not a decode
+/// or fetch bug, and it was invisible because the wrong path still returned a plausible number.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BackfillPath {
+    /// Sequential two-pass factory backfill - the only path that discovers children (RFC-0009 §3).
+    Factory,
+    /// Concurrent seal-direct.
+    Pipelined,
+    /// Sequential seal-direct.
+    Direct,
+    /// Decode → redb hot store.
+    HotStore,
+}
+
+/// A factory nest takes the factory path **whatever else was asked for**: `--concurrency` cannot
+/// override it, because the pipelined path has no child registry and would silently measure the
+/// factory's own events alone.
+fn choose_path(is_factory: bool, seal_direct: bool, concurrency: usize) -> BackfillPath {
+    if is_factory {
+        BackfillPath::Factory
+    } else if seal_direct && concurrency > 1 {
+        BackfillPath::Pipelined
+    } else if seal_direct {
+        BackfillPath::Direct
+    } else {
+        BackfillPath::HotStore
+    }
+}
 
 /// One run's raw measurements.
 struct Run {
@@ -30,6 +61,10 @@ struct Run {
     events_per_sec: f64,
     peak_rss_mb: u64,
     rpc_requests: u64,
+    /// Children discovered during the run - 0 for a nest with no `[[factories]]`. A factory nest that
+    /// reports 0 here has measured nothing but its own factory events, which is the failure this
+    /// field exists to make visible.
+    children: u64,
 }
 
 /// The published artifact: medians across runs plus the pinned inputs and provenance.
@@ -64,6 +99,15 @@ pub struct BenchReport {
     pub events_per_sec: f64,
     pub peak_rss_mb: u64,
     pub rpc_requests: u64,
+    /// Whether the nest declares `[[factories]]`, and so took the sequential two-pass factory
+    /// backfill rather than the static-address path. Recorded because it changes what `concurrency`
+    /// means (it does not apply) and because a factory nest measured without it is measuring the
+    /// wrong workload.
+    pub factory: bool,
+    /// Children discovered during the run. For a factory workload this is the number that says the
+    /// harness actually followed the templates: `"factory": true` with `"children": 0` is a broken
+    /// measurement, not a fast one.
+    pub children: u64,
     pub commit: Option<String>,
     /// The RPC endpoint's host, never the full URL - an API key in a committed benchmark report is a
     /// credential leak, and these get pasted into issues.
@@ -132,6 +176,21 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     let config = Config::load(&dir)?;
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, &config)?);
 
+    // **A factory nest must be measured through the factory path** (RFC-0009 §3). The static
+    // `addresses` filter below is fixed at start-up, so a factory nest measured through the plain
+    // paths sees only its own creation events and never the children they announce - it reports a
+    // fast, small, entirely wrong number, and reports success. That is the "harness measuring a
+    // strawman" failure of RFC-0029 §4b in a second place, found running OBIB case 6 (which is
+    // *entirely* child activity: 232 factory events against 35,039 expected records).
+    let factory = {
+        let fs = FactorySet::build(&config)?;
+        if fs.is_empty() {
+            None
+        } else {
+            Some(fs)
+        }
+    };
+
     let rpc_urls = match &args.rpc {
         Some(u) => vec![u.clone()],
         None => config.nest.rpc_urls.clone(),
@@ -168,18 +227,34 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         } else {
             "hot store (decode → redb)"
         },
-        if args.seal_direct && args.concurrency > 1 {
+        if args.seal_direct && args.concurrency > 1 && factory.is_none() {
             format!(", {}-way concurrent fetch", args.concurrency)
         } else {
             String::new()
         }
     );
+    if let Some(fs) = &factory {
+        // Say it out loud rather than silently ignoring the flag: the factory backfill is the
+        // sequential two-pass path (pass 2 needs pass 1's discoveries), so `--concurrency` does not
+        // apply. A number that quietly ignored the flag would be unreproducible by anyone reading the
+        // command line that produced it.
+        println!(
+            "factory nest: {} template(s) - sequential two-pass factory backfill{}",
+            fs.templates().len(),
+            if args.concurrency > 1 {
+                ", --concurrency does not apply"
+            } else {
+                ""
+            }
+        );
+    }
 
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
         let r = one_run(
             &rpc_urls,
             &registry,
+            factory.as_ref(),
             &addresses,
             &topic0s,
             args.from,
@@ -191,8 +266,18 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         )
         .await?;
         println!(
-            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req",
-            args.runs, r.events, r.wall_clock_s, r.events_per_sec, r.peak_rss_mb, r.rpc_requests
+            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req{}",
+            args.runs,
+            r.events,
+            r.wall_clock_s,
+            r.events_per_sec,
+            r.peak_rss_mb,
+            r.rpc_requests,
+            if factory.is_some() {
+                format!(", {} children", r.children)
+            } else {
+                String::new()
+            }
         );
         runs.push(r);
     }
@@ -209,7 +294,9 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         // The hot-store path still fetches at a fixed width; only the seal-direct paths adapt.
         window_adaptive: args.seal_direct,
         seal_direct: args.seal_direct,
-        concurrency: if args.seal_direct {
+        // The factory path is sequential, so reporting the flag's value would describe a run that did
+        // not happen.
+        concurrency: if args.seal_direct && factory.is_none() {
             args.concurrency
         } else {
             1
@@ -220,6 +307,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         events_per_sec: round2(median_f64(runs.iter().map(|r| r.events_per_sec))),
         peak_rss_mb: median_u64(runs.iter().map(|r| r.peak_rss_mb)),
         rpc_requests: median_u64(runs.iter().map(|r| r.rpc_requests)),
+        factory: factory.is_some(),
+        children: median_u64(runs.iter().map(|r| r.children)),
         commit: git_commit(),
         provider: rpc_urls.first().and_then(|u| provider_of(u)),
         hardware: hardware_summary(),
@@ -375,6 +464,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
 async fn one_run(
     rpc_urls: &[String],
     registry: &DecodeRegistry,
+    factory: Option<&FactorySet>,
     addresses: &[String],
     topic0s: &[String],
     from: u64,
@@ -392,33 +482,60 @@ async fn one_run(
 
     let rss = RssSampler::start();
     let start = Instant::now();
-    let events = if seal_direct && concurrency > 1 {
+    // A fresh child registry per run: discovery is part of what the run measures, so carrying one
+    // across runs would make run 2 cheaper than run 1 and the median a blend of two workloads.
+    let mut children = ChildRegistry::new();
+    let events = match choose_path(factory.is_some(), seal_direct, concurrency) {
+        // Sequential two-pass factory backfill - the same path `dev` takes (RFC-0009 §3). Pass 2
+        // fetches the children pass 1 discovered, so it cannot be pipelined against itself.
+        BackfillPath::Factory => {
+            let fs = factory.expect("choose_path returned Factory without a FactorySet");
+            crate::indexer::backfill_direct_factory(
+                &source,
+                registry,
+                fs,
+                &mut children,
+                &work,
+                topic0s,
+                from,
+                to,
+                window,
+                fs.force_topic0(),
+                |_| Ok(()),
+                |_, _| {},
+            )
+            .await?
+        }
         // Pipelined seal-direct: concurrent fetch, in-order deterministic sealing.
-        crate::indexer::backfill_direct_pipelined(
-            &source,
-            registry,
-            &work,
-            addresses,
-            topic0s,
-            from,
-            to,
-            window,
-            concurrency,
-            |_| Ok(()), // bench doesn't persist a resume watermark
-            |_, _| {},  // bench doesn't render progress
-        )
-        .await?
-    } else if seal_direct {
+        BackfillPath::Pipelined => {
+            crate::indexer::backfill_direct_pipelined(
+                &source,
+                registry,
+                &work,
+                addresses,
+                topic0s,
+                from,
+                to,
+                window,
+                concurrency,
+                |_| Ok(()), // bench doesn't persist a resume watermark
+                |_, _| {},  // bench doesn't render progress
+            )
+            .await?
+        }
         // Seal-direct: decode → Parquet, bypassing the hot store. Exactly the production path.
-        crate::indexer::backfill_direct(
-            &source, registry, &work, addresses, topic0s, from, to, window,
-        )
-        .await?
-    } else {
-        hot_store_backfill(
-            &source, registry, &work, addresses, topic0s, from, to, window,
-        )
-        .await?
+        BackfillPath::Direct => {
+            crate::indexer::backfill_direct(
+                &source, registry, &work, addresses, topic0s, from, to, window,
+            )
+            .await?
+        }
+        BackfillPath::HotStore => {
+            hot_store_backfill(
+                &source, registry, &work, addresses, topic0s, from, to, window,
+            )
+            .await?
+        }
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
     let peak_rss_mb = rss.stop();
@@ -434,6 +551,7 @@ async fn one_run(
         },
         peak_rss_mb,
         rpc_requests: source.request_count(),
+        children: children.len() as u64,
     })
 }
 
@@ -650,5 +768,33 @@ mod tests {
         assert_eq!(percentile(&v, 100.0), 50.0); // rank round(4)  = 4 → v[4]
         assert_eq!(percentile(&[], 99.0), 0.0); // empty guard
         assert_eq!(percentile(&[42.0], 99.0), 42.0); // single element
+    }
+
+    /// **The regression this file exists to prevent.** A factory nest measured through any other path
+    /// fetches a fixed address list that never grows, so it counts the factory's own creation events
+    /// and none of the child activity the workload is *made of* - and it reports success. Found on
+    /// OBIB case 6, where the plain path returned 232 events in 2.6 s against an expected 35,039.
+    ///
+    /// `--concurrency` must not be able to steer a factory nest off the factory path: the pipelined
+    /// backfill takes no `ChildRegistry` and cannot discover anything.
+    #[test]
+    fn a_factory_nest_always_takes_the_factory_path() {
+        for seal_direct in [true, false] {
+            for concurrency in [1, 8, 16] {
+                assert_eq!(
+                    choose_path(true, seal_direct, concurrency),
+                    BackfillPath::Factory,
+                    "factory nest with seal_direct={seal_direct} concurrency={concurrency}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_factory_nest_dispatches_on_seal_direct_and_concurrency() {
+        assert_eq!(choose_path(false, true, 8), BackfillPath::Pipelined);
+        assert_eq!(choose_path(false, true, 1), BackfillPath::Direct);
+        assert_eq!(choose_path(false, false, 8), BackfillPath::HotStore);
+        assert_eq!(choose_path(false, false, 1), BackfillPath::HotStore);
     }
 }
