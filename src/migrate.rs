@@ -198,11 +198,16 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Everything an un-migrated roost held belongs to the default tenant (RFC-0032 §6): migration is
+    // a **relabel, not a migration** - no data moves between tenants, nothing re-indexes, and
+    // enabling hosted tenancy later is another relabel rather than a second migration.
+    let tenant = Roost::load(dir)?.tenant_default();
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
     for p in &plans {
         match p {
             Plan::AlreadyMigrated { alias, nid } => records.push(Mount {
+                tenant: tenant.clone(),
                 alias: alias.clone(),
                 nid: nid.clone(),
             }),
@@ -214,6 +219,7 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
             } => {
                 relocate(from, to)?;
                 records.push(Mount {
+                    tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid: nid.clone(),
                 });
@@ -232,6 +238,7 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                     aside.display()
                 );
                 records.push(Mount {
+                    tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid: nid.clone(),
                 });

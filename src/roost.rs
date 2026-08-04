@@ -50,10 +50,58 @@ pub const DATA_DIR: &str = "data";
 /// this struct in slices 2-3 rather than beside it, so the growth is additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mount {
-    /// The name this mount is served under. Free-form, and *not* part of the nest's identity.
+    /// Who mounted it (RFC-0032 §6). An **opaque string** - nuthatch refcounts it and knows nothing
+    /// else about it. No authz, no quotas, no metering; identity stays the gateway's job.
+    ///
+    /// Always a real value, never `Option<String>` and never null. Single-tenant is `N=1` with
+    /// [`DEFAULT_TENANT`], not a special case, so there is one code path rather than two - and the
+    /// one almost every user is on is the one that would otherwise rot.
+    #[serde(default = "default_tenant")]
+    pub tenant: String,
+    /// The name this mount is served under. Free-form, unique **within a tenant**, and *not* part of
+    /// the nest's identity.
     pub alias: String,
     /// The nest identity ([`crate::blob::Manifest::nid`]) - the dataset key.
     pub nid: String,
+}
+
+/// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per roost via
+/// `[roost] default_tenant`.
+pub const DEFAULT_TENANT: &str = "default";
+
+fn default_tenant() -> String {
+    DEFAULT_TENANT.to_string()
+}
+
+/// One mount's coordinates: who mounted it, and what they call it (RFC-0032 §4, §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountRef {
+    pub tenant: String,
+    pub alias: String,
+}
+
+impl std::fmt::Display for MountRef {
+    /// Always tenant-qualified, unlike [`MountRef::route_key`]. Logs and errors must stay
+    /// unambiguous even in a single-tenant runtime whose routes omit the tenant.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.tenant, self.alias)
+    }
+}
+
+impl MountRef {
+    /// The path this mount is served under (RFC-0032 §7), and the key its health and footprint are
+    /// recorded against.
+    ///
+    /// `multi_tenant` decides whether the tenant appears: with one tenant in the runtime the segment
+    /// would be pure ceremony, and today's URLs must not move for the overwhelming majority of
+    /// users who will never type the word "tenant".
+    pub fn route_key(&self, multi_tenant: bool) -> String {
+        if multi_tenant {
+            format!("{}/{}", self.tenant, self.alias)
+        } else {
+            self.alias.clone()
+        }
+    }
 }
 
 /// A roost manifest: the mounted nests plus the chain(s) they follow. A roost may host nests across
@@ -97,13 +145,36 @@ pub struct RoostMeta {
     /// Single-chain form: RPC endpoints for the one chain. Overridable at runtime with `--rpc`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rpc_urls: Vec<String>,
-    /// The mounted nests, by directory name under `nests/`.
+    /// The mounted nests, by directory name under `nests/`. Superseded by `[[mounts]]` once the
+    /// roost is migrated (RFC-0032 §4) - see [`Roost::mount_refs`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nests: Vec<String>,
+    /// The tenant a mount belongs to when it does not say (RFC-0032 §6). Operator-configurable so a
+    /// single-tenant deployment can call its tenant whatever it likes; absent → [`DEFAULT_TENANT`].
+    /// Never `None` in effect - [`Roost::tenant_default`] always yields a real string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tenant: Option<String>,
     /// Resident-set ceiling **per active-chain cursor**, in MB (RFC-0021 - the footprint budget is
     /// per-cursor; a roost's total is Σ cursors). A cursor whose *projected* RSS exceeds this is refused
     /// before it starts. Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_mb: Option<u64>,
+}
+
+/// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
+///
+/// Tenants and aliases are both. A tenant being **opaque** to nuthatch (RFC-0032 §6) means we never
+/// interpret it, not that it may contain `..` or a separator - opacity is about meaning, not about
+/// what a path resolver will do with it.
+fn safe_segment(value: &str, what: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        bail!("{what} '{value}' is invalid (allowed: letters, digits, '_', '-')");
+    }
+    Ok(())
 }
 
 /// The default per-cursor RSS ceiling: the CLAUDE.md ≤2 GB budget (RFC-0021 - now per active-chain
@@ -142,35 +213,37 @@ impl Roost {
             .with_context(|| format!("no {ROOST_FILE} in {}", dir.display()))?;
         let roost: Roost =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-        if roost.roost.nests.is_empty() {
+        if roost.roost.nests.is_empty() && roost.mounts.is_empty() {
             bail!(
-                "roost '{}' mounts no nests (empty `nests` list)",
+                "roost '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
                 roost.roost.name
             );
         }
-        // Reject duplicate mounts and any name that would collide with a reserved top-level route
-        // (`/nests`, `/health`) - the roster and per-nest prefixes share one path namespace.
+        roost.validate_mounts()?;
+        // Every mount, whichever form declared it, must be a safe path segment and must not collide
+        // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
         let mut seen = std::collections::HashSet::new();
-        for n in &roost.roost.nests {
-            // SEC-10: a nest name is both a filesystem path segment (`nests/<name>/`) and a route
-            // prefix (`/<name>/…`), so restrict it to a safe charset - no `/`, `..`, or empties that
-            // could escape the nests dir or produce surprising routes (matters once names come from a
-            // resolved blob roster, not just an operator-authored toml).
-            if n.is_empty()
-                || !n
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                bail!("nest name '{n}' is invalid (allowed: letters, digits, '_', '-')");
+        for m in roost.mount_refs() {
+            safe_segment(&m.alias, "nest name")?;
+            safe_segment(&m.tenant, "tenant")?;
+            if m.alias == "nests" || m.alias == "health" {
+                bail!(
+                    "nest name '{}' is reserved (collides with a roost route)",
+                    m.alias
+                );
             }
-            if n == "nests" || n == "health" {
-                bail!("nest name '{n}' is reserved (collides with a roost route)");
+            // In a multi-tenant runtime the tenant is the *first* path segment, so it collides with
+            // the same two routes an alias would.
+            if m.tenant == "nests" || m.tenant == "health" {
+                bail!(
+                    "tenant '{}' is reserved (collides with a roost route)",
+                    m.tenant
+                );
             }
-            if !seen.insert(n) {
-                bail!("nest '{n}' is mounted more than once");
+            if !seen.insert((m.tenant.clone(), m.alias.clone())) {
+                bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
         }
-        roost.validate_mounts()?;
         Ok(roost)
     }
 
@@ -181,6 +254,8 @@ impl Roost {
     /// `migrate` rather than by hand, but a roost dir is an operator-editable file and a bundle
     /// roster is untrusted input, so the check is on load, not on write.
     fn validate_mounts(&self) -> Result<()> {
+        // The primary key is `(tenant, alias)`: two tenants may each call their mount "usdc" and
+        // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
             if m.nid.len() != 64 || !m.nid.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -190,17 +265,62 @@ impl Roost {
                     m.nid
                 );
             }
-            if !self.roost.nests.contains(&m.alias) {
-                bail!(
-                    "mount '{}' names no mounted nest (it is absent from the `nests` list)",
-                    m.alias
-                );
-            }
-            if !seen.insert(&m.alias) {
-                bail!("nest '{}' has more than one mount record", m.alias);
+            // SEC-10, again: a tenant is a path segment now, so it gets the same charset as an alias.
+            // It is opaque to nuthatch, which is not the same as being allowed to contain `../`.
+            safe_segment(&m.tenant, "tenant")?;
+            safe_segment(&m.alias, "nest name")?;
+            if !seen.insert((&m.tenant, &m.alias)) {
+                bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
         }
         Ok(())
+    }
+
+    /// Every mount this roost serves, in serving order (RFC-0032 §4).
+    ///
+    /// **`[[mounts]]` first, then any `nests` entry no record covers.** The records are the only
+    /// form that can express `(acme, usdc)` and `(globex, usdc)` as two distinct mounts, which a
+    /// flat list of names cannot - but the list is not simply ignored, because a **half-migrated**
+    /// roost is a supported state and `migrate` produces one whenever it refuses a nest. Dropping
+    /// the uncovered names would silently unmount exactly the nests that failed to migrate.
+    pub fn mount_refs(&self) -> Vec<MountRef> {
+        let mut out: Vec<MountRef> = self
+            .mounts
+            .iter()
+            .map(|m| MountRef {
+                tenant: m.tenant.clone(),
+                alias: m.alias.clone(),
+            })
+            .collect();
+        let tenant = self.tenant_default();
+        for alias in &self.roost.nests {
+            if !self.mounts.iter().any(|m| &m.alias == alias) {
+                out.push(MountRef {
+                    tenant: tenant.clone(),
+                    alias: alias.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// The tenant a mount with no explicit one belongs to. Operator-configurable, defaulted, never
+    /// absent.
+    pub fn tenant_default(&self) -> String {
+        self.roost
+            .default_tenant
+            .clone()
+            .unwrap_or_else(default_tenant)
+    }
+
+    /// Whether more than one tenant is present, which is what decides if routes carry a tenant
+    /// segment (RFC-0032 §7). With one tenant the segment is ceremony, so today's URLs do not move.
+    pub fn is_multi_tenant(&self) -> bool {
+        let mut tenants = self.mount_refs().into_iter().map(|m| m.tenant);
+        let Some(first) = tenants.next() else {
+            return false;
+        };
+        tenants.any(|t| t != first)
     }
 
     /// The on-disk directory of a mounted nest, in the pre-2.0 name-keyed layout.
@@ -227,19 +347,22 @@ impl Roost {
     /// order. `aliases[0]` is the canonical mount - the one that indexes.
     pub fn datasets(&self, dir: &Path) -> Vec<Dataset> {
         let mut out: Vec<Dataset> = Vec::new();
-        for alias in &self.roost.nests {
+        for m in self.mount_refs() {
             let nid = self
                 .mounts
                 .iter()
-                .find(|m| &m.alias == alias)
-                .map(|m| &m.nid);
-            let path = self.dir_for(dir, alias);
+                .find(|r| r.tenant == m.tenant && r.alias == m.alias)
+                .map(|r| r.nid.clone());
+            let path = match &nid {
+                Some(nid) => Self::data_dir(dir, nid),
+                None => Self::nest_dir(dir, &m.alias),
+            };
             match out.iter_mut().find(|d| d.dir == path) {
-                Some(d) => d.aliases.push(alias.clone()),
+                Some(d) => d.mounts.push(m),
                 None => out.push(Dataset {
                     dir: path,
-                    aliases: vec![alias.clone()],
-                    nid: nid.cloned(),
+                    mounts: vec![m],
+                    nid,
                 }),
             }
         }
@@ -251,6 +374,11 @@ impl Roost {
     ///
     /// Both layouts resolve through this one function so a half-migrated roost - some nests adopted,
     /// a new one dropped into `nests/` - is a supported state rather than an accident.
+    ///
+    /// Alias-only, so it resolves the **first** tenant mounting that alias. That is unambiguous in a
+    /// single-tenant runtime and correct in a multi-tenant one *because the dataset is shared*: two
+    /// tenants with the same alias and the same identity resolve to the same directory anyway. Where
+    /// the tenant matters - routing, health, footprint - use [`Roost::datasets`], which carries it.
     pub fn dir_for(&self, dir: &Path, alias: &str) -> PathBuf {
         match self.mounts.iter().find(|m| m.alias == alias) {
             Some(m) => Self::data_dir(dir, &m.nid),
@@ -300,18 +428,21 @@ pub fn fan_out_aliases(
     mut states: Vec<(String, crate::serve::AppState)>,
     health: &crate::health::RoostHealth,
     estimates: &mut std::collections::HashMap<String, u64>,
+    multi_tenant: bool,
 ) -> Vec<(String, crate::serve::AppState)> {
     let mut extra = Vec::new();
     for ds in datasets {
-        let Some((_, state)) = states.iter().find(|(n, _)| n == ds.canonical()) else {
+        let canonical = ds.canonical().route_key(multi_tenant);
+        let Some((_, state)) = states.iter().find(|(n, _)| n == &canonical) else {
             continue;
         };
-        for alias in &ds.aliases[1..] {
-            health.register_alias(alias, ds.canonical(), &state.chain);
-            // The footprint was charged once, to the dataset. Charging it again per alias would make
+        for m in &ds.mounts[1..] {
+            let key = m.route_key(multi_tenant);
+            health.register_alias(&key, &canonical, &state.chain);
+            // The footprint was charged once, to the dataset. Charging it again per mount would make
             // the per-cursor budget refuse a mount that costs nothing - sharing must not be taxed.
-            estimates.insert(alias.clone(), 0);
-            extra.push((alias.clone(), state.clone()));
+            estimates.insert(key.clone(), 0);
+            extra.push((key, state.clone()));
         }
     }
     states.extend(extra);
@@ -323,16 +454,16 @@ pub fn fan_out_aliases(
 pub struct Dataset {
     /// Where the data lives: `data/<nid>`, or `nests/<alias>` for a nest not yet migrated.
     pub dir: PathBuf,
-    /// Every alias serving this dataset, in `nests` order. Never empty.
-    pub aliases: Vec<String>,
+    /// Every mount serving this dataset, in serving order. Never empty.
+    pub mounts: Vec<MountRef>,
     /// The nest identity, when this dataset is identity-keyed. `None` for the pre-2.0 layout.
     pub nid: Option<String>,
 }
 
 impl Dataset {
-    /// The alias that indexes. The others are additional doors onto the same room.
-    pub fn canonical(&self) -> &str {
-        &self.aliases[0]
+    /// The mount that indexes. The others are additional doors onto the same room.
+    pub fn canonical(&self) -> &MountRef {
+        &self.mounts[0]
     }
 
     /// How many mounts want this dataset (RFC-0032 §5).
@@ -340,7 +471,7 @@ impl Dataset {
     /// **Derived, never stored.** A count over the mount table cannot drift out of sync with the
     /// table, which is the failure mode every hand-maintained refcount eventually reaches.
     pub fn refcount(&self) -> usize {
-        self.aliases.len()
+        self.mounts.len()
     }
 }
 
@@ -414,6 +545,7 @@ pub async fn dev(
     // identity share one store and one place in the cursor; only the canonical one indexes, and the
     // rest become extra routes onto it further down.
     let datasets = roost.datasets(&dir);
+    let multi_tenant = roost.is_multi_tenant();
     let mut mounted = Vec::with_capacity(datasets.len());
     for ds in &datasets {
         let config = Config::load(&ds.dir).with_context(|| {
@@ -423,7 +555,11 @@ pub async fn dev(
                 ds.dir.display()
             )
         })?;
-        mounted.push((ds.canonical().to_string(), ds.dir.clone(), config));
+        mounted.push((
+            ds.canonical().route_key(multi_tenant),
+            ds.dir.clone(),
+            config,
+        ));
     }
     let groups = group_by_chain(&endpoints, mounted)?;
 
@@ -433,9 +569,24 @@ pub async fn dev(
                 "dataset {} is shared by {} mounts ({}) - indexed once",
                 ds.nid.as_deref().unwrap_or("<un-migrated>"),
                 ds.refcount(),
-                ds.aliases.join(", "),
+                ds.mounts
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             );
         }
+    }
+    if multi_tenant {
+        tracing::info!(
+            "multi-tenant: routes are /<tenant>/<nest>/… ({} tenants)",
+            roost
+                .mount_refs()
+                .iter()
+                .map(|m| m.tenant.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
     }
 
     // `--rpc` is ambiguous once a roost spans chains (which chain would it override?). Allow it only for
@@ -567,7 +718,7 @@ pub async fn dev(
         ingests.len()
     );
 
-    let all_states = fan_out_aliases(&datasets, all_states, &health, &mut estimates);
+    let all_states = fan_out_aliases(&datasets, all_states, &health, &mut estimates, multi_tenant);
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // roost's real resident set alongside the projection so operators can calibrate.
@@ -578,13 +729,23 @@ pub async fn dev(
             // operator seeing two entries has no way to tell one shared dataset from two backfills.
             let ds = datasets
                 .iter()
-                .find(|d| d.aliases.iter().any(|a| a == name));
-            let shared_with: Vec<&String> = ds
-                .map(|d| d.aliases.iter().filter(|a| *a != name).collect())
+                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
+            let this =
+                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
+            let tenant = this.map(|m| m.tenant.clone());
+            let shared_with: Vec<String> = ds
+                .map(|d| {
+                    d.mounts
+                        .iter()
+                        .map(|m| m.route_key(multi_tenant))
+                        .filter(|k| k != name)
+                        .collect()
+                })
                 .unwrap_or_default();
             serde_json::json!({
                 "name": name,
                 "chain": state.chain,
+                "tenant": tenant,
                 "nid": ds.and_then(|d| d.nid.clone()),
                 "shared_with": shared_with,
                 "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
@@ -835,12 +996,27 @@ fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
         .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
     let mut roost: Roost = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
-    roost.roost.nests = nests.to_vec();
-    // Drop mount records for nests that are no longer mounted, or the next `load` refuses the file
-    // it just wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5
-    // makes collection explicit, because re-backfilling is precisely the cost this design exists to
-    // avoid and an accidental unmount must not trigger one.
-    roost.mounts.retain(|m| nests.contains(&m.alias));
+    // `nests` here are **route keys** - tenant-qualified when the runtime is multi-tenant - because
+    // that is what the serving layer and the admin API name a mount by. Matching them against
+    // `alias` alone would drop every mount in a multi-tenant roost on the first unmount.
+    let multi_tenant = roost.is_multi_tenant();
+    if roost.mounts.is_empty() {
+        roost.roost.nests = nests.to_vec();
+    } else {
+        // Drop the records for mounts that are gone, or the next `load` refuses the file it just
+        // wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5 makes
+        // collection explicit, because re-backfilling is precisely the cost this design exists to
+        // avoid and an accidental unmount must not trigger one.
+        roost.mounts.retain(|m| {
+            let key = MountRef {
+                tenant: m.tenant.clone(),
+                alias: m.alias.clone(),
+            }
+            .route_key(multi_tenant);
+            nests.contains(&key)
+        });
+        roost.roost.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
+    }
     let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
@@ -972,9 +1148,21 @@ impl RoostHandles {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
-        let dir = match self.mount_ctx.mounts.iter().find(|m| m.alias == name) {
+        // `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split it
+        // so a record lookup works either way, rather than silently missing every multi-tenant mount
+        // and falling through to the pre-2.0 directory - which would come up empty and re-backfill.
+        let (tenant, alias) = match name.split_once('/') {
+            Some((t, a)) => (Some(t), a),
+            None => (None, name),
+        };
+        let record = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
+        let dir = match record {
             Some(m) => Roost::data_dir(&self.mount_ctx.dir, &m.nid),
-            None => Roost::nest_dir(&self.mount_ctx.dir, name),
+            None => Roost::nest_dir(&self.mount_ctx.dir, alias),
         };
         let config = Config::load(&dir)
             .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
@@ -1216,6 +1404,42 @@ mod tests {
         (name.to_string(), p, c)
     }
 
+    fn aliases(ds: &Dataset) -> Vec<String> {
+        ds.mounts.iter().map(|m| m.alias.clone()).collect()
+    }
+
+    /// The unmount path rewrites `roost.toml` from **route keys**, which are tenant-qualified in a
+    /// multi-tenant runtime. Matching them against `alias` alone would retain nothing and silently
+    /// unmount every co-tenant on the first unmount - so this asserts the survivor, not the casualty.
+    #[test]
+    fn persisting_after_an_unmount_keeps_the_other_tenants_mount() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let nid = "aa11".repeat(16);
+        std::fs::write(
+            root.join(ROOST_FILE),
+            format!(
+                "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                 rpc_urls = []\n\n\
+                 [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"{nid}\"\n\n\
+                 [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+
+        // acme unmounts; the runtime persists what is left, by route key.
+        persist_mounted_nests(root, &["globex/usdc".to_string()]).unwrap();
+
+        let after = Roost::load(root).expect("the rewritten file must still load");
+        assert_eq!(after.mounts.len(), 1, "the co-tenant's mount was dropped");
+        assert_eq!(after.mounts[0].tenant, "globex");
+        assert_eq!(after.mounts[0].alias, "usdc");
+        assert_eq!(
+            after.mounts[0].nid, nid,
+            "the surviving mount must still point at the same dataset"
+        );
+    }
+
     /// RFC-0032 §4: grouping is by *dataset*, and a roost may be half-migrated while it happens.
     #[test]
     fn datasets_group_by_identity_across_both_layouts() {
@@ -1235,12 +1459,12 @@ mod tests {
 
         // Two migrated aliases collapse to one dataset; the un-migrated nest keeps its own.
         assert_eq!(ds.len(), 2, "expected 2 datasets, got {ds:?}");
-        assert_eq!(ds[0].aliases, vec!["a", "b"]);
+        assert_eq!(aliases(&ds[0]), vec!["a", "b"]);
         assert_eq!(ds[0].refcount(), 2);
-        assert_eq!(ds[0].canonical(), "a", "the first alias in `nests` indexes");
+        assert_eq!(ds[0].canonical().alias, "a", "the first mount indexes");
         assert!(ds[0].dir.starts_with(root.join(DATA_DIR)));
 
-        assert_eq!(ds[1].aliases, vec!["legacy"]);
+        assert_eq!(aliases(&ds[1]), vec!["legacy"]);
         assert_eq!(ds[1].refcount(), 1);
         assert_eq!(
             ds[1].nid, None,
@@ -1249,30 +1473,56 @@ mod tests {
         assert!(ds[1].dir.starts_with(root.join(NESTS_DIR)));
     }
 
-    /// A mount record naming a nest that is not mounted would leave the runtime resolving a dataset
-    /// nothing serves, so it is refused at load rather than silently ignored.
+    /// A mount record is untrusted input - `roost.toml` is operator-editable and a roster may come
+    /// from a resolved bundle - so the identity and the path segments are checked at load.
     #[test]
-    fn a_mount_record_is_validated_against_the_nest_list() {
+    fn a_mount_record_is_validated() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         let base = "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
-                    rpc_urls = []\nnests = [\"a\"]\n\n[[mounts]]\n";
+                    rpc_urls = []\n\n[[mounts]]\n";
+        let good = "aa11".repeat(16);
 
         for (record, expect) in [
-            ("alias = \"ghost\"\nnid = \"aa\"\n", "invalid nest identity"),
+            // Too short, and not hex - a NID is a path segment before it is anything else.
+            ("alias = \"a\"\nnid = \"aa\"\n".to_string(), "invalid nest identity"),
             (
-                &format!("alias = \"ghost\"\nnid = \"{}\"\n", "aa11".repeat(16)),
-                "names no mounted nest",
+                format!("alias = \"a\"\nnid = \"{}\"\n", "zz".repeat(32)),
+                "invalid nest identity",
             ),
             (
-                &format!("alias = \"a\"\nnid = \"{}\"\n", "zz".repeat(32)),
-                "invalid nest identity",
+                format!("alias = \"../esc\"\nnid = \"{good}\"\n"),
+                "nest name '../esc' is invalid",
+            ),
+            (
+                format!("alias = \"health\"\nnid = \"{good}\"\n"),
+                "reserved",
+            ),
+            // The primary key is (tenant, alias), so the *same* pair twice is the collision.
+            (
+                format!(
+                    "alias = \"a\"\nnid = \"{good}\"\n\n[[mounts]]\nalias = \"a\"\nnid = \"{good}\"\n"
+                ),
+                "more than once",
             ),
         ] {
             std::fs::write(root.join(ROOST_FILE), format!("{base}{record}")).unwrap();
             let err = Roost::load(root).unwrap_err().to_string();
             assert!(err.contains(expect), "expected {expect:?}, got: {err}");
         }
+
+        // ...and the same alias under two *different* tenants is fine, which is the whole point.
+        std::fs::write(
+            root.join(ROOST_FILE),
+            format!(
+                "{base}tenant = \"acme\"\nalias = \"a\"\nnid = \"{good}\"\n\n\
+                 [[mounts]]\ntenant = \"globex\"\nalias = \"a\"\nnid = \"{good}\"\n"
+            ),
+        )
+        .unwrap();
+        let roost = Roost::load(root).expect("two tenants may share an alias");
+        assert!(roost.is_multi_tenant());
+        assert_eq!(roost.mount_refs().len(), 2);
     }
 
     #[test]
@@ -1387,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_empty_nest_list() {
+    fn rejects_a_roost_that_mounts_nothing() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join(ROOST_FILE),
@@ -1397,7 +1647,7 @@ mod tests {
         assert!(Roost::load(d.path())
             .unwrap_err()
             .to_string()
-            .contains("no nests"));
+            .contains("mounts nothing"));
     }
 
     #[test]
