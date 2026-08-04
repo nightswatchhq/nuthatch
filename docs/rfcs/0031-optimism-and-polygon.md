@@ -1,8 +1,15 @@
 # RFC-0031: Optimism and Polygon - the two chains that fail in opposite ways
 
-- Status: **Draft** (2026-08-03)
+- Status: **Parked** (2026-08-04; drafted 2026-08-03)
 - Author: Pete (cargopete)
 - Date: 2026-08-03
+- Parked because: a deliberate priority call. Tracked as issues #274 (Polygon) and #275 (Optimism).
+  Note the two chains are parked for *different* reasons and only one of them is ours to unpark:
+  Polygon waits on us building `Finality::Depth` trust (§3), while **Optimism is blocked externally**
+  on there being a second endpoint that clears the bar - of ten probed, one qualified. Unparking
+  Optimism needs the world to change, or an explicit decision to ship a single-endpoint chain.
+  §3's finality-trust criterion is the durable part of this document and applies to every future
+  chain whether or not these two are ever built.
 - Depends on: RFC-0030 (the chain registry and the endpoint bar this applies), RFC-0004 §2 (the
   adaptive chunker a `log_window` seeds), RFC-0028 (cap-error taxonomy), RFC-0026 (fault taxonomy,
   for the finality-regression case in §3.3).

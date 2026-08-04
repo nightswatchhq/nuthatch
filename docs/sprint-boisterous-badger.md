@@ -208,9 +208,11 @@ queued behind them - a security finding on day 8 is much cheaper than one on day
 **Ordering note:** 10 and 11 should come *after* 1-6, or they will be rewritten twice. 7-9 should start
 immediately and run continuously - they are the ones whose findings change what gets built.
 
-**Parked, and only these:** RFC-0003 (ExEx tip mode), RFC-0014 (extraction), RFC-0024 (eth-call
-execution engine - a research note behind 0023 by its own framing). All three wait on the dedicated
-box in §4. Nothing else is blocked on anything.
+**Parked, and only these:** RFC-0003 (ExEx tip mode), RFC-0014 (extraction), **RFC-0030 and RFC-0031** (adding EVM chains; parked 2026-08-04 by priority call, not difficulty - though RFC-0031's Optimism half is blocked externally, and RFC-0030 slice 3 is carved out because two shipped Arbitrum defaults cannot serve a backfill, issue #267), RFC-0024 (eth-call
+execution engine - a research note behind 0023 by its own framing). **0003, 0014 and 0024 wait on the
+dedicated box in §4; 0030 and 0031 do not** - they are parked by choice and buildable whenever we
+choose, except RFC-0031's Optimism half, which waits on a second qualifying endpoint existing.
+Nothing else is blocked on anything.
 
 **What "1.0" should mean, before anyone assumes:** this list closes the RFCs we *can* close. It does
 not by itself make the version 1.0 - that is a separate judgement about API stability and the §683
