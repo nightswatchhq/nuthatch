@@ -177,6 +177,13 @@ struct Tape {
 /// zero-timestamp window and would retry forever.
 pub struct TapeSource {
     inner: Mutex<Tape>,
+    /// How many `logs` calls this tape has answered.
+    ///
+    /// The point of a shared dataset (RFC-0032 §4) is that it is fetched **once**, and the only way
+    /// to prove that is to count what the source was asked for. A test that merely checks both
+    /// aliases return the same rows would pass just as happily with two identical backfills running
+    /// side by side - which is the bug, not the fix.
+    logs_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for TapeSource {
@@ -193,7 +200,13 @@ impl TapeSource {
                 tip: 0,
                 finalized: 0,
             }),
+            logs_calls: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many `logs` calls have been made against this tape.
+    pub fn logs_call_count(&self) -> usize {
+        self.logs_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Insert/overwrite a block. Raises the tip to `number` if it was behind (does not lower it).
@@ -275,6 +288,8 @@ impl Source for TapeSource {
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
+        self.logs_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for (_, fixture) in t.blocks.range(from..=to) {

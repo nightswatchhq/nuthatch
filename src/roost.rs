@@ -216,6 +216,36 @@ impl Roost {
         dir.join(DATA_DIR).join(nid)
     }
 
+    /// The distinct **datasets** this roost mounts, each with every alias serving it (RFC-0032 §4).
+    ///
+    /// This is the function that makes sharing real. Two aliases naming one nest identity are one
+    /// dataset: one store, one place in the cursor, **one backfill**. Iterating `nests` directly
+    /// instead - the pre-2.0 shape - would open the same store twice and index the same chain data
+    /// twice, which is the entire cost this design exists to remove.
+    ///
+    /// Order is deterministic: datasets in first-alias order, aliases within a dataset in `nests`
+    /// order. `aliases[0]` is the canonical mount - the one that indexes.
+    pub fn datasets(&self, dir: &Path) -> Vec<Dataset> {
+        let mut out: Vec<Dataset> = Vec::new();
+        for alias in &self.roost.nests {
+            let nid = self
+                .mounts
+                .iter()
+                .find(|m| &m.alias == alias)
+                .map(|m| &m.nid);
+            let path = self.dir_for(dir, alias);
+            match out.iter_mut().find(|d| d.dir == path) {
+                Some(d) => d.aliases.push(alias.clone()),
+                None => out.push(Dataset {
+                    dir: path,
+                    aliases: vec![alias.clone()],
+                    nid: nid.cloned(),
+                }),
+            }
+        }
+        out
+    }
+
     /// Where `alias` is served from: `data/<nid>` when a mount record exists, else the pre-2.0
     /// `nests/<alias>`.
     ///
@@ -256,23 +286,70 @@ impl Roost {
     }
 }
 
+/// Give every extra alias of a shared dataset its own route onto the *same* state (RFC-0032 §7).
+///
+/// One dataset was indexed, under its canonical alias. Each further alias gets a **clone** of that
+/// `AppState` - the same `Arc` store, the same directory, the same views. Two doors, one room: no
+/// second store, no second backfill, and nothing to keep in sync afterwards because there is only
+/// ever one of everything.
+///
+/// A dataset whose canonical mount is absent (its cursor was refused) is skipped rather than
+/// aliased onto nothing.
+pub fn fan_out_aliases(
+    datasets: &[Dataset],
+    mut states: Vec<(String, crate::serve::AppState)>,
+    health: &crate::health::RoostHealth,
+    estimates: &mut std::collections::HashMap<String, u64>,
+) -> Vec<(String, crate::serve::AppState)> {
+    let mut extra = Vec::new();
+    for ds in datasets {
+        let Some((_, state)) = states.iter().find(|(n, _)| n == ds.canonical()) else {
+            continue;
+        };
+        for alias in &ds.aliases[1..] {
+            health.register_alias(alias, ds.canonical(), &state.chain);
+            // The footprint was charged once, to the dataset. Charging it again per alias would make
+            // the per-cursor budget refuse a mount that costs nothing - sharing must not be taxed.
+            estimates.insert(alias.clone(), 0);
+            extra.push((alias.clone(), state.clone()));
+        }
+    }
+    states.extend(extra);
+    states
+}
+
+/// One dataset and every alias serving it (RFC-0032 §4-§5) - "two doors, one room".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dataset {
+    /// Where the data lives: `data/<nid>`, or `nests/<alias>` for a nest not yet migrated.
+    pub dir: PathBuf,
+    /// Every alias serving this dataset, in `nests` order. Never empty.
+    pub aliases: Vec<String>,
+    /// The nest identity, when this dataset is identity-keyed. `None` for the pre-2.0 layout.
+    pub nid: Option<String>,
+}
+
+impl Dataset {
+    /// The alias that indexes. The others are additional doors onto the same room.
+    pub fn canonical(&self) -> &str {
+        &self.aliases[0]
+    }
+
+    /// How many mounts want this dataset (RFC-0032 §5).
+    ///
+    /// **Derived, never stored.** A count over the mount table cannot drift out of sync with the
+    /// table, which is the failure mode every hand-maintained refcount eventually reaches.
+    pub fn refcount(&self) -> usize {
+        self.aliases.len()
+    }
+}
+
 /// A chain's cursor unit (RFC-0021): the endpoint (RPC) plus the mounted nests that follow that chain.
 /// Each becomes one isolated cursor - the single-cursor law, held per chain.
 #[derive(Debug)]
 pub struct ChainGroup {
     pub endpoint: ChainEndpoint,
     pub nests: Vec<(String, PathBuf, Config)>,
-}
-
-/// Load a mounted nest's config (chain grouping is validated by [`group_by_chain`], not here).
-///
-/// Resolution goes through [`Roost::dir_for`], so a migrated nest is read from `data/<nid>` and an
-/// un-migrated one from `nests/<name>` with no other difference.
-fn load_mounted_nest(roost: &Roost, roost_dir: &Path, name: &str) -> Result<(PathBuf, Config)> {
-    let dir = roost.dir_for(roost_dir, name);
-    let config = Config::load(&dir)
-        .with_context(|| format!("loading mounted nest '{name}' from {}", dir.display()))?;
-    Ok((dir, config))
 }
 
 /// Group loaded nests by their declared chain, matching each to a roost chain endpoint (RFC-0021).
@@ -333,13 +410,33 @@ pub async fn dev(
     let meta = &roost.roost;
     let endpoints = roost.chain_endpoints()?;
 
-    // Load every mounted nest, then group by chain - one isolated cursor per distinct chain (RFC-0021).
-    let mut mounted = Vec::with_capacity(meta.nests.len());
-    for name in &meta.nests {
-        let (nest_path, config) = load_mounted_nest(&roost, &dir, name)?;
-        mounted.push((name.clone(), nest_path, config));
+    // Load every mounted **dataset** - not every alias (RFC-0032 §4). Aliases sharing one nest
+    // identity share one store and one place in the cursor; only the canonical one indexes, and the
+    // rest become extra routes onto it further down.
+    let datasets = roost.datasets(&dir);
+    let mut mounted = Vec::with_capacity(datasets.len());
+    for ds in &datasets {
+        let config = Config::load(&ds.dir).with_context(|| {
+            format!(
+                "loading mounted nest '{}' from {}",
+                ds.canonical(),
+                ds.dir.display()
+            )
+        })?;
+        mounted.push((ds.canonical().to_string(), ds.dir.clone(), config));
     }
     let groups = group_by_chain(&endpoints, mounted)?;
+
+    for ds in &datasets {
+        if ds.refcount() > 1 {
+            tracing::info!(
+                "dataset {} is shared by {} mounts ({}) - indexed once",
+                ds.nid.as_deref().unwrap_or("<un-migrated>"),
+                ds.refcount(),
+                ds.aliases.join(", "),
+            );
+        }
+    }
 
     // `--rpc` is ambiguous once a roost spans chains (which chain would it override?). Allow it only for
     // a single-chain roost; a multichain roost sets rpc_urls per chain under [[chains]].
@@ -470,14 +567,26 @@ pub async fn dev(
         ingests.len()
     );
 
+    let all_states = fan_out_aliases(&datasets, all_states, &health, &mut estimates);
+
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // roost's real resident set alongside the projection so operators can calibrate.
     let roster_entries: Vec<_> = all_states
         .iter()
         .map(|(name, state)| {
+            // Which dataset backs this mount, and who else is on it (RFC-0032 §4). Without this an
+            // operator seeing two entries has no way to tell one shared dataset from two backfills.
+            let ds = datasets
+                .iter()
+                .find(|d| d.aliases.iter().any(|a| a == name));
+            let shared_with: Vec<&String> = ds
+                .map(|d| d.aliases.iter().filter(|a| *a != name).collect())
+                .unwrap_or_default();
             serde_json::json!({
                 "name": name,
                 "chain": state.chain,
+                "nid": ds.and_then(|d| d.nid.clone()),
+                "shared_with": shared_with,
                 "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
                 "table_count": state.tables.len(),
                 "base_path": format!("/{name}"),
@@ -1102,8 +1211,68 @@ mod tests {
 
     fn mounted(roost_dir: &Path, name: &str) -> (String, PathBuf, Config) {
         let roost = Roost::load(roost_dir).unwrap();
-        let (p, c) = load_mounted_nest(&roost, roost_dir, name).unwrap();
+        let p = roost.dir_for(roost_dir, name);
+        let c = Config::load(&p).unwrap();
         (name.to_string(), p, c)
+    }
+
+    /// RFC-0032 §4: grouping is by *dataset*, and a roost may be half-migrated while it happens.
+    #[test]
+    fn datasets_group_by_identity_across_both_layouts() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::write(
+            root.join(ROOST_FILE),
+            "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\nnests = [\"a\", \"b\", \"legacy\"]\n\n\
+             [[mounts]]\nalias = \"a\"\nnid = \"aa11\"\n\n\
+             [[mounts]]\nalias = \"b\"\nnid = \"aa11\"\n"
+                .replace("aa11", &"aa11".repeat(16)),
+        )
+        .unwrap();
+        let roost = Roost::load(root).unwrap();
+        let ds = roost.datasets(root);
+
+        // Two migrated aliases collapse to one dataset; the un-migrated nest keeps its own.
+        assert_eq!(ds.len(), 2, "expected 2 datasets, got {ds:?}");
+        assert_eq!(ds[0].aliases, vec!["a", "b"]);
+        assert_eq!(ds[0].refcount(), 2);
+        assert_eq!(ds[0].canonical(), "a", "the first alias in `nests` indexes");
+        assert!(ds[0].dir.starts_with(root.join(DATA_DIR)));
+
+        assert_eq!(ds[1].aliases, vec!["legacy"]);
+        assert_eq!(ds[1].refcount(), 1);
+        assert_eq!(
+            ds[1].nid, None,
+            "an un-migrated nest has no identity recorded"
+        );
+        assert!(ds[1].dir.starts_with(root.join(NESTS_DIR)));
+    }
+
+    /// A mount record naming a nest that is not mounted would leave the runtime resolving a dataset
+    /// nothing serves, so it is refused at load rather than silently ignored.
+    #[test]
+    fn a_mount_record_is_validated_against_the_nest_list() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let base = "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                    rpc_urls = []\nnests = [\"a\"]\n\n[[mounts]]\n";
+
+        for (record, expect) in [
+            ("alias = \"ghost\"\nnid = \"aa\"\n", "invalid nest identity"),
+            (
+                &format!("alias = \"ghost\"\nnid = \"{}\"\n", "aa11".repeat(16)),
+                "names no mounted nest",
+            ),
+            (
+                &format!("alias = \"a\"\nnid = \"{}\"\n", "zz".repeat(32)),
+                "invalid nest identity",
+            ),
+        ] {
+            std::fs::write(root.join(ROOST_FILE), format!("{base}{record}")).unwrap();
+            let err = Roost::load(root).unwrap_err().to_string();
+            assert!(err.contains(expect), "expected {expect:?}, got: {err}");
+        }
     }
 
     #[test]

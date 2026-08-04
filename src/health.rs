@@ -56,6 +56,10 @@ pub struct RoostHealth {
     /// Nest name → how many times it has ever been quarantined. A monotonic counter, so a nest that
     /// flaps in and out is visible on a graph even though its *current* state keeps reading healthy.
     quarantine_count: RwLock<HashMap<String, u64>>,
+    /// Alias → the mount whose dataset it shares (RFC-0032 §4). Two aliases over one nest identity
+    /// are **one dataset indexed once**, so only the canonical mount is ever quarantined; the others
+    /// must inherit its state or they would cheerfully report "indexing" while nothing is.
+    shares: RwLock<HashMap<String, String>>,
 }
 
 impl RoostHealth {
@@ -69,6 +73,16 @@ impl RoostHealth {
             .write()
             .unwrap()
             .insert(nest.to_string(), chain.to_string());
+    }
+
+    /// Record that `alias` serves the same dataset as `canonical` (RFC-0032 §4), so it reports that
+    /// dataset's health rather than a private, permanently-cheerful one of its own.
+    pub fn register_alias(&self, alias: &str, canonical: &str, chain: &str) {
+        self.register(alias, chain);
+        self.shares
+            .write()
+            .unwrap()
+            .insert(alias.to_string(), canonical.to_string());
     }
 
     /// Quarantine one nest. `next_retry_secs` is `None` for a terminal fault (§3).
@@ -146,10 +160,20 @@ impl RoostHealth {
     /// This nest's effective quarantine: its own if it has one, otherwise its cursor's. A nest that is
     /// itself fine but whose cursor died is still not indexing, and must not report that it is.
     pub fn status(&self, nest: &str) -> Option<QuarantineInfo> {
-        if let Some(q) = self.nests.read().unwrap().get(nest) {
+        // An alias resolves to the mount that actually indexes the shared dataset (RFC-0032 §4).
+        // Only that one is ever quarantined, so asking about the alias directly would always say
+        // "indexing" - the exact false-healthy report `/ready` exists to prevent.
+        let canonical = self
+            .shares
+            .read()
+            .unwrap()
+            .get(nest)
+            .cloned()
+            .unwrap_or_else(|| nest.to_string());
+        if let Some(q) = self.nests.read().unwrap().get(&canonical) {
             return Some(q.clone());
         }
-        let chain = self.chain_of.read().unwrap().get(nest).cloned()?;
+        let chain = self.chain_of.read().unwrap().get(&canonical).cloned()?;
         self.cursors.read().unwrap().get(&chain).cloned()
     }
 

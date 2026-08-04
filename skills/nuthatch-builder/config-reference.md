@@ -140,3 +140,25 @@ called it. Both resolve, so a partly-migrated roost is a supported state.
 Run `nuthatch migrate --dir <roost> --dry-run` to see the plan before applying it. The migration
 moves data and never re-indexes; if two aliases turn out to be the same nest, it says so and merges
 them onto one dataset.
+
+**Two aliases may name the same `nid`, and that is the point.** They share one dataset: one store,
+one place in the cursor, one backfill, two routes.
+
+```toml
+nests = ["acme-usdc", "globex-usdc"]
+
+[[mounts]]
+alias = "acme-usdc"
+nid = "9f2c…"
+
+[[mounts]]
+alias = "globex-usdc"
+nid = "9f2c…"        # same nest, same data, indexed once
+```
+
+`/acme-usdc/…` and `/globex-usdc/…` both serve it. `GET /nests` reports each mount's `nid` and its
+`shared_with` list, so a shared dataset is distinguishable from two separate backfills, and the
+alias's `estimated_rss_mb` is `0` because the footprint was charged once to the dataset.
+
+Sharing is by *identity*, so it survives nothing and forks on anything: edit either nest's inputs and
+the NID changes, the mounts stop matching, and the edited one gets its own dataset automatically.
