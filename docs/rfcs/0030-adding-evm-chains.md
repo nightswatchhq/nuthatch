@@ -1,8 +1,13 @@
 # RFC-0030: Adding EVM chains - the registry, the endpoint bar, and Gnosis first
 
-- Status: **Draft** (2026-08-03)
+- Status: **Parked** (2026-08-04; drafted 2026-08-03)
 - Author: Pete (cargopete)
 - Date: 2026-08-03
+- Parked because: a deliberate priority call, not a difficulty or a blocker. The design stands and
+  needs no revision to resume. Tracked as issue #273. **One slice is carved out and is *not* parked**:
+  re-measuring the endpoints we already ship (§7 slice 3), because two of our shipped Arbitrum
+  defaults are recorded here as unable to serve a backfill - that is a live defect on a chain we
+  serve today, filed separately as #267.
 - Depends on: RFC-0004 §2 (the adaptive chunker a new chain's `log_window` seeds), RFC-0028 (the
   cap-error taxonomy the endpoint probe must reuse), RFC-0021 (the multichain roost, which multiplies
   the value of every chain added here).
