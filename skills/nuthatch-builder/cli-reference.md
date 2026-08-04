@@ -256,6 +256,13 @@ Verify a pack: signature, artifact hashes, and grant conformance
 
 - `--dir <DIR>` - Nest directory (must contain a `compliance-pack.toml`)
 
+## `nuthatch prune`
+
+Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
+
+- `--dir <DIR>` - Roost directory (must contain a roost.toml)
+- `--yes` - Actually delete. Without this, prune only reports what it would remove
+
 ## `nuthatch recipe`
 
 Derive-first recipes (RFC-0023): add a view that computes a read (e.g. `total_supply`) from indexed events instead of fetching it with an `eth_call`. No archive node, deterministic, free

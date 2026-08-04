@@ -83,6 +83,12 @@ pub enum Command {
     /// Data is moved, never re-indexed. Idempotent, and safe to run on a roost that is already
     /// partly migrated. Use `--dry-run` first: it prints the entire plan and changes nothing.
     Migrate(MigrateArgs),
+    /// Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5).
+    ///
+    /// Unmounting a nest never deletes its data - re-backfilling is the cost identity-keyed storage
+    /// exists to avoid, so unmount/remount is free. This is the explicit way to get the disk back.
+    /// It LISTS by default; `--yes` is what deletes.
+    Prune(PruneArgs),
     /// Regenerate the builder skill's machine-generated references from clap metadata (RFC-0017).
     /// Hidden: a dev/authoring tool, not part of the user-facing two-command story.
     #[command(hide = true)]
@@ -98,6 +104,16 @@ pub struct MigrateArgs {
     /// anything.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct PruneArgs {
+    /// Roost directory (must contain a roost.toml).
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Actually delete. Without this, prune only reports what it would remove.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]

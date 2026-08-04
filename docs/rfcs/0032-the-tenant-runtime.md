@@ -238,6 +238,35 @@ Each ends runnable and testable. No slice ships the next one's ceremony.
 backfill, and assert the RPC request count is that of *one* backfill. Every other guarantee in this
 RFC is a consequence of that one being true.
 
+> **Amended after building slices 1-4 (2026-08-04).** Four things this section got wrong, kept here
+> rather than quietly corrected, because the corrections are the useful part.
+>
+> 1. **The "test that matters" above does not discriminate.** RFC-0012's shared cursor already fetches
+>    the *union* of its nests' logs once per window and demuxes, so two *distinct* nests on one cursor
+>    already cost one nest's worth of RPC chatter. The count is identical whether or not datasets are
+>    shared, and the test would have passed against the broken implementation. It is still asserted as
+>    a regression guard, against a single-mount control run rather than a magic number. What actually
+>    discriminates: one dataset directory on disk, `Arc::ptr_eq` on the two stores, identical sealed
+>    rows through both doors, and the second mount charged zero RSS. Related: the pre-slice-2 shape did
+>    not silently double-index - it called `Store::open` on one redb file twice and redb refused, so it
+>    could not come up at all.
+> 2. **Slice 2 could not "replace `RoostMeta::nests`" and slice 3 had to.** The alias is unique only
+>    *within* a tenant, so `(acme, usdc)` and `(globex, usdc)` cannot be expressed by a flat list of
+>    names at all. `[[mounts]]` became authoritative in slice 3, one slice earlier than planned. The
+>    config-key *rename* still belongs to slice 5.
+> 3. **A half-migrated roost needs `nests` and `[[mounts]]` unioned**, not one superseding the other -
+>    `migrate` produces exactly that state whenever it refuses a nest, and treating the records as the
+>    whole truth silently unmounts the nests that failed to migrate.
+> 4. **Health had to follow the sharing.** Only the canonical mount is ever quarantined, so an alias
+>    reporting its own state answers "indexing" while nothing is - the false-healthy report `/ready`
+>    exists to prevent. `register_alias` records the sharing and `status()` resolves through it.
+>
+> Slice 4's criterion, by contrast, was exactly right to insist on measurement: a remount that quietly
+> re-indexed leaves the same rows, the same watermark and the same content-hashes behind, so every
+> obvious assertion passes against the broken version. The shipped test counts source requests across
+> first-backfill / remount / prune-and-rebuild, and the third leg is what stops the second passing for
+> the wrong reason.
+
 ## 10. What this does not change
 
 - **One cursor per chain, single-writer, one observable failure boundary.** RFC-0021 stands unchanged.
