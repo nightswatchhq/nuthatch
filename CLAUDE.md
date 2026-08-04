@@ -14,7 +14,7 @@ non-negotiables below, stop and flag it instead of proceeding.
    --chain mainnet` → `nuthatch dev` → live API. Target: <2 minutes to first indexed query.
 2. **Footprint budget: ≤2 GB RAM per active-chain cursor** - one chain's tip-following +
    serving in embedded mode, whether that cursor hosts one nest or several. A single-chain
-   roost is one cursor (≤2 GB); a multichain roost's total is Σ cursors (RFC-0021). The budget
+   runtime is one cursor (≤2 GB); a multichain runtime's total is Σ cursors (RFC-0021). The budget
    is per-cursor and shared across the nests on that cursor - density is RAM-bounded, not free.
    Treat this as a CI-enforced budget (per cursor), not an aspiration. If a design decision
    threatens it, surface the tradeoff before implementing.
@@ -47,21 +47,35 @@ DuckDB writers.
 DataFusion federates hot + cold behind one SQL surface. Feature-flag the storage backend
 behind a trait; no `#[cfg]` forks of business logic.
 
-**Multi-nest co-tenancy (a *roost*):** one runtime may host N nests an operator chose to
-co-locate, across **one or more chains**, running **one isolated cursor per distinct chain**
-(RFC-0021) - each cursor with its own hot DB, finality view, and reorg boundary. Cooperating
-tenants an operator picked - not paying strangers (that's the hosted-SaaS path, out of scope).
-Strict per-nest **and per-cursor** isolation of storage, reorg, and blast radius: one nest's
-bad view or runaway factory, or one chain's stall or reorg, must not harm another. The
-single-cursor law holds **per chain**: a cursor is always single-chain, single-writer, one
-observable failure boundary - never multiplex two chains behind one cursor. Multichain in one
-runtime is a **capability, not a mandate**; one-chain-per-roost stays valid and is the default.
-A second chain means a second cursor - in the same runtime (a multichain roost) or on another
-worker (the distributed pool, RFC-0022) - but never a second chain behind one cursor. See
-RFC-0012, RFC-0021.
+**Multi-nest tenancy (in the runtime):** one runtime hosts **N nests**, across **one or more
+chains**, running **one isolated cursor per distinct chain** (RFC-0021) - each cursor with its
+own finality view and reorg boundary. A single nest is simply N=1; there is no separate mode to
+opt into and no container to declare.
+
+**A nest's data is keyed by its content address (NID); a mount is keyed by (tenant, NID).** A
+*tenant* is an **opaque string** that labels a mount and never touches the data layer - it exists
+so one operator can host nests on behalf of several parties. Two tenants mounting the same nest
+share one dataset: it is **never indexed twice**, and deleting one mount decrements a reference
+rather than destroying data someone else is using. Because the NID is a true content address, any
+edit yields a different nest, so divergence forks its own data automatically and cannot
+contaminate a shared one.
+
+Strict per-nest **and per-cursor** isolation of storage, reorg, and blast radius: one nest's bad
+view or runaway factory, or one chain's stall or reorg, must not harm another. The single-cursor
+law holds **per chain**: a cursor is always single-chain, single-writer, one observable failure
+boundary - never multiplex two chains behind one cursor. Multichain in one runtime is a
+**capability, not a mandate**; one chain per runtime stays valid and is the default. A second
+chain means a second cursor - in the same runtime or on another worker (the distributed pool,
+RFC-0022) - but never a second chain behind one cursor. See RFC-0012, RFC-0021.
+
+> **Status (2026-08-04): agreed, not yet built.** Today the runtime ships this as a *roost* -
+> `roost.toml`, `nuthatch roost dev`, a directory of nest directories, and storage keyed by nest
+> name. Tenants, NID-keyed storage and refcounted mounts are the agreed target and land in 2.0;
+> the roost is retired as a concept at that point. Read this paragraph as the destination and
+> `docs/rfcs/0012` + `0021` + `0027` as what exists. Do not describe tenants as shipped.
 
 **Reorg strategy:** reorgs only ever touch the mutable hot store - and only that of the
-affected chain's cursor, isolated from other cursors in the same roost. Segments are sealed to
+affected chain's cursor, isolated from other cursors in the same runtime. Segments are sealed to
 Parquet strictly past finality, so the columnar layer is append-only and immutable. If a
 change requires mutating sealed segments, the design is wrong - go back.
 
@@ -148,11 +162,15 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
 
 - Hosted service, billing, metering, **hosted-SaaS multi-tenancy** (per-tenant authz/quotas,
   isolation between mutually-untrusting paying customers - that's the become-a-data-service-
-  company path, and the gateway's job regardless). Note: *multi-nest co-tenancy* (a roost) and
-  *distributed **self-hosted** scaled mode* (one operator's writer pool + query-FE tier +
-  control-plane over cooperating nests, RFC-0022) are both **in scope** - see Architecture. The
-  line is per-tenant billing/authz between untrusting **paying** customers: that stays out and
-  is the gateway's job.
+  company path, and the gateway's job regardless). Note: **multi-nest tenancy in the runtime**
+  (a tenant is an opaque ownership label plus refcounting - no identity, no authn, no quotas, no
+  metering) and *distributed **self-hosted** scaled mode* (one operator's writer pool + query-FE
+  tier + control-plane, RFC-0022) are both **in scope** - see Architecture. **The line is what
+  nuthatch does about tenants, not who they are** (amended 2026-08-04): it sees a string, refcounts
+  it, and knows nothing else, so an operator's tenants may well be paying customers and nuthatch
+  has no concept of it. Per-tenant billing and authz stay out and are the gateway's job. The
+  earlier wording drew the line at "cooperating tenants an operator picked - not paying strangers",
+  which asked a question nobody could answer from the code.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight.
