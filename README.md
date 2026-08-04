@@ -165,6 +165,12 @@ no redeploy, one rule.
 | RPC requests | **16** |
 | peak RSS | **247 MB** |
 
+For scale, OBIB's own published figures for case 6 differ between its two tables: the January 2026
+results table gives Envio HyperIndex **1.92 min**, Subsquid 5.34 min and Sentio 14.36 min, while the
+case-6 page reports Envio at **30 s** from an earlier round. We are quoting both rather than the
+flattering one; on the second, Envio is faster than us. Note too that Envio and Subsquid serve this
+from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
+
 Both against a real provider (Alchemy), on an 11-core laptop. The artifacts are
 [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json) and
 [`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs either.
