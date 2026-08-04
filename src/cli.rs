@@ -78,10 +78,26 @@ pub enum Command {
     /// Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-0023 tier 2). Called
     /// once (they never change) and remembered in `metadata.json`; the constants tier 1 can't derive.
     Metadata(MetadataArgs),
+    /// Move a roost to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/` (RFC-0032).
+    ///
+    /// Data is moved, never re-indexed. Idempotent, and safe to run on a roost that is already
+    /// partly migrated. Use `--dry-run` first: it prints the entire plan and changes nothing.
+    Migrate(MigrateArgs),
     /// Regenerate the builder skill's machine-generated references from clap metadata (RFC-0017).
     /// Hidden: a dev/authoring tool, not part of the user-facing two-command story.
     #[command(hide = true)]
     SkillRefs,
+}
+
+#[derive(Args)]
+pub struct MigrateArgs {
+    /// Roost directory (must contain a roost.toml).
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Print the plan - every nest, its identity, and where it would land - without changing
+    /// anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]

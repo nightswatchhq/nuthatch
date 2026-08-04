@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run),
         cli::Command::Roost(args) => match args.what {
             cli::RoostWhat::Dev(a) => {
                 roost::dev(

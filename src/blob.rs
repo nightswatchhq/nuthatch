@@ -66,7 +66,41 @@ impl Manifest {
     pub fn blob_hash(&self) -> String {
         hex::encode(Sha256::digest(self.canonical_bytes()))
     }
+
+    /// The **nest identity (NID)** - the key a dataset is stored under (RFC-0032 §3).
+    ///
+    /// Deliberately *not* [`blob_hash`](Self::blob_hash). The blob hash pins the bundle **a
+    /// particular binary produced**, and it includes `generator_version`, which changes on every
+    /// nuthatch release. That is right for a bundle and fatal for a storage key: upgrading the
+    /// binary would hand every nest a new identity, orphan every dataset, and re-index the lot -
+    /// precisely the cost RFC-0032 exists to avoid, and a contradiction of the drop-in upgrade
+    /// property we have already proven in production.
+    ///
+    /// So the NID hashes the manifest with `generator_version` neutralised, and **nothing is lost**:
+    /// the *behavioural* part of the generator is already pinned by `registry_hash`, which `load`
+    /// regenerates from the inputs and asserts (see [`verify_registry_reproduces`]). A new binary
+    /// that decodes differently moves the registry hash and therefore the NID - which is correct. A
+    /// new binary that decodes identically leaves the nest the same nest, and it keeps its data.
+    ///
+    /// Domain-separated from the blob hash so the two can never be confused by a caller that has one
+    /// hex string and no context.
+    pub fn nid(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.generator_version = NID_GENERATOR_SENTINEL.to_string();
+        let mut h = Sha256::new();
+        h.update(NID_DOMAIN);
+        h.update(canonical.canonical_bytes());
+        hex::encode(h.finalize())
+    }
 }
+
+/// Domain separator for [`Manifest::nid`]. Two hashes over near-identical bytes must never collide
+/// into meaning the same thing, and a bare `sha256` of a manifest already means "blob hash".
+const NID_DOMAIN: &[u8] = b"nuthatch-nid-v1\0";
+
+/// What `generator_version` is replaced with before hashing a NID. A fixed sentinel rather than an
+/// empty string, so the field's *absence* from the identity is explicit in the hashed bytes.
+const NID_GENERATOR_SENTINEL: &str = "<not-part-of-identity>";
 
 /// Recursively collect the authored input files under `root`, relative-pathed and sorted, skipping the
 /// [`EXCLUDE`] set (and `skip`, e.g. the output dir when it sits inside the nest). Deterministic order.
@@ -141,6 +175,17 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
         registry_hash,
         files,
     })
+}
+
+/// The NID of the nest at `dir`, computed from its authored inputs (RFC-0032 §3).
+///
+/// This is how an *unpacked* nest directory - the thing an operator actually has on disk - gets the
+/// identity its data is stored under. It regenerates the decode registry, so it costs what a mount
+/// costs and is not something to call in a loop.
+pub fn nest_nid(dir: &Path) -> Result<String> {
+    Ok(build_manifest(dir, None)
+        .with_context(|| format!("computing the nest identity of {}", dir.display()))?
+        .nid())
 }
 
 /// `nuthatch nest bundle <dir> [--out <path>] [--as-dir]`: bundle a nest into a single portable,
@@ -692,6 +737,68 @@ abi = "abis/c.json"
         // Files are sorted and exclude nothing authored (config + abi + llms.txt = 3).
         assert_eq!(m1.files.len(), 3);
         assert!(m1.files.windows(2).all(|w| w[0].path <= w[1].path));
+    }
+
+    /// RFC-0032 §3: the NID is a **storage key**, so it must survive a nuthatch upgrade. The blob
+    /// hash does not - it carries `generator_version` by design - and using it to key datasets would
+    /// orphan every dataset on every release. This test is the difference between the two.
+    #[test]
+    fn the_nid_survives_a_nuthatch_upgrade() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let mut old = build_manifest(a.path(), None).unwrap();
+        old.generator_version = "1.0.2".into();
+        let mut new = old.clone();
+        new.generator_version = "2.0.0".into();
+
+        // The blob hash is *supposed* to move: it pins which binary produced the bundle.
+        assert_ne!(
+            old.blob_hash(),
+            new.blob_hash(),
+            "the blob hash must still pin the producer"
+        );
+        // The identity must not. Same inputs, same decode, same nest, same data.
+        assert_eq!(
+            old.nid(),
+            new.nid(),
+            "upgrading nuthatch changed a nest's identity - every dataset would be orphaned and \
+             re-indexed on upgrade. `generator_version` must stay out of the NID; the generator's \
+             *behaviour* is already pinned by `registry_hash`."
+        );
+    }
+
+    /// The other half of the contract, and the one refcounting depends on: any authored edit yields
+    /// a different identity, so divergence forks its own dataset instead of contaminating a shared
+    /// one. A NID that ignored inputs would pass the test above and be catastrophic.
+    #[test]
+    fn any_authored_edit_changes_the_nid() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = nest_nid(a.path()).unwrap();
+
+        // A non-decode input: docs.
+        std::fs::write(a.path().join("llms.txt"), "different docs\n").unwrap();
+        let after_docs = nest_nid(a.path()).unwrap();
+        assert_ne!(
+            before, after_docs,
+            "editing an authored input must fork the identity"
+        );
+
+        // An input that changes *decode*, which also moves `registry_hash` inside the manifest.
+        std::fs::write(
+            a.path().join("abis/c.json"),
+            r#"[{"type":"event","name":"Approval","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true}]}]"#,
+        )
+        .unwrap();
+        let after_abi = nest_nid(a.path()).unwrap();
+        assert_ne!(
+            after_docs, after_abi,
+            "changing the ABI must fork the identity"
+        );
+
+        // And a NID is never a blob hash, even for the same nest - the domain separator sees to it.
+        let m = build_manifest(a.path(), None).unwrap();
+        assert_ne!(m.nid(), m.blob_hash());
     }
 
     #[test]

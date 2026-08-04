@@ -89,6 +89,8 @@ async fn two_nest_roost(
         ]),
         mount_ctx: roost::MountContext {
             dir: roost_dir.to_path_buf(),
+            // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
+            mounts: Vec::new(),
             sources: std::collections::HashMap::from([(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
