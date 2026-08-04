@@ -148,6 +148,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run),
+        cli::Command::Prune(a) => {
+            nuthatch::prune::run(std::path::Path::new(&a.dir), a.yes)
+        }
         cli::Command::Roost(args) => match args.what {
             cli::RoostWhat::Dev(a) => {
                 roost::dev(
