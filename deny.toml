@@ -22,6 +22,22 @@ ignore = [
   "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation
   # RUSTSEC-2026-0188 (wasmtime-wasi FilePerms bypass) is FIXED, not ignored: wasmtime 44 → 46 clears it
   # with no code change (the component-model API was stable across the bump). Ignore entry removed.
+  #
+  # rkyv 0.7.46 (transitive: dbsp → {rkyv, feldera-storage, ordered-float}). The advisory is an
+  # out-of-bounds read when *validating an untrusted archive*: `rkyv::access` / `from_bytes` could be
+  # handed a forged slice length. Reachability here is the question, and the answer is no:
+  #   - nuthatch never calls rkyv (`grep -rn rkyv src/` is empty); it arrives only under DBSP, which
+  #     uses it for its own batch/spine serialisation.
+  #   - Every rkyv archive in play is written by this process into its own nest directory. Forging one
+  #     means already having write access to the nest dir, at which point the archive is the least of
+  #     it - `nuthatch.toml` and the ABIs are right there.
+  #   - The genuinely untrusted inputs are RPC responses (JSON), nest bundles (config/ABIs/views plus a
+  #     hash-checked manifest) and `/sql` text. None of them is an rkyv archive, and a bundle's data
+  #     files are Parquet.
+  # Not fixable by upgrading: the fix is rkyv >= 0.8.17, the 0.7 series is unsupported upstream, and
+  # **dbsp still requires `rkyv ^0.7.45` as of 0.327.0** (checked 2026-08-04), so even the newest dbsp
+  # does not clear it. Tracked upstream; re-check on the next dbsp bump, same as the quick-xml pair.
+  "RUSTSEC-2026-0235", # rkyv: shared-pointer validation ignored pointer metadata
 ]
 
 [licenses]
