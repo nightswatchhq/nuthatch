@@ -265,9 +265,28 @@ under this RFC's name:
 ## 12. Risks
 
 **The migration is the dangerous part.** It moves an operator's indexed history between directory
-layouts. Mitigations: `migrate` is copy-then-verify-then-swap rather than move-in-place, it is
-idempotent, and it refuses on any NID that does not reproduce. A dry-run mode prints the full plan -
-every source path, destination NID and merge - and changes nothing.
+layouts. Mitigations: `migrate` is atomic per nest, it is idempotent, and it refuses on any NID that
+does not reproduce. A dry-run mode prints the full plan - every source path, destination NID and
+merge - and changes nothing.
+
+> **Amended after building it (slice 1).** This section originally specified copy-then-verify-then-
+> swap. The implementation renames instead, falling back to copy-verify-remove only across
+> filesystems - and source and destination are both under the roost root, so the fallback is
+> effectively unreachable. A rename is *atomic*: it cannot produce the half-written destination the
+> copy path exists to guard against, and it does not require double the disk of an indexed history.
+> The requirement was never the mechanism, it was "never lose data"; rename meets it better. Recorded
+> rather than silently substituted, because the RFC named a specific mechanism and a reader would
+> otherwise find the code disagreeing with it.
+
+**The NID could not be the blob hash, and slice 1 found out why.** §3 says the NID "is the content
+address `blob.rs` already computes". Not quite: `Manifest::blob_hash()` includes `generator_version`
+(`env!("CARGO_PKG_VERSION")`), which is correct for a *bundle* - it pins the producing binary - and
+fatal for a *storage key*, since every nuthatch release would then re-key every dataset and re-index
+the lot. `Manifest::nid()` therefore hashes the manifest with that field neutralised, under its own
+domain separator. Nothing is lost: the generator's *behaviour* is already pinned by `registry_hash`,
+which `load` regenerates from the inputs and asserts, so a binary that decodes differently still moves
+the identity. The claim in §3 is otherwise unchanged - the hash is over the same canonical manifest of
+the same authored inputs.
 
 **A shared dataset makes one tenant's mistake visible to another.** Not a data-integrity risk (the NID
 guarantees the inputs are identical), but a resource one: a heavy query is felt across a shared
