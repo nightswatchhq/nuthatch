@@ -174,6 +174,9 @@ from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
 Both against a real provider (Alchemy), on an 11-core laptop. The artifacts are
 [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json) and
 [`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs either.
+The case-6 nest is published at [`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6)
+so the run can be reproduced rather than believed, and is submitted upstream as
+[sentioxyz/open-blockchain-indexer-benchmark#3](https://github.com/sentioxyz/open-blockchain-indexer-benchmark/pull/3).
 
 **Wall clock on a shared endpoint is the provider's number as much as ours.** The same case-6 range on
 the same commit measured anywhere from 17 s to 57 s depending on when it ran. We checked whether the
