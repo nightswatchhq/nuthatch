@@ -1,6 +1,6 @@
-//! Roost-vs-solo parity (RFC-0012's open acceptance item): over the SAME tape + range, two nests run
+//! MountTable-vs-solo parity (RFC-0012's open acceptance item): over the SAME tape + range, two nests run
 //! solo (`spawn_nest` each) must produce per-nest sealed segments byte-identical to the same two nests
-//! run under one shared cursor (`spawn_roost`), and identical query output. The shared cursor over-
+//! run under one shared cursor (`spawn_runtime`), and identical query output. The shared cursor over-
 //! fetches the union and demuxes by address - this proves that demux is exact.
 
 mod common;
@@ -14,7 +14,7 @@ use nuthatch::{analytics, indexer, seal};
 use common::tape::*;
 
 /// A block carrying one USDC transfer (log 0) and one ARB transfer (log 1) - so both nests have rows
-/// in every block and the roost's union-fetch-then-demux is genuinely exercised.
+/// in every block and the runtime's union-fetch-then-demux is genuinely exercised.
 fn dual_block(b: u64) -> BlockFixture {
     let hash = block_hash(b, 0);
     let a1 = account(1);
@@ -125,14 +125,14 @@ async fn roost_is_byte_identical_to_solo() {
     )
     .await;
 
-    // --- Roost: the same two nests behind one shared cursor over an identical tape. ---
+    // --- MountTable: the same two nests behind one shared cursor over an identical tape. ---
     let roost_tape = build_parity_tape();
     let roost_u = tempfile::tempdir().unwrap();
     let roost_a = tempfile::tempdir().unwrap();
     let rcfg_u = scaffold_nest(roost_u.path(), "usdc", USDC);
     let rcfg_a = scaffold_nest(roost_a.path(), "arb", ARB);
 
-    let cursor = indexer::spawn_roost(
+    let cursor = indexer::spawn_runtime(
         roost_tape.clone(),
         vec![
             ("usdc".to_string(), roost_u.path().to_path_buf(), rcfg_u),
@@ -144,13 +144,13 @@ async fn roost_is_byte_identical_to_solo() {
         Some(2),
         false,
         None,
-        std::sync::Arc::new(nuthatch::health::RoostHealth::new()),
+        std::sync::Arc::new(nuthatch::health::RuntimeHealth::new()),
         // Fail-fast off: this parity run must exercise the same quarantine-capable path an operator
         // gets by default (RFC-0026), not a fail-stop variant of it.
         false,
     )
     .await
-    .expect("spawn_roost");
+    .expect("spawn_runtime");
     let (states, roost_ingest, roost_workers) =
         (cursor.states, cursor.ingest, cursor.alert_workers);
 
@@ -159,11 +159,11 @@ async fn roost_is_byte_identical_to_solo() {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.store.clone())
-            .expect("nest present in roost")
+            .expect("nest present in mounts")
     };
     drive_to_seal(&roost_tape, &[store_of("usdc"), store_of("arb")]).await;
 
-    // --- Parity: per-nest sealed content-hashes byte-identical solo-vs-roost. ---
+    // --- Parity: per-nest sealed content-hashes byte-identical solo-vs-mounts. ---
     for name in ["usdc", "arb"] {
         let solo_dir = if name == "usdc" {
             solo_u.path()
@@ -181,13 +181,13 @@ async fn roost_is_byte_identical_to_solo() {
         assert!(!solo_h.is_empty(), "{name}: solo produced no segments");
         assert_eq!(
             solo_h, roost_h,
-            "{name}: sealed content-hashes must be byte-identical solo-vs-roost"
+            "{name}: sealed content-hashes must be byte-identical solo-vs-mounts"
         );
 
         assert_eq!(
             cold_rows(solo_dir, name),
             cold_rows(roost_dir, name),
-            "{name}: cold query output must be identical solo-vs-roost"
+            "{name}: cold query output must be identical solo-vs-mounts"
         );
     }
 

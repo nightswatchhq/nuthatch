@@ -1,11 +1,11 @@
-//! **Migrating a roost must not change a byte of what it serves** (RFC-0032 slice 1).
+//! **Migrating a runtime must not change a byte of what it serves** (RFC-0032 slice 1).
 //!
 //! The migration moves indexed history from the name-keyed layout (`nests/<name>/`) to
 //! identity-keyed datasets (`data/<nid>/`). The whole design rests on that being a *move*: if it
 //! ever re-derives anything, the migration is wrong, and the cheapest way for that to go wrong
 //! silently is for it to look like it worked.
 //!
-//! So this indexes a real roost to a sealed state, migrates it, and asserts the sealed segment
+//! So this indexes a real mounts to a sealed state, migrates it, and asserts the sealed segment
 //! content-hashes and the cold query output are identical either side - then that the runtime
 //! resolves the nests at their new home through the mount records.
 //!
@@ -17,7 +17,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Roost, DATA_DIR, MOUNTS_FILE, NESTS_DIR};
+use nuthatch::runtime::{MountTable, DATA_DIR, MOUNTS_FILE, NESTS_DIR};
 use nuthatch::store::HotStore;
 use nuthatch::{analytics, indexer, migrate, seal};
 
@@ -62,7 +62,7 @@ async fn migrating_preserves_every_sealed_byte() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
 
-    // A roost in the pre-2.0 layout: two nests on one chain, each under `nests/<name>/`.
+    // A mounts in the pre-2.0 layout: two nests on one chain, each under `nests/<name>/`.
     std::fs::write(
         root.join(MOUNTS_FILE),
         "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
@@ -83,7 +83,7 @@ async fn migrating_preserves_every_sealed_byte() {
     }
     tape.advance_tip_to(8);
 
-    let cursor = indexer::spawn_roost(
+    let cursor = indexer::spawn_runtime(
         tape.clone(),
         vec![
             ("usdc".to_string(), usdc_dir.clone(), cfg_u),
@@ -95,11 +95,11 @@ async fn migrating_preserves_every_sealed_byte() {
         Some(2),
         false,
         None,
-        Arc::new(nuthatch::health::RoostHealth::new()),
+        Arc::new(nuthatch::health::RuntimeHealth::new()),
         false,
     )
     .await
-    .expect("spawn_roost");
+    .expect("spawn_runtime");
 
     let store_of = |name: &str| -> Arc<dyn HotStore> {
         cursor
@@ -107,7 +107,7 @@ async fn migrating_preserves_every_sealed_byte() {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.store.clone())
-            .expect("nest present in roost")
+            .expect("nest present in mounts")
     };
     let stores = [store_of("usdc"), store_of("arb")];
 
@@ -128,7 +128,7 @@ async fn migrating_preserves_every_sealed_byte() {
     .await;
     assert!(sealed, "nests did not seal [1,6] in time");
 
-    // Record what the roost serves *before* anything moves.
+    // Record what the runtime serves *before* anything moves.
     let before: Vec<_> = [("usdc", &usdc_dir), ("arb", &arb_dir)]
         .iter()
         .map(|(name, dir)| (*name, seg_hashes(dir, name), cold_rows(dir, name)))
@@ -149,15 +149,15 @@ async fn migrating_preserves_every_sealed_byte() {
     // --- The migration. ---
     migrate::run(root, false, false).expect("migrate");
 
-    let roost = Roost::load(root).expect("the migrated roost.toml must still load");
+    let mounts = MountTable::load(root).expect("the migrated mounts.toml must still load");
     assert_eq!(
-        roost.mounts.len(),
+        mounts.mounts.len(),
         2,
         "both nests should have a mount record"
     );
 
     for (name, hashes_before, rows_before) in &before {
-        let now = roost.dir_for(root, name);
+        let now = mounts.dir_for(root, name);
         assert!(
             now.starts_with(root.join(DATA_DIR)),
             "{name} was not addressed by identity: {}",
@@ -184,5 +184,5 @@ async fn migrating_preserves_every_sealed_byte() {
     }
 
     // Two different nests keep two identities - the merge path must not have swallowed one.
-    assert_ne!(roost.mounts[0].nid, roost.mounts[1].nid);
+    assert_ne!(mounts.mounts[0].nid, mounts.mounts[1].nid);
 }

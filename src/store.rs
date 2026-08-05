@@ -548,7 +548,7 @@ impl Store {
     /// The unbounded version parses **every unsealed row into memory on every query**, which on a
     /// deep-finality chain with a busy contract is the largest RAM risk the process carries: the hot
     /// store holds everything between the sealed watermark and the tip, and a single `/sql` call can
-    /// therefore breach the per-cursor budget and, in a roost, take co-tenants down with it.
+    /// therefore breach the per-cursor budget and, in a runtime, take co-tenants down with it.
     ///
     /// It **fails** at the cap rather than truncating. Serving a partial tip would silently change the
     /// answer to an aggregate - a `count(*)` quietly missing rows is far worse than a query that

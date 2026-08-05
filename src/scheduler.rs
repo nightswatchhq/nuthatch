@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::roost::{DEFAULT_MAX_RSS_MB, ROOST_BASE_RSS_MB};
+use crate::runtime::{DEFAULT_MAX_RSS_MB, RUNTIME_BASE_RSS_MB};
 
 /// A nest the operator wants running, as recorded in the control plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub struct DesiredNest {
     pub name: String,
     /// The chain decides which cursor it lands on - nests sharing a chain share a cursor.
     pub chain: String,
-    /// Projected resident footprint, from the same estimator the roost already uses at mount time.
+    /// Projected resident footprint, from the same estimator the runtime already uses at mount time.
     pub estimated_rss_mb: u64,
 }
 
@@ -57,8 +57,8 @@ impl Worker {
 pub struct Cursor {
     pub chain: String,
     pub nests: Vec<String>,
-    /// Projected footprint of the whole cursor - the roost base plus each nest's estimate, matching
-    /// how `roost::estimate` already reasons. Co-tenancy is RAM-bounded, not free.
+    /// Projected footprint of the whole cursor - the runtime base plus each nest's estimate, matching
+    /// how `runtime::estimate` already reasons. Co-tenancy is RAM-bounded, not free.
     pub rss_mb: u64,
 }
 
@@ -133,9 +133,9 @@ pub fn cursors_of(desired: &[DesiredNest]) -> Vec<Cursor> {
             Cursor {
                 chain: chain.to_string(),
                 nests: nests.iter().map(|n| n.name.clone()).collect(),
-                // The roost base is paid once per cursor, not once per nest - which is exactly why
+                // The mounts base is paid once per cursor, not once per nest - which is exactly why
                 // co-locating nests of one chain is cheaper than spreading them.
-                rss_mb: ROOST_BASE_RSS_MB + nests.iter().map(|n| n.estimated_rss_mb).sum::<u64>(),
+                rss_mb: RUNTIME_BASE_RSS_MB + nests.iter().map(|n| n.estimated_rss_mb).sum::<u64>(),
             }
         })
         .collect()
@@ -266,8 +266,8 @@ mod tests {
         assert_eq!(cursors.len(), 2, "two chains, two cursors");
         assert_eq!(cursors[0].chain, "arbitrum-one");
         assert_eq!(cursors[1].nests, vec!["usdc", "weth"]);
-        // The roost base is paid once per cursor, not per nest.
-        assert_eq!(cursors[1].rss_mb, ROOST_BASE_RSS_MB + 180);
+        // The mounts base is paid once per cursor, not per nest.
+        assert_eq!(cursors[1].rss_mb, RUNTIME_BASE_RSS_MB + 180);
 
         let p = plan(&[Worker::new("w1"), Worker::new("w2")], &desired, &[]);
         let mainnet: Vec<&Assignment> = p.assign.iter().filter(|a| a.chain == "mainnet").collect();
@@ -309,7 +309,7 @@ mod tests {
     /// to prevent, and a scheduler that ignores it is a more elaborate way to breach it.
     #[test]
     fn a_worker_is_never_committed_past_its_budget() {
-        let big = ROOST_BASE_RSS_MB + 900;
+        let big = RUNTIME_BASE_RSS_MB + 900;
         let desired = [
             nest("a", "c1", 900),
             nest("b", "c2", 900),
@@ -351,7 +351,7 @@ mod tests {
         let desired = [nest("a", "c1", 900), nest("b", "c2", 900)];
         let workers = [Worker {
             id: "w1".into(),
-            budget_mb: ROOST_BASE_RSS_MB + 900,
+            budget_mb: RUNTIME_BASE_RSS_MB + 900,
         }];
         let p = plan(&workers, &desired, &[]);
         assert_eq!(p.assign.len(), 1);
@@ -398,10 +398,10 @@ mod tests {
     fn large_cursors_are_placed_before_small_ones() {
         // `rss_mb` is ROOST_BASE + the nest estimate, so subtract the base to hit round cursor sizes.
         let desired = [
-            nest("a", "c700", 700 - ROOST_BASE_RSS_MB),
-            nest("b", "c600", 600 - ROOST_BASE_RSS_MB),
-            nest("c", "c400", 400 - ROOST_BASE_RSS_MB),
-            nest("d", "c300", 300 - ROOST_BASE_RSS_MB),
+            nest("a", "c700", 700 - RUNTIME_BASE_RSS_MB),
+            nest("b", "c600", 600 - RUNTIME_BASE_RSS_MB),
+            nest("c", "c400", 400 - RUNTIME_BASE_RSS_MB),
+            nest("d", "c300", 300 - RUNTIME_BASE_RSS_MB),
         ];
         let workers = [
             Worker {

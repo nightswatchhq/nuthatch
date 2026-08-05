@@ -12,7 +12,7 @@
 
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, indexer, labels,
-    lifecycle, lists, mcp, pack, project, roost, screen, store, transform,
+    lifecycle, lists, mcp, pack, project, runtime, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
@@ -34,13 +34,13 @@ async fn main() -> Result<()> {
         // **One command for 1..N nests** (RFC-0032). The runtime hosts a single nest or many; which
         // one you get is a property of the directory, not a decision an operator has to make before
         // they know which they want. A `mounts.toml` means a multi-nest runtime, a `nuthatch.toml`
-        // means one nest, and the pre-2.0 `roost dev` split is gone.
+        // means one nest, and the pre-2.0 `mounts dev` split is gone.
         cli::Command::Dev(args) => {
             let dir = std::path::PathBuf::from(&args.dir);
-            if dir.join(nuthatch::roost::MOUNTS_FILE).exists()
-                || dir.join(nuthatch::roost::LEGACY_ROOST_FILE).exists()
+            if dir.join(nuthatch::runtime::MOUNTS_FILE).exists()
+                || dir.join(nuthatch::runtime::LEGACY_ROOST_FILE).exists()
             {
-                roost::dev(
+                runtime::dev(
                     dir,
                     args.listen,
                     args.rpc,
