@@ -163,6 +163,47 @@ alias's `estimated_rss_mb` is `0` because the footprint was charged once to the 
 Sharing is by *identity*, so it survives nothing and forks on anything: edit either nest's inputs and
 the NID changes, the mounts stop matching, and the edited one gets its own dataset automatically.
 
+### `sql` and `[[mounts.queries]]` - bounding a public endpoint (RFC-0034)
+
+`/sql` accepts arbitrary SQL. That is the product locally and a liability publicly: the node guards
+(concurrency 2, 30 s, 50,000 rows, 2,000,000 hot rows, 16 KB of query text) bound one query and say
+nothing about *which* queries a nest will answer.
+
+```toml
+[[mounts]]
+alias = "usdc"
+nid = "9f2c…"
+sql = "allowlist"               # "open" (default) | "deny" | "allowlist"
+
+[[mounts.queries]]
+name = "top_holders"
+sql = "SELECT addr, net FROM balances WHERE addr = {who} LIMIT {n}"
+params = { who = "address", n = "int" }
+```
+
+| `sql` | Behaviour |
+|---|---|
+| `open` (default) | Arbitrary `/sql` and `/explain`, guards only. Unchanged from every prior release. |
+| `deny` | `/sql` and `/explain` return `403`. The typed routes (`/tables`, `/entity/{id}`, `/balances`, …) still serve. |
+| `allowlist` | Only the declared queries answer, via `GET /q/{name}`. Free-form returns `403` naming the allowed set. |
+
+**The caller sends a name and arguments, never SQL.** Parameter types are `int` and `address` only -
+both have a total validating parse into a form with no escaping hazard. `text` is deliberately absent:
+free text needs escaping, and "we escaped it carefully" is how that class of bug ships.
+
+`GET /queries` lists the surface with each query's parameters, and works on a bounded nest without
+being refused - so a caller can discover what to ask before being told no.
+
+Two configuration mistakes are **refused at load** rather than serving something surprising: declaring
+queries while leaving `sql = "open"` (the control would silently not apply), and `sql = "allowlist"`
+with no queries (the nest would answer nothing).
+
+A declared query is still subject to every node guard. Being on the allowlist means the operator is
+willing to answer it, not that it is cheap.
+
+**This is mount config, not manifest**, so changing it leaves the NID untouched and re-indexes
+nothing - and two tenants sharing one dataset can expose different surfaces over it.
+
 ### Tenants (RFC-0032)
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No

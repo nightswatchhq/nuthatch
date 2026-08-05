@@ -150,6 +150,8 @@ fn remount(root: &Path, nid: &str) {
         tenant: "default".into(),
         alias: "usdc".into(),
         nid: nid.to_string(),
+        sql: Default::default(),
+        queries: Vec::new(),
     }];
     std::fs::write(
         root.join(ROOST_FILE),

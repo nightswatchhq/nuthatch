@@ -1605,6 +1605,9 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(registry.schema()),
         sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::SQL_MAX_CONCURRENCY)),
+        // Open by default; `roost::dev` overlays the mount's surface after the nest is built
+        // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
+        surface: Arc::new(crate::allowlist::Surface::default()),
         // Set by `spawn_roost` for a co-tenanted nest; a solo `dev` nest has no roost health surface.
         roost_health: None,
         admin_enabled,
