@@ -146,14 +146,14 @@ One static binary. No Postgres, no Docker daemon, no IPFS, no sidecar. State is 
 | Topology | Command | Shape |
 |---|---|---|
 | **Nest** (one indexer) | `nuthatch dev --dir <nest>` | one chain, one cursor, one API at `/` |
-| **Roost** (many nests) | `nuthatch roost dev --dir <roost>` | N nests across one **or more** chains, one isolated cursor per chain, each nest's full API under `/<name>/` |
+| **Many nests** | `nuthatch dev --dir <dir>` (with a `mounts.toml`) | N nests across one **or more** chains, one isolated cursor per chain, each mount's full API under `/<alias>/` |
 
 A **cursor** is the unit that matters. It is always single-chain, single-writer, and one observable
-failure boundary. A roost hosting nests on Ethereum and Arbitrum runs two cursors in one process, each
+failure boundary. A runtime hosting nests on Ethereum and Arbitrum runs two cursors in one process, each
 with its own tip, finality view, reorg handling, and RSS budget. Two chains are never multiplexed
 behind one cursor; the runtime refuses to.
 
-Multichain is a **capability, not a mandate** - one chain per roost stays valid and is the simplest
+Multichain is a **capability, not a mandate** - one chain per runtime stays valid and is the simplest
 default.
 
 ### Scaled mode: a fleet across machines (RFC-0022)
@@ -164,7 +164,7 @@ different problem - one operator running many nests across many machines - and i
 build time** (`--features postgres-store`). The published binary does not carry a database driver.
 
 Reach for it when a single box can no longer hold your cursors inside its RAM budget, or when serving
-load and ingestion load want to scale independently. Not before: a roost on one machine is simpler,
+load and ingestion load want to scale independently. Not before: several nests on one machine is simpler,
 and simplicity is the point of the embedded path.
 
 | Role | Command | Owns |
@@ -251,24 +251,27 @@ mutually-untrusting paying customers. That is a gateway's job in front of nuthat
 out of scope - see RFC-0022 §6.
 
 ```
-roost/
-  roost.toml              # desired state: chains + mounted nest names + budget
-  nests/
-    lodestar/             # a nest dir exactly as `nuthatch init` produces
+runtime-dir/
+  mounts.toml             # runtime state: chains + mount records (tenant, alias, nid) + budget
+  segments/               # SHARED sealed Parquet, content-addressed - two nests that decode the
+                          #   same contract hold ONE copy here, not two (RFC-0033 §11a)
+  data/
+    <nid>/                # a dataset, keyed by NEST IDENTITY rather than by a name you chose
       nuthatch.toml       # contracts, events, factories, webhooks, alerts
       semantic.toml       # what the data means (drives MCP + SQL hints)
+      queries.toml        # optional: the author's sanctioned query surface (RFC-0034)
       schema.json         # generated: registry hash + table list
       abis/               # vendored ABIs (no runtime resolution)
       views/              # authored SQL views
       checks/             # invariant/parity checks for `nuthatch check`
       nuthatch.redb       # hot store (mutable, reorg-affected)
-      segments/           # sealed Parquet, content-addressed, immutable
-      manifest.json       # segment catalogue + sealed watermark
+      segments/
+        manifest.json     # this dataset's segment catalogue + sealed watermark
 ```
 
 The nest directory is the *entire* state. Move it, copy it, snapshot it.
 
-**Serving in a roost.** `GET /nests` is the roster. Every nest's full API lives under its prefix:
+**Serving several nests.** `GET /nests` is the roster. Every nest's full API lives under its prefix:
 `/<name>/tables`, `/<name>/sql`, `/<name>/_admin/`. `/sql` stays per-nest scoped - a query sees one
 nest's data. Stores are per-nest; only the cursor is shared. Static and factory nests co-exist, may
 mount at different heights, and each backfills its own history; the cursor only couples them at tip.
@@ -287,8 +290,8 @@ Nests live in their own repositories rather than in-tree; see the
 
 ## Capacity and sizing
 
-**The budget is per active-chain cursor: 2 GB RAM.** A roost's total is the sum of its cursors. This
-is a CI-enforced ceiling, not an aspiration, and `roost dev` **refuses to start** a cursor whose
+**The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. This
+is a CI-enforced ceiling, not an aspiration, and `dev` **refuses to start** a cursor whose
 projected footprint exceeds `max_rss_mb` (default 2048).
 
 The projection model (deliberately rough):
@@ -300,7 +303,7 @@ The projection model (deliberately rough):
 | each additional IVM view (exposure, velocity) or factory child registry | 40 |
 
 **Measured reality is far below the projection.** A single-chain ERC-20 nest at tip measures ~37 MB
-resident; a two-nest roost measures ~110 MB against a ~300 MB projection. Provision against the
+resident; a two-nest runtime measures ~110 MB against a ~300 MB projection. Provision against the
 measurement (`nuthatch_rss_bytes`, also reported as `rss_bytes` on `GET /nests`) and treat the
 projection as a guard rail rather than a sizing tool.
 
@@ -323,7 +326,7 @@ events, not chain history: a nest tracking a few events on a few contracts stays
 
 ## Configuration surface
 
-**Files:** `roost.toml` (chains, mounted nests, budget), `nuthatch.toml` per nest (contracts, events,
+**Files:** `mounts.toml` (chains, mounted nests, budget), `nuthatch.toml` per nest (contracts, events,
 factories, screening, flags, webhooks, alerts), `semantic.toml` per nest (descriptions for the AI and
 SQL surfaces). Full key reference:
 [`config-reference.md`](../skills/nuthatch-builder/config-reference.md).
@@ -334,12 +337,12 @@ SQL surfaces). Full key reference:
 |---|---|
 | `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
 
-**Runtime flags that matter operationally** (`dev` and `roost dev`):
+**Runtime flags that matter operationally** (`dev` and `dev`):
 
 | Flag | Use |
 |---|---|
 | `--listen` | bind address. Defaults to `127.0.0.1:8288` |
-| `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain roosts only (ambiguous once a roost spans chains) |
+| `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Much faster from deployment |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
 | `--window` | override the `eth_getLogs` block window. A *sparse* contract wants a large window (50k) to turn thousands of near-empty requests into a few. Keep under your provider's range cap |
@@ -399,7 +402,7 @@ World Chain (`480`) and Base Sepolia (`84532`) this way. The split is worth know
 
 | Command | Unlisted chain? |
 |---|---|
-| `dev`, `sql`, `bench`, `roost dev` | **yes** - chain-agnostic, falls back to defaults |
+| `dev`, `sql`, `bench`, `dev` | **yes** - chain-agnostic, falls back to defaults |
 | `init`, `add` | **no** - they refuse an unrecognised `--chain`/config chain with "unknown chain … cannot resolve ABIs" |
 
 So the working recipe is: scaffold nothing, write `nuthatch.toml` yourself, vendor the ABI, and run.
@@ -421,7 +424,7 @@ events = ["Swapped"]         # optional allowlist
 ```
 
 Then `nuthatch dev --dir .` as usual. Everything downstream - decode, sealing, `/sql`, views, MCP,
-roosts, bundles - is chain-agnostic and behaves exactly as it does on a built-in chain.
+runtimes, bundles - is chain-agnostic and behaves exactly as it does on a built-in chain.
 
 **Two caveats that are easy to miss:**
 
@@ -443,7 +446,7 @@ built-in registry, which is where the tuned window and finality policy come from
 
 ## The service surface
 
-Per-nest routes. In a roost they are prefixed: `/<name>/sql`, `/<name>/tables`, and so on.
+Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`, and so on.
 
 | Route | Purpose |
 |---|---|
@@ -462,7 +465,7 @@ Per-nest routes. In a roost they are prefixed: `/<name>/sql`, `/<name>/tables`, 
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events` | admin UI. Token-gated off-localhost; removable with `--no-admin` |
 
-**Roost root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (roost-wide),
+**Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`.
 
 ---
@@ -562,10 +565,10 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 Get this right in your supervisor and your load balancer:
 
 - **`/health`** is liveness. `200` while the process serves. Restart on failure.
-- **`/ready`** is readiness. Roost root: `200` only when **every** cursor and nest is indexing; `503`
+- **`/ready`** is readiness. Runtime root: `200` only when **every** cursor and nest is indexing; `503`
   with a body naming what is quarantined. Per-nest `/<name>/ready` answers only for that nest.
 
-Readiness is **advice to a supervisor, not a traffic gate**. A roost with one quarantined nest reports
+Readiness is **advice to a supervisor, not a traffic gate**. A runtime with one quarantined nest reports
 `503` at the root while its healthy nests keep serving correct data on their own prefixes. Wire root
 readiness to a load balancer and one sick tenant evicts every healthy tenant from rotation. **Route on
 per-nest `/<name>/ready`; page on the root.**
@@ -688,8 +691,10 @@ local-first. (Live S3 verification against a real bucket is still pending an ope
 **Upgrading a nest without the resync tax** (RFC-0020):
 
 ```sh
-nuthatch nest diff <old> <new>     # classify: compatible (additive only) or breaking
-nuthatch nest upgrade --dir <old> --to <new> --listen …
+# 2.0: there is no upgrade command to remember. Stage the new version and migrate; the runtime
+# classifies the change itself and refuses a breaking one until you accept it.
+nuthatch migrate --dir <runtime> --dry-run    # prints the plan, including any BREAKING changes by name
+nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking to accept one
 ```
 
 - **Compatible** (internal changes, or purely additive schema): the new version indexes alongside the
@@ -701,10 +706,9 @@ nuthatch nest upgrade --dir <old> --to <new> --listen …
   its successor; the new is served under `--new-endpoint` (default `/next`). Consumers migrate on
   their own clock.
 
-**Adding or removing a nest in a running roost currently requires a restart**, which stops every
-co-tenant nest in that runtime. This is the largest operational gap for a team onboarding nests on
-behalf of others, and it is designed in [RFC-0027](rfcs/0027-the-live-roost.md). Until it lands, plan
-nest onboarding as a maintenance window, or give each tenant its own process.
+**Adding or removing a nest no longer requires a restart** (RFC-0027). Mount and unmount are live, so
+onboarding one tenant's nest no longer stops every co-tenant's. This used to be the largest operational
+gap for a team running nests on behalf of others.
 
 **Compliance operations** (RFC-0008), if you serve regulated customers:
 
@@ -758,7 +762,7 @@ line: a minor is `1.1`, `1.2`, and so on; breaking changes wait for `2.0`.
 
 | Surface | A minor release may | Reserved for a major |
 |---|---|---|
-| `nuthatch.toml` / `roost.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
+| `nuthatch.toml` / `mounts.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
 | nest `schema_version` | bump it when the upgrade is in-place and automatic | a bump that requires a re-index |
 | On-disk layout (redb tables, segment layout, `manifest.json`, `schema.json`) | change it when the upgrade is in-place and automatic | a layout needing a reseal or re-index |
 | HTTP routes and response shapes | add a route; add a field | remove a route, remove a field, or change a field's type or units |
@@ -878,15 +882,15 @@ Before pointing real traffic at a nuthatch deployment:
 - [ ] Running as an unprivileged user; nest directory `0700`; `MemoryMax` set to the cursor budget.
 - [ ] Prometheus scraping `/metrics`; alerts wired for quarantine, cursor death, tip lag, ingest
       stall and memory.
-- [ ] Load balancer routes on **per-nest** `/<name>/ready`; paging on roost-root `/ready`.
+- [ ] Load balancer routes on **per-nest** `/<name>/ready`; paging on the runtime-root `/ready`.
 - [ ] `nuthatch bench backfill` and `nuthatch bench query` run on your hardware and RPC; sizing
       derived from the measurements, not the projection.
 - [ ] Every `rpc_urls` pool has at least two endpoints on the correct chain (verified at startup).
 - [ ] Backup covering the nest directory, tested by restoring into a clean box.
 - [ ] `nuthatch check` passing for each nest, with parity fixtures committed.
 - [ ] A restart drill performed: SIGTERM, restart, confirm no gaps or duplicates.
-- [ ] A nest upgrade rehearsed with `nest diff` and `nest upgrade` on a non-production copy.
-- [ ] Nest onboarding process agreed. *(Adding a nest no longer restarts the roost - `POST
+- [ ] A nest upgrade rehearsed with `nuthatch migrate --dry-run` on a non-production copy.
+- [ ] Nest onboarding process agreed. *(Adding a nest no longer restarts the runtime - `POST
       /_admin/nests` mounts one live, since 0.7.0. This line said otherwise for two releases.)*
 - [ ] **The acceptance runbook walked**, at the levels matching your deployment - see
       [`verification.md`](verification.md). It is falsifiable step by step, which this checklist is
