@@ -550,6 +550,29 @@ fn union_filter<'a>(
     (addrs, topics)
 }
 
+/// Which nests are answerable for a union fetch that exceeded the provider's result cap on a single
+/// block (COR-5).
+///
+/// A union fetch has no owner, which is why the cap failure used to end the whole cursor: there was
+/// nobody to quarantine, so RFC-0026's "one nest cannot kill its siblings" did not apply. But the
+/// blame is one-directional. [`union_filter`] drops the address filter *only* when a live nest is a
+/// factory nest, and an unfiltered fetch returns strictly more than a filtered one - so a static
+/// nest's addresses cannot have caused a cap breach that a topic0-only union hit. The factory nests
+/// forced the wide filter, and they are the ones to fault.
+///
+/// Returns the empty set when no factory nest is live, which means the union carried real addresses
+/// and no nest can be singled out - the caller must then fail loudly, as before.
+///
+/// Kept beside [`union_filter`] deliberately: the two encode the same rule from opposite ends, and a
+/// change to one that is not mirrored in the other is caught by
+/// `a_topic0_only_union_always_has_someone_to_blame`.
+fn topic0_only_culprits<'a>(nests: impl Iterator<Item = (usize, &'a NestIngest)>) -> Vec<usize> {
+    nests
+        .filter(|(_, n)| n.factory.is_some())
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
 /// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
 /// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
@@ -1180,7 +1203,38 @@ async fn roost_index_loop(
             }
             Err(e) if chunker::is_result_too_large(&e) => {
                 if global_next >= to {
-                    return Err(e).with_context(|| single_block_over_cap(global_next));
+                    // COR-5. One block is over the provider's cap and there is no narrower range to
+                    // ask for, so this fetch cannot succeed as issued.
+                    //
+                    // It used to `return Err`, which ends `roost_index_loop` - and that task drives
+                    // *every* nest on the cursor, so one nest's topic0 stopped its co-tenants dead.
+                    // RFC-0026 exists to make exactly that impossible, and this path went around it
+                    // because a union fetch has no owner: the error is not attributable to a nest a
+                    // priori, so there was nobody to quarantine.
+                    //
+                    // It is attributable in one direction, though. `union_filter` drops the address
+                    // filter only when a live nest is a factory nest, so a topic0-only union is the
+                    // factory nests' doing and a static nest's addresses cannot have caused it. Fault
+                    // them, leave the static co-tenants indexing, and the cursor survives.
+                    let factories =
+                        topic0_only_culprits(live.iter().map(|&i| (i, live_ref(&nests, i))));
+                    if factories.is_empty() {
+                        // No factory nest, so the union carried real addresses and narrowing the
+                        // filter is not available either. Unchanged behaviour: fail loudly.
+                        return Err(e).with_context(|| single_block_over_cap(global_next));
+                    }
+                    for i in factories {
+                        // Terminal: re-admission would re-issue the identical fetch against the
+                        // identical block and fail identically, so a retryable fault would spin at
+                        // the backoff ceiling forever. This needs an operator (a provider with a
+                        // higher cap, or an `events` allowlist that narrows the topic0 set).
+                        let fault = anyhow::Error::new(TerminalFault(format!(
+                            "{}: {e:#}",
+                            single_block_over_cap(global_next)
+                        )));
+                        sup.quarantine(i, &fault)?;
+                    }
+                    continue;
                 }
                 chunker.too_large();
                 tracing::debug!("range {global_next}..={to} too large; shrinking and retrying");
@@ -4543,6 +4597,40 @@ template = "pool"
     }
 
     /// Build a minimal static ERC20 `NestIngest` on disk through the real `build_nest` path.
+    /// A nest with one `[[factories]]` rule, so `FactorySet::build` is non-empty and `build_nest`
+    /// marks it a factory nest - the state that forces the union topic0-only.
+    async fn build_factory_test_nest(dir: &std::path::Path) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"f\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+             abi = \"abis/fac.json\"\n\n\
+             [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\n\
+             template = \"child\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/fac.json"),
+            r#"[{"type":"event","name":"ChildCreated","inputs":[{"name":"child","type":"address","indexed":true}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/child.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, _worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .unwrap();
+        assert!(nest.factory.is_some(), "fixture must be a factory nest");
+        nest
+    }
+
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
@@ -4901,6 +4989,75 @@ template = "pool"
             prev = w;
         }
         assert_eq!(quarantine_backoff_secs(63), QUARANTINE_BACKOFF_MAX_SECS);
+    }
+
+    /// COR-5, the invariant that makes the fix safe: **whenever the union goes topic0-only, there is
+    /// at least one nest to blame for it.**
+    ///
+    /// The cap fallback quarantines [`topic0_only_culprits`] instead of ending the cursor. That is
+    /// only sound if the set is non-empty exactly when the address filter is empty - otherwise a cap
+    /// breach on an unowned fetch would be silently ignored and the loop would spin. The two
+    /// functions encode the same rule from opposite ends, so this pins them together: a change to
+    /// `union_filter`'s "any factory → clear addresses" that is not mirrored in the culprit rule
+    /// fails here rather than in production.
+    #[tokio::test]
+    async fn a_topic0_only_union_always_has_someone_to_blame() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+
+        // A static nest alone: the union keeps its addresses, and nobody is to blame for a cap
+        // breach - so the caller must still fail loudly, exactly as before this fix.
+        let (addrs, _) =
+            union_filter([(stat.addresses.as_slice(), stat.topic0s.as_slice())].into_iter());
+        assert!(
+            !addrs.is_empty(),
+            "a static-only union must carry addresses"
+        );
+        assert!(
+            topic0_only_culprits([(0usize, &stat)].into_iter()).is_empty(),
+            "no factory nest → nobody to fault → the loud error is preserved"
+        );
+
+        // Add a factory nest and the union goes wide. Now there is a culprit, and it is the factory
+        // nest - never the static one, whose addresses cannot have widened anything.
+        let (addrs, _) = union_filter(
+            [
+                (stat.addresses.as_slice(), stat.topic0s.as_slice()),
+                (fact.addresses.as_slice(), fact.topic0s.as_slice()),
+            ]
+            .into_iter(),
+        );
+        assert!(
+            addrs.is_empty(),
+            "a live factory nest must force the union topic0-only"
+        );
+        assert_eq!(
+            topic0_only_culprits([(0usize, &stat), (1usize, &fact)].into_iter()),
+            vec![1],
+            "the factory nest is answerable; the static co-tenant is not"
+        );
+    }
+
+    /// COR-5: the fault raised for an over-cap single block must be **terminal**.
+    ///
+    /// A retryable quarantine is re-admitted after a backoff, which re-issues the identical fetch
+    /// against the identical block and fails identically - a spin at the backoff ceiling that buries
+    /// the operator's real job (raise the provider cap, or narrow the topic0 set with an `events`
+    /// allowlist) under a repeating log.
+    #[test]
+    fn an_over_cap_block_is_a_terminal_fault() {
+        let e = anyhow::Error::new(TerminalFault(format!(
+            "{}: query returned more than 10000 results",
+            single_block_over_cap(19_000_000)
+        )));
+        assert!(is_terminal(&e), "must not be re-admitted on a backoff");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("block 19000000 alone exceeds"),
+            "the operator needs the block named: {msg}"
+        );
     }
 
     /// Issue #147, the headline scenario, on the real fan-out path: a reorg drops below one nest's
