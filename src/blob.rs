@@ -201,6 +201,11 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 /// it anyway), and anything under `abis/` (the decode itself).
 const NON_DATA_INPUTS: &[&str] = &[
     "views/",
+    // The author's query ceiling (RFC-0034 §3). An authored input, so it is in the NID - but it
+    // cannot change a stored byte, and if it moved the *data* identity then every security tweak
+    // would re-index the chain, which is precisely what phase 2 was sequenced behind early cutoff to
+    // avoid.
+    "queries.toml",
     "semantic.toml",
     "llms.txt",
     "README.md",
@@ -950,12 +955,49 @@ abi = "abis/c.json"
         );
     }
 
+    /// RFC-0034 §3 + §5, the sequencing that made phase 2 affordable: editing the **author's query
+    /// ceiling** must move the NID (it is an authored input) and **not** the data identity - or every
+    /// security tweak re-indexes the chain, which is the exact problem phase 2 was sequenced behind
+    /// early cutoff to avoid.
+    #[test]
+    fn editing_the_query_ceiling_does_not_force_a_re_index() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        std::fs::write(
+            a.path().join("queries.toml"),
+            "[[queries]]\nname = \"total\"\nsql = \"SELECT count(*) FROM t\"\n",
+        )
+        .unwrap();
+        let before = build_manifest(a.path(), None).unwrap();
+
+        // A security tweak: narrow what the nest sanctions.
+        std::fs::write(
+            a.path().join("queries.toml"),
+            "[[queries]]\nname = \"total\"\nsql = \"SELECT count(*) FROM t WHERE ok\"\n",
+        )
+        .unwrap();
+        let after = build_manifest(a.path(), None).unwrap();
+
+        assert_ne!(
+            before.nid(),
+            after.nid(),
+            "the ceiling is an authored input - the package really did change"
+        );
+        assert_eq!(
+            before.data_identity(),
+            after.data_identity(),
+            "a ceiling edit must not move the data identity, or tightening a nest's query surface \
+             costs a full re-index of the chain"
+        );
+    }
+
     /// The exclusion list is the one place a mistake costs correctness rather than speed, so its
     /// membership is pinned rather than left to a reader's memory.
     #[test]
     fn the_non_data_exclusion_list_is_exactly_what_it_claims() {
         for excluded in [
             "views/10-a.sql",
+            "queries.toml",
             "views/nested/deep.sql",
             "semantic.toml",
             "llms.txt",
