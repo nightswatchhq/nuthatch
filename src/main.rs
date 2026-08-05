@@ -12,7 +12,7 @@
 
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, indexer, labels,
-    lifecycle, lists, mcp, pack, project, runtime, screen, store, transform,
+    lists, mcp, pack, project, runtime, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
@@ -142,23 +142,6 @@ async fn main() -> Result<()> {
                     &a.registry,
                     std::path::Path::new(&a.bundle),
                     a.as_ref.as_deref(),
-                )
-                .await
-            }
-            cli::NestWhat::Diff(a) => {
-                lifecycle::diff_cli(std::path::Path::new(&a.old), std::path::Path::new(&a.new))
-            }
-            cli::NestWhat::Upgrade(a) => {
-                indexer::upgrade(
-                    std::path::PathBuf::from(&a.dir),
-                    std::path::PathBuf::from(&a.to),
-                    a.listen,
-                    a.new_endpoint,
-                    a.rpc,
-                    a.seal_direct,
-                    a.concurrency,
-                    a.window,
-                    a.no_admin,
                 )
                 .await
             }

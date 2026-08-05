@@ -196,13 +196,6 @@ Bundle a nest into one portable, content-addressed `.bundle` file - its authored
 - `--out <OUT>` - Output path for the `.bundle` (default: `<nest-name>-<hash>.bundle` beside the nest). With `--as-dir`, an unpacked bundle *directory* is written here instead of a single file
 - `--as-dir` - Write an unpacked bundle directory instead of a single `.bundle` file (handy for inspecting a bundle's contents)
 
-## `nuthatch nest diff`
-
-Classify an update between two nests as compatible or breaking (RFC-0020). Compatible = additive only (safe to hot-swap on the same endpoint); breaking = a consumer-observable change (needs a new endpoint). Each argument is a nest directory or a `schema.json` path
-
-- `<OLD>` - The old (current) version: a nest directory or a `schema.json` path
-- `<NEW>` - The new (proposed) version: a nest directory or a `schema.json` path
-
 ## `nuthatch nest load`
 
 Load a bundle: verify a `.bundle` (or a URL to one, or an unpacked bundle dir) and install it as a runnable nest. Checks the manifest format, every file's hash, and that the decode registry regenerated from the inputs matches the manifest - so a loaded nest decodes exactly as authored. With `--registry`, the positional is a `name[@version]` reference resolved against that store
@@ -219,20 +212,6 @@ Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `la
 - `<BUNDLE>` - The `.bundle` file to publish (from `nuthatch nest bundle`)
 - `--registry <REGISTRY>` - The registry to publish to (RFC-0019). A filesystem path, or `s3://bucket/prefix` with configured via the usual `AWS_*` env (S3/MinIO/R2)
 - `--as <AS_REF>` - Publish as `name` or `name@version`. Defaults: name = the bundle's nest name; version = `h<hash12>` (a content-addressed label - semantic versions are RFC-0020's concern)
-
-## `nuthatch nest upgrade`
-
-Hot-upgrade a running nest to a compatible new version with zero downtime (RFC-0020): serve the old version, index the new one concurrently, then atomically flip the endpoint once it catches up. A breaking update is refused (it needs a new endpoint). The served address never changes
-
-- `--dir <DIR>` - The running/current nest directory - the OLD version being upgraded from
-- `--to <TO>` - The NEW version to upgrade to: a prepared nest directory (e.g. from `nest load`)
-- `--listen <LISTEN>` - Address to serve on. For a compatible update the endpoint stays the same across the flip; for a breaking one the old version stays here (deprecated) and the new is served under `--new-endpoint`
-- `--new-endpoint <NEW_ENDPOINT>` - For a BREAKING update, the path prefix the new version is served under while the old stays at root (deprecated). Default `next` → served at `/next`. Ignored for a compatible update
-- `--rpc <RPC>` - Override `rpc_urls` at runtime (repeatable); tried ahead of the configured endpoints
-- `--seal-direct` - Backfill the new version's finalized history straight to Parquet before tip-following (RFC-0004)
-- `--concurrency <CONCURRENCY>` - Concurrent window fetches during the new version's seal-direct backfill
-- `--window <WINDOW>` - Override the `eth_getLogs` block-window for the new version's backfill
-- `--no-admin` - Disable the built-in admin UI entirely
 
 ## `nuthatch pack`
 

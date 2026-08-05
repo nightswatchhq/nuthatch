@@ -88,6 +88,10 @@ pub struct AppState {
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
     pub surface: Arc<crate::allowlist::Surface>,
+    /// The identity of the dataset serving this mount (RFC-0032 §3), stamped into `provenance` so an
+    /// answer can be cited against the data that produced it. `None` for a solo `dev` nest, which has
+    /// no mount record and therefore no identity to report.
+    pub nid: Option<Arc<str>>,
     /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
@@ -1067,12 +1071,18 @@ async fn run_sql_query(
             "count": out.rows.len(),
             "truncated": out.truncated,
             "rows": out.rows,
+            // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
+            // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
+            // cutoff a result may legitimately come from data a *different* identity produced - the
+            // adoption is correct, and the old stamp could not express it. `nid` closes that: an agent
+            // citing an answer can now name the dataset, not just the decode.
             "provenance": {
                 "as_of": s.store.get_meta("last_block").ok().flatten()
                     .and_then(|v| v.parse::<u64>().ok()),
                 "sealed_through": s.store.sealed_through(),
                 "source": "hot+sealed",
                 "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
+                "nid": s.nid.as_deref(),
             },
         }))
         .into_response(),
@@ -1413,6 +1423,7 @@ mod tests {
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
             surface: Arc::new(crate::allowlist::Surface::default()),
+            nid: None,
             admin_enabled: true,
             admin_token: None,
             nest_info: Arc::new(json!({ "name": "t" })),

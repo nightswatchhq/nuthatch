@@ -1686,6 +1686,8 @@ async fn build_nest(
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
         surface: Arc::new(crate::allowlist::Surface::default()),
+        // Set by the runtime for a mounted nest; a solo `dev` nest has no mount record.
+        nid: None,
         // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
         runtime_health: None,
         admin_enabled,
