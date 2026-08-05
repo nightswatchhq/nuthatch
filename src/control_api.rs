@@ -65,7 +65,7 @@ struct DeclareBody {
     name: String,
     chain: String,
     /// Projected footprint. Optional: an operator who does not know should not be blocked, and the
-    /// roost's own per-nest baseline is a better guess than zero - zero would make the cursor look
+    /// mounts's own per-nest baseline is a better guess than zero - zero would make the cursor look
     /// free and let the scheduler overcommit a worker.
     estimated_rss_mb: Option<u64>,
 }
@@ -94,7 +94,7 @@ struct UnplaceableView {
     detail: String,
 }
 
-/// Per-nest baseline when the caller does not supply an estimate - the same figure `roost` uses for a
+/// Per-nest baseline when the caller does not supply an estimate - the same figure `mounts` uses for a
 /// nest with no views, so an unestimated nest is costed as a small one rather than a free one.
 const DEFAULT_NEST_RSS_MB: u64 = 90;
 

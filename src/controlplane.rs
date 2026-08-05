@@ -18,7 +18,7 @@
 //!
 //! ## Secrets
 //!
-//! Runtime secrets (RFC-0019 §4 credential kind **b**) live here too, keyed by nest. They are stored
+//! MountTable secrets (RFC-0019 §4 credential kind **b**) live here too, keyed by nest. They are stored
 //! **outside** the content-addressed bundle on purpose: baking a credential into a bundle would leak
 //! it *and* break addressing, because two nests differing only in credentials would hash differently.
 //! Rotating a secret is a control-plane write that changes no bundle hash.
@@ -131,7 +131,7 @@ impl ControlPlane {
                     budget_mb     BIGINT      NOT NULL,
                     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
-                -- Runtime secrets (RFC-0019 §4 credential kind (b), mechanism per RFC-0022 §5).
+                -- MountTable secrets (RFC-0019 §4 credential kind (b), mechanism per RFC-0022 §5).
                 -- Keyed by nest and **never** by bundle: baking a secret into a content-addressed
                 -- bundle would both leak it and break addressing, since two nests differing only in
                 -- credentials would hash differently. Rotating a secret here changes no bundle hash.

@@ -273,7 +273,7 @@ pub async fn upgrade(
 
 /// A single nest's contribution to a running process: its serve state plus the background tasks that
 /// keep it fed (the ingestion loop, and an optional alert/webhook delivery worker). Built by
-/// [`spawn_nest`]; consumed either by [`run`] (one nest, served at the root) or by the roost
+/// [`spawn_nest`]; consumed either by [`run`] (one nest, served at the root) or by the runtime
 /// (RFC-0012 - many nests, each served under a `/<name>/…` prefix behind one listener).
 pub struct NestRuntime {
     pub state: serve::AppState,
@@ -368,7 +368,7 @@ pub async fn run(
 }
 
 /// Whether the built-in admin UI should be served, given `--no-admin` and the bind address. Extracted
-/// so the roost computes it once for the whole process (RFC-0010 Part A semantics unchanged).
+/// so the runtime computes it once for the whole process (RFC-0010 Part A semantics unchanged).
 /// The admin token from the environment, treating unset OR empty/whitespace as "no token": an empty
 /// `NUTHATCH_ADMIN_TOKEN=` must neither enable the admin route off-localhost nor become a null
 /// credential that a bare `?token=` satisfies (SEC).
@@ -403,7 +403,7 @@ pub fn admin_required_token(admin_enabled: bool, listen: &str) -> Option<String>
 /// ingestion loop and delivery worker, and assemble its serve state - everything *except* binding a
 /// listener. The serving decision (root vs a `/<name>/…` prefix, one nest vs many) belongs to the
 /// caller. Per-nest isolation (own store, own segments, own views) is the CLAUDE.md non-negotiable a
-/// roost preserves by calling this once per nest.
+/// mounts preserves by calling this once per nest.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_nest(
     source: Arc<dyn Source>,
@@ -498,7 +498,7 @@ fn addr_in(addresses: &[String], addr: &str) -> bool {
     addresses.iter().any(|a| a.eq_ignore_ascii_case(addr))
 }
 
-/// The roost demux decision (RFC-0012 §2). A **static** nest (non-empty `addresses`) owns a log by
+/// The mounts demux decision (RFC-0012 §2). A **static** nest (non-empty `addresses`) owns a log by
 /// emitting address; a **factory** nest (empty `addresses` - topic0-only) owns it by topic0, so it
 /// catches its factory-creation events and its runtime-discovered children regardless of their address.
 /// Pure so it's testable without a `NestIngest`.
@@ -622,12 +622,12 @@ enum NestState {
         retry_at: Option<std::time::Instant>,
     },
     /// Removed by the **operator**, not by a fault (RFC-0027 §6). Never re-admitted, never counted as
-    /// a failure, and never a reason to report the roost unready.
+    /// a failure, and never a reason to report the runtime unready.
     ///
     /// Kept distinct from `Quarantined` rather than modelled as a terminal fault, because the two mean
     /// opposite things to anyone watching: a terminal quarantine says "something broke, come and
     /// look", while a retirement says "you asked for this". Conflating them would page an operator for
-    /// doing exactly what they intended, and - worse - would make a roost whose last nest was unmounted
+    /// doing exactly what they intended, and - worse - would make a runtime whose last nest was unmounted
     /// exit non-zero as though every nest had died.
     Retired,
 }
@@ -648,14 +648,14 @@ struct Supervisor {
     /// not "start at genesis" but "unknown" - it must re-`prepare` before it may rejoin the working set.
     prepared: Vec<bool>,
     /// The live health surface the API reads (RFC-0026 §5).
-    health: Arc<crate::health::RoostHealth>,
+    health: Arc<crate::health::RuntimeHealth>,
     /// Fail-stop instead of quarantine (§6): exit on the first fault of any kind. Off by default;
     /// restores the pre-RFC-0026 behaviour for CI, deterministic tests, and operators who want it.
     fail_fast: bool,
 }
 
 impl Supervisor {
-    fn new(names: Vec<String>, health: Arc<crate::health::RoostHealth>, fail_fast: bool) -> Self {
+    fn new(names: Vec<String>, health: Arc<crate::health::RuntimeHealth>, fail_fast: bool) -> Self {
         let n = names.len();
         Self {
             names,
@@ -673,7 +673,7 @@ impl Supervisor {
     /// the subtlety the whole design turns on (RFC-0026 §3.1). The cursor derives `global_next` from the
     /// *min* of the live nests' cursors, its reorg reference from the *max*, and its `getLogs` filter
     /// from the *union* of their addresses/topics. A quarantined nest left in the min pins the shared
-    /// cursor at its dead position - every healthy sibling stalls while the roost still reports itself
+    /// cursor at its dead position - every healthy sibling stalls while the runtime still reports itself
     /// alive, which is strictly worse than the crash this replaces.
     fn live(&self) -> Vec<usize> {
         self.states
@@ -752,7 +752,7 @@ impl Supervisor {
     ///
     /// Retired nests are excluded from the question entirely (RFC-0027 §6). A cursor whose nests were
     /// all unmounted has nothing to do, but nothing has *failed*; treating that as "every nest is
-    /// terminally quarantined" would make the roost exit non-zero the moment an operator removed the
+    /// terminally quarantined" would make the runtime exit non-zero the moment an operator removed the
     /// last nest - killing the process they were about to mount the replacement into.
     fn all_terminal(&self) -> bool {
         let mut saw_fault = false;
@@ -878,7 +878,7 @@ fn fan_out_rollback(
 /// queue is empty, so an idle lifecycle channel costs one atomic load per window.
 ///
 /// A command naming a nest this cursor does not host is logged and dropped rather than treated as an
-/// error - with one cursor per chain, a roost-level command may legitimately reach the wrong cursor.
+/// error - with one cursor per chain, a runtime-level command may legitimately reach the wrong cursor.
 fn drain_lifecycle(
     lifecycle: &mut Option<CursorCommands>,
     sup: &mut Supervisor,
@@ -1001,14 +1001,14 @@ impl std::fmt::Debug for CursorCommand {
 pub type CursorCommands = tokio::sync::mpsc::UnboundedReceiver<CursorCommand>;
 
 #[allow(clippy::too_many_arguments)]
-async fn roost_index_loop(
+async fn runtime_index_loop(
     source: Arc<dyn Source>,
     nests: Vec<NestIngest>,
     backfill: Option<u64>,
     seal_direct: bool,
     concurrency: usize,
     window: u64,
-    health: Arc<crate::health::RoostHealth>,
+    health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
     mut lifecycle: Option<CursorCommands>,
 ) -> Result<()> {
@@ -1052,7 +1052,7 @@ async fn roost_index_loop(
         drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         if sup.all_retired() {
             // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
-            // so this returns cleanly rather than bailing, and the roost stays up (RFC-0027 §6).
+            // so this returns cleanly rather than bailing, and the runtime stays up (RFC-0027 §6).
             tracing::info!("every nest on this cursor has been unmounted; retiring the cursor");
             return Ok(());
         }
@@ -1083,7 +1083,7 @@ async fn roost_index_loop(
         let live = sup.live();
         if live.is_empty() {
             // Nothing left to advance. If every quarantine is terminal the cursor is dead and says so
-            // (slice 2 turns this into a per-cursor quarantine at the roost driver); if some are
+            // (slice 2 turns this into a per-cursor quarantine at the runtime driver); if some are
             // retryable, wait for the backoff rather than spin.
             if sup.all_terminal() {
                 anyhow::bail!(TerminalFault(format!(
@@ -1101,7 +1101,7 @@ async fn roost_index_loop(
                 // Publish to **each nest on this cursor**, not only to the process-global gauge. With
                 // one cursor per chain, a single global tip means whichever cursor polled last wins -
                 // and `/<nest>/ready` then answers with another chain's block height. Observed live in
-                // a two-chain roost: the mainnet nest reported an Arbitrum tip.
+                // a two-chain mounts: the mainnet nest reported an Arbitrum tip.
                 for &i in &live {
                     live_ref(&nests, i).metrics.mark_poll_ok();
                 }
@@ -1137,12 +1137,14 @@ async fn roost_index_loop(
             .await
             {
                 Ok(Some(ancestor)) => {
-                    tracing::warn!("roost reorg to block {ancestor}: rolling back every live nest");
+                    tracing::warn!(
+                        "mounts reorg to block {ancestor}: rolling back every live nest"
+                    );
                     fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor)?;
                     continue;
                 }
                 Ok(None) => {}
-                Err(e) => tracing::debug!("roost reorg check skipped: {e:#}"),
+                Err(e) => tracing::debug!("mounts reorg check skipped: {e:#}"),
             }
         }
 
@@ -1206,7 +1208,7 @@ async fn roost_index_loop(
                     // COR-5. One block is over the provider's cap and there is no narrower range to
                     // ask for, so this fetch cannot succeed as issued.
                     //
-                    // It used to `return Err`, which ends `roost_index_loop` - and that task drives
+                    // It used to `return Err`, which ends `runtime_index_loop` - and that task drives
                     // *every* nest on the cursor, so one nest's topic0 stopped its co-tenants dead.
                     // RFC-0026 exists to make exactly that impossible, and this path went around it
                     // because a union fetch has no owner: the error is not attributable to a nest a
@@ -1252,7 +1254,7 @@ async fn roost_index_loop(
 /// handle, and the nests' alert-delivery workers. Static and factory nests may be co-mounted (slice 2b):
 /// a factory nest forces the union fetch topic0-only and demuxes by topic0, static nests by address.
 #[allow(clippy::too_many_arguments)]
-pub async fn spawn_roost(
+pub async fn spawn_runtime(
     source: Arc<dyn Source>,
     nests: Vec<(String, PathBuf, Config)>,
     backfill: Option<u64>,
@@ -1261,9 +1263,9 @@ pub async fn spawn_roost(
     window_override: Option<u64>,
     admin_enabled: bool,
     admin_token: Option<String>,
-    health: Arc<crate::health::RoostHealth>,
+    health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
-) -> Result<RoostCursor> {
+) -> Result<ChainCursor> {
     let mut ingests = Vec::new();
     let mut states = Vec::new();
     let mut alert_workers: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -1283,7 +1285,7 @@ pub async fn spawn_roost(
         ingests.push(nest);
         // So `/<name>/ready` answers for THIS nest rather than the process-global poll freshness.
         let mut state = state;
-        state.roost_health = Some((name.clone(), health.clone()));
+        state.runtime_health = Some((name.clone(), health.clone()));
         if let Some(worker) = worker {
             alert_workers.push((name.clone(), worker));
         }
@@ -1293,7 +1295,7 @@ pub async fn spawn_roost(
     // The cursor's command channel. The control surface that *sends* on it is slice 4; the driver
     // holds the sender meanwhile so unmount can be driven programmatically and tested.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let ingest = tokio::spawn(roost_index_loop(
+    let ingest = tokio::spawn(runtime_index_loop(
         source,
         ingests,
         backfill,
@@ -1304,7 +1306,7 @@ pub async fn spawn_roost(
         fail_fast,
         Some(rx),
     ));
-    Ok(RoostCursor {
+    Ok(ChainCursor {
         states,
         ingest,
         alert_workers,
@@ -1313,7 +1315,7 @@ pub async fn spawn_roost(
 }
 
 /// One chain cursor, plus the handles a driver needs to manage the nests on it (RFC-0027).
-pub struct RoostCursor {
+pub struct ChainCursor {
     /// Per-nest serving state. The driver **retains** these so it can re-compose the router without a
     /// nest when one is unmounted; previously they were moved straight into the router and lost.
     pub states: Vec<(String, serve::AppState)>,
@@ -1378,12 +1380,12 @@ pub async fn build_and_prepare_nest(
 /// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
 /// handles (the API must see the same views the loop feeds). Also spawns the optional alert/webhook
 /// delivery worker, and returns the effective `eth_getLogs` window. Spawning the ingestion loop is
-/// the caller's job ([`spawn_nest`] today; a roost driver tomorrow, RFC-0012). Per-nest isolation
-/// (own store, own segments, own views) is the CLAUDE.md non-negotiable a roost preserves by calling
+/// the caller's job ([`spawn_nest`] today; a runtime driver tomorrow, RFC-0012). Per-nest isolation
+/// (own store, own segments, own views) is the CLAUDE.md non-negotiable a runtime preserves by calling
 /// this once per nest.
 async fn build_nest(
     // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
-    // signature per the RFC-0012 contract so a roost driver can `build_nest` then `index_loop(source, …)`.
+    // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
     _source: &Arc<dyn Source>,
     dir: PathBuf,
     config: &Config,
@@ -1600,7 +1602,7 @@ async fn build_nest(
         )))
     };
 
-    // Group the per-nest state the loop owns and mutates into one struct, so a roost can drive many
+    // Group the per-nest state the loop owns and mutates into one struct, so a runtime can drive many
     // nests from one cursor (RFC-0012). `source` stays shared and borrowed, not owned; `children`
     // starts empty (it is rebuilt/grown by `prepare`). The view handles are cloned here and shared
     // with the `AppState` below - the API must see the same views the loop feeds.
@@ -1641,7 +1643,7 @@ async fn build_nest(
         // Deliberately NOT the full `url`: webhook URLs routinely embed a secret in the path (Slack/
         // Discord/bearer-in-path), and `/nest` is unauthenticated. Expose only scheme+host so the admin
         // UI can show *where* a webhook points without leaking the credential to any reader (incl. a
-        // co-tenant on a roost).
+        // co-tenant on a runtime).
         "webhooks": config.webhooks.iter()
             .map(|w| serde_json::json!({ "name": w.name, "table": w.table, "target": webhook_host(&w.url),
                 "finality": w.finality.clone().unwrap_or_else(|| "sealed".into()) })).collect::<Vec<_>>(),
@@ -1659,11 +1661,11 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(registry.schema()),
         sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::SQL_MAX_CONCURRENCY)),
-        // Open by default; `roost::dev` overlays the mount's surface after the nest is built
+        // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
         surface: Arc::new(crate::allowlist::Surface::default()),
-        // Set by `spawn_roost` for a co-tenanted nest; a solo `dev` nest has no roost health surface.
-        roost_health: None,
+        // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
+        runtime_health: None,
         admin_enabled,
         admin_token,
         nest_info: Arc::new(nest_info),
@@ -2501,7 +2503,7 @@ pub struct NestIngest {
     children: ChildRegistry,
     finality: Finality,
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
-    /// aggregates. In a roost each nest gets its own, keyed by name.
+    /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
     addresses: Vec<String>,
     topic0s: Vec<String>,
@@ -2514,7 +2516,7 @@ impl NestIngest {
     /// Run the one-time preamble before the tip loop, then return the block to begin tip-following
     /// from. Initialises webhook cursors, rebuilds the discovered-child registry on a warm restart,
     /// runs the `--seal-direct` phase-0 backfill on a cold start, and computes the cold-start `next`.
-    /// Extracted verbatim from `index_loop` so a roost can build many `NestIngest`s and drive them
+    /// Extracted verbatim from `index_loop` so a runtime can build many `NestIngest`s and drive them
     /// through the same code; `source` stays borrowed (not owned) and `window` is the chunker seed the
     /// phase-0 backfill uses.
     async fn prepare(
@@ -2707,7 +2709,7 @@ impl NestIngest {
     }
 
     /// Does this log belong to this nest? Two demux modes, mirroring the two nest kinds:
-    /// - **Static nest** (non-empty address filter): by emitting address - the roost fetches the union
+    /// - **Static nest** (non-empty address filter): by emitting address - the runtime fetches the union
     ///   of every nest's addresses and each log routes to the nest(s) whose set contains it.
     /// - **Factory nest** (empty address filter - topic0-only, children discovered at runtime, RFC-0009):
     ///   by **topic0** - a child contract has an arbitrary address but its events carry a *template*
@@ -2753,8 +2755,8 @@ impl NestIngest {
 
     /// Roll this nest's mutable hot store + IVM views back to `ancestor` (the deepest reorg-survivor
     /// block). Detection is the *caller's* job: a solo nest detects on its own cursor (`handle_reorg`);
-    /// a roost detects **once** at the shared boundary and fans this out to every nest (slice 3). A
-    /// nest already at or below `ancestor` (e.g. a still-backfilling nest in a roost while the tip
+    /// a runtime detects **once** at the shared boundary and fans this out to every nest (slice 3). A
+    /// nest already at or below `ancestor` (e.g. a still-backfilling nest in a runtime while the tip
     /// reorgs) is a no-op - nothing above `ancestor` to undo, and its cursor must NOT be bumped up to
     /// `ancestor` (that would claim blocks it never indexed). Propagates the finality-violation bail.
     /// Fail loudly if any derived-view circuit thread has died. A dead IVM thread silently freezes the
@@ -4676,7 +4678,7 @@ template = "pool"
     /// fork; a still-backfilling nest below the fork is spared and - crucially - its cursor is NOT
     /// bumped up to the ancestor (that would claim blocks it never indexed).
     #[tokio::test]
-    async fn roost_reorg_fans_out_and_spares_behind_nests() {
+    async fn runtime_reorg_fans_out_and_spares_behind_nests() {
         let da = tempfile::tempdir().unwrap();
         let db = tempfile::tempdir().unwrap();
         let mut caught_up =
@@ -4688,7 +4690,7 @@ template = "pool"
         seed_blocks(&caught_up, &[10, 20, 30, 40, 50, 60, 80, 100]);
         seed_blocks(&behind, &[10, 20, 30]);
 
-        // One shared reorg to ancestor 50, fanned to both nests (as `roost_index_loop` does).
+        // One shared reorg to ancestor 50, fanned to both nests (as `runtime_index_loop` does).
         caught_up.rollback_reorg(50).unwrap();
         behind.rollback_reorg(50).unwrap();
 
@@ -4716,7 +4718,7 @@ template = "pool"
     fn test_supervisor(n: usize) -> Supervisor {
         Supervisor::new(
             (0..n).map(|i| format!("nest{i}")).collect(),
-            Arc::new(crate::health::RoostHealth::new()),
+            Arc::new(crate::health::RuntimeHealth::new()),
             false,
         )
     }
@@ -4755,7 +4757,7 @@ template = "pool"
         assert!(sup.all_retired());
         assert!(
             !sup.all_terminal(),
-            "an all-retired cursor must not report itself terminally dead - that would exit the roost"
+            "an all-retired cursor must not report itself terminally dead - that would exit the runtime"
         );
     }
 
@@ -4776,7 +4778,7 @@ template = "pool"
     }
 
     /// Commands are applied at the window boundary, and one naming a nest this cursor does not host is
-    /// dropped rather than treated as an error - with one cursor per chain, a roost-level command can
+    /// dropped rather than treated as an error - with one cursor per chain, a runtime-level command can
     /// legitimately reach the wrong cursor.
     #[test]
     fn lifecycle_commands_retire_the_named_nest_and_ignore_strangers() {
@@ -4803,7 +4805,7 @@ template = "pool"
         drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         assert_eq!(sup.live(), vec![1]);
 
-        // No channel at all (today's `spawn_roost`) is simply a no-op.
+        // No channel at all (today's `spawn_runtime`) is simply a no-op.
         let mut none = None;
         drain_lifecycle(&mut none, &mut sup, &mut nests, &mut nexts);
         assert_eq!(sup.live(), vec![1]);
@@ -4865,7 +4867,7 @@ template = "pool"
     /// RFC-0026 §3.1 - the trap the whole design turns on. A quarantined nest must leave the working
     /// set, not merely be skipped: the shared cursor advances from the *min* of the live cursors, so a
     /// quarantined nest left in that min pins the cursor at its dead position and stalls every healthy
-    /// sibling - while the roost still reports itself alive. Strictly worse than the crash it replaces.
+    /// sibling - while the runtime still reports itself alive. Strictly worse than the crash it replaces.
     #[test]
     fn a_quarantined_nest_stops_pinning_the_shared_cursor() {
         let nexts = [30u64, 100, 120];
@@ -5256,17 +5258,17 @@ template = "pool"
         // Compare by a stable key (Log isn't PartialEq): (address-lowercased, block, log_index).
         let key =
             |l: &crate::rpc::Log| (l.address.to_ascii_lowercase(), l.block_number, l.log_index);
-        // What the roost feeds nest A: union filtered by A's ownership.
-        let roost_input: Vec<_> = union
+        // What the runtime feeds nest A: union filtered by A's ownership.
+        let runtime_input: Vec<_> = union
             .iter()
             .filter(|l| addr_in(&nest_a_addrs, &l.address))
             .map(key)
             .collect();
         // What a solo, address-filtered source would return for nest A: only A's own logs.
         let solo_input: Vec<_> = [&a, &a2].into_iter().map(key).collect();
-        assert_eq!(roost_input, solo_input);
+        assert_eq!(runtime_input, solo_input);
         // Nest B's log is never routed to A.
-        assert!(!roost_input
+        assert!(!runtime_input
             .iter()
             .any(|(addr, _, _)| addr.eq_ignore_ascii_case(&b.address)));
     }

@@ -1,8 +1,8 @@
-//! `nuthatch migrate` - move a roost from the name-keyed layout to identity-keyed datasets
+//! `nuthatch migrate` - move a runtime from the name-keyed layout to identity-keyed datasets
 //! (RFC-0032 §8, slice 1).
 //!
 //! Before: `<root>/nests/<name>/` - an operator's label decides where data lives. After:
-//! `<root>/data/<nid>/`, addressed by what the nest *is*, with `roost.toml` carrying `[[mounts]]`
+//! `<root>/data/<nid>/`, addressed by what the nest *is*, with `mounts.toml` carrying `[[mounts]]`
 //! records mapping alias → identity.
 //!
 //! **Data is moved, never re-indexed.** If a migration ever needs a backfill, the migration is wrong.
@@ -12,18 +12,18 @@
 //! - **Idempotent.** Running it twice is a no-op. Running it after adding one nest migrates only that
 //!   nest. There is no "already migrated" error to work around.
 //! - **Refuses rather than guesses.** A nest whose inputs no longer reproduce its own manifest is
-//!   named and skipped, and the whole run reports a failure. A half-migrated roost still serves,
-//!   because [`crate::roost::Roost::dir_for`] resolves both layouts.
+//!   named and skipped, and the whole run reports a failure. A half-migrated mounts still serves,
+//!   because [`crate::runtime::MountTable::dir_for`] resolves both layouts.
 //!
 //! **Deviation from RFC-0032 §12, recorded deliberately.** The RFC specified copy-then-verify-then-
 //! swap. This uses `rename` when source and destination share a filesystem - which they do, both
-//! being under the roost root - and falls back to copy-verify-remove only across devices. A rename is
+//! being under the runtime root - and falls back to copy-verify-remove only across devices. A rename is
 //! atomic: it cannot produce the half-written destination the copy path exists to guard against, and
 //! it does not require double the disk of an indexed history. The RFC's *intent* was "never lose
 //! data"; rename serves it better than the mechanism the RFC named.
 
 use crate::blob;
-use crate::roost::{Mount, Roost, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR};
+use crate::runtime::{Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -114,22 +114,22 @@ impl Plan {
 /// Computing every nest's identity up front is what makes [`Plan::Merge`] detectable at all: two
 /// nests only turn out to be the same nest once both have been hashed.
 pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
-    let roost = Roost::load_for_migration(dir)?;
-    let mut plans = Vec::with_capacity(roost.roost.nests.len());
+    let mounts = MountTable::load_for_migration(dir)?;
+    let mut plans = Vec::with_capacity(mounts.runtime.nests.len());
     // Identity -> the first alias that claimed it, for merge detection within this run.
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    // `mount_refs()`, **not** `roost.nests`: once a directory is migrated the mount records are
+    // `mount_refs()`, **not** `mounts.nests`: once a directory is migrated the mount records are
     // authoritative and `nests` is empty, so iterating the list would see nothing on a second run and
     // then write an empty mount table - turning "migrate twice" from a no-op into data loss.
-    for alias in roost
+    for alias in mounts
         .mount_refs()
         .iter()
         .map(|m| m.alias.clone())
         .collect::<Vec<_>>()
     {
         let alias = &alias;
-        let recorded = roost.mounts.iter().find(|m| &m.alias == alias);
+        let recorded = mounts.mounts.iter().find(|m| &m.alias == alias);
         let legacy = dir.join(NESTS_DIR).join(alias);
 
         // Already migrated: a record exists, its dataset is on disk, and **nothing is staged**.
@@ -176,7 +176,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
 
         let dest = dir.join(DATA_DIR).join(&nid);
         match claimed.get(&nid) {
-            // Another alias in this same roost is the same nest, byte for byte.
+            // Another alias in this same mounts is the same nest, byte for byte.
             Some(other) => plans.push(Plan::Merge {
                 alias: alias.clone(),
                 nid: nid.clone(),
@@ -210,7 +210,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                         to: dest,
                     }),
                     None => {
-                        let breaking = breaking_against_current(dir, &roost, alias, &legacy);
+                        let breaking = breaking_against_current(dir, &mounts, alias, &legacy);
                         plans.push(Plan::Move {
                             alias: alias.clone(),
                             nid,
@@ -238,13 +238,13 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
 /// breaking change, and inventing one would train operators to ignore the warning.
 fn breaking_against_current(
     dir: &Path,
-    roost: &Roost,
+    mounts: &MountTable,
     alias: &str,
     staged: &Path,
 ) -> Option<Vec<String>> {
-    let current_nid = &roost.mounts.iter().find(|m| m.alias == alias)?.nid;
+    let current_nid = &mounts.mounts.iter().find(|m| m.alias == alias)?.nid;
     let old =
-        std::fs::read_to_string(Roost::data_dir(dir, current_nid).join("schema.json")).ok()?;
+        std::fs::read_to_string(MountTable::data_dir(dir, current_nid).join("schema.json")).ok()?;
     let new = std::fs::read_to_string(staged.join("schema.json")).ok()?;
     let class = crate::lifecycle::classify_schemas(&old, &new).ok()?;
     if class.verdict != crate::lifecycle::Verdict::Breaking {
@@ -313,7 +313,7 @@ fn nid_of(nest: &Path) -> Result<String> {
 /// `nuthatch migrate <dir> [--dry-run]`: apply the plan (RFC-0032 §8).
 ///
 /// Returns an error if any nest was refused, *after* migrating every nest that was fine - a bad nest
-/// must not hold the rest hostage, and `dir_for` means a partially-migrated roost still serves.
+/// must not hold the rest hostage, and `dir_for` means a partially-migrated mounts still serves.
 pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     let plans = plan(dir)?;
     println!(
@@ -353,10 +353,10 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Everything an un-migrated roost held belongs to the default tenant (RFC-0032 §6): migration is
+    // Everything an un-migrated mounts held belongs to the default tenant (RFC-0032 §6): migration is
     // a **relabel, not a migration** - no data moves between tenants, nothing re-indexes, and
     // enabling hosted tenancy later is another relabel rather than a second migration.
-    let tenant = Roost::load_for_migration(dir)?.tenant_default();
+    let tenant = MountTable::load_for_migration(dir)?.tenant_default();
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
     for p in &plans {
@@ -452,7 +452,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     if !refused.is_empty() {
         bail!(
             "migrated what could be migrated, but refused: {}. \
-             The roost still serves - un-migrated nests resolve through the old layout.",
+             The mounts still serves - un-migrated nests resolve through the old layout.",
             refused.join(", ")
         );
     }
@@ -478,7 +478,7 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite `roost.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
+/// Rewrite `mounts.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
 fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
     // Read whichever file this directory has - the migration's whole job is that it may still be the
     // pre-2.0 one - and always *write* the 2.0 name.
@@ -491,13 +491,13 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
     let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {} to record mounts", source.display()))?;
-    let mut roost: Roost = toml::from_str(&raw)
+    let mut mounts: MountTable = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", source.display()))?;
-    roost.mounts = records.to_vec();
+    mounts.mounts = records.to_vec();
     // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
     // stale list beside them would lie.
-    roost.roost.nests.clear();
-    let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
+    mounts.runtime.nests.clear();
+    let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
@@ -516,7 +516,7 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
 mod tests {
     use super::*;
 
-    /// A roost with `n` nests, all on one chain, in the pre-2.0 layout.
+    /// A mounts with `n` nests, all on one chain, in the pre-2.0 layout.
     fn write_roost(dir: &Path, nests: &[(&str, &str)]) {
         let names: Vec<String> = nests.iter().map(|(n, _)| format!("\"{n}\"")).collect();
         std::fs::write(
@@ -562,11 +562,11 @@ mod tests {
         assert_eq!(
             before,
             std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap(),
-            "roost.toml was rewritten by a dry run"
+            "mounts.toml was rewritten by a dry run"
         );
     }
 
-    /// The core of slice 1: data moves to an identity-keyed directory, byte for byte, and the roost
+    /// The core of slice 1: data moves to an identity-keyed directory, byte for byte, and the runtime
     /// resolves through the records afterwards.
     #[test]
     fn migration_moves_data_and_never_re_indexes() {
@@ -580,10 +580,10 @@ mod tests {
         );
         run(d.path(), false, false).unwrap();
 
-        let roost = Roost::load(d.path()).unwrap();
-        assert_eq!(roost.mounts.len(), 2);
+        let mounts = MountTable::load(d.path()).unwrap();
+        assert_eq!(mounts.mounts.len(), 2);
         for (alias, expected) in [("a", "data for a"), ("b", "data for b")] {
-            let dir = roost.dir_for(d.path(), alias);
+            let dir = mounts.dir_for(d.path(), alias);
             assert!(
                 dir.starts_with(d.path().join(DATA_DIR)),
                 "{alias} did not move under data/"
@@ -600,7 +600,7 @@ mod tests {
             );
         }
         // Two different nests, two identities.
-        assert_ne!(roost.mounts[0].nid, roost.mounts[1].nid);
+        assert_ne!(mounts.mounts[0].nid, mounts.mounts[1].nid);
     }
 
     /// The regression that made this test earn its keep: clearing `nests` when the mount records
@@ -616,10 +616,10 @@ mod tests {
             &[("a", "0x0000000000000000000000000000000000000001")],
         );
         run(d.path(), false, false).unwrap();
-        assert_eq!(Roost::load(d.path()).unwrap().mounts.len(), 1);
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts.len(), 1);
 
         run(d.path(), false, false).unwrap();
-        let after = Roost::load(d.path()).unwrap();
+        let after = MountTable::load(d.path()).unwrap();
         assert_eq!(
             after.mounts.len(),
             1,
@@ -637,7 +637,7 @@ mod tests {
         );
         run(d.path(), false, false).unwrap();
         let after_first = std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap();
-        let nid = Roost::load(d.path()).unwrap().mounts[0].nid.clone();
+        let nid = MountTable::load(d.path()).unwrap().mounts[0].nid.clone();
 
         run(d.path(), false, false).unwrap();
 
@@ -645,7 +645,7 @@ mod tests {
             after_first,
             std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap()
         );
-        assert_eq!(Roost::load(d.path()).unwrap().mounts[0].nid, nid);
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts[0].nid, nid);
         assert_eq!(
             std::fs::read_to_string(d.path().join(DATA_DIR).join(&nid).join("nuthatch.redb"))
                 .unwrap(),
@@ -659,7 +659,7 @@ mod tests {
     fn two_names_for_one_nest_merge_into_one_dataset() {
         let d = tempfile::tempdir().unwrap();
         // Same contract, same ABI - the nest *name* differs, and a nest's name is in its config, so
-        // write both configs identically and let the alias differ only in the roost.
+        // write both configs identically and let the alias differ only in the runtime.
         write_roost(
             d.path(),
             &[
@@ -684,14 +684,14 @@ mod tests {
         );
 
         run(d.path(), false, false).unwrap();
-        let roost = Roost::load(d.path()).unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
         assert_eq!(
-            roost.mounts[0].nid, roost.mounts[1].nid,
+            mounts.mounts[0].nid, mounts.mounts[1].nid,
             "both aliases must land on one identity"
         );
         assert_eq!(
-            roost.dir_for(d.path(), "a"),
-            roost.dir_for(d.path(), "clone"),
+            mounts.dir_for(d.path(), "a"),
+            mounts.dir_for(d.path(), "clone"),
             "two doors, one room"
         );
     }
@@ -710,7 +710,7 @@ mod tests {
         std::fs::write(root.join(NESTS_DIR).join("a").join("llms.txt"), "docs v1\n").unwrap();
         run(root, false, false).unwrap();
 
-        let first = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let first = MountTable::load(root).unwrap().mounts[0].nid.clone();
         let dataset = root.join(DATA_DIR).join(&first);
         assert_eq!(
             std::fs::read_to_string(dataset.join("nuthatch.redb")).unwrap(),
@@ -732,12 +732,12 @@ mod tests {
             "CREATE VIEW v AS SELECT 1 -- authored logic, never materialised",
         )
         .unwrap();
-        let mut roost = Roost::load(root).unwrap();
-        roost.mounts.clear();
-        roost.roost.nests = vec!["a".into()];
+        let mut mounts = MountTable::load(root).unwrap();
+        mounts.mounts.clear();
+        mounts.runtime.nests = vec!["a".into()];
         std::fs::write(
             root.join(MOUNTS_FILE),
-            toml::to_string_pretty(&roost).unwrap(),
+            toml::to_string_pretty(&mounts).unwrap(),
         )
         .unwrap();
 
@@ -757,7 +757,7 @@ mod tests {
         );
 
         run(root, false, false).unwrap();
-        let after = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let after = MountTable::load(root).unwrap().mounts[0].nid.clone();
         assert_ne!(after, first);
         assert_eq!(
             std::fs::read_to_string(root.join(DATA_DIR).join(&after).join("nuthatch.redb"))
@@ -779,7 +779,7 @@ mod tests {
         let root = d.path();
         write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
         run(root, false, false).unwrap();
-        let first = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let first = MountTable::load(root).unwrap().mounts[0].nid.clone();
 
         // A different contract address: different data, whatever the rest of the nest says.
         let staged = root.join(NESTS_DIR).join("a");
@@ -793,12 +793,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut roost = Roost::load(root).unwrap();
-        roost.mounts.clear();
-        roost.roost.nests = vec!["a".into()];
+        let mut mounts = MountTable::load(root).unwrap();
+        mounts.mounts.clear();
+        mounts.runtime.nests = vec!["a".into()];
         std::fs::write(
             root.join(MOUNTS_FILE),
-            toml::to_string_pretty(&roost).unwrap(),
+            toml::to_string_pretty(&mounts).unwrap(),
         )
         .unwrap();
 
@@ -821,7 +821,7 @@ mod tests {
         let schema = r#"{"tables":[{"table":"a__transfer","columns":[{"name":"from","sol_type":"address"},{"name":"value","sol_type":"uint256"}]}]}"#;
         std::fs::write(root.join(NESTS_DIR).join("a").join("schema.json"), schema).unwrap();
         run(root, false, false).unwrap();
-        let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let nid = MountTable::load(root).unwrap().mounts[0].nid.clone();
 
         // Re-stage the same alias with a column dropped: compatible data, broken consumers.
         let staged = root.join(NESTS_DIR).join("a");
@@ -853,14 +853,14 @@ mod tests {
             "the refusal must name the way forward: {err}"
         );
         assert_eq!(
-            Roost::load(root).unwrap().mounts[0].nid,
+            MountTable::load(root).unwrap().mounts[0].nid,
             nid,
             "a refused run must not have changed the mount"
         );
 
         // ...and it proceeds when the operator says so.
         run(root, false, true).expect("--allow-breaking proceeds");
-        assert_ne!(Roost::load(root).unwrap().mounts[0].nid, nid);
+        assert_ne!(MountTable::load(root).unwrap().mounts[0].nid, nid);
     }
 
     /// The control: a **compatible** change must not be flagged, or the warning becomes noise and
@@ -876,7 +876,7 @@ mod tests {
         )
         .unwrap();
         run(root, false, false).unwrap();
-        let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let nid = MountTable::load(root).unwrap().mounts[0].nid.clone();
 
         let staged = root.join(NESTS_DIR).join("a");
         crate::project::copy_dir(&root.join(DATA_DIR).join(&nid), &staged).unwrap();
@@ -896,7 +896,7 @@ mod tests {
         run(root, false, false).expect("a compatible change proceeds without a flag");
     }
 
-    /// A refusal must not hold the healthy nests hostage, and the roost must still serve.
+    /// A refusal must not hold the healthy nests hostage, and the runtime must still serve.
     #[test]
     fn a_broken_nest_is_refused_and_the_rest_still_migrate() {
         let d = tempfile::tempdir().unwrap();
@@ -922,18 +922,18 @@ mod tests {
             "the refusal must name the nest: {err}"
         );
 
-        let roost = Roost::load(d.path()).unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
         assert_eq!(
-            roost.mounts.len(),
+            mounts.mounts.len(),
             1,
             "the healthy nest should have migrated"
         );
-        assert_eq!(roost.mounts[0].alias, "good");
+        assert_eq!(mounts.mounts[0].alias, "good");
         // Mixed layout: one resolved by identity, one still by name. Both resolve.
-        assert!(roost
+        assert!(mounts
             .dir_for(d.path(), "good")
             .starts_with(d.path().join(DATA_DIR)));
-        assert!(roost
+        assert!(mounts
             .dir_for(d.path(), "broken")
             .starts_with(d.path().join(NESTS_DIR)));
     }

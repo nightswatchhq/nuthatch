@@ -1,4 +1,4 @@
-//! Roost lifecycle end-to-end: unmounting a nest releases everything it held (RFC-0027 §6).
+//! MountTable lifecycle end-to-end: unmounting a nest releases everything it held (RFC-0027 §6).
 //!
 //! The acceptance test that matters here is not "does the route disappear" - that is easy and
 //! unconvincing - but **does the nest's redb file actually become free**. `Store` is an `Arc<Database>`
@@ -10,16 +10,16 @@ mod common;
 
 use std::sync::Arc;
 
-use nuthatch::{health::RoostHealth, indexer, roost, serve, store::Store};
+use nuthatch::{health::RuntimeHealth, indexer, runtime, serve, store::Store};
 
 use common::tape::*;
 
-/// A two-nest, one-chain roost over a scripted tape, wrapped in the driver handles a live roost keeps.
+/// A two-nest, one-chain mounts over a scripted tape, wrapped in the driver handles a live mounts keeps.
 async fn two_nest_roost(
     roost_dir: &std::path::Path,
     usdc_dir: &std::path::Path,
     arb_dir: &std::path::Path,
-) -> (roost::RoostHandles, Arc<TapeSource>) {
+) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
     let tape = Arc::new(TapeSource::new());
     let a1 = account(1);
     let a2 = account(2);
@@ -39,11 +39,11 @@ async fn two_nest_roost(
 
     let cfg_u = scaffold_nest(usdc_dir, "usdc", USDC);
     let cfg_a = scaffold_nest(arb_dir, "arb", ARB);
-    let health = Arc::new(RoostHealth::new());
+    let health = Arc::new(RuntimeHealth::new());
     health.register("usdc", "arbitrum-one");
     health.register("arb", "arbitrum-one");
 
-    let cursor = indexer::spawn_roost(
+    let cursor = indexer::spawn_runtime(
         tape.clone(),
         vec![
             ("usdc".to_string(), usdc_dir.to_path_buf(), cfg_u),
@@ -59,18 +59,18 @@ async fn two_nest_roost(
         false,
     )
     .await
-    .expect("spawn_roost");
+    .expect("spawn_runtime");
 
     let roster = serde_json::json!({
-        "roost": "test",
+        "mounts": "test",
         "nests": [{"name": "usdc"}, {"name": "arb"}],
     });
-    let live = serve::LiveRoost::new(serve::compose_roost(
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
         roster.clone(),
         cursor.states.clone(),
         health.clone(),
     ));
-    let handles = roost::RoostHandles {
+    let handles = runtime::RuntimeHandles {
         live,
         states: cursor.states,
         alert_workers: cursor.alert_workers,
@@ -87,7 +87,7 @@ async fn two_nest_roost(
             ("usdc".to_string(), 90),
             ("arb".to_string(), 90),
         ]),
-        mount_ctx: roost::MountContext {
+        mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
             mounts: Vec::new(),
@@ -111,7 +111,7 @@ async fn two_nest_roost(
 }
 
 /// Drive one GET through the served composition and return its status.
-async fn status(live: &serve::LiveRoost, path: &str) -> axum::http::StatusCode {
+async fn status(live: &serve::LiveRuntime, path: &str) -> axum::http::StatusCode {
     use tower::ServiceExt;
     let req = axum::http::Request::builder()
         .uri(path)
@@ -150,7 +150,7 @@ async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
     handles.unmount("arb").await.expect("unmount");
 
     // The routes are gone, and the co-tenant is untouched - the whole point of unmounting one nest
-    // rather than restarting the roost.
+    // rather than restarting the runtime.
     assert_eq!(
         status(&handles.live, "/arb/health").await,
         axum::http::StatusCode::NOT_FOUND,
@@ -195,17 +195,17 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
     std::fs::create_dir_all(&arb_dir).unwrap();
     let (mut handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
 
-    // 1. A name already on the roost. This is an upgrade (RFC-0020), not a mount.
+    // 1. A name already on the runtime. This is an upgrade (RFC-0020), not a mount.
     let err = handles.mount("usdc").await.unwrap_err();
     assert!(
         matches!(
-            err.downcast_ref::<roost::MountRefusal>(),
-            Some(roost::MountRefusal::AlreadyMounted(_))
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::AlreadyMounted(_))
         ),
         "expected AlreadyMounted, got: {err:#}"
     );
 
-    // 2. A nest whose chain the roost declares no cursor for. Scaffold one on a different chain.
+    // 2. A nest whose chain the runtime declares no cursor for. Scaffold one on a different chain.
     let other = roost_dir.path().join("nests/elsewhere");
     std::fs::create_dir_all(&other).unwrap();
     let mut cfg = scaffold_nest(&other, "elsewhere", USDC);
@@ -215,8 +215,8 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
     let err = handles.mount("elsewhere").await.unwrap_err();
     assert!(
         matches!(
-            err.downcast_ref::<roost::MountRefusal>(),
-            Some(roost::MountRefusal::UndeclaredChain { .. })
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::UndeclaredChain { .. })
         ),
         "expected UndeclaredChain, got: {err:#}"
     );
@@ -228,8 +228,8 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
     scaffold_nest(&third, "third", ARB);
     handles.mount_ctx.max_rss_mb = 100; // below even the base cost, so any mount breaches it
     let err = handles.mount("third").await.unwrap_err();
-    match err.downcast_ref::<roost::MountRefusal>() {
-        Some(roost::MountRefusal::OverBudget {
+    match err.downcast_ref::<runtime::MountRefusal>() {
+        Some(runtime::MountRefusal::OverBudget {
             projected_mb,
             ceiling_mb,
             ..
@@ -240,13 +240,13 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
         other => panic!("expected OverBudget, got: {other:?} / {err:#}"),
     }
 
-    // Every refusal left the roost exactly as it was.
+    // Every refusal left the runtime exactly as it was.
     assert_eq!(handles.states.len(), 2, "no partial mount was left behind");
 }
 
 /// RFC-0027 §5: a lifecycle change must survive a restart.
 ///
-/// `roost.toml` is the embedded stand-in for a control-plane DB - desired state lives in the same file
+/// `mounts.toml` is the embedded stand-in for a control-plane DB - desired state lives in the same file
 /// the static boot path reads. Without this, an unmount would silently come back on the next restart,
 /// which is the worst kind of bug because it looks like it worked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -259,7 +259,7 @@ async fn a_lifecycle_change_is_persisted_to_the_mount_table() {
 
     // A mount table matching the running set, as `dev` would have loaded.
     std::fs::write(
-        roost_dir.path().join(nuthatch::roost::MOUNTS_FILE),
+        roost_dir.path().join(nuthatch::runtime::MOUNTS_FILE),
         r#"[runtime]
 name = "test"
 chain = "arbitrum-one"
@@ -273,14 +273,14 @@ nests = ["usdc", "arb"]
     let (mut handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
     handles.unmount("arb").await.expect("unmount");
 
-    let reloaded =
-        nuthatch::roost::Roost::load(roost_dir.path()).expect("the mount table still parses");
+    let reloaded = nuthatch::runtime::MountTable::load(roost_dir.path())
+        .expect("the mount table still parses");
     assert_eq!(
-        reloaded.roost.nests,
+        reloaded.runtime.nests,
         vec!["usdc".to_string()],
         "the unmount must be recorded, or it silently returns on the next restart"
     );
     // Everything else about the manifest survives the rewrite untouched.
-    assert_eq!(reloaded.roost.chain.as_deref(), Some("arbitrum-one"));
-    assert_eq!(reloaded.roost.chain_id, Some(42161));
+    assert_eq!(reloaded.runtime.chain.as_deref(), Some("arbitrum-one"));
+    assert_eq!(reloaded.runtime.chain_id, Some(42161));
 }

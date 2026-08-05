@@ -19,7 +19,7 @@
 //! removes indexed history and is not. The dangerous direction should be the one you have to ask
 //! for.
 
-use crate::roost::{Roost, DATA_DIR};
+use crate::runtime::{MountTable, DATA_DIR};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -54,14 +54,14 @@ fn size_of(dir: &Path) -> u64 {
 
 /// Every dataset under `data/` that no mount record refers to (RFC-0032 §5).
 ///
-/// Reads the mount table first and fails loudly if it cannot: a roost whose `roost.toml` is
+/// Reads the mount table first and fails loudly if it cannot: a runtime whose `mounts.toml` is
 /// unreadable has *no* known mounts, and treating that as "nothing is mounted" would make every
 /// dataset collectable at once. The one failure this command must never have.
 pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
-    let roost = Roost::load(dir)
+    let mounts = MountTable::load(dir)
         .with_context(|| format!("reading the mount table of {}", dir.display()))?;
     let mounted: std::collections::HashSet<&str> =
-        roost.mounts.iter().map(|m| m.nid.as_str()).collect();
+        mounts.mounts.iter().map(|m| m.nid.as_str()).collect();
 
     let data = dir.join(DATA_DIR);
     let Ok(entries) = std::fs::read_dir(&data) else {
@@ -154,19 +154,19 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roost::{Mount, MOUNTS_FILE};
+    use crate::runtime::{Mount, MOUNTS_FILE};
 
-    /// A roost with `mounted` recorded and `orphans` sitting in `data/` with no record.
+    /// A mounts with `mounted` recorded and `orphans` sitting in `data/` with no record.
     fn fixture(dir: &Path, mounted: &[&str], orphans: &[&str]) {
-        let mut roost =
+        let mut mounts =
             "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n"
                 .to_string();
         for (i, nid) in mounted.iter().enumerate() {
-            roost.push_str(&format!(
+            mounts.push_str(&format!(
                 "\n[[mounts]]\nalias = \"n{i}\"\nnid = \"{nid}\"\n"
             ));
         }
-        std::fs::write(dir.join(MOUNTS_FILE), roost).unwrap();
+        std::fs::write(dir.join(MOUNTS_FILE), mounts).unwrap();
         for nid in mounted.iter().chain(orphans) {
             let d = dir.join(DATA_DIR).join(nid);
             std::fs::create_dir_all(&d).unwrap();
@@ -258,7 +258,7 @@ mod tests {
     }
 
     /// An unreadable mount table means "we do not know what is mounted", never "nothing is". The
-    /// difference is every dataset in the roost.
+    /// difference is every dataset in the runtime.
     #[test]
     fn an_unreadable_mount_table_refuses_rather_than_collecting_everything() {
         let d = tempfile::tempdir().unwrap();
@@ -268,7 +268,7 @@ mod tests {
 
         assert!(
             collectable(d.path()).is_err(),
-            "an unparseable roost.toml must refuse, not offer every dataset for deletion"
+            "an unparseable mounts.toml must refuse, not offer every dataset for deletion"
         );
         assert!(run(d.path(), true).is_err());
         assert!(
@@ -299,9 +299,9 @@ mod tests {
         );
 
         // Remount the same identity: collectable again becomes empty, with no backfill involved.
-        let mut roost = Roost::load(d.path()).unwrap();
-        roost.roost.nests.clear();
-        roost.mounts.push(Mount {
+        let mut mounts = MountTable::load(d.path()).unwrap();
+        mounts.runtime.nests.clear();
+        mounts.mounts.push(Mount {
             tenant: "default".into(),
             alias: "back".into(),
             nid: a.clone(),
@@ -310,7 +310,7 @@ mod tests {
         });
         std::fs::write(
             d.path().join(MOUNTS_FILE),
-            toml::to_string_pretty(&roost).unwrap(),
+            toml::to_string_pretty(&mounts).unwrap(),
         )
         .unwrap();
         assert!(collectable(d.path()).unwrap().is_empty());

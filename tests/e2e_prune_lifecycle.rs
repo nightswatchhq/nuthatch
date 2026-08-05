@@ -16,9 +16,9 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Mount, Roost, DATA_DIR, MOUNTS_FILE};
+use nuthatch::runtime::{Mount, MountTable, DATA_DIR, MOUNTS_FILE};
 use nuthatch::store::HotStore;
-use nuthatch::{health::RoostHealth, indexer, migrate, prune, seal};
+use nuthatch::{health::RuntimeHealth, indexer, migrate, prune, seal};
 
 use common::tape::*;
 
@@ -55,11 +55,11 @@ fn fresh_tape() -> Arc<TapeSource> {
     tape
 }
 
-/// Bring the roost's single dataset up over a fresh tape, index to the tip, seal past finality, then
+/// Bring the runtime's single dataset up over a fresh tape, index to the tip, seal past finality, then
 /// stop. Returns how many `logs` calls that cost and where the data landed.
 async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
-    let roost = Roost::load(root).unwrap();
-    let datasets = roost.datasets(root);
+    let mounts = MountTable::load(root).unwrap();
+    let datasets = mounts.datasets(root);
     assert_eq!(
         datasets.len(),
         1,
@@ -69,9 +69,9 @@ async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
     let cfg = nuthatch::config::Config::load(&ds.dir).unwrap();
 
     let tape = fresh_tape();
-    let health = Arc::new(RoostHealth::new());
+    let health = Arc::new(RuntimeHealth::new());
     health.register(&ds.canonical().alias, "arbitrum-one");
-    let cursor = indexer::spawn_roost(
+    let cursor = indexer::spawn_runtime(
         tape.clone(),
         vec![(ds.canonical().alias.clone(), ds.dir.clone(), cfg)],
         None,
@@ -84,7 +84,7 @@ async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
         false,
     )
     .await
-    .expect("spawn_roost");
+    .expect("spawn_runtime");
 
     let store = cursor.states[0].1.store.clone();
     // `>=`, not `==`. A **remounted** dataset starts out already *past* this tape's tip: the previous
@@ -133,20 +133,20 @@ fn segment_hashes(dir: &Path) -> Vec<String> {
 }
 
 fn unmount(root: &Path) {
-    let mut roost = Roost::load(root).unwrap();
-    roost.mounts.clear();
-    roost.roost.nests = vec!["placeholder".into()];
+    let mut mounts = MountTable::load(root).unwrap();
+    mounts.mounts.clear();
+    mounts.runtime.nests = vec!["placeholder".into()];
     std::fs::write(
         root.join(MOUNTS_FILE),
-        toml::to_string_pretty(&roost).unwrap(),
+        toml::to_string_pretty(&mounts).unwrap(),
     )
     .unwrap();
 }
 
 fn remount(root: &Path, nid: &str) {
-    let mut roost = Roost::load(root).unwrap();
-    roost.roost.nests.clear();
-    roost.mounts = vec![Mount {
+    let mut mounts = MountTable::load(root).unwrap();
+    mounts.runtime.nests.clear();
+    mounts.mounts = vec![Mount {
         tenant: "default".into(),
         alias: "usdc".into(),
         nid: nid.to_string(),
@@ -155,7 +155,7 @@ fn remount(root: &Path, nid: &str) {
     }];
     std::fs::write(
         root.join(MOUNTS_FILE),
-        toml::to_string_pretty(&roost).unwrap(),
+        toml::to_string_pretty(&mounts).unwrap(),
     )
     .unwrap();
 }
@@ -170,7 +170,7 @@ async fn remounting_costs_nothing_until_you_prune() {
     std::fs::create_dir_all(&nest).unwrap();
     scaffold_nest(&nest, "usdc", USDC);
     migrate::run(root, false, false).expect("migrate");
-    let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+    let nid = MountTable::load(root).unwrap().mounts[0].nid.clone();
 
     // --- First run: the backfill we are trying never to repeat. ---
     let (first_calls, data_dir, watermark) = index_once(root).await;
@@ -241,7 +241,7 @@ async fn remounting_costs_nothing_until_you_prune() {
     scaffold_nest(&nest, "usdc", USDC);
     migrate::run(root, false, false).expect("re-migrate");
     assert_eq!(
-        Roost::load(root).unwrap().mounts[0].nid,
+        MountTable::load(root).unwrap().mounts[0].nid,
         nid,
         "the same inputs must yield the same identity after a prune"
     );

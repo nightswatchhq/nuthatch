@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 /// The one process-wide metrics registry. `const`-constructed, so it needs no lazy init.
 pub static METRICS: Metrics = Metrics::new();
 
-/// Per-nest counterparts of the nest-scoped signals (SEC-9). In a roost the process-global gauges and
+/// Per-nest counterparts of the nest-scoped signals (SEC-9). In a runtime the process-global gauges and
 /// counters blend every mounted nest into one number; these let an operator see each nest's own
 /// progress under a `{nest="…"}` label. Updating a per-nest value also bumps the matching global
 /// aggregate, so the existing unlabelled series stay correct and backward-compatible.
@@ -22,7 +22,7 @@ pub struct NestMetrics {
     sealed_through: AtomicU64,
     /// The tip of **this nest's chain**, and when its cursor last polled successfully.
     ///
-    /// Duplicated per nest rather than kept only process-globally because a multichain roost runs one
+    /// Duplicated per nest rather than kept only process-globally because a multichain mounts runs one
     /// cursor per chain: with a single global tip, whichever cursor polled last wins, and
     /// `/<nest>/ready` reports another chain's block height. Observed live - a mainnet nest reporting
     /// an Arbitrum tip of 488,677,305 while mainnet was at 25,632,906.
@@ -273,7 +273,7 @@ impl Metrics {
             self.rpc_requests.load(Relaxed),
         ));
 
-        // Per-nest series (SEC-9): in a roost, one `{nest="…"}`-labelled line per mounted nest, so the
+        // Per-nest series (SEC-9): in a runtime, one `{nest="…"}`-labelled line per mounted nest, so the
         // blended aggregates above can be broken down by nest. Distinct `_nest_` metric names keep the
         // exposition unambiguous (a name is never both labelled and unlabelled).
         let per = self.per_nest.lock().unwrap();

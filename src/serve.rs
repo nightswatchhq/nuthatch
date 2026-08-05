@@ -40,7 +40,7 @@ const SQL_MAX_ROWS: usize = 50_000;
 ///
 /// The hot store holds everything between the sealed watermark and the tip, and every `/sql` call
 /// parses all of it into memory. On a deep-finality chain with a busy contract that is the largest RAM
-/// risk the process carries - and in a roost it is a co-tenant's problem too, because the budget is
+/// risk the process carries - and in a runtime it is a co-tenant's problem too, because the budget is
 /// per cursor. This is the ceiling that turns "the box fell over" into a `503` naming the reason.
 ///
 /// It is generous on purpose: a nest at tip on a normal chain is nowhere near it, so the guard is
@@ -88,10 +88,10 @@ pub struct AppState {
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
     pub surface: Arc<crate::allowlist::Surface>,
-    /// This nest's name and the roost health surface it should answer `/ready` from (RFC-0026 §5).
-    /// `None` for a solo `dev` nest, which has no roost around it and falls back to the global
+    /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
+    /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
-    pub roost_health: Option<(String, Arc<crate::health::RoostHealth>)>,
+    pub runtime_health: Option<(String, Arc<crate::health::RuntimeHealth>)>,
 }
 
 /// A hot-swappable handle to the `AppState` backing one served endpoint (RFC-0020 slice 2). The router
@@ -130,7 +130,7 @@ impl axum::extract::FromRef<SharedNest> for AppState {
 }
 
 /// Build a nest's router - every per-nest route plus the request-count layer, bound to a swappable
-/// [`SharedNest`]. Split out of [`run`] so a roost (RFC-0012) can mount many of these under
+/// [`SharedNest`]. Split out of [`run`] so a runtime (RFC-0012) can mount many of these under
 /// `/<nest>/…` prefixes; a solo `dev` serves exactly one at the root. Identical routes either way - a
 /// nest can't tell it's co-hosted, nor that its backing can be hot-swapped underneath it.
 pub fn router(backing: SharedNest) -> Router {
@@ -212,30 +212,30 @@ pub fn two_version_router(old: SharedNest, new_prefix: &str, new: SharedNest) ->
         .merge(router(old).layer(deprecate))
 }
 
-/// Serve many nests behind one listener (RFC-0012 roost, slice 1): a `/nests` roster plus every nest's
+/// Serve many nests behind one listener (RFC-0012 mounts, slice 1): a `/nests` roster plus every nest's
 /// full API under its `/<name>/…` prefix. Chain identity and the cursor are still per-nest at this
 /// slice (the shared cursor is slice 2); this lands the routing + per-nest isolation of the serving
 /// surface first. Each nest's routes are byte-identical to a solo `dev`, just prefixed.
-pub async fn run_roost(
+pub async fn run_runtime(
     listen: &str,
     roster: serde_json::Value,
     nests: Vec<(String, AppState)>,
-    health: Arc<crate::health::RoostHealth>,
+    health: Arc<crate::health::RuntimeHealth>,
 ) -> Result<()> {
-    let live = LiveRoost::new(compose_roost(roster, nests, health));
+    let live = LiveRuntime::new(compose_runtime(roster, nests, health));
     bind_and_serve(listen, live.service()).await
 }
 
-/// Compose the roost's routes for a given nest set: the root endpoints plus every nest nested under
+/// Compose the runtime's routes for a given nest set: the root endpoints plus every nest nested under
 /// its `/<name>` prefix.
 ///
-/// Split out of [`run_roost`] so the set can be re-composed at runtime (RFC-0027). Routing semantics
+/// Split out of [`run_runtime`] so the set can be re-composed at runtime (RFC-0027). Routing semantics
 /// are unchanged from the static version - still `Router::nest` - which is what makes the parity test
 /// meaningful rather than a tautology.
-pub fn compose_roost(
+pub fn compose_runtime(
     roster: serde_json::Value,
     nests: Vec<(String, AppState)>,
-    health: Arc<crate::health::RoostHealth>,
+    health: Arc<crate::health::RuntimeHealth>,
 ) -> Router {
     let roster = Arc::new(roster);
     let roster_health = health.clone();
@@ -254,7 +254,7 @@ pub fn compose_roost(
                 async move { Json(merge_roster_health(&r, &h)) }
             }),
         )
-        // `GET /ready` at the roost root - the roost-wide readiness a supervisor polls. The per-nest
+        // `GET /ready` at the runtime root - the runtime-wide readiness a supervisor polls. The per-nest
         // `/ready` under `/<name>/` answers only for that nest.
         .route(
             "/ready",
@@ -271,9 +271,9 @@ pub fn compose_roost(
     app
 }
 
-/// A roost's routes behind a swappable handle (RFC-0027 slice 1).
+/// A mounts's routes behind a swappable handle (RFC-0027 slice 1).
 ///
-/// Today a roost's nest set is frozen at boot: `axum::Router` is composed before it is served and has
+/// Today a runtime's nest set is frozen at boot: `axum::Router` is composed before it is served and has
 /// no insertion point afterwards, so adding or removing a nest means restarting the process - which
 /// stops every *co-tenant* nest too. That makes the blast radius of a configuration change larger than
 /// the blast radius of a fault, which RFC-0026 already fixed.
@@ -284,13 +284,13 @@ pub fn compose_roost(
 /// serving semantics are *identical* to the static path by construction rather than by careful
 /// re-implementation. Re-composition is rare (a mount or unmount), so rebuilding is not a hot path.
 ///
-/// **Slice 1 changes no behaviour**: nothing calls [`LiveRoost::swap`] yet. It exists so the lifecycle
+/// **Slice 1 changes no behaviour**: nothing calls [`LiveRuntime::swap`] yet. It exists so the lifecycle
 /// slices have somewhere to stand, and so the parity test can prove the indirection is free.
-pub struct LiveRoost {
+pub struct LiveRuntime {
     current: Arc<arc_swap::ArcSwap<Router>>,
 }
 
-impl LiveRoost {
+impl LiveRuntime {
     pub fn new(router: Router) -> Self {
         Self {
             current: Arc::new(arc_swap::ArcSwap::from_pointee(router)),
@@ -329,7 +329,7 @@ impl LiveRoost {
 /// reason, class, and retry deadline an operator needs to act on.
 fn merge_roster_health(
     roster: &serde_json::Value,
-    health: &crate::health::RoostHealth,
+    health: &crate::health::RuntimeHealth,
 ) -> serde_json::Value {
     let mut out = roster.clone();
     if let Some(entries) = out.get_mut("nests").and_then(|n| n.as_array_mut()) {
@@ -353,14 +353,14 @@ fn merge_roster_health(
     out
 }
 
-/// Roost-wide readiness (RFC-0026 §5): **200** while every mounted nest is indexing, **503** as soon as
+/// MountTable-wide readiness (RFC-0026 §5): **200** while every mounted nest is indexing, **503** as soon as
 /// any nest or cursor is quarantined, with the offenders named.
 ///
 /// 503-on-any-quarantine is the deliberately conservative choice. A supervisor should treat a
-/// partly-broken roost as not-ready and fetch a human, while the healthy nests carry on serving reads
+/// partly-broken mounts as not-ready and fetch a human, while the healthy nests carry on serving reads
 /// to consumers who ask for them directly - readiness is advice to a supervisor, it does not gate
 /// traffic. The healthy/unhealthy split stays visible per nest on `/nests` and `/<name>/ready`.
-fn roost_ready(health: &crate::health::RoostHealth) -> impl IntoResponse {
+fn roost_ready(health: &crate::health::RuntimeHealth) -> impl IntoResponse {
     let unhealthy = health.unhealthy();
     let ready = unhealthy.is_empty();
     let body = json!({
@@ -375,7 +375,7 @@ fn roost_ready(health: &crate::health::RoostHealth) -> impl IntoResponse {
     (code, Json(body))
 }
 
-/// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_roost`].
+/// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_runtime`].
 pub async fn bind_and_serve(listen: &str, app: Router) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -426,7 +426,7 @@ struct AdminQuery {
 /// way, so a timing side-channel cannot recover it byte-by-byte.
 /// Whether a request carries the admin credential, as `?token=` or `Authorization: Bearer`.
 ///
-/// Shared with the roost's lifecycle routes (RFC-0027 §5) so mount/unmount are gated by exactly the
+/// Shared with the runtime's lifecycle routes (RFC-0027 §5) so mount/unmount are gated by exactly the
 /// same rule as the admin UI - one credential, one comparison, no second auth concept to get subtly
 /// wrong. `None` means a localhost bind, which is open by design.
 pub fn token_ok(
@@ -547,10 +547,10 @@ async fn count_request(
 /// `GET /metrics` - Prometheus text exposition (RFC-0005 §6).
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
-    // In a roost, append the health series (RFC-0026 §5) so an operator can alert on "anything
+    // In a runtime, append the health series (RFC-0026 §5) so an operator can alert on "anything
     // quarantined" without polling `/nests`. Like the existing per-nest series, these describe the
-    // whole roost regardless of which nest's `/metrics` is scraped.
-    if let Some((_, health)) = &s.roost_health {
+    // whole mounts regardless of which nest's `/metrics` is scraped.
+    if let Some((_, health)) = &s.runtime_health {
         body.push_str(&health.render_metrics());
     }
     (
@@ -578,10 +578,10 @@ fn poll_stalled(last_poll: u64, now: u64, threshold: u64) -> bool {
 /// i.e. every RPC endpoint is down). A just-started node that has never polled is *not* stalled (grace).
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     use crate::metrics::{now_unix, METRICS};
-    // In a roost, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
-    // must not be told the roost is unwell because some unrelated co-tenant is quarantined - nor told
+    // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
+    // must not be told the runtime is unwell because some unrelated co-tenant is quarantined - nor told
     // all is well when *this* nest is the one that is frozen.
-    if let Some((name, health)) = &s.roost_health {
+    if let Some((name, health)) = &s.runtime_health {
         if let Some(q) = health.status(name) {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -598,14 +598,17 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     }
-    // Answer from **this nest's** counters when it is one of several in a roost. The process-global
-    // gauges are shared by every cursor, so in a multichain roost whichever cursor polled last wins -
-    // and this endpoint then reports another chain's block heights. Observed live in a two-chain roost:
+    // Answer from **this nest's** counters when it is one of several in a runtime. The process-global
+    // gauges are shared by every cursor, so in a multichain mounts whichever cursor polled last wins -
+    // and this endpoint then reports another chain's block heights. Observed live in a two-chain mounts:
     // the mainnet nest reported `tip: 488677305` (Arbitrum) while mainnet was at 25,632,906, alongside
     // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
     //
     // A solo `dev` has exactly one nest feeding the globals, so both paths agree there.
-    let nest = s.roost_health.as_ref().map(|(name, _)| METRICS.nest(name));
+    let nest = s
+        .runtime_health
+        .as_ref()
+        .map(|(name, _)| METRICS.nest(name));
     let (last_poll, tip, last, sealed) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
@@ -1413,7 +1416,7 @@ mod tests {
             admin_enabled: true,
             admin_token: None,
             nest_info: Arc::new(json!({ "name": "t" })),
-            roost_health: None,
+            runtime_health: None,
         }
     }
 
@@ -1456,14 +1459,14 @@ mod tests {
         (status, body)
     }
 
-    /// A two-nest roost composition, built the same way `run_roost` builds one.
-    fn two_nest_roost(dir: &std::path::Path, health: Arc<crate::health::RoostHealth>) -> Router {
-        let roster = json!({"roost": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
+    /// A two-nest mounts composition, built the same way `run_runtime` builds one.
+    fn two_nest_roost(dir: &std::path::Path, health: Arc<crate::health::RuntimeHealth>) -> Router {
+        let roster = json!({"mounts": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
         let nests = vec![
             ("alpha".to_string(), test_state(&dir.join("a"), 4)),
             ("beta".to_string(), test_state(&dir.join("b"), 4)),
         ];
-        compose_roost(roster, nests, health)
+        compose_runtime(roster, nests, health)
     }
 
     /// RFC-0027 slice 1: serving through the swappable handle must be **indistinguishable** from
@@ -1478,7 +1481,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("a")).unwrap();
         std::fs::create_dir_all(tmp.path().join("b")).unwrap();
-        let health = Arc::new(crate::health::RoostHealth::new());
+        let health = Arc::new(crate::health::RuntimeHealth::new());
         health.register("alpha", "mainnet");
         health.register("beta", "mainnet");
 
@@ -1495,7 +1498,7 @@ mod tests {
         ] {
             let direct = get(two_nest_roost(tmp.path(), health.clone()), path).await;
             let dispatched = get(
-                LiveRoost::new(two_nest_roost(tmp.path(), health.clone())).service(),
+                LiveRuntime::new(two_nest_roost(tmp.path(), health.clone())).service(),
                 path,
             )
             .await;
@@ -1513,11 +1516,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("a")).unwrap();
         std::fs::create_dir_all(tmp.path().join("b")).unwrap();
-        let health = Arc::new(crate::health::RoostHealth::new());
+        let health = Arc::new(crate::health::RuntimeHealth::new());
         health.register("alpha", "mainnet");
         health.register("beta", "mainnet");
 
-        let live = LiveRoost::new(two_nest_roost(tmp.path(), health.clone()));
+        let live = LiveRuntime::new(two_nest_roost(tmp.path(), health.clone()));
         let (status, _) = get(live.service(), "/beta/health").await;
         assert_eq!(status, StatusCode::OK, "beta is mounted to begin with");
 
@@ -1529,8 +1532,8 @@ mod tests {
         // to be closed cleanly before anything reopens it, and a half-closed store is the one way a
         // lifecycle operation could corrupt data that faults never do.
         std::fs::create_dir_all(tmp.path().join("a2")).unwrap();
-        let roster = json!({"roost": "t", "nests": [{"name": "alpha"}]});
-        let only_alpha = compose_roost(
+        let roster = json!({"mounts": "t", "nests": [{"name": "alpha"}]});
+        let only_alpha = compose_runtime(
             roster,
             vec![("alpha".to_string(), test_state(&tmp.path().join("a2"), 4))],
             health.clone(),
@@ -1547,12 +1550,12 @@ mod tests {
     /// merged per request - and a quarantined nest must never come back reported as indexing.
     #[test]
     fn the_roster_reports_live_health_per_nest() {
-        use crate::health::RoostHealth;
-        let health = RoostHealth::new();
+        use crate::health::RuntimeHealth;
+        let health = RuntimeHealth::new();
         health.register("alpha", "base");
         health.register("beta", "base");
         let roster = json!({
-            "roost": "test",
+            "mounts": "test",
             "nests": [ {"name": "alpha", "chain": "base"}, {"name": "beta", "chain": "base"} ],
         });
 
@@ -1586,13 +1589,13 @@ mod tests {
         assert!(merged["nests"][0].get("quarantine").is_none());
     }
 
-    /// RFC-0026 §5: roost-root `/ready` is 200 only while **everything** is indexing, and 503 names the
-    /// offenders. Conservative on purpose - a supervisor should treat a partly-broken roost as
+    /// RFC-0026 §5: mounts-root `/ready` is 200 only while **everything** is indexing, and 503 names the
+    /// offenders. Conservative on purpose - a supervisor should treat a partly-broken mounts as
     /// not-ready, while the healthy nests carry on serving anyone who asks for them directly.
     #[tokio::test]
     async fn roost_readiness_goes_unavailable_as_soon_as_anything_is_quarantined() {
-        use crate::health::RoostHealth;
-        let health = RoostHealth::new();
+        use crate::health::RuntimeHealth;
+        let health = RuntimeHealth::new();
         health.register("alpha", "base");
         health.register("beta", "arbitrum-one");
         assert_eq!(
@@ -1600,7 +1603,7 @@ mod tests {
             StatusCode::OK
         );
 
-        // One chain's cursor dies: the roost is no longer ready, even though `beta` is perfectly fine.
+        // One chain's cursor dies: the runtime is no longer ready, even though `beta` is perfectly fine.
         health.quarantine_cursor(
             "base",
             "every nest on this cursor is terminally quarantined".into(),
@@ -1663,7 +1666,7 @@ mod tests {
         drop(held);
     }
 
-    /// A multichain roost runs one cursor per chain, so `/<nest>/ready` must answer from **that
+    /// A multichain mounts runs one cursor per chain, so `/<nest>/ready` must answer from **that
     /// nest's** counters.
     ///
     /// Found by the RFC-0021 live two-chain run rather than by any test: a mainnet nest reported
@@ -1674,7 +1677,7 @@ mod tests {
     async fn per_nest_readiness_does_not_report_another_chains_tip() {
         use crate::metrics::METRICS;
         let tmp = tempfile::tempdir().unwrap();
-        let health = Arc::new(crate::health::RoostHealth::new());
+        let health = Arc::new(crate::health::RuntimeHealth::new());
         health.register("on-mainnet", "mainnet");
         health.register("on-arbitrum", "arbitrum-one");
 
@@ -1690,7 +1693,7 @@ mod tests {
         arb.mark_poll_ok();
 
         let mut state = test_state(tmp.path(), 1);
-        state.roost_health = Some(("on-mainnet".to_string(), health.clone()));
+        state.runtime_health = Some(("on-mainnet".to_string(), health.clone()));
         let body = ready(State(state)).await.into_response();
         let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
             .await
@@ -1712,7 +1715,7 @@ mod tests {
 
     /// The `/sql` RAM guard (the "node owns resource safety" half of the CLAUDE.md division of
     /// labour): the unsealed tip is materialised per query, so an unbounded one is the largest RAM
-    /// risk the process carries - and in a roost it is a co-tenant's problem too.
+    /// risk the process carries - and in a runtime it is a co-tenant's problem too.
     ///
     /// It must **fail**, not truncate. Serving a partial tip would silently change the answer to an
     /// aggregate, and a `count(*)` quietly missing rows is far worse than a query that refuses.

@@ -221,7 +221,7 @@ async fn reorg_below_finality_halts() {
 }
 
 /// RFC-0021 §2 - **cross-cursor reorg isolation.** Two independent cursors (two chains) run in one
-/// process, exactly as a multichain roost hosts one isolated cursor per chain (each its own source,
+/// process, exactly as a multichain mounts hosts one isolated cursor per chain (each its own source,
 /// stores, tip, finality, reorg boundary). A reorg on chain A must leave chain B's data
 /// **byte-identical** - one chain's reorg can never reach across into another's. Isolation is by
 /// construction; this proves it, and guards the CLAUDE.md per-cursor-isolation non-negotiable.

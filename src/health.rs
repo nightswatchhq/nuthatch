@@ -1,4 +1,4 @@
-//! Live roost health - which nests and cursors are indexing, and which are quarantined (RFC-0026 §5).
+//! Live mounts health - which nests and cursors are indexing, and which are quarantined (RFC-0026 §5).
 //!
 //! The `/nests` roster used to be a `serde_json::Value` built once at startup and cloned per request,
 //! so it could not express "partly working" at all. This is the live handle that replaces it: the
@@ -43,9 +43,9 @@ impl QuarantineInfo {
     }
 }
 
-/// The roost's live health. Cheap to clone behind an `Arc`; every mutation is a short write lock.
+/// The mounts's live health. Cheap to clone behind an `Arc`; every mutation is a short write lock.
 #[derive(Default)]
-pub struct RoostHealth {
+pub struct RuntimeHealth {
     /// Nest name → its own quarantine. Absent means indexing.
     nests: RwLock<HashMap<String, QuarantineInfo>>,
     /// Chain → the cursor's quarantine. A dead cursor takes all its nests out of service, so this is
@@ -62,7 +62,7 @@ pub struct RoostHealth {
     shares: RwLock<HashMap<String, String>>,
 }
 
-impl RoostHealth {
+impl RuntimeHealth {
     pub fn new() -> Self {
         Self::default()
     }
@@ -125,7 +125,7 @@ impl RoostHealth {
     /// Record a nest as **retired by the operator** (RFC-0027 §6) rather than quarantined by a fault.
     ///
     /// Reported with `class: "retired"` so `/nests` can say *why* a nest stopped indexing, and
-    /// deliberately excluded from [`RoostHealth::unhealthy`] - readiness answers "is anything broken?",
+    /// deliberately excluded from [`RuntimeHealth::unhealthy`] - readiness answers "is anything broken?",
     /// and an intended removal is not. Paging someone because an operator did what they meant to do is
     /// how alerting gets muted.
     pub fn retire_nest(&self, nest: &str) {
@@ -205,12 +205,12 @@ impl RoostHealth {
         out
     }
 
-    /// Whether every registered nest is indexing. This is what roost-root `/ready` answers.
+    /// Whether every registered nest is indexing. This is what mounts-root `/ready` answers.
     pub fn all_indexing(&self) -> bool {
         self.unhealthy().is_empty()
     }
 
-    /// Prometheus lines for the roost's health (RFC-0026 §5) - enough to alert on "anything
+    /// Prometheus lines for the runtime's health (RFC-0026 §5) - enough to alert on "anything
     /// quarantined" and to graph a nest that flaps.
     pub fn render_metrics(&self) -> String {
         let chain_of = self.chain_of.read().unwrap();
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_healthy_nest_reports_indexing_and_a_quarantined_one_never_does() {
-        let h = RoostHealth::new();
+        let h = RuntimeHealth::new();
         h.register("alpha", "base");
         h.register("beta", "base");
         assert!(h.all_indexing());
@@ -286,7 +286,7 @@ mod tests {
 
         // Its co-tenant is untouched - the whole point of per-nest quarantine.
         assert_eq!(h.json_for("beta").0, "indexing");
-        // …but the roost as a whole is not ready while anything is out.
+        // …but the runtime as a whole is not ready while anything is out.
         assert!(!h.all_indexing());
         assert_eq!(h.unhealthy().len(), 1);
 
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn a_terminal_fault_has_no_retry_deadline() {
-        let h = RoostHealth::new();
+        let h = RuntimeHealth::new();
         h.register("alpha", "base");
         h.quarantine_nest("alpha", "finality violation".into(), 0, None);
         let q = h.status("alpha").unwrap();
@@ -308,7 +308,7 @@ mod tests {
     /// individually failed. Reporting those as "indexing" would be exactly the lie RFC-0026 forbids.
     #[test]
     fn a_dead_cursor_marks_all_its_nests_and_spares_the_other_chains() {
-        let h = RoostHealth::new();
+        let h = RuntimeHealth::new();
         h.register("alpha", "base");
         h.register("beta", "base");
         h.register("gamma", "arbitrum-one");
@@ -337,7 +337,7 @@ mod tests {
     /// The health surface must be scrapeable: alert on "anything quarantined", graph a flapping nest.
     #[test]
     fn metrics_expose_nest_health_cursor_liveness_and_a_flap_counter() {
-        let h = RoostHealth::new();
+        let h = RuntimeHealth::new();
         h.register("alpha", "base");
         h.register("gamma", "arbitrum-one");
 
@@ -390,7 +390,7 @@ mod tests {
     /// one the operator must act on.
     #[test]
     fn a_nests_own_fault_outranks_its_cursors() {
-        let h = RoostHealth::new();
+        let h = RuntimeHealth::new();
         h.register("alpha", "base");
         h.quarantine_nest(
             "alpha",

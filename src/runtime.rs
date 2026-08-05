@@ -1,23 +1,36 @@
-//! The roost (RFC-0012 §1-4; multichain per RFC-0021): one runtime hosting many nests across **one or
-//! more chains** - one isolated cursor per distinct chain (`group_by_chain` → a `spawn_roost` each),
-//! held to a **per-cursor** RSS budget. A single-chain roost (top-level `chain`) is the N=1 case, still
-//! byte-identical to solo `dev`. The single-cursor law holds per chain: never multiplex two chains
-//! behind one cursor. Below is the original RFC-0012 single-chain history.
+//! **The runtime**: one process hosting 1..N nests, with tenancy handled here rather than by a
+//! container above it (RFC-0032).
 //!
-//! (RFC-0012) one runtime hosting many nests on the same chain. Slice 1 landed the
-//! **layout + serving surface** - a `roost.toml` naming the chain and the mounted nests, a `/nests`
-//! roster, and every nest's full API under a `/<name>/…` prefix. Slice 2a landed the **shared cursor**:
-//! `dev` now drives all nests from ONE `indexer::spawn_roost` task - one `getLogs` per window fanned
-//! out to the owning nests (see `indexer::roost_index_loop`), so N nests cost one nest's worth of RPC
-//! chatter. Per-nest tables stay byte-identical to running each nest solo (the same per-window code
-//! runs either way). Static and factory nests can be co-mounted (slice 2b - a factory forces the union
-//! fetch topic0-only, demuxing by topic0 instead of address); shared reorg fan-out is slice 3; and a
-//! per-runtime footprint projection + `max_rss` refusal is slice 4.
+//! ## The roost is gone, and this is not a rename of it
 //!
-//! Isolation is by construction: each nest keeps its own directory (`nests/<name>/` - its own
-//! `nuthatch.redb`, `segments/`, views), so one nest's bad view or runaway factory can't touch
-//! another's data (the CLAUDE.md non-negotiable). The roost shares the *chain identity* and the
-//! *cursor* - never the stores.
+//! A *roost* was a **container** - a directory of nest directories that an operator chose between
+//! (`dev` or `roost dev`) before they knew which they wanted. It was retired in 2.0, not renamed.
+//! What is left is the runtime: the process itself, which hosts one nest or many with no ceremony
+//! difference, and which owns multi-tenancy directly.
+//!
+//! So the types here are named for what they *are*, not for what they replaced:
+//!
+//! - [`MountTable`] is the file (`mounts.toml`), i.e. **the mount records plus the runtime settings**.
+//!   It is not "the runtime" - the runtime is the process reading it.
+//! - [`RuntimeMeta`] is the `[runtime]` section: name, chain(s), RPC endpoints, the RSS ceiling, the
+//!   default tenant.
+//! - [`ChainCursor`] is deliberately per-**chain**: the single-cursor law holds per chain, and a
+//!   cursor is never per-runtime. A second chain is a second cursor (RFC-0021).
+//!
+//! ## What the runtime owns
+//!
+//! - **Mounts, keyed by `(tenant, NID)`.** A tenant is an opaque string with a real default, so
+//!   single-tenant is `N=1` rather than a special case and nobody who does not want tenancy types the
+//!   word. Two tenants mounting the same nest share **one dataset**; it is never indexed twice.
+//! - **One isolated cursor per distinct chain** (`group_by_chain` → a `spawn_runtime` each), each
+//!   with its own tip, finality view and reorg boundary, held to a per-cursor RSS budget.
+//! - **Blast radius.** One nest's fault quarantines that nest; one cursor's death does not take its
+//!   siblings (RFC-0026). Stores are always per-dataset and never shared across chains.
+//!
+//! Historically this began as RFC-0012's multi-nest runtime: a shared cursor fanning one `getLogs`
+//! per window out to the owning nests, so N nests cost one nest's worth of RPC chatter, with per-nest
+//! tables byte-identical to running each nest solo. That mechanism is unchanged; only the container
+//! and the key around it went.
 
 use crate::config::Config;
 use crate::indexer;
@@ -30,9 +43,9 @@ use std::sync::Arc;
 
 /// The **mount table**, at the runtime directory root (RFC-0032 §4).
 ///
-/// Runtime state that the runtime owns, not authored config an operator maintains. It records which
-/// alias, for which tenant, serves which nest identity - and nothing else. `roost.toml` was its name
-/// until 2.0, when the roost was retired as a concept; a directory still carrying the old file is
+/// MountTable state that the runtime owns, not authored config an operator maintains. It records which
+/// alias, for which tenant, serves which nest identity - and nothing else. `mounts.toml` was its name
+/// until 2.0, when the runtime was retired as a concept; a directory still carrying the old file is
 /// pointed at `nuthatch migrate` rather than silently ignored.
 pub const MOUNTS_FILE: &str = "mounts.toml";
 
@@ -40,7 +53,7 @@ pub const MOUNTS_FILE: &str = "mounts.toml";
 /// can be recognised and named in an error, and so `migrate` can read it.
 pub const LEGACY_ROOST_FILE: &str = "roost.toml";
 
-/// Where mounted nests live under the roost dir: `nests/<name>/` is a nest directory, exactly as a
+/// Where mounted nests live under the runtime dir: `nests/<name>/` is a nest directory, exactly as a
 /// standalone nest is today.
 ///
 /// **Pre-2.0 layout.** RFC-0032 replaces it with [`DATA_DIR`] keyed by nest identity; this constant
@@ -92,8 +105,8 @@ impl Mount {
     }
 }
 
-/// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per roost via
-/// `[roost] default_tenant`.
+/// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per mounts via
+/// `[mounts] default_tenant`.
 pub const DEFAULT_TENANT: &str = "default";
 
 fn default_tenant() -> String {
@@ -131,28 +144,28 @@ impl MountRef {
     }
 }
 
-/// A roost manifest: the mounted nests plus the chain(s) they follow. A roost may host nests across
+/// A mounts manifest: the mounted nests plus the chain(s) they follow. A mounts may host nests across
 /// **one or more chains** (RFC-0021) - one isolated cursor per distinct chain. The single-chain form
-/// keeps the top-level `chain`/`chain_id`/`rpc_urls`; a multichain roost lists its chains under
+/// keeps the top-level `chain`/`chain_id`/`rpc_urls`; a multichain mounts lists its chains under
 /// `[[chains]]` and lets each nest declare its own chain. The single-cursor law holds **per chain**:
 /// never multiplex two chains behind one cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Roost {
+pub struct MountTable {
     /// Serialised as `[runtime]`. Was `[roost]` until 2.0, when the roost was retired as a concept
     /// (RFC-0032 slice 5); `migrate` rewrites the section along with everything else.
     #[serde(rename = "runtime", alias = "roost")]
-    pub roost: RoostMeta,
-    /// Multichain: each chain the roost serves, with its own RPC endpoints (RFC-0021). Mutually
+    pub runtime: RuntimeMeta,
+    /// Multichain: each chain the runtime serves, with its own RPC endpoints (RFC-0021). Mutually
     /// exclusive with the top-level `chain`/`chain_id`. Empty → the single-chain top-level form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chains: Vec<ChainEndpoint>,
-    /// Mount records (RFC-0032 §4): which alias serves which nest identity. Empty means this roost
+    /// Mount records (RFC-0032 §4): which alias serves which nest identity. Empty means this directory
     /// has not been migrated and still resolves nests by name under [`NESTS_DIR`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
 }
 
-/// One chain a roost follows, plus how to reach it - a cursor's substrate (RFC-0021).
+/// One chain the runtime follows, plus how to reach it - a cursor's substrate (RFC-0021).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainEndpoint {
     pub chain: String,
@@ -162,30 +175,30 @@ pub struct ChainEndpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoostMeta {
-    /// Human name for the roost (logging/roster only).
+pub struct RuntimeMeta {
+    /// Human name for the runtime (logging/roster only).
     pub name: String,
     /// Single-chain form: the one chain the cursor follows. Omit (with `chain_id`) for a multichain
-    /// roost that declares its chains under `[[chains]]` instead.
+    /// mounts that declares its chains under `[[chains]]` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
-    /// Single-chain form: the one chain id. Omit for a multichain roost.
+    /// Single-chain form: the one chain id. Omit for a multichain mounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
     /// Single-chain form: RPC endpoints for the one chain. Overridable at runtime with `--rpc`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rpc_urls: Vec<String>,
     /// The mounted nests, by directory name under `nests/`. Superseded by `[[mounts]]` once the
-    /// roost is migrated (RFC-0032 §4) - see [`Roost::mount_refs`].
+    /// mounts is migrated (RFC-0032 §4) - see [`MountTable::mount_refs`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nests: Vec<String>,
     /// The tenant a mount belongs to when it does not say (RFC-0032 §6). Operator-configurable so a
     /// single-tenant deployment can call its tenant whatever it likes; absent → [`DEFAULT_TENANT`].
-    /// Never `None` in effect - [`Roost::tenant_default`] always yields a real string.
+    /// Never `None` in effect - [`MountTable::tenant_default`] always yields a real string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_tenant: Option<String>,
     /// Resident-set ceiling **per active-chain cursor**, in MB (RFC-0021 - the footprint budget is
-    /// per-cursor; a roost's total is Σ cursors). A cursor whose *projected* RSS exceeds this is refused
+    /// per-cursor; a runtime's total is Σ cursors). A cursor whose *projected* RSS exceeds this is refused
     /// before it starts. Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_mb: Option<u64>,
@@ -215,7 +228,7 @@ pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
 // magnitude estimates for the pre-mount projection, not measurements - the roster reports the real
 // `rss_bytes()` alongside so an operator can calibrate. The shared serving/runtime cost is paid once;
 // each nest adds its hot-store working set + decode registry, plus a chunk per active IVM view.
-pub const ROOST_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
+pub const RUNTIME_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
 const NEST_BASE_RSS_MB: u64 = 90; // redb hot store + decode registry + the always-on balance view
 const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity view, or child registry
 
@@ -235,22 +248,22 @@ pub fn estimate_nest_rss_mb(config: &Config, has_labels: bool) -> u64 {
     mb
 }
 
-impl Roost {
-    /// Load and validate `roost.toml` from a roost directory.
-    pub fn load(dir: &Path) -> Result<Roost> {
+impl MountTable {
+    /// Load and validate `mounts.toml` from a runtime directory.
+    pub fn load(dir: &Path) -> Result<MountTable> {
         Self::load_inner(dir, false)
     }
 
     /// Load for **migration**, accepting the pre-2.0 file.
     ///
-    /// [`Roost::load`] refuses a directory still holding `roost.toml` and points at `nuthatch
+    /// [`MountTable::load`] refuses a directory still holding `mounts.toml` and points at `nuthatch
     /// migrate`. `migrate` therefore cannot use it: the one command that fixes the problem would
     /// refuse to run *because* the problem exists. This is that door, and it is the only caller.
-    pub fn load_for_migration(dir: &Path) -> Result<Roost> {
+    pub fn load_for_migration(dir: &Path) -> Result<MountTable> {
         Self::load_inner(dir, true)
     }
 
-    fn load_inner(dir: &Path, accept_legacy: bool) -> Result<Roost> {
+    fn load_inner(dir: &Path, accept_legacy: bool) -> Result<MountTable> {
         let legacy = dir.join(LEGACY_ROOST_FILE);
         let path = if accept_legacy && !dir.join(MOUNTS_FILE).exists() && legacy.exists() {
             legacy
@@ -271,24 +284,24 @@ impl Roost {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("no {MOUNTS_FILE} in {}", dir.display()))?;
-        let roost: Roost =
+        let mounts: MountTable =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-        if roost.roost.nests.is_empty() && roost.mounts.is_empty() {
+        if mounts.runtime.nests.is_empty() && mounts.mounts.is_empty() {
             bail!(
-                "roost '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
-                roost.roost.name
+                "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
+                mounts.runtime.name
             );
         }
-        roost.validate_mounts()?;
+        mounts.validate_mounts()?;
         // Every mount, whichever form declared it, must be a safe path segment and must not collide
         // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
         let mut seen = std::collections::HashSet::new();
-        for m in roost.mount_refs() {
+        for m in mounts.mount_refs() {
             safe_segment(&m.alias, "nest name")?;
             safe_segment(&m.tenant, "tenant")?;
             if m.alias == "nests" || m.alias == "health" {
                 bail!(
-                    "nest name '{}' is reserved (collides with a roost route)",
+                    "nest name '{}' is reserved (collides with a runtime route)",
                     m.alias
                 );
             }
@@ -296,7 +309,7 @@ impl Roost {
             // the same two routes an alias would.
             if m.tenant == "nests" || m.tenant == "health" {
                 bail!(
-                    "tenant '{}' is reserved (collides with a roost route)",
+                    "tenant '{}' is reserved (collides with a runtime route)",
                     m.tenant
                 );
             }
@@ -304,14 +317,14 @@ impl Roost {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
         }
-        Ok(roost)
+        Ok(mounts)
     }
 
     /// Validate the mount records (RFC-0032 §4).
     ///
     /// A NID is a **filesystem path segment**, exactly as a nest name is, so it gets the same SEC-10
     /// treatment: hex only, fixed length, no `..`, no separators. The records are written by
-    /// `migrate` rather than by hand, but a roost dir is an operator-editable file and a bundle
+    /// `migrate` rather than by hand, but a runtime dir is an operator-editable file and a bundle
     /// roster is untrusted input, so the check is on load, not on write.
     fn validate_mounts(&self) -> Result<()> {
         // The primary key is `(tenant, alias)`: two tenants may each call their mount "usdc" and
@@ -337,12 +350,12 @@ impl Roost {
         Ok(())
     }
 
-    /// Every mount this roost serves, in serving order (RFC-0032 §4).
+    /// Every mount this runtime serves, in serving order (RFC-0032 §4).
     ///
     /// **`[[mounts]]` first, then any `nests` entry no record covers.** The records are the only
     /// form that can express `(acme, usdc)` and `(globex, usdc)` as two distinct mounts, which a
     /// flat list of names cannot - but the list is not simply ignored, because a **half-migrated**
-    /// roost is a supported state and `migrate` produces one whenever it refuses a nest. Dropping
+    /// mounts is a supported state and `migrate` produces one whenever it refuses a nest. Dropping
     /// the uncovered names would silently unmount exactly the nests that failed to migrate.
     pub fn mount_refs(&self) -> Vec<MountRef> {
         let mut out: Vec<MountRef> = self
@@ -354,7 +367,7 @@ impl Roost {
             })
             .collect();
         let tenant = self.tenant_default();
-        for alias in &self.roost.nests {
+        for alias in &self.runtime.nests {
             if !self.mounts.iter().any(|m| &m.alias == alias) {
                 out.push(MountRef {
                     tenant: tenant.clone(),
@@ -368,7 +381,7 @@ impl Roost {
     /// The tenant a mount with no explicit one belongs to. Operator-configurable, defaulted, never
     /// absent.
     pub fn tenant_default(&self) -> String {
-        self.roost
+        self.runtime
             .default_tenant
             .clone()
             .unwrap_or_else(default_tenant)
@@ -386,7 +399,7 @@ impl Roost {
 
     /// The on-disk directory of a mounted nest, in the pre-2.0 name-keyed layout.
     ///
-    /// Prefer [`Roost::dir_for`], which consults the mount records first. This stays for un-migrated
+    /// Prefer [`MountTable::dir_for`], which consults the mount records first. This stays for un-migrated
     /// roosts and as `migrate`'s source side.
     pub fn nest_dir(dir: &Path, name: &str) -> PathBuf {
         dir.join(NESTS_DIR).join(name)
@@ -397,7 +410,7 @@ impl Roost {
         dir.join(DATA_DIR).join(nid)
     }
 
-    /// The distinct **datasets** this roost mounts, each with every alias serving it (RFC-0032 §4).
+    /// The distinct **datasets** this runtime mounts, each with every alias serving it (RFC-0032 §4).
     ///
     /// This is the function that makes sharing real. Two aliases naming one nest identity are one
     /// dataset: one store, one place in the cursor, **one backfill**. Iterating `nests` directly
@@ -433,13 +446,13 @@ impl Roost {
     /// Where `alias` is served from: `data/<nid>` when a mount record exists, else the pre-2.0
     /// `nests/<alias>`.
     ///
-    /// Both layouts resolve through this one function so a half-migrated roost - some nests adopted,
+    /// Both layouts resolve through this one function so a half-migrated mounts - some nests adopted,
     /// a new one dropped into `nests/` - is a supported state rather than an accident.
     ///
     /// Alias-only, so it resolves the **first** tenant mounting that alias. That is unambiguous in a
     /// single-tenant runtime and correct in a multi-tenant one *because the dataset is shared*: two
     /// tenants with the same alias and the same identity resolve to the same directory anyway. Where
-    /// the tenant matters - routing, health, footprint - use [`Roost::datasets`], which carries it.
+    /// the tenant matters - routing, health, footprint - use [`MountTable::datasets`], which carries it.
     pub fn dir_for(&self, dir: &Path, alias: &str) -> PathBuf {
         match self.mounts.iter().find(|m| m.alias == alias) {
             Some(m) => Self::data_dir(dir, &m.nid),
@@ -447,29 +460,29 @@ impl Roost {
         }
     }
 
-    /// The chains this roost serves, each with its RPC endpoints (RFC-0021). A single-chain roost
-    /// synthesizes one entry from the top-level `chain`/`chain_id`/`rpc_urls`; a multichain roost
+    /// The chains this runtime serves, each with its RPC endpoints (RFC-0021). A single-chain mounts
+    /// synthesizes one entry from the top-level `chain`/`chain_id`/`rpc_urls`; a multichain mounts
     /// returns its `[[chains]]`. Errors if both forms are present (ambiguous) or neither (no chain).
     pub fn chain_endpoints(&self) -> Result<Vec<ChainEndpoint>> {
-        let has_top = self.roost.chain.is_some() || self.roost.chain_id.is_some();
+        let has_top = self.runtime.chain.is_some() || self.runtime.chain_id.is_some();
         if !self.chains.is_empty() {
             if has_top {
                 bail!(
-                    "roost '{}' declares both a top-level chain and [[chains]] - use one form",
-                    self.roost.name
+                    "mounts '{}' declares both a top-level chain and [[chains]] - use one form",
+                    self.runtime.name
                 );
             }
             return Ok(self.chains.clone());
         }
-        match (self.roost.chain.clone(), self.roost.chain_id) {
+        match (self.runtime.chain.clone(), self.runtime.chain_id) {
             (Some(chain), Some(chain_id)) => Ok(vec![ChainEndpoint {
                 chain,
                 chain_id,
-                rpc_urls: self.roost.rpc_urls.clone(),
+                rpc_urls: self.runtime.rpc_urls.clone(),
             }]),
             _ => bail!(
-                "roost '{}' declares no chain - set [roost] chain/chain_id/rpc_urls, or [[chains]]",
-                self.roost.name
+                "mounts '{}' declares no chain - set [mounts] chain/chain_id/rpc_urls, or [[chains]]",
+                self.runtime.name
             ),
         }
     }
@@ -487,7 +500,7 @@ impl Roost {
 pub fn fan_out_aliases(
     datasets: &[Dataset],
     mut states: Vec<(String, crate::serve::AppState)>,
-    health: &crate::health::RoostHealth,
+    health: &crate::health::RuntimeHealth,
     estimates: &mut std::collections::HashMap<String, u64>,
     multi_tenant: bool,
 ) -> Vec<(String, crate::serve::AppState)> {
@@ -544,8 +557,8 @@ pub struct ChainGroup {
     pub nests: Vec<(String, PathBuf, Config)>,
 }
 
-/// Group loaded nests by their declared chain, matching each to a roost chain endpoint (RFC-0021).
-/// A nest whose chain the roost doesn't declare is a hard error; declared-but-unused chains are dropped
+/// Group loaded nests by their declared chain, matching each to a runtime chain endpoint (RFC-0021).
+/// A nest whose chain the runtime doesn't declare is a hard error; declared-but-unused chains are dropped
 /// (a cursor with no nests is pointless). Deterministic order (endpoints as declared).
 pub fn group_by_chain(
     endpoints: &[ChainEndpoint],
@@ -565,8 +578,8 @@ pub fn group_by_chain(
         match idx {
             Some(i) => groups[i].nests.push((name, path, config)),
             None => bail!(
-                "nest '{name}' is on {} (chain_id {}), which this roost doesn't declare - add it under \
-                 [[chains]] (or [roost] chain/chain_id)",
+                "nest '{name}' is on {} (chain_id {}), which this runtime doesn't declare - add it under \
+                 [[chains]] (or [mounts] chain/chain_id)",
                 config.nest.chain,
                 config.nest.chain_id
             ),
@@ -574,7 +587,7 @@ pub fn group_by_chain(
     }
     groups.retain(|g| !g.nests.is_empty());
     if groups.is_empty() {
-        bail!("roost mounts nests but none matched a declared chain");
+        bail!("mounts mounts nests but none matched a declared chain");
     }
     Ok(groups)
 }
@@ -582,10 +595,10 @@ pub fn group_by_chain(
 /// `nuthatch dev --dir <dir>` where `<dir>` holds a mount table: bring up every mounted nest and
 /// serve them behind one listener. Reached from the same `dev` a single nest uses (RFC-0032).
 ///
-/// One shared source drives all nests through a single `indexer::spawn_roost` task per chain (the
+/// One shared source drives all nests through a single `indexer::spawn_runtime` task per chain (the
 /// shared cursor - one `getLogs` per window fanned out to the owning nests). Before starting it
-/// projects the roost's RSS and refuses a mount that would exceed `max_rss` (§3). A cursor that dies
-/// is **quarantined, not fatal** (RFC-0026): its siblings keep indexing and serving, and the roost
+/// projects the runtime's RSS and refuses a mount that would exceed `max_rss` (§3). A cursor that dies
+/// is **quarantined, not fatal** (RFC-0026): its siblings keep indexing and serving, and the runtime
 /// exits only when every cursor is gone - the per-cursor blast-radius rule, actually held.
 #[allow(clippy::too_many_arguments)]
 pub async fn dev(
@@ -599,15 +612,15 @@ pub async fn dev(
     no_admin: bool,
     fail_fast: bool,
 ) -> Result<()> {
-    let roost = Roost::load(&dir)?;
-    let meta = &roost.roost;
-    let endpoints = roost.chain_endpoints()?;
+    let mounts = MountTable::load(&dir)?;
+    let meta = &mounts.runtime;
+    let endpoints = mounts.chain_endpoints()?;
 
     // Load every mounted **dataset** - not every alias (RFC-0032 §4). Aliases sharing one nest
     // identity share one store and one place in the cursor; only the canonical one indexes, and the
     // rest become extra routes onto it further down.
-    let datasets = roost.datasets(&dir);
-    let multi_tenant = roost.is_multi_tenant();
+    let datasets = mounts.datasets(&dir);
+    let multi_tenant = mounts.is_multi_tenant();
     let mut mounted = Vec::with_capacity(datasets.len());
     for ds in &datasets {
         let config = Config::load(&ds.dir).with_context(|| {
@@ -631,7 +644,7 @@ pub async fn dev(
     for ds in &datasets {
         if let Some(ceiling) = crate::allowlist::Ceiling::load(&ds.dir)? {
             for m in &ds.mounts {
-                if let Some(rec) = roost
+                if let Some(rec) = mounts
                     .mounts
                     .iter()
                     .find(|r| r.tenant == m.tenant && r.alias == m.alias)
@@ -660,7 +673,7 @@ pub async fn dev(
     if multi_tenant {
         tracing::info!(
             "multi-tenant: routes are /<tenant>/<nest>/… ({} tenants)",
-            roost
+            mounts
                 .mount_refs()
                 .iter()
                 .map(|m| m.tenant.clone())
@@ -669,18 +682,18 @@ pub async fn dev(
         );
     }
 
-    // `--rpc` is ambiguous once a roost spans chains (which chain would it override?). Allow it only for
-    // a single-chain roost; a multichain roost sets rpc_urls per chain under [[chains]].
+    // `--rpc` is ambiguous once a runtime spans chains (which chain would it override?). Allow it only for
+    // a single-chain mounts; a multichain mounts sets rpc_urls per chain under [[chains]].
     if !rpc_override.is_empty() && groups.len() > 1 {
         bail!(
-            "--rpc is ambiguous for a multichain roost ({} chains) - set rpc_urls per chain under [[chains]]",
+            "--rpc is ambiguous for a multichain mounts ({} chains) - set rpc_urls per chain under [[chains]]",
             groups.len()
         );
     }
     tracing::info!(
         "runtime '{}': mounting {} nest(s) across {} chain(s) - one isolated cursor per chain",
         meta.name,
-        roost.mount_refs().len(), // NOT `meta.nests`, which is empty once the mount table is authoritative
+        mounts.mount_refs().len(), // NOT `meta.nests`, which is empty once the mount table is authoritative
         groups.len(),
     );
 
@@ -689,7 +702,7 @@ pub async fn dev(
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 
-    // Bring up one cursor per chain group: its own source + `spawn_roost`, isolated tip/finality/reorg,
+    // Bring up one cursor per chain group: its own source + `spawn_runtime`, isolated tip/finality/reorg,
     // and held to the per-cursor RSS budget. A cursor's failure quarantines that cursor alone (RFC-0026).
     let mut all_states: Vec<(String, crate::serve::AppState)> = Vec::new();
     let mut ingests: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
@@ -702,18 +715,18 @@ pub async fn dev(
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sources: std::collections::HashMap<String, Arc<dyn Source>> =
         std::collections::HashMap::new();
-    let mut roost_total_mb = ROOST_BASE_RSS_MB;
+    let mut runtime_total_mb = RUNTIME_BASE_RSS_MB;
     // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
     // per request. Replaces the roster snapshot that was built once at startup and could not express
     // "partly working".
-    let health = Arc::new(crate::health::RoostHealth::new());
+    let health = Arc::new(crate::health::RuntimeHealth::new());
 
     for group in groups {
         let rpc_urls = rpc::merge_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
         if rpc_urls.is_empty() {
             bail!(
-                "roost '{}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \
-                 single-chain roost)",
+                "mounts '{}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \
+                 single-chain mounts)",
                 meta.name,
                 group.endpoint.chain
             );
@@ -729,20 +742,20 @@ pub async fn dev(
             cursor_mb += mb;
         }
         tracing::info!(
-            "roost cursor on {} (chain_id {}): {} nest(s), ~{cursor_mb} MB projected; budget {max_rss} MB/cursor",
+            "mounts cursor on {} (chain_id {}): {} nest(s), ~{cursor_mb} MB projected; budget {max_rss} MB/cursor",
             group.endpoint.chain,
             group.endpoint.chain_id,
             group.nests.len(),
         );
         if cursor_mb > max_rss {
             bail!(
-                "roost '{}' cursor on {} projects ~{cursor_mb} MB but max_rss is {max_rss} MB/cursor - \
-                 raise max_rss, drop a nest, or move it to another roost",
+                "mounts '{}' cursor on {} projects ~{cursor_mb} MB but max_rss is {max_rss} MB/cursor - \
+                 raise max_rss, drop a nest, or move it to another mounts",
                 meta.name,
                 group.endpoint.chain
             );
         }
-        roost_total_mb += cursor_mb;
+        runtime_total_mb += cursor_mb;
 
         // Attribute each nest to this chain's cursor, so a cursor fault marks all of them (§5).
         for (name, _, _) in &group.nests {
@@ -750,7 +763,7 @@ pub async fn dev(
         }
 
         // One source + one shared cursor per chain - per-nest tables stay byte-identical to solo `dev`.
-        // Verify the whole pool is on THIS chain first (issue #150). It matters more in a roost than
+        // Verify the whole pool is on THIS chain first (issue #150). It matters more in a runtime than
         // solo: with several chains in one runtime, pasting one chain's endpoint under another's
         // `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
         let rpc = RpcClient::new(rpc_urls)?;
@@ -758,7 +771,7 @@ pub async fn dev(
             .await
             .with_context(|| {
                 format!(
-                    "verifying rpc_urls for roost '{}' cursor on {}",
+                    "verifying rpc_urls for mounts '{}' cursor on {}",
                     meta.name, group.endpoint.chain
                 )
             })?;
@@ -766,7 +779,7 @@ pub async fn dev(
         // Retained so a mount can build a nest against the same source its co-tenants use - a nest
         // mounted at runtime must be indistinguishable from one mounted at boot.
         sources.insert(group.endpoint.chain.clone(), source.clone());
-        let cursor = indexer::spawn_roost(
+        let cursor = indexer::spawn_runtime(
             source,
             group.nests,
             backfill,
@@ -781,7 +794,7 @@ pub async fn dev(
         .await
         .with_context(|| {
             format!(
-                "bringing up roost '{}' cursor on {}",
+                "bringing up mounts '{}' cursor on {}",
                 meta.name, group.endpoint.chain
             )
         })?;
@@ -794,7 +807,7 @@ pub async fn dev(
     }
 
     tracing::info!(
-        "roost footprint: ~{roost_total_mb} MB projected across {} cursor(s)",
+        "mounts footprint: ~{runtime_total_mb} MB projected across {} cursor(s)",
         ingests.len()
     );
 
@@ -805,7 +818,7 @@ pub async fn dev(
     // the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
     // dataset can expose different surfaces over it, and neither the NID nor the data is affected.
     for (key, state) in all_states.iter_mut() {
-        let Some(m) = roost.mounts.iter().find(|m| {
+        let Some(m) = mounts.mounts.iter().find(|m| {
             &MountRef {
                 tenant: m.tenant.clone(),
                 alias: m.alias.clone(),
@@ -833,7 +846,7 @@ pub async fn dev(
     let all_states = all_states;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
-    // roost's real resident set alongside the projection so operators can calibrate.
+    // mounts's real resident set alongside the projection so operators can calibrate.
     let roster_entries: Vec<_> = all_states
         .iter()
         .map(|(name, state)| {
@@ -868,9 +881,9 @@ pub async fn dev(
         })
         .collect();
     let roster = serde_json::json!({
-        "roost": meta.name,
+        "mounts": meta.name,
         "chains": endpoints.iter().map(|e| e.chain.clone()).collect::<Vec<_>>(),
-        "projected_rss_mb": roost_total_mb,
+        "projected_rss_mb": runtime_total_mb,
         "max_rss_mb_per_cursor": max_rss,
         "rss_bytes": crate::metrics::rss_bytes(),
         "nests": roster_entries,
@@ -879,12 +892,12 @@ pub async fn dev(
     // The live handles: what makes the nest set changeable at runtime instead of frozen at boot
     // (RFC-0027). Everything the driver needs to re-compose the router lives here rather than being
     // moved into it and forgotten.
-    let live = crate::serve::LiveRoost::new(crate::serve::compose_roost(
+    let live = crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
         roster.clone(),
         all_states.clone(),
         health.clone(),
     ));
-    let handles = Arc::new(tokio::sync::Mutex::new(RoostHandles {
+    let handles = Arc::new(tokio::sync::Mutex::new(RuntimeHandles {
         live,
         states: all_states,
         alert_workers: std::mem::take(&mut alert_workers),
@@ -894,7 +907,7 @@ pub async fn dev(
         estimates: estimates.clone(),
         mount_ctx: MountContext {
             dir: dir.clone(),
-            mounts: roost.mounts.clone(),
+            mounts: mounts.mounts.clone(),
             sources,
             backfill,
             seal_direct,
@@ -926,7 +939,7 @@ pub async fn dev(
     result
 }
 
-/// Watch every chain cursor, quarantining the ones that die instead of taking the roost down with them
+/// Watch every chain cursor, quarantining the ones that die instead of taking the runtime down with them
 /// (RFC-0026 §6, issue #147).
 ///
 /// The old behaviour was `select_all` over the cursors: the **first** to finish - success or failure -
@@ -935,12 +948,12 @@ pub async fn dev(
 /// rule forbids. Now a dead cursor is retired from the set and logged; its nests keep serving the data
 /// they had (frozen but correct - slice 3 marks them unhealthy so nobody mistakes it for fresh).
 ///
-/// This returns - ending the roost - only when **every** cursor is gone, because at that point nothing
+/// This returns - ending the runtime - only when **every** cursor is gone, because at that point nothing
 /// will ever advance again and a restart is the only thing that can help. Exiting non-zero under a
 /// supervisor beats staying up serving permanently-frozen data.
 async fn supervise_cursors(
     ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
-    health: &crate::health::RoostHealth,
+    health: &crate::health::RuntimeHealth,
     fail_fast: bool,
 ) -> Result<()> {
     let total = ingests.len();
@@ -960,15 +973,15 @@ async fn supervise_cursors(
         };
         match outcome {
             Ok(()) => tracing::info!(
-                "roost cursor on {chain} finished cleanly; {} cursor(s) still indexing",
+                "mounts cursor on {chain} finished cleanly; {} cursor(s) still indexing",
                 ingests.len()
             ),
             Err(e) => {
                 if fail_fast {
-                    bail!("--fail-fast: roost cursor on {chain} died: {e:#}");
+                    bail!("--fail-fast: mounts cursor on {chain} died: {e:#}");
                 }
                 tracing::error!(
-                    "roost cursor on {chain} QUARANTINED: {e:#} - its nests keep serving their last \
+                    "mounts cursor on {chain} QUARANTINED: {e:#} - its nests keep serving their last \
                      indexed state; {} sibling cursor(s) continue unaffected",
                     ingests.len()
                 );
@@ -979,16 +992,16 @@ async fn supervise_cursors(
         }
     }
     if failures.is_empty() {
-        tracing::warn!("every roost cursor ({total}) finished cleanly - nothing left to index");
+        tracing::warn!("every mounts cursor ({total}) finished cleanly - nothing left to index");
         return Ok(());
     }
     bail!(
-        "every roost cursor is dead, so nothing will advance again - {}",
+        "every mounts cursor is dead, so nothing will advance again - {}",
         failures.join("; ")
     )
 }
 
-/// The lifecycle control surface (RFC-0027 §5): mount and unmount a nest on a running roost.
+/// The lifecycle control surface (RFC-0027 §5): mount and unmount a nest on a running mounts.
 ///
 /// Mounted on the **outer** router rather than the composed one, which is what avoids a cycle - the
 /// inner composition is swapped underneath on every change, so routes living there would be replaced
@@ -999,7 +1012,7 @@ async fn supervise_cursors(
 /// to get subtly wrong. `--no-admin` removes these routes entirely, for operators who front their own
 /// control plane and want the runtime to have no lifecycle surface at all.
 pub fn lifecycle_routes(
-    handles: Arc<tokio::sync::Mutex<RoostHandles>>,
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
     admin_enabled: bool,
     admin_token: Option<String>,
 ) -> axum::Router {
@@ -1017,7 +1030,7 @@ pub fn lifecycle_routes(
         name: String,
     }
 
-    type Shared = (Arc<tokio::sync::Mutex<RoostHandles>>, Option<String>);
+    type Shared = (Arc<tokio::sync::Mutex<RuntimeHandles>>, Option<String>);
 
     if !admin_enabled {
         return axum::Router::new();
@@ -1088,38 +1101,38 @@ pub fn lifecycle_routes(
         .with_state((handles, admin_token))
 }
 
-/// Persist the mounted-nest list to `roost.toml` (RFC-0027 §5).
+/// Persist the mounted-nest list to `mounts.toml` (RFC-0027 §5).
 ///
 /// This is the embedded stand-in for RFC-0022's control-plane DB: desired state lives in the *same*
 /// file the static path reads, so a restart converges on whatever the operator last asked for. Without
 /// it, a mount would silently vanish on the next restart - the worst kind of bug, because it looks
 /// like it worked.
 ///
-/// Written temp-then-rename so a crash mid-write cannot leave a roost with a truncated manifest and no
+/// Written temp-then-rename so a crash mid-write cannot leave a runtime with a truncated manifest and no
 /// nests at all.
 ///
 /// The conflict this creates is named rather than left to be discovered: **at runtime nuthatch owns
-/// this list.** An operator who manages `roost.toml` with configuration management should run
+/// this list.** An operator who manages `mounts.toml` with configuration management should run
 /// `--no-admin` and restart to change the set, because fighting a config-management tool over a file
 /// is a losing game.
 fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
     let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
-    let mut roost: Roost = toml::from_str(&raw)
+    let mut mounts: MountTable = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
     // `nests` here are **route keys** - tenant-qualified when the runtime is multi-tenant - because
     // that is what the serving layer and the admin API name a mount by. Matching them against
-    // `alias` alone would drop every mount in a multi-tenant roost on the first unmount.
-    let multi_tenant = roost.is_multi_tenant();
-    if roost.mounts.is_empty() {
-        roost.roost.nests = nests.to_vec();
+    // `alias` alone would drop every mount in a multi-tenant mounts on the first unmount.
+    let multi_tenant = mounts.is_multi_tenant();
+    if mounts.mounts.is_empty() {
+        mounts.runtime.nests = nests.to_vec();
     } else {
         // Drop the records for mounts that are gone, or the next `load` refuses the file it just
         // wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5 makes
         // collection explicit, because re-backfilling is precisely the cost this design exists to
         // avoid and an accidental unmount must not trigger one.
-        roost.mounts.retain(|m| {
+        mounts.mounts.retain(|m| {
             let key = MountRef {
                 tenant: m.tenant.clone(),
                 alias: m.alias.clone(),
@@ -1127,23 +1140,23 @@ fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
             .route_key(multi_tenant);
             nests.contains(&key)
         });
-        roost.roost.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
+        mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
     }
-    let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
+    let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
-/// The handles a roost driver keeps so it can change its nest set while running (RFC-0027 §6).
+/// The handles a runtime driver keeps so it can change its nest set while running (RFC-0027 §6).
 ///
-/// Before this, `roost::dev` moved every `AppState` into the composed router and kept nothing, so the
+/// Before this, `runtime::dev` moved every `AppState` into the composed router and kept nothing, so the
 /// only way to change the mounted set was to restart the process - which stops every co-tenant nest
 /// too. Retaining them is what makes an unmount possible at all.
-pub struct RoostHandles {
+pub struct RuntimeHandles {
     /// The swappable composition being served (RFC-0027 slice 1).
-    pub live: crate::serve::LiveRoost,
+    pub live: crate::serve::LiveRuntime,
     /// Per-nest serving state, in roster order.
     pub states: Vec<(String, crate::serve::AppState)>,
     /// Alert delivery workers keyed by nest - each holds that nest's `Store` clone.
@@ -1153,7 +1166,7 @@ pub struct RoostHandles {
         String,
         tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
     >,
-    pub health: Arc<crate::health::RoostHealth>,
+    pub health: Arc<crate::health::RuntimeHealth>,
     /// The static half of the roster, re-merged with live health per request.
     pub roster: serde_json::Value,
     /// Per-nest projected RSS, so a mount can price the cursor it is joining without re-reading
@@ -1164,18 +1177,18 @@ pub struct RoostHandles {
     pub mount_ctx: MountContext,
 }
 
-/// The context a running roost needs in order to build and admit a nest (RFC-0027 §3).
+/// The context a running mounts needs in order to build and admit a nest (RFC-0027 §3).
 ///
 /// Deliberately captured at startup rather than re-derived per mount: a nest mounted at 3am must be
 /// built with the same backfill mode, concurrency, window and admin posture as its co-tenants, or two
-/// nests in one roost would behave differently for no reason an operator could see.
+/// nests in one mounts would behave differently for no reason an operator could see.
 #[derive(Clone)]
 pub struct MountContext {
-    /// The roost directory; a nest lives at `data/<nid>/`, or `nests/<name>/` if un-migrated.
+    /// The runtime directory; a nest lives at `data/<nid>/`, or `nests/<name>/` if un-migrated.
     pub dir: PathBuf,
     /// The mount records as of startup (RFC-0032 §4), so a live mount resolves its dataset the same
     /// way the static path does. A runtime mount of a nest with no record still resolves through
-    /// the pre-2.0 layout - a half-migrated roost is a supported state, not an accident.
+    /// the pre-2.0 layout - a half-migrated mounts is a supported state, not an accident.
     pub mounts: Vec<Mount>,
     /// Chain -> the source driving that chain's cursor. A nest whose chain is absent cannot be mounted.
     pub sources: std::collections::HashMap<String, Arc<dyn Source>>,
@@ -1195,7 +1208,7 @@ pub struct MountContext {
 pub enum MountRefusal {
     /// Mounting over a live name is an *upgrade*, and that is RFC-0020's job.
     AlreadyMounted(String),
-    /// The roost declares no cursor for this nest's chain. Adding a chain at runtime is a non-goal.
+    /// The mounts declares no cursor for this nest's chain. Adding a chain at runtime is a non-goal.
     UndeclaredChain { nest: String, chain: String },
     /// The cursor's projected footprint would exceed its ceiling. A refusal, not a warning - the
     /// budget stops being a budget the moment it becomes advisory.
@@ -1216,7 +1229,7 @@ impl std::fmt::Display for MountRefusal {
             ),
             MountRefusal::UndeclaredChain { nest, chain } => write!(
                 f,
-                "nest '{nest}' is on {chain}, which this roost declares no cursor for - add it under \
+                "nest '{nest}' is on {chain}, which this runtime declares no cursor for - add it under \
                  [[chains]] and restart"
             ),
             MountRefusal::OverBudget {
@@ -1227,7 +1240,7 @@ impl std::fmt::Display for MountRefusal {
             } => write!(
                 f,
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
-                 {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another roost"
+                 {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
         }
     }
@@ -1243,8 +1256,8 @@ impl std::error::Error for MountRefusal {}
 /// tear the routes down while it is still writing.
 const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-impl RoostHandles {
-    /// Mount a nest into the running roost (RFC-0027 §3-§4).
+impl RuntimeHandles {
+    /// Mount a nest into the running mounts (RFC-0027 §3-§4).
     ///
     /// Admission first, work second: every refusal is decided before a store is opened or a block is
     /// fetched, so a rejected mount costs nothing and leaves nothing behind.
@@ -1273,8 +1286,8 @@ impl RoostHandles {
             .iter()
             .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
         let dir = match record {
-            Some(m) => Roost::data_dir(&self.mount_ctx.dir, &m.nid),
-            None => Roost::nest_dir(&self.mount_ctx.dir, alias),
+            Some(m) => MountTable::data_dir(&self.mount_ctx.dir, &m.nid),
+            None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
         let config = Config::load(&dir)
             .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
@@ -1297,7 +1310,7 @@ impl RoostHandles {
 
         // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
         // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
-        // against *this cursor's* current membership, not the whole roost - the ceiling is per cursor.
+        // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
         let has_labels = !crate::labels::load(&dir).is_empty();
         let incoming = estimate_nest_rss_mb(&config, has_labels);
         let existing: u64 = self
@@ -1306,7 +1319,7 @@ impl RoostHandles {
             .filter(|(_, s)| s.chain == chain)
             .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
             .sum();
-        let projected = ROOST_BASE_RSS_MB + existing + incoming;
+        let projected = RUNTIME_BASE_RSS_MB + existing + incoming;
         if projected > self.mount_ctx.max_rss_mb {
             return Err(MountRefusal::OverBudget {
                 nest: name.to_string(),
@@ -1332,7 +1345,7 @@ impl RoostHandles {
         )
         .await
         .with_context(|| format!("preparing nest '{name}' for mount"))?;
-        state.roost_health = Some((name.to_string(), self.health.clone()));
+        state.runtime_health = Some((name.to_string(), self.health.clone()));
 
         // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -1359,7 +1372,7 @@ impl RoostHandles {
         }
         self.estimates.insert(name.to_string(), incoming);
         self.states.push((name.to_string(), state));
-        self.live.swap(crate::serve::compose_roost(
+        self.live.swap(crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
             self.health.clone(),
@@ -1369,7 +1382,7 @@ impl RoostHandles {
         Ok(())
     }
 
-    /// Write the current mounted set to `roost.toml`.
+    /// Write the current mounted set to `mounts.toml`.
     ///
     /// Best-effort by design: the mount or unmount has *already happened* in the running process, and
     /// failing the operation because the manifest could not be rewritten would leave the caller with a
@@ -1379,7 +1392,7 @@ impl RoostHandles {
         let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
         if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names) {
             tracing::warn!(
-                "the roost's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
+                "the runtime's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
                  change is live now but will not survive a restart"
             );
         }
@@ -1454,13 +1467,13 @@ impl RoostHandles {
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
-        self.live.swap(crate::serve::compose_roost(
+        self.live.swap(crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
             self.health.clone(),
         ));
         self.persist();
-        tracing::info!("nest '{name}' unmounted from the roost");
+        tracing::info!("nest '{name}' unmounted from the runtime");
         Ok(())
     }
 }
@@ -1470,7 +1483,7 @@ mod tests {
     use super::*;
     use crate::config::CONFIG_FILE;
 
-    /// Write a minimal roost.toml + one nest dir on the given chain.
+    /// Write a minimal mounts.toml + one nest dir on the given chain.
     fn write_roost(dir: &Path, chain: &str, chain_id: u64, nest_chain: &str, nest_chain_id: u64) {
         std::fs::write(
             dir.join(MOUNTS_FILE),
@@ -1480,7 +1493,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let nest = Roost::nest_dir(dir, "a");
+        let nest = MountTable::nest_dir(dir, "a");
         std::fs::create_dir_all(&nest).unwrap();
         std::fs::write(
             nest.join(CONFIG_FILE),
@@ -1494,9 +1507,9 @@ mod tests {
         std::fs::write(nest.join("abi.json"), "[]").unwrap();
     }
 
-    /// Write a nest dir on a given chain under a roost (for multichain grouping tests).
+    /// Write a nest dir on a given chain under a runtime (for multichain grouping tests).
     fn write_nest_dir(roost_dir: &Path, name: &str, chain: &str, chain_id: u64) {
-        let nest = Roost::nest_dir(roost_dir, name);
+        let nest = MountTable::nest_dir(roost_dir, name);
         std::fs::create_dir_all(&nest).unwrap();
         std::fs::write(
             nest.join(CONFIG_FILE),
@@ -1510,8 +1523,8 @@ mod tests {
     }
 
     fn mounted(roost_dir: &Path, name: &str) -> (String, PathBuf, Config) {
-        let roost = Roost::load(roost_dir).unwrap();
-        let p = roost.dir_for(roost_dir, name);
+        let mounts = MountTable::load(roost_dir).unwrap();
+        let p = mounts.dir_for(roost_dir, name);
         let c = Config::load(&p).unwrap();
         (name.to_string(), p, c)
     }
@@ -1520,7 +1533,7 @@ mod tests {
         ds.mounts.iter().map(|m| m.alias.clone()).collect()
     }
 
-    /// The unmount path rewrites `roost.toml` from **route keys**, which are tenant-qualified in a
+    /// The unmount path rewrites `mounts.toml` from **route keys**, which are tenant-qualified in a
     /// multi-tenant runtime. Matching them against `alias` alone would retain nothing and silently
     /// unmount every co-tenant on the first unmount - so this asserts the survivor, not the casualty.
     #[test]
@@ -1542,7 +1555,7 @@ mod tests {
         // acme unmounts; the runtime persists what is left, by route key.
         persist_mounted_nests(root, &["globex/usdc".to_string()]).unwrap();
 
-        let after = Roost::load(root).expect("the rewritten file must still load");
+        let after = MountTable::load(root).expect("the rewritten file must still load");
         assert_eq!(after.mounts.len(), 1, "the co-tenant's mount was dropped");
         assert_eq!(after.mounts[0].tenant, "globex");
         assert_eq!(after.mounts[0].alias, "usdc");
@@ -1552,7 +1565,7 @@ mod tests {
         );
     }
 
-    /// RFC-0032 slice 5: the roost is retired, so a directory still holding the pre-2.0 file is a
+    /// RFC-0032 slice 5: the runtime is retired, so a directory still holding the pre-2.0 file is a
     /// **migration that has not been run** - and must say so, rather than reporting a missing
     /// `mounts.toml` an operator never had.
     #[test]
@@ -1564,7 +1577,7 @@ mod tests {
              rpc_urls = []\nnests = [\"a\"]\n",
         )
         .unwrap();
-        let err = Roost::load(d.path()).unwrap_err().to_string();
+        let err = MountTable::load(d.path()).unwrap_err().to_string();
         assert!(
             err.contains("nuthatch migrate"),
             "the error must name the fix: {err}"
@@ -1588,11 +1601,11 @@ mod tests {
             ),
         )
         .unwrap();
-        let roost = Roost::load(d.path()).expect("a migrated directory loads");
-        assert_eq!(roost.mounts.len(), 1);
+        let mounts = MountTable::load(d.path()).expect("a migrated directory loads");
+        assert_eq!(mounts.mounts.len(), 1);
     }
 
-    /// RFC-0032 §4: grouping is by *dataset*, and a roost may be half-migrated while it happens.
+    /// RFC-0032 §4: grouping is by *dataset*, and a runtime may be half-migrated while it happens.
     #[test]
     fn datasets_group_by_identity_across_both_layouts() {
         let d = tempfile::tempdir().unwrap();
@@ -1606,8 +1619,8 @@ mod tests {
                 .replace("aa11", &"aa11".repeat(16)),
         )
         .unwrap();
-        let roost = Roost::load(root).unwrap();
-        let ds = roost.datasets(root);
+        let mounts = MountTable::load(root).unwrap();
+        let ds = mounts.datasets(root);
 
         // Two migrated aliases collapse to one dataset; the un-migrated nest keeps its own.
         assert_eq!(ds.len(), 2, "expected 2 datasets, got {ds:?}");
@@ -1625,7 +1638,7 @@ mod tests {
         assert!(ds[1].dir.starts_with(root.join(NESTS_DIR)));
     }
 
-    /// A mount record is untrusted input - `roost.toml` is operator-editable and a roster may come
+    /// A mount record is untrusted input - `mounts.toml` is operator-editable and a roster may come
     /// from a resolved bundle - so the identity and the path segments are checked at load.
     #[test]
     fn a_mount_record_is_validated() {
@@ -1659,7 +1672,7 @@ mod tests {
             ),
         ] {
             std::fs::write(root.join(MOUNTS_FILE), format!("{base}{record}")).unwrap();
-            let err = Roost::load(root).unwrap_err().to_string();
+            let err = MountTable::load(root).unwrap_err().to_string();
             assert!(err.contains(expect), "expected {expect:?}, got: {err}");
         }
 
@@ -1672,30 +1685,30 @@ mod tests {
             ),
         )
         .unwrap();
-        let roost = Roost::load(root).expect("two tenants may share an alias");
-        assert!(roost.is_multi_tenant());
-        assert_eq!(roost.mount_refs().len(), 2);
+        let mounts = MountTable::load(root).expect("two tenants may share an alias");
+        assert!(mounts.is_multi_tenant());
+        assert_eq!(mounts.mount_refs().len(), 2);
     }
 
     #[test]
     fn loads_a_valid_roost() {
         let d = tempfile::tempdir().unwrap();
         write_roost(d.path(), "arbitrum-one", 42161, "arbitrum-one", 42161);
-        let r = Roost::load(d.path()).unwrap();
-        assert_eq!(r.roost.chain.as_deref(), Some("arbitrum-one"));
-        assert_eq!(r.roost.nests, vec!["a"]);
-        // A single-chain roost resolves to exactly one endpoint.
+        let r = MountTable::load(d.path()).unwrap();
+        assert_eq!(r.runtime.chain.as_deref(), Some("arbitrum-one"));
+        assert_eq!(r.runtime.nests, vec!["a"]);
+        // A single-chain mounts resolves to exactly one endpoint.
         assert_eq!(r.chain_endpoints().unwrap().len(), 1);
     }
 
     #[test]
     fn rejects_a_nest_whose_chain_isnt_declared() {
         let d = tempfile::tempdir().unwrap();
-        // Roost declares arbitrum-one; the nest claims mainnet → hard error at grouping.
+        // MountTable declares arbitrum-one; the nest claims mainnet → hard error at grouping.
         write_roost(d.path(), "arbitrum-one", 42161, "mainnet", 1);
-        let roost = Roost::load(d.path()).unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
         let err = group_by_chain(
-            &roost.chain_endpoints().unwrap(),
+            &mounts.chain_endpoints().unwrap(),
             vec![mounted(d.path(), "a")],
         )
         .unwrap_err()
@@ -1715,8 +1728,8 @@ mod tests {
         .unwrap();
         write_nest_dir(d.path(), "a", "base", 8453);
         write_nest_dir(d.path(), "b", "arbitrum-one", 42161);
-        let roost = Roost::load(d.path()).unwrap();
-        let endpoints = roost.chain_endpoints().unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
+        let endpoints = mounts.chain_endpoints().unwrap();
         assert_eq!(endpoints.len(), 2, "two declared chains");
         let groups = group_by_chain(
             &endpoints,
@@ -1738,8 +1751,8 @@ mod tests {
              [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = [\"v\"]\n",
         )
         .unwrap();
-        let roost = Roost::load(d.path()).unwrap();
-        let err = roost.chain_endpoints().unwrap_err().to_string();
+        let mounts = MountTable::load(d.path()).unwrap();
+        let err = mounts.chain_endpoints().unwrap_err().to_string();
         assert!(
             err.contains("both a top-level chain and [[chains]]"),
             "got: {err}"
@@ -1756,7 +1769,7 @@ mod tests {
                 format!("[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"{bad}\"]\n"),
             )
             .unwrap();
-            let err = Roost::load(d.path()).unwrap_err().to_string();
+            let err = MountTable::load(d.path()).unwrap_err().to_string();
             assert!(
                 err.contains("invalid") || err.contains("reserved"),
                 "name {bad:?} should be rejected, got: {err}"
@@ -1772,7 +1785,7 @@ mod tests {
             "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"nests\"]\n",
         )
         .unwrap();
-        assert!(Roost::load(d.path())
+        assert!(MountTable::load(d.path())
             .unwrap_err()
             .to_string()
             .contains("reserved"));
@@ -1782,7 +1795,7 @@ mod tests {
             "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"a\", \"a\"]\n",
         )
         .unwrap();
-        assert!(Roost::load(d.path())
+        assert!(MountTable::load(d.path())
             .unwrap_err()
             .to_string()
             .contains("more than once"));
@@ -1796,7 +1809,7 @@ mod tests {
             "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = []\n",
         )
         .unwrap();
-        assert!(Roost::load(d.path())
+        assert!(MountTable::load(d.path())
             .unwrap_err()
             .to_string()
             .contains("mounts nothing"));
@@ -1874,8 +1887,8 @@ mod tests {
             ("arbitrum-one".to_string(), healthy),
         ];
         // The supervisor must NOT return while a healthy cursor is still indexing: returning is what
-        // ends the roost.
-        let health = crate::health::RoostHealth::new();
+        // ends the runtime.
+        let health = crate::health::RuntimeHealth::new();
         health.register("nest-a", "base");
         health.register("nest-b", "arbitrum-one");
         let returned = tokio::time::timeout(
@@ -1885,7 +1898,7 @@ mod tests {
         .await;
         assert!(
             returned.is_err(),
-            "the roost ended even though a healthy cursor was still indexing"
+            "the runtime ended even though a healthy cursor was still indexing"
         );
 
         // The dead cursor was retired from the set; the healthy one is untouched and still working.
@@ -1903,11 +1916,14 @@ mod tests {
         // living chain's is not (RFC-0026 §5).
         assert_eq!(health.json_for("nest-a").0, "quarantined");
         assert_eq!(health.json_for("nest-b").0, "indexing");
-        assert!(!health.all_indexing(), "a partly-broken roost is not ready");
+        assert!(
+            !health.all_indexing(),
+            "a partly-broken mounts is not ready"
+        );
         ingests[0].1.abort();
     }
 
-    /// RFC-0026 §6: the roost exits only once **every** cursor is gone - at that point nothing will
+    /// RFC-0026 §6: the runtime exits only once **every** cursor is gone - at that point nothing will
     /// ever advance again, so exiting non-zero under a supervisor beats serving permanently-frozen
     /// data. The error must name every dead chain, since that is the operator's starting point.
     #[tokio::test]
@@ -1919,7 +1935,7 @@ mod tests {
         });
         let mut ingests = vec![("base".to_string(), a), ("arbitrum-one".to_string(), b)];
 
-        let health = crate::health::RoostHealth::new();
+        let health = crate::health::RuntimeHealth::new();
         let err = supervise_cursors(&mut ingests, &health, false)
             .await
             .unwrap_err();

@@ -20,13 +20,13 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Dataset, Roost, DATA_DIR, MOUNTS_FILE};
+use nuthatch::runtime::{Dataset, MountTable, DATA_DIR, MOUNTS_FILE};
 use nuthatch::store::HotStore;
-use nuthatch::{analytics, health::RoostHealth, indexer, migrate, roost};
+use nuthatch::{analytics, health::RuntimeHealth, indexer, migrate, runtime};
 
 use common::tape::*;
 
-/// A one-nest roost in the pre-2.0 layout, migrated, then given a second alias onto the same
+/// A one-nest mounts in the pre-2.0 layout, migrated, then given a second alias onto the same
 /// identity - which is exactly what a second tenant mounting the same nest produces.
 fn two_mounts_one_nest(root: &Path) -> String {
     std::fs::write(
@@ -40,13 +40,13 @@ fn two_mounts_one_nest(root: &Path) -> String {
     scaffold_nest(&nest, "primary", USDC);
 
     migrate::run(root, false, false).expect("migrate");
-    let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+    let nid = MountTable::load(root).unwrap().mounts[0].nid.clone();
 
     // The second mount: a different alias, the same identity. No second directory, no second copy.
-    let mut roost = Roost::load(root).unwrap();
-    roost.roost.nests.push("mirror".to_string());
-    roost.mounts.push(nuthatch::roost::Mount {
-        tenant: roost.tenant_default(),
+    let mut mounts = MountTable::load(root).unwrap();
+    mounts.runtime.nests.push("mirror".to_string());
+    mounts.mounts.push(nuthatch::runtime::Mount {
+        tenant: mounts.tenant_default(),
         alias: "mirror".to_string(),
         nid: nid.clone(),
         sql: Default::default(),
@@ -54,7 +54,7 @@ fn two_mounts_one_nest(root: &Path) -> String {
     });
     std::fs::write(
         root.join(MOUNTS_FILE),
-        toml::to_string_pretty(&roost).unwrap(),
+        toml::to_string_pretty(&mounts).unwrap(),
     )
     .unwrap();
     nid
@@ -71,7 +71,7 @@ fn rows(dir: &Path, nest: &str) -> Vec<serde_json::Value> {
     .unwrap()
 }
 
-/// Drive a roost dir the way `roost::dev` does - datasets, not aliases - and hand back the served
+/// Drive a runtime dir the way `runtime::dev` does - datasets, not aliases - and hand back the served
 /// states plus the tape, so the test asserts against the same wiring production uses.
 async fn bring_up(
     root: &Path,
@@ -80,9 +80,9 @@ async fn bring_up(
     Arc<TapeSource>,
     std::collections::HashMap<String, u64>,
 ) {
-    let roost = Roost::load(root).unwrap();
-    let datasets = roost.datasets(root);
-    let multi_tenant = roost.is_multi_tenant();
+    let mounts = MountTable::load(root).unwrap();
+    let datasets = mounts.datasets(root);
+    let multi_tenant = mounts.is_multi_tenant();
 
     let tape = Arc::new(TapeSource::new());
     let a1 = account(1);
@@ -109,11 +109,11 @@ async fn bring_up(
         })
         .collect();
 
-    let health = Arc::new(RoostHealth::new());
+    let health = Arc::new(RuntimeHealth::new());
     for ds in &datasets {
         health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
     }
-    let cursor = indexer::spawn_roost(
+    let cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
         None,
@@ -126,7 +126,7 @@ async fn bring_up(
         false,
     )
     .await
-    .expect("spawn_roost");
+    .expect("spawn_runtime");
 
     let landed = wait_until(POLL_TIMEOUT, || {
         cursor
@@ -152,7 +152,7 @@ async fn bring_up(
     assert!(sealed, "the dataset did not seal in time");
 
     let mut estimates = std::collections::HashMap::new();
-    let states = roost::fan_out_aliases(
+    let states = runtime::fan_out_aliases(
         &datasets,
         cursor.states,
         &health,
@@ -174,8 +174,8 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
     let nid = two_mounts_one_nest(root);
 
     // --- The grouping: two aliases collapse to one dataset before anything is opened. ---
-    let roost = Roost::load(root).unwrap();
-    let datasets = roost.datasets(root);
+    let mounts = MountTable::load(root).unwrap();
+    let datasets = mounts.datasets(root);
     assert_eq!(
         datasets.len(),
         1,
@@ -268,7 +268,7 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
 /// answer `/ready` exists to prevent.
 #[test]
 fn an_alias_reports_the_health_of_the_dataset_it_shares() {
-    let health = RoostHealth::new();
+    let health = RuntimeHealth::new();
     health.register("primary", "arbitrum-one");
     health.register_alias("mirror", "primary", "arbitrum-one");
 
@@ -311,27 +311,27 @@ async fn two_tenants_mounting_one_nest_share_it() {
     scaffold_nest(&nest, "usdc", USDC);
     migrate::run(root, false, false).expect("migrate");
 
-    let mut roost = Roost::load(root).unwrap();
+    let mut mounts = MountTable::load(root).unwrap();
     assert_eq!(
-        roost.mounts[0].tenant, "default",
+        mounts.mounts[0].tenant, "default",
         "migration must relabel to the default tenant, not leave it absent"
     );
     assert!(
-        !roost.is_multi_tenant(),
+        !mounts.is_multi_tenant(),
         "one tenant must stay single-tenant - the route segment would be pure ceremony"
     );
-    let nid = roost.mounts[0].nid.clone();
+    let nid = mounts.mounts[0].nid.clone();
 
     // Two tenants, both calling it `usdc`. Same identity, so the same dataset.
-    roost.mounts = vec![
-        nuthatch::roost::Mount {
+    mounts.mounts = vec![
+        nuthatch::runtime::Mount {
             tenant: "acme".into(),
             alias: "usdc".into(),
             nid: nid.clone(),
             sql: Default::default(),
             queries: Vec::new(),
         },
-        nuthatch::roost::Mount {
+        nuthatch::runtime::Mount {
             tenant: "globex".into(),
             alias: "usdc".into(),
             nid: nid.clone(),
@@ -339,17 +339,17 @@ async fn two_tenants_mounting_one_nest_share_it() {
             queries: Vec::new(),
         },
     ];
-    roost.roost.nests.clear(); // `[[mounts]]` is authoritative once present
+    mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative once present
     std::fs::write(
         root.join(MOUNTS_FILE),
-        toml::to_string_pretty(&roost).unwrap(),
+        toml::to_string_pretty(&mounts).unwrap(),
     )
     .unwrap();
 
-    let roost = Roost::load(root).expect("a two-tenant roost must load");
-    assert!(roost.is_multi_tenant());
+    let mounts = MountTable::load(root).expect("a two-tenant mounts must load");
+    assert!(mounts.is_multi_tenant());
 
-    let ds = roost.datasets(root);
+    let ds = mounts.datasets(root);
     assert_eq!(ds.len(), 1, "two tenants, one dataset - got {ds:?}");
     assert_eq!(ds[0].refcount(), 2);
     assert_eq!(
@@ -381,7 +381,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
     assert_eq!(rows(&acme.dir, "usdc"), rows(&globex.dir, "usdc"));
 
     // Unmounting one tenant leaves the other serving, and leaves the data alone (RFC-0032 §5).
-    let mut after = Roost::load(root).unwrap();
+    let mut after = MountTable::load(root).unwrap();
     after.mounts.retain(|m| m.tenant != "acme");
     std::fs::write(
         root.join(MOUNTS_FILE),
@@ -389,7 +389,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
     )
     .unwrap();
 
-    let after = Roost::load(root).unwrap();
+    let after = MountTable::load(root).unwrap();
     let ds = after.datasets(root);
     assert_eq!(ds.len(), 1);
     assert_eq!(
@@ -428,7 +428,7 @@ fn a_tenant_is_still_a_path_segment() {
             ),
         )
         .unwrap();
-        let err = Roost::load(root).unwrap_err().to_string();
+        let err = MountTable::load(root).unwrap_err().to_string();
         assert!(
             err.contains(expect),
             "tenant {tenant:?}: expected {expect:?}, got: {err}"

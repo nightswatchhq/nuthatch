@@ -245,7 +245,7 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
     let hard = cap.map(|c| c + 1);
     // A row cap alone bounds row *count*, not row *width*: the materialised `Vec<Value>` lives Rust-side,
     // outside DuckDB's `memory_limit`, so `SELECT repeat('A', 20000000) FROM range(50000)` would accrue
-    // ~1 TB before the wall-clock guard fires - breaching the <=2 GB per-cursor budget and, in a roost,
+    // ~1 TB before the wall-clock guard fires - breaching the <=2 GB per-cursor budget and, in a runtime,
     // OOM-killing co-tenants. The guarded (untrusted `/sql`) path therefore also caps cumulative result
     // bytes. Trusted unguarded queries (`cap = None`: registry-built folds, cold seeds) are never
     // byte-capped, so a large token's balance rebuild is never silently truncated.
