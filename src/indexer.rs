@@ -1579,6 +1579,28 @@ async fn build_nest(
         }
     }
 
+    // Grafting (RFC-0033): tell the author up front what will and will not be reusable, rather than
+    // leaving them to wonder why edits stay slow. A **cycle is a refusal** - derivations read decoded
+    // events and other derivations, never themselves, so a cycle means the nest is malformed (§6).
+    // Everything else is advisory: a volatile view is legal to author, it simply cannot be cached, and
+    // refusing to start over one would break nests that work today.
+    let graft = crate::graft::report(&dir);
+    if let Some(cycle) = &graft.cycle {
+        anyhow::bail!(
+            "this nest's derivations form a cycle: {cycle}. A derivation may read decoded events and \
+             other derivations, never itself - break the loop and reload."
+        );
+    }
+    for (view, why) in &graft.never_graftable {
+        tracing::warn!("view {view} can never be reused across an edit: it {why}");
+    }
+    if !graft.uncanonical.is_empty() {
+        tracing::debug!(
+            "views whose plan could not be canonicalised (only a byte-identical edit will match): {}",
+            graft.uncanonical.join(", ")
+        );
+    }
+
     // A nest that vendors deployment blocks backfills from the earliest one (full history from
     // deployment); otherwise a cold start falls back to the `--backfill` tip offset.
     let start_block = config.contracts.iter().filter_map(|c| c.start_block).min();

@@ -326,6 +326,63 @@ impl Derivation {
     }
 }
 
+/// What a nest's authored derivations look like to the grafting layer (RFC-0033).
+///
+/// Produced at nest load and at `nuthatch check`, so an author is told *why* a view will never graft
+/// rather than discovering that edits stay slow. This is the seam that makes the reuse key, the DAG
+/// and the refusal list reachable rather than merely present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraftReport {
+    /// A derivation that can never be reused, and why (RFC-0033 §4).
+    pub never_graftable: Vec<(String, String)>,
+    /// A derivation whose plan could not be canonicalised, so only a byte-identical edit will match.
+    pub uncanonical: Vec<String>,
+    /// The cycle among derivations, if the nest has one - a load-time refusal (RFC-0033 §6).
+    pub cycle: Option<Cycle>,
+}
+
+impl GraftReport {
+    pub fn is_clean(&self) -> bool {
+        self.never_graftable.is_empty() && self.uncanonical.is_empty() && self.cycle.is_none()
+    }
+}
+
+/// Inspect a nest's `views/*.sql` for everything the grafting layer can tell an author up front.
+///
+/// Deliberately **advisory except for the cycle**: a volatile view is a perfectly legal thing to
+/// author, it simply cannot be cached, and refusing to start over it would be a regression for nests
+/// that work today. A cycle is different - it is malformed, and RFC-0033 §6 makes it a refusal.
+pub fn report(nest_dir: &std::path::Path) -> GraftReport {
+    let Ok(conn) = parser_connection() else {
+        return GraftReport {
+            never_graftable: Vec::new(),
+            uncanonical: Vec::new(),
+            cycle: None,
+        };
+    };
+    let files: Vec<(String, String)> = crate::analytics::nest_view_files(nest_dir)
+        .into_iter()
+        .map(|v| (v.file, v.sql))
+        .collect();
+    let dag = Dag::build(&conn, &files);
+
+    let mut never_graftable = Vec::new();
+    let mut uncanonical = Vec::new();
+    for node in &dag.nodes {
+        for r in static_refusals(&node.plan) {
+            never_graftable.push((node.name.clone(), r.to_string()));
+        }
+        if !node.plan.is_canonical() {
+            uncanonical.push(node.name.clone());
+        }
+    }
+    GraftReport {
+        never_graftable,
+        uncanonical,
+        cycle: dag.find_cycle(),
+    }
+}
+
 /// Open a connection suitable for canonicalisation. No data is attached: parsing needs no catalogue.
 pub fn parser_connection() -> Result<Connection> {
     Connection::open_in_memory().context("opening DuckDB to canonicalise a derivation")
@@ -745,6 +802,67 @@ mod tests {
             node.inputs.is_empty() && node.sources == vec!["loop_v"],
             "a self-reference should not become an edge: {node:?}"
         );
+    }
+
+    // ---- the seam: what a nest load and `nuthatch check` actually see ----
+
+    fn nest_with_views(views: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("views")).unwrap();
+        for (f, sql) in views {
+            std::fs::write(d.path().join("views").join(f), sql).unwrap();
+        }
+        d
+    }
+
+    /// The whole point of wiring: an author is told *why* a view will never be reusable, by name.
+    #[test]
+    fn the_report_names_a_never_graftable_view() {
+        let d = nest_with_views(&[
+            (
+                "10-pure.sql",
+                "CREATE VIEW pure AS SELECT k FROM usdc__transfer",
+            ),
+            (
+                "20-volatile.sql",
+                "CREATE VIEW volatile_v AS SELECT now() AS t FROM usdc__transfer",
+            ),
+        ]);
+        let r = report(d.path());
+        assert!(r.cycle.is_none());
+        assert_eq!(r.never_graftable.len(), 1, "{r:?}");
+        assert_eq!(r.never_graftable[0].0, "volatile_v");
+        assert!(
+            r.never_graftable[0].1.contains("now()"),
+            "the reason must name the function: {r:?}"
+        );
+    }
+
+    /// A nest with no views is clean, not broken - the overwhelmingly common case must stay silent.
+    #[test]
+    fn a_nest_without_views_reports_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(report(d.path()).is_clean());
+
+        // ...and so does a nest whose views are all ordinary.
+        let d = nest_with_views(&[(
+            "10-ok.sql",
+            "CREATE VIEW ok AS SELECT k FROM usdc__transfer",
+        )]);
+        assert!(report(d.path()).is_clean(), "{:?}", report(d.path()));
+    }
+
+    /// A cycle is the one thing the report escalates to a refusal (RFC-0033 §6).
+    #[test]
+    fn the_report_surfaces_a_cycle_for_the_caller_to_refuse() {
+        let d = nest_with_views(&[
+            ("10-a.sql", "CREATE VIEW a AS SELECT x FROM b"),
+            ("20-b.sql", "CREATE VIEW b AS SELECT x FROM a"),
+        ]);
+        let r = report(d.path());
+        let cycle = r.cycle.clone().expect("a -> b -> a is a cycle").to_string();
+        assert!(cycle.contains('a') && cycle.contains('b'), "{cycle}");
+        assert!(!r.is_clean());
     }
 
     // ---- slice 3: refusals and the determinism gate ----

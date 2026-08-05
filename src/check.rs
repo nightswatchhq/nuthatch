@@ -20,6 +20,27 @@ use crate::cli::CheckArgs;
 
 pub fn check(args: CheckArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
+
+    // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
+    // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
+    // their views can never be reused. Reporting it after the bail made this dead code for most
+    // nests - found by running the command rather than by the tests, which supplied a checks dir.
+    let graft = crate::graft::report(&dir);
+    if let Some(cycle) = &graft.cycle {
+        bail!(
+            "this nest's derivations form a cycle: {cycle}. A derivation may read decoded events and \
+             other derivations, never itself."
+        );
+    }
+    for (view, why) in &graft.never_graftable {
+        println!("! view {view} can never be reused across an edit: it {why}");
+    }
+    for view in &graft.uncanonical {
+        println!(
+            "! view {view}: plan could not be canonicalised, so only a byte-identical edit matches"
+        );
+    }
+
     let checks = collect_checks(&dir, args.name.as_deref())?;
     if checks.is_empty() {
         bail!(
