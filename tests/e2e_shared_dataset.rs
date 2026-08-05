@@ -39,7 +39,7 @@ fn two_mounts_one_nest(root: &Path) -> String {
     std::fs::create_dir_all(&nest).unwrap();
     scaffold_nest(&nest, "primary", USDC);
 
-    migrate::run(root, false).expect("migrate");
+    migrate::run(root, false, false).expect("migrate");
     let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
 
     // The second mount: a different alias, the same identity. No second directory, no second copy.
@@ -252,7 +252,7 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
     let solo_nest = solo_root.join("nests").join("primary");
     std::fs::create_dir_all(&solo_nest).unwrap();
     scaffold_nest(&solo_nest, "primary", USDC);
-    migrate::run(solo_root, false).unwrap();
+    migrate::run(solo_root, false, false).unwrap();
     let (_, solo_tape, _) = bring_up(solo_root).await;
 
     assert!(
@@ -309,7 +309,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
     let nest = root.join("nests").join("usdc");
     std::fs::create_dir_all(&nest).unwrap();
     scaffold_nest(&nest, "usdc", USDC);
-    migrate::run(root, false).expect("migrate");
+    migrate::run(root, false, false).expect("migrate");
 
     let mut roost = Roost::load(root).unwrap();
     assert_eq!(

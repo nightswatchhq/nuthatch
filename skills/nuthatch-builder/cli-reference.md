@@ -181,6 +181,7 @@ Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `da
 
 - `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a roost.toml, or one already part-migrated
 - `--dry-run` - Print the plan - every nest, its identity, and where it would land - without changing anything
+- `--allow-breaking` - Proceed even when a nest's schema would break its consumers. The change is listed either way; this only decides whether the run stops. Data is safe regardless - this is about queries
 
 ## `nuthatch nest`
 

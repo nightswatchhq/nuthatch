@@ -169,7 +169,7 @@ async fn remounting_costs_nothing_until_you_prune() {
     let nest = root.join("nests").join("usdc");
     std::fs::create_dir_all(&nest).unwrap();
     scaffold_nest(&nest, "usdc", USDC);
-    migrate::run(root, false).expect("migrate");
+    migrate::run(root, false, false).expect("migrate");
     let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
 
     // --- First run: the backfill we are trying never to repeat. ---
@@ -239,7 +239,7 @@ async fn remounting_costs_nothing_until_you_prune() {
     let nest = root.join("nests").join("usdc");
     std::fs::create_dir_all(&nest).unwrap();
     scaffold_nest(&nest, "usdc", USDC);
-    migrate::run(root, false).expect("re-migrate");
+    migrate::run(root, false, false).expect("re-migrate");
     assert_eq!(
         Roost::load(root).unwrap().mounts[0].nid,
         nid,
