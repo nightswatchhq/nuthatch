@@ -29,7 +29,7 @@
 //! arrive as a bound parameter through the query layer, which is a change to `analytics.rs`, not a
 //! cleverer `replace()` here.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// How much SQL surface a mount exposes (RFC-0034 §2).
@@ -447,6 +447,137 @@ mod tests {
         }
     }
 
+    // ---- phase 2: the author's ceiling ----
+
+    fn ceiling(qs: &[NamedQuery]) -> Ceiling {
+        Ceiling {
+            queries: qs.to_vec(),
+        }
+    }
+
+    /// RFC-0034 §3: narrowing is the only permitted direction.
+    #[test]
+    fn a_mount_may_narrow_the_ceiling_but_never_widen_it() {
+        let c = ceiling(&[
+            q(
+                "holders",
+                "SELECT * FROM t LIMIT {n}",
+                &[("n", ParamType::Int)],
+            ),
+            q("total", "SELECT count(*) FROM t", &[]),
+        ]);
+
+        // Narrowing: expose one of the two.
+        let narrow = Surface {
+            access: SqlAccess::Allowlist,
+            queries: vec![q("total", "SELECT count(*) FROM t", &[])],
+        };
+        narrow
+            .validate_within(&c, "usdc")
+            .expect("narrowing is fine");
+
+        // Exposing everything the author sanctioned is also fine - the ceiling is a maximum.
+        let all = Surface {
+            access: SqlAccess::Allowlist,
+            queries: c.queries.clone(),
+        };
+        all.validate_within(&c, "usdc")
+            .expect("the full ceiling is fine");
+
+        // Widening by adding a name the author never sanctioned.
+        let wider = Surface {
+            access: SqlAccess::Allowlist,
+            queries: vec![q("secrets", "SELECT * FROM t", &[])],
+        };
+        let err = wider.validate_within(&c, "usdc").unwrap_err().to_string();
+        assert!(err.contains("did not sanction"), "{err}");
+        assert!(
+            err.contains("holders") && err.contains("total"),
+            "the refusal must say what IS sanctioned: {err}"
+        );
+    }
+
+    /// The dangerous widening, and the one a name-only check would miss: keep a sanctioned **name**
+    /// and change what it does. The surface still reads as within the ceiling.
+    #[test]
+    fn redefining_a_sanctioned_name_is_still_widening() {
+        let c = ceiling(&[q("total", "SELECT count(*) FROM t", &[])]);
+
+        for (label, forged) in [
+            (
+                "different statement",
+                q("total", "SELECT * FROM secrets", &[]),
+            ),
+            (
+                "smuggled parameter",
+                q(
+                    "total",
+                    "SELECT count(*) FROM t LIMIT {n}",
+                    &[("n", ParamType::Int)],
+                ),
+            ),
+        ] {
+            let s = Surface {
+                access: SqlAccess::Allowlist,
+                queries: vec![forged],
+            };
+            let err = s.validate_within(&c, "usdc").unwrap_err().to_string();
+            assert!(err.contains("redefines"), "{label} must be refused: {err}");
+        }
+    }
+
+    /// No ceiling declared → phase 1's behaviour, unchanged. An author who has not opted in must not
+    /// find their nest suddenly unmountable.
+    #[test]
+    fn a_nest_without_a_ceiling_is_unconstrained() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(Ceiling::load(d.path()).unwrap().is_none());
+
+        // And an empty ceiling is not the same as an absent one: it sanctions nothing.
+        let empty = ceiling(&[]);
+        let s = Surface {
+            access: SqlAccess::Allowlist,
+            queries: vec![q("anything", "SELECT 1", &[])],
+        };
+        let err = s.validate_within(&empty, "usdc").unwrap_err().to_string();
+        assert!(err.contains("(none)"), "{err}");
+    }
+
+    #[test]
+    fn a_ceiling_is_validated_when_it_is_read() {
+        let d = tempfile::tempdir().unwrap();
+        // An undeclared placeholder is as wrong in a ceiling as in a mount.
+        std::fs::write(
+            d.path().join(CEILING_FILE),
+            "[[queries]]\nname = \"bad\"\nsql = \"SELECT {x}\"\n",
+        )
+        .unwrap();
+        assert!(Ceiling::load(d.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not declare"));
+
+        std::fs::write(
+            d.path().join(CEILING_FILE),
+            "[[queries]]\nname = \"a\"\nsql = \"SELECT 1\"\n\n[[queries]]\nname = \"a\"\nsql = \"SELECT 2\"\n",
+        )
+        .unwrap();
+        assert!(Ceiling::load(d.path())
+            .unwrap_err()
+            .to_string()
+            .contains("twice"));
+
+        // The happy path round-trips.
+        std::fs::write(
+            d.path().join(CEILING_FILE),
+            "[[queries]]\nname = \"total\"\nsql = \"SELECT count(*) FROM t\"\n",
+        )
+        .unwrap();
+        let c = Ceiling::load(d.path()).unwrap().unwrap();
+        assert_eq!(c.queries.len(), 1);
+        assert_eq!(c.queries[0].name, "total");
+    }
+
     /// A query name is a path segment (`/<mount>/q/<name>`), so it gets the same charset as a nest
     /// name and a tenant.
     #[test]
@@ -457,5 +588,99 @@ mod tests {
                 "{bad:?} should not validate as a query name"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 2: the author's ceiling (RFC-0034 §3)
+// ---------------------------------------------------------------------------------------------
+
+/// The file a nest author declares their sanctioned query surface in.
+///
+/// **Its own file, deliberately, and this is the load-bearing detail.** The ceiling is an *authored
+/// input*, so it belongs in the bundle and therefore in the NID - §3 is explicit about that. But
+/// `nuthatch.toml` is part of the **data identity** (RFC-0033 §5), so putting the ceiling there would
+/// move the data identity on every security tweak, defeat early cutoff, and force the chain to
+/// re-index. A separate file is excluded from the data identity exactly as `views/` is: in the NID,
+/// out of the data.
+pub const CEILING_FILE: &str = "queries.toml";
+
+/// What a nest's **author** sanctions being asked of it (RFC-0034 §3).
+///
+/// A mount may narrow within this, never widen it. The point is that a published nest becomes
+/// self-describing about what it answers - a property a registry needs and an operator cannot supply
+/// for somebody else's nest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ceiling {
+    #[serde(default)]
+    pub queries: Vec<NamedQuery>,
+}
+
+impl Ceiling {
+    /// Read `queries.toml` from a nest directory. Absent → no ceiling declared, and a mount may
+    /// expose whatever its operator chooses (phase 1's behaviour, unchanged).
+    pub fn load(nest_dir: &std::path::Path) -> Result<Option<Ceiling>> {
+        let path = nest_dir.join(CEILING_FILE);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        let ceiling: Ceiling =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        for q in &ceiling.queries {
+            q.validate()
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for q in &ceiling.queries {
+            if !seen.insert(&q.name) {
+                bail!("{}: query '{}' is declared twice", path.display(), q.name);
+            }
+        }
+        Ok(Some(ceiling))
+    }
+
+    fn get(&self, name: &str) -> Option<&NamedQuery> {
+        self.queries.iter().find(|q| q.name == name)
+    }
+}
+
+impl Surface {
+    /// Refuse a mount that exposes more than its author sanctioned (RFC-0034 §3).
+    ///
+    /// Narrowing is the whole permitted direction. Two ways to widen, both refused:
+    ///
+    /// 1. **A name the ceiling does not contain.** Obvious.
+    /// 2. **A name the ceiling contains, redefined.** Less obvious and more dangerous: an operator
+    ///    could keep `holder_balance` and change its SQL to select something the author never
+    ///    sanctioned, while the surface still *reads* as within the ceiling. So the statement and its
+    ///    parameters must match too, not just the name.
+    pub fn validate_within(&self, ceiling: &Ceiling, mount: &str) -> Result<()> {
+        for q in &self.queries {
+            let Some(sanctioned) = ceiling.get(&q.name) else {
+                bail!(
+                    "mount '{mount}' exposes query '{}', which this nest's author did not sanction. \
+                     A mount may narrow the author's ceiling, never widen it. Sanctioned: {}",
+                    q.name,
+                    if ceiling.queries.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        ceiling
+                            .queries
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            };
+            if sanctioned.sql != q.sql || sanctioned.params != q.params {
+                bail!(
+                    "mount '{mount}' redefines query '{}': the name is sanctioned but the statement \
+                     is not the author's. Widening by redefinition is still widening.",
+                    q.name
+                );
+            }
+        }
+        Ok(())
     }
 }

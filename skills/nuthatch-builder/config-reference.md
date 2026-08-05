@@ -214,6 +214,35 @@ willing to answer it, not that it is cheap.
 **This is mount config, not manifest**, so changing it leaves the NID untouched and re-indexes
 nothing - and two tenants sharing one dataset can expose different surfaces over it.
 
+### `queries.toml` - the author's ceiling (RFC-0034 phase 2)
+
+A nest **author** can declare the maximum surface they sanction. A mount may then narrow within it,
+never widen it - so a published nest is self-describing about what it answers, which is a property a
+registry needs and an operator cannot supply for someone else's nest.
+
+```toml
+# queries.toml, beside nuthatch.toml
+[[queries]]
+name = "holder_balance"
+sql = "SELECT net FROM balances WHERE addr = {who}"
+params = { who = "address" }
+```
+
+Two ways to widen, both refused **at startup**:
+
+- exposing a name the ceiling does not contain
+- keeping a sanctioned name and changing its statement or parameters (widening by redefinition is
+  still widening, and a name-only check would miss it)
+
+No `queries.toml` → no ceiling, and a mount exposes whatever its operator chooses. An **empty**
+`queries.toml` is different: it sanctions nothing.
+
+**Why its own file rather than a section in `nuthatch.toml`.** The ceiling is an authored input, so it
+belongs in the NID. But `nuthatch.toml` is part of the *data identity*, so a ceiling living there would
+move the data identity on every security tweak and force a full re-index - the exact cost phase 2 was
+sequenced behind early cutoff to avoid. `queries.toml` is in the NID and out of the data identity,
+exactly like `views/`.
+
 ### Tenants (RFC-0032)
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No

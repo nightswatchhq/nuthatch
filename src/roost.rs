@@ -625,6 +625,24 @@ pub async fn dev(
     }
     let groups = group_by_chain(&endpoints, mounted)?;
 
+    // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
+    // store is opened, so a nest exposing more than its author sanctioned fails to start rather than
+    // serving the excess until somebody notices.
+    for ds in &datasets {
+        if let Some(ceiling) = crate::allowlist::Ceiling::load(&ds.dir)? {
+            for m in &ds.mounts {
+                if let Some(rec) = roost
+                    .mounts
+                    .iter()
+                    .find(|r| r.tenant == m.tenant && r.alias == m.alias)
+                {
+                    rec.surface()
+                        .validate_within(&ceiling, &m.route_key(multi_tenant))?;
+                }
+            }
+        }
+    }
+
     for ds in &datasets {
         if ds.refcount() > 1 {
             tracing::info!(
