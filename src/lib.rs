@@ -7,6 +7,7 @@
 
 pub mod abi;
 pub mod alerts;
+pub mod allowlist;
 pub mod analytics;
 pub mod audit;
 pub mod bench;

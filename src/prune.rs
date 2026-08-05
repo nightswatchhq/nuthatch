@@ -305,6 +305,8 @@ mod tests {
             tenant: "default".into(),
             alias: "back".into(),
             nid: a.clone(),
+            sql: Default::default(),
+            queries: Vec::new(),
         });
         std::fs::write(
             d.path().join(ROOST_FILE),

@@ -84,6 +84,10 @@ pub struct AppState {
     /// `/table` queries run at once so a burst can't multiply DuckDB's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
     pub sql_gate: Arc<Semaphore>,
+    /// The SQL surface this mount exposes (RFC-0034). Default is [`Open`](crate::allowlist::SqlAccess::Open) -
+    /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
+    /// a security control that turns itself on is a support ticket.
+    pub surface: Arc<crate::allowlist::Surface>,
     /// This nest's name and the roost health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no roost around it and falls back to the global
     /// poll-freshness check.
@@ -142,6 +146,8 @@ pub fn router(backing: SharedNest) -> Router {
         .route("/entity/{id}", get(entity))
         .route("/sql", get(sql))
         .route("/explain", get(explain))
+        .route("/queries", get(queries))
+        .route("/q/{name}", get(named_query))
         .route("/balances", get(balances))
         .route("/balance/{address}", get(balance))
         .route("/exposure/{address}", get(exposure))
@@ -885,6 +891,87 @@ struct SqlQuery {
     max_rows: Option<usize>,
 }
 
+/// The refusal a bounded mount gives free-form SQL (RFC-0034 §2).
+///
+/// `403`, not `400`: the query may be perfectly valid: this nest simply does not answer arbitrary
+/// SQL. And it names what *can* be asked, in RFC-0016's errors-as-prompts style, so an agent hitting
+/// a bounded nest is told the surface rather than left guessing at it.
+fn refuse_free_form(surface: &crate::allowlist::Surface) -> axum::response::Response {
+    crate::metrics::METRICS.inc_sql_rejected();
+    let names = surface.names();
+    let body = if names.is_empty() {
+        json!({
+            "error": "this nest does not answer SQL",
+            "hint": "the operator has disabled /sql and /explain for this mount; the typed routes \
+                     (/tables, /table/{name}, /entity/{id}, /balances) still work",
+        })
+    } else {
+        json!({
+            "error": "this nest answers only its declared queries, not arbitrary SQL",
+            "allowed_queries": names,
+            "hint": "call GET /q/{name} with the query's parameters as the query string; \
+                     GET /queries lists them with their parameters",
+        })
+    };
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+/// `GET /queries` - what this mount will answer, and with what parameters.
+///
+/// Always present, whatever the mode, so a caller can discover a *bounded* nest's surface without
+/// first getting refused by it.
+async fn queries(State(s): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "sql": match s.surface.access {
+            crate::allowlist::SqlAccess::Open => "open",
+            crate::allowlist::SqlAccess::Deny => "deny",
+            crate::allowlist::SqlAccess::Allowlist => "allowlist",
+        },
+        "free_form": s.surface.free_form_allowed(),
+        "queries": s.surface.queries.iter().map(|q| json!({
+            "name": q.name,
+            "params": q.param_list(),
+            "path": format!("/q/{}", q.name),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// `GET /q/{name}?param=value` - run one declared query.
+///
+/// The caller sends a **name and arguments, never SQL**. Everything the node's own guards do to
+/// `/sql` still applies here: a declared query can still be expensive, and the timeout, row cap and
+/// concurrency limit are what stop it.
+async fn named_query(
+    State(s): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(args): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use crate::metrics::METRICS;
+    let Some(q) = s.surface.get(&name) else {
+        METRICS.inc_sql_rejected();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": format!("no query named '{name}' on this nest"),
+                "allowed_queries": s.surface.names(),
+            })),
+        )
+            .into_response();
+    };
+    let sql = match q.render(&args) {
+        Ok(sql) => sql,
+        Err(e) => {
+            METRICS.inc_sql_rejected();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("{e:#}"), "query": name })),
+            )
+                .into_response();
+        }
+    };
+    run_sql_query(s, sql, None).await
+}
+
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
 ///
 /// Self-protecting, so a public `/sql` isn't a DoS vector: bounded concurrency (503 when the
@@ -892,8 +979,14 @@ struct SqlQuery {
 /// budget (a runaway is interrupted), a max query length, and a row cap (bounds the result buffer).
 /// What's deliberately *absent* is authn / per-caller quotas: those need caller identity a sovereign
 /// node doesn't have, so gating *who* may query and *how much* is a gateway's job, not the node's.
+/// **Bounded surfaces (RFC-0034).** What the guards above cannot express is *which* queries a nest
+/// will answer at all. A mount may set `sql = "deny"` or `sql = "allowlist"`, and this route then
+/// refuses free-form text and points at `/q/{name}` instead.
 async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
     use crate::metrics::METRICS;
+    if !s.surface.free_form_allowed() {
+        return refuse_free_form(&s.surface);
+    }
     if q.q.len() > SQL_MAX_QUERY_LEN {
         METRICS.inc_sql_rejected();
         return (
@@ -902,6 +995,24 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
         )
             .into_response();
     }
+    run_sql_query(s, q.q, q.max_rows).await
+}
+
+/// Execute SQL and shape the response - shared by `/sql` (caller-supplied text, only when the
+/// surface is open) and `/q/{name}` (a declared query, rendered from typed arguments).
+///
+/// **Every node guard lives here**, so a declared query is bounded exactly as free-form SQL is. A
+/// name on the allowlist says the operator is willing to answer it, not that it is cheap.
+async fn run_sql_query(
+    s: AppState,
+    sql_text: String,
+    requested_max_rows: Option<usize>,
+) -> axum::response::Response {
+    use crate::metrics::METRICS;
+    let q = SqlQuery {
+        q: sql_text,
+        max_rows: requested_max_rows,
+    };
     // Fail fast when the analytical surface is saturated rather than queue: a backlog of pending
     // DuckDB queries would itself exhaust memory/threads.
     let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
@@ -1000,6 +1111,13 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
 /// concurrency slot on the real thing. Returns `{valid:true}` or the enriched error.
 async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
     use crate::metrics::METRICS;
+    // `/explain` gets the same treatment as `/sql`. It plans caller-supplied SQL, so leaving it open
+    // on a bounded mount would leak the schema and the cost model of every table - and it is the
+    // route that still lacks `/sql`'s hot-row bound (#293), so an unbounded scan is reachable through
+    // it. Bounding the surface closes both.
+    if !s.surface.free_form_allowed() {
+        return refuse_free_form(&s.surface);
+    }
     if q.q.len() > SQL_MAX_QUERY_LEN {
         return (
             StatusCode::BAD_REQUEST,
@@ -1291,6 +1409,7 @@ mod tests {
             velocity_threshold: None,
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
+            surface: Arc::new(crate::allowlist::Surface::default()),
             admin_enabled: true,
             admin_token: None,
             nest_info: Arc::new(json!({ "name": "t" })),

@@ -63,6 +63,24 @@ pub struct Mount {
     pub alias: String,
     /// The nest identity ([`crate::blob::Manifest::nid`]) - the dataset key.
     pub nid: String,
+    /// How much SQL surface this mount exposes (RFC-0034 §2). **Mount config, not manifest**, so
+    /// changing it leaves the NID untouched, re-indexes nothing, and lets two tenants share one
+    /// dataset while exposing different surfaces.
+    #[serde(default)]
+    pub sql: crate::allowlist::SqlAccess,
+    /// The queries this mount answers by name, when `sql = "allowlist"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<crate::allowlist::NamedQuery>,
+}
+
+impl Mount {
+    /// This mount's SQL surface.
+    pub fn surface(&self) -> crate::allowlist::Surface {
+        crate::allowlist::Surface {
+            access: self.sql,
+            queries: self.queries.clone(),
+        }
+    }
 }
 
 /// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per roost via
@@ -269,6 +287,7 @@ impl Roost {
             // It is opaque to nuthatch, which is not the same as being allowed to contain `../`.
             safe_segment(&m.tenant, "tenant")?;
             safe_segment(&m.alias, "nest name")?;
+            m.surface().validate(&m.alias)?;
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
@@ -718,7 +737,39 @@ pub async fn dev(
         ingests.len()
     );
 
-    let all_states = fan_out_aliases(&datasets, all_states, &health, &mut estimates, multi_tenant);
+    let mut all_states =
+        fan_out_aliases(&datasets, all_states, &health, &mut estimates, multi_tenant);
+
+    // Overlay each mount's SQL surface (RFC-0034 §2). Applied **per mount, not per dataset**: that is
+    // the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
+    // dataset can expose different surfaces over it, and neither the NID nor the data is affected.
+    for (key, state) in all_states.iter_mut() {
+        let Some(m) = roost.mounts.iter().find(|m| {
+            &MountRef {
+                tenant: m.tenant.clone(),
+                alias: m.alias.clone(),
+            }
+            .route_key(multi_tenant)
+                == key
+        }) else {
+            continue;
+        };
+        let surface = m.surface();
+        if surface.access != crate::allowlist::SqlAccess::Open {
+            tracing::info!(
+                "mount {key}: sql = {:?}, {} declared quer{}",
+                surface.access,
+                surface.queries.len(),
+                if surface.queries.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+        }
+        state.surface = Arc::new(surface);
+    }
+    let all_states = all_states;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // roost's real resident set alongside the projection so operators can calibrate.

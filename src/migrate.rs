@@ -210,6 +210,11 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                 tenant: tenant.clone(),
                 alias: alias.clone(),
                 nid: nid.clone(),
+                // Migration never invents a security posture: an existing deployment keeps the
+                // arbitrary-/sql behaviour it already had. Bounding the surface is an operator's
+                // deliberate act (RFC-0034), not something a layout change does to them.
+                sql: crate::allowlist::SqlAccess::Open,
+                queries: Vec::new(),
             }),
             Plan::Move {
                 alias,
@@ -222,6 +227,8 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                     tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid: nid.clone(),
+                    sql: crate::allowlist::SqlAccess::Open,
+                    queries: Vec::new(),
                 });
             }
             Plan::Merge {
@@ -241,6 +248,8 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                     tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid: nid.clone(),
+                    sql: crate::allowlist::SqlAccess::Open,
+                    queries: Vec::new(),
                 });
             }
             Plan::Refuse { alias, .. } => refused.push(alias),
