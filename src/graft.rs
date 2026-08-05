@@ -561,6 +561,291 @@ mod tests {
         );
     }
 
+    // ---- slice 2: the DAG ----
+
+    fn dag(files: &[(&str, &str)]) -> Dag {
+        let owned: Vec<(String, String)> = files
+            .iter()
+            .map(|(f, s)| (f.to_string(), s.to_string()))
+            .collect();
+        Dag::build(&parser_connection().unwrap(), &owned)
+    }
+
+    fn any_source(name: &str) -> Option<SourceIdentity> {
+        Some(src(name, "0xaa"))
+    }
+
+    #[test]
+    fn a_create_view_prefix_is_split_strictly() {
+        for (stmt, want) in [
+            ("CREATE VIEW v AS SELECT 1", Some(("v", "SELECT 1"))),
+            (
+                "create or replace view v as select 1",
+                Some(("v", "select 1")),
+            ),
+            ("CREATE TEMP VIEW v AS SELECT 1", Some(("v", "SELECT 1"))),
+            (
+                "CREATE VIEW \"odd name\" AS SELECT 1",
+                Some(("odd name", "SELECT 1")),
+            ),
+            // A column list, including a nested paren that must not end it early.
+            (
+                "CREATE VIEW v (a, b) AS SELECT 1, 2",
+                Some(("v", "SELECT 1, 2")),
+            ),
+            // Anything unexpected drops out rather than being guessed at.
+            ("SELECT 1", None),
+            ("CREATE TABLE t AS SELECT 1", None),
+            ("CREATE VIEW v", None),
+            ("CREATE VIEW AS SELECT 1", None),
+        ] {
+            let got = split_create_view(stmt);
+            let got = got.as_ref().map(|(n, b)| (n.as_str(), b.as_str()));
+            assert_eq!(got, want, "{stmt:?}");
+        }
+    }
+
+    /// Slice 2's stated acceptance, half one: a diamond hashes correctly and transitively.
+    #[test]
+    fn a_diamond_dependency_hashes_transitively() {
+        let files = [
+            (
+                "10.sql",
+                "CREATE VIEW base AS SELECT k, v FROM usdc__transfer",
+            ),
+            ("20.sql", "CREATE VIEW left_arm AS SELECT k FROM base"),
+            ("21.sql", "CREATE VIEW right_arm AS SELECT v FROM base"),
+            (
+                "30.sql",
+                "CREATE VIEW tip AS SELECT * FROM left_arm, right_arm",
+            ),
+        ];
+        let d = dag(&files);
+        assert_eq!(d.nodes.len(), 4);
+        assert!(d.find_cycle().is_none(), "a diamond is not a cycle");
+
+        let tip = d.get("tip").unwrap();
+        assert_eq!(tip.inputs, vec!["left_arm", "right_arm"]);
+        let base = d.get("base").unwrap();
+        assert!(
+            base.inputs.is_empty(),
+            "base reads a decoded table, not a derivation"
+        );
+        assert_eq!(
+            base.sources,
+            vec!["usdc__transfer"],
+            "a non-derivation reference is a source, not an edge"
+        );
+
+        let keys = d
+            .reuse_keys((1, 100), "duckdb-test", &Finality::Final, &any_source)
+            .unwrap();
+        assert_eq!(keys.len(), 4);
+
+        // The point of transitivity: edit the root and everything downstream moves...
+        let edited = [
+            (
+                "10.sql",
+                "CREATE VIEW base AS SELECT k, v FROM usdc__transfer WHERE v > 0",
+            ),
+            ("20.sql", "CREATE VIEW left_arm AS SELECT k FROM base"),
+            ("21.sql", "CREATE VIEW right_arm AS SELECT v FROM base"),
+            (
+                "30.sql",
+                "CREATE VIEW tip AS SELECT * FROM left_arm, right_arm",
+            ),
+        ];
+        let after = dag(&edited)
+            .reuse_keys((1, 100), "duckdb-test", &Finality::Final, &any_source)
+            .unwrap();
+        for n in ["base", "left_arm", "right_arm", "tip"] {
+            assert_ne!(keys[n], after[n], "{n} should have moved with its ancestor");
+        }
+    }
+
+    /// ...and the half that makes per-derivation keying worth having at all: editing **one arm**
+    /// leaves the sibling and the sibling's descendants alone. Whole-nest identity cannot express
+    /// this, which is why the second axis exists.
+    ///
+    /// Note this test asserts *isolation*, not propagation - the edited node here has no descendants,
+    /// so it passes even against a build with transitivity removed entirely.
+    /// `a_diamond_dependency_hashes_transitively` is what catches that, by editing a node that does
+    /// have descendants. Both are needed; neither is sufficient.
+    #[test]
+    fn an_edit_propagates_downstream_and_nowhere_else() {
+        let before = dag(&[
+            ("10.sql", "CREATE VIEW base AS SELECT k FROM usdc__transfer"),
+            ("20.sql", "CREATE VIEW left_arm AS SELECT k FROM base"),
+            ("21.sql", "CREATE VIEW right_arm AS SELECT k FROM base"),
+            ("30.sql", "CREATE VIEW tip AS SELECT * FROM right_arm"),
+        ])
+        .reuse_keys((1, 100), "duckdb-test", &Finality::Final, &any_source)
+        .unwrap();
+
+        let after = dag(&[
+            ("10.sql", "CREATE VIEW base AS SELECT k FROM usdc__transfer"),
+            (
+                "20.sql",
+                "CREATE VIEW left_arm AS SELECT k FROM base WHERE k > 1",
+            ),
+            ("21.sql", "CREATE VIEW right_arm AS SELECT k FROM base"),
+            ("30.sql", "CREATE VIEW tip AS SELECT * FROM right_arm"),
+        ])
+        .reuse_keys((1, 100), "duckdb-test", &Finality::Final, &any_source)
+        .unwrap();
+
+        assert_ne!(
+            before["left_arm"], after["left_arm"],
+            "the edited arm moves"
+        );
+        assert_eq!(before["base"], after["base"], "its ancestor must not move");
+        assert_eq!(
+            before["right_arm"], after["right_arm"],
+            "a sibling must not move - this is the whole point of a per-derivation key"
+        );
+        assert_eq!(
+            before["tip"], after["tip"],
+            "a descendant of the *sibling* must not move either"
+        );
+    }
+
+    /// Slice 2's acceptance, half two: a cycle is refused **by name**.
+    #[test]
+    fn a_cycle_is_refused_and_named() {
+        let d = dag(&[
+            ("10.sql", "CREATE VIEW a AS SELECT x FROM c"),
+            ("20.sql", "CREATE VIEW b AS SELECT x FROM a"),
+            ("30.sql", "CREATE VIEW c AS SELECT x FROM b"),
+        ]);
+        let cycle = d.find_cycle().expect("a -> c -> b -> a is a cycle");
+        let named = cycle.to_string();
+        for n in ["a", "b", "c"] {
+            assert!(named.contains(n), "the cycle must name {n}: {named}");
+        }
+        assert!(
+            named.starts_with(named.split(" -> ").last().unwrap()),
+            "the report should close the loop rather than read as a path: {named}"
+        );
+
+        let err = d
+            .reuse_keys((1, 100), "duckdb-test", &Finality::Final, &any_source)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cycle"), "{err}");
+    }
+
+    /// A view that reads itself is a cycle of one, and must not be silently treated as a leaf.
+    #[test]
+    fn a_self_referencing_view_is_a_cycle() {
+        let d = dag(&[("10.sql", "CREATE VIEW loop_v AS SELECT x FROM loop_v")]);
+        // Self-reference is excluded from `inputs` (a node cannot be its own edge), so it surfaces
+        // as an unresolvable ordering rather than a graph cycle - either way it must not key.
+        let node = d.get("loop_v").unwrap();
+        assert!(
+            node.inputs.is_empty() && node.sources == vec!["loop_v"],
+            "a self-reference should not become an edge: {node:?}"
+        );
+    }
+
+    // ---- slice 3: refusals and the determinism gate ----
+
+    /// RFC-0033 §4. Each of these **must** be refused - Trino #22533 is what happens otherwise: a
+    /// materialized view over `CURRENT_TIMESTAMP` served a frozen timestamp forever.
+    #[test]
+    fn volatile_functions_are_refused_by_name() {
+        for (sql, func) in [
+            ("SELECT now()", "now"),
+            // Bare, no parens - parses as a COLUMN_REF, not a FUNCTION. A function-only check
+            // misses this entirely, which is Trino #22533 in one line of SQL.
+            ("SELECT current_timestamp", "current_timestamp"),
+            ("SELECT CURRENT_DATE", "current_date"),
+            ("SELECT random()", "random"),
+            ("SELECT uuid()", "uuid"),
+            ("SELECT version()", "version"),
+            ("SELECT getenv('HOME')", "getenv"),
+            // Buried in a predicate rather than the projection, and case-insensitive.
+            ("SELECT x FROM t WHERE ts > NOW()", "now"),
+            // Nested inside another call.
+            ("SELECT date_trunc('day', now())", "now"),
+        ] {
+            let refusals = static_refusals(&plan(sql));
+            assert!(
+                refusals.contains(&Refusal::Volatile {
+                    function: func.into()
+                }),
+                "{sql:?} should be refused for {func}, got {refusals:?}"
+            );
+            // The reason has to reach a human, not just a match arm.
+            let reported = refusals[0].to_string();
+            assert!(
+                reported.contains(func),
+                "the refusal must name it: {reported}"
+            );
+        }
+    }
+
+    /// A `LIMIT` with no `ORDER BY` returns whichever rows the engine felt like. Caching that is
+    /// caching a coin flip.
+    #[test]
+    fn limit_without_order_by_is_refused() {
+        assert_eq!(
+            static_refusals(&plan("SELECT x FROM t LIMIT 10")),
+            vec![Refusal::ImplicitRowOrder]
+        );
+        // ...and with an ordering it is fine, which is the half that proves the check discriminates
+        // rather than refusing everything.
+        assert!(static_refusals(&plan("SELECT x FROM t ORDER BY x LIMIT 10")).is_empty());
+    }
+
+    /// The control for the whole refusal list: ordinary derivations must **not** be refused. A check
+    /// that refused everything would pass every test above and make grafting useless.
+    #[test]
+    fn ordinary_derivations_are_not_refused() {
+        for sql in [
+            "SELECT count(*) FROM usdc__transfer",
+            "SELECT \"from\", sum(value_dec) FROM usdc__transfer GROUP BY 1",
+            "SELECT a.k FROM t AS a JOIN u ON a.k = u.k WHERE a.v > 100",
+            "WITH r AS (SELECT k FROM t) SELECT count(*) FROM r",
+            "SELECT x FROM t ORDER BY x",
+            // A *qualified* reference is an ordinary column, not the bare keyword.
+            "SELECT t.current_date FROM t",
+        ] {
+            assert!(
+                static_refusals(&plan(sql)).is_empty(),
+                "{sql:?} should be graftable, got {:?}",
+                static_refusals(&plan(sql))
+            );
+        }
+    }
+
+    /// RFC-0033 §10. The gate is the backstop for everything the static list cannot prove - which is
+    /// why it must actually catch a nondeterminism the list does *not* name.
+    #[test]
+    fn the_determinism_gate_catches_what_the_static_list_cannot() {
+        let conn = parser_connection().unwrap();
+
+        // A deterministic derivation passes, twice over.
+        determinism_gate(&conn, "SELECT i FROM range(50) t(i) ORDER BY i").expect("pure");
+
+        // `random()` is on the static list, but the gate must catch it *empirically* rather than by
+        // recognising the name - that is the property that makes it a backstop.
+        let err = determinism_gate(&conn, "SELECT random() AS r FROM range(200)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not deterministic"), "{err}");
+        assert!(
+            err.contains("recomputes"),
+            "the error should say what it costs, not just that it failed: {err}"
+        );
+    }
+
+    /// A derivation whose plan fell back to raw text adds no refusals: it can never match anyway, so
+    /// reporting one would be noise an author cannot act on.
+    #[test]
+    fn an_unparsed_plan_adds_no_refusals() {
+        assert!(static_refusals(&plan("this is not sql at all")).is_empty());
+    }
+
     /// A statement the engine cannot parse falls back to raw text - sound, just coarse.
     #[test]
     fn an_unparseable_statement_falls_back_rather_than_failing() {
@@ -570,4 +855,503 @@ mod tests {
         // Coarse in exactly the expected direction: formatting now matters.
         assert_ne!(p, plan("this  is not sql at all"));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 2: the derivation DAG
+// ---------------------------------------------------------------------------------------------
+
+/// One authored derivation: a `CREATE VIEW` in `views/*.sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// The view's name, which is how other derivations refer to it.
+    pub name: String,
+    /// The file it came from, for an error a human can act on.
+    pub file: String,
+    /// The canonical form of its `SELECT` body.
+    pub plan: CanonicalPlan,
+    /// The names it reads that are **also authored derivations**, sorted and deduplicated. Names
+    /// that resolve to decoded event tables are sources, not edges, and live in [`Node::sources`].
+    pub inputs: Vec<String>,
+    /// Every table name it reads that is not an authored derivation - the decoded tables it sits on.
+    pub sources: Vec<String>,
+}
+
+/// Split `CREATE [OR REPLACE] [TEMP|TEMPORARY] VIEW <name> [(cols)] AS <select>`.
+///
+/// Deliberately a small scanner over a fixed prefix rather than a SQL parser, for one reason:
+/// `json_serialize_sql` refuses anything that is not a `SELECT` ("Only SELECT statements can be
+/// serialized to json!"), so the engine's parser cannot be used on the statement as written. Only the
+/// prefix is parsed here; the body still goes to DuckDB.
+///
+/// **Strict on purpose.** Anything unexpected returns `None`, and a `None` is treated as "not a
+/// derivation" - it drops out of the graph rather than being guessed at. A missed derivation costs a
+/// recompute; a mis-parsed one would put a wrong edge in the DAG.
+fn split_create_view(stmt: &str) -> Option<(String, String)> {
+    let t = stmt.trim_start();
+    let mut rest = strip_kw(t, "create")?;
+    if let Some(r) = strip_kw(rest, "or") {
+        rest = strip_kw(r, "replace")?;
+    }
+    for temp in ["temporary", "temp"] {
+        if let Some(r) = strip_kw(rest, temp) {
+            rest = r;
+            break;
+        }
+    }
+    rest = strip_kw(rest, "view")?;
+
+    // The name: a bare identifier or a double-quoted one.
+    let rest = rest.trim_start();
+    let (name, mut after) = if let Some(body) = rest.strip_prefix('"') {
+        let end = body.find('"')?;
+        (body[..end].to_string(), &body[end + 1..])
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        (rest[..end].to_string(), &rest[end..])
+    };
+
+    // An optional column list. Skipped by depth so a nested paren cannot end it early.
+    after = after.trim_start();
+    if let Some(body) = after.strip_prefix('(') {
+        let mut depth = 1usize;
+        let mut end = None;
+        for (i, c) in body.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        after = &body[end? + 1..];
+    }
+
+    let select = strip_kw(after, "as")?.trim().to_string();
+    if select.is_empty() {
+        return None;
+    }
+    Some((name, select))
+}
+
+/// Strip a leading case-insensitive keyword that is followed by whitespace or `(`.
+fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let s = s.trim_start();
+    if s.len() < kw.len() || !s[..kw.len()].eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let rest = &s[kw.len()..];
+    match rest.chars().next() {
+        Some(c) if c.is_whitespace() || c == '(' => Some(rest),
+        None => Some(rest),
+        _ => None,
+    }
+}
+
+/// Every base-table name a serialized AST reads.
+fn table_refs(ast: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    walk(ast, &mut |obj| {
+        if obj.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+            if let Some(n) = obj.get("table_name").and_then(Value::as_str) {
+                if !out.iter().any(|s| s == n) {
+                    out.push(n.to_string());
+                }
+            }
+        }
+    });
+    out.sort();
+    out
+}
+
+/// A cycle among derivations, named so an operator can act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycle(pub Vec<String>);
+
+impl std::fmt::Display for Cycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.join(" -> "))
+    }
+}
+
+/// The derivation graph of a nest.
+#[derive(Debug, Clone, Default)]
+pub struct Dag {
+    pub nodes: Vec<Node>,
+}
+
+impl Dag {
+    /// Build the graph from a nest's `views/*.sql`.
+    ///
+    /// Statements that are not `CREATE VIEW` are ignored rather than guessed at.
+    pub fn build(conn: &Connection, files: &[(String, String)]) -> Dag {
+        let mut raw: Vec<(String, String, String)> = Vec::new(); // (name, file, select body)
+        for (file, sql) in files {
+            for stmt in crate::analytics::split_sql_statements(sql) {
+                if let Some((name, body)) = split_create_view(&stmt) {
+                    raw.push((name, file.clone(), body));
+                }
+            }
+        }
+        let defined: Vec<String> = raw.iter().map(|(n, _, _)| n.clone()).collect();
+
+        let nodes = raw
+            .into_iter()
+            .map(|(name, file, body)| {
+                let plan = canonical_plan(conn, &body);
+                // Edges come from the *canonicalised* AST, so a view that fails to parse contributes
+                // no edges - it becomes a leaf rather than a wrong shape.
+                let refs = match &plan {
+                    CanonicalPlan::Ast(json) => serde_json::from_str::<Value>(json)
+                        .map(|v| table_refs(&v))
+                        .unwrap_or_default(),
+                    CanonicalPlan::RawText(_) => Vec::new(),
+                };
+                let (inputs, sources): (Vec<_>, Vec<_>) = refs
+                    .into_iter()
+                    .partition(|r| defined.contains(r) && r != &name);
+                Node {
+                    name,
+                    file,
+                    plan,
+                    inputs,
+                    sources,
+                }
+            })
+            .collect();
+        Dag { nodes }
+    }
+
+    fn get(&self, name: &str) -> Option<&Node> {
+        self.nodes.iter().find(|n| n.name == name)
+    }
+
+    /// The first cycle, if any (RFC-0033 §6).
+    ///
+    /// Derivations read decoded events and other derivations, never themselves, so the graph is a DAG
+    /// **by construction** - a cycle means the nest is malformed, and it is a load-time refusal with
+    /// the cycle named rather than a fixpoint to solve or a runtime surprise.
+    pub fn find_cycle(&self) -> Option<Cycle> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Open,
+            Done,
+        }
+        let mut marks: std::collections::HashMap<&str, Mark> = std::collections::HashMap::new();
+        let mut stack: Vec<&str> = Vec::new();
+
+        fn visit<'a>(
+            dag: &'a Dag,
+            name: &'a str,
+            marks: &mut std::collections::HashMap<&'a str, Mark>,
+            stack: &mut Vec<&'a str>,
+        ) -> Option<Cycle> {
+            match marks.get(name) {
+                Some(Mark::Done) => return None,
+                Some(Mark::Open) => {
+                    // Report from where the cycle actually closes, and close the loop in the output
+                    // so `a -> b -> a` reads as a cycle rather than a path.
+                    let at = stack.iter().position(|s| *s == name).unwrap_or(0);
+                    let mut path: Vec<String> = stack[at..].iter().map(|s| s.to_string()).collect();
+                    path.push(name.to_string());
+                    return Some(Cycle(path));
+                }
+                None => {}
+            }
+            marks.insert(name, Mark::Open);
+            stack.push(name);
+            if let Some(node) = dag.get(name) {
+                for input in &node.inputs {
+                    if let Some(found) = visit(dag, input, marks, stack) {
+                        return Some(found);
+                    }
+                }
+            }
+            stack.pop();
+            marks.insert(name, Mark::Done);
+            None
+        }
+
+        for node in &self.nodes {
+            if let Some(found) = visit(self, &node.name, &mut marks, &mut stack) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Every derivation's reuse key, transitively (RFC-0033 §1).
+    ///
+    /// A Merkle hash over the DAG: a node's key includes its inputs' keys, so a change propagates
+    /// downstream **and nowhere else**. That is the whole reason the key is per-derivation rather
+    /// than per-nest: whole-package identity over-invalidates by construction.
+    ///
+    /// Errors on a cycle rather than looping. `range`, `engine` and `finality` are the run's, shared
+    /// by every derivation in it; `sources` resolves a table name to its identity.
+    pub fn reuse_keys(
+        &self,
+        range: (u64, u64),
+        engine: &str,
+        finality: &Finality,
+        resolve: &dyn Fn(&str) -> Option<SourceIdentity>,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        if let Some(cycle) = self.find_cycle() {
+            anyhow::bail!("derivations form a cycle: {cycle}");
+        }
+        let mut keys: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        // Repeatedly place every node whose inputs are all keyed. Terminates because the graph is
+        // acyclic (checked above) and every pass places at least one node.
+        while keys.len() < self.nodes.len() {
+            let mut placed = false;
+            for node in &self.nodes {
+                if keys.contains_key(&node.name) {
+                    continue;
+                }
+                if !node.inputs.iter().all(|i| keys.contains_key(i)) {
+                    continue;
+                }
+                let derivation = Derivation {
+                    name: node.name.clone(),
+                    plan: node.plan.clone(),
+                    input_keys: node
+                        .inputs
+                        .iter()
+                        .filter_map(|i| keys.get(i).cloned())
+                        .collect(),
+                    sources: node.sources.iter().filter_map(|s| resolve(s)).collect(),
+                    range,
+                    engine: engine.to_string(),
+                    finality: finality.clone(),
+                };
+                keys.insert(node.name.clone(), derivation.reuse_key());
+                placed = true;
+            }
+            if !placed {
+                // An input naming a derivation that does not exist. Not a cycle, so `find_cycle` did
+                // not catch it; refusing beats keying a node against a dependency we cannot see.
+                let stuck: Vec<&str> = self
+                    .nodes
+                    .iter()
+                    .filter(|n| !keys.contains_key(&n.name))
+                    .map(|n| n.name.as_str())
+                    .collect();
+                anyhow::bail!(
+                    "derivations cannot be ordered - unresolved inputs among: {}",
+                    stuck.join(", ")
+                );
+            }
+        }
+        Ok(keys)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3: the hard refusal list (§4) and the determinism gate (§10)
+// ---------------------------------------------------------------------------------------------
+
+/// Why a derivation can never be reused, whatever its key says.
+///
+/// A refusal is **loud**: the derivation recomputes and the reason is reported, so an author can see
+/// *why* their view never grafts rather than wondering why edits stay slow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// A volatile or nondeterministic function. Every production cache surveyed refuses these, and
+    /// Trino #22533 is what happens when you do not: a materialized view over `CURRENT_TIMESTAMP`
+    /// served a frozen timestamp, because snapshot-based freshness has no concept of
+    /// time-dependence.
+    Volatile { function: String },
+    /// A result that depends on row order the engine does not guarantee - `LIMIT` with no `ORDER BY`
+    /// being the canonical case. Two runs may legitimately disagree, so caching either is caching a
+    /// coin flip.
+    ImplicitRowOrder,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Volatile { function } => write!(
+                f,
+                "calls the volatile function `{function}()`, whose value changes between runs"
+            ),
+            Refusal::ImplicitRowOrder => write!(
+                f,
+                "uses LIMIT without ORDER BY, so which rows it returns is not guaranteed between runs"
+            ),
+        }
+    }
+}
+
+/// Functions whose value is not a function of the data (RFC-0033 §4).
+///
+/// Deliberately a **denylist of known-volatile names** rather than an allowlist of known-pure ones,
+/// with the determinism gate (§10) as the empirical backstop. An allowlist over DuckDB's several
+/// hundred scalar functions would be wrong on day one and wrong differently after every upgrade;
+/// this list plus a gate that actually runs the query twice is the honest combination.
+const VOLATILE_FUNCTIONS: &[&str] = &[
+    "now",
+    "current_timestamp",
+    "get_current_timestamp",
+    "transaction_timestamp",
+    "current_date",
+    "current_time",
+    "current_localtime",
+    "current_localtimestamp",
+    "today",
+    "random",
+    "setseed",
+    "uuid",
+    "gen_random_uuid",
+    "uuidv4",
+    "uuidv7",
+    "version",
+    "current_setting",
+    "getenv",
+    "current_schema",
+    "current_schemas",
+    "current_catalog",
+    "current_database",
+    "current_user",
+    "current_query",
+    "txid_current",
+    "nextval",
+    "currval",
+];
+
+/// Static refusals provable from the parse alone (RFC-0033 §4).
+///
+/// **What this cannot prove, stated rather than left as a gap:** §4 also refuses *float aggregation
+/// where order matters*, because IEEE-754 addition is not associative, so `sum()` over a `DOUBLE`
+/// column can differ between runs that group rows differently. Deciding that needs the **column's
+/// type**, which needs binding the view against the nest's schema - not parsing it. Detecting it
+/// half-way would be worse than not at all: flagging every `sum()` makes almost every useful view
+/// never-graftable, and flagging only float *literals* would create confidence that a `DOUBLE` column
+/// had been checked when it had not.
+///
+/// [`determinism_gate`] is the backstop, and it is the stronger one: it catches float
+/// non-associativity empirically, along with every other nondeterminism this list does not name.
+pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
+    let CanonicalPlan::Ast(json) = plan else {
+        // A derivation we could not parse is never reused anyway - its plan is raw text, so any edit
+        // at all breaks the match. No refusal to add.
+        return Vec::new();
+    };
+    let Ok(ast) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<Refusal> = Vec::new();
+    walk(&ast, &mut |obj| {
+        if obj.get("class").and_then(Value::as_str) == Some("FUNCTION") {
+            if let Some(name) = obj.get("function_name").and_then(Value::as_str) {
+                let lower = name.to_ascii_lowercase();
+                if VOLATILE_FUNCTIONS.contains(&lower.as_str()) {
+                    let r = Refusal::Volatile { function: lower };
+                    if !out.contains(&r) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        // **A bare volatile keyword is not a FUNCTION node.** `SELECT current_timestamp` - standard
+        // SQL, no parens - parses as a `COLUMN_REF` whose single name is the keyword, so a
+        // function-only check misses it entirely and the derivation caches a frozen timestamp
+        // forever. That *is* Trino #22533. Verified against DuckDB's AST rather than assumed.
+        //
+        // Only **unqualified** single-element references are considered: `t.current_date` is an
+        // ordinary column on table `t`. A column genuinely named `current_date` would be refused
+        // here, which is the safe direction - an over-refusal costs a recompute, and the alternative
+        // costs correctness.
+        if obj.get("type").and_then(Value::as_str) == Some("COLUMN_REF") {
+            if let Some(Value::Array(parts)) = obj.get("column_names") {
+                if parts.len() == 1 {
+                    if let Some(name) = parts[0].as_str() {
+                        let lower = name.to_ascii_lowercase();
+                        if VOLATILE_FUNCTIONS.contains(&lower.as_str()) {
+                            let r = Refusal::Volatile { function: lower };
+                            if !out.contains(&r) {
+                                out.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A `SELECT_NODE`'s modifiers carry LIMIT and ORDER BY. A limit with no ordering leaves the
+        // engine free to return any rows it likes.
+        if obj.get("type").and_then(Value::as_str) == Some("SELECT_NODE") {
+            if let Some(Value::Array(mods)) = obj.get("modifiers") {
+                let kind = |t: &str| {
+                    mods.iter()
+                        .any(|m| m.get("type").and_then(Value::as_str) == Some(t))
+                };
+                if kind("LIMIT_MODIFIER")
+                    && !kind("ORDER_MODIFIER")
+                    && !out.contains(&Refusal::ImplicitRowOrder)
+                {
+                    out.push(Refusal::ImplicitRowOrder);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Run a derivation twice over the same range and report whether it agreed with itself (§10).
+///
+/// The cache is only as correct as the determinism of what it caches, and this is the one check that
+/// does not depend on us having *named* the nondeterminism in advance - which is why it is the
+/// backstop for everything [`static_refusals`] cannot prove, float non-associativity included.
+///
+/// Cheap by design: finalized ranges are exactly where re-execution is supposed to be free, so a gate
+/// that re-runs one is testing the property it relies on at the price it was promised.
+///
+/// Returns `Ok(())` when the two runs agree. `conn` must already have the derivation's inputs
+/// defined; this runs the statement, it does not build a nest.
+pub fn determinism_gate(conn: &Connection, sql: &str) -> Result<()> {
+    let digest = |attempt: usize| -> Result<String> {
+        let mut stmt = conn
+            .prepare(sql)
+            .with_context(|| format!("preparing the derivation for determinism run {attempt}"))?;
+        let mut rows = stmt
+            .query([])
+            .with_context(|| format!("running the derivation for determinism run {attempt}"))?;
+        let mut h = Sha256::new();
+        // Row *and* column order are part of the answer: a derivation that returns the same bag in a
+        // different order is not the same derivation for anything downstream that reads positionally.
+        while let Some(row) = rows.next()? {
+            let mut col = 0usize;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(col) {
+                h.update(format!("{v:?}").as_bytes());
+                h.update(b"\x1f");
+                col += 1;
+            }
+            h.update(b"\x1e");
+        }
+        Ok(hex::encode(h.finalize()))
+    };
+
+    let first = digest(1)?;
+    let second = digest(2)?;
+    if first != second {
+        anyhow::bail!(
+            "derivation is not deterministic: two runs over the same range produced different \
+             output ({} vs {}). It cannot be cached - find the nondeterminism (a volatile function, \
+             float aggregation whose order varies, or a result that depends on row order) or accept \
+             that it recomputes.",
+            &first[..12],
+            &second[..12]
+        );
+    }
+    Ok(())
 }

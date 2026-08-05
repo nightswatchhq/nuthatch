@@ -161,6 +161,27 @@ Never matched, never reused, at any granularity:
 Refusal is loud: the derivation recomputes and the reason is reported, so an author can see *why* their
 view never grafts instead of wondering why edits are slow.
 
+> **Amended after building slice 3 (2026-08-05).** Two things this section needed that it did not say.
+>
+> **A bare volatile keyword is not a function node.** `SELECT current_timestamp` - standard SQL, no
+> parentheses - parses as a `COLUMN_REF` in DuckDB's AST, not a `FUNCTION`. A denylist that only
+> inspects function calls misses it completely, and the derivation then caches a frozen timestamp
+> forever, which *is* Trino #22533 in one line of SQL. The check now also inspects **unqualified,
+> single-element** column references. Qualified ones (`t.current_date`) stay untouched, since those
+> are ordinary columns; a column genuinely named `current_date` gets over-refused, which is the safe
+> direction.
+>
+> **Float aggregation cannot be decided from the parse**, so it is not in the static list. Whether
+> `sum(x)` is float-associative depends on `x`'s *type*, which needs binding the view against the
+> nest's schema rather than parsing it. Detecting it half-way would be worse than not at all -
+> flagging every `sum()` makes almost every useful view never-graftable, and flagging only float
+> *literals* would create confidence that a `DOUBLE` column had been checked when it had not. **§10's
+> determinism gate is the backstop and is the stronger instrument**: it catches float
+> non-associativity empirically, along with every other nondeterminism the list does not name. The
+> right division of labour is a denylist for what we can name and a gate that actually runs the query
+> twice - not an allowlist over DuckDB's several hundred scalar functions, which would be wrong on
+> day one and wrong differently after every upgrade.
+
 ## 5. Early cutoff and backdating - the largest win
 
 This is the mechanism, and it is the thing Substreams does **not** have.
