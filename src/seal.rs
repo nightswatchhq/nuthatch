@@ -40,6 +40,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const SEGMENTS_DIR: &str = "segments";
+
+/// The **shared segment store** for the runtime `dir` belongs to, if it has one (RFC-0033 §11a).
+///
+/// Derived by convention rather than plumbed: a mounted dataset lives at `<root>/data/<nid>`, so its
+/// runtime root is two levels up and the store is `<root>/segments`. A solo `nuthatch dev` nest is
+/// not under a `data/` parent, gets `None`, and keeps its segments where they have always been -
+/// sharing is a property of a runtime hosting several nests, not of a nest.
+///
+/// The alternative was threading a root through every seal and query call site, which would have made
+/// the layout a parameter of functions that have no business knowing about it.
+pub fn shared_store(dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    if parent.file_name()? != crate::runtime::DATA_DIR {
+        return None;
+    }
+    Some(parent.parent()?.join(SEGMENTS_DIR))
+}
+
+/// Where a segment's bytes actually live: the shared store when there is one, else beside the nest.
+///
+/// **Falls back to the per-dataset path when the shared copy is absent**, so a dataset migrated
+/// before slice C still reads. A missing shared segment is not evidence of corruption; it is evidence
+/// of a layout that has not been relocated yet.
+pub fn segment_path(dir: &Path, file: &str, hash: &str) -> PathBuf {
+    if let Some(store) = shared_store(dir) {
+        let shared = store.join(format!("{hash}.parquet"));
+        if shared.exists() {
+            return shared;
+        }
+    }
+    dir.join(SEGMENTS_DIR).join(file)
+}
 pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// One sealed Parquet file. `hash` is the content address (sha256 of the file bytes).
@@ -126,7 +158,21 @@ pub fn seal_range_with_snapshot(
         if segments.iter().any(|s| s.hash == hash) {
             continue;
         }
-        std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
+        // Write once, into the shared store when this dataset belongs to a runtime (RFC-0033 §11a).
+        // Content-addressed, so a second nest sealing byte-identical rows finds it already there and
+        // the write is a no-op rather than a duplicate.
+        match shared_store(dir) {
+            Some(store) => {
+                std::fs::create_dir_all(&store).context("creating the shared segment store")?;
+                let shared = store.join(format!("{hash}.parquet"));
+                if !shared.exists() {
+                    std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
+                }
+            }
+            None => {
+                std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
+            }
+        }
         summary.tables += 1;
         summary.rows += rows.len();
         segments.push(Segment {
@@ -212,14 +258,19 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// Returns the number of segments quarantined. Best-effort - never fatal (an IO error just logs).
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     let manifest = load_manifest(dir)?;
-    let seg_dir = dir.join(SEGMENTS_DIR);
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
     let quarantine = dir.join("quarantine");
     let mut quarantined = 0usize;
 
     for (table, segs) in &manifest.tables {
         for s in segs {
-            let path = seg_dir.join(&s.file);
+            let path = segment_path(dir, &s.file, &s.hash);
+            // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and
+            // in the shared store those bytes belong to every dataset referencing them - one nest's
+            // integrity pass must not yank data out from under its neighbours. A corrupt shared
+            // segment is reported loudly and left in place; the operator decides, with the knowledge
+            // that more than one dataset is affected.
+            let is_shared = shared_store(dir).is_some_and(|st| path.starts_with(&st));
             let reason = match std::fs::read(&path) {
                 Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => continue, // intact
                 Ok(_) => "hash mismatch (corrupt or tampered)",
@@ -227,6 +278,14 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => "unreadable",
             };
+            if is_shared {
+                tracing::error!(
+                    "shared segment {} for table {table} is {reason} - left in place because other \
+                     datasets reference it. Remove it deliberately once you know what else breaks.",
+                    s.hash
+                );
+                continue;
+            }
             std::fs::create_dir_all(&quarantine).ok();
             let dest = quarantine.join(&s.file);
             match std::fs::rename(&path, &dest) {

@@ -849,7 +849,6 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
             .map(|(_, c)| c.as_slice())
             .unwrap_or(&[])
     };
-    let seg_dir = dir.join(crate::seal::SEGMENTS_DIR);
 
     // The full set of tables to define: declared (schema) ∪ sealed (manifest) ∪ hot. Each view is the
     // `UNION ALL` of whichever of {sealed Parquet, hot tip} exist. COR-1: hot and cold are kept disjoint
@@ -871,7 +870,9 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
                 segs.iter()
                     .filter(|s| s.to_block <= sealed_through)
                     .filter_map(|s| {
-                        let p = seg_dir.join(&s.file);
+                        // Resolve through the shared store when this dataset belongs to a runtime
+                        // (RFC-0033 §11a), falling back to the per-dataset path.
+                        let p = crate::seal::segment_path(dir, &s.file, &s.hash);
                         // Skip a manifest segment whose file is gone from disk (quarantined as corrupt
                         // by the startup integrity pass, or externally removed). Without this, one
                         // missing file makes `read_parquet` throw and the whole query fail; instead the

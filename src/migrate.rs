@@ -434,6 +434,19 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
         }
     }
 
+    // Slice C (RFC-0033 §11a): pull the migrated datasets' segments into the shared store, so two
+    // nests holding byte-identical segments stop holding two copies.
+    let mut shared = 0usize;
+    for r in &records {
+        shared += relocate_segments(dir, &MountTable::data_dir(dir, &r.nid))?;
+    }
+    if shared > 0 {
+        println!(
+            "Shared {shared} segment(s) into {}/.",
+            crate::seal::SEGMENTS_DIR
+        );
+    }
+
     let removed_legacy = write_mounts(dir, &records)?;
     println!(
         "\nWrote {} mount record(s) to {MOUNTS_FILE}.",
@@ -476,6 +489,43 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
     std::fs::remove_dir_all(from)
         .with_context(|| format!("removing {} after copying it", from.display()))?;
     Ok(())
+}
+
+/// Relocate a dataset's per-dataset segments into the shared store (RFC-0033 §11a, slice C).
+///
+/// **Hard-links where it can, copies otherwise.** A link means two datasets holding byte-identical
+/// segments collapse to one copy on disk with no read and no rewrite; a copy is the fallback across
+/// filesystems. The per-dataset file is deliberately left in place: `segment_path` prefers the shared
+/// copy and falls back to the local one, so a half-relocated dataset reads correctly throughout.
+///
+/// Idempotent by construction - the destination is the content hash, so a segment another dataset
+/// already contributed is skipped rather than rewritten.
+fn relocate_segments(root: &Path, dataset: &Path) -> Result<usize> {
+    let Ok(manifest) = crate::seal::load_manifest(dataset) else {
+        return Ok(0);
+    };
+    let store = root.join(crate::seal::SEGMENTS_DIR);
+    std::fs::create_dir_all(&store).context("creating the shared segment store")?;
+
+    let mut moved = 0usize;
+    for segs in manifest.tables.values() {
+        for s in segs {
+            let dest = store.join(format!("{}.parquet", s.hash));
+            if dest.exists() {
+                continue;
+            }
+            let src = dataset.join(crate::seal::SEGMENTS_DIR).join(&s.file);
+            if !src.exists() {
+                continue;
+            }
+            if std::fs::hard_link(&src, &dest).is_err() {
+                std::fs::copy(&src, &dest)
+                    .with_context(|| format!("copying {} into the shared store", s.file))?;
+            }
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 /// Rewrite `mounts.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
@@ -903,6 +953,82 @@ mod tests {
             "an added column is compatible and must not be flagged: {breaking:?}"
         );
         run(root, false, false).expect("a compatible change proceeds without a flag");
+    }
+
+    /// RFC-0033 §11a slice C: **two nests with byte-identical segments hold one copy on disk.**
+    ///
+    /// This is the cross-nest reuse chris asked for ("if two entity hashes across any nest are the
+    /// same, you can reuse the data across"), and note what makes it work: the nests differ - two
+    /// names, two identities, two datasets - and still share the bytes, because the *segment* is what
+    /// they have in common, not the nest.
+    #[test]
+    fn two_different_nests_with_identical_segments_hold_one_copy() {
+        use crate::seal::{Manifest, Segment, SEGMENTS_DIR};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(
+            root,
+            &[
+                ("alpha", "0x0000000000000000000000000000000000000001"),
+                ("beta", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+
+        // Both nests sealed the same rows, so both hold the same segment bytes under the same hash -
+        // exactly what RFC-0009's determinism guarantees for the same contract and binary.
+        let hash = "ab".repeat(32);
+        let bytes = b"identical parquet bytes";
+        for alias in ["alpha", "beta"] {
+            let seg_dir = root.join(NESTS_DIR).join(alias).join(SEGMENTS_DIR);
+            std::fs::create_dir_all(&seg_dir).unwrap();
+            let file = format!("t-{hash}.parquet");
+            std::fs::write(seg_dir.join(&file), bytes).unwrap();
+            let mut m = Manifest::default();
+            m.tables.insert(
+                "t".to_string(),
+                vec![Segment {
+                    hash: hash.clone(),
+                    from_block: 1,
+                    to_block: 2,
+                    rows: 1,
+                    file,
+                    registry_snapshot: None,
+                }],
+            );
+            std::fs::write(
+                seg_dir.join("manifest.json"),
+                serde_json::to_string(&m).unwrap(),
+            )
+            .unwrap();
+        }
+
+        run(root, false, false).unwrap();
+
+        // Two distinct datasets...
+        let table = MountTable::load(root).unwrap();
+        assert_eq!(table.mounts.len(), 2);
+        assert_ne!(
+            table.mounts[0].nid, table.mounts[1].nid,
+            "two different nests must keep two identities"
+        );
+
+        // ...and exactly one copy of the shared bytes.
+        let store = root.join(SEGMENTS_DIR);
+        let copies: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "two nests with identical segments should hold ONE copy, got {copies:?}"
+        );
+        assert_eq!(
+            std::fs::read(store.join(format!("{hash}.parquet"))).unwrap(),
+            bytes,
+            "the shared copy must be the same bytes both nests sealed"
+        );
     }
 
     /// A refusal must not hold the healthy nests hostage, and the runtime must still serve.
