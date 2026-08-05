@@ -267,12 +267,49 @@ where re-execution is supposed to be free.
 | 1 | **Hash the plan.** Canonical normalisation (§3) + `resolved_source_identity` (§2.1) + engine/version (§2.2). No reuse yet, just a stable key. | Two byte-different-but-α-equivalent views hash identically; a re-`init` against a different contract under the same table name hashes *differently*. Both as tests. |
 | 2 | **The DAG.** Build the derivation graph from `views/`; transitive hashing; cycle refusal at load (§6). | A nest with a diamond dependency hashes correctly, and a hand-written cycle is refused by name. |
 | 3 | **Refusals.** The hard list (§4) and the determinism gate (§10). | A view calling `now()` is reported as never-graftable, with the reason. CI fails a nondeterministic derivation. |
-| 4 | **Whole-derivation reuse.** Grafting v1: match the key, reuse the data. | Edit one view in a nest of twenty; nineteen graft; the RPC request count is zero. This is the headline test. |
-| 5 | **Early cutoff.** Probe-range recompute, output digest comparison, downstream propagation stop (§5). | A cosmetic edit (a comment, a rename) that changes the NID re-indexes *nothing*. |
+| 4 | ~~**Whole-derivation reuse.**~~ **Deferred - see below.** | ~~Edit one view in a nest of twenty; nineteen graft; the RPC request count is zero.~~ |
+| 5 | **Early cutoff.** Adopt an existing dataset when the new identity produces identical data (§5). | A cosmetic edit - a comment, a view rename, a doc change - that moves the NID re-indexes *nothing*. |
 | 6 | **Mount-time breaking-change detection** (§9), and removal of `nest diff` / `nest upgrade`. | Mounting a schema-incompatible successor warns or refuses with the incompatibility named. |
 
 Slices 1-3 ship no user-visible behaviour and must not be skipped for that reason: they are the
 correctness of everything after them.
+
+> **Slice 4 deferred, slice 5 promoted (2026-08-05).** Checked before building, and slice 4's
+> acceptance criterion **cannot fail**: it is already true and always has been.
+>
+> Authored views are **not materialised**. `define_nest_views` defines them per query on an ephemeral
+> in-memory DuckDB over the sealed segments and the hot tip; nothing persists them. So editing a view
+> has never cost an RPC request *for the view*, and "the RPC request count is zero" passes against a
+> build containing no grafting at all. Slice 4's premise - "match the key, reuse the data" - has no
+> data to match, because the derivation was never stored.
+>
+> **What a view edit actually costs** is the thing to fix. Views are pinned in the blob, so editing
+> one moves the NID; under RFC-0032 the dataset lives at `data/<nid>/`, so the new identity resolves
+> to an empty directory and **the chain data re-indexes**. The cost was never recomputing a view - it
+> is re-fetching everything, because the dataset moved.
+>
+> That is early cutoff's job, so slice 5 comes next and slice 4 waits for RFC-0018 §3's hot
+> incremental views, which is the first thing nuthatch will have that is a *stored* derivation.
+> Slices 1-3 are not wasted: early cutoff needs exactly the DAG and the keys they built, to know which
+> derivations moved and whether their outputs did.
+>
+> The general lesson, since this is the third acceptance criterion this RFC series has had to correct:
+> **a criterion phrased as the absence of an effect passes trivially when the mechanism is missing.**
+> Prefer one that fails loudly against today's build before the work starts.
+>
+> The same shape showed up four times in the *tests* while building slices 1-5, each time caught only
+> by deliberately breaking the code and re-running:
+>
+> - "a real table name is never renamed" passed against a renamer that renamed everything - twice,
+>   because the dangerous path needs *both* a declared alias and an unaliased qualifier before it is
+>   reachable at all.
+> - "an edit propagates downstream and nowhere else" passed against a build with transitivity removed
+>   entirely, because the node it edits has no descendants. It asserts isolation, not propagation.
+> - "a cosmetic edit adopts the existing dataset" passed against a build with the exclusion list
+>   removed, because the edit was made before the copy and both sides ended up identical.
+>
+> None of these were subtle in hindsight and all four would have shipped. **Mutation-check any test
+> whose failure mode is silent** - which, in a reuse cache, is all of them.
 
 ## 12. Risks
 

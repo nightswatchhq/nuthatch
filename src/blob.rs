@@ -177,6 +177,80 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
     })
 }
 
+/// Authored inputs that provably cannot change a nest's **stored data** (RFC-0033 §5).
+///
+/// This list is the load-bearing part of [`Manifest::data_identity`], and it is deliberately written
+/// as an exclusion list rather than an inclusion one, because the two directions fail differently:
+///
+/// - Wrongly **including** something here that does affect data → a dataset is adopted when it should
+///   have differed → **wrong data**. Catastrophic.
+/// - Wrongly **omitting** something that does not → no adoption → a re-index. Slow, and correct.
+///
+/// So every entry needs a reason that survives a hostile reading, and when in doubt an input stays in
+/// the identity. Each one below is justified by "the indexing path never reads it":
+///
+/// - `views/**` - authored SQL is **not materialised**. `analytics::define_nest_views` defines views
+///   per query on an ephemeral in-memory DuckDB over the segments and the hot tip; nothing persists
+///   them, so no view can influence a byte that is stored.
+/// - `semantic.toml` - descriptions and derived footguns, read by the MCP/semantic surface only.
+/// - `llms.txt`, `README.md` - documentation.
+/// - `.claude/**` - the scaffolded agent skill.
+///
+/// Deliberately **not** excluded, though a reader might expect them to be: `labels/**` (labels drive
+/// exposure annotations, which are stored), `schema.json` (derived from the config, and it moves with
+/// it anyway), and anything under `abis/` (the decode itself).
+const NON_DATA_INPUTS: &[&str] = &[
+    "views/",
+    "semantic.toml",
+    "llms.txt",
+    "README.md",
+    ".claude/",
+];
+
+fn affects_data(path: &str) -> bool {
+    !NON_DATA_INPUTS.iter().any(|p| {
+        if let Some(dir) = p.strip_suffix('/') {
+            path == dir || path.starts_with(p)
+        } else {
+            path == *p
+        }
+    })
+}
+
+impl Manifest {
+    /// The **data identity**: what this nest's inputs imply about the bytes it will store
+    /// (RFC-0033 §5, early cutoff).
+    ///
+    /// Two nests with the same data identity produce byte-identical segments over the same range, so
+    /// one may **adopt** the other's dataset instead of re-indexing the chain. That is the whole
+    /// mechanism: a cosmetic edit - a comment, a view rename, a doc change - moves the NID, and the
+    /// data identity stays put, so the new identity resolves onto data that already exists.
+    ///
+    /// It is a *second, coarser* identity, not a hole cut in the NID. The NID remains the package
+    /// identity that mounts, refcounting and sharing key on (RFC-0032); this one is only ever
+    /// consulted to answer "may this dataset be adopted?". Carving an exception into the NID itself
+    /// is what RFC-0034 §4 rejected, and this is not that.
+    ///
+    /// Includes `registry_hash`, which pins the decode: a generator that decodes differently moves it
+    /// even when every authored byte is unchanged.
+    pub fn data_identity(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"nuthatch-data-identity-v1\0");
+        h.update(self.schema_version.to_le_bytes());
+        let mut feed = |s: &str| {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        };
+        feed(&self.registry_hash);
+        // `files` is sorted by path at build time, so this is deterministic.
+        for f in self.files.iter().filter(|f| affects_data(&f.path)) {
+            feed(&f.path);
+            feed(&f.sha256);
+        }
+        hex::encode(h.finalize())
+    }
+}
+
 /// The NID of the nest at `dir`, computed from its authored inputs (RFC-0032 §3).
 ///
 /// This is how an *unpacked* nest directory - the thing an operator actually has on disk - gets the
@@ -799,6 +873,110 @@ abi = "abis/c.json"
         // And a NID is never a blob hash, even for the same nest - the domain separator sees to it.
         let m = build_manifest(a.path(), None).unwrap();
         assert_ne!(m.nid(), m.blob_hash());
+    }
+
+    /// RFC-0033 §5. The whole point of early cutoff: a cosmetic edit moves the **package** identity
+    /// and leaves the **data** identity alone, so the new NID can adopt the old dataset instead of
+    /// re-indexing the chain.
+    #[test]
+    fn a_cosmetic_edit_moves_the_nid_but_not_the_data_identity() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        std::fs::create_dir_all(a.path().join("views")).unwrap();
+        std::fs::write(a.path().join("views/10-v.sql"), "CREATE VIEW v AS SELECT 1").unwrap();
+        let before = build_manifest(a.path(), None).unwrap();
+
+        for (file, contents, what) in [
+            ("llms.txt", "completely different docs\n", "documentation"),
+            (
+                "views/10-v.sql",
+                "CREATE VIEW renamed AS SELECT 1 -- and a comment",
+                "an authored view, which is never materialised",
+            ),
+            (
+                "semantic.toml",
+                "[nest]\ndescription = \"x\"\n",
+                "descriptions",
+            ),
+        ] {
+            std::fs::write(a.path().join(file), contents).unwrap();
+            let after = build_manifest(a.path(), None).unwrap();
+            assert_ne!(
+                before.nid(),
+                after.nid(),
+                "editing {what} must still move the NID - the package really did change"
+            );
+            assert_eq!(
+                before.data_identity(),
+                after.data_identity(),
+                "editing {what} must NOT move the data identity, or the chain re-indexes for nothing"
+            );
+        }
+    }
+
+    /// The dangerous direction, and the one that must never regress: anything that changes what is
+    /// **stored** must move the data identity, or a dataset gets adopted that should have differed.
+    #[test]
+    fn anything_that_changes_stored_data_moves_the_data_identity() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap().data_identity();
+
+        // The ABI: decoding differently is different data, and it also moves `registry_hash`.
+        std::fs::write(
+            a.path().join("abis/c.json"),
+            r#"[{"type":"event","name":"Approval","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true}]}]"#,
+        )
+        .unwrap();
+        let after_abi = build_manifest(a.path(), None).unwrap().data_identity();
+        assert_ne!(before, after_abi, "a changed ABI is different data");
+
+        // The config: a different contract address indexes a different contract.
+        let b = tempfile::tempdir().unwrap();
+        write_nest(b.path());
+        let cfg = std::fs::read_to_string(b.path().join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            b.path().join(CONFIG_FILE),
+            cfg.replace(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        )
+        .unwrap();
+        assert_ne!(
+            before,
+            build_manifest(b.path(), None).unwrap().data_identity(),
+            "a different contract address is different data"
+        );
+    }
+
+    /// The exclusion list is the one place a mistake costs correctness rather than speed, so its
+    /// membership is pinned rather than left to a reader's memory.
+    #[test]
+    fn the_non_data_exclusion_list_is_exactly_what_it_claims() {
+        for excluded in [
+            "views/10-a.sql",
+            "views/nested/deep.sql",
+            "semantic.toml",
+            "llms.txt",
+            "README.md",
+            ".claude/skills/x.md",
+        ] {
+            assert!(!affects_data(excluded), "{excluded} should be excluded");
+        }
+        for included in [
+            "nuthatch.toml",
+            "abis/erc20.json",
+            "schema.json",
+            "labels/exchanges.json",
+            // Near-misses that must NOT be swept up by a prefix match.
+            "views.sql",
+            "my-views/x.sql",
+            "semantic.toml.bak",
+            "docs/README.md",
+        ] {
+            assert!(affects_data(included), "{included} must affect data");
+        }
     }
 
     #[test]

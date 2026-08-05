@@ -49,6 +49,16 @@ pub enum Plan {
         with: String,
         from: PathBuf,
     },
+    /// The nest's identity is new, but an existing dataset was built from inputs that produce
+    /// **byte-identical data** (RFC-0033 §5, early cutoff). Adopt it rather than re-indexing the
+    /// chain: the package changed, the data did not.
+    Adopt {
+        alias: String,
+        nid: String,
+        from_nid: String,
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// Something is wrong with the nest and it will not be touched.
     Refuse { alias: String, why: String },
 }
@@ -60,6 +70,16 @@ impl Plan {
             Plan::AlreadyMigrated { alias, nid } => {
                 format!("  {alias}: already at data/{} - nothing to do", &nid[..12])
             }
+            Plan::Adopt {
+                alias,
+                nid,
+                from_nid,
+                ..
+            } => format!(
+                "  {alias}: ADOPT data/{} -> data/{} - identity moved, data did not (no re-index)",
+                &from_nid[..12],
+                &nid[..12]
+            ),
             Plan::Move { alias, nid, .. } => {
                 format!("  {alias}: nests/{alias} -> data/{}", &nid[..12])
             }
@@ -142,16 +162,63 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
             }
             None => {
                 claimed.insert(nid.clone(), alias.clone());
-                plans.push(Plan::Move {
-                    alias: alias.clone(),
-                    nid,
-                    from: legacy,
-                    to: dest,
-                });
+                // Early cutoff (RFC-0033 §5) before falling back to a move: if some existing dataset
+                // already holds what this nest would index, adopt it rather than moving a legacy
+                // directory that may be empty and would then re-backfill.
+                let adopt = blob::build_manifest(&legacy, None)
+                    .ok()
+                    .and_then(|m| adoptable(dir, &m, &nid));
+                match adopt {
+                    Some((from_nid, from)) => plans.push(Plan::Adopt {
+                        alias: alias.clone(),
+                        nid,
+                        from_nid,
+                        from,
+                        to: dest,
+                    }),
+                    None => plans.push(Plan::Move {
+                        alias: alias.clone(),
+                        nid,
+                        from: legacy,
+                        to: dest,
+                    }),
+                }
             }
         }
     }
     Ok(plans)
+}
+
+/// An existing dataset whose inputs produce **byte-identical data** to `want` (RFC-0033 §5).
+///
+/// Early cutoff, concretely: a cosmetic edit moves the NID, so `data/<new-nid>/` does not exist and
+/// the naive answer is to re-index the chain. If some existing dataset was built from inputs with the
+/// same *data* identity, its segments are what a re-index would produce, so it is adopted instead.
+///
+/// Two independent conditions, both required. The data identity is the general check; `registry_hash`
+/// is a second, narrower one that pins the decode specifically. Requiring both means a bug in the
+/// exclusion list cannot on its own cause an adoption - and the failure of either costs only a
+/// re-index.
+///
+/// Skips `want`'s own NID: a dataset that already exists is [`Plan::AlreadyMigrated`], not an
+/// adoption.
+fn adoptable(root: &Path, want: &blob::Manifest, want_nid: &str) -> Option<(String, PathBuf)> {
+    let entries = std::fs::read_dir(root.join(DATA_DIR)).ok()?;
+    let mut candidates: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .filter(|(nid, _)| nid != want_nid && nid.len() == 64)
+        .collect();
+    // Deterministic: two equally-adoptable datasets must not depend on directory order.
+    candidates.sort();
+
+    candidates.into_iter().find(|(_, dir)| {
+        let Ok(m) = blob::build_manifest(dir, None) else {
+            return false;
+        };
+        m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
+    })
 }
 
 /// A nest's identity, refusing one whose packed manifest no longer matches its inputs.
@@ -244,6 +311,28 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                     "  {alias}: duplicate data kept at {} (safe to delete once verified)",
                     aside.display()
                 );
+                records.push(Mount {
+                    tenant: tenant.clone(),
+                    alias: alias.clone(),
+                    nid: nid.clone(),
+                    sql: crate::allowlist::SqlAccess::Open,
+                    queries: Vec::new(),
+                });
+            }
+            Plan::Adopt {
+                alias,
+                nid,
+                from,
+                to,
+                ..
+            } => {
+                // A **copy**, not a move or a rename: the source dataset may still be mounted by
+                // another alias or another tenant, and early cutoff must never take data away from a
+                // mount that is using it. Costs disk; the alternative costs a full backfill.
+                crate::project::copy_dir(from, to).with_context(|| {
+                    format!("adopting {} into {}", from.display(), to.display())
+                })?;
+                println!("  {alias}: adopted without re-indexing");
                 records.push(Mount {
                     tenant: tenant.clone(),
                     alias: alias.clone(),
@@ -465,6 +554,118 @@ mod tests {
             roost.dir_for(d.path(), "a"),
             roost.dir_for(d.path(), "clone"),
             "two doors, one room"
+        );
+    }
+
+    /// RFC-0033 §5, slice 5's stated acceptance: **a cosmetic edit re-indexes nothing.**
+    ///
+    /// The nest is migrated, then edited in a way that cannot change a stored byte (a doc change and
+    /// an authored view, neither of which the indexing path reads). The NID moves - it must, the
+    /// package really did change - and the new identity adopts the existing dataset instead of
+    /// resolving to an empty directory and re-backfilling the chain.
+    #[test]
+    fn a_cosmetic_edit_adopts_the_existing_dataset_instead_of_re_indexing() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        std::fs::write(root.join(NESTS_DIR).join("a").join("llms.txt"), "docs v1\n").unwrap();
+        run(root, false).unwrap();
+
+        let first = Roost::load(root).unwrap().mounts[0].nid.clone();
+        let dataset = root.join(DATA_DIR).join(&first);
+        assert_eq!(
+            std::fs::read_to_string(dataset.join("nuthatch.redb")).unwrap(),
+            "data for a",
+            "the fixture's indexed history should be in place"
+        );
+
+        // Stage a "new" nest the way a re-published bundle would arrive, **then** make the cosmetic
+        // edit in the staged copy only. Editing before the copy would leave both sides identical and
+        // the test would pass without the exclusion list doing anything - which is exactly how the
+        // first version of this test passed against a build with the exclusions removed.
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&dataset, &staged).unwrap();
+        std::fs::remove_file(staged.join("nuthatch.redb")).ok(); // a fresh bundle carries no data
+        std::fs::write(staged.join("llms.txt"), "docs v2, completely rewritten\n").unwrap();
+        std::fs::create_dir_all(staged.join("views")).unwrap();
+        std::fs::write(
+            staged.join("views/10-v.sql"),
+            "CREATE VIEW v AS SELECT 1 -- authored logic, never materialised",
+        )
+        .unwrap();
+        let mut roost = Roost::load(root).unwrap();
+        roost.mounts.clear();
+        roost.roost.nests = vec!["a".into()];
+        std::fs::write(
+            root.join(ROOST_FILE),
+            toml::to_string_pretty(&roost).unwrap(),
+        )
+        .unwrap();
+
+        let plans = plan(root).unwrap();
+        assert!(
+            matches!(plans[0], Plan::Adopt { .. }),
+            "a cosmetic edit must adopt, not move an empty staging dir: {:?}",
+            plans[0]
+        );
+        let Plan::Adopt { nid, from_nid, .. } = &plans[0] else {
+            unreachable!()
+        };
+        assert_ne!(nid, &first, "the NID must move - the package changed");
+        assert_eq!(
+            from_nid, &first,
+            "and it must adopt the dataset it came from"
+        );
+
+        run(root, false).unwrap();
+        let after = Roost::load(root).unwrap().mounts[0].nid.clone();
+        assert_ne!(after, first);
+        assert_eq!(
+            std::fs::read_to_string(root.join(DATA_DIR).join(&after).join("nuthatch.redb"))
+                .unwrap(),
+            "data for a",
+            "the indexed history must be present under the new identity - if it is absent, the \
+             nest re-backfills, which is the entire cost early cutoff exists to remove"
+        );
+        assert!(
+            root.join(DATA_DIR).join(&first).is_dir(),
+            "adoption must COPY - the source may still be mounted by another tenant"
+        );
+    }
+
+    /// The dangerous direction: a nest whose inputs genuinely change the data must **not** adopt.
+    #[test]
+    fn a_substantive_edit_does_not_adopt() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        run(root, false).unwrap();
+        let first = Roost::load(root).unwrap().mounts[0].nid.clone();
+
+        // A different contract address: different data, whatever the rest of the nest says.
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&root.join(DATA_DIR).join(&first), &staged).unwrap();
+        let cfg = std::fs::read_to_string(staged.join("nuthatch.toml")).unwrap();
+        std::fs::write(
+            staged.join("nuthatch.toml"),
+            cfg.replace(
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+            ),
+        )
+        .unwrap();
+        let mut roost = Roost::load(root).unwrap();
+        roost.mounts.clear();
+        roost.roost.nests = vec!["a".into()];
+        std::fs::write(
+            root.join(ROOST_FILE),
+            toml::to_string_pretty(&roost).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(plan(root).unwrap()[0], Plan::Move { .. }),
+            "a different contract must not adopt another contract's data"
         );
     }
 
