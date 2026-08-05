@@ -147,7 +147,7 @@ async fn migrating_preserves_every_sealed_byte() {
     }
 
     // --- The migration. ---
-    migrate::run(root, false).expect("migrate");
+    migrate::run(root, false, false).expect("migrate");
 
     let roost = Roost::load(root).expect("the migrated roost.toml must still load");
     assert_eq!(

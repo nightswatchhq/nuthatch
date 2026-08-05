@@ -102,6 +102,11 @@ pub struct MigrateArgs {
     /// anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Proceed even when a nest's schema would break its consumers. The change is listed either way;
+    /// this only decides whether the run stops. Data is safe regardless - this is about queries.
+    #[arg(long)]
+    pub allow_breaking: bool,
 }
 
 #[derive(Args)]

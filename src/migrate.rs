@@ -39,6 +39,9 @@ pub enum Plan {
         nid: String,
         from: PathBuf,
         to: PathBuf,
+        /// When this alias was already serving a *different* identity, how the new nest's schema
+        /// compares (RFC-0033 §9). `None` when there is nothing to compare against.
+        breaking: Option<Vec<String>>,
     },
     /// `data/<nid>` already holds this exact nest, mounted under another alias. The migration has
     /// found a **pre-existing double-index**: two names, byte-identical inputs, two backfills of the
@@ -80,8 +83,20 @@ impl Plan {
                 &from_nid[..12],
                 &nid[..12]
             ),
-            Plan::Move { alias, nid, .. } => {
-                format!("  {alias}: nests/{alias} -> data/{}", &nid[..12])
+            Plan::Move {
+                alias,
+                nid,
+                breaking,
+                ..
+            } => {
+                let base = format!("  {alias}: nests/{alias} -> data/{}", &nid[..12]);
+                match breaking {
+                    Some(reasons) if !reasons.is_empty() => format!(
+                        "{base}\n      BREAKING for consumers of `{alias}`:\n        - {}",
+                        reasons.join("\n        - ")
+                    ),
+                    _ => base,
+                }
             }
             Plan::Merge {
                 alias, nid, with, ..
@@ -117,11 +132,20 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
         let recorded = roost.mounts.iter().find(|m| &m.alias == alias);
         let legacy = dir.join(NESTS_DIR).join(alias);
 
-        // Already migrated: a record exists and its dataset is on disk. Trust the record rather than
-        // re-hashing - re-deriving the identity of every nest on every startup would make `migrate`
-        // cost a full registry rebuild per nest for no decision it could change.
+        // Already migrated: a record exists, its dataset is on disk, and **nothing is staged**.
+        //
+        // The staged check is what lets `migrate` double as the upgrade path (RFC-0033 §9): a new
+        // version of an already-mounted nest arrives in `nests/<alias>`, and if its identity differs
+        // from the record this is an upgrade, not a no-op. Without it the staged directory is
+        // silently ignored and the operator is told "nothing to do" while holding a new version.
+        //
+        // Re-hashing only when something is staged keeps the ordinary case cheap - re-deriving every
+        // nest's identity on every run would cost a registry rebuild each time for no decision it
+        // could change.
         if let Some(m) = recorded {
-            if dir.join(DATA_DIR).join(&m.nid).is_dir() {
+            let staged_differs =
+                legacy.is_dir() && nid_of(&legacy).map(|n| n != m.nid).unwrap_or(false);
+            if dir.join(DATA_DIR).join(&m.nid).is_dir() && !staged_differs {
                 claimed.insert(m.nid.clone(), alias.clone());
                 plans.push(Plan::AlreadyMigrated {
                     alias: alias.clone(),
@@ -185,17 +209,55 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                         from,
                         to: dest,
                     }),
-                    None => plans.push(Plan::Move {
-                        alias: alias.clone(),
-                        nid,
-                        from: legacy,
-                        to: dest,
-                    }),
+                    None => {
+                        let breaking = breaking_against_current(dir, &roost, alias, &legacy);
+                        plans.push(Plan::Move {
+                            alias: alias.clone(),
+                            nid,
+                            from: legacy,
+                            to: dest,
+                            breaking,
+                        })
+                    }
                 }
             }
         }
     }
     Ok(plans)
+}
+
+/// Whether replacing `alias`'s current dataset with the nest staged at `staged` would **break
+/// consumers** (RFC-0033 §9), and how.
+///
+/// This is what `nest diff` used to tell an operator who remembered to run it. Grafting makes the
+/// *data* free; it says nothing about whether a dashboard's query still resolves. So the runtime
+/// reports it at the moment the identity actually changes, rather than leaving it to a command.
+///
+/// `None` when there is nothing to compare against - a first migration, or a dataset with no
+/// `schema.json`. Comparison failures are `None` too: an unreadable schema is not evidence of a
+/// breaking change, and inventing one would train operators to ignore the warning.
+fn breaking_against_current(
+    dir: &Path,
+    roost: &Roost,
+    alias: &str,
+    staged: &Path,
+) -> Option<Vec<String>> {
+    let current_nid = &roost.mounts.iter().find(|m| m.alias == alias)?.nid;
+    let old =
+        std::fs::read_to_string(Roost::data_dir(dir, current_nid).join("schema.json")).ok()?;
+    let new = std::fs::read_to_string(staged.join("schema.json")).ok()?;
+    let class = crate::lifecycle::classify_schemas(&old, &new).ok()?;
+    if class.verdict != crate::lifecycle::Verdict::Breaking {
+        return None;
+    }
+    Some(
+        class
+            .changes
+            .iter()
+            .filter(|c| c.is_breaking())
+            .map(|c| c.describe())
+            .collect(),
+    )
 }
 
 /// An existing dataset whose inputs produce **byte-identical data** to `want` (RFC-0033 §5).
@@ -252,7 +314,7 @@ fn nid_of(nest: &Path) -> Result<String> {
 ///
 /// Returns an error if any nest was refused, *after* migrating every nest that was fine - a bad nest
 /// must not hold the rest hostage, and `dir_for` means a partially-migrated roost still serves.
-pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
+pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     let plans = plan(dir)?;
     println!(
         "{} {} nest(s) in {}\n",
@@ -268,6 +330,23 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
         println!("{}", p.describe());
     }
     println!();
+
+    // A breaking change stops the run **before** anything moves, unless it is explicitly accepted.
+    // Warning and proceeding was the old behaviour of `nest diff`, which relied on somebody having run
+    // it; refusing by default puts the decision in front of the operator at the moment it matters.
+    let breaking: Vec<&Plan> = plans
+        .iter()
+        .filter(|p| matches!(p, Plan::Move { breaking: Some(r), .. } if !r.is_empty()))
+        .collect();
+    if !breaking.is_empty() && !allow_breaking && !dry_run {
+        bail!(
+            "{} mount(s) would break consumers (listed above). Nothing was changed.\n\
+             The data is safe either way - this is about queries, not bytes. Re-run with \
+             `--allow-breaking` once the consumers are ready, or mount the new nest under a \
+             different alias and migrate them across.",
+            breaking.len()
+        );
+    }
 
     if dry_run {
         println!("Dry run: nothing was changed. Re-run without --dry-run to apply.");
@@ -297,6 +376,7 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
                 nid,
                 from,
                 to,
+                ..
             } => {
                 relocate(from, to)?;
                 records.push(Mount {
@@ -475,7 +555,7 @@ mod tests {
         );
         let before = std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap();
 
-        run(d.path(), true).unwrap();
+        run(d.path(), true, false).unwrap();
 
         assert!(d.path().join(NESTS_DIR).join("a").is_dir(), "source moved");
         assert!(!d.path().join(DATA_DIR).exists(), "destination created");
@@ -498,7 +578,7 @@ mod tests {
                 ("b", "0x0000000000000000000000000000000000000002"),
             ],
         );
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
 
         let roost = Roost::load(d.path()).unwrap();
         assert_eq!(roost.mounts.len(), 2);
@@ -535,10 +615,10 @@ mod tests {
             d.path(),
             &[("a", "0x0000000000000000000000000000000000000001")],
         );
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
         assert_eq!(Roost::load(d.path()).unwrap().mounts.len(), 1);
 
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
         let after = Roost::load(d.path()).unwrap();
         assert_eq!(
             after.mounts.len(),
@@ -555,11 +635,11 @@ mod tests {
             d.path(),
             &[("a", "0x0000000000000000000000000000000000000001")],
         );
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
         let after_first = std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap();
         let nid = Roost::load(d.path()).unwrap().mounts[0].nid.clone();
 
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
 
         assert_eq!(
             after_first,
@@ -603,7 +683,7 @@ mod tests {
             plans[1]
         );
 
-        run(d.path(), false).unwrap();
+        run(d.path(), false, false).unwrap();
         let roost = Roost::load(d.path()).unwrap();
         assert_eq!(
             roost.mounts[0].nid, roost.mounts[1].nid,
@@ -628,7 +708,7 @@ mod tests {
         let root = d.path();
         write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
         std::fs::write(root.join(NESTS_DIR).join("a").join("llms.txt"), "docs v1\n").unwrap();
-        run(root, false).unwrap();
+        run(root, false, false).unwrap();
 
         let first = Roost::load(root).unwrap().mounts[0].nid.clone();
         let dataset = root.join(DATA_DIR).join(&first);
@@ -676,7 +756,7 @@ mod tests {
             "and it must adopt the dataset it came from"
         );
 
-        run(root, false).unwrap();
+        run(root, false, false).unwrap();
         let after = Roost::load(root).unwrap().mounts[0].nid.clone();
         assert_ne!(after, first);
         assert_eq!(
@@ -698,7 +778,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
-        run(root, false).unwrap();
+        run(root, false, false).unwrap();
         let first = Roost::load(root).unwrap().mounts[0].nid.clone();
 
         // A different contract address: different data, whatever the rest of the nest says.
@@ -728,6 +808,94 @@ mod tests {
         );
     }
 
+    /// RFC-0033 §9, slice 6: **the runtime tells you a change is breaking, at the moment it happens.**
+    ///
+    /// `nest diff` carried this information and relied on somebody remembering to run it. Grafting
+    /// makes the *data* free; it says nothing about whether a consumer's query still resolves. So the
+    /// classification moves to the moment the identity actually changes, and stops the run by default.
+    #[test]
+    fn a_breaking_schema_change_is_named_and_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        let schema = r#"{"tables":[{"table":"a__transfer","columns":[{"name":"from","sol_type":"address"},{"name":"value","sol_type":"uint256"}]}]}"#;
+        std::fs::write(root.join(NESTS_DIR).join("a").join("schema.json"), schema).unwrap();
+        run(root, false, false).unwrap();
+        let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+
+        // Re-stage the same alias with a column dropped: compatible data, broken consumers.
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&root.join(DATA_DIR).join(&nid), &staged).unwrap();
+        std::fs::write(
+            staged.join("schema.json"),
+            r#"{"tables":[{"table":"a__transfer","columns":[{"name":"from","sol_type":"address"}]}]}"#,
+        )
+        .unwrap();
+
+        let plans = plan(root).unwrap();
+        let Plan::Move { breaking, .. } = &plans[0] else {
+            panic!("expected a Move, got {:?}", plans[0]);
+        };
+        let reasons = breaking
+            .as_ref()
+            .expect("the drop must be classified as breaking");
+        assert!(
+            reasons.iter().any(|r| r.contains("value")),
+            "the incompatibility must be named, not merely counted: {reasons:?}"
+        );
+
+        // Refused by default, and nothing moved.
+        let err = run(root, false, false).unwrap_err().to_string();
+        assert!(err.contains("break consumers"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert!(
+            err.contains("--allow-breaking"),
+            "the refusal must name the way forward: {err}"
+        );
+        assert_eq!(
+            Roost::load(root).unwrap().mounts[0].nid,
+            nid,
+            "a refused run must not have changed the mount"
+        );
+
+        // ...and it proceeds when the operator says so.
+        run(root, false, true).expect("--allow-breaking proceeds");
+        assert_ne!(Roost::load(root).unwrap().mounts[0].nid, nid);
+    }
+
+    /// The control: a **compatible** change must not be flagged, or the warning becomes noise and
+    /// gets ignored - which is worse than not having it.
+    #[test]
+    fn an_additive_schema_change_is_not_breaking() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        std::fs::write(
+            root.join(NESTS_DIR).join("a").join("schema.json"),
+            r#"{"tables":[{"table":"a__transfer","columns":[{"name":"from","sol_type":"address"}]}]}"#,
+        )
+        .unwrap();
+        run(root, false, false).unwrap();
+        let nid = Roost::load(root).unwrap().mounts[0].nid.clone();
+
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&root.join(DATA_DIR).join(&nid), &staged).unwrap();
+        std::fs::write(
+            staged.join("schema.json"),
+            r#"{"tables":[{"table":"a__transfer","columns":[{"name":"from","sol_type":"address"},{"name":"added","sol_type":"address"}]}]}"#,
+        )
+        .unwrap();
+
+        let Plan::Move { breaking, .. } = &plan(root).unwrap()[0] else {
+            panic!("expected a Move");
+        };
+        assert!(
+            breaking.is_none(),
+            "an added column is compatible and must not be flagged: {breaking:?}"
+        );
+        run(root, false, false).expect("a compatible change proceeds without a flag");
+    }
+
     /// A refusal must not hold the healthy nests hostage, and the roost must still serve.
     #[test]
     fn a_broken_nest_is_refused_and_the_rest_still_migrate() {
@@ -748,7 +916,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = run(d.path(), false).unwrap_err().to_string();
+        let err = run(d.path(), false, false).unwrap_err().to_string();
         assert!(
             err.contains("broken"),
             "the refusal must name the nest: {err}"

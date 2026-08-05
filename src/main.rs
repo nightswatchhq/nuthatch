@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run),
+        cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run, a.allow_breaking),
         cli::Command::Prune(a) => {
             nuthatch::prune::run(std::path::Path::new(&a.dir), a.yes)
         }
