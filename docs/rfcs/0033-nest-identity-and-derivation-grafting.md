@@ -311,6 +311,88 @@ correctness of everything after them.
 > None of these were subtle in hindsight and all four would have shipped. **Mutation-check any test
 > whose failure mode is silent** - which, in a reuse cache, is all of them.
 
+## 11a. Cross-nest segment reuse (amendment, 2026-08-05)
+
+Chris's note the rest of this RFC has not delivered: *"it would work across all the nests in the
+system ... if two entity hashes across any nest are the same, you can reuse the data across."*
+
+### Why dataset-level identity cannot do it
+
+RFC-0033 §5's data identity is computed over a nest's **authored inputs**, and `nuthatch.toml`
+contains `[nest] name`. Two nests indexing the same contract under different names therefore have
+different data identities, and never adopt each other's data. Dataset-level sharing works *within* a
+nest's lineage - a cosmetic edit adopts its predecessor - and essentially never fires *across* nests.
+
+That is not a bug in the data identity. It is the wrong **granularity**: the unit two different nests
+have in common is not the dataset, it is the **table**.
+
+### The mechanism already exists
+
+Sealed segments are already content-addressed (RFC-0009): the file is `{table}-{hash}.parquet` where
+the hash is over the Parquet bytes, seal is already idempotent on `(table, hash)`, and the manifest
+already references each segment by `hash` **and** `file`. Two nests decoding the same contract with
+the same binary produce **byte-identical segment files** - that is the determinism guarantee, and it
+is already tested.
+
+So cross-nest reuse is not a new mechanism. It is moving the segment store up one level:
+
+```
+before   <root>/data/<nid>/segments/{table}-{hash}.parquet     one copy per dataset
+after    <root>/segments/{hash}.parquet                        one copy per distinct segment
+         <root>/data/<nid>/segments/manifest.json              unchanged: references by hash
+```
+
+Precedent is the same as §5's: Nix store paths and OCI layers. A dataset stops *owning* bytes and
+starts *referencing* them.
+
+### What this is keyed by
+
+The **segment content hash**, not a derivation key. Deliberately: the segment hash is already computed,
+already proven byte-stable for identical inputs, and requires no matching logic at all - two datasets
+either produce the same bytes or they do not. Introducing a second, cleverer key here would reopen the
+equivalence problem §2 exists to avoid.
+
+The table name stays out of the shared path. `{table}-{hash}` was per-dataset disambiguation; in a
+shared store the hash alone is the identity, and two tables that genuinely produced identical bytes are
+identical data.
+
+### The dangerous part: `prune`
+
+Today `prune` deletes a dataset directory wholesale. With a shared store that would delete **bytes
+another dataset still references** - the one data-loss failure mode in this design, and the reason it
+gets designed rather than patched.
+
+Rules, mirroring RFC-0032 §5's refcount:
+
+1. A segment's refcount is **derived**: the number of dataset manifests referencing its hash. Never
+   stored - a stored count drifts, and here drift deletes data.
+2. `prune` removes a dataset's *manifest and hot store* first, then collects segments no surviving
+   manifest references. Manifest-first, so an interrupted prune leaves orphaned bytes (recoverable)
+   rather than dangling references (not).
+3. A segment with **no** referencing manifest is collectable, and like a dataset it is only collectable
+   - an operator still has to ask.
+
+### What it does not change
+
+- **Sealed segments stay immutable.** Sharing never mutates; a second nest referencing a segment writes
+  nothing. The RFC-0009 non-negotiable holds untouched.
+- **The ≤2 GB per-cursor budget.** This is disk, not RAM.
+- **Solo `nuthatch dev`.** A single nest with no runtime root has no shared store and keeps its
+  segments where they are. Sharing is a property of a runtime hosting several nests, not of a nest.
+- **Tenancy.** Two tenants may reference one segment for the same reason they may share a dataset: the
+  bytes are provably identical, so there is nothing to leak that either did not already have.
+
+### Slices
+
+| # | Slice | Ends with |
+|---|---|---|
+| A | The shared store: seal writes `<root>/segments/<hash>`, readers resolve through it, per-dataset manifests unchanged. | Two nests indexing the same contract hold **one** copy on disk, proven by counting files. |
+| B | Segment refcounting in `prune`, manifest-first collection. | Pruning one of two nests that share segments leaves the other's data **readable**. This is the test that matters. |
+| C | `migrate` relocates existing per-dataset segments into the store. | An existing deployment migrates without re-indexing and without duplicate bytes. |
+
+Slice B is where the risk is. It should not be built after A ships - a shared store with a `prune` that
+does not understand sharing is strictly worse than no sharing at all.
+
 ## 12. Risks
 
 **A false match is silent and ships wrong data.** This is the only risk that matters, and the whole

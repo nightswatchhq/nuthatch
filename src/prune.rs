@@ -94,6 +94,45 @@ pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
     Ok(out)
 }
 
+/// Every segment hash any surviving dataset still references (RFC-0033 §11a).
+///
+/// **Derived from the manifests, never stored.** A stored count drifts, and here drift deletes bytes
+/// another dataset is reading - the one data-loss failure mode in the shared store, and the same
+/// reasoning as RFC-0032 §5's dataset refcount.
+fn referenced_segments(dir: &Path, surviving: &[String]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for nid in surviving {
+        let Ok(manifest) = crate::seal::load_manifest(&MountTable::data_dir(dir, nid)) else {
+            continue;
+        };
+        for segs in manifest.tables.values() {
+            for s in segs {
+                out.insert(s.hash.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Shared segments no surviving dataset references, with their sizes.
+fn orphan_segments(dir: &Path, surviving: &[String]) -> Vec<(PathBuf, u64)> {
+    let referenced = referenced_segments(dir, surviving);
+    let Ok(entries) = std::fs::read_dir(dir.join(crate::seal::SEGMENTS_DIR)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        .filter_map(|e| {
+            let hash = e.path().file_stem()?.to_string_lossy().to_string();
+            if referenced.contains(&hash) {
+                return None;
+            }
+            Some((e.path(), e.metadata().ok()?.len()))
+        })
+        .collect()
+}
+
 fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
@@ -143,11 +182,32 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
         return Ok(());
     }
 
+    // **Manifest first, bytes second** (RFC-0033 §11a). Removing the dataset - and with it the
+    // manifest referencing its segments - before collecting orphans means an interrupted prune leaves
+    // unreferenced bytes (recoverable, just disk) rather than dangling references (not).
     for c in &found {
         std::fs::remove_dir_all(&c.dir).with_context(|| format!("removing {}", c.dir.display()))?;
         println!("Removed data/{}", &c.nid[..12]);
     }
-    println!("\nFreed {}.", human(total));
+
+    let surviving: Vec<String> = MountTable::load(dir)
+        .map(|r| r.mounts.iter().map(|m| m.nid.clone()).collect())
+        .unwrap_or_default();
+    let orphans = orphan_segments(dir, &surviving);
+    let mut freed_segments = 0u64;
+    for (path, size) in &orphans {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        freed_segments += size;
+    }
+    if !orphans.is_empty() {
+        println!(
+            "Removed {} shared segment(s) no dataset referenced ({}).",
+            orphans.len(),
+            human(freed_segments)
+        );
+    }
+
+    println!("\nFreed {}.", human(total + freed_segments));
     Ok(())
 }
 
@@ -275,6 +335,88 @@ mod tests {
             d.path().join(DATA_DIR).join(&a).is_dir(),
             "data was deleted"
         );
+    }
+
+    /// RFC-0033 §11a slice B, **the test that matters**: pruning one of two datasets that share
+    /// segments must leave the other's data readable.
+    ///
+    /// This is the one data-loss failure mode in the shared store. A `prune` that deleted a dataset
+    /// directory wholesale - which is what it did before slice A - would take bytes another dataset
+    /// is still reading.
+    #[test]
+    fn pruning_one_dataset_does_not_delete_a_segment_another_still_references() {
+        use crate::seal::{Segment, SEGMENTS_DIR};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let (keep, drop_) = (nid("aa"), nid("bb"));
+
+        // Two datasets. Both reference `shared`; only the pruned one references `lonely`.
+        let shared_hash = "11".repeat(32);
+        let lonely_hash = "22".repeat(32);
+        std::fs::create_dir_all(root.join(SEGMENTS_DIR)).unwrap();
+        for h in [&shared_hash, &lonely_hash] {
+            std::fs::write(
+                root.join(SEGMENTS_DIR).join(format!("{h}.parquet")),
+                b"bytes",
+            )
+            .unwrap();
+        }
+        let seg = |h: &str| Segment {
+            hash: h.to_string(),
+            from_block: 1,
+            to_block: 2,
+            rows: 1,
+            file: format!("t-{h}.parquet"),
+            registry_snapshot: None,
+        };
+        for (nid_, hashes) in [
+            (&keep, vec![shared_hash.clone()]),
+            (&drop_, vec![shared_hash.clone(), lonely_hash.clone()]),
+        ] {
+            let dir = MountTable::data_dir(root, nid_);
+            std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).unwrap();
+            let mut m = crate::seal::Manifest::default();
+            m.tables
+                .insert("t".to_string(), hashes.iter().map(|h| seg(h)).collect());
+            std::fs::write(
+                dir.join(SEGMENTS_DIR).join("manifest.json"),
+                serde_json::to_string(&m).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Only `keep` is mounted, so `drop_` is collectable.
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"a\"\nnid = \"{keep}\"\n"
+            ),
+        )
+        .unwrap();
+
+        run(root, true).unwrap();
+
+        let shared = root
+            .join(SEGMENTS_DIR)
+            .join(format!("{shared_hash}.parquet"));
+        let lonely = root
+            .join(SEGMENTS_DIR)
+            .join(format!("{lonely_hash}.parquet"));
+        assert!(
+            shared.exists(),
+            "prune deleted a segment the surviving dataset still references - this is the data-loss \
+             failure mode the shared store was designed around"
+        );
+        assert!(
+            !lonely.exists(),
+            "a segment nothing references should have been collected"
+        );
+        assert!(
+            MountTable::data_dir(root, &keep).is_dir(),
+            "the mounted dataset survives"
+        );
+        assert!(!MountTable::data_dir(root, &drop_).exists());
     }
 
     /// Mount, unmount, prune, and the mount record's identity is all it ever took to find the data.
