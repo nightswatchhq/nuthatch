@@ -213,10 +213,26 @@ case.
 - [ ] ✅ Versioning + release workflow in place (`release.yml`), reproducible `--locked` builds.
   *(RFC-0005)*
 - [ ] ✅ `curl | sh` install path.
-- [ ] 🟡 Cross-platform release matrix - which targets are built/tested? (Linux x86_64 is the CI host;
-  macOS/arm64 install claims should be tested or scoped.)
-- [ ] 🟡 CHANGELOG / release notes discipline per tag (the progress-log is close; formalise for
-  consumers).
+- [ ] ✅ MSRV is honest. `Cargo.toml` declares `rust-version = "1.95"` and every CI job pins
+  `dtolnay/rust-toolchain@1.95.0`, so the declared floor is the tested floor. (Raised from an
+  untested `1.85` in `b2abc9f`, 2026-07-14.)
+- [ ] ✅ Cross-platform release matrix, stated plainly rather than implied:
+
+  | Target | Built by | Tested by |
+  |---|---|---|
+  | `x86_64-unknown-linux-gnu` | `release.yml` | full `cargo test --locked` on every CI run |
+  | `x86_64-unknown-linux-gnu` (scaled) | `release.yml` | the `--features postgres-store` job |
+  | `aarch64-apple-darwin` | `release.yml` | **nothing - built and published, never exercised** |
+
+  The macOS arm64 binary is compiled on a macOS runner and attached to the release, and no job in
+  `ci.yml` runs on macOS. So the install path is covered but the behaviour is not: a macOS-only
+  regression reaches a user before it reaches us. Scope the claim that way or add a macOS test job;
+  do not leave it ambiguous.
+- [ ] ✅ CHANGELOG / release-note discipline per tag. The standing rule, from the v0.9.1 incident:
+  before tagging, run `git log --stat <previous-tag>..HEAD` and read every entry against the draft
+  notes. Anything in the range that is not in the notes is either added or explained. The notes
+  additionally state **"in-place safe"** or **"reseal required"** for the on-disk format, because
+  that is the one line an operator has to read before upgrading.
 - [ ] ✅ Documented upgrade path / on-disk format stability guarantee across `0.x` bumps. - *Proven in
   production: a `0.3.0 → 0.6.0` nest upgrade was a binary swap plus a restart - no data migration, no
   flag or unit changes, sealed segments and hot store preserved. Each release states "in-place safe" or

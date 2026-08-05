@@ -751,62 +751,57 @@ appears in the release that breaks things reads as an apology.
 
 Fix behaviour. Nothing in the surfaces below changes.
 
-### What a minor may do - additive only
+### What a minor may change, and what is reserved for a major
 
-A minor may **add**: config keys, HTTP routes, fields in an existing response, CLI flags, metrics,
-tables, and MCP tools. Anything already there keeps working.
+The bullets above are the observed practice. This table is the promise, and it applies to the `1.x`
+line: a minor is `1.1`, `1.2`, and so on; breaking changes wait for `2.0`.
 
-A minor may also **deprecate** - which means it warns and keeps working. It never removes.
+| Surface | A minor release may | Reserved for a major |
+|---|---|---|
+| `nuthatch.toml` / `roost.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
+| nest `schema_version` | bump it when the upgrade is in-place and automatic | a bump that requires a re-index |
+| On-disk layout (redb tables, segment layout, `manifest.json`, `schema.json`) | change it when the upgrade is in-place and automatic | a layout needing a reseal or re-index |
+| HTTP routes and response shapes | add a route; add a field | remove a route, remove a field, or change a field's type or units |
+| CLI flags | add a flag; deprecate one with a warning | remove or rename a flag on `init`, `dev`, `sql`, `add` or `check` |
+| Metric names and labels | add a metric or a label | remove or rename a `nuthatch_*` series, change its unit, or change what a label means |
+| MCP tools | add a tool | (not covered - see below) |
 
-### What is reserved for a major
+**Upgrades are in-place by default.** A release that requires a data migration says so in its notes
+and ships the command that performs it. The record so far is five consecutive in-place production
+upgrades; 2.0's layout change ships `nuthatch migrate`, which moves data and never re-indexes.
 
-Removing or changing the meaning of any of these:
+**Deprecation window.** A deprecation is announced in at least one minor release before removal,
+removal comes **no sooner than 90 days** after that release, and removal itself waits for the next
+major. The warning names the replacement.
 
-| Surface | Covered |
-|---|---|
-| **Config** | `nuthatch.toml` and `roost.toml` keys: renaming, removing, or changing a key's type or meaning |
-| **On-disk layout** | The nest directory layout, redb table names, segment layout, `manifest.json`, `schema.json` - anything that would stop a running deployment from starting on the new binary |
-| **HTTP** | Removing a route; removing a field from a response, or changing its type or units |
-| **CLI** | Renaming or removing a flag on `init`, `dev`, `sql`, `add`, or `check` |
-| **Metrics** | Renaming or removing a `nuthatch_*` series, or changing its unit |
-| **`schema_version`** | A bump that a nest cannot be migrated across in place |
+That is the **floor rather than the target**: anything an operator wires into a unit file, a scrape
+config or a dashboard gets longer, because the cost of breaking it is not paid by us.
 
-**Upgrades are in-place by default.** A release that requires a data migration says so in its notes and
-ships the command that performs it. The record so far is five consecutive in-place production upgrades;
-2.0's layout change ships `nuthatch migrate`, which moves data and never re-indexes.
+If a removal ever has to move faster - a security fix with no compatible form - the release notes say
+so explicitly and explain why. That has not happened.
 
-### Deprecation window
-
-A deprecation lands in a minor, warns at load or on use, and is removed **no earlier than the next
-major**, which will be at least **two minor releases and 90 days** after the warning first shipped.
-Whichever is longer.
-
-If a removal ever has to move faster than that - a security fix with no compatible form - the release
-notes say so explicitly and explain why. That has not happened.
-
-### Explicitly outside the promise
+### Not covered by 1.x, deliberately
 
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
-- **The MCP tool surface.** Tools are advertised *adaptively per nest* (RFC-0025): a nest that cannot
-  answer compliance questions does not advertise compliance tools. The surface is therefore a function
-  of the nest, not of the release, and it moves as the AI surface improves. **Discover it with
-  `tools/list`; never hardcode a tool name.** That is the contract, and it is the one an agent should
-  want.
-- **`semantic.toml`'s derived blocks.** `[table.*.footguns]` are regenerated from the ABI and move when
-  the generator improves. **Your authored descriptions are preserved** across regeneration - that part
-  is covered.
-- **The admin UI's internals.** `/_admin` is a human surface, not an API. Its HTML and its internal
+- **The MCP surface and `semantic.toml`.** Both are documented as in-design rather than shipped
+  (RFC-0016, RFC-0017), and both are moving. The MCP tool surface is also advertised *adaptively per
+  nest* (RFC-0025) - it is a function of the nest, not of the release - so **discover it with
+  `tools/list` and never hardcode a tool name**. `semantic.toml`'s derived `[table.*.footguns]` are
+  regenerated from the ABI; your **authored descriptions are preserved**, and that half is covered.
+  If you build against the rest inside 1.x, pin the version.
+- **Segment identity across `arrow-rs` releases.** Byte-identical segments are a correctness
+  boundary, not an API, and the boundary belongs to a dependency we do not control: a segment's hash
+  covers the Parquet bytes including arrow-rs's `created_by` stamp, so identical decoded rows can
+  hash differently under a different build. What *is* promised is that sealed segments stay readable
+  and are never rewritten - compare decoded rows, not hashes, across versions. A release that changes
+  segment bytes says so in its notes; semver is the wrong instrument for it. (Same reason RFC-0033
+  puts the engine and its version inside the derivation reuse key.)
+- **The admin UI's internals.** `/_admin` is a human surface, not an API. Its HTML and internal
   endpoints may change in any release; the JSON APIs it consumes are covered by the HTTP row above.
-- **Segment content hashes across releases.** A segment's hash covers the Parquet bytes, which include
-  the `created_by` string stamped by the arrow-rs build, so **the same decoded rows may hash differently
-  under a different nuthatch version**. What *is* promised: sealed segments stay readable, and are never
-  rewritten. Compare decoded rows, not segment hashes, across versions. (This is the same reason
-  RFC-0033 puts the engine and its version inside the derivation reuse key: an identity that ignores
-  what produced the bytes is unsound across our own upgrades.)
 - **Anything behind an unreleased feature flag**, and the `postgres-store` build's internal schema
-  while scaled mode is young. Scaled mode's *external* surfaces - its HTTP API, its CLI, its config -
-  are covered like everything else.
+  while scaled mode is young. Scaled mode's *external* surfaces - its HTTP API, its CLI, its
+  config - are covered like everything else.
 
 ### What "1.0" claimed, and what it did not
 

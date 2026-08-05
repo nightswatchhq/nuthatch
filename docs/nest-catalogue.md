@@ -6,6 +6,13 @@ operator replace a rented Graph/Goldsky/Alchemy subgraph with a local, self-host
 thesis of "be your own indexer" is only as strong as the catalogue of things people actually want
 indexed on day one.
 
+**What this is not: a status board.** This document ranks *candidates*. What is actually published
+lives in the [nests index](https://github.com/nightswatchhq/nests), which is the single source of
+truth for what an operator can run today. Read a tier here as "how hard we expected this to be",
+never as "this has not shipped" - as of 2026-08-04 the index lists Graph Horizon, Uniswap V3,
+Uniswap V4, Livepeer and POA as 🟢 available, and two of those are not ranked in this file at all.
+Keeping a plan and a status board in one document is what let a shipped nest sit in Tier 3 for weeks.
+
 **Scope:** EVM-only - Ethereum mainnet + major L2s (Arbitrum, Optimism, Base, Polygon), per the
 [CLAUDE.md](../CLAUDE.md) non-negotiable that non-EVM is out of scope until EVM is airtight.
 
@@ -248,9 +255,12 @@ Strong demand, more build cost, or dependent on Tier-1 templates landing first.
 
 Real demand but narrower, more complex, or blocked on capabilities nuthatch hasn't shipped yet.
 
-- **Uniswap V4** *(DEX)* - emerging; **singleton `PoolManager` + hooks**, a *different* pattern from
-  V3's factory (hooks are arbitrary per-pool contracts). Watch it, but V3 is where the demand still
-  sits. 🔴 High.
+- **Uniswap V4** *(DEX)* - **shipped.** Published as
+  [`uniswap-v4-ethereum`](https://github.com/nightswatchhq/uniswap-v4-ethereum) and 🟢 available in
+  the [nests index](https://github.com/nightswatchhq/nests). The singleton `PoolManager` + hooks
+  pattern turned out to *suit* nuthatch rather than block it: no factory, no per-pool contracts, ten
+  event tables off one address. Left in this tier only as the record of a prediction that was wrong -
+  it was rated 🔴 High difficulty and Tier 3 here, and it landed anyway.
 - **EigenLayer** *(restaking)* - high narrative demand; `eigenlayer` standardized schema exists.
   Operator/staker delegation event model. 🟠 Medium-High.
 - **GMX** *(perps)* - perpetuals category leader; `gmx-forks` template. Position/PnL accounting.
