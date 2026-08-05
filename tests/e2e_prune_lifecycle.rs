@@ -16,7 +16,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Mount, Roost, DATA_DIR, ROOST_FILE};
+use nuthatch::roost::{Mount, Roost, DATA_DIR, MOUNTS_FILE};
 use nuthatch::store::HotStore;
 use nuthatch::{health::RoostHealth, indexer, migrate, prune, seal};
 
@@ -26,9 +26,9 @@ const BLOCKS: u64 = 12;
 
 fn write_roost(root: &Path, nests: &str) {
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         format!(
-            "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
              rpc_urls = []\nnests = [{nests}]\n"
         ),
     )
@@ -137,7 +137,7 @@ fn unmount(root: &Path) {
     roost.mounts.clear();
     roost.roost.nests = vec!["placeholder".into()];
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         toml::to_string_pretty(&roost).unwrap(),
     )
     .unwrap();
@@ -154,7 +154,7 @@ fn remount(root: &Path, nid: &str) {
         queries: Vec::new(),
     }];
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         toml::to_string_pretty(&roost).unwrap(),
     )
     .unwrap();

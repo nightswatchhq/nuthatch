@@ -31,7 +31,31 @@ async fn main() -> Result<()> {
     match cli::Cli::parse().command {
         cli::Command::Init(args) => project::init(args).await,
         cli::Command::Add(args) => project::add(args).await,
-        cli::Command::Dev(args) => indexer::dev(args).await,
+        // **One command for 1..N nests** (RFC-0032). The runtime hosts a single nest or many; which
+        // one you get is a property of the directory, not a decision an operator has to make before
+        // they know which they want. A `mounts.toml` means a multi-nest runtime, a `nuthatch.toml`
+        // means one nest, and the pre-2.0 `roost dev` split is gone.
+        cli::Command::Dev(args) => {
+            let dir = std::path::PathBuf::from(&args.dir);
+            if dir.join(nuthatch::roost::MOUNTS_FILE).exists()
+                || dir.join(nuthatch::roost::LEGACY_ROOST_FILE).exists()
+            {
+                roost::dev(
+                    dir,
+                    args.listen,
+                    args.rpc,
+                    args.backfill,
+                    args.seal_direct,
+                    args.concurrency,
+                    args.window,
+                    args.no_admin,
+                    args.fail_fast,
+                )
+                .await
+            } else {
+                indexer::dev(args).await
+            }
+        }
         cli::Command::Serve(args) => indexer::serve_role(args).await,
         #[cfg(feature = "postgres-store")]
         cli::Command::Worker(args) => {
@@ -151,22 +175,6 @@ async fn main() -> Result<()> {
         cli::Command::Prune(a) => {
             nuthatch::prune::run(std::path::Path::new(&a.dir), a.yes)
         }
-        cli::Command::Roost(args) => match args.what {
-            cli::RoostWhat::Dev(a) => {
-                roost::dev(
-                    std::path::PathBuf::from(&a.dir),
-                    a.listen,
-                    a.rpc,
-                    a.backfill,
-                    a.seal_direct,
-                    a.concurrency,
-                    a.window,
-                    a.no_admin,
-                    a.fail_fast,
-                )
-                .await
-            }
-        },
         cli::Command::Recipe(args) => match args.what {
             cli::RecipeWhat::List => {
                 nuthatch::recipes::list_cli();

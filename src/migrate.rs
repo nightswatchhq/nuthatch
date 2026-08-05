@@ -23,7 +23,7 @@
 //! data"; rename serves it better than the mechanism the RFC named.
 
 use crate::blob;
-use crate::roost::{Mount, Roost, DATA_DIR, NESTS_DIR, ROOST_FILE};
+use crate::roost::{Mount, Roost, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -99,12 +99,21 @@ impl Plan {
 /// Computing every nest's identity up front is what makes [`Plan::Merge`] detectable at all: two
 /// nests only turn out to be the same nest once both have been hashed.
 pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
-    let roost = Roost::load(dir)?;
+    let roost = Roost::load_for_migration(dir)?;
     let mut plans = Vec::with_capacity(roost.roost.nests.len());
     // Identity -> the first alias that claimed it, for merge detection within this run.
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    for alias in &roost.roost.nests {
+    // `mount_refs()`, **not** `roost.nests`: once a directory is migrated the mount records are
+    // authoritative and `nests` is empty, so iterating the list would see nothing on a second run and
+    // then write an empty mount table - turning "migrate twice" from a no-op into data loss.
+    for alias in roost
+        .mount_refs()
+        .iter()
+        .map(|m| m.alias.clone())
+        .collect::<Vec<_>>()
+    {
+        let alias = &alias;
         let recorded = roost.mounts.iter().find(|m| &m.alias == alias);
         let legacy = dir.join(NESTS_DIR).join(alias);
 
@@ -268,7 +277,7 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
     // Everything an un-migrated roost held belongs to the default tenant (RFC-0032 §6): migration is
     // a **relabel, not a migration** - no data moves between tenants, nothing re-indexes, and
     // enabling hosted tenancy later is another relabel rather than a second migration.
-    let tenant = Roost::load(dir)?.tenant_default();
+    let tenant = Roost::load_for_migration(dir)?.tenant_default();
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
     for p in &plans {
@@ -345,8 +354,14 @@ pub fn run(dir: &Path, dry_run: bool) -> Result<()> {
         }
     }
 
-    write_mounts(dir, &records)?;
-    println!("\nWrote {} mount record(s) to {ROOST_FILE}.", records.len());
+    let removed_legacy = write_mounts(dir, &records)?;
+    println!(
+        "\nWrote {} mount record(s) to {MOUNTS_FILE}.",
+        records.len()
+    );
+    if removed_legacy {
+        println!("Removed the pre-2.0 {LEGACY_ROOST_FILE} - this directory is now 2.0 shaped.");
+    }
 
     // An empty `nests/` left standing reads as "half of it didn't work". `remove_dir` refuses a
     // non-empty directory, so this can only ever tidy up - never delete a nest.
@@ -384,18 +399,37 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Rewrite `roost.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
-fn write_mounts(dir: &Path, records: &[Mount]) -> Result<()> {
-    let path = dir.join(ROOST_FILE);
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {} to record mounts", path.display()))?;
+fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
+    // Read whichever file this directory has - the migration's whole job is that it may still be the
+    // pre-2.0 one - and always *write* the 2.0 name.
+    let legacy = dir.join(LEGACY_ROOST_FILE);
+    let source = if dir.join(MOUNTS_FILE).exists() {
+        dir.join(MOUNTS_FILE)
+    } else {
+        legacy.clone()
+    };
+    let path = dir.join(MOUNTS_FILE);
+    let raw = std::fs::read_to_string(&source)
+        .with_context(|| format!("reading {} to record mounts", source.display()))?;
     let mut roost: Roost = toml::from_str(&raw)
-        .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
+        .with_context(|| format!("parsing {} before rewriting it", source.display()))?;
     roost.mounts = records.to_vec();
+    // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
+    // stale list beside them would lie.
+    roost.roost.nests.clear();
     let out = toml::to_string_pretty(&roost).context("serialising roost.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    // The pre-2.0 file goes only once its replacement is durably in place, so an interrupted run
+    // leaves a directory that still loads rather than one that loads as neither.
+    let mut removed_legacy = false;
+    if source == legacy && legacy.exists() {
+        std::fs::remove_file(&legacy)
+            .with_context(|| format!("removing the pre-2.0 {}", legacy.display()))?;
+        removed_legacy = true;
+    }
+    Ok(removed_legacy)
 }
 
 #[cfg(test)]
@@ -406,9 +440,9 @@ mod tests {
     fn write_roost(dir: &Path, nests: &[(&str, &str)]) {
         let names: Vec<String> = nests.iter().map(|(n, _)| format!("\"{n}\"")).collect();
         std::fs::write(
-            dir.join(ROOST_FILE),
+            dir.join(MOUNTS_FILE),
             format!(
-                "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
                  rpc_urls = []\nnests = [{}]\n",
                 names.join(", ")
             ),
@@ -439,7 +473,7 @@ mod tests {
             d.path(),
             &[("a", "0x0000000000000000000000000000000000000001")],
         );
-        let before = std::fs::read_to_string(d.path().join(ROOST_FILE)).unwrap();
+        let before = std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap();
 
         run(d.path(), true).unwrap();
 
@@ -447,7 +481,7 @@ mod tests {
         assert!(!d.path().join(DATA_DIR).exists(), "destination created");
         assert_eq!(
             before,
-            std::fs::read_to_string(d.path().join(ROOST_FILE)).unwrap(),
+            std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap(),
             "roost.toml was rewritten by a dry run"
         );
     }
@@ -489,6 +523,31 @@ mod tests {
         assert_ne!(roost.mounts[0].nid, roost.mounts[1].nid);
     }
 
+    /// The regression that made this test earn its keep: clearing `nests` when the mount records
+    /// became authoritative meant a **second** `migrate` saw nothing to do and wrote an empty mount
+    /// table - turning idempotency into data loss. Asserted explicitly, not just via the byte
+    /// comparison below, so a future refactor gets told what broke rather than that two strings
+    /// differ.
+    #[test]
+    fn migrating_twice_does_not_empty_the_mount_table() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[("a", "0x0000000000000000000000000000000000000001")],
+        );
+        run(d.path(), false).unwrap();
+        assert_eq!(Roost::load(d.path()).unwrap().mounts.len(), 1);
+
+        run(d.path(), false).unwrap();
+        let after = Roost::load(d.path()).unwrap();
+        assert_eq!(
+            after.mounts.len(),
+            1,
+            "a second migrate emptied the mount table - the directory would then serve nothing"
+        );
+        assert_eq!(after.mounts[0].alias, "a");
+    }
+
     #[test]
     fn migrating_twice_is_a_no_op() {
         let d = tempfile::tempdir().unwrap();
@@ -497,14 +556,14 @@ mod tests {
             &[("a", "0x0000000000000000000000000000000000000001")],
         );
         run(d.path(), false).unwrap();
-        let after_first = std::fs::read_to_string(d.path().join(ROOST_FILE)).unwrap();
+        let after_first = std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap();
         let nid = Roost::load(d.path()).unwrap().mounts[0].nid.clone();
 
         run(d.path(), false).unwrap();
 
         assert_eq!(
             after_first,
-            std::fs::read_to_string(d.path().join(ROOST_FILE)).unwrap()
+            std::fs::read_to_string(d.path().join(MOUNTS_FILE)).unwrap()
         );
         assert_eq!(Roost::load(d.path()).unwrap().mounts[0].nid, nid);
         assert_eq!(
@@ -597,7 +656,7 @@ mod tests {
         roost.mounts.clear();
         roost.roost.nests = vec!["a".into()];
         std::fs::write(
-            root.join(ROOST_FILE),
+            root.join(MOUNTS_FILE),
             toml::to_string_pretty(&roost).unwrap(),
         )
         .unwrap();
@@ -658,7 +717,7 @@ mod tests {
         roost.mounts.clear();
         roost.roost.nests = vec!["a".into()];
         std::fs::write(
-            root.join(ROOST_FILE),
+            root.join(MOUNTS_FILE),
             toml::to_string_pretty(&roost).unwrap(),
         )
         .unwrap();

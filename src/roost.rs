@@ -28,8 +28,17 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The roost manifest file, at the roost directory root. Sibling of a nest's `nuthatch.toml`.
-pub const ROOST_FILE: &str = "roost.toml";
+/// The **mount table**, at the runtime directory root (RFC-0032 §4).
+///
+/// Runtime state that the runtime owns, not authored config an operator maintains. It records which
+/// alias, for which tenant, serves which nest identity - and nothing else. `roost.toml` was its name
+/// until 2.0, when the roost was retired as a concept; a directory still carrying the old file is
+/// pointed at `nuthatch migrate` rather than silently ignored.
+pub const MOUNTS_FILE: &str = "mounts.toml";
+
+/// The pre-2.0 name for [`MOUNTS_FILE`]. Retained **only** so a directory that has not been migrated
+/// can be recognised and named in an error, and so `migrate` can read it.
+pub const LEGACY_ROOST_FILE: &str = "roost.toml";
 
 /// Where mounted nests live under the roost dir: `nests/<name>/` is a nest directory, exactly as a
 /// standalone nest is today.
@@ -129,6 +138,9 @@ impl MountRef {
 /// never multiplex two chains behind one cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Roost {
+    /// Serialised as `[runtime]`. Was `[roost]` until 2.0, when the roost was retired as a concept
+    /// (RFC-0032 slice 5); `migrate` rewrites the section along with everything else.
+    #[serde(rename = "runtime", alias = "roost")]
     pub roost: RoostMeta,
     /// Multichain: each chain the roost serves, with its own RPC endpoints (RFC-0021). Mutually
     /// exclusive with the top-level `chain`/`chain_id`. Empty → the single-chain top-level form.
@@ -226,9 +238,39 @@ pub fn estimate_nest_rss_mb(config: &Config, has_labels: bool) -> u64 {
 impl Roost {
     /// Load and validate `roost.toml` from a roost directory.
     pub fn load(dir: &Path) -> Result<Roost> {
-        let path = dir.join(ROOST_FILE);
+        Self::load_inner(dir, false)
+    }
+
+    /// Load for **migration**, accepting the pre-2.0 file.
+    ///
+    /// [`Roost::load`] refuses a directory still holding `roost.toml` and points at `nuthatch
+    /// migrate`. `migrate` therefore cannot use it: the one command that fixes the problem would
+    /// refuse to run *because* the problem exists. This is that door, and it is the only caller.
+    pub fn load_for_migration(dir: &Path) -> Result<Roost> {
+        Self::load_inner(dir, true)
+    }
+
+    fn load_inner(dir: &Path, accept_legacy: bool) -> Result<Roost> {
+        let legacy = dir.join(LEGACY_ROOST_FILE);
+        let path = if accept_legacy && !dir.join(MOUNTS_FILE).exists() && legacy.exists() {
+            legacy
+        } else {
+            dir.join(MOUNTS_FILE)
+        };
+        // A directory still carrying the pre-2.0 file is a *migration that has not been run*, not a
+        // missing file. Saying so beats "no mounts.toml", which sends an operator looking for a file
+        // they never had.
+        if !accept_legacy && !path.exists() && dir.join(LEGACY_ROOST_FILE).exists() {
+            bail!(
+                "{} holds a pre-2.0 {LEGACY_ROOST_FILE}. The roost was retired in 2.0: run \
+                 `nuthatch migrate --dir {}` to move its data to identity-keyed datasets and write a \
+                 {MOUNTS_FILE}. It moves data and never re-indexes; `--dry-run` prints the plan first.",
+                dir.display(),
+                dir.display()
+            );
+        }
         let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("no {ROOST_FILE} in {}", dir.display()))?;
+            .with_context(|| format!("no {MOUNTS_FILE} in {}", dir.display()))?;
         let roost: Roost =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         if roost.roost.nests.is_empty() && roost.mounts.is_empty() {
@@ -537,7 +579,8 @@ pub fn group_by_chain(
     Ok(groups)
 }
 
-/// `nuthatch roost dev <dir>`: bring up every mounted nest and serve them behind one listener.
+/// `nuthatch dev --dir <dir>` where `<dir>` holds a mount table: bring up every mounted nest and
+/// serve them behind one listener. Reached from the same `dev` a single nest uses (RFC-0032).
 ///
 /// One shared source drives all nests through a single `indexer::spawn_roost` task per chain (the
 /// shared cursor - one `getLogs` per window fanned out to the owning nests). Before starting it
@@ -617,9 +660,9 @@ pub async fn dev(
         );
     }
     tracing::info!(
-        "roost '{}': mounting {} nest(s) across {} chain(s) - one isolated cursor per chain",
+        "runtime '{}': mounting {} nest(s) across {} chain(s) - one isolated cursor per chain",
         meta.name,
-        meta.nests.len(),
+        roost.mount_refs().len(), // NOT `meta.nests`, which is empty once the mount table is authoritative
         groups.len(),
     );
 
@@ -1042,7 +1085,7 @@ pub fn lifecycle_routes(
 /// `--no-admin` and restart to change the set, because fighting a config-management tool over a file
 /// is a losing game.
 fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
-    let path = dir.join(ROOST_FILE);
+    let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
     let mut roost: Roost = toml::from_str(&raw)
@@ -1318,7 +1361,7 @@ impl RoostHandles {
         let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
         if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names) {
             tracing::warn!(
-                "the roost's nest set changed but {ROOST_FILE} could not be updated ({e:#}) - the \
+                "the roost's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
                  change is live now but will not survive a restart"
             );
         }
@@ -1412,9 +1455,9 @@ mod tests {
     /// Write a minimal roost.toml + one nest dir on the given chain.
     fn write_roost(dir: &Path, chain: &str, chain_id: u64, nest_chain: &str, nest_chain_id: u64) {
         std::fs::write(
-            dir.join(ROOST_FILE),
+            dir.join(MOUNTS_FILE),
             format!(
-                "[roost]\nname = \"test\"\nchain = \"{chain}\"\nchain_id = {chain_id}\n\
+                "[runtime]\nname = \"test\"\nchain = \"{chain}\"\nchain_id = {chain_id}\n\
                  rpc_urls = [\"http://localhost:8545\"]\nnests = [\"a\"]\n"
             ),
         )
@@ -1468,9 +1511,9 @@ mod tests {
         let root = d.path();
         let nid = "aa11".repeat(16);
         std::fs::write(
-            root.join(ROOST_FILE),
+            root.join(MOUNTS_FILE),
             format!(
-                "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
                  rpc_urls = []\n\n\
                  [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"{nid}\"\n\n\
                  [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"{nid}\"\n"
@@ -1491,14 +1534,54 @@ mod tests {
         );
     }
 
+    /// RFC-0032 slice 5: the roost is retired, so a directory still holding the pre-2.0 file is a
+    /// **migration that has not been run** - and must say so, rather than reporting a missing
+    /// `mounts.toml` an operator never had.
+    #[test]
+    fn a_pre_2_0_directory_is_pointed_at_migrate() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join(LEGACY_ROOST_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\nnests = [\"a\"]\n",
+        )
+        .unwrap();
+        let err = Roost::load(d.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("nuthatch migrate"),
+            "the error must name the fix: {err}"
+        );
+        assert!(
+            err.contains("never re-indexes"),
+            "and reassure about the cost: {err}"
+        );
+        assert!(
+            err.contains("retired in 2.0"),
+            "and say why the file stopped working: {err}"
+        );
+
+        // Once migrated the old file is irrelevant: `mounts.toml` is what is read.
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                 rpc_urls = []\n\n[[mounts]]\nalias = \"a\"\nnid = \"{}\"\n",
+                "aa11".repeat(16)
+            ),
+        )
+        .unwrap();
+        let roost = Roost::load(d.path()).expect("a migrated directory loads");
+        assert_eq!(roost.mounts.len(), 1);
+    }
+
     /// RFC-0032 §4: grouping is by *dataset*, and a roost may be half-migrated while it happens.
     #[test]
     fn datasets_group_by_identity_across_both_layouts() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         std::fs::write(
-            root.join(ROOST_FILE),
-            "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+            root.join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
              rpc_urls = []\nnests = [\"a\", \"b\", \"legacy\"]\n\n\
              [[mounts]]\nalias = \"a\"\nnid = \"aa11\"\n\n\
              [[mounts]]\nalias = \"b\"\nnid = \"aa11\"\n"
@@ -1530,7 +1613,7 @@ mod tests {
     fn a_mount_record_is_validated() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
-        let base = "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+        let base = "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
                     rpc_urls = []\n\n[[mounts]]\n";
         let good = "aa11".repeat(16);
 
@@ -1557,14 +1640,14 @@ mod tests {
                 "more than once",
             ),
         ] {
-            std::fs::write(root.join(ROOST_FILE), format!("{base}{record}")).unwrap();
+            std::fs::write(root.join(MOUNTS_FILE), format!("{base}{record}")).unwrap();
             let err = Roost::load(root).unwrap_err().to_string();
             assert!(err.contains(expect), "expected {expect:?}, got: {err}");
         }
 
         // ...and the same alias under two *different* tenants is fine, which is the whole point.
         std::fs::write(
-            root.join(ROOST_FILE),
+            root.join(MOUNTS_FILE),
             format!(
                 "{base}tenant = \"acme\"\nalias = \"a\"\nnid = \"{good}\"\n\n\
                  [[mounts]]\ntenant = \"globex\"\nalias = \"a\"\nnid = \"{good}\"\n"
@@ -1606,8 +1689,8 @@ mod tests {
     fn multichain_roost_groups_nests_by_chain() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"multi\"\nnests = [\"a\", \"b\"]\n\n\
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"multi\"\nnests = [\"a\", \"b\"]\n\n\
              [[chains]]\nchain = \"base\"\nchain_id = 8453\nrpc_urls = [\"http://base\"]\n\n\
              [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = [\"http://arb\"]\n",
         )
@@ -1632,8 +1715,8 @@ mod tests {
     fn rejects_both_top_level_and_multichain_forms() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"x\"\nchain = \"base\"\nchain_id = 8453\nrpc_urls = [\"u\"]\nnests = [\"a\"]\n\n\
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"x\"\nchain = \"base\"\nchain_id = 8453\nrpc_urls = [\"u\"]\nnests = [\"a\"]\n\n\
              [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = [\"v\"]\n",
         )
         .unwrap();
@@ -1651,8 +1734,8 @@ mod tests {
         for bad in ["../etc", "a/b", "", "has space"] {
             let d = tempfile::tempdir().unwrap();
             std::fs::write(
-                d.path().join(ROOST_FILE),
-                format!("[roost]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"{bad}\"]\n"),
+                d.path().join(MOUNTS_FILE),
+                format!("[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"{bad}\"]\n"),
             )
             .unwrap();
             let err = Roost::load(d.path()).unwrap_err().to_string();
@@ -1667,8 +1750,8 @@ mod tests {
     fn rejects_reserved_and_duplicate_nest_names() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"nests\"]\n",
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"nests\"]\n",
         )
         .unwrap();
         assert!(Roost::load(d.path())
@@ -1677,8 +1760,8 @@ mod tests {
             .contains("reserved"));
 
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"a\", \"a\"]\n",
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = [\"a\", \"a\"]\n",
         )
         .unwrap();
         assert!(Roost::load(d.path())
@@ -1691,8 +1774,8 @@ mod tests {
     fn rejects_a_roost_that_mounts_nothing() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = []\n",
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = []\n",
         )
         .unwrap();
         assert!(Roost::load(d.path())

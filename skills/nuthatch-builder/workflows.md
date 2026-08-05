@@ -72,13 +72,13 @@ generator → same decode, verifiably. `semantic.toml` travels in the bundle and
 
 You can also `init --from <git-url|dir>` to start from a published nest instead of an address.
 
-## Run many nests in one process (a roost)
+## Run many nests in one process (RFC-0032)
 
-A *roost* hosts several nests **on the same chain** behind one API, sharing one cursor and one getLogs
-per window - N nests for roughly one nest's RPC cost. Create a `roost.toml` (see config-reference) and:
+One runtime hosts several nests **on the same chain** behind one API, sharing one cursor and one getLogs
+per window - N nests for roughly one nest's RPC cost. Create a `mounts.toml` (see config-reference) and:
 
 ```sh
-nuthatch roost dev --dir .            # serves /nests + each nest under /<name>/…
+nuthatch dev --dir .            # serves /nests + each nest under /<name>/…
 ```
 
 Each nest is isolated (own store, own reorg blast radius) but shares the finality view. A per-runtime

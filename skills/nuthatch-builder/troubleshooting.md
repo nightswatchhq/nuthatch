@@ -1,7 +1,7 @@
 # nuthatch troubleshooting
 
 Symptom → what to look at (`/metrics`, Prometheus) → remedy. All `/metrics` series are on the running
-`dev`/`roost` at `http://127.0.0.1:8288/metrics`.
+`dev` at `http://127.0.0.1:8288/metrics`.
 
 ## Backfill seems stuck / hung
 
@@ -44,7 +44,7 @@ use a provider with a higher/no result cap. This fails loudly rather than loopin
 
 ## RAM near the 2 GB budget
 
-- The budget is per-runtime and CI-enforced. In a roost it's shared across nests (`max_rss_mb`, default
+- The budget is per-runtime and CI-enforced. With several nests in one runtime it's shared across them (`max_rss_mb`, default
   2048); a mount projected to exceed it is refused. Check actual `nuthatch_rss_bytes` in the roster.
 - DuckDB queries have their own 512 MB / 2-thread cap; the concurrency gate bounds the aggregate. If
   you're tight, lower concurrency rather than the per-query cap.

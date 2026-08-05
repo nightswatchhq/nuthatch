@@ -69,18 +69,16 @@ pub enum Command {
     Audit(AuditArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
-    /// Run a roost: many nests across one or more chains behind one API, each under `/<name>/…`
-    /// (RFC-0012, RFC-0021 - one isolated cursor per chain).
-    Roost(RoostArgs),
     /// Derive-first recipes (RFC-0023): add a view that computes a read (e.g. `total_supply`) from
     /// indexed events instead of fetching it with an `eth_call`. No archive node, deterministic, free.
     Recipe(RecipeArgs),
     /// Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-0023 tier 2). Called
     /// once (they never change) and remembered in `metadata.json`; the constants tier 1 can't derive.
     Metadata(MetadataArgs),
-    /// Move a roost to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/` (RFC-0032).
+    /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
+    /// and `roost.toml` becomes `mounts.toml` (RFC-0032).
     ///
-    /// Data is moved, never re-indexed. Idempotent, and safe to run on a roost that is already
+    /// Data is moved, never re-indexed. Idempotent, and safe to run on a directory that is already
     /// partly migrated. Use `--dry-run` first: it prints the entire plan and changes nothing.
     Migrate(MigrateArgs),
     /// Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5).
@@ -97,7 +95,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct MigrateArgs {
-    /// Roost directory (must contain a roost.toml).
+    /// The directory to migrate: a pre-2.0 one with a roost.toml, or one already part-migrated.
     #[arg(long, default_value = ".")]
     pub dir: String,
     /// Print the plan - every nest, its identity, and where it would land - without changing
@@ -108,67 +106,12 @@ pub struct MigrateArgs {
 
 #[derive(Args)]
 pub struct PruneArgs {
-    /// Roost directory (must contain a roost.toml).
+    /// The directory to migrate: a pre-2.0 one with a roost.toml, or one already part-migrated.
     #[arg(long, default_value = ".")]
     pub dir: String,
     /// Actually delete. Without this, prune only reports what it would remove.
     #[arg(long)]
     pub yes: bool,
-}
-
-#[derive(Args)]
-pub struct RoostArgs {
-    #[command(subcommand)]
-    pub what: RoostWhat,
-}
-
-#[derive(Subcommand)]
-pub enum RoostWhat {
-    /// Bring up every nest a `roost.toml` mounts and serve them behind one listener: `/nests` roster
-    /// plus each nest's full API under its `/<name>/…` prefix. Chain identity is shared; the stores are
-    /// per-nest and isolated.
-    Dev(RoostDevArgs),
-}
-
-#[derive(Args)]
-pub struct RoostDevArgs {
-    /// Roost directory (must contain a roost.toml and a nests/ dir).
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-
-    /// Address to bind the HTTP API to.
-    #[arg(long, default_value = "127.0.0.1:8288")]
-    pub listen: String,
-
-    /// Override the roost's `rpc_urls` at runtime without editing the config (repeatable).
-    #[arg(long)]
-    pub rpc: Vec<String>,
-
-    /// Index only this many blocks back from the tip, for every mounted nest (recent-history mode).
-    #[arg(long)]
-    pub backfill: Option<u64>,
-
-    /// Backfill finalized history straight to Parquet before tip-following, for every nest (RFC-0004).
-    #[arg(long)]
-    pub seal_direct: bool,
-
-    /// Concurrent window fetches during each nest's seal-direct backfill.
-    #[arg(long, default_value_t = 1)]
-    pub concurrency: usize,
-
-    /// Override the `eth_getLogs` block-window (the chain default otherwise) for every nest's backfill.
-    #[arg(long)]
-    pub window: Option<u64>,
-
-    /// Disable the built-in admin UI (`/<name>/_admin/`) entirely for every nest (RFC-0010 Part A).
-    #[arg(long)]
-    pub no_admin: bool,
-
-    /// Exit on the first fault instead of quarantining it (RFC-0026 §6). By default a failed nest or
-    /// cursor is quarantined and its healthy siblings keep indexing and serving; this restores the old
-    /// fail-stop behaviour for CI, deterministic tests, and operators who prefer it.
-    #[arg(long)]
-    pub fail_fast: bool,
 }
 
 #[derive(Args)]
@@ -886,9 +829,16 @@ pub struct ServeArgs {
 
 #[derive(Args)]
 pub struct DevArgs {
-    /// Project directory (must contain a nuthatch.toml).
+    /// The directory to run. A `nuthatch.toml` runs that one nest; a `mounts.toml` runs every nest
+    /// it mounts, one isolated cursor per chain (RFC-0032). One command either way.
     #[arg(long, default_value = ".")]
     pub dir: String,
+
+    /// Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more
+    /// than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep
+    /// indexing and serving.
+    #[arg(long)]
+    pub fail_fast: bool,
 
     /// Address to bind the HTTP API to.
     #[arg(long, default_value = "127.0.0.1:8288")]
