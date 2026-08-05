@@ -250,17 +250,17 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
 /// the static boot path reads. Without this, an unmount would silently come back on the next restart,
 /// which is the worst kind of bug because it looks like it worked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_lifecycle_change_is_persisted_to_roost_toml() {
+async fn a_lifecycle_change_is_persisted_to_the_mount_table() {
     let roost_dir = tempfile::tempdir().unwrap();
     let usdc_dir = roost_dir.path().join("nests/usdc");
     let arb_dir = roost_dir.path().join("nests/arb");
     std::fs::create_dir_all(&usdc_dir).unwrap();
     std::fs::create_dir_all(&arb_dir).unwrap();
 
-    // A manifest matching the running set, as `roost dev` would have loaded.
+    // A mount table matching the running set, as `dev` would have loaded.
     std::fs::write(
-        roost_dir.path().join("roost.toml"),
-        r#"[roost]
+        roost_dir.path().join(nuthatch::roost::MOUNTS_FILE),
+        r#"[runtime]
 name = "test"
 chain = "arbitrum-one"
 chain_id = 42161
@@ -273,7 +273,8 @@ nests = ["usdc", "arb"]
     let (mut handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
     handles.unmount("arb").await.expect("unmount");
 
-    let reloaded = nuthatch::roost::Roost::load(roost_dir.path()).expect("roost.toml still parses");
+    let reloaded =
+        nuthatch::roost::Roost::load(roost_dir.path()).expect("the mount table still parses");
     assert_eq!(
         reloaded.roost.nests,
         vec!["usdc".to_string()],

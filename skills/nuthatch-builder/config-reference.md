@@ -1,6 +1,6 @@
 # nuthatch config reference
 
-The three config files a nest/roost uses. Keys mirror the serde structs in `src/config.rs`,
+The three config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in `src/config.rs`,
 `src/semantic.rs`, and `src/roost.rs`; a CI check fails the build if this file names a key those
 structs don't have.
 
@@ -10,7 +10,7 @@ Written by `init`; edit by hand freely.
 
 ```toml
 [nest]
-name = "usdc"                 # nest name (also the roost mount name)
+name = "usdc"                 # nest name (also the default mount alias)
 chain = "mainnet"             # mainnet | arbitrum-one | base
 chain_id = 1
 rpc_urls = ["https://…"]      # tried in order, then round-robin failover
@@ -84,29 +84,40 @@ reserved_words = ["from", "to"]   # double-quote these in SQL
 big_ints = ["value"]              # use value_dec for SUM/AVG/compare
 ```
 
-## `roost.toml` - many nests, one process (RFC-0012; multichain RFC-0021)
+## `mounts.toml` - many nests, one runtime (RFC-0012; multichain RFC-0021; renamed in 2.0)
+
+**The roost is retired.** There is one command - `nuthatch dev --dir <dir>` - and what it runs is a
+property of the directory: a `nuthatch.toml` runs that one nest, a `mounts.toml` runs every nest it
+mounts. `roost dev` no longer exists, and a directory still holding a pre-2.0 `roost.toml` is refused
+with a pointer to `nuthatch migrate` (which moves data and never re-indexes).
+
+**This file is runtime state, not authored config.** `migrate` writes it and the runtime keeps it in
+step.
+
 
 Single-chain form - all mounted nests share ONE chain, ONE cursor:
 
 ```toml
-[roost]
-name = "my-roost"
+[runtime]                     # was [roost] before 2.0
+name = "my-runtime"
 chain = "mainnet"             # the one chain (one cursor)
 chain_id = 1
 rpc_urls = ["https://…"]
-nests = ["usdc", "weth"]      # subdirectories under nests/ to mount
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048)
+
+[[mounts]]                    # what is mounted; `nests = [...]` is gone
+alias = "usdc"
+nid = "9f2c…"
 ```
 
 Multichain form (RFC-0021) - one isolated cursor per chain. Omit the top-level
-`chain`/`chain_id`/`rpc_urls`; list chains under `[[chains]]` (a top-level array, beside `[roost]`),
+`chain`/`chain_id`/`rpc_urls`; list chains under `[[chains]]` (a top-level array, beside `[runtime]`),
 and let each nest declare its own `chain` in its `nuthatch.toml`:
 
 ```toml
-[roost]
-name = "my-roost"
-nests = ["usdc", "base-app"]  # usdc → mainnet, base-app → base (per each nest's own chain)
-max_rss_mb = 2048             # per-cursor; a roost's total budget is Σ cursors
+[runtime]
+name = "my-runtime"
+max_rss_mb = 2048             # per-cursor; the runtime's total budget is Σ cursors
 
 [[chains]]
 chain = "mainnet"
@@ -133,11 +144,10 @@ alias = "usdc"                  # the name in `nests` and the route prefix `/usd
 nid = "9f2c…"                   # 64 hex chars: the nest's identity, and its dataset key
 ```
 
-Without mount records a roost resolves each nest at `nests/<name>/`, the pre-2.0 layout. With them,
-the nest is read from `data/<nid>/` - addressed by *what the nest is* rather than by what an operator
-called it. Both resolve, so a partly-migrated roost is a supported state.
+Before 2.0 a runtime resolved each nest at `nests/<name>/`. Now the nest is read from `data/<nid>/` - addressed by *what the nest is* rather than by what an operator
+called it. Both resolve, so a partly-migrated directory is a supported state.
 
-Run `nuthatch migrate --dir <roost> --dry-run` to see the plan before applying it. The migration
+Run `nuthatch migrate --dir <dir> --dry-run` to see the plan before applying it. The migration
 moves data and never re-indexes; if two aliases turn out to be the same nest, it says so and merges
 them onto one dataset.
 
@@ -208,7 +218,7 @@ nothing - and two tenants sharing one dataset can expose different surfaces over
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No
 authz, no quotas, no metering - identity is the gateway's job. Omit it and you get `default`
-(configurable per roost with `[roost] default_tenant`).
+(configurable per runtime with `[runtime] default_tenant`).
 
 ```toml
 [[mounts]]
@@ -223,7 +233,7 @@ nid = "9f2c…"         # same nest, one dataset, one backfill
 ```
 
 **Routes carry the tenant only when there is more than one.** One tenant → `/usdc/…`, exactly as
-today. Two or more → `/acme/usdc/…` and `/globex/usdc/…`. Nobody running a single-tenant roost ever
+today. Two or more → `/acme/usdc/…` and `/globex/usdc/…`. Nobody running a single-tenant runtime ever
 types the word, and their URLs never move.
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.

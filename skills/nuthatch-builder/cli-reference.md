@@ -85,7 +85,8 @@ Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet
 
 Run the indexer: poll logs, store entities, and serve the API
 
-- `--dir <DIR>` - Project directory (must contain a nuthatch.toml)
+- `--dir <DIR>` - The directory to run. A `nuthatch.toml` runs that one nest; a `mounts.toml` runs every nest it mounts, one isolated cursor per chain (RFC-0032). One command either way
+- `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving
 - `--listen <LISTEN>` - Address to bind the HTTP API to
 - `--rpc <RPC>` - Override the nest's `rpc_urls` at runtime without editing the config (repeatable). These are tried first; the nest's configured endpoints remain as fallback. Point at your own node
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
@@ -176,9 +177,9 @@ Fetch + cache immutable metadata for every contract in the nest (skips already-c
 
 ## `nuthatch migrate`
 
-Move a roost to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/` (RFC-0032)
+Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`, and `roost.toml` becomes `mounts.toml` (RFC-0032)
 
-- `--dir <DIR>` - Roost directory (must contain a roost.toml)
+- `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a roost.toml, or one already part-migrated
 - `--dry-run` - Print the plan - every nest, its identity, and where it would land - without changing anything
 
 ## `nuthatch nest`
@@ -260,7 +261,7 @@ Verify a pack: signature, artifact hashes, and grant conformance
 
 Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
 
-- `--dir <DIR>` - Roost directory (must contain a roost.toml)
+- `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a roost.toml, or one already part-migrated
 - `--yes` - Actually delete. Without this, prune only reports what it would remove
 
 ## `nuthatch recipe`
@@ -280,25 +281,6 @@ Add a recipe's derived view to a nest's `views/` (never clobbers an existing fil
 
 List the available derive-first recipes
 
-
-## `nuthatch roost`
-
-Run a roost: many nests across one or more chains behind one API, each under `/<name>/…` (RFC-0012, RFC-0021 - one isolated cursor per chain)
-
-
-## `nuthatch roost dev`
-
-Bring up every nest a `roost.toml` mounts and serve them behind one listener: `/nests` roster plus each nest's full API under its `/<name>/…` prefix. Chain identity is shared; the stores are per-nest and isolated
-
-- `--dir <DIR>` - Roost directory (must contain a roost.toml and a nests/ dir)
-- `--listen <LISTEN>` - Address to bind the HTTP API to
-- `--rpc <RPC>` - Override the roost's `rpc_urls` at runtime without editing the config (repeatable)
-- `--backfill <BACKFILL>` - Index only this many blocks back from the tip, for every mounted nest (recent-history mode)
-- `--seal-direct` - Backfill finalized history straight to Parquet before tip-following, for every nest (RFC-0004)
-- `--concurrency <CONCURRENCY>` - Concurrent window fetches during each nest's seal-direct backfill
-- `--window <WINDOW>` - Override the `eth_getLogs` block-window (the chain default otherwise) for every nest's backfill
-- `--no-admin` - Disable the built-in admin UI (`/<name>/_admin/`) entirely for every nest (RFC-0010 Part A)
-- `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). By default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving; this restores the old fail-stop behaviour for CI, deterministic tests, and operators who prefer it
 
 ## `nuthatch schema`
 

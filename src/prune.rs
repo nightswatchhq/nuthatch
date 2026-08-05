@@ -154,19 +154,19 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roost::{Mount, ROOST_FILE};
+    use crate::roost::{Mount, MOUNTS_FILE};
 
     /// A roost with `mounted` recorded and `orphans` sitting in `data/` with no record.
     fn fixture(dir: &Path, mounted: &[&str], orphans: &[&str]) {
         let mut roost =
-            "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n"
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n"
                 .to_string();
         for (i, nid) in mounted.iter().enumerate() {
             roost.push_str(&format!(
                 "\n[[mounts]]\nalias = \"n{i}\"\nnid = \"{nid}\"\n"
             ));
         }
-        std::fs::write(dir.join(ROOST_FILE), roost).unwrap();
+        std::fs::write(dir.join(MOUNTS_FILE), roost).unwrap();
         for nid in mounted.iter().chain(orphans) {
             let d = dir.join(DATA_DIR).join(nid);
             std::fs::create_dir_all(&d).unwrap();
@@ -198,9 +198,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let shared = nid("cc");
         std::fs::write(
-            d.path().join(ROOST_FILE),
+            d.path().join(MOUNTS_FILE),
             format!(
-                "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
                  [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"{shared}\"\n"
             ),
         )
@@ -264,7 +264,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = nid("aa");
         fixture(d.path(), &[&a], &[]);
-        std::fs::write(d.path().join(ROOST_FILE), "this is not toml {{{").unwrap();
+        std::fs::write(d.path().join(MOUNTS_FILE), "this is not toml {{{").unwrap();
 
         assert!(
             collectable(d.path()).is_err(),
@@ -287,8 +287,8 @@ mod tests {
 
         // Unmount: the record goes, the data stays.
         std::fs::write(
-            d.path().join(ROOST_FILE),
-            "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
              rpc_urls = []\nnests = [\"placeholder\"]\n",
         )
         .unwrap();
@@ -309,7 +309,7 @@ mod tests {
             queries: Vec::new(),
         });
         std::fs::write(
-            d.path().join(ROOST_FILE),
+            d.path().join(MOUNTS_FILE),
             toml::to_string_pretty(&roost).unwrap(),
         )
         .unwrap();

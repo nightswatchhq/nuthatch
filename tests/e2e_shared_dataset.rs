@@ -20,7 +20,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Dataset, Roost, DATA_DIR, ROOST_FILE};
+use nuthatch::roost::{Dataset, Roost, DATA_DIR, MOUNTS_FILE};
 use nuthatch::store::HotStore;
 use nuthatch::{analytics, health::RoostHealth, indexer, migrate, roost};
 
@@ -30,8 +30,8 @@ use common::tape::*;
 /// identity - which is exactly what a second tenant mounting the same nest produces.
 fn two_mounts_one_nest(root: &Path) -> String {
     std::fs::write(
-        root.join(ROOST_FILE),
-        "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+        root.join(MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
          rpc_urls = []\nnests = [\"primary\"]\n",
     )
     .unwrap();
@@ -53,7 +53,7 @@ fn two_mounts_one_nest(root: &Path) -> String {
         queries: Vec::new(),
     });
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         toml::to_string_pretty(&roost).unwrap(),
     )
     .unwrap();
@@ -244,8 +244,8 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
     let solo_root = tempfile::tempdir().unwrap();
     let solo_root = solo_root.path();
     std::fs::write(
-        solo_root.join(ROOST_FILE),
-        "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+        solo_root.join(MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
          rpc_urls = []\nnests = [\"primary\"]\n",
     )
     .unwrap();
@@ -301,8 +301,8 @@ async fn two_tenants_mounting_one_nest_share_it() {
 
     // Start single-tenant and migrate, exactly as an existing deployment would.
     std::fs::write(
-        root.join(ROOST_FILE),
-        "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+        root.join(MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
          rpc_urls = []\nnests = [\"usdc\"]\n",
     )
     .unwrap();
@@ -341,7 +341,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
     ];
     roost.roost.nests.clear(); // `[[mounts]]` is authoritative once present
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         toml::to_string_pretty(&roost).unwrap(),
     )
     .unwrap();
@@ -384,7 +384,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
     let mut after = Roost::load(root).unwrap();
     after.mounts.retain(|m| m.tenant != "acme");
     std::fs::write(
-        root.join(ROOST_FILE),
+        root.join(MOUNTS_FILE),
         toml::to_string_pretty(&after).unwrap(),
     )
     .unwrap();
@@ -421,9 +421,9 @@ fn a_tenant_is_still_a_path_segment() {
         ("nests", "reserved"),
     ] {
         std::fs::write(
-            root.join(ROOST_FILE),
+            root.join(MOUNTS_FILE),
             format!(
-                "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
                  rpc_urls = []\n\n[[mounts]]\ntenant = \"{tenant}\"\nalias = \"a\"\nnid = \"{nid}\"\n"
             ),
         )

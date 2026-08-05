@@ -17,7 +17,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::roost::{Roost, DATA_DIR, NESTS_DIR, ROOST_FILE};
+use nuthatch::roost::{Roost, DATA_DIR, MOUNTS_FILE, NESTS_DIR};
 use nuthatch::store::HotStore;
 use nuthatch::{analytics, indexer, migrate, seal};
 
@@ -64,8 +64,8 @@ async fn migrating_preserves_every_sealed_byte() {
 
     // A roost in the pre-2.0 layout: two nests on one chain, each under `nests/<name>/`.
     std::fs::write(
-        root.join(ROOST_FILE),
-        "[roost]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+        root.join(MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
          rpc_urls = []\nnests = [\"usdc\", \"arb\"]\n",
     )
     .unwrap();

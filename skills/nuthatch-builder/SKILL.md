@@ -1,6 +1,6 @@
 ---
 name: nuthatch-builder
-description: Build, configure, run, or debug a nuthatch indexer (a "nest" or "roost"). Use when the user wants to index a smart contract's events into a local SQL database with nuthatch - scaffolding from an address, editing nuthatch.toml/semantic.toml, adding contracts, factories, compliance screening, packaging/mounting nests, running a roost, or troubleshooting a running indexer.
+description: Build, configure, run, or debug a nuthatch indexer (a "nest", one or many in a runtime). Use when the user wants to index a smart contract's events into a local SQL database with nuthatch - scaffolding from an address, editing nuthatch.toml/semantic.toml, adding contracts, factories, compliance screening, packaging/mounting nests, running several nests in one runtime, or troubleshooting a running indexer.
 ---
 
 # Building with nuthatch
@@ -33,13 +33,13 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer"
 
 - **[cli-reference.md](cli-reference.md)** - GENERATED from the binary. The authoritative list of every
   subcommand and flag. If a flag isn't here, it doesn't exist - never invent one.
-- **[config-reference.md](config-reference.md)** - every `nuthatch.toml` / `semantic.toml` / `roost.toml`
+- **[config-reference.md](config-reference.md)** - every `nuthatch.toml` / `semantic.toml` / `mounts.toml`
   key.
 - **[config-as-code.md](config-as-code.md)** - the `nest.star` (Starlark) front-end, **RETIRED**. Author
   nests in plain `nuthatch.toml`; the `.star` path stays in the binary for backward compatibility only.
   Read this only to understand a legacy `nest.star` you've inherited - don't write new ones.
 - **[workflows.md](workflows.md)** - the recipes: init→dev→sql, add a contract, factories, publish a
-  nest (bundle/load), run a roost, wire an AI client.
+  nest (bundle/load), run several nests in one runtime, wire an AI client.
 - **[views.md](views.md)** - a nest's logic layer: authoring `views/*.sql` derivations, describing them
   in `semantic.toml`, and the reserved-word / big-int / hot∪cold footguns.
 - **[compliance.md](compliance.md)** - labels, sanctions lists, screening, flags, exposure, the signed
