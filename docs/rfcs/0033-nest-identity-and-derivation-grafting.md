@@ -104,7 +104,31 @@ Only these normalisations are applied. Everything else is significant.
 
 - Whitespace and comments
 - Alias α-renaming
-- Inner join written as a comma versus explicit `JOIN`
+- ~~Inner join written as a comma versus explicit `JOIN`~~ - **withdrawn, see below**
+
+> **Amended after building slice 1 (2026-08-05).** The comma-versus-explicit normalisation is
+> **not safe and is not implemented.** Against DuckDB's own AST the two forms are not a renaming: the
+> comma form yields `ref_type: "CROSS"` with the predicate in `where_clause`, while the explicit form
+> yields `ref_type: "REGULAR"` with the predicate in `condition`. Normalising them means *moving a
+> predicate between clauses*, which is a semantic rewrite rather than a renaming - and proving that
+> rewrite sound in general is the equivalence problem §2 says we are not attempting. It happens to
+> hold for two inner joins; "happens to hold" is not the standard here. Cost of withdrawing it: an
+> author who rewrites a comma join as an explicit one recomputes once. Cost of keeping it: a class of
+> false match.
+>
+> Two other things the AST settled, both in our favour and neither needing code:
+> - **Literal types are already distinguished.** `5/2` carries `INTEGER` where `5/2.0` carries
+>   `DECIMAL(2,1)`, so §3's integer-division trap cannot be normalised away by accident.
+> - **Whitespace and comments collapse for free.** They touch exactly one field, `query_location`, a
+>   byte offset into the source. Dropping it *is* the normalisation - no tokenizer, and no risk of
+>   stripping a `--` that lives inside a string literal.
+>
+> And an implementation note worth keeping: canonicalisation runs on **DuckDB's own parser**
+> (`json_serialize_sql`), not a second one. A separate parser could disagree with the engine about
+> what a statement means, and a disagreement in the permissive direction is a false match. Using the
+> executing engine's parse makes that class of error unreachable rather than unlikely - and it
+> satisfies §2.2 structurally, since a DuckDB release that changes how a statement parses changes the
+> key by construction.
 
 **Explicitly unsafe, preserved verbatim, with the reason each one is a trap:**
 
