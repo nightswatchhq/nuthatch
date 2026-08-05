@@ -464,28 +464,53 @@ impl MountTable {
     /// synthesizes one entry from the top-level `chain`/`chain_id`/`rpc_urls`; a multichain mounts
     /// returns its `[[chains]]`. Errors if both forms are present (ambiguous) or neither (no chain).
     pub fn chain_endpoints(&self) -> Result<Vec<ChainEndpoint>> {
-        let has_top = self.runtime.chain.is_some() || self.runtime.chain_id.is_some();
+        // **`[[chains]]` is the only form in 2.0** (RFC-0035 §2). The top-level
+        // `chain`/`chain_id`/`rpc_urls` shorthand said the same thing a second way, and one way to say
+        // a thing is the point of a config cleanup. The fields survive on [`RuntimeMeta`] purely so
+        // `migrate` can *read* a pre-2.0 file and translate it - see [`Self::chains_from_legacy`].
         if !self.chains.is_empty() {
-            if has_top {
-                bail!(
-                    "mounts '{}' declares both a top-level chain and [[chains]] - use one form",
-                    self.runtime.name
-                );
-            }
             return Ok(self.chains.clone());
         }
+        if self.runtime.chain.is_some() || self.runtime.chain_id.is_some() {
+            bail!(
+                "runtime '{}' uses the pre-2.0 top-level chain form. 2.0 declares chains under \
+                 [[chains]] - one form, one meaning. `nuthatch migrate` rewrites it for you.",
+                self.runtime.name
+            );
+        }
+        bail!(
+            "runtime '{}' declares no chain - add a [[chains]] entry with chain, chain_id and rpc_urls",
+            self.runtime.name
+        )
+    }
+
+    /// Translate a pre-2.0 top-level chain declaration into a `[[chains]]` entry.
+    ///
+    /// `migrate`'s job, and the reason [`RuntimeMeta`]'s single-chain fields still exist: a legacy
+    /// file *only* has the top-level form, so migration has to carry it across or it writes a
+    /// `mounts.toml` that will not start. That would turn a migration into an outage.
+    pub fn chains_from_legacy(&self) -> Option<ChainEndpoint> {
         match (self.runtime.chain.clone(), self.runtime.chain_id) {
-            (Some(chain), Some(chain_id)) => Ok(vec![ChainEndpoint {
+            (Some(chain), Some(chain_id)) if self.chains.is_empty() => Some(ChainEndpoint {
                 chain,
                 chain_id,
                 rpc_urls: self.runtime.rpc_urls.clone(),
-            }]),
-            _ => bail!(
-                "mounts '{}' declares no chain - set [mounts] chain/chain_id/rpc_urls, or [[chains]]",
-                self.runtime.name
-            ),
+            }),
+            _ => None,
         }
     }
+}
+
+/// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
+fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
+    datasets
+        .iter()
+        .find(|d| {
+            d.mounts
+                .iter()
+                .any(|m| m.route_key(multi_tenant) == route_key)
+        })
+        .and_then(|d| d.nid.as_deref().map(Arc::from))
 }
 
 /// Give every extra alias of a shared dataset its own route onto the *same* state (RFC-0032 §7).
@@ -842,6 +867,7 @@ pub async fn dev(
             );
         }
         state.surface = Arc::new(surface);
+        state.nid = ds_nid_for(&datasets, key, multi_tenant);
     }
     let all_states = all_states;
 
@@ -1488,8 +1514,9 @@ mod tests {
         std::fs::write(
             dir.join(MOUNTS_FILE),
             format!(
-                "[runtime]\nname = \"test\"\nchain = \"{chain}\"\nchain_id = {chain_id}\n\
-                 rpc_urls = [\"http://localhost:8545\"]\nnests = [\"a\"]\n"
+                "[runtime]\nname = \"test\"\nnests = [\"a\"]\n\n\
+                 [[chains]]\nchain = \"{chain}\"\nchain_id = {chain_id}\n\
+                 rpc_urls = [\"http://localhost:8545\"]\n"
             ),
         )
         .unwrap();
@@ -1695,10 +1722,15 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write_roost(d.path(), "arbitrum-one", 42161, "arbitrum-one", 42161);
         let r = MountTable::load(d.path()).unwrap();
-        assert_eq!(r.runtime.chain.as_deref(), Some("arbitrum-one"));
         assert_eq!(r.runtime.nests, vec!["a"]);
-        // A single-chain mounts resolves to exactly one endpoint.
-        assert_eq!(r.chain_endpoints().unwrap().len(), 1);
+        // 2.0 declares chains under `[[chains]]` only - one form, one meaning (RFC-0035 §2).
+        assert!(
+            r.runtime.chain.is_none(),
+            "the top-level shorthand is gone; these fields exist only for `migrate` to read"
+        );
+        let endpoints = r.chain_endpoints().unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].chain, "arbitrum-one");
     }
 
     #[test]
@@ -1742,21 +1774,37 @@ mod tests {
         }
     }
 
+    /// RFC-0035 §2: the pre-2.0 top-level chain form is refused outright in 2.0, and the refusal
+    /// names the way forward rather than just the rule. (It used to be accepted, and only *combining*
+    /// it with `[[chains]]` was an error.)
     #[test]
-    fn rejects_both_top_level_and_multichain_forms() {
+    fn the_pre_2_0_top_level_chain_form_is_refused_with_a_pointer() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join(MOUNTS_FILE),
-            "[runtime]\nname = \"x\"\nchain = \"base\"\nchain_id = 8453\nrpc_urls = [\"u\"]\nnests = [\"a\"]\n\n\
-             [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = [\"v\"]\n",
+            "[runtime]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\n\
+             rpc_urls = [\"http://x\"]\nnests = [\"a\"]\n",
         )
         .unwrap();
-        let mounts = MountTable::load(d.path()).unwrap();
-        let err = mounts.chain_endpoints().unwrap_err().to_string();
+        let err = MountTable::load(d.path())
+            .unwrap()
+            .chain_endpoints()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pre-2.0 top-level chain form"), "{err}");
         assert!(
-            err.contains("both a top-level chain and [[chains]]"),
-            "got: {err}"
+            err.contains("nuthatch migrate"),
+            "the refusal must name the fix: {err}"
         );
+
+        // ...and `migrate` can still *read* it, which is the whole reason the fields survive.
+        let table = MountTable::load_for_migration(d.path()).unwrap();
+        let carried = table
+            .chains_from_legacy()
+            .expect("migrate must be able to translate it");
+        assert_eq!(carried.chain, "mainnet");
+        assert_eq!(carried.chain_id, 1);
+        assert_eq!(carried.rpc_urls, vec!["http://x".to_string()]);
     }
 
     #[test]
