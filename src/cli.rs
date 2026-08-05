@@ -191,14 +191,6 @@ pub enum NestWhat {
     /// on by default). A self-built bundle and `nest load <file|dir>` never need one.
     /// Prints the content address.
     Publish(NestPublishArgs),
-    /// Classify an update between two nests as compatible or breaking (RFC-0020). Compatible = additive
-    /// only (safe to hot-swap on the same endpoint); breaking = a consumer-observable change (needs a
-    /// new endpoint). Each argument is a nest directory or a `schema.json` path.
-    Diff(NestDiffArgs),
-    /// Hot-upgrade a running nest to a compatible new version with zero downtime (RFC-0020): serve the
-    /// old version, index the new one concurrently, then atomically flip the endpoint once it catches
-    /// up. A breaking update is refused (it needs a new endpoint). The served address never changes.
-    Upgrade(NestUpgradeArgs),
 }
 
 #[derive(Args)]
@@ -253,55 +245,6 @@ pub struct NestPublishArgs {
     /// `h<hash12>` (a content-addressed label - semantic versions are RFC-0020's concern).
     #[arg(long = "as")]
     pub as_ref: Option<String>,
-}
-
-#[derive(Args)]
-pub struct NestDiffArgs {
-    /// The old (current) version: a nest directory or a `schema.json` path.
-    pub old: String,
-    /// The new (proposed) version: a nest directory or a `schema.json` path.
-    pub new: String,
-}
-
-#[derive(Args)]
-pub struct NestUpgradeArgs {
-    /// The running/current nest directory - the OLD version being upgraded from.
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-
-    /// The NEW version to upgrade to: a prepared nest directory (e.g. from `nest load`).
-    #[arg(long)]
-    pub to: String,
-
-    /// Address to serve on. For a compatible update the endpoint stays the same across the flip; for a
-    /// breaking one the old version stays here (deprecated) and the new is served under `--new-endpoint`.
-    #[arg(long, default_value = "127.0.0.1:8288")]
-    pub listen: String,
-
-    /// For a BREAKING update, the path prefix the new version is served under while the old stays at
-    /// root (deprecated). Default `next` → served at `/next`. Ignored for a compatible update.
-    #[arg(long, default_value = "next")]
-    pub new_endpoint: String,
-
-    /// Override `rpc_urls` at runtime (repeatable); tried ahead of the configured endpoints.
-    #[arg(long)]
-    pub rpc: Vec<String>,
-
-    /// Backfill the new version's finalized history straight to Parquet before tip-following (RFC-0004).
-    #[arg(long)]
-    pub seal_direct: bool,
-
-    /// Concurrent window fetches during the new version's seal-direct backfill.
-    #[arg(long, default_value_t = 1)]
-    pub concurrency: usize,
-
-    /// Override the `eth_getLogs` block-window for the new version's backfill.
-    #[arg(long)]
-    pub window: Option<u64>,
-
-    /// Disable the built-in admin UI entirely.
-    #[arg(long)]
-    pub no_admin: bool,
 }
 
 #[derive(Args)]

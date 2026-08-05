@@ -494,6 +494,15 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
     let mut mounts: MountTable = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", source.display()))?;
     mounts.mounts = records.to_vec();
+    // Carry a pre-2.0 top-level chain across into `[[chains]]` (RFC-0035 §2). Without this the
+    // migration writes a file that parses and then refuses to start - a migration that produces an
+    // outage is worse than one that refuses.
+    if let Some(endpoint) = mounts.chains_from_legacy() {
+        mounts.chains = vec![endpoint];
+        mounts.runtime.chain = None;
+        mounts.runtime.chain_id = None;
+        mounts.runtime.rpc_urls.clear();
+    }
     // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
     // stale list beside them would lie.
     mounts.runtime.nests.clear();

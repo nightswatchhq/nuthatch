@@ -371,18 +371,17 @@ pub struct Contract {
 
 impl Config {
     pub fn load(dir: &Path) -> Result<Config> {
-        // RFC-0018 §2: a nest may be authored as `nest.star` (Starlark) that *computes* its config.
-        // When present it takes precedence and is evaluated hermetically to the same `Config` a TOML
-        // file would produce; TOML remains what `init` emits and the default for everyone else.
-        let star = dir.join("nest.star");
-        if star.exists() {
-            let cfg = crate::starlark_config::load_star(&star, dir)?;
-            // A `.star` produces the same `Config` a TOML file would, so it must clear the same
-            // version gates. It used to return straight out of here and skip them - which meant a
-            // computed nest could declare any `schema_version` it liked, including one this build has
-            // no idea how to honour, and be accepted.
-            cfg.check_schema_version()?;
-            return Ok(cfg);
+        // RFC-0018 §2's Starlark front-end was retired on 2026-07-21 (one graph nest, plain TOML) and
+        // the loader is removed in 2.0. A directory still carrying `nest.star` is told so rather than
+        // having it silently ignored - the file used to *take precedence*, so quietly skipping it
+        // would change what a nest indexes without saying anything.
+        if dir.join("nest.star").exists() {
+            bail!(
+                "{} has a nest.star, and the Starlark front-end was removed in 2.0 (RFC-0018 §2, \
+                 retired 2026-07-21). Port it to nuthatch.toml - `nuthatch init` emits that shape, \
+                 and it is what every other nest already uses.",
+                dir.display()
+            );
         }
         let path = dir.join(CONFIG_FILE);
         let raw = std::fs::read_to_string(&path).with_context(|| {
@@ -862,40 +861,31 @@ rpc_urls = ["https://rpc.example"]
         assert!(cfg.nest.block_timestamps);
     }
 
-    /// A computed nest can make the declaration too, and its `schema_version` is *derived* rather
-    /// than authored - so the mismatch a hand-edited TOML can produce is unrepresentable here.
+    /// RFC-0035 §2: the Starlark front-end is removed in 2.0, and a `nest.star` is **refused** rather
+    /// than ignored.
+    ///
+    /// Silently skipping it would be the dangerous option: `nest.star` used to take *precedence* over
+    /// `nuthatch.toml`, so a nest carrying both would quietly start indexing something different from
+    /// what it indexed yesterday, with no error to explain why.
     #[test]
-    fn a_starlark_nest_can_be_timestamp_free_and_versions_itself() {
+    fn a_nest_star_is_refused_rather_than_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let write = |ts: &str| {
-            std::fs::write(
-                dir.path().join("nest.star"),
-                format!(
-                    r#"
-nest(
-    name = "computed",
-    chain = "mainnet",
-    rpc_urls = ["https://rpc.example"],
-    block_timestamps = {ts},
-)
-"#
-                ),
-            )
-            .unwrap();
-        };
+        std::fs::write(dir.path().join("nest.star"), "# computed config\n").unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
 
-        write("False");
-        let cfg = Config::load(dir.path()).unwrap();
-        assert!(!cfg.nest.block_timestamps);
-        assert_eq!(
-            cfg.nest.schema_version, 2,
-            "a timestamp-free .star must stamp v2, or an older binary would accept and mis-index it"
+        let err = Config::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("removed in 2.0"), "{err}");
+        assert!(
+            err.contains("nuthatch.toml"),
+            "the refusal must name the way forward: {err}"
         );
 
-        // The default is on, and stays a v1 file so older builds can still open it.
-        write("True");
-        let cfg = Config::load(dir.path()).unwrap();
-        assert!(cfg.nest.block_timestamps);
-        assert_eq!(cfg.nest.schema_version, 1);
+        // Without the `.star`, the same directory loads normally.
+        std::fs::remove_file(dir.path().join("nest.star")).unwrap();
+        assert_eq!(Config::load(dir.path()).unwrap().nest.name, "t");
     }
 }
