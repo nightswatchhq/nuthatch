@@ -277,7 +277,7 @@ Nests live in their own repositories rather than in-tree; see the
 [nest catalogue](nest-catalogue.md) for what ships and what is planned.
 
 > **Scaled mode exists** (RFC-0022): a Postgres hot store, a writer pool taking one lease per cursor,
-> a query-FE tier, and a control plane holding desired state — see *Scaled mode* below. DataFusion
+> a query-FE tier, and a control plane holding desired state - see *Scaled mode* below. DataFusion
 > federation (RFC-0013) is a separate question and remains DuckDB today.
 >
 > It is newer and less exercised than embedded mode, which runs in production. If one process per box
@@ -378,12 +378,12 @@ you are standing up a new nest over a long history. **When it is clearly wrong:*
 unsure, keep them - the default is on for a reason.
 
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
-(RFC-0019 §4) is that secrets never go into a published bundle — so keep the directory `0700` and
+(RFC-0019 §4) is that secrets never go into a published bundle - so keep the directory `0700` and
 owned by the service user, and never publish a bundle built from a config carrying a credential.
 
 In **scaled** mode, per-nest secret injection at mount time is built (RFC-0022 §5): secrets live in the
 control plane and a worker receives only those of the nests it is actually assigned. The interface is
-write-only — you can list which keys exist and never read a value back — and rotating one changes no
+write-only - you can list which keys exist and never read a value back - and rotating one changes no
 bundle hash, so it neither invalidates segment reuse nor forces a re-index.
 
 ---
@@ -740,20 +740,80 @@ advertises the tools it can actually answer.
 
 ## Stability contract
 
-- **Config**: `nuthatch.toml` keys and the nest `schema_version` follow a deprecation policy - a key
-  is warned about for a release before it is removed, never removed from under you.
-- **Data layout**: redb tables, segment layout, `manifest.json` and `schema.json` are versioned.
-  **In-place-safe upgrades** are the target and each release states which it is; the record so far is
-  four consecutive in-place upgrades in production (see [Data lifecycle](#data-lifecycle)).
-- **CLI flags**: `dev`'s flags and the unit files that depend on them are treated as an interface. A
-  release does not silently rename a flag your systemd unit references.
+Nuthatch follows **semantic versioning** from 1.0 onwards. This section is the commitment, not a
+description of habits: it says what a minor may do to you, what is reserved for a major, and what is
+deliberately outside the promise.
 
-**What is not yet promised, stated plainly because a platform team will ask.** This section described a
-`0.x` policy until 1.0.1 and was not rewritten when 1.0 shipped. A **published semver commitment for
-1.x** - what specifically may change in a minor, what is reserved for a major, and how long a
-deprecation window runs - is a decision that deserves to be made on its own terms rather than inferred
-from a checklist, and it has not been made yet. Tracked as an open question; until it is published,
-treat the three bullets above as the observed practice rather than a guarantee.
+It is published *before* the first major bump rather than alongside it. A stability promise that first
+appears in the release that breaks things reads as an apology.
+
+### What a patch may do
+
+Fix behaviour. Nothing in the surfaces below changes.
+
+### What a minor may do - additive only
+
+A minor may **add**: config keys, HTTP routes, fields in an existing response, CLI flags, metrics,
+tables, and MCP tools. Anything already there keeps working.
+
+A minor may also **deprecate** - which means it warns and keeps working. It never removes.
+
+### What is reserved for a major
+
+Removing or changing the meaning of any of these:
+
+| Surface | Covered |
+|---|---|
+| **Config** | `nuthatch.toml` and `roost.toml` keys: renaming, removing, or changing a key's type or meaning |
+| **On-disk layout** | The nest directory layout, redb table names, segment layout, `manifest.json`, `schema.json` - anything that would stop a running deployment from starting on the new binary |
+| **HTTP** | Removing a route; removing a field from a response, or changing its type or units |
+| **CLI** | Renaming or removing a flag on `init`, `dev`, `sql`, `add`, or `check` |
+| **Metrics** | Renaming or removing a `nuthatch_*` series, or changing its unit |
+| **`schema_version`** | A bump that a nest cannot be migrated across in place |
+
+**Upgrades are in-place by default.** A release that requires a data migration says so in its notes and
+ships the command that performs it. The record so far is five consecutive in-place production upgrades;
+2.0's layout change ships `nuthatch migrate`, which moves data and never re-indexes.
+
+### Deprecation window
+
+A deprecation lands in a minor, warns at load or on use, and is removed **no earlier than the next
+major**, which will be at least **two minor releases and 90 days** after the warning first shipped.
+Whichever is longer.
+
+If a removal ever has to move faster than that - a security fix with no compatible form - the release
+notes say so explicitly and explain why. That has not happened.
+
+### Explicitly outside the promise
+
+Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
+
+- **The MCP tool surface.** Tools are advertised *adaptively per nest* (RFC-0025): a nest that cannot
+  answer compliance questions does not advertise compliance tools. The surface is therefore a function
+  of the nest, not of the release, and it moves as the AI surface improves. **Discover it with
+  `tools/list`; never hardcode a tool name.** That is the contract, and it is the one an agent should
+  want.
+- **`semantic.toml`'s derived blocks.** `[table.*.footguns]` are regenerated from the ABI and move when
+  the generator improves. **Your authored descriptions are preserved** across regeneration - that part
+  is covered.
+- **The admin UI's internals.** `/_admin` is a human surface, not an API. Its HTML and its internal
+  endpoints may change in any release; the JSON APIs it consumes are covered by the HTTP row above.
+- **Segment content hashes across releases.** A segment's hash covers the Parquet bytes, which include
+  the `created_by` string stamped by the arrow-rs build, so **the same decoded rows may hash differently
+  under a different nuthatch version**. What *is* promised: sealed segments stay readable, and are never
+  rewritten. Compare decoded rows, not segment hashes, across versions. (This is the same reason
+  RFC-0033 puts the engine and its version inside the derivation reuse key: an identity that ignores
+  what produced the bytes is unsound across our own upgrades.)
+- **Anything behind an unreleased feature flag**, and the `postgres-store` build's internal schema
+  while scaled mode is young. Scaled mode's *external* surfaces - its HTTP API, its CLI, its config -
+  are covered like everything else.
+
+### What "1.0" claimed, and what it did not
+
+Until 1.0.1 this section was headed "Stability contract (0.x)" and described a 0.x deprecation policy;
+the heading was not revisited when 1.0 shipped, so for four releases the document promised less than
+the version number implied. That is fixed here, and the gap is recorded rather than quietly closed -
+issue #312.
 
 ---
 
@@ -775,17 +835,17 @@ Stated plainly, because finding them yourself in production would be worse.
   data. It refuses rather than truncating, because a partial tip would silently change the answer to an
   aggregate. Generous enough to be invisible on a normal chain; it exists so a deep-finality tip turns
   into a clear error instead of an OOM that takes co-tenants with it.
-- **Container images are published** to `ghcr.io/nightswatchhq/nuthatch` — `:<version>` for embedded,
+- **Container images are published** to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for embedded,
   `:<version>-scaled` for the scaled build. The recipe above still works if you would rather build one.
 - **Secrets live in on-disk config *in embedded mode*.** Private RPC URLs and webhook HMAC secrets sit
   in the nest's `nuthatch.toml`, so the mitigation there is filesystem permissions: `0700`, owned by
   the service user. In **scaled** mode they live in the control plane and are injected per nest, per
-  worker, scoped to the cursors that worker actually holds (RFC-0022 §5, built) — write-only, so you
+  worker, scoped to the cursors that worker actually holds (RFC-0022 §5, built) - write-only, so you
   can list which keys exist and never read a value back.
 - **Scaled mode is built but young.** The control plane, the writer pool, cursor leases with a
   store-enforced fence, the query-FE tier and the registry pull all exist and are verified across real
   machines (runbook level 5). It has not run a production workload for anyone, and until 0.9.3 the
-  writer pool did not index at all (#250) — a defect a suite of ten passing checks did not catch,
+  writer pool did not index at all (#250) - a defect a suite of ten passing checks did not catch,
   because every one of them tested the control plane rather than the data. Weigh it accordingly.
   DataFusion federation (RFC-0013) is separate and still unbuilt; both modes use DuckDB.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
