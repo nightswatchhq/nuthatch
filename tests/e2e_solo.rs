@@ -399,10 +399,15 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     // is at least as far along as the old - so no consumer sees the endpoint go backwards. It does
     // *not* promise the new version has reached the tip.
     //
-    // Both versions index the same tape concurrently, so the flip fires as soon as they are level -
-    // which may be block 2, not 5. Asserting `Some(5)` here was asserting something the code never
-    // promised, and it duly failed under full-suite parallel load, where both indexers run slower and
-    // the flip catches them level early. That was a bug in the test, not a race in the flip.
+    // **Measure it at that moment, not afterwards.** `await_catchup_and_flip` returns when the two are
+    // level, but *both indexers keep running* - so reading the heads after it returns lets the old
+    // version race ahead again, and the comparison then fails for a reason the flip never claimed. It
+    // did exactly that on main (`new=Some(2) old=Some(5)`): a bug in the observation, not in the flip.
+    //
+    // Stopping the old indexer first makes the measurement match the guarantee. An earlier fix here
+    // relaxed `== Some(5)` to `>=`, which was right about the head value and still measured at the
+    // wrong time.
+    old_rt.ingest.abort();
     let (new_head, old_head) = (
         new_store.indexed_head().unwrap(),
         old_store.indexed_head().unwrap(),
@@ -422,7 +427,7 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .await
     .expect("the new version should reach the tip once it has caught up");
 
-    old_rt.ingest.abort();
+    old_rt.ingest.abort(); // already aborted above; abort is idempotent
     new_rt.ingest.abort();
 }
 
