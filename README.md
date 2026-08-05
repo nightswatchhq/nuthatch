@@ -188,14 +188,14 @@ across every run, and they are the honest measure of range control.
 Two things that number is worth knowing about:
 
 - **It did not finish at all before v0.9.0.** Alchemy returns its oversized-range refusal as HTTP
-  **400**, which our status classifier did not enumerate — so a window that needed splitting was
+  **400**, which our status classifier did not enumerate - so a window that needed splitting was
   retried unchanged, forever. Running an outside benchmark found a defect that our own testing had not.
-- **~85% of the original wall clock was buying `block_timestamp`** — one serial round trip per block,
+- **~85% of the original wall clock was buying `block_timestamp`** - one serial round trip per block,
   for a column that workload never stores. Timestamps are now demand-driven and the log window adapts
   to what an endpoint will actually serve. See [RFC-0029](docs/rfcs/0029-the-fastest-indexer.md).
 
 Case 6 found a defect too, in the harness rather than the indexer: `bench backfill` fetched a fixed
-address list, so a **factory nest was measured without its children** — 232 events in 2.6 s against an
+address list, so a **factory nest was measured without its children** - 232 events in 2.6 s against an
 expected 35,039, reported as a success. Running an outside benchmark has now found two things our own
 testing did not.
 
@@ -244,7 +244,7 @@ Then just ask: *"what are the top USDC holders?"* - the agent writes the SQL and
 nest. (Making that correct on the first try is the [semantic-layer work](docs/rfcs/0016-governed-semantic-layer-and-agent-grade-mcp.md).)
 
 **Teach your agent to *build* nests too.** Install the builder skill and an agent can drive nuthatch
-itself - `init`, config, factories, compliance, roosts, troubleshooting - before you even have a nest:
+itself - `init`, config, factories, compliance, multi-nest runtimes, troubleshooting - before you even have a nest:
 
 ```sh
 cp -r skills/nuthatch-builder ~/.claude/skills/   # or your repo's .claude/skills/
@@ -273,18 +273,18 @@ who need more - none of it in the way of the happy path:
   Localhost-open; off-localhost it requires a token per request.
 - **Roost - many nests, one runtime, one or more chains** (RFC-0012, RFC-0021). Host many nests in one
   process; nests on the same chain share a single cursor and one `getLogs` per window (N nests for
-  roughly one nest's RPC cost), and a roost can span **multiple chains** with **one isolated cursor per
+  roughly one nest's RPC cost), and a runtime can span **multiple chains** with **one isolated cursor per
   chain** - a Base nest and an Arbitrum nest in one runtime. Per-nest isolation, and a footprint budget
-  **per active-chain cursor** (≤2 GB). A capability, not a mandate: one-chain-per-roost stays the simple
+  **per active-chain cursor** (≤2 GB). A capability, not a mandate: one chain per runtime stays the simple
   default.
-- **The live roost - mount and unmount nests without a restart** (RFC-0027). Changing a roost's nest set
-  used to mean editing `roost.toml` and restarting, which stops every *co-tenant* nest too - so the blast
+- **Mount and unmount nests without a restart** (RFC-0027). Changing a runtime's nest set
+  used to mean editing config and restarting, which stops every *co-tenant* nest too - so the blast
   radius of a config change was larger than that of a fault. Now `POST /_admin/nests` mounts one and
   `DELETE /_admin/nests/<name>` unmounts one, live. A mount is admitted only if it fits the cursor's RAM
   budget (refused with `507`, never a warning - a budget that can be quietly exceeded is not a budget),
   catches up *before* it joins so it never drags co-tenants back through history, and only then gets
   routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
-  the store before anything is torn down. The set is persisted to `roost.toml`, so a restart converges
+  the store before anything is torn down. The set is persisted to `mounts.toml`, so a restart converges
   on what you last asked for.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
@@ -312,16 +312,15 @@ who need more - none of it in the way of the happy path:
   bucket's auth. Self-hosted-first: the registry is decoupled and never mandatory - a self-built bundle
   and `load <file|dir>` need no registry at all. S3/MinIO/R2 is built in - configure it with the usual
   `AWS_*` env (`AWS_ENDPOINT` for non-AWS), verified live against Hetzner Object Storage.
-- **Safe upgrades - no resync tax** (RFC-0020). `nuthatch nest diff <old> <new>` classifies a nest
-  update as *compatible* (additive only) or *breaking* (a consumer-observable change); `nuthatch nest
-  upgrade --to <new>` then handles either kind. A **compatible** update is **hot-swapped with zero
-  downtime** - it serves the old version, indexes the new one concurrently, and atomically flips the
-  endpoint the moment the new one catches up, so the served address never changes. A **breaking** update
-  instead serves the new version on a new endpoint (`/next`) alongside the old - which keeps working, now
-  carrying a `Deprecation` header - so downstream migrate on their own clock before the old is sunset.
-  Either way, updating a nest stops being a subgraph-style genesis resync - and when a compatible
-  update's decode is unchanged, the new version **mounts the old's sealed content-addressed segments**
-  instead of re-indexing history at all: a true no-re-index upgrade subgraphs structurally can't do.
+- **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
+  genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update
+  when a nest's identity changes: *compatible* (additive only) is applied, *breaking* (a
+  consumer-observable change - a dropped column, a removed table) is **named and refused** until you
+  say `--allow-breaking`. Grafting does the rest: a **cosmetic** edit - a comment, a renamed view, a
+  doc change - moves the nest's identity and **adopts the existing dataset**, so nothing re-indexes.
+  Segments are content-addressed and shared across the runtime, so **two nests that decode the same
+  contract hold one copy**, not two. What a subgraph pays a full resync for, nuthatch answers with a
+  hash comparison.
 - **Derive-first - the `eth_call` you don't need** (RFC-0023). >70% of subgraphs call `eth_call` for
   reads that are *derivable* from the events they already index - they fetch only because they have no
   incremental-view engine. Nuthatch does: `nuthatch recipe add total_supply` drops in a derived view
@@ -354,7 +353,7 @@ default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.m
   Copy-paste **systemd** and **Docker** recipes are in [`docs/operators.md`](docs/operators.md#deploy-recipes).
 - **Outgrown one machine?** [Scaled mode](docs/operators.md#scaled-mode-a-fleet-across-machines-rfc-0022)
   spreads cursors across a writer pool with an independently-scaled serving tier. Reach for it when a
-  single box cannot hold your cursors inside its RAM budget - not before, because a roost on one
+  single box cannot hold your cursors inside its RAM budget - not before, because several nests on one
   machine is simpler and that simplicity is the point of the embedded path.
 
 **[`docs/operators.md`](docs/operators.md) is the full operating guide**, and worth reading before you
@@ -388,7 +387,7 @@ The guide covers the questions people actually hit:
 - **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
   build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
   command. A version nobody tests is not a promise.)
-- **Embedded mode is the production path.** `dev` and `roost` run in production today. **Scaled mode
+- **Embedded mode is the production path.** `dev` runs in production today, whether it is hosting one nest or many. **Scaled mode
   is built and verified across real machines, but younger** - and until 0.9.3 its writer pool did not
   index at all. If one process per box is enough, that is still the shape to reach for.
 
