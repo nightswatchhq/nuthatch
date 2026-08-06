@@ -4125,6 +4125,7 @@ mod tests {
                 abi: serde_json::from_str(
                     r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
                 ).unwrap(),
+                events: Vec::new(),
             }],
         )
         .unwrap();
@@ -4263,6 +4264,7 @@ template="pool"
                 abi: serde_json::from_str(
                     r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
                 ).unwrap(),
+                events: Vec::new(),
             }],
         )
         .unwrap();
@@ -4410,6 +4412,7 @@ template="pool"
             vec![TemplateSpec {
                 name: "pool".into(),
                 abi: pool_abi,
+                events: Vec::new(),
             }],
         )
         .unwrap();

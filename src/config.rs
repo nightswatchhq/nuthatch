@@ -147,6 +147,16 @@ pub struct Template {
     /// to have many children. Omit for the automatic address-list → topic0 flip above ~500 children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// Event names to decode for every child of this template, matching `[[contracts]].events`.
+    /// Empty (the default) decodes every event the template ABI defines.
+    ///
+    /// Distinct from `filter`, which chooses *how the range is fetched*; this chooses *what is
+    /// decoded from it*. Without it the vendored ABI is the only filter, so a full `UniswapV2Pair`
+    /// ABI decodes Swap, Sync, Mint, Burn, Transfer and Approval when the nest wanted Swap - not
+    /// wrong, but a different workload, and nothing said so. A name here the ABI does not define is
+    /// a config error, caught at registry build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
 }
 
 /// A factory rule (RFC-0009): when `watch`'s `event` fires, the child address in `child_param` is
