@@ -74,6 +74,14 @@ jobs:
 
   fleet:
     name: the compose fleet comes up
+    # The compose stack requires its credentials rather than shipping defaults, so CI supplies them
+    # like any other operator. Job-level because several steps invoke `docker compose` and a missing
+    # value fails interpolation before a single container starts. These are throwaway values for an
+    # ephemeral runner - the point of the `:?` in the compose file is that *choosing* them is
+    # deliberate, not that they are secret here.
+    env:
+      POSTGRES_PASSWORD: ci-postgres-password
+      NUTHATCH_CONTROL_TOKEN: ci-control-token
     # **ubuntu-22.04, not ubuntu-latest**, and for the same reason the release job is pinned: a
     # dynamically-linked binary needs the glibc it was built against *or newer*, and `Dockerfile` is
     # `debian:bookworm-slim` (glibc 2.36). Building on 24.04 (2.39) produces a binary the image cannot
