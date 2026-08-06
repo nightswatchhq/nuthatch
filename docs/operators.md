@@ -867,7 +867,20 @@ Additive in the same release, so nothing to do: `provenance` now carries `nid`, 
 answered rather than only how it decoded - which matters once early cutoff lets a result legitimately
 come from data a different identity produced.
 
-### The order
+### A single nest has nothing to migrate
+
+If the service runs `nuthatch dev --dir <nest>` against a directory holding a `nuthatch.toml`, the
+upgrade is a **binary swap**: stop, swap, start. The layout change is to *runtime* directories, and a
+solo nest does not have one. `nuthatch migrate` is for a directory containing a **`roost.toml`**; no
+such file, nothing to run.
+
+Verified on the Lodestar box: two solo nests upgraded 1.0.2 → 2.0.0 by binary swap, every table's row
+count identical before and after (422 and 3,491 rows), both back at tip within seconds, no migration
+invoked. Before the swap, 2.0.0 was pointed read-only at a copy of one nest's on-disk data and counted
+byte-identical rows at a common block ceiling - so the compatibility was measured on real data, not
+assumed from the version number.
+
+### The order, for a runtime directory
 
 1. `nuthatch migrate --dir <copy> --dry-run` against a copy. Read the plan.
 2. Stop the service. The migration wants no writer.
