@@ -492,8 +492,18 @@ refusal rather than a warning because the endpoint decides what an entire fleet 
 authenticated** - the guards below bound *how much*, never *who*. Off-localhost binds log a loud
 warning at startup. Put TLS and authentication in front, always.
 
+**A public nest without an allowlist is an open query engine.** Said plainly because it is the single
+decision that matters here: `sql = "open"` is the default and it is the right default for a local
+`nuthatch dev`, where exploration is the point - but on an endpoint strangers can reach, it means
+anyone may run arbitrary analytical SQL over your disk, bounded only by the guards below. If that is
+not what you want, set `sql = "allowlist"` on the mount and declare the queries it answers, or
+`sql = "deny"` to close SQL entirely while the typed routes keep serving. See
+[Bounding what a mount will answer](https://nuthatch-indexer.com/docs/operate/security/#bounding-what-a-mount-will-answer).
+
 **Query guards** - node self-protection against a single runaway query or a burst, not per-caller
-quotas (that needs identity a single-tenant node does not have):
+quotas (that needs identity a single-tenant node does not have). They bound *how much* one query
+costs; they say nothing about *which* queries a nest is willing to answer, which is the allowlist's
+job:
 
 | Guard | Default | What it bounds |
 |---|---|---|
