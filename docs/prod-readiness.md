@@ -114,10 +114,13 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   `COPY … TO` / `ATTACH` was an arbitrary file write, bounded by the service user. Present in **0.6.1
   and earlier**; fixed by `reject_statement_stacking` with regression tests, released as **v0.6.2**
   with binaries, and the Lodestar box upgraded and verified the same day. *Any deployment still
-  exposing `/sql` on ≤0.6.1 remains affected and should upgrade.* Advisory GHSA-jvjx-5528-r6mm is
-  drafted and **deliberately unpublished as of 2026-07-29** - a decision, not an oversight. The fix
-  shipped in 0.6.2 and 0.7.x, so the remedy is available to anyone who looks; publication is a
-  disclosure call for the maintainer to make, not a task waiting on engineering.
+  exposing `/sql` on ≤0.6.1 remains affected and should upgrade.* Advisory GHSA-jvjx-5528-r6mm was
+  drafted and held unpublished as of 2026-07-29 - a decision, not an oversight - and **published on
+  2026-08-02**, alongside GHSA-393p-f3vr-rf2r for the arbitrary file read, which is what the
+  2026-07-31 audit recommended: two advisories together with the fixed versions named, rather than a
+  quiet patch. Both are repository advisories; neither appears in GitHub's *global* database, because
+  entry there needs a package in a supported registry and nuthatch ships as a binary rather than a
+  crates.io package. Worth revisiting if that ever changes.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
 - [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).

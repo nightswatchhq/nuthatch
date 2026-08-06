@@ -182,3 +182,10 @@ Finding 1 is exploitable in released versions and warrants a **GHSA**, published
 A project asking to be taken seriously at 1.0 does not fix security bugs silently. Two advisories
 published together, with the fixed versions named, is a better first impression than a quiet patch —
 and the second one is already overdue.
+
+> **Resolved 2026-08-02.** Both were published together as recommended: **GHSA-393p-f3vr-rf2r**
+> (arbitrary file read, quoted function name) and **GHSA-jvjx-5528-r6mm** (arbitrary file write,
+> statement stacking), each naming its fixed version. Neither is listed in GitHub's *global* advisory
+> database — that needs a package in a supported registry, and nuthatch ships as a binary rather than
+> a crates.io package, so there is no coordinate to attach one to. A consequence of how we distribute,
+> not an omission.
