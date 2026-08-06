@@ -784,6 +784,9 @@ templates:
         - file:
             /: /ipfs/QmHybridVotingAbiCid000000000000000000000000
           name: HybridVoting
+      eventHandlers:
+        - event: VoteCast(indexed address,indexed uint256,uint8)
+          handler: handleVoteCast
 "#;
 
     #[test]
@@ -792,6 +795,17 @@ templates:
         assert_eq!(m.spec_version.as_deref(), Some("0.0.9"));
         assert_eq!(m.data_sources.len(), 2);
         assert_eq!(m.templates.len(), 1);
+
+        // A template's `eventHandlers` say which of its ABI's events the subgraph actually decoded,
+        // and the import carries them into `[[templates]].events`. Asserted here because the parse
+        // is the *source* of that allowlist: the import discarded it for as long as this data was
+        // parsed and unread, and an empty list here would silently restore the superset decode.
+        assert_eq!(
+            m.templates[0].events,
+            vec!["VoteCast(indexedaddress,indexeduint256,uint8)"],
+            "a template's event handlers must survive the parse"
+        );
+        assert_eq!(event_name(&m.templates[0].events[0]), "VoteCast");
 
         let ds = &m.data_sources[0];
         assert_eq!(ds.name, "GovernanceFactory");
