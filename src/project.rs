@@ -507,17 +507,45 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             continue;
         };
         let alias = sg::dedupe_alias(&sg::to_alias(&t.name), &mut taken);
-        fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched).await?;
+        let abi_json =
+            fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched)
+                .await?;
         // Both the entry and its ABI path must use the *settled* alias. Recomputing
         // `to_alias(&t.name)` here would name the file the template was never written to:
         // a dataSource `Vault` plus a template `Vault` — the canonical factory shape — makes
         // the template point at the dataSource's ABI. Nothing errors, because that file
         // exists; every discovered child is just decoded against the wrong contract.
         template_alias.insert(t.name.clone(), alias.clone());
+        // Carry the manifest's own allowlist, exactly as the `[[contracts]]` loop does. A subgraph
+        // declares `eventHandlers` per template, so the manifest already says which of the ABI's
+        // events the author cared about - dropping it here made an imported nest decode a superset
+        // of what the subgraph decoded, which is the one thing this import must not do.
+        let events: Vec<String> = t
+            .events
+            .iter()
+            .map(|sig| sg::event_name(sig).to_string())
+            .collect();
+        // The gap is worth saying out loud at init: it is the difference between the workload the
+        // subgraph ran and the one this nest will run, and it is invisible until a row count
+        // surprises someone.
+        if !events.is_empty() {
+            let defined = abi_json
+                .as_array()
+                .map(|a| a.iter().filter(|e| e["type"] == "event").count())
+                .unwrap_or(0);
+            if defined > events.len() {
+                notes.push(format!(
+                    "template `{alias}` handles {} of the {defined} events its ABI defines - \
+                     the rest are not indexed",
+                    events.len()
+                ));
+            }
+        }
         templates.push(crate::config::Template {
             name: alias.clone(),
             abi: format!("abis/{alias}.json"),
             filter: None,
+            events,
         });
     }
 

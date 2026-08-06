@@ -451,6 +451,9 @@ pub struct ContractSpec {
 pub struct TemplateSpec {
     pub name: String,
     pub abi: JsonAbi,
+    /// Event allowlist for this template's children, empty = decode every event the ABI defines.
+    /// Mirrors `[[contracts]].events`; see `config::Template::events`.
+    pub events: Vec<String>,
 }
 
 /// The immutable per-nest decode registry.
@@ -504,6 +507,7 @@ impl DecodeRegistry {
             templates.push(TemplateSpec {
                 name: t.name.clone(),
                 abi,
+                events: t.events.clone(),
             });
         }
         Ok(Self::build_with_templates(specs, templates)?
@@ -564,14 +568,34 @@ impl DecodeRegistry {
         // are matched by template name against the runtime child registry, not by address.
         let mut templates_by_topic0: HashMap<B256, Vec<EventDecoder>> = HashMap::new();
         for t in &templates {
-            // Templates are address-agnostic child ABIs; no per-template allowlist (RFC-0009 nests
-            // author focused template ABIs already). Pass an empty allowlist = decode all.
+            // Same allowlist rule as a contract: a typo would silently index nothing at scale.
+            if !t.events.is_empty() {
+                let known: std::collections::HashSet<&str> =
+                    t.abi.events().map(|e| e.name.as_str()).collect();
+                for want in &t.events {
+                    if !known.contains(want.as_str()) {
+                        bail!(
+                            "template '{}' allowlists event '{}', which its ABI does not define \
+                             (known events: {})",
+                            t.name,
+                            want,
+                            {
+                                let mut ks: Vec<&str> = known.iter().copied().collect();
+                                ks.sort();
+                                ks.join(", ")
+                            }
+                        );
+                    }
+                }
+            }
+            // An empty allowlist still decodes everything, so a template that does not set `events`
+            // behaves exactly as it did before RFC-0009 gained one.
             skipped_anonymous += register_events(
                 &mut templates_by_topic0,
                 &t.name,
                 Address::ZERO,
                 &t.abi,
-                &[],
+                &t.events,
             );
         }
 
@@ -1352,4 +1376,69 @@ mod tests {
         assert_eq!(snake_case("PoolCreated"), "pool_created");
         assert_eq!(snake_case("OperatorSet"), "operator_set");
     }
+
+    /// A `[[templates]]` allowlist scopes a child's decode without editing the vendored ABI
+    /// (#311). Before this, the ABI was the only filter: a full `UniswapV2Pair` ABI decoded six
+    /// events where the nest wanted one, which is a different workload with nothing to say so.
+    #[test]
+    fn a_template_allowlist_scopes_what_children_decode() {
+        let abi: JsonAbi = serde_json::from_str(PAIR_ABI).unwrap();
+
+        // Empty allowlist = decode everything, exactly as before the key existed.
+        let all = DecodeRegistry::build_with_templates(
+            vec![],
+            vec![TemplateSpec {
+                name: "pair".into(),
+                abi: abi.clone(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let mut names: Vec<String> = all.tables().iter().map(|d| d.table.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["pair__swap", "pair__sync", "pair__transfer"]);
+
+        // Allowlisted = only that event, and the other decoders are gone rather than merely unused.
+        let scoped = DecodeRegistry::build_with_templates(
+            vec![],
+            vec![TemplateSpec {
+                name: "pair".into(),
+                abi,
+                events: vec!["Swap".into()],
+            }],
+        )
+        .unwrap();
+        let names: Vec<String> = scoped.tables().iter().map(|d| d.table.clone()).collect();
+        assert_eq!(names, vec!["pair__swap"]);
+    }
+
+    /// The same loud rejection a contract allowlist gets. A typo that silently indexed nothing
+    /// would only surface as an empty table long after the backfill.
+    #[test]
+    fn a_template_allowlist_typo_is_rejected_at_build() {
+        let abi: JsonAbi = serde_json::from_str(PAIR_ABI).unwrap();
+        let err = DecodeRegistry::build_with_templates(
+            vec![],
+            vec![TemplateSpec {
+                name: "pair".into(),
+                abi,
+                events: vec!["Swop".into()],
+            }],
+        )
+        .err()
+        .expect("a template allowlisting an event its ABI lacks must be rejected")
+        .to_string();
+        assert!(err.contains("template 'pair'"), "names the template: {err}");
+        assert!(err.contains("Swop"), "names the offending event: {err}");
+        assert!(
+            err.contains("Swap"),
+            "lists what the ABI does define: {err}"
+        );
+    }
+
+    const PAIR_ABI: &str = r#"[
+      {"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount0In","type":"uint256","indexed":false}]},
+      {"type":"event","name":"Sync","anonymous":false,"inputs":[{"name":"reserve0","type":"uint112","indexed":false}]},
+      {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true}]}
+    ]"#;
 }
