@@ -11,7 +11,9 @@ still honestly unfinished.
 
 **Companions:** [`prod-readiness.md`](prod-readiness.md) is the *release* gate - what must be true
 before a build ships. This document is the *run* guide - what must be true in your environment.
-[`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
+What is deferred and why lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
+(the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
+explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
 Written against **2.0.0** (2026-08-06). Read [Known gaps](#known-gaps) before exposing `/sql`.
 

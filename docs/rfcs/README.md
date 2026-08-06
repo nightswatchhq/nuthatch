@@ -2,8 +2,10 @@
 
 Design documents for the post-skeleton phase. Numbered in build order; each states its
 dependencies. Status lifecycle: **Draft → Accepted → Implemented → (Superseded / Parked)**.
-For everything *deferred or not-yet-done* across the whole series (the infra track + leftovers),
-see **[backlog.md](../backlog.md)**. For the bar a release must clear before it's pointed at a real
+For everything *deferred or not-yet-done* across the whole series, the source of truth is
+**[the issue queue](https://github.com/nightswatchhq/nuthatch/issues)** - one issue per leftover, with
+`parked` marking what is deferred by decision. [backlog.md](../backlog.md) explains how to read that
+queue and records the standing decisions behind it; it no longer keeps a second list. For the bar a release must clear before it's pointed at a real
 workload unattended, see the **[production-readiness checklist](../prod-readiness.md)**.
 RFCs **0019-0023** derive from the **[Jul-Aug 2026 roadmap](../high-level-roadmap-jul-aug-2026.md)**
 (strategy agreed 2026-07-21); their decisions log is the authority for the choices they encode.
