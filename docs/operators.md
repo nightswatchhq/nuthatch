@@ -757,8 +757,8 @@ Fix behaviour. Nothing in the surfaces below changes.
 
 ### What a minor may change, and what is reserved for a major
 
-The bullets above are the observed practice. This table is the promise, and it applies to the `1.x`
-line: a minor is `1.1`, `1.2`, and so on; breaking changes wait for `2.0`.
+The bullets above are the observed practice. This table is the promise, and it applies to the `2.x`
+line: a minor is `2.1`, `2.2`, and so on; breaking changes wait for `3.0`.
 
 | Surface | A minor release may | Reserved for a major |
 |---|---|---|
@@ -784,7 +784,7 @@ config or a dashboard gets longer, because the cost of breaking it is not paid b
 If a removal ever has to move faster - a security fix with no compatible form - the release notes say
 so explicitly and explain why. That has not happened.
 
-### Not covered by 1.x, deliberately
+### Not covered by 2.x, deliberately
 
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
@@ -793,7 +793,7 @@ Stated because a platform team will ask, and because a vague promise is worse th
   nest* (RFC-0025) - it is a function of the nest, not of the release - so **discover it with
   `tools/list` and never hardcode a tool name**. `semantic.toml`'s derived `[table.*.footguns]` are
   regenerated from the ABI; your **authored descriptions are preserved**, and that half is covered.
-  If you build against the rest inside 1.x, pin the version.
+  If you build against the rest inside 2.x, pin the version.
 - **Segment identity across `arrow-rs` releases.** Byte-identical segments are a correctness
   boundary, not an API, and the boundary belongs to a dependency we do not control: a segment's hash
   covers the Parquet bytes including arrow-rs's `created_by` stamp, so identical decoded rows can
@@ -813,6 +813,69 @@ Until 1.0.1 this section was headed "Stability contract (0.x)" and described a 0
 the heading was not revisited when 1.0 shipped, so for four releases the document promised less than
 the version number implied. That is fixed here, and the gap is recorded rather than quietly closed -
 issue #312.
+
+At 2.0 the table was retargeted from the `1.x` line to `2.x` **as part of cutting the release**, which
+is the only way this section stays true: a version line is not a detail you revisit when someone
+notices. What 2.0 itself broke is listed in the upgrade notes below, and every one of those breaks is
+a row in the table above - which is the test of whether a contract published before the major bump
+was worth publishing.
+
+---
+
+## Upgrading to 2.0
+
+Written **after** migrating a real deployment, not before. The numbers below are from the two-nest
+Lodestar box, not from a fixture - the distinction matters, because a fixture and that box have already
+disagreed about this exact behaviour once, and the box was right.
+
+### What it costs
+
+```text
+BEFORE   882 MB   504 parquet files
+$ nuthatch migrate --dir /opt/verify20
+Shared 504 segment(s) into segments/ (504 duplicate copies reclaimed).
+real 0m0.259s
+AFTER    880 MB   252 parquet files      per-dataset leftovers: 0
+```
+
+**A quarter of a second, and nothing re-indexed.** A separate 428 MB single-nest run took 0.144s. The
+migration moves files and rewrites a config; it never touches the chain.
+
+Note the disk total barely moved, and that is not a failure: the segments were ~4 MB of that 882 MB,
+and the bulk is two 393 MB redb hot stores which are per-dataset by design - mutable, reorg-affected,
+and not shareable. **The file count is the measure of the collapse, not `du`.** Nests with a lot of
+sealed history will see the byte saving too; these two simply had little.
+
+Rehearse it anyway: `nuthatch migrate --dir <copy> --dry-run` prints the whole plan and changes
+nothing.
+
+### What breaks, and where it is in the table above
+
+| Break | Table row |
+|---|---|
+| `roost.toml` → `mounts.toml`, `[roost]` → `[runtime]` | config keys - *rename, reserved for a major* |
+| `nuthatch roost dev` → `nuthatch dev` (one command; the directory decides what runs) | CLI flags/commands |
+| `nest diff` and `nest upgrade` removed - the runtime now classifies at the moment identity changes | CLI |
+| On-disk layout: `nests/<name>/` → `data/<nid>/`, plus a shared content-addressed `segments/` | on-disk layout - *`nuthatch migrate` performs it* |
+| `GET /nests` roster field `roost` → `runtime` | HTTP - *field rename* |
+| The Starlark config front-end is gone (retired 2026-07-21, unreachable since) | config |
+
+Every row is a break the contract reserves for a major. Nothing here was a surprise to the table,
+which is the point of having written it first.
+
+Additive in the same release, so nothing to do: `provenance` now carries `nid`, naming *which dataset*
+answered rather than only how it decoded - which matters once early cutoff lets a result legitimately
+come from data a different identity produced.
+
+### The order
+
+1. `nuthatch migrate --dir <copy> --dry-run` against a copy. Read the plan.
+2. Stop the service. The migration wants no writer.
+3. Swap the binary, `nuthatch migrate --dir <runtime>`, start.
+
+A breaking schema change is **named and refused** with nothing moved; add `--allow-breaking` once
+consumers are ready, or mount the new version under a different alias and migrate them on their own
+clock. The data is safe either way - this is about queries, not bytes.
 
 ---
 
