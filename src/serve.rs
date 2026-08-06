@@ -603,7 +603,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         }
     }
     // Answer from **this nest's** counters when it is one of several in a runtime. The process-global
-    // gauges are shared by every cursor, so in a multichain mounts whichever cursor polled last wins -
+    // gauges are shared by every cursor, so in a multichain runtime whichever cursor polled last wins -
     // and this endpoint then reports another chain's block heights. Observed live in a two-chain mounts:
     // the mainnet nest reported `tip: 488677305` (Arbitrum) while mainnet was at 25,632,906, alongside
     // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
@@ -1357,6 +1357,14 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
         .into_iter()
         .flatten()
     {
+        // Only an *absolute* prefix is worth redacting, and only an absolute one is safe to. The
+        // default `--dir` is `.`, which as a plain `replace` target matches every full stop in the
+        // message: `1.5` became `1<nest>5` and DuckDB's `...` ellipsis became `<nest><nest><nest>`.
+        // The absolute form above is what DuckDB actually embeds, so nothing is lost by skipping
+        // the relative one.
+        if !p.is_absolute() {
+            continue;
+        }
         let s = p.display().to_string();
         if !s.is_empty() {
             out = out.replace(&s, "<nest>");
@@ -1405,6 +1413,33 @@ mod tests {
         assert!(out.contains("<nest>/segments/usdc__transfer-abc.parquet"));
         // The useful DuckDB detail (the message + filename) survives.
         assert!(out.contains("No files found"));
+    }
+
+    /// The default `--dir` is `.`, and a bare `replace(".", "<nest>")` corrupted every message that
+    /// contained a full stop - decimals, qualified names, and DuckDB's `...` ellipsis alike. Observed
+    /// live on `nuthatch dev`: `SELECT 1.5 + bogus` came back as `SELECT 1<nest>5`.
+    #[test]
+    fn sanitize_sql_error_leaves_full_stops_alone_for_a_relative_dir() {
+        let raw = "Binder Error: Referenced column \"bogus\" not found!\n\
+                   LINE 1: SELECT 1.5 + bogus FROM usdc__transfer ORDER BY block_number DESC...";
+        for dir in [".", "..", "./"] {
+            let out = sanitize_sql_error(raw, std::path::Path::new(dir));
+            assert_eq!(
+                out, raw,
+                "a relative --dir ({dir}) must not rewrite the message"
+            );
+        }
+        // ...and the redaction it exists for still happens via the canonical (absolute) form.
+        let tmp = std::env::temp_dir();
+        let raw_abs = format!(
+            "IO Error: no such file \"{}/segments/x.parquet\"",
+            tmp.display()
+        );
+        let out = sanitize_sql_error(&raw_abs, &tmp);
+        assert!(
+            out.contains("<nest>/segments/x.parquet"),
+            "absolute prefix still redacted"
+        );
     }
 
     /// A minimal but real `AppState` - enough to drive the analytical handlers directly (no HTTP
@@ -1472,7 +1507,7 @@ mod tests {
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
     fn two_nest_roost(dir: &std::path::Path, health: Arc<crate::health::RuntimeHealth>) -> Router {
-        let roster = json!({"mounts": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
+        let roster = json!({"runtime": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
         let nests = vec![
             ("alpha".to_string(), test_state(&dir.join("a"), 4)),
             ("beta".to_string(), test_state(&dir.join("b"), 4)),
@@ -1543,7 +1578,7 @@ mod tests {
         // to be closed cleanly before anything reopens it, and a half-closed store is the one way a
         // lifecycle operation could corrupt data that faults never do.
         std::fs::create_dir_all(tmp.path().join("a2")).unwrap();
-        let roster = json!({"mounts": "t", "nests": [{"name": "alpha"}]});
+        let roster = json!({"runtime": "t", "nests": [{"name": "alpha"}]});
         let only_alpha = compose_runtime(
             roster,
             vec![("alpha".to_string(), test_state(&tmp.path().join("a2"), 4))],
@@ -1566,7 +1601,7 @@ mod tests {
         health.register("alpha", "base");
         health.register("beta", "base");
         let roster = json!({
-            "mounts": "test",
+            "runtime": "test",
             "nests": [ {"name": "alpha", "chain": "base"}, {"name": "beta", "chain": "base"} ],
         });
 
@@ -1677,7 +1712,7 @@ mod tests {
         drop(held);
     }
 
-    /// A multichain mounts runs one cursor per chain, so `/<nest>/ready` must answer from **that
+    /// A multichain runtime runs one cursor per chain, so `/<nest>/ready` must answer from **that
     /// nest's** counters.
     ///
     /// Found by the RFC-0021 live two-chain run rather than by any test: a mainnet nest reported

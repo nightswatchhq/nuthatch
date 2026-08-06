@@ -180,12 +180,12 @@ afterwards. *Proves* reorgs only ever touch the mutable hot store.
 
 ---
 
-## Level 3 — a roost (many nests, one runtime)
+## Level 3 — a runtime hosting many nests
 
 **3.1 Co-tenancy**
 
 ```sh
-nuthatch roost dev --dir /tmp/v-roost
+nuthatch dev --dir /tmp/v-runtime   # a dir with a mounts.toml runs every nest it mounts
 curl -s localhost:8288/nests
 ```
 
@@ -210,7 +210,7 @@ curl -XDELETE localhost:8288/_admin/nests/another
 ```
 
 Expect both to succeed **without co-tenants being interrupted** — check the other nests' `/ready` and
-row counts across the operation. *Proves* the live roost: a configuration change no longer has a wider
+row counts across the operation. *Proves* the live runtime: a configuration change no longer has a wider
 blast radius than a fault.
 
 Expect a `507` if the mount would breach the cursor's RAM budget, carrying the projected and ceiling
@@ -219,7 +219,7 @@ figures. That refusal is the feature; a budget that can be quietly exceeded is n
 **3.5 Per-nest blast radius**
 
 Break one nest deliberately — an invalid authored view is easiest. Expect that nest to be quarantined
-and reported, and **every other nest to keep serving**. *Proves* isolation. A roost-wide failure here
+and reported, and **every other nest to keep serving**. *Proves* isolation. A runtime-wide failure here
 is the most serious finding in this document.
 
 ---
@@ -358,7 +358,7 @@ unauthenticated off-localhost.
 > a suite that verifies the machinery *around* a thing rather than the thing - and a level-5 check
 > that asserts indexed data is part of the fix, or it recurs.
 >
-> The embedded path (`dev`, `roost`) is unaffected; this is scaled mode only.
+> The embedded path (`dev`) is unaffected; this is scaled mode only.
 
 >
 > **A first-run 5.1b failure should be re-run before it is reported.** The harness runs its level-5

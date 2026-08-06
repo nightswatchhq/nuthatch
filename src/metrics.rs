@@ -22,7 +22,7 @@ pub struct NestMetrics {
     sealed_through: AtomicU64,
     /// The tip of **this nest's chain**, and when its cursor last polled successfully.
     ///
-    /// Duplicated per nest rather than kept only process-globally because a multichain mounts runs one
+    /// Duplicated per nest rather than kept only process-globally because a multichain runtime runs one
     /// cursor per chain: with a single global tip, whichever cursor polled last wins, and
     /// `/<nest>/ready` reports another chain's block height. Observed live - a mainnet nest reporting
     /// an Arbitrum tip of 488,677,305 while mainnet was at 25,632,906.
