@@ -25,6 +25,7 @@
 use crate::blob;
 use crate::runtime::{Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR};
 use anyhow::{bail, Context, Result};
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 
 /// What migrating one nest would do. Computed for every nest before anything moves, so `--dry-run`
@@ -436,14 +437,17 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
 
     // Slice C (RFC-0033 §11a): pull the migrated datasets' segments into the shared store, so two
     // nests holding byte-identical segments stop holding two copies.
-    let mut shared = 0usize;
+    let (mut shared, mut reclaimed) = (0usize, 0usize);
     for r in &records {
-        shared += relocate_segments(dir, &MountTable::data_dir(dir, &r.nid))?;
+        let (m, d) = relocate_segments(dir, &MountTable::data_dir(dir, &r.nid))?;
+        shared += m;
+        reclaimed += d;
     }
     if shared > 0 {
         println!(
-            "Shared {shared} segment(s) into {}/.",
-            crate::seal::SEGMENTS_DIR
+            "Shared {shared} segment(s) into {}/ ({reclaimed} duplicate cop{} reclaimed).",
+            crate::seal::SEGMENTS_DIR,
+            if reclaimed == 1 { "y" } else { "ies" }
         );
     }
 
@@ -500,32 +504,73 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
 ///
 /// Idempotent by construction - the destination is the content hash, so a segment another dataset
 /// already contributed is skipped rather than rewritten.
-fn relocate_segments(root: &Path, dataset: &Path) -> Result<usize> {
+fn relocate_segments(root: &Path, dataset: &Path) -> Result<(usize, usize)> {
     let Ok(manifest) = crate::seal::load_manifest(dataset) else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     let store = root.join(crate::seal::SEGMENTS_DIR);
     std::fs::create_dir_all(&store).context("creating the shared segment store")?;
 
     let mut moved = 0usize;
+    let mut reclaimed = 0usize;
     for segs in manifest.tables.values() {
         for s in segs {
             let dest = store.join(format!("{}.parquet", s.hash));
-            if dest.exists() {
-                continue;
-            }
             let src = dataset.join(crate::seal::SEGMENTS_DIR).join(&s.file);
             if !src.exists() {
                 continue;
             }
-            if std::fs::hard_link(&src, &dest).is_err() {
+            if !dest.exists() && std::fs::hard_link(&src, &dest).is_err() {
                 std::fs::copy(&src, &dest)
                     .with_context(|| format!("copying {} into the shared store", s.file))?;
+            }
+
+            // **Then drop the per-dataset copy**, which is what actually reclaims the disk.
+            //
+            // Verified on 881 MB of real production data before this existed: linking alone shares
+            // nothing that already exists. Two nests migrated separately hold two *distinct inodes*
+            // of identical bytes, and linking one of them into the store only avoids creating a
+            // third. The duplication between the two datasets survived, and the total on disk did
+            // not move.
+            //
+            // This is a deletion during a migration, so it is gated rather than assumed:
+            //
+            // - if `src` and `dest` are the **same inode** (the hard-link path) the bytes cannot go
+            //   anywhere - unlinking one name of a two-name file is free;
+            // - otherwise the shared copy is **re-hashed and checked against the manifest** before
+            //   anything is removed. A mismatched or unreadable shared copy leaves the local one
+            //   exactly where it is.
+            //
+            // `segment_path` prefers the shared copy and falls back to the local one, so a dataset
+            // reads correctly at every point in this sequence.
+            if safe_to_drop_local(&src, &dest, &s.hash) {
+                std::fs::remove_file(&src)
+                    .with_context(|| format!("removing the duplicate copy of {}", s.file))?;
+                reclaimed += 1;
             }
             moved += 1;
         }
     }
-    Ok(moved)
+    Ok((moved, reclaimed))
+}
+
+/// Whether the per-dataset copy may be removed now the shared store holds these bytes.
+///
+/// Two ways to be sure, and nothing else counts. Same inode means unlinking one name of a two-name
+/// file cannot lose data. Otherwise the shared copy is re-read and hashed against what the manifest
+/// says it should be - because the alternative is deleting an operator's only copy on the strength of
+/// a filename.
+fn safe_to_drop_local(src: &Path, dest: &Path, hash: &str) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(dest)) {
+        use std::os::unix::fs::MetadataExt;
+        if a.ino() == b.ino() && a.dev() == b.dev() {
+            return true;
+        }
+    }
+    match std::fs::read(dest) {
+        Ok(bytes) => hex::encode(sha2::Sha256::digest(&bytes)) == hash,
+        Err(_) => false,
+    }
 }
 
 /// Rewrite `mounts.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
@@ -573,6 +618,23 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    fn walkdir(p: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![p.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    if e.path().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.push(e.path().display().to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     use super::*;
 
     /// A mounts with `n` nests, all on one chain, in the pre-2.0 layout.
@@ -1029,6 +1091,143 @@ mod tests {
             bytes,
             "the shared copy must be the same bytes both nests sealed"
         );
+    }
+
+    /// The bug the Lodestar box found, and the tempdir test missed (RFC-0033 §11a slice C).
+    ///
+    /// Two nests migrated from **separately copied** directories hold two *distinct inodes* of
+    /// identical bytes - which is what any real deployment looks like. Linking one of them into the
+    /// shared store only avoids creating a third copy; the duplication between the two datasets
+    /// survives, and the disk does not move. Measured on 881 MB of real production data: 251 segments
+    /// "shared", zero bytes reclaimed.
+    ///
+    /// The earlier test passed because its fixture only ever had one copy to begin with.
+    #[test]
+    fn migrating_two_nests_actually_reclaims_the_duplicate_bytes() {
+        use crate::seal::{Manifest, Segment, SEGMENTS_DIR};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(
+            root,
+            &[
+                ("alpha", "0x0000000000000000000000000000000000000001"),
+                ("beta", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+
+        // The **real** hash of the bytes, not a made-up one: `safe_to_drop_local` re-hashes the
+        // shared copy before removing a local one, and correctly refuses when they disagree. A
+        // fixture with a fake hash exercises the refusal, not the reclaim.
+        let bytes = vec![7u8; 4096];
+        let hash = hex::encode(sha2::Sha256::digest(&bytes));
+        for alias in ["alpha", "beta"] {
+            let seg_dir = root.join(NESTS_DIR).join(alias).join(SEGMENTS_DIR);
+            std::fs::create_dir_all(&seg_dir).unwrap();
+            let file = format!("t-{hash}.parquet");
+            // Written separately, so these are two distinct inodes - exactly as two nests copied
+            // onto a box would be.
+            std::fs::write(seg_dir.join(&file), &bytes).unwrap();
+            let mut m = Manifest::default();
+            m.tables.insert(
+                "t".to_string(),
+                vec![Segment {
+                    hash: hash.clone(),
+                    from_block: 1,
+                    to_block: 2,
+                    rows: 1,
+                    file,
+                    registry_snapshot: None,
+                }],
+            );
+            std::fs::write(
+                seg_dir.join("manifest.json"),
+                serde_json::to_string(&m).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let count_parquet = |p: &Path| -> usize {
+            walkdir(p)
+                .into_iter()
+                .filter(|f| f.ends_with(".parquet"))
+                .count()
+        };
+        assert_eq!(
+            count_parquet(root),
+            2,
+            "the fixture must start with two copies"
+        );
+
+        run(root, false, false).unwrap();
+
+        // One copy, in the shared store, and **no per-dataset duplicates left behind**.
+        assert_eq!(
+            count_parquet(root),
+            1,
+            "two nests with identical segments must end up holding ONE copy - linking without \
+             dropping the local copy reclaims nothing, which is what the box proved"
+        );
+        assert!(
+            root.join(SEGMENTS_DIR)
+                .join(format!("{hash}.parquet"))
+                .exists(),
+            "the surviving copy must be the shared one"
+        );
+        assert_eq!(
+            std::fs::read(root.join(SEGMENTS_DIR).join(format!("{hash}.parquet"))).unwrap(),
+            bytes,
+            "and it must still be the right bytes"
+        );
+
+        // Both datasets still resolve their segment through the shared store.
+        let table = MountTable::load(root).unwrap();
+        assert_eq!(table.mounts.len(), 2);
+        for m in &table.mounts {
+            let ds = MountTable::data_dir(root, &m.nid);
+            let p = crate::seal::segment_path(&ds, &format!("t-{hash}.parquet"), &hash);
+            assert!(
+                p.exists(),
+                "dataset {} cannot find its segment: {p:?}",
+                &m.nid[..8]
+            );
+        }
+    }
+
+    /// The guard on the deletion, pinned because it is the difference between reclaiming a duplicate
+    /// and destroying an operator's only copy.
+    ///
+    /// This was found the useful way round: the first version of the test above used a made-up hash,
+    /// and `safe_to_drop_local` refused to delete anything - correctly.
+    #[test]
+    fn a_local_copy_is_never_dropped_against_an_unverifiable_shared_one() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = b"the real bytes";
+        let real = hex::encode(sha2::Sha256::digest(bytes));
+
+        let src = d.path().join("local.parquet");
+        let dest = d.path().join("shared.parquet");
+        std::fs::write(&src, bytes).unwrap();
+
+        // Shared copy absent: nothing to fall back to, so keep the local one.
+        assert!(!safe_to_drop_local(&src, &dest, &real));
+
+        // Shared copy present but **different bytes**: refuse. This is the case that would otherwise
+        // delete good data in favour of bad.
+        std::fs::write(&dest, b"different bytes entirely").unwrap();
+        assert!(
+            !safe_to_drop_local(&src, &dest, &real),
+            "a shared copy whose hash does not match the manifest must not authorise a deletion"
+        );
+
+        // Shared copy present and correct: now it is safe.
+        std::fs::write(&dest, bytes).unwrap();
+        assert!(safe_to_drop_local(&src, &dest, &real));
+
+        // Same inode is safe without re-reading anything - unlinking one name of a two-name file
+        // cannot lose the bytes.
+        let linked = d.path().join("linked.parquet");
+        std::fs::hard_link(&src, &linked).unwrap();
+        assert!(safe_to_drop_local(&src, &linked, "not-even-a-hash"));
     }
 
     /// A refusal must not hold the healthy nests hostage, and the runtime must still serve.
