@@ -158,7 +158,7 @@ jobs:
           # as product failures - `5.10` in particular, because with no workers the unplaceable reason
           # is `noworkers` rather than the budget one it was asserting.
           for i in $(seq 1 30); do
-            n=$(curl -fsS -m 3 -H 'authorization: Bearer dev-token-change-me' \
+            n=$(curl -fsS -m 3 -H "authorization: Bearer $NUTHATCH_CONTROL_TOKEN" \
               localhost:8290/workers | python3 -c 'import sys,json;print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)
             [ "${n:-0}" -ge 1 ] && { echo "workers registered: $n"; break; }
             sleep 2
@@ -178,7 +178,7 @@ jobs:
       - name: walk verification.md level 5
         env:
           NUTHATCH: target/release/nuthatch
-          CONTROL_TOKEN: dev-token-change-me
+          CONTROL_TOKEN: ${{ env.NUTHATCH_CONTROL_TOKEN }}
         run: ./scripts/verify.sh 5
       - name: a worker takes a lease and only one does
         run: |
@@ -186,7 +186,7 @@ jobs:
           # single-owner invariant, read from the workers' own logs - the control plane records intent,
           # the lease records ownership, so asking the control plane would prove nothing.
           curl -fsS -X POST localhost:8290/nests \
-            -H 'authorization: Bearer dev-token-change-me' \
+            -H "authorization: Bearer $NUTHATCH_CONTROL_TOKEN" \
             -H 'content-type: application/json' \
             -d '{"name":"ci","chain":"arbitrum-one","estimated_rss_mb":120}'
           sleep 12

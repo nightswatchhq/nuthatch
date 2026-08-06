@@ -13,7 +13,7 @@
 #   NUTHATCH        path to the binary            (default: nuthatch on PATH)
 #   NUTHATCH_URL    a running nest's API          (default: http://127.0.0.1:8288)
 #   CONTROL_URL     the control plane             (default: http://127.0.0.1:8290)
-#   CONTROL_TOKEN   control-plane bearer token    (default: dev-token-change-me)
+#   CONTROL_TOKEN   control-plane bearer token    (required - same value the fleet uses)
 #   RPC             an RPC endpoint for level 1   (default: the chain's built-in)
 #   NEST_DIR        an existing nest to test       (default: a temp one is scaffolded)
 #
@@ -26,7 +26,10 @@ set -uo pipefail
 NUTHATCH="${NUTHATCH:-nuthatch}"
 NUTHATCH_URL="${NUTHATCH_URL:-http://127.0.0.1:8288}"
 CONTROL_URL="${CONTROL_URL:-http://127.0.0.1:8290}"
-CONTROL_TOKEN="${CONTROL_TOKEN:-dev-token-change-me}"
+# No default. The compose stack no longer ships one, so a default here could only ever be wrong -
+# it would send a token the control plane does not know and report the result as a 401, which reads
+# as a broken fleet rather than an unset variable.
+CONTROL_TOKEN="${CONTROL_TOKEN:?set CONTROL_TOKEN to the same value the fleet was started with}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.scaled.yml}"
 
 STRICT=0
