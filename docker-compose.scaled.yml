@@ -7,7 +7,7 @@
 # store and owns nothing. Every service here corresponds to something that exists and is tested.
 #
 #   docker compose -f docker-compose.scaled.yml up -d postgres     # just the store (for the tests)
-#   NUTHATCH_TEST_PG=postgres://nuthatch:nuthatch@127.0.0.1:5433/nuthatch \
+#   NUTHATCH_TEST_PG=postgres://nuthatch:$POSTGRES_PASSWORD@127.0.0.1:5433/nuthatch \
 #     cargo test --features postgres-store --test pg_parity
 #
 #   docker compose -f docker-compose.scaled.yml --profile fleet up \
@@ -31,7 +31,7 @@
 #    which is the worst possible way for a defect to behave.
 #
 # Control-plane calls need the token:
-#   curl -H 'authorization: Bearer dev-token-change-me' localhost:8290/workers
+#   curl -H "authorization: Bearer $NUTHATCH_CONTROL_TOKEN" localhost:8290/workers
 #
 # The fleet profile needs the **scaled** image - `ghcr.io/nightswatchhq/nuthatch:<version>-scaled`.
 # The default published image is the embedded build and deliberately carries no database driver, so
@@ -42,7 +42,11 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: nuthatch
-      POSTGRES_PASSWORD: nuthatch
+      # Same reasoning as `NUTHATCH_CONTROL_TOKEN` below: `PG_BIND` is parameterised, so the easiest
+      # override to reach for pairs an exposed 5433 with a credential everyone can read. Postgres has
+      # no equivalent of the control plane's refuse-to-start guard, so this is the only thing standing
+      # between `PG_BIND=0.0.0.0` and an open database.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set a database password, e.g. POSTGRES_PASSWORD=$(openssl rand -hex 16)}"
       POSTGRES_DB: nuthatch
       # `--locale-provider=icu` is deliberately NOT used, and the initdb locale is C. The hot store
       # keys on zero-padded strings whose *byte* order is chain order; a locale-aware default
@@ -80,7 +84,7 @@ services:
       postgres: { condition: service_healthy }
     command: >-
       control --listen 0.0.0.0:8290
-      --db postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+      --db postgres://nuthatch:${POSTGRES_PASSWORD}@postgres:5432/nuthatch
     environment:
       # **Required, not optional.** Docker publishes a port by binding 0.0.0.0 *inside* the container,
       # so the control plane always sees an off-localhost bind and refuses to start without a token -
@@ -88,8 +92,12 @@ services:
       # empty with a comment about the host-side 127.0.0.1 mapping, and the stack simply would not come
       # up: `Error: refusing to serve the control-plane API on '0.0.0.0:8290' without a token`.
       #
-      # This is a **development default**. Change it, or pass it in from your own environment.
-      NUTHATCH_CONTROL_TOKEN: "${NUTHATCH_CONTROL_TOKEN:-dev-token-change-me}"
+      # No default, deliberately. A literal default here defeats the binary's own guard in the one
+      # case it exists for: `CONTROL_BIND` is parameterised, so reaching the control plane from
+      # another host means setting it to 0.0.0.0 - at which point a baked-in token means the bind is
+      # *accepted*, protected by a string published in this repo. The guard would then only ever fire
+      # for operators who were already on localhost. `:?` fails the stack with this message instead.
+      NUTHATCH_CONTROL_TOKEN: "${NUTHATCH_CONTROL_TOKEN:?set a control-plane token, e.g. NUTHATCH_CONTROL_TOKEN=$(openssl rand -hex 32)}"
     # `CONTROL_BIND` defaults to 127.0.0.1 - see `PG_BIND` above. Binding this off-localhost without
     # `NUTHATCH_CONTROL_TOKEN` set is refused by the binary itself, which is the guard that matters.
     ports:
@@ -117,8 +125,8 @@ services:
     # per replica; two workers sharing an id would look like one to the registry.
     command: >-
       worker
-      --control-db postgres://nuthatch:nuthatch@postgres:5432/nuthatch
-      --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+      --control-db postgres://nuthatch:${POSTGRES_PASSWORD}@postgres:5432/nuthatch
+      --hot-store postgres://nuthatch:${POSTGRES_PASSWORD}@postgres:5432/nuthatch
       --chains arbitrum-one
       --budget-mb 2048
     volumes:
@@ -135,7 +143,7 @@ services:
       postgres: { condition: service_healthy }
     command: >-
       serve --dir /nest --listen 0.0.0.0:8288
-      --hot-store postgres://nuthatch:nuthatch@postgres:5432/nuthatch
+      --hot-store postgres://nuthatch:${POSTGRES_PASSWORD}@postgres:5432/nuthatch
     # **Read-only, and it must stay that way.** An FE owns no cursor and has no business writing to a
     # nest directory; `:ro` is what makes that structural instead of merely intended.
     #

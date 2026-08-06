@@ -36,8 +36,8 @@ services:
     # variable.
     command: >-
       worker
-      --control-db postgres://nuthatch:nuthatch@${CONTROL_HOST:?set CONTROL_HOST to the control box private ip}:5433/nuthatch
-      --hot-store postgres://nuthatch:nuthatch@${CONTROL_HOST}:5433/nuthatch
+      --control-db postgres://nuthatch:${POSTGRES_PASSWORD:?set the same POSTGRES_PASSWORD as the control box}@${CONTROL_HOST:?set CONTROL_HOST to the control box private ip}:5433/nuthatch
+      --hot-store postgres://nuthatch:${POSTGRES_PASSWORD}@${CONTROL_HOST}:5433/nuthatch
       --chains ${CHAINS:-arbitrum-one}
       --budget-mb ${BUDGET_MB:-2048}
       ${REGISTRY:+--registry ${REGISTRY}}

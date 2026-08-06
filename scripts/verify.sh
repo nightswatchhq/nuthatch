@@ -13,7 +13,7 @@
 #   NUTHATCH        path to the binary            (default: nuthatch on PATH)
 #   NUTHATCH_URL    a running nest's API          (default: http://127.0.0.1:8288)
 #   CONTROL_URL     the control plane             (default: http://127.0.0.1:8290)
-#   CONTROL_TOKEN   control-plane bearer token    (default: dev-token-change-me)
+#   CONTROL_TOKEN   control-plane bearer token    (required for level 5; same value the fleet uses)
 #   RPC             an RPC endpoint for level 1   (default: the chain's built-in)
 #   NEST_DIR        an existing nest to test       (default: a temp one is scaffolded)
 #
@@ -26,7 +26,15 @@ set -uo pipefail
 NUTHATCH="${NUTHATCH:-nuthatch}"
 NUTHATCH_URL="${NUTHATCH_URL:-http://127.0.0.1:8288}"
 CONTROL_URL="${CONTROL_URL:-http://127.0.0.1:8290}"
-CONTROL_TOKEN="${CONTROL_TOKEN:-dev-token-change-me}"
+# No default. The compose stack no longer ships one, so a default here could only ever be wrong -
+# it would send a token the control plane does not know and report the result as a 401, which reads
+# as a broken fleet rather than an unset variable.
+#
+# Unset is not an error *here*, though: only Level 5 talks to the control plane, and making this a
+# hard `:?` aborted the script before a single check ran - so verifying an embedded nest, which is
+# what almost everyone runs this for, failed on a variable it never needed. Level 5 requires it at
+# the point of use instead.
+CONTROL_TOKEN="${CONTROL_TOKEN:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.scaled.yml}"
 
 STRICT=0
@@ -246,6 +254,12 @@ level5() {
 
   if ! have docker || ! docker info >/dev/null 2>&1; then
     skip 5.x "the whole level" "docker is not available"
+    return
+  fi
+  # Checked here rather than at the top: this is the only level that needs it, and an unset token
+  # must not stop the other levels from running.
+  if [ -z "$CONTROL_TOKEN" ]; then
+    skip 5.x "the whole level" "set CONTROL_TOKEN to the same value the fleet was started with"
     return
   fi
   if ! ctl "$CONTROL_URL/health" >/dev/null 2>&1; then
