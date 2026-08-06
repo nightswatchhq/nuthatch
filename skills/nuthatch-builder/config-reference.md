@@ -35,8 +35,11 @@ velocity_window = 7200            # window in BLOCKS, not seconds (≈24h at 12s
 [[templates]]                 # optional (RFC-0009 factories)
 name = "pool"                 # shared table prefix for discovered children
 abi = "abis/pool.json"
-filter = "topic0"             # optional backfill-STRATEGY override (not an event allowlist):
+filter = "topic0"             # optional backfill-STRATEGY override - HOW the range is fetched:
                               #   force topic0-only fetch for many-children templates
+events = ["Swap"]             # optional event allowlist - WHAT is decoded from it.
+                              #   omit/empty = every event the ABI defines. A name the ABI
+                              #   lacks is refused at load, not silently empty at query time.
 
 [[factories]]                 # optional (RFC-0009)
 watch = "factory"             # ALIAS of the watched [[contracts]] (or a template, for nesting)
