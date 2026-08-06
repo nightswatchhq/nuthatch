@@ -73,6 +73,9 @@ skip() {
   printf '  \033[33m·\033[0m %-6s %s \033[33m(skipped: %s)\033[0m\n' "$1" "$2" "$3"
 }
 
+# Context for the checks that follow - not a verdict, so it scores nothing.
+note() { printf '  \033[2m%s\033[0m\n' "$1"; }
+
 have() { command -v "$1" >/dev/null 2>&1; }
 api()  { curl -fsS -m 15 "$@"; }
 ctl()  { curl -fsS -m 15 -H "authorization: Bearer $CONTROL_TOKEN" "$@"; }
@@ -131,23 +134,48 @@ level1() {
   check 1.3a "/health returns ok" \
     bash -c "[ \"\$(api $NUTHATCH_URL/health)\" = ok ]"
 
+  # A solo `dev` serves the nest API at the root; a runtime hosting many nests serves each nest under
+  # `/<name>/`. Resolve which shape we are pointed at, so Level 1 exercises the nest API either way
+  # rather than reporting a runtime's prefixed routes as a missing one - a false failure in a document
+  # whose whole point is that a reported failure means something.
+  local base="$NUTHATCH_URL"
+  if ! api "$NUTHATCH_URL/tables" >/dev/null 2>&1; then
+    local prefix
+    prefix=$(api "$NUTHATCH_URL/nests" 2>/dev/null \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["nests"][0]["base_path"])' 2>/dev/null)
+    if [ -n "$prefix" ]; then
+      base="$NUTHATCH_URL$prefix"
+      note "a runtime hosting many nests - Level 1 runs against $prefix"
+    fi
+  fi
+
   check 1.3b "/tables reports at least one table" \
-    bash -c "[ \"\$(api $NUTHATCH_URL/tables | jget count)\" -ge 1 ]"
+    bash -c "[ \"\$(api $base/tables | jget count)\" -ge 1 ]"
+
+  # A mount may answer only its declared queries (RFC-0034), in which case a refused `/sql` is the
+  # configured behaviour and not a defect. Detect that rather than scoring it as a failure.
+  local free_form
+  free_form=$(api "$base/queries" 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("free_form"))' 2>/dev/null)
 
   # The step that separates "it ran" from "it is correct" is comparing against an independent source,
   # which this script cannot do for you. It asserts the weaker machine-checkable claim and says so.
   local table
-  table=$(api "$NUTHATCH_URL/tables" | python3 -c 'import sys,json;print(json.load(sys.stdin)["tables"][0]["table"])' 2>/dev/null)
-  if [ -n "$table" ]; then
+  table=$(api "$base/tables" | python3 -c 'import sys,json;print(json.load(sys.stdin)["tables"][0]["table"])' 2>/dev/null)
+  if [ "$free_form" = "False" ]; then
+    skip 1.3c "a decoded table is queryable" "this mount answers only its declared queries (sql != open)"
+    skip 1.4 "responses carry provenance" "no free-form /sql on this mount"
+    return
+  elif [ -n "$table" ]; then
     check 1.3c "a decoded table is queryable via /sql" \
-      bash -c "api --get $NUTHATCH_URL/sql --data-urlencode 'q=select count(*) c from \"$table\"' >/dev/null"
+      bash -c "api --get $base/sql --data-urlencode 'q=select count(*) c from \"$table\"' >/dev/null"
   else
     skip 1.3c "a decoded table is queryable" "no tables in the schema"
   fi
 
   # Provenance is what makes an answer attributable to a decode version and a chain position.
   check 1.4 "responses carry provenance (as_of, registry_hash, sealed_through)" \
-    bash -c "api --get $NUTHATCH_URL/sql --data-urlencode 'q=select 1' | grep -q registry_hash"
+    bash -c "api --get $base/sql --data-urlencode 'q=select 1' | grep -q registry_hash"
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -172,18 +200,18 @@ level2() {
 
 # ---------------------------------------------------------------------------------------------------
 level3() {
-  hr "Level 3 — a roost"
+  hr "Level 3 — a runtime hosting many nests"
 
   if ! api "$NUTHATCH_URL/nests" >/dev/null 2>&1; then
-    skip 3.1 "the roster lists mounted nests" "not a roost at $NUTHATCH_URL"
-    skip 3.4 "mount and unmount without a restart" "not a roost"
+    skip 3.1 "the roster lists mounted nests" "not a multi-nest runtime at $NUTHATCH_URL"
+    skip 3.4 "mount and unmount without a restart" "not a multi-nest runtime"
     return
   fi
 
   check 3.1 "/nests lists mounted nests with chain and footprint" \
     bash -c "api $NUTHATCH_URL/nests | grep -q chain"
 
-  # The live roost. Mount/unmount is admin-gated, so a 401/404 means the admin surface is off rather
+  # The live runtime. Mount/unmount is admin-gated, so a 401/404 means the admin surface is off rather
   # than the feature being broken - distinguished so the result is not misread.
   if api "$NUTHATCH_URL/_admin/nests" >/dev/null 2>&1; then
     check 3.4 "the lifecycle routes are served (live mount/unmount)" true

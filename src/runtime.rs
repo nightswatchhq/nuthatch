@@ -146,7 +146,7 @@ impl MountRef {
 
 /// A mounts manifest: the mounted nests plus the chain(s) they follow. A mounts may host nests across
 /// **one or more chains** (RFC-0021) - one isolated cursor per distinct chain. The single-chain form
-/// keeps the top-level `chain`/`chain_id`/`rpc_urls`; a multichain mounts lists its chains under
+/// keeps the top-level `chain`/`chain_id`/`rpc_urls`; a multichain runtime lists its chains under
 /// `[[chains]]` and lets each nest declare its own chain. The single-cursor law holds **per chain**:
 /// never multiplex two chains behind one cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,14 +182,14 @@ pub struct RuntimeMeta {
     /// mounts that declares its chains under `[[chains]]` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
-    /// Single-chain form: the one chain id. Omit for a multichain mounts.
+    /// Single-chain form: the one chain id. Omit for a multichain runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
     /// Single-chain form: RPC endpoints for the one chain. Overridable at runtime with `--rpc`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rpc_urls: Vec<String>,
     /// The mounted nests, by directory name under `nests/`. Superseded by `[[mounts]]` once the
-    /// mounts is migrated (RFC-0032 §4) - see [`MountTable::mount_refs`].
+    /// mount table is migrated (RFC-0032 §4) - see [`MountTable::mount_refs`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nests: Vec<String>,
     /// The tenant a mount belongs to when it does not say (RFC-0032 §6). Operator-configurable so a
@@ -460,8 +460,8 @@ impl MountTable {
         }
     }
 
-    /// The chains this runtime serves, each with its RPC endpoints (RFC-0021). A single-chain mounts
-    /// synthesizes one entry from the top-level `chain`/`chain_id`/`rpc_urls`; a multichain mounts
+    /// The chains this runtime serves, each with its RPC endpoints (RFC-0021). A single-chain runtime
+    /// synthesizes one entry from the top-level `chain`/`chain_id`/`rpc_urls`; a multichain runtime
     /// returns its `[[chains]]`. Errors if both forms are present (ambiguous) or neither (no chain).
     pub fn chain_endpoints(&self) -> Result<Vec<ChainEndpoint>> {
         // **`[[chains]]` is the only form in 2.0** (RFC-0035 §2). The top-level
@@ -708,10 +708,10 @@ pub async fn dev(
     }
 
     // `--rpc` is ambiguous once a runtime spans chains (which chain would it override?). Allow it only for
-    // a single-chain mounts; a multichain mounts sets rpc_urls per chain under [[chains]].
+    // a single-chain runtime; a multichain runtime sets rpc_urls per chain under [[chains]].
     if !rpc_override.is_empty() && groups.len() > 1 {
         bail!(
-            "--rpc is ambiguous for a multichain mounts ({} chains) - set rpc_urls per chain under [[chains]]",
+            "--rpc is ambiguous for a multichain runtime ({} chains) - set rpc_urls per chain under [[chains]]",
             groups.len()
         );
     }
@@ -751,7 +751,7 @@ pub async fn dev(
         if rpc_urls.is_empty() {
             bail!(
                 "mounts '{}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \
-                 single-chain mounts)",
+                 single-chain runtime)",
                 meta.name,
                 group.endpoint.chain
             );
@@ -907,7 +907,9 @@ pub async fn dev(
         })
         .collect();
     let roster = serde_json::json!({
-        "mounts": meta.name,
+        // The runtime's own name. Called `roost` pre-2.0; the blanket rename briefly made this
+        // `mounts`, which read as "the mount list" while holding a single name string.
+        "runtime": meta.name,
         "chains": endpoints.iter().map(|e| e.chain.clone()).collect::<Vec<_>>(),
         "projected_rss_mb": runtime_total_mb,
         "max_rss_mb_per_cursor": max_rss,
