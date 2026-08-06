@@ -48,10 +48,10 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 
 | Level | Verified by us | On what |
 |---|---|---|
-| 0 Artifact | yes | every release |
-| 1 Single nest | yes | CI + the Lodestar production box |
+| 0 Artifact | yes | every release, from the *published* tarball: SHA-256 checked against the release's own checksum, then run |
+| 1 Single nest | yes | CI + the Lodestar production box, upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows) |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
-| 3 Roost | yes | live two-chain run, 8-nest density run |
+| 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
 | 5 Scaled mode | **verified across machines** | Every cross-machine invariant is now measured on published v0.9.3 artifacts: workers register, the scheduler assigns to a named remote worker, the lease carries a monotonic fence (incremented by a real handover), **clock skew** does not move a lease, a worker **indexes into a remote store**, and it **indexes straight through a control-plane partition**. |
 

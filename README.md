@@ -271,7 +271,7 @@ who need more - none of it in the way of the happy path:
   endpoint never blocks indexing.
 - **Built-in admin UI.** A self-contained page at `/_admin/` - status, tables, view/nest inspector.
   Localhost-open; off-localhost it requires a token per request.
-- **Roost - many nests, one runtime, one or more chains** (RFC-0012, RFC-0021). Host many nests in one
+- **Many nests, one runtime, one or more chains** (RFC-0012, RFC-0021). Host many nests in one
   process; nests on the same chain share a single cursor and one `getLogs` per window (N nests for
   roughly one nest's RPC cost), and a runtime can span **multiple chains** with **one isolated cursor per
   chain** - a Base nest and an Arbitrum nest in one runtime. Per-nest isolation, and a footprint budget
