@@ -2,11 +2,21 @@
 
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
-[RFC series](rfcs/README.md), the [backlog](backlog.md), and [CI](../.github/workflows/ci.yml) on
-**2026-07-30** (repo at `0.7.2`).
+[RFC series](rfcs/README.md), the [issue queue](https://github.com/nightswatchhq/nuthatch/issues), and
+[CI](../.github/workflows/ci.yml) on **2026-08-06** (repo at `2.0.0`).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
+
+**Every 🟡 and ⛔ names the issue that tracks it.** This file answers *"is this safe to ship?"*; the
+[issue queue](https://github.com/nightswatchhq/nuthatch/issues) answers *"what is being done about
+it?"* - and the issue is the one that moves. Do not record work here that has no issue, and do not
+close an issue by editing this file.
+
+The reason for that rule is on this page's own history: two entries here outlived their fix. MSRV was
+listed amber for claiming `rust-version = 1.85` long after it was corrected to `1.95`, and the
+"write a production guide" item stayed amber while `operators.md` grew to 975 lines of exactly that
+guide. Both are green as of 2026-08-06. A checklist nobody re-reads decides what gets built next.
 
 ## Legend & scope
 
@@ -18,7 +28,7 @@ verifiable today. When you cut a release, walk it top to bottom and update the f
 
 **Two production targets, graded separately** - don't conflate them:
 
-- **Embedded / single-chain roost** (the primary deliverable): one binary, one chain, tip-follow +
+- **Embedded / single-chain runtime** (the primary deliverable): one binary, one chain, tip-follow +
   serve, `≤2 GB` RAM. This is the thing that can be "prod ready" *now*.
 - **Scaled mode** (docker-compose, Postgres + DataFusion federation): greenfield. Nowhere near a
   release, and honestly so - most of its checklist is ⛔ by design, not neglect.
@@ -35,9 +45,9 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 - [ ] ✅ **Single static binary, zero external services in embedded mode.** `curl | sh` → `init` →
   `dev` → live API, no Postgres/Docker/IPFS. - *CI builds the release binary; footprint job runs the
   real `init → dev` path.*
-- [ ] ✅ **Footprint ≤ 2 GB RAM** for a single-chain roost, CI-enforced. - *`footprint.sh` gate, 256 MB
+- [ ] ✅ **Footprint ≤ 2 GB RAM** for a single-chain runtime, CI-enforced. - *`footprint.sh` gate, 256 MB
   ceiling, measured ~37 MB. The CI scenario is only `--backfill 200` on one nest, so the *dense
-  multi-nest roost at tip* was measured out-of-band instead: 8 nests on one cursor peaked at 89 MB at
+  multi-nest runtime at tip* was measured out-of-band instead: 8 nests on one cursor peaked at 89 MB at
   tip, 4% of budget - see §5. Wiring that density into the gate itself is still open (§3).*
 - [ ] ✅ **No phone-home.** No telemetry, no mandatory tokens, AI degrades offline. - *Verify per
   release: grep for outbound calls not gated behind explicit user config / BYO-key.*
@@ -63,7 +73,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   Arbitrum: two nests indexed solo and again behind one shared cursor over the same 2,400-block range,
   compared table by table - **20 tables, 17,108 rows, byte-identical**, including empty tables and the
   topic0-disambiguated `weth__transfer_ddf2`/`_e192` pair.*
-- [ ] 🟡 Factory / dynamic-contract discovery correctness at scale. - *Implemented (0009); child
+- [ ] 🟡 Factory / dynamic-contract discovery correctness at scale. - *Implemented (0009); child  **[#297]**
   `end`/expiry conditions and wildcard-address decode still open.*
 
 ## 2. Reliability, reorgs & crash safety
@@ -75,7 +85,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   read-only. No concurrent-writer design anywhere.
 - [ ] ✅ Single cursor / single process / one observable failure boundary. A second chain = a second
   process (never multiplex chains behind one cursor).
-- [ ] ✅ Per-nest blast-radius isolation in a roost: one nest's bad view / runaway factory can't harm
+- [ ] ✅ Per-nest blast-radius isolation in a runtime: one nest's bad view / runaway factory can't harm
   another. *(RFC-0012)*
 - [ ] ✅ Graceful recovery from a corrupt/partial segment on startup (detect + quarantine + resume
   rather than crash-loop). - *0.5.x: `seal::verify_and_quarantine` runs at startup - each manifest
@@ -97,12 +107,12 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 
 - [ ] ✅ Backfill throughput bench exists and is reproducible (`nuthatch bench backfill`). - *Floor
   ≥10K events/sec, aim 30K.*
-- [ ] 🟡 A **published, current** backfill number for the release commit on reference hardware. -
+- [ ] 🟡 A **published, current** backfill number for the release commit on reference hardware. -  **[#285]**
   *Re-run per release; don't ship a stale figure.*
-- [ ] ⛔ Tip-lag benchmark (notification → row queryable) as a tracked number. - *Meaningful number
+- [ ] ⛔ Tip-lag benchmark (notification → row queryable) as a tracked number. - *Meaningful number  **[#282]**
   needs ExEx. **Blocked on:** reth node (0003).*
-- [ ] 🟡 Entity point-read p50/p99 bench tracked across releases (regressions fail the build).
-- [ ] 🟡 Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest
+- [ ] 🟡 Entity point-read p50/p99 bench tracked across releases (regressions fail the build).  **[#283]**
+- [ ] 🟡 Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest  **[#284]**
   `--backfill 200`. - *The density itself is now measured (§5); what is missing is the **gate** - a
   one-off run does not catch the release that regresses it.*
 - [ ] ✅ Regressions fail the build (benchmarks-as-gates principle established). - *Extend coverage as
@@ -123,7 +133,7 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   crates.io package. Worth revisiting if that ever changes.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
-- [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).
+- [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).  **[#289]**
   `reject_file_access` is the only control stopping a file read, so the file-access defence is one layer
   deep, not two. A tripwire test fails if a future bump makes the layer real. *Re-check on every duckdb
   bump.*
@@ -133,7 +143,7 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   three-deep, no SSRF (ABI/RPC hosts are fixed constants), no file-read via `/sql`. Fixed: `/nest`
   webhook-URL disclosure, `/sql` error path-scrub, `screen_status` quote-escape, constant-time admin
   token, concurrent webhook delivery. Re-run per release on the diff.*
-- [ ] 🟡 Bind/exposure defaults are safe. - *`dev` binds `127.0.0.1` by default; off-localhost it warns
+- [ ] 🟡 Bind/exposure defaults are safe. - *`dev` binds `127.0.0.1` by default; off-localhost it warns  **[#292]**
   loudly that the data surface has NO auth (the gateway's job). Confirmed by the review; the one control
   a fronting gateway must enforce is auth on **every** route, not just `/_admin`.*
 - [ ] ✅ Dependency vulnerability scan (`cargo deny`) wired into CI. - *`deny` job runs advisories +
@@ -149,7 +159,7 @@ Called out separately because it's the headline promise and the current gate onl
 case.
 
 - [ ] ✅ Single nest, backfill, single chain: measured ~37 MB, gated at 256 MB.
-- [ ] ✅ Multiple nests co-located in one roost at tip, sustained, measured against 2 GB.
+- [ ] ✅ Multiple nests co-located in one runtime at tip, sustained, measured against 2 GB.
   **8 nests on one Arbitrum cursor** (2026-07-29): at tip, mean RSS **84 MB**, peak **89 MB** against
   the 2048 MB per-cursor budget - **4%**. Backfill peaked at **154 MB**, the more demanding phase.
   Adding a nest costs far less than the first one does: the cursor's RPC buffers and decode machinery
@@ -159,7 +169,7 @@ case.
   **workload**. Those 8 nests were small and at tip; a *single* nest doing a 125M-block backfill on
   the same budget reached 427 MB by itself. Per-nest RSS is dominated by what a nest is *doing*, not
   by how many share a cursor - so read this as "co-tenancy is cheap", never as "a cursor uses 84 MB".
-- [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store
+- [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
   churn).
 - [ ] ✅ Long-running soak (23h) with no RSS creep (leak check).
   **Two nests on the Lodestar prod box, 0.7.2, 2026-07-29 → 30.** Final RSS **459 MB** and **427 MB**
@@ -181,35 +191,34 @@ case.
 - [ ] ✅ `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --locked` on every
   PR + main.
 - [ ] ✅ Release binary builds `--locked`; footprint gate runs against the built artifact.
-- [ ] ✅ e2e harness exists (`TapeSource`) and covers solo, reorg, crash-safety, roost parity.
-- [ ] 🟡 MSRV is honest. - *`Cargo.toml` declares `rust-version = 1.85`, but CI pins the toolchain to
-  `1.95.0`. Either test against 1.85 in CI or bump the declared MSRV; right now the claim is
-  unverified. The declared MSRV is not cosmetic: it silently selected DataFusion 48 over 54 during the
+- [ ] ✅ e2e harness exists (`TapeSource`) and covers solo, reorg, crash-safety, multi-nest parity.
+- [ ] ✅ MSRV is honest. - *Fixed at 1.0: `Cargo.toml` now declares `rust-version = "1.95"`, matching
+  `rust-toolchain.toml`'s pinned `1.95.0`, so the declared floor is the one that is actually tested. The declared MSRV is not cosmetic: it silently selected DataFusion 48 over 54 during the
   RFC-0013 spike, and cargo reports that as a one-line warning nobody reads.*
-- [ ] 🟡 Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup, subscribe) with
+- [ ] 🟡 Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup, subscribe) with  **[#304]**
   the RFC-0016 eval harness. - *S1 eval harness gates the semantic-layer work; wire it in.*
-- [ ] 🟡 `--offline` / no-network test path proving AI features degrade gracefully.
+- [ ] 🟡 `--offline` / no-network test path proving AI features degrade gracefully.  **[#304]**
 
 ## 7. Operability & observability
 
 - [ ] ✅ Metrics surface exists (`metrics.rs`), **including per-nest series** - `{nest="…"}`-labelled
-  `nuthatch_nest_*` plus `nuthatch_cursor_live{chain}` (RFC-0026), so a co-tenant roost is attributable
+  `nuthatch_nest_*` plus `nuthatch_cursor_live{chain}` (RFC-0026), so a co-tenant runtime is attributable
   per nest rather than only process-globally. *(This closes the old SEC-9 gap.)*
 - [ ] ✅ Health/readiness endpoint suitable for a supervisor. - *0.5.x: `/health` = liveness (plain
   `200 "ok"`); `/ready` = readiness - JSON with tip / last_block / lag / sealed_through / last-poll age,
   `200` when fresh and **`503` when stalled** (no successful source poll within 90 s ⇒ every RPC endpoint
   down). A just-started node gets grace (never-polled ≠ stalled). **0.6.x (RFC-0026):** `/ready` is now
-  also mounted at the **roost root** - `200` only when every cursor and nest is indexing, `503` naming
+  also mounted at the **runtime root** - `200` only when every cursor and nest is indexing, `503` naming
   what is quarantined - with per-nest `/<name>/ready` answering for that nest alone. Route traffic on
   the per-nest one and page on the root; wiring a load balancer to the root means one sick nest evicts
   every healthy sibling.*
-- [ ] 🟡 Structured logs at a sane default level; a clear "we are behind / we are at tip" signal.
+- [ ] 🟡 Structured logs at a sane default level; a clear "we are behind / we are at tip" signal.  **[#302]**
 - [ ] ✅ Documented restart/recovery runbook and a backup/restore story for the redb hot store +
   sealed segments. - *[operators.md](operators.md) carries the failure model, the symptom→action
   runbook, backup/restore, and a go-live checklist (2026-07-28).*
 - [ ] ✅ SSE **push** for live status - `/_admin/events`. *(This entry outlived its fix; it was shipped
   and sat here marked ⛔ regardless, which is how a checklist stops being trusted.)*
-- [ ] 🟡 Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.
+- [ ] 🟡 Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.  **[#302]**
 
 ## 8. Release engineering
 
@@ -246,18 +255,19 @@ case.
 - [ ] ✅ MCP server compiled into the binary (`mcp.rs`), works offline against the local instance.
 - [ ] ✅ `init` scaffolds schema + views + handlers + tests from the ABI.
 - [ ] ✅ Ships `llms.txt` / docs-as-MCP / `.claude/skills/` in scaffolded projects.
-- [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,
+- [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#304]**
   `explain`) - *in design, measure-first, not shipped.*
-- [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *in design.*
+- [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *in design.*  **[#353]**
 
 ## 10. Docs & first-run UX
 
 - [ ] ✅ `<2 minute` first-indexed-query demo path (`init → dev → sql`).
 - [ ] ✅ Terminal-native query REPL (`nuthatch sql`). *(RFC-0015 slice 1)*
 - [ ] ✅ Operator docs, factory docs, benchmark docs present.
-- [ ] 🟡 A single "here's how you run this in production, unattended" guide that ties together
-  §7 (ops), §4 (safe exposure), and §8 (upgrades). - *This checklist's operational cousin; write it
-  when the 🟡s above go green.*
+- [ ] ✅ A single "here's how you run this in production, unattended" guide that ties together
+  §7 (ops), §4 (safe exposure), and §8 (upgrades). - *[`operators.md`](operators.md) is it: deploy
+  recipes, the division of labour, capacity, what to scrape, what to back up, the stability contract,
+  upgrade notes, known gaps, and a go-live checklist. Written against 2.0.0.*
 
 ---
 
@@ -296,13 +306,13 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
   segments at 2M/8M/20M rows, each size in both engine orders to defeat the page-cache confound.
   **DataFusion is 1.6-2.7x slower and the gap widens with size**, at exact result parity. RFC-0013 §5;
   artifact in `docs/bench/rfc-0013-datafusion-gate.json`.*
-- [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4. **The gate
+- [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4. **The gate  **[#279]**
   said no for 1.0** - DuckDB stays in both modes. Reopen if a DataFusion release closes the aggregate
   gap, or if a scaled-mode query genuinely needs one plan spanning Postgres hot and Parquet cold,
   which is the case DuckDB cannot serve and the real point of §2.*
-- [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike
+- [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike  **[#279]**
   already showed parity on the fold that matters.*
-- [ ] ⛔ A multi-machine run. - *Everything above is verified on one host: several processes and
+- [ ] ⛔ A multi-machine run. - *Everything above is verified on one host: several processes and  **[#281]**
   connections against one database, which is what two machines are from the data's point of view for
   every invariant tested. It is **not** a substitute for real network partitions or clock skew, and
   the RFC always said scale validation happens on operator infra.*
@@ -311,11 +321,11 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
 
 Almost everything un-buildable-on-a-laptop traces to one missing box.
 
-- [ ] ⛔ **Colocated reth node** (full for tip, archive for deep backfill/traces). - *Provisioning +
+- [ ] ⛔ **Colocated reth node** (full for tip, archive for deep backfill/traces). - *Provisioning +  **[#276]**
   days of sync; hardware/ops, not code. Gates the two below.*
-- [ ] ⛔ ExEx tip mode wired to a real node; `nuthatch-node` binary; honest tip-latency number. *(0003;
+- [ ] ⛔ ExEx tip mode wired to a real node; `nuthatch-node` binary; honest tip-latency number. *(0003;  **[#276]**
   groundwork in, **blocked on** the node.)*
-- [ ] ⛔ Firehose-class extraction (traces + state diffs), own-node/ExEx only. *(0014; **blocked on**
+- [ ] ⛔ Firehose-class extraction (traces + state diffs), own-node/ExEx only. *(0014; **blocked on**  **[#277]**
   0003.)* - *One node-independent slice is buildable now and forward-compatible: the calldata decoder,
   `[extract]` config, `traces`/`state_diffs` schemas, and the unbounded-volume guard.*
 
@@ -325,7 +335,7 @@ Almost everything un-buildable-on-a-laptop traces to one missing box.
 
 **Embedded, single-chain, single-nest:** the core (§0-§2, §6) is genuinely strong - this is the
 column that can go to `1.0` first. The honest gaps before you'd point a stranger's workload at it
-unattended are the operational and load ones. Several have since closed - the **dense-roost RAM proof**
+unattended are the operational and load ones. Several have since closed - the **dense-runtime RAM proof**
 (§5, measured at 4% of budget), **provider-failure resilience** (§2, RFC-0028), **safe-exposure
 defaults** (§4) and the **unattended-operation runbook** (§7, §10) are done. What is left is time-based
 rather than build-based: a **24h+ soak** for RSS creep and a **sustained parity run** (§1). Neither can

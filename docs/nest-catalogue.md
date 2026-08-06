@@ -294,8 +294,11 @@ Real demand but narrower, more complex, or blocked on capabilities nuthatch hasn
   until those land. When a candidate needs them, that's a Tier-3-or-later signal, not a "make it work
   somehow."
 - **This dovetails with the Horizon nest work.** RFC-0002 (`horizon-nest`) and the Lodestar migration
-  (RFC-0011) already prove the "publish a real nest" path; this catalogue is the demand-ranked backlog of
-  *which nests come next*.
+  (RFC-0011) already prove the "publish a real nest" path; this catalogue is the demand-ranked list of
+  *which nests come next*. It ranks **content**, not engineering work: when a nest here is actually
+  picked up, it becomes an issue like anything else, and the
+  [issue queue](https://github.com/nightswatchhq/nuthatch/issues) stays the single source of truth for
+  what is being built.
 
 ---
 

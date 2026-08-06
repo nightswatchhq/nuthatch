@@ -11,7 +11,9 @@ still honestly unfinished.
 
 **Companions:** [`prod-readiness.md`](prod-readiness.md) is the *release* gate - what must be true
 before a build ships. This document is the *run* guide - what must be true in your environment.
-[`backlog.md`](backlog.md) and the [RFC index](rfcs/README.md) say what is deferred and why.
+What is deferred and why lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
+(the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
+explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
 Written against **2.0.0** (2026-08-06). Read [Known gaps](#known-gaps) before exposing `/sql`.
 
@@ -490,8 +492,18 @@ refusal rather than a warning because the endpoint decides what an entire fleet 
 authenticated** - the guards below bound *how much*, never *who*. Off-localhost binds log a loud
 warning at startup. Put TLS and authentication in front, always.
 
+**A public nest without an allowlist is an open query engine.** Said plainly because it is the single
+decision that matters here: `sql = "open"` is the default and it is the right default for a local
+`nuthatch dev`, where exploration is the point - but on an endpoint strangers can reach, it means
+anyone may run arbitrary analytical SQL over your disk, bounded only by the guards below. If that is
+not what you want, set `sql = "allowlist"` on the mount and declare the queries it answers, or
+`sql = "deny"` to close SQL entirely while the typed routes keep serving. See
+[Bounding what a mount will answer](https://nuthatch-indexer.com/docs/operate/security/#bounding-what-a-mount-will-answer).
+
 **Query guards** - node self-protection against a single runaway query or a burst, not per-caller
-quotas (that needs identity a single-tenant node does not have):
+quotas (that needs identity a single-tenant node does not have). They bound *how much* one query
+costs; they say nothing about *which* queries a nest is willing to answer, which is the allowlist's
+job:
 
 | Guard | Default | What it bounds |
 |---|---|---|
@@ -867,7 +879,20 @@ Additive in the same release, so nothing to do: `provenance` now carries `nid`, 
 answered rather than only how it decoded - which matters once early cutoff lets a result legitimately
 come from data a different identity produced.
 
-### The order
+### A single nest has nothing to migrate
+
+If the service runs `nuthatch dev --dir <nest>` against a directory holding a `nuthatch.toml`, the
+upgrade is a **binary swap**: stop, swap, start. The layout change is to *runtime* directories, and a
+solo nest does not have one. `nuthatch migrate` is for a directory containing a **`roost.toml`**; no
+such file, nothing to run.
+
+Verified on the Lodestar box: two solo nests upgraded 1.0.2 → 2.0.0 by binary swap, every table's row
+count identical before and after (422 and 3,491 rows), both back at tip within seconds, no migration
+invoked. Before the swap, 2.0.0 was pointed read-only at a copy of one nest's on-disk data and counted
+byte-identical rows at a common block ceiling - so the compatibility was measured on real data, not
+assumed from the version number.
+
+### The order, for a runtime directory
 
 1. `nuthatch migrate --dir <copy> --dry-run` against a copy. Read the plan.
 2. Stop the service. The migration wants no writer.

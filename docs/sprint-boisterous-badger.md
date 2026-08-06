@@ -1,4 +1,13 @@
-# Sprint: boisterous-badger (2026-07-30 - )
+# Sprint: boisterous-badger (2026-07-30 - 2026-08-06) - **closed**
+
+> Closed 2026-08-06 by the **2.0.0 release**. The road-to-1.0 plan below was overtaken: 1.0 shipped
+> on 2026-08-04 and the August architecture session then produced RFCs 0032-0035, which became 2.0 -
+> tenancy in the runtime, nest identity and grafting, the query allowlist, and one deliberate
+> migration. The quality track survives as issues #287-#309; **those issues are the live state, this
+> file is the record of what was planned.**
+>
+> Read it for *why*, never for *what is left*. The queue answers that:
+> [open issues](https://github.com/nightswatchhq/nuthatch/issues).
 
 Successor to [amiable-axolotl](sprint-amiable-axolotl.md), which closed with RFC-0022 built, released
 (0.8.0/0.8.1), verified on a real box, and documented. Companion to [backlog.md](backlog.md) and
