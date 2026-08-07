@@ -1923,7 +1923,12 @@ pub async fn backfill_direct(
     // Adaptively size the getLogs range around the target response budget (RFC-0004 §2), starting
     // from the chain's default window - so dense and sparse ranges self-tune and provider result
     // caps are handled by shrink-and-retry rather than a hard failure.
-    let mut chunker = AdaptiveWindow::for_window(window);
+    // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
+    let mut chunker = if registry.blocks() {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    };
     while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
         let logs = match source.logs(addresses, topic0s, next, chunk_to).await {
@@ -1968,6 +1973,33 @@ pub async fn backfill_direct(
             buf.push((r.block_number, r.to_json().to_string()));
             total += 1;
         }
+
+        // RFC-0036 §4.2: one row per block in the window, for a nest that declares `[extract] blocks`.
+        //
+        // Enumerated from the **window** rather than from `rows`, which is the whole point: `rows` only
+        // covers blocks that emitted a matching log, and a blocks table must cover blocks that emitted
+        // nothing. OBIB case 3 is 100,001 blocks of early mainnet with no contract in the nest at all -
+        // derive it from logs and you get zero rows and a green run.
+        if registry.blocks() {
+            let want: Vec<u64> = (next..=chunk_to).collect();
+            let headers = source.block_headers(&want).await?;
+            let mut block_rows: Vec<_> = want
+                .iter()
+                .filter_map(|b| {
+                    headers
+                        .get(b)
+                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                })
+                .collect();
+            // Same canonical ordering rule as above: segment bytes, and therefore the content
+            // address, depend on row order.
+            block_rows.sort_by_key(|r| r.block_number);
+            for r in &block_rows {
+                buf.push((r.block_number, r.to_json().to_string()));
+                total += 1;
+            }
+        }
+
         next = chunk_to + 1;
 
         // Flush on a data-determined boundary (RFC-0028 §4), not on the fetch window's end.
@@ -2227,7 +2259,14 @@ pub async fn backfill_direct_pipelined(
     // be `Send`. The generator and the consumer loop are in fact on the same task, so there is never
     // contention - but the compiler cannot know that, and one uncontended lock per window is free
     // beside an RPC round trip.
-    let chunker = std::sync::Arc::new(std::sync::Mutex::new(AdaptiveWindow::for_window(window)));
+    // A blocks nest pays one header request per *block*, so its window ceiling is set by header cost
+    // rather than log density (RFC-0036). Without this the zero-log ranges grow widest and demand the
+    // most headers - which is how OBIB case 3 rate-limited itself into partial responses.
+    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if registry.blocks() {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    }));
     // The generator *owns* a handle rather than borrowing one. Borrowing across the generator's await
     // makes the whole backfill future carry a higher-ranked lifetime that `tokio::spawn` cannot
     // satisfy - which shows up far from here, as a "one type is more general than the other" error on
@@ -2289,13 +2328,40 @@ pub async fn backfill_direct_pipelined(
             rows.sort_by_key(|r| (r.block_number, r.log_index));
             // Carry each row's block so the consumer can seal on a data-determined boundary
             // (RFC-0028 §4) instead of at whichever window filled the buffer.
-            let json: Vec<(u64, String)> = rows
+            let mut json: Vec<(u64, String)> = rows
                 .iter_mut()
                 .map(|r| {
                     r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
                     (r.block_number, r.to_json().to_string())
                 })
                 .collect();
+            // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
+            // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
+            // is 100,001 blocks with no contract in the nest at all.
+            if registry.blocks() {
+                let want: Vec<u64> = (w_from..=w_to).collect();
+                let headers = retry_transient(
+                    &format!("seal-direct block_headers {w_from}..={w_to}"),
+                    BACKFILL_RETRY_ATTEMPTS,
+                    BACKFILL_RETRY_BASE,
+                    || source.block_headers(&want),
+                )
+                .await?;
+                let mut block_rows: Vec<_> = want
+                    .iter()
+                    .filter_map(|b| {
+                        headers
+                            .get(b)
+                            .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                    })
+                    .collect();
+                block_rows.sort_by_key(|r| r.block_number);
+                json.extend(
+                    block_rows
+                        .iter()
+                        .map(|r| (r.block_number, r.to_json().to_string())),
+                );
+            }
             Ok::<(u64, u64, Vec<(u64, String)>), anyhow::Error>((w_to, fetched, json))
         })
         .buffered(concurrency.max(1));
@@ -2371,7 +2437,12 @@ pub async fn backfill_direct_factory(
     let mut next = from;
     let mut total = 0u64;
     let mut flipped_logged = false;
-    let mut chunker = AdaptiveWindow::for_window(window);
+    // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
+    let mut chunker = if registry.blocks() {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    };
     while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
 

@@ -37,6 +37,16 @@ pub trait Source: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Full block headers for the given blocks (RFC-0036 §4.2), for a nest with `[extract] blocks`.
+    ///
+    /// Default: none, which means a source that cannot answer produces **no block rows** rather than
+    /// empty ones. That asymmetry with `block_timestamps` is deliberate: a missing timestamp leaves a
+    /// column unset on a row that still exists, while a missing header would be a missing *row* - and
+    /// a gap in a blocks table is indistinguishable from "the chain had no block there".
+    async fn block_headers(&self, _blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        Ok(HashMap::new())
+    }
+
     /// Forget any cached per-block data above `block`, because the chain reorganised there.
     ///
     /// Default: nothing to forget. A source that caches anything keyed by **block number** must
@@ -81,6 +91,10 @@ impl Source for RpcClient {
 
     async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         RpcClient::block_timestamps(self, blocks).await
+    }
+
+    async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        RpcClient::block_headers(self, blocks).await
     }
 
     async fn logs(
