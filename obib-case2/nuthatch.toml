@@ -1,0 +1,21 @@
+[nest]
+name = "obib-case2"
+chain = "mainnet"
+chain_id = 1
+# Keyless defaults. The published number was measured against an Alchemy endpoint passed on the
+# command line (`--rpc "$RPC"`), which is what OBIB's own methodology uses - never put a key in here,
+# this file is meant to be committed.
+rpc_urls = [
+    "https://eth-pokt.nodies.app",
+    "https://eth.drpc.org",
+    "https://eth.api.onfinality.io/public",
+]
+schema_version = 2
+block_timestamps = false
+
+[[contracts]]
+alias = "lbtc"
+address = "0x8236a87084f8b84306f72007f36f2618a5634494"
+start_block = 19888667
+abi = "abis/lbtc.json"
+events = ["Transfer"]
