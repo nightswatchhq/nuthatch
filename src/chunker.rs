@@ -15,6 +15,10 @@ pub const TARGET_LOGS_PER_RESPONSE: u64 = 2_000;
 pub const MIN_WINDOW: u64 = 1;
 pub const MAX_WINDOW: u64 = 100_000;
 
+/// Window ceiling for a nest that fetches a header per block (RFC-0036). Four batches of
+/// `MAX_TIMESTAMP_BATCH` (200), so one window is one fan-out wave rather than a hundred.
+pub const HEADER_WINDOW_CAP: u64 = 800;
+
 /// A block-window controller that converges on `target` logs per response.
 #[derive(Debug, Clone)]
 pub struct AdaptiveWindow {
@@ -38,6 +42,29 @@ impl AdaptiveWindow {
     /// A sensible controller for a chain whose default window is `initial`.
     pub fn for_window(initial: u64) -> Self {
         Self::new(initial, TARGET_LOGS_PER_RESPONSE, MIN_WINDOW, MAX_WINDOW)
+    }
+
+    /// The controller for a nest that also fetches **one header per block** (RFC-0036 `[extract]
+    /// blocks`), which changes what a window costs.
+    ///
+    /// The ordinary controller sizes on *logs per response*, so a range with no matching logs grows to
+    /// [`MAX_WINDOW`]. For a blocks nest that is exactly backwards: headers cost one request per block
+    /// regardless of logs, so the emptiest ranges grow the window widest and then demand the most
+    /// header requests. Measured on OBIB case 3 (blocks 0-100,000, no contracts, so *every* window is
+    /// zero-log): the window reached 20,480, which at 200 blocks per batch is 102 batches for one
+    /// window, times the window fan-out - and the provider rate-limited into partial responses.
+    ///
+    /// Narrowing cannot fix it, and that is the point: `batch_is_narrowable` deliberately refuses to
+    /// split under a rate limit, because splitting doubles the request count in the wrong direction.
+    /// The answer is *fewer* requests, not smaller ones, so the ceiling is lowered rather than the
+    /// batch. `HEADER_WINDOW_CAP` keeps one window to a handful of header batches.
+    pub fn for_window_with_headers(initial: u64) -> Self {
+        Self::new(
+            initial.min(HEADER_WINDOW_CAP),
+            TARGET_LOGS_PER_RESPONSE,
+            MIN_WINDOW,
+            HEADER_WINDOW_CAP,
+        )
     }
 
     /// The block span to request next.

@@ -173,6 +173,9 @@ pub struct Column {
 pub enum TableKind {
     #[default]
     Event,
+    /// One row per block, from the header (RFC-0036). Has no topic0, no selector and no ABI: it is
+    /// the first table whose source is the chain itself rather than something a contract emitted.
+    Block,
     /// A decoded contract call, keyed by 4-byte function selector (RFC-0014).
     Call,
     /// Raw storage writes (RFC-0014).
@@ -184,6 +187,24 @@ impl TableKind {
         matches!(self, TableKind::Event)
     }
 }
+
+/// The `blocks` table (RFC-0036 §4.2). Declared once, here, and used by both the schema and the row
+/// builder - two places that must agree on every name and order, and would drift if each held its own
+/// list. `number`/`hash`/`timestamp` are deliberately **not** repeated as columns: they arrive as the
+/// implicit `block_number`/`block_hash`/`block_timestamp` every row already carries.
+pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
+    ("parent_hash", "bytes32", StorageKind::FixedBytes),
+    ("miner", "address", StorageKind::Address),
+    ("gas_used", "uint64", StorageKind::U64),
+    ("gas_limit", "uint64", StorageKind::U64),
+    ("base_fee_per_gas", "uint64", StorageKind::U64),
+    ("size", "uint64", StorageKind::U64),
+    ("transaction_count", "uint64", StorageKind::U64),
+];
+
+/// The table name for [`BLOCK_COLUMNS`]. Unprefixed by an alias, because a block belongs to the chain
+/// rather than to any one contract in the nest.
+pub const BLOCKS_TABLE: &str = "blocks";
 
 /// A serializable table schema (per-event table + its columns).
 ///
@@ -339,6 +360,75 @@ impl EventDecoder {
     }
 }
 
+/// Build the `blocks` row for one header (RFC-0036 §4.2). `None` when the header is missing the
+/// fields that identify it, which the caller turns into a refused window rather than a gap.
+///
+/// **Row identity, stated because a silent convention in the key encoding is how COR-6 happened.**
+/// The hot store keys on `(block, log_index)` and every row carries `tx_hash`/`address`. A block has
+/// none of the three, so: `log_index` is 0 (one row per block makes it unique by construction),
+/// `tx_hash` is the block's own hash, and `address` is empty. The alternative - reshaping the key for
+/// one table - would touch the storage layer this design exists to leave alone.
+pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<DecodedRow> {
+    let hex = |k: &str| -> u64 {
+        header
+            .get(k)
+            .and_then(Json::as_str)
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    };
+    // A 20-byte address arrives as `0x`-prefixed hex; anything else (a `null` `miner` on some
+    // endpoints) becomes the zero address rather than failing the whole window.
+    let addr = |k: &str| -> Value {
+        let raw = header.get(k).and_then(Json::as_str).unwrap_or_default();
+        let mut out = [0u8; 20];
+        if let Ok(bytes) = hex::decode(raw.trim_start_matches("0x")) {
+            if bytes.len() == 20 {
+                out.copy_from_slice(&bytes);
+            }
+        }
+        Value::Address(out)
+    };
+    // `bytes32` is `StorageKind::FixedBytes`, whose value is `Value::Bytes` - matching what an
+    // ordinary bytes32 event param produces, so `parent_hash` is not a special case downstream.
+    let fixed_bytes = |k: &str| -> Value {
+        let raw = header.get(k).and_then(Json::as_str).unwrap_or_default();
+        Value::Bytes(hex::decode(raw.trim_start_matches("0x")).unwrap_or_default())
+    };
+    let hash = header.get("hash").and_then(Json::as_str)?.to_string();
+    let tx_count = header
+        .get("transactions")
+        .and_then(Json::as_array)
+        .map(|a| a.len() as u64)
+        // `[block, false]` returns transaction *hashes*; an endpoint that omits the array entirely
+        // yields 0 rather than a wrong count, and the column says `transaction_count` not `has_txs`.
+        .unwrap_or(0);
+    let params = vec![
+        ("parent_hash".to_string(), fixed_bytes("parentHash")),
+        ("miner".to_string(), addr("miner")),
+        ("gas_used".to_string(), Value::U64(hex("gasUsed"))),
+        ("gas_limit".to_string(), Value::U64(hex("gasLimit"))),
+        // Pre-EIP-1559 blocks have no base fee at all; 0 is the honest value for "the field did not
+        // exist yet", and OBIB case 3 covers blocks 0-100,000, which are all pre-London.
+        (
+            "base_fee_per_gas".to_string(),
+            Value::U64(hex("baseFeePerGas")),
+        ),
+        ("size".to_string(), Value::U64(hex("size"))),
+        ("transaction_count".to_string(), Value::U64(tx_count)),
+    ];
+    Some(DecodedRow {
+        table: BLOCKS_TABLE.to_string(),
+        params,
+        block_number: number,
+        block_hash: hash.clone(),
+        block_timestamp: hex("timestamp"),
+        timestamps,
+        log_index: 0,
+        tx_hash: hash,
+        address: String::new(),
+    })
+}
+
 /// One decoded log row.
 #[derive(Debug, Clone)]
 pub struct DecodedRow {
@@ -475,6 +565,15 @@ pub struct DecodeRegistry {
     /// into it would invalidate the snapshots of every existing nest to describe something the
     /// content-addressed segment bytes already distinguish.
     timestamps: bool,
+    /// Whether this nest declares `[extract] blocks` (RFC-0036). Lives here for the same reason
+    /// `timestamps` does: the registry is the single source of truth for a nest's table set, and a
+    /// second place that decides which tables exist is a second place that can disagree.
+    ///
+    /// Also **not** folded into [`DecodeRegistry::hash`] - for the same reason as `timestamps`. The
+    /// hash versions *decode behaviour* and is stamped into every segment's `registry_snapshot`;
+    /// mixing a table-set flag into it would invalidate every existing nest's snapshots to describe
+    /// something the content-addressed segment bytes already distinguish.
+    blocks: bool,
 }
 
 impl DecodeRegistry {
@@ -511,12 +610,25 @@ impl DecodeRegistry {
             });
         }
         Ok(Self::build_with_templates(specs, templates)?
-            .with_timestamps(config.nest.block_timestamps))
+            .with_timestamps(config.nest.block_timestamps)
+            .with_blocks(config.extract.blocks))
     }
 
     /// Set whether decoded rows carry `block_timestamp`. Defaults to `true`; `from_nest` applies the
     /// nest's declaration. Kept as a builder rather than a `build_with_templates` parameter so the
     /// dozens of test and tool call sites that don't care keep the behaviour they had.
+    /// Declare the `blocks` table (RFC-0036 §4.2). Builder-style beside `with_timestamps` because
+    /// both answer "what tables does this nest have" and are set from the same config load.
+    pub fn with_blocks(mut self, blocks: bool) -> DecodeRegistry {
+        self.blocks = blocks;
+        self
+    }
+
+    /// Does this nest declare a `blocks` table?
+    pub fn blocks(&self) -> bool {
+        self.blocks
+    }
+
     pub fn with_timestamps(mut self, timestamps: bool) -> DecodeRegistry {
         self.timestamps = timestamps;
         self
@@ -606,6 +718,7 @@ impl DecodeRegistry {
             hash,
             skipped_anonymous,
             timestamps: true,
+            blocks: false,
         })
     }
 
@@ -664,7 +777,8 @@ impl DecodeRegistry {
     /// A serializable schema of every table - the single source of truth for `/tables`, the MCP
     /// `schema`/`tables` tools, `llms.txt`, and the nest's `schema.json`.
     pub fn schema(&self) -> Vec<TableSchema> {
-        self.tables()
+        let mut out: Vec<TableSchema> = self
+            .tables()
             .iter()
             .map(|d| {
                 let mut columns = implicit_columns(self.timestamps);
@@ -685,7 +799,30 @@ impl DecodeRegistry {
                     columns,
                 }
             })
-            .collect()
+            .collect();
+        if self.blocks {
+            let mut columns = implicit_columns(self.timestamps);
+            columns.extend(BLOCK_COLUMNS.iter().map(|(name, sol, kind)| ColumnSchema {
+                name: (*name).to_string(),
+                sol_type: (*sol).to_string(),
+                storage: kind.as_str().to_string(),
+                indexed: false,
+            }));
+            out.push(TableSchema {
+                table: BLOCKS_TABLE.to_string(),
+                // No contract owns it, and an empty alias would read as "unset" rather than
+                // "deliberately none", so it names the chain layer it comes from.
+                alias: "chain".to_string(),
+                kind: TableKind::Block,
+                event: String::new(),
+                topic0: String::new(),
+                function: String::new(),
+                selector: String::new(),
+                columns,
+            });
+            out.sort_by(|a, b| a.table.cmp(&b.table));
+        }
+        out
     }
 
     /// Decode a log against the contract decoders. Returns None if no decoder matches (topic0 +

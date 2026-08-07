@@ -136,10 +136,36 @@ Sentio, which is also going over RPC.
 
 | # | Slice | Acceptance |
 |---|---|---|
-| 1 | Split the `[extract]` refusal so `traces`/`state` still refuse and `blocks`/`transactions` do not. **No config field lands without rows behind it.** | A nest with `traces = true` still refuses, naming the node; the split is covered by a test that fails if either half regresses |
-| 2 | `blocks` table from the existing header batch, with the row-identity convention of §4.2 | OBIB case 3 range yields exactly **100,001** rows; `nuthatch sql` reads them; published as `docs/bench/obib-case3.json` |
+| 1 | ~~Split the `[extract]` refusal~~ **Done** (PR #360). Turned out to be free: `Extract::enabled()` was already exactly `traces \|\| state`, so adding `blocks` beside them without touching it gives the right behaviour. | Met |
+| 2 | `blocks` table from the existing header batch, with the row-identity convention of §4.2 | **Built, NOT met.** Blocks 0-2,000 yields exactly 2,001 rows and reads via `nuthatch sql`. The stated criterion - 100,001 rows over OBIB's range - **has never been achieved**, so this slice is open. See §5.1 |
 | 3 | `transactions` table from full bodies, inside `scope_check`, with a loud pre-backfill estimate | OBIB case 4 range yields exactly **1,696,641** rows (inclusive end block) and **493,181** unique senders / **315,861** unique recipients, matching Envio's published aggregates |
 | 4 | Round-trip economics: measure, then decide whether receipts and a concurrent header fan-out are worth it | A number, and a decision recorded either way |
+
+### 5.1 Why slice 2's criterion is unmet, and what is left
+
+Not a design problem, as far as the evidence goes: a paced full-range run.
+
+Case 3 is **100,001 individual `eth_getBlockByNumber` calls** by definition. Proving it consumed a
+meaningful share of the project's provider quota - the full range was run six times in twenty minutes
+while debugging, each attempt issuing tens of thousands of requests before failing, and until the
+classifier fix below it was *splitting batches under a rate limit* and multiplying them further. The
+provider noticed and said so.
+
+Three defects were found and fixed on the way, all of which would have surfaced identically on a
+2,000-block range that completes in 1.2 seconds:
+
+1. **Per-item 429s inside an HTTP 200 batch were invisible** to the failure classifier, reported as
+   *"800/800 header(s) missing"* - the symptom, not the cause.
+2. **`classify_rpc_error` never read the JSON-RPC `code`**, so a body-level 429 classified `Transient`,
+   which is narrowable, so the batch was **split** - doubling requests against a per-second limit.
+   Both of these also affect `block_timestamps`, so they are older than this RFC.
+3. **The window ceiling was sized on logs**, so a zero-log range grew widest and demanded the most
+   headers - backwards for this workload (§4.4's prediction, arriving early).
+
+**The lesson, recorded because it is the expensive one:** validate a per-block workload on a *small*
+range first. The mechanism is identical at 2,000 blocks and at 100,001; only the bill differs. This
+RFC predicted "expect the first measurement to be bad and to be informative" and was right about both,
+but the informative part cost far more than it needed to.
 
 ## 6. Non-goals
 
@@ -152,7 +178,7 @@ Sentio, which is also going over RPC.
 
 ## 7. Status
 
-Draft. Written after reading the code rather than before: §3's coupling table is measured, and it is
+Draft, **slice 1 done and slice 2 built but unverified** (PR #360). Written after reading the code rather than before: §3's coupling table is measured, and it is
 what makes this a slice instead of a refactor. Slice 1 is a precondition, not a feature - it should not
 ship on its own, because a config key that parses and produces nothing is the defect issue #262 spent a
 release being.

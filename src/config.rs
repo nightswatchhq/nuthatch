@@ -216,6 +216,16 @@ pub struct Flags {
 /// it. `unbounded = true` is the deliberate opt-out, and has to be typed by a human.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Extract {
+    /// Emit a row per **block**: header fields, one row per block, queryable (RFC-0036 §4.2).
+    ///
+    /// Unlike `traces`/`state` this is **sourceable from ordinary RPC** - `eth_getBlockByNumber` is
+    /// already called for every window when `[nest] block_timestamps = true`, and this keeps the rest
+    /// of the header instead of reading `timestamp` and discarding it. So it deliberately does **not**
+    /// count towards [`Extract::enabled`], which is the node-gated pair and the startup refusal.
+    ///
+    /// Bounded by construction: exactly one row per block, so no volume guard applies.
+    #[serde(default)]
+    pub blocks: bool,
     /// Emit a row per **call** (top-level and internal), calldata decoded by 4-byte selector.
     #[serde(default)]
     pub traces: bool,
@@ -238,16 +248,26 @@ pub struct Extract {
 
 impl Extract {
     pub fn is_empty(&self) -> bool {
-        !self.traces
+        !self.blocks
+            && !self.traces
             && !self.state
             && self.contracts.is_empty()
             && self.selectors.is_empty()
             && !self.unbounded
     }
 
-    /// Is any extraction surface actually switched on?
+    /// Is any **node-gated** extraction surface switched on? This is the startup-refusal predicate,
+    /// so `blocks` is deliberately absent: it comes from ordinary RPC (RFC-0036 §1), and refusing a
+    /// nest for asking for something we can actually serve would be the wrong half of RFC-0014's
+    /// bundling mistake.
     pub fn enabled(&self) -> bool {
         self.traces || self.state
+    }
+
+    /// Is any surface at all switched on, node-gated or not? For "does this nest want extraction work
+    /// scheduled", as distinct from "must this nest be refused".
+    pub fn any(&self) -> bool {
+        self.blocks || self.traces || self.state
     }
 
     /// Scoped means "bounded by something the operator named". A selector allowlist bounds traces

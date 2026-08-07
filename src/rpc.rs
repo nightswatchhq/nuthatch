@@ -19,7 +19,7 @@ const MAX_TIMESTAMP_BATCH: usize = 200;
 /// Return type of the self-recursive [`RpcClient::fetch_timestamp_batch`]. Boxed because an `async fn`
 /// cannot recurse into itself without a heap indirection.
 type TimestampBatchFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HashMap<u64, u64>>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HashMap<u64, Value>>> + Send + 'a>>;
 
 /// Return type of the self-recursive [`RpcClient::eth_call_batch_at`]. Boxed because an `async fn`
 /// cannot recurse into itself without a heap indirection.
@@ -296,6 +296,36 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         "project id",
     ];
 
+    // **Rate limits first, and by `code` as well as by message.** A provider may answer HTTP 200 and
+    // put the throttle in the JSON-RPC error body - Alchemy returns `{"code":429,"message":"Your app
+    // has exceeded its compute units per second capacity"}` per *item* inside a batch. Without this
+    // the message matches nothing, falls through to `Transient`, and `batch_is_narrowable` then splits
+    // the batch - doubling the request count against a limit on requests per second, which is the one
+    // response guaranteed to make it worse. Found on OBIB case 3 (RFC-0036) after three wrong
+    // diagnoses; the ordering matters because "limit exceeded" is already in NARROWABLE and would
+    // otherwise claim a message like "compute units limit exceeded" for the splitting path.
+    // Phrasing is per-provider and there is no standard, so this list is evidence rather than
+    // guesswork - each entry is a message we have actually been refused with:
+    //   Alchemy     `{"code":429,  "...exceeded its compute units per second capacity"}`
+    //   Chainstack  `{"code":-32005,"You've exceeded the RPS limit available on the current plan"}`
+    // Note Chainstack sets neither 429 nor any phrase the first version of this list matched, which
+    // is the argument for matching on several spellings rather than one provider's.
+    const RATE_LIMITED: &[&str] = &[
+        "compute units per second",
+        "rate limit",
+        "rate-limit",
+        "rps limit",
+        "requests per second",
+        "too many requests",
+        "exceeded its throughput",
+        "request limit reached",
+    ];
+    // `-32005` is the de-facto "limit exceeded" code (Infura, Chainstack and others); `429` is
+    // Alchemy putting the HTTP status in the body.
+    let code = err.get("code").and_then(Value::as_i64);
+    if matches!(code, Some(429) | Some(-32005)) || RATE_LIMITED.iter().any(|p| msg.contains(p)) {
+        return FailureClass::RateLimited;
+    }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
             suggested: suggested_range(
@@ -901,12 +931,24 @@ impl RpcClient {
             .chunks(MAX_TIMESTAMP_BATCH)
             .map(|c| self.fetch_timestamp_batch(c))
             .collect();
-        let results: Vec<Result<HashMap<u64, u64>>> = futures::stream::iter(futures)
+        let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
             .buffered(TIMESTAMP_FANOUT)
             .collect()
             .await;
+        // The batch returns whole headers (RFC-0036 reuses this path for the `blocks` table); this
+        // caller wants one field. Projecting here rather than widening the cache keeps the cache a
+        // `block -> u64` map: holding headers for `TIMESTAMP_CACHE_MAX` blocks instead would be a
+        // footprint regression on the hot path, against a 2 GB per-cursor budget.
         for r in results {
-            out.extend(r?);
+            for (b, header) in r? {
+                if let Some(ts) = header
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|s| parse_hex_u64(s).ok())
+                {
+                    out.insert(b, ts);
+                }
+            }
         }
         {
             let mut cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
@@ -934,6 +976,92 @@ impl RpcClient {
             );
         }
         Ok(out)
+    }
+
+    /// Full block headers for `blocks` (RFC-0036 §4.2), over the **same** batched, narrowing,
+    /// failover-capable path as [`RpcClient::block_timestamps`].
+    ///
+    /// Deliberately not a second fetcher. That path took three attempts to get right - RFC-0028 gave
+    /// `getLogs` a narrowing retry, RFC-0029 §6h found the timestamp batch still lacked one and was
+    /// reissuing an over-large batch five times at identical width before killing the backfill. A
+    /// parallel header fetcher would have to relearn all of it, and would drift.
+    ///
+    /// Unlike `block_timestamps` this does **not** consult or fill the timestamp cache: headers are
+    /// consumed once, as rows, and caching them would hold `TIMESTAMP_CACHE_MAX` full headers against
+    /// a 2 GB per-cursor budget to serve a read that never repeats.
+    pub async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, Value>> {
+        if blocks.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // **Serial, deliberately.** The two fan-outs compose *multiplicatively* and nothing bounds the
+        // product - RFC-0029 §6h's finding, rediscovered here the hard way. At `--concurrency 8` a
+        // fan-out of 4 means 32 concurrent multi-hundred-block batches sharing one connection pool,
+        // and OBIB case 3 measured that as the provider returning a 429 for every item in a batch.
+        // Serial here leaves the window fan-out as the only multiplier, which is the one the adaptive
+        // controller can see and steer.
+        const HEADER_FANOUT: usize = 1;
+        // Re-ask only for what is missing, with a widening pause between rounds.
+        //
+        // A rate-limited provider answers HTTP 200 with *some* items filled and the rest carrying a
+        // per-item 429, so a partial response is the **normal** shape under load rather than an
+        // anomaly. Failing the batch throws away the headers that did arrive and re-fetches them on
+        // the retry, which costs more of the very budget that ran out. Narrowing is not the answer
+        // either: `batch_is_narrowable` refuses to split under a rate limit because splitting doubles
+        // the request count in exactly the wrong direction.
+        //
+        // So: keep what arrived, pause, ask for the remainder. One header per block is unavoidable
+        // work - 100,001 of them for OBIB case 3 - and pacing is the only lever that helps.
+        const ROUNDS: usize = 8;
+        let mut out: HashMap<u64, Value> = HashMap::new();
+        let mut missing: Vec<u64> = blocks.to_vec();
+        for round in 0..ROUNDS {
+            use futures::stream::StreamExt;
+            let futures: Vec<_> = missing
+                .chunks(MAX_TIMESTAMP_BATCH)
+                .map(|c| self.fetch_timestamp_batch(c))
+                .collect();
+            let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
+                .buffered(HEADER_FANOUT)
+                .collect()
+                .await;
+            let mut last_err = None;
+            for r in results {
+                match r {
+                    Ok(m) => out.extend(m),
+                    // A whole-batch failure is kept and only raised if the rounds run out - the other
+                    // batches in this round may still have made progress worth keeping.
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            missing.retain(|b| !out.contains_key(b));
+            if missing.is_empty() {
+                return Ok(out);
+            }
+            if round + 1 == ROUNDS {
+                if let Some(e) = last_err {
+                    return Err(e.context(format!(
+                        "block_headers: {} of {} header(s) still missing after {ROUNDS} rounds",
+                        missing.len(),
+                        blocks.len()
+                    )));
+                }
+                break;
+            }
+            // Linear rather than exponential: a compute-units-per-second budget refills on a clock, so
+            // waiting longer than the window buys nothing, and the first pause should be short enough
+            // that an isolated blip costs milliseconds.
+            tokio::time::sleep(std::time::Duration::from_millis(250 * (round as u64 + 1))).await;
+        }
+        // Same COR-3 reasoning as `block_timestamps`: a partial map must be an error rather than a
+        // short map. A missing header would seal a *missing block row*, and "no row" is
+        // indistinguishable from "the chain had no block there" to whoever queries the table later.
+        bail!(
+            "block_headers: {}/{} header(s) missing after {ROUNDS} rounds - refusing a partial map \
+             (would seal a gap in the blocks table). The provider is rate-limiting a workload that \
+             needs one header per block; lower --concurrency or use an endpoint with more headroom.",
+            missing.len(),
+            blocks.len()
+        )
     }
 
     /// One bounded `eth_getBlockByNumber` batch → `{block: timestamp}` (may be partial if the endpoint
@@ -976,7 +1104,7 @@ impl RpcClient {
         })
     }
 
-    async fn fetch_timestamp_batch_once(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+    async fn fetch_timestamp_batch_once(&self, blocks: &[u64]) -> Result<HashMap<u64, Value>> {
         let batch: Vec<Value> = blocks
             .iter()
             .enumerate()
@@ -1013,6 +1141,7 @@ impl RpcClient {
             }
         };
         let mut out = HashMap::new();
+        let mut first_item_error: Option<FailureClass> = None;
         for item in resp.as_array().into_iter().flatten() {
             let Some(idx) = item.get("id").and_then(Value::as_u64) else {
                 continue;
@@ -1020,12 +1149,42 @@ impl RpcClient {
             let Some(&block) = blocks.get(idx as usize) else {
                 continue;
             };
-            if let Some(ts) = item
-                .pointer("/result/timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| parse_hex_u64(s).ok())
-            {
-                out.insert(block, ts);
+            // The whole header, not just `timestamp`: `block_timestamps` projects the field it
+            // needs, and RFC-0036's `blocks` table keeps the rest. A `null` result (archive-vs-full
+            // load-balancer split) is skipped, and the caller's total-count check turns that into an
+            // error rather than a partial map - see COR-3 above.
+            if let Some(result) = item.get("result").filter(|v| !v.is_null()) {
+                out.insert(block, result.clone());
+            } else if let Some(err) = item.get("error") {
+                // **A per-item error inside an HTTP 200 batch.** `post_one` only rejects a *top-level*
+                // error, so these are invisible to the failure classifier: the batch "succeeded", the
+                // items are silently dropped, and the caller's count check reports
+                // `N/M block(s) missing from the RPC response` - true, but it names the symptom and
+                // hides the cause.
+                //
+                // Found on OBIB case 3 (RFC-0036), where every item of an 800-block batch came back
+                // `{"error":{"code":429,"message":"Your app has exceeded its compute units per second
+                // capacity"}}`. It read as a broken endpoint for three diagnoses running, and it
+                // matters beyond this call: `block_timestamps` shares this parse, so a throttled
+                // timestamp batch has always reported COR-3's "blocks missing" rather than "you are
+                // being rate limited" - and then retried at the same width on a short backoff, which
+                // is the one response guaranteed not to help.
+                first_item_error.get_or_insert_with(|| classify_rpc_error(err));
+            }
+        }
+        // Surface the item-level class so the retry path can act on it: a rate limit needs a longer
+        // backoff and never a narrower batch (`batch_is_narrowable` refuses to split under one,
+        // because splitting doubles the request count in the wrong direction).
+        if out.is_empty() {
+            if let Some(class) = first_item_error {
+                return Err(anyhow::Error::new(ClassifiedError {
+                    class,
+                    detail: format!(
+                        "every item in a {}-block eth_getBlockByNumber batch returned an error \
+                         (per-item, inside an HTTP 200 response)",
+                        blocks.len()
+                    ),
+                }));
             }
         }
         Ok(out)
@@ -2027,5 +2186,67 @@ mod tests {
             "Batch of more than 3 requests".into(),
         );
         assert!(batch_is_narrowable(&odd));
+    }
+}
+
+#[cfg(test)]
+mod rfc0036_tests {
+    use super::*;
+
+    /// A rate limit delivered **inside** a JSON-RPC error body must classify as `RateLimited`, not
+    /// `Transient`.
+    ///
+    /// This is the bug that cost three wrong diagnoses on OBIB case 3. Alchemy answers HTTP 200 and
+    /// puts the throttle in each batch *item*: `{"code":429,"message":"Your app has exceeded its
+    /// compute units per second capacity"}`. Classified `Transient`, `batch_is_narrowable` returns
+    /// true and the batch is split - doubling the request count against a per-second request limit,
+    /// which is the one response guaranteed to make it worse. It split all the way to a 1-block batch
+    /// before giving up.
+    #[test]
+    fn a_rate_limit_inside_the_error_body_is_not_narrowable() {
+        let alchemy = serde_json::json!({
+            "code": 429,
+            "message": "Your app has exceeded its compute units per second capacity. If you have \
+                        retries enabled, you can safely ignore this message."
+        });
+        assert_eq!(classify_rpc_error(&alchemy), FailureClass::RateLimited);
+
+        // By message alone too, for a provider that does not set the numeric code.
+        let by_message = serde_json::json!({"code": -32000, "message": "rate limit exceeded"});
+        assert_eq!(classify_rpc_error(&by_message), FailureClass::RateLimited);
+
+        // Chainstack: neither a 429 nor any phrase Alchemy uses. Matching one provider's spelling is
+        // how this bug survives a provider switch, so both the code and the wording are covered.
+        let chainstack = serde_json::json!({
+            "code": -32005,
+            "message": "You've exceeded the RPS limit available on the current plan. Learn more how \
+                        to increase the limit, visit https://docs.chainstack.com/docs/pricing"
+        });
+        assert_eq!(classify_rpc_error(&chainstack), FailureClass::RateLimited);
+
+        // And the consequence that actually matters: never split under one.
+        let err = anyhow::Error::new(ClassifiedError {
+            class: FailureClass::RateLimited,
+            detail: "429".into(),
+        });
+        assert!(
+            !batch_is_narrowable(&err),
+            "splitting under a rate limit doubles the request count in the wrong direction"
+        );
+    }
+
+    /// A genuine size refusal must still narrow - the fix above must not swallow the case the
+    /// narrowing path exists for. `limit exceeded` sits in NARROWABLE and could plausibly have been
+    /// claimed by a rate-limit substring match.
+    #[test]
+    fn a_size_refusal_still_narrows() {
+        let too_big = serde_json::json!({"code": -32602, "message": "query returned more than 10000 results"});
+        assert!(
+            matches!(
+                classify_rpc_error(&too_big),
+                FailureClass::Narrowable { .. }
+            ),
+            "a result-cap refusal is the case narrowing exists for"
+        );
     }
 }
