@@ -304,16 +304,26 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
     // response guaranteed to make it worse. Found on OBIB case 3 (RFC-0036) after three wrong
     // diagnoses; the ordering matters because "limit exceeded" is already in NARROWABLE and would
     // otherwise claim a message like "compute units limit exceeded" for the splitting path.
+    // Phrasing is per-provider and there is no standard, so this list is evidence rather than
+    // guesswork - each entry is a message we have actually been refused with:
+    //   Alchemy     `{"code":429,  "...exceeded its compute units per second capacity"}`
+    //   Chainstack  `{"code":-32005,"You've exceeded the RPS limit available on the current plan"}`
+    // Note Chainstack sets neither 429 nor any phrase the first version of this list matched, which
+    // is the argument for matching on several spellings rather than one provider's.
     const RATE_LIMITED: &[&str] = &[
         "compute units per second",
         "rate limit",
         "rate-limit",
+        "rps limit",
+        "requests per second",
         "too many requests",
         "exceeded its throughput",
         "request limit reached",
     ];
+    // `-32005` is the de-facto "limit exceeded" code (Infura, Chainstack and others); `429` is
+    // Alchemy putting the HTTP status in the body.
     let code = err.get("code").and_then(Value::as_i64);
-    if code == Some(429) || RATE_LIMITED.iter().any(|p| msg.contains(p)) {
+    if matches!(code, Some(429) | Some(-32005)) || RATE_LIMITED.iter().any(|p| msg.contains(p)) {
         return FailureClass::RateLimited;
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
@@ -2204,6 +2214,15 @@ mod rfc0036_tests {
         // By message alone too, for a provider that does not set the numeric code.
         let by_message = serde_json::json!({"code": -32000, "message": "rate limit exceeded"});
         assert_eq!(classify_rpc_error(&by_message), FailureClass::RateLimited);
+
+        // Chainstack: neither a 429 nor any phrase Alchemy uses. Matching one provider's spelling is
+        // how this bug survives a provider switch, so both the code and the wording are covered.
+        let chainstack = serde_json::json!({
+            "code": -32005,
+            "message": "You've exceeded the RPS limit available on the current plan. Learn more how \
+                        to increase the limit, visit https://docs.chainstack.com/docs/pricing"
+        });
+        assert_eq!(classify_rpc_error(&chainstack), FailureClass::RateLimited);
 
         // And the consequence that actually matters: never split under one.
         let err = anyhow::Error::new(ClassifiedError {
