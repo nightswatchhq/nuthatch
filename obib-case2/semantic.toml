@@ -1,0 +1,31 @@
+# semantic.toml - what this nest's data *means* (RFC-0016). Read by the MCP `schema`
+# tool, the admin UI, and the scaffolded skill. Edit descriptions freely; the
+# `[table.*.footguns]` are DERIVED from the ABI and regenerated - leave them be.
+
+schema_version = 1
+
+[nest]
+description = "The `obib-case2` nest on mainnet. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.lbtc__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `lbtc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.lbtc__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.lbtc__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[view]
+
+# Authored views (views/*.sql) are described here so the MCP/`/schema` can render them:
+# [view.your_view_name]
+# description = "What this derivation computes."
