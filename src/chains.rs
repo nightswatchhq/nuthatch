@@ -57,12 +57,16 @@ const MAINNET: Chain = Chain {
         // **Ordered by measured backfill capability, best first** - see the module note above on why
         // this list has an expiry date. Re-measured 2026-07-31 with a 10-block address-filtered
         // `eth_getLogs` 5,000 blocks behind tip, which is the smallest request a real backfill makes.
+        // Measured with `nuthatch doctor --rpc … --address <usdc>` on 2026-08-07, **ordered
+        // archive-first** because that is the only limit here with no workaround:
+        //   eth-pokt.nodies.app   window 40   batch 10  archive YES
+        //   eth.drpc.org          window 160  batch 3   archive YES
+        //   onfinality (public)   window 160  batch 3   archive NO
+        // A batch cap *degrades* - the timestamp fetcher splits down to it. Missing archive state is
+        // fatal to a from-genesis backfill and cannot be split around, so it outranks batch width.
         "https://eth-pokt.nodies.app",
+        "https://eth.drpc.org",
         "https://eth.api.onfinality.io/public",
-        // Removed 2026-08-06 (issue #267): `eth.drpc.org` answers a 5-request JSON-RPC batch with
-        // `Batch of more than 3 requests are not allowed` (HTTP 500), failing RFC-0030 §4 criterion 3.
-        // `getLogs` was 5/5 - the batch cap is the disqualifier, and it is not one a narrower block
-        // range can fix: it is a *request-count* limit, and the block-timestamp fetcher batches.
         // Removed 2026-07-31: `ethereum-rpc.publicnode.com` now answers
         // `Archive requests require a personal token` for anything more than ~100 blocks behind tip,
         // so it cannot serve a backfill at all - and it was listed *first*. `eth.llamarpc.com` was
@@ -95,7 +99,14 @@ const ARBITRUM_ONE: Chain = Chain {
     finality: Finality::FinalizedTag {
         fallback_depth: 1800,
     },
-    // Arbitrum blocks are frequent but Horizon events are rare; a wide window keeps up cheaply.
+    // Arbitrum blocks are frequent but Horizon events are rare, so a wide window keeps up cheaply.
+    //
+    // Measured 2026-08-07, address-filtered: `arb1.arbitrum.io` sustains ~163,840 blocks, but
+    // `arb-pokt.nodies.app` only ~40 - and failover can route any request to the narrower one, so
+    // `doctor` recommends 20 across the pair. 2000 is kept deliberately: it is right for the sparse-L2
+    // case this window exists for, and RFC-0028's `fetch_logs_splitting` narrows a refused range
+    // rather than failing it. The cost of that rescue is a burst of retries at the start of a
+    // backfill, which reads as slowness - so a busy contract wants `--window` set from `doctor`.
     log_window: 2000,
 };
 
@@ -119,6 +130,9 @@ const BASE: Chain = Chain {
         fallback_depth: 900,
     },
     // ~2 s blocks and busy - a moderate window that the adaptive chunker (RFC-0004 §2) tunes further.
+    // Measured 2026-08-07, address-filtered: `mainnet.base.org` ~80, `base-pokt.nodies.app` ~40.
+    // Same reasoning as Arbitrum: the optimistic default is recovered by adaptive splitting, at the
+    // cost of early retries.
     log_window: 1000,
 };
 
