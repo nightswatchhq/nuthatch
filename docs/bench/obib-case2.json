@@ -37,5 +37,14 @@
     "sentio": 7.78,
     "envio": 8.54,
     "subsquid": 46.85
-  }
+  },
+  "obib_window_only": {
+    "note": "OBIB's own block range, for the closest comparison on *range*: 22,400,000-22,500,000. Fast, but it cannot produce the case's output - absolute balances need history before the window, which is exactly why the benchmark makes balanceOf() calls. Published so the 49.18s headline is not mistaken for a like-for-like range.",
+    "blocks": 100001,
+    "events": 22327,
+    "wall_clock_s": 9.3,
+    "rpc_requests": 18,
+    "runs": 1
+  },
+  "reproduce": "git checkout the obib-case2/ nest, then: nuthatch bench backfill --dir . --from 19888667 --to 22500000 --runs 3 --seal-direct --concurrency 8 --rpc \"$RPC\". Verified from a clean `git archive` checkout with no local state."
 }

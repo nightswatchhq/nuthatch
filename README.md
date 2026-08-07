@@ -153,6 +153,32 @@ We ran **someone else's** benchmark rather than writing our own: Sentio's
 | RPC requests | **321** |
 | peak RSS | **320 MB** |
 
+**Case 2** is case 1's contract with per-account balances, and OBIB's implementations get them with one
+`balanceOf()` per account. **We make none.** For a plain ERC-20 the balance *is* the transfer history,
+so we index the token's whole life instead and derive it - trading 2.5M extra blocks of cheap `getLogs`
+for zero `eth_call` round trips.
+
+| | |
+|---|---|
+| wall clock | **49.2 s** (median of 3) |
+| accounts | **7,634** - OBIB's published figure, exactly |
+| `eth_call` round trips | **0** |
+| RPC requests | **136** |
+| peak RSS | **325 MB** |
+
+Reference times for the same case: Sentio 7.78 min, Envio 8.54 min, Subsquid 46.85 min.
+
+**Two caveats, stated rather than buried.** First, this is deliberately not like-for-like on *range*:
+OBIB windows to 100,001 blocks, we index 2,611,334. On OBIB's own range we take **9.3 s** - but that
+run cannot produce the case's output at all, because absolute balances need history from before the
+window, which is precisely why the benchmark makes the RPC calls. Second, "derived" is proven rather
+than asserted: at the pinned end block, 39 sampled accounts - the ten largest, ten smallest non-zero,
+ten zero-balance and ten by address order - **all matched `balanceOf()`**, including every zero-balance
+account, which is the case an off-by-one in the ledger would betray.
+
+The count is 7,634 and not 7,635 because `0x0` is the mint/burn counterparty rather than a holder. That
+off-by-one was the tell that the interpretation was right.
+
 **Case 6** is the factory-template case: the Uniswap V2 factory over blocks 19,000,000-19,010,000,
 discovering pairs from `PairCreated` and indexing `Swap` on every child it finds. No per-child config,
 no redeploy, one rule.
@@ -172,8 +198,11 @@ flattering one; on the second, Envio is faster than us. Note too that Envio and 
 from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
 
 Both against a real provider (Alchemy), on an 11-core laptop. The artifacts are
-[`docs/bench/obib-case1.json`](docs/bench/obib-case1.json) and
-[`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs either.
+[`docs/bench/obib-case1.json`](docs/bench/obib-case1.json),
+[`docs/bench/obib-case2.json`](docs/bench/obib-case2.json) and
+[`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs any of them.
+The case-2 nest is committed at [`obib-case2/`](obib-case2/) - keyless, so the endpoint arrives via
+`--rpc`, and verified to rebuild from a clean checkout.
 The case-6 nest is published at [`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6)
 so the run can be reproduced rather than believed, and is submitted upstream as
 [sentioxyz/open-blockchain-indexer-benchmark#3](https://github.com/sentioxyz/open-blockchain-indexer-benchmark/pull/3).
@@ -201,7 +230,7 @@ testing did not.
 
 **Analytical queries** run on DuckDB over sealed Parquet. We benchmark-gated the alternative rather
 than arguing about it: DataFusion measured **1.6–2.7× slower** on the fold that matters, with the gap
-widening as segments grow, at exact result parity —
+widening as segments grow, at exact result parity -
 [RFC-0013 §5](docs/rfcs/0013-storage-and-query-engine-direction.md).
 
 ---
