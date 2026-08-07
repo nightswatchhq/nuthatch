@@ -1440,13 +1440,34 @@ async fn build_nest(
     // Before anything reads `schema.json`: regenerate it if it is missing or stale. A hand-written
     // `nuthatch.toml` produces no schema, and the failure is silent and expensive - the schema tool
     // keeps recommending `{col}_dec` companions that the analytics layer never created (issue #241
-    // item 2). Cheap, idempotent, and preserves authored views.
-    match crate::project::refresh_stale_artifacts(&dir, config) {
-        Ok(Some(what)) => tracing::info!("{what}"),
-        Ok(None) => {}
-        // Never fatal: a nest that cannot regenerate its artifacts can still index, and refusing to
-        // start over a derived file would be a worse failure than the one being fixed.
-        Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
+    // item 2). Cheap and preserves authored views.
+    //
+    // **Never inside an identity-keyed dataset**, which is the same mistake as the query-FE redb note
+    // above: writing to a directory this process does not own. `refresh_stale_artifacts` rewrites
+    // `schema.json`, `llms.txt` and `.claude/skills/**`, and all three are hashed into the NID - the
+    // blob's `EXCLUDE` covers only `nuthatch.redb`, `segments`, `.git` and `.DS_Store`. Its staleness
+    // test is an *mtime* comparison against `nuthatch.toml`, which a checkout, an rsync or a `touch`
+    // is enough to trip, so a dataset could be rewritten - and the identity its mount record claims
+    // invalidated - without anyone editing a byte of it.
+    //
+    // Measured 2026-08-07 before this guard: a two-nest runtime started twice, with no operator action
+    // between the starts, reported identity drift on the second start. Skipping here is safe because a
+    // dataset reached `data/<nid>` through `migrate` or a verified bundle, so its artifacts were
+    // consistent when its identity was computed; if they later are not, that is drift, and
+    // `MountTable::identity_drift` is what reports it.
+    if crate::runtime::MountTable::is_identity_keyed(&dir) {
+        tracing::debug!(
+            "identity-keyed dataset: leaving derived artifacts alone (rewriting them would move the \
+             NID its mount record claims)"
+        );
+    } else {
+        match crate::project::refresh_stale_artifacts(&dir, config) {
+            Ok(Some(what)) => tracing::info!("{what}"),
+            Ok(None) => {}
+            // Never fatal: a nest that cannot regenerate its artifacts can still index, and refusing
+            // to start over a derived file would be a worse failure than the one being fixed.
+            Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
+        }
     }
     let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
