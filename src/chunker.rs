@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn positive_classifications_still_veto_a_split() {
         for class in [
-            crate::rpc::FailureClass::RateLimited,
+            crate::rpc::FailureClass::RateLimited { retry_after: None },
             crate::rpc::FailureClass::Terminal,
         ] {
             let err = anyhow::Error::new(crate::rpc::ClassifiedError {
