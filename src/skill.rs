@@ -18,7 +18,9 @@ use crate::cli::Cli;
 pub const SKILL_DIR: &str = "skills/nuthatch-builder";
 
 /// Regenerate the skill's machine-generated references into `root/skills/nuthatch-builder/`. Today
-/// that's `cli-reference.md`; the config reference is authored (its keys are drift-checked in CI).
+/// that's `cli-reference.md`; the config reference is authored, with its keys drift-checked in CI
+/// in both directions — no key it names that the structs lack, and none the structs have that it
+/// never mentions (`tests/skill_refs.rs`).
 pub fn write_refs(root: &Path) -> Result<()> {
     let dir = root.join(SKILL_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
