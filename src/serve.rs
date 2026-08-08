@@ -1125,9 +1125,8 @@ async fn run_sql_query(
 async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
     use crate::metrics::METRICS;
     // `/explain` gets the same treatment as `/sql`. It plans caller-supplied SQL, so leaving it open
-    // on a bounded mount would leak the schema and the cost model of every table - and it is the
-    // route that still lacks `/sql`'s hot-row bound (#293), so an unbounded scan is reachable through
-    // it. Bounding the surface closes both.
+    // on a bounded mount would leak the schema and the cost model of every table. Bounding the
+    // surface closes that; the hot-row ceiling below closes the scan cost (#293).
     if !s.surface.free_form_allowed() {
         return refuse_free_form(&s.surface);
     }
@@ -1155,7 +1154,17 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let store = s.store.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let hot = store.hot_rows_by_table().unwrap_or_default();
+        // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
+        // into temp tables first - so `/explain` carries the full scan cost. Without the same
+        // ceiling `/sql` enforces, an endpoint reachable by anyone who can reach `/sql` could push
+        // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
+        // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
+        // would bind against a narrower schema than the one a subsequent `/sql` would see.
+        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+            Ok(hot) => hot,
+            Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
+            Err(_) => Default::default(),
+        };
         let sealed_through = store.sealed_through();
         analytics::query_hot_cold(
             &dir,
@@ -1172,6 +1181,21 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     match result {
         Ok(Ok(_)) => {
             Json(json!({ "valid": true, "note": "query binds; run it with the sql tool" }))
+                .into_response()
+        }
+        // Same contract as `/sql`: a `503`, not a `400`. The query may well be valid - the node is
+        // refusing to spend the memory to find out, so a caller should retry later, not rewrite
+        // their SQL. `valid` is deliberately absent rather than `false`: bindability is unknown
+        // here, and reporting `false` would tell a caller their query is broken when it is not.
+        Ok(Err(e)) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => {
+            METRICS.inc_sql_rejected();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!("{e}"),
+                    "sealed_through": s.store.sealed_through(),
+                })),
+            )
                 .into_response()
         }
         Ok(Err(e)) => {
@@ -1793,6 +1817,36 @@ mod tests {
             .hot_rows_by_table_bounded(3)
             .expect("at the cap");
         assert_eq!(ok.get("t").map(|v| v.len()), Some(3));
+    }
+
+    /// No request handler may reach the tip through the unbounded scan (#293).
+    ///
+    /// `/sql` has always been bounded; `/explain` was not, and because the `LIMIT 0` probe hides
+    /// the cost — no rows come back — the gap was invisible from the outside while still parsing
+    /// the whole tip into temp tables. The cap itself is 2,000,000 rows, far too many to
+    /// materialise in a test, so the invariant is checked where it is actually expressible: no
+    /// handler in this file calls the unbounded variant at all.
+    ///
+    /// `main.rs` (the local REPL backend) and `bench.rs` legitimately still use it — neither is
+    /// reachable over the network, which is the whole distinction this guard draws.
+    #[test]
+    fn no_request_path_uses_the_unbounded_hot_scan() {
+        let src = include_str!("serve.rs");
+        // Split so the needle never appears verbatim in this file - otherwise the scan matches
+        // the line it is written on and the test fails against itself.
+        let needle = concat!("hot_rows_by_table", "()");
+        let offenders: Vec<usize> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle) && !l.trim_start().starts_with("//"))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "serve.rs serves HTTP, so every hot scan here must be bounded by SQL_MAX_HOT_ROWS; \
+             unbounded call(s) at line(s) {offenders:?}. Use hot_rows_by_table_bounded and map \
+             HotScanTooLarge to a 503, as /sql and /explain do."
+        );
     }
 
     /// An over-length query string is rejected (400) before it ever reaches the planner.
