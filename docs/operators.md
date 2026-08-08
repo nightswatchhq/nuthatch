@@ -517,6 +517,13 @@ job:
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
 Rejections surface as `400`/`503` and count in `nuthatch_sql_rejections_total`.
 
+**`/explain` is guarded identically.** It plans caller-supplied SQL without returning rows, but
+planning still materialises the tip, so it carries the same scan cost as the query it is describing
+- and therefore the same ceilings, including the unsealed-row one. An over-budget tip answers `503`
+with the reason rather than reporting on sealed data alone, which would bind against a narrower
+schema than a following `/sql` would see. Anywhere you bound `/sql`, bound `/explain` with it: a
+guard on one and not the other leaves the cheaper-looking route as the expensive one.
+
 **Admin surface.** Off-localhost the admin UI requires `NUTHATCH_ADMIN_TOKEN` on every request; token
 comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
 
