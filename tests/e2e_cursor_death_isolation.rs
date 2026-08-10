@@ -66,7 +66,11 @@ fn replacement_block(b: u64) -> BlockFixture {
         1,
         1_700_000_500 + b,
         USDC,
-        &[(account(3).as_str(), account(4).as_str(), (7_000 + b) as u128)],
+        &[(
+            account(3).as_str(),
+            account(4).as_str(),
+            (7_000 + b) as u128,
+        )],
     )
 }
 
