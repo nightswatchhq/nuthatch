@@ -1331,7 +1331,14 @@ pub async fn dev(
 /// This returns - ending the runtime - only when **every** cursor is gone, because at that point nothing
 /// will ever advance again and a restart is the only thing that can help. Exiting non-zero under a
 /// supervisor beats staying up serving permanently-frozen data.
-async fn supervise_cursors(
+///
+/// `pub` for one reason: this is the *only* point at which a dead cursor's fate is decided, and
+/// [`dev`] reaches it through a real RPC endpoint set, so no integration test can drive the property
+/// through `dev` with a fixture chain. `tests/e2e_cursor_death_isolation.rs` hands it the genuine
+/// [`crate::indexer::ChainCursor::ingest`] handles of two live cursors instead (issue #387). Keeping it
+/// private would only have moved that test onto handles it fabricated itself, which is the coverage
+/// that already existed and the coverage the issue was filed about.
+pub async fn supervise_cursors(
     ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
     health: &crate::health::RuntimeHealth,
     fail_fast: bool,
