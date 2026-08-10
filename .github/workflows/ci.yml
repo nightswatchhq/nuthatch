@@ -401,9 +401,11 @@ jobs:
           # The regression half was measured by probe PR #404: a synthetic retention leak in the
           # multi-nest fan-out, which reported **323 MB on the runner and 323 MB on the 32-core box**.
           # Worth knowing *why* they agree, because the sister gate does not behave this way. The
-          # #283 point-read ceiling was set from a dev-box mutation and lost a third of its assumed
-          # margin on the runner, because a cache-resident scan is a memory walk that does not scale
-          # with cores. This regression is data-size-driven over a deterministic fixture - identical
+          # #283 point-read ceiling was set from a dev-box mutation and its margin below a real
+          # regression came out at 1.21x on the runner against the 1.61x assumed, because a
+          # cache-resident scan is a memory walk that does not scale with cores - the mutation ran
+          # *faster* on the runner (18.15µs) than on the 32-core box (24.17µs) while the baseline did
+          # not move. This regression is data-size-driven over a deterministic fixture - identical
           # 240,200 rows on both machines - so it lands on the same number either side. Do not
           # generalise from this gate to that one, in either direction: measure both halves where the
           # gate runs.
