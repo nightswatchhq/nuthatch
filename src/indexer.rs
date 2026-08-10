@@ -5969,9 +5969,20 @@ rpc_urls = ["https://rpc.example"]
 
     /// A transfer row shaped exactly as `DecodedRow::to_json` writes one: `value` is a decimal
     /// *string* (uint256 does not fit a JSON number) and `block_number` is a number.
-    fn transfer_row(block: u64, log_index: u64, from: &str, to: &str, value: &str) -> String {
+    ///
+    /// `to` is optional and writes JSON `null` when absent, which is how an undecodable recipient
+    /// reaches the hot store. Such a row still carries outbound volume, so the rebuild must feed it
+    /// to velocity while withholding it from balances and exposure.
+    fn transfer_row(
+        block: u64,
+        log_index: u64,
+        from: &str,
+        to: Option<&str>,
+        value: &str,
+    ) -> String {
+        let to = to.map_or("null".to_string(), |t| format!("\"{t}\""));
         format!(
-            r#"{{"table":"usdc__transfer","block_number":{block},"block_hash":"0xbh","block_timestamp":{ts},"tx_hash":"0xtx","log_index":{log_index},"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","from":"{from}","to":"{to}","value":"{value}"}}"#,
+            r#"{{"table":"usdc__transfer","block_number":{block},"block_hash":"0xbh","block_timestamp":{ts},"tx_hash":"0xtx","log_index":{log_index},"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","from":"{from}","to":{to},"value":"{value}"}}"#,
             ts = 1_700_000_000 + block
         )
     }
@@ -6026,15 +6037,23 @@ rpc_urls = ["https://rpc.example"]
         const MIXER: &str = "0x3333333333333333333333333333333333333333";
         const ALICE: &str = "0x1111111111111111111111111111111111111111";
         const BOB: &str = "0x2222222222222222222222222222222222222222";
+        const CAROL: &str = "0x4444444444444444444444444444444444444444";
         const WINDOW: u64 = 100;
 
         // Two blocks in one velocity bucket and one far outside it, so bucketing is exercised; a
         // labelled counterparty on both sides, so exposure has "out" and "in" rows to build.
+        //
+        // CAROL's row has an unreadable `to` (JSON null) with `from` and `value` intact. It is the
+        // row that pins the shape of the hot-replay guard: balances and exposure need a counterparty
+        // and must skip it, velocity needs only (from, block, value) and must still count its
+        // outbound volume. Without such a row, folding velocity inside the `(from, to, val)` guard
+        // silently drops outbound volume with every assertion still green.
         let fixture = [
-            (10u64, 0u64, ALICE, MIXER, "100"),
-            (11, 0, ALICE, BOB, "250"),
-            (11, 1, BOB, MIXER, "7"),
-            (210, 0, MIXER, ALICE, "42"),
+            (10u64, 0u64, ALICE, Some(MIXER), "100"),
+            (11, 0, ALICE, Some(BOB), "250"),
+            (11, 1, BOB, Some(MIXER), "7"),
+            (210, 0, MIXER, Some(ALICE), "42"),
+            (12, 0, CAROL, None, "500"),
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -6079,8 +6098,14 @@ rpc_urls = ["https://rpc.example"]
         let want_velocity = VelocityView::start(true).unwrap();
         for (b, _li, from, to, val) in fixture {
             let v: i128 = val.parse().unwrap();
-            want_balances.apply(views::transfer_deltas(from, to, v, 1));
-            want_exposure.apply(exposure::exposure_deltas(from, to, v, 1, &labels));
+            // Balances and exposure are both two-sided, so a row with no readable `to` has nothing
+            // to move between and nothing to be exposed to - the live loop never feeds them one.
+            if let Some(to) = to {
+                want_balances.apply(views::transfer_deltas(from, to, v, 1));
+                want_exposure.apply(exposure::exposure_deltas(from, to, v, 1, &labels));
+            }
+            // Velocity is one-sided - "how much did `from` push out" - so it is fed unconditionally,
+            // `to` readable or not. This asymmetry is the thing under test.
             want_velocity.apply(velocity::velocity_deltas(from, b, v, 1, WINDOW));
         }
         want_balances.flush();
@@ -6109,6 +6134,26 @@ rpc_urls = ["https://rpc.example"]
         assert!(
             velocity_v.entries() > 1,
             "fixture must land in more than one window bucket"
+        );
+
+        // The unreadable-`to` row, asserted directly rather than only against the reference, so both
+        // sides of the guard's asymmetry are pinned even if the reference above drifts.
+        let carol = velocity_v
+            .flags(1)
+            .into_iter()
+            .find(|f| f.address == CAROL)
+            .expect("velocity must count outbound volume for a transfer with an unreadable `to`");
+        assert_eq!(
+            carol.volume, 500,
+            "velocity must count the whole outbound value of an unreadable-`to` transfer"
+        );
+        assert!(
+            !balances.top(usize::MAX).iter().any(|(a, _)| a == CAROL),
+            "balances must not move value for a transfer with no readable counterparty"
+        );
+        assert!(
+            exposure_v.exposure(CAROL).is_empty(),
+            "exposure must not build a row for a transfer with no readable counterparty"
         );
     }
 
