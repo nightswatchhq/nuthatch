@@ -23,7 +23,10 @@ deadline and a document nobody trusts. If it finishes early, close it early.
 > or the REST route
 > `gh api "repos/nightswatchhq/nuthatch/issues?labels=circumspect-capybara&state=all&per_page=60"`.
 > Both routes and the web UI filter agree, re-checked 2026-08-10.
-> A bare `gh issue list` resolves against `origin`, which on our clones is the fork remote; the label filter returns zero there with no error. Pass `--repo nightswatchhq/nuthatch`.
+> A bare `gh issue list` resolves against `origin`, which on our clones is `cargopete/nuthatch` - not a
+> fork, but this same repository under a former name, reached by GitHub's rename redirect. The redirect
+> serves the plain issue list, and answers the label filter with zero rows, exit 0 and no error. Pass
+> `--repo nightswatchhq/nuthatch`.
 
 ## Definition of done, for every item in this sprint
 
