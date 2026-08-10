@@ -201,3 +201,176 @@ async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
         );
     }
 }
+
+/// Sentinels planted in every config field that can carry a credential. Distinct per field, so a red
+/// assertion names the leaking field rather than just "something leaked".
+const RPC_KEY: &str = "rpckey-must-not-leak";
+const WEBHOOK_PATH_SECRET: &str = "whpath-must-not-leak";
+const WEBHOOK_HMAC_SECRET: &str = "whhmac-must-not-leak";
+const ALERT_PATH_SECRET: &str = "alertpath-must-not-leak";
+
+/// [`scaffold_fe_nest`] with a credential planted in every config field that can hold one: the RPC URL
+/// (provider keys live in the path), a webhook URL (Slack/Discord style secret path), that webhook's
+/// HMAC secret, and an alert sink URL.
+///
+/// `.invalid` is a reserved TLD that cannot resolve, so nothing here can be dialled by accident.
+fn scaffold_fe_nest_with_secrets(dir: &std::path::Path) -> nuthatch::config::Config {
+    scaffold_nest(dir, "usdc", USDC);
+    let toml_path = dir.join("nuthatch.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    let toml = toml.replace(
+        "rpc_urls = []",
+        &format!(r#"rpc_urls = ["https://rpc.invalid/v2/{RPC_KEY}"]"#),
+    );
+    std::fs::write(
+        &toml_path,
+        format!(
+            r#"{toml}
+[[webhooks]]
+name = "transfers"
+table = "usdc__transfer"
+url = "https://hooks.invalid/services/T00/B00/{WEBHOOK_PATH_SECRET}"
+secret = "{WEBHOOK_HMAC_SECRET}"
+
+[[alerts]]
+kinds = ["threshold_flag"]
+url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
+"#
+        ),
+    )
+    .unwrap();
+    nuthatch::config::Config::load(dir).unwrap()
+}
+
+/// #292 item 1: **what the admin surface discloses once the credential has passed.**
+///
+/// Every prior pass on this issue stopped at the gate - they proved who may knock, never what is handed
+/// over when the knock is answered. The open question was whether `/nest` and the `/_admin/events`
+/// frames carry anything an operator would not knowingly give to whoever holds the admin token:
+/// provider URLs with keys in them, webhook secrets, absolute filesystem locations.
+///
+/// The answer is meant to be "nothing", and part of it is already deliberate: `indexer::nest_info`
+/// reduces each webhook URL to scheme+host via `webhook_host`. But that defence was pinned only by a
+/// unit test on `webhook_host` itself, which asserts the redactor redacts and never that the served
+/// payload uses it. That is the gap this closes: the sweep drives `indexer::serve_role` over a socket
+/// and reads what the wire actually carries. Restoring the full `w.url` to `nest_info` turns it red.
+///
+/// **What this does not reach, stated so nobody inherits it as covered.** `serve::sanitize_sql_error`
+/// rewrites the nest directory out of DuckDB errors, and the `/sql` and `/explain` probes below do
+/// *not* exercise it: an unknown table is a Catalog Error carrying no path, and a table the registry
+/// declares resolves against the hot store and succeeds. Making `sanitize_sql_error` a no-op leaves
+/// this test green - verified, not assumed. Provoking the `IO Error` that names an absolute parquet
+/// glob needs a nest with sealed segments missing underneath it, which this FE fixture has no way to
+/// build. That redaction remains covered by its unit tests in `serve.rs` alone.
+///
+/// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
+/// it has teeth there: adding the nest directory to `nest_info` turns it red.
+///
+/// The sweep is over the *whole* served surface rather than the two routes the issue names. A secret
+/// leaking from `/schema` is the same disclosure as one leaking from `/nest`, and enumerating the
+/// router costs nothing - whereas checking two routes would have proved two routes.
+///
+/// Deliberately run with a valid admin token: the question is what a credentialed caller receives, so
+/// gating the surface is not an answer here.
+#[tokio::test]
+async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
+    let _env = ENV.lock().await;
+    std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
+
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_fe_nest_with_secrets(dir.path());
+    // The absolute path an error message would embed. Canonicalised because that is the form DuckDB
+    // and `std::fs` report on macOS, where `/tmp` is a symlink to `/private/tmp`.
+    let nest_dir = dir.path().canonicalize().unwrap().display().to_string();
+    let (base, task) = start_fe(dir.path(), true).await;
+
+    let client = reqwest::Client::new();
+    // Every GET the router registers, plus a deliberately failing `/sql` - the error path is where an
+    // absolute path escapes if `sanitize_sql_error` is not actually wired in.
+    let paths = [
+        "/",
+        "/nest",
+        "/shape",
+        "/health",
+        "/ready",
+        "/metrics",
+        "/tables",
+        "/schema",
+        "/entities?limit=10",
+        "/balances?limit=10",
+        "/flags",
+        "/queries",
+        // Both SQL probes are here for the error *body*, not the happy path - a query error is the
+        // classic place an absolute path escapes. See the note on `sanitize_sql_error` below for what
+        // this does and does not reach.
+        "/sql?q=SELECT%20*%20FROM%20no_such_table",
+        "/explain?q=SELECT%20*%20FROM%20no_such_table",
+        "/sql?q=SELECT%20*%20FROM%20usdc__transfer",
+        "/_admin/?token=s3cret",
+    ];
+    let mut bodies: Vec<(String, String)> = Vec::new();
+    for p in paths {
+        let resp = client
+            .get(format!("{base}{p}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {p}: {e}"));
+        bodies.push((p.to_string(), resp.text().await.unwrap_or_default()));
+    }
+
+    // `/_admin/events` is an endless SSE stream, so take the first frame and stop. This is the payload
+    // the issue singled out: it re-serves `summary_value`, the same body as `GET /`.
+    let mut sse = client
+        .get(format!("{base}/_admin/events?token=s3cret"))
+        .send()
+        .await
+        .expect("SSE connect");
+    assert_eq!(sse.status().as_u16(), 200, "the credentialed SSE must open");
+    let frame = tokio::time::timeout(Duration::from_secs(10), sse.chunk())
+        .await
+        .expect("SSE frame within 10s")
+        .expect("SSE chunk")
+        .expect("the stream must push a frame, not close");
+    bodies.push((
+        "/_admin/events".to_string(),
+        String::from_utf8_lossy(&frame).to_string(),
+    ));
+    drop(sse);
+    task.abort();
+
+    // Premise: the sweep actually read something. Without this a router rename would silently reduce
+    // the test to asserting over empty strings, which passes for the wrong reason.
+    let served: usize = bodies.iter().filter(|(_, b)| !b.is_empty()).count();
+    assert!(
+        served >= paths.len(),
+        "the sweep must have read real payloads, got {served} non-empty of {}",
+        bodies.len()
+    );
+    // ...and that the nest whose secrets we planted is the one being served.
+    let (_, nest_body) = bodies.iter().find(|(p, _)| p == "/nest").unwrap();
+    assert!(
+        nest_body.contains("hooks.invalid"),
+        "premise: /nest must describe the webhook we configured, else the redaction assertion below \
+         passes because the webhook is missing entirely - got {nest_body}"
+    );
+
+    for (path, body) in &bodies {
+        for (label, secret) in [
+            ("the RPC provider key", RPC_KEY),
+            ("the webhook URL secret", WEBHOOK_PATH_SECRET),
+            ("the webhook HMAC secret", WEBHOOK_HMAC_SECRET),
+            ("the alert URL secret", ALERT_PATH_SECRET),
+        ] {
+            assert!(
+                !body.contains(secret),
+                "{path} disclosed {label} to a credentialed caller: {body}"
+            );
+        }
+        assert!(
+            !body.contains(&nest_dir),
+            "{path} disclosed the nest's absolute filesystem path ({nest_dir}): {body}"
+        );
+    }
+
+    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+}
