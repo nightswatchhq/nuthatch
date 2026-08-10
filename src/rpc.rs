@@ -362,22 +362,32 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
 /// pacing already applies on top.
 pub(crate) const MAX_RETRY_HINT: Duration = Duration::from_secs(30);
 
-/// Clamp a provider's retry hint to [`MAX_RETRY_HINT`], saying so when it bites (#361).
+/// Clamp a provider's retry hint into `[own_pacing, MAX_RETRY_HINT]`, saying so when the cap bites
+/// (#361).
 ///
 /// A hint is advice. Obeying `try_again_in: 3600s` verbatim would park a backfill for an hour with
 /// nothing in the log to explain the silence - so the pause is capped and the fact is recorded at
 /// `warn`, which is the difference between a run that stalls loudly and one that looks hung.
-pub(crate) fn clamp_retry_hint(hint: Duration) -> Duration {
-    if hint > MAX_RETRY_HINT {
+///
+/// **`own_pacing` is a floor, and it is the half that is easy to forget.** A hint is only ever a
+/// reason to wait *longer* than we already would; it is never a licence to wait less. Without the
+/// floor, a provider or CDN answering `Retry-After: 0` - and they do - parses to `Some(0s)`, passes
+/// the cap untouched, and replaces our backoff with `sleep(0)`, so we would hammer a limiter with no
+/// pacing at all precisely while it was telling us we were over its limit. The cap protects the run
+/// from the provider; the floor protects the provider from us.
+pub(crate) fn clamp_retry_hint(hint: Duration, own_pacing: Duration) -> Duration {
+    let capped = if hint > MAX_RETRY_HINT {
         tracing::warn!(
             requested_s = hint.as_secs_f64(),
             capped_s = MAX_RETRY_HINT.as_secs_f64(),
             "provider asked us to wait longer than the cap; pausing for the cap instead - if this \
              repeats, the plan's rate limit is the bottleneck, not a blip"
         );
-        return MAX_RETRY_HINT;
-    }
-    hint
+        MAX_RETRY_HINT
+    } else {
+        hint
+    };
+    capped.max(own_pacing)
 }
 
 /// Parse a provider's "come back in" duration string into a [`Duration`].
@@ -1152,7 +1162,7 @@ impl RpcClient {
             let pause = match last_err.as_ref().and_then(class_of) {
                 Some(FailureClass::RateLimited {
                     retry_after: Some(hint),
-                }) => clamp_retry_hint(hint),
+                }) => clamp_retry_hint(hint, linear),
                 // No hint, or a failure that was not a rate limit: our own pacing stands.
                 _ => linear,
             };
@@ -1231,11 +1241,12 @@ impl RpcClient {
                 Err(e) => {
                     tracing::debug!("block_timestamps attempt {} failed: {e:#}", attempt + 1);
                     // Same as `block_headers` (#361): prefer the provider's own number to our guess.
+                    let own_pacing = Duration::from_millis(200 * (attempt as u64 + 1));
                     let pause = match class_of(&e) {
                         Some(FailureClass::RateLimited {
                             retry_after: Some(hint),
-                        }) => clamp_retry_hint(hint),
-                        _ => Duration::from_millis(200 * (attempt as u64 + 1)),
+                        }) => clamp_retry_hint(hint, own_pacing),
+                        _ => own_pacing,
                     };
                     last_err = Some(e);
                     tokio::time::sleep(pause).await;
@@ -2360,15 +2371,44 @@ mod rfc0036_tests {
     /// An absurd hint is capped rather than obeyed, so a backfill stalls loudly (#361).
     #[test]
     fn an_absurd_retry_hint_is_capped() {
+        let none = Duration::ZERO;
         let hour = Duration::from_secs(3600);
         assert_eq!(
-            clamp_retry_hint(hour),
+            clamp_retry_hint(hour, none),
             MAX_RETRY_HINT,
             "obeying an hour-long hint would park a backfill with nothing to explain the silence"
         );
         // Anything within the cap passes through untouched - the provider knows its own limiter.
         let modest = Duration::from_millis(560);
-        assert_eq!(clamp_retry_hint(modest), modest);
+        assert_eq!(clamp_retry_hint(modest, none), modest);
+    }
+
+    /// A hint may only ever make us wait **longer** than our own pacing, never less (#361).
+    ///
+    /// Without the floor, `Retry-After: 0` - which proxies and CDNs do send - parses to `Some(0s)`,
+    /// passes the cap untouched, and *replaces* the caller's backoff, so we would retry with no
+    /// pacing at all precisely while a limiter was telling us to slow down.
+    #[test]
+    fn a_retry_hint_can_never_undercut_our_own_pacing() {
+        let ours = Duration::from_millis(250);
+        for zero in ["0s", "0", "0ms", "0ns"] {
+            let hint = parse_retry_hint(zero).expect("a parseable zero is still a parse");
+            assert_eq!(
+                clamp_retry_hint(hint, ours),
+                ours,
+                "{zero:?} must floor to our own pacing, not turn a rate limit into a hot loop"
+            );
+        }
+        // A hint shorter than our pacing but non-zero is the same hazard, less obviously.
+        assert_eq!(clamp_retry_hint(Duration::from_millis(1), ours), ours);
+        // The floor must not become a floor on everything: a longer hint still wins.
+        let longer = Duration::from_millis(900);
+        assert_eq!(clamp_retry_hint(longer, ours), longer);
+        // Both bounds at once: capped from above, floored from below.
+        assert_eq!(
+            clamp_retry_hint(Duration::from_secs(3600), ours),
+            MAX_RETRY_HINT
+        );
     }
 
     /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is
