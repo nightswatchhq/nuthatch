@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// How many times a whole `block_timestamps` batch is retried before it's returned as an error rather
 /// than silently yielding an all-zeros timestamp map into the sealed path.
@@ -75,7 +76,13 @@ pub(crate) enum FailureClass {
     /// endpoint refuses the same request, that stops being evidence about pacing and starts being
     /// evidence about the request (RFC-0028 §3d). Narrowing also happens to reduce load, so the
     /// escalation is benign even when the cause really was pacing.
-    RateLimited,
+    ///
+    /// `retry_after` carries the provider's own answer to "when should I come back", when it gave
+    /// one - Chainstack names it as `error.data.try_again_in`, and an HTTP 429 may carry
+    /// `Retry-After`. Honouring it is the same move as honouring a suggested *range* on
+    /// [`FailureClass::Narrowable`]: a number the provider just handed us beats a number we guessed.
+    /// `None` is the common case - most providers say nothing - and the caller keeps its own pacing.
+    RateLimited { retry_after: Option<Duration> },
     /// The request is fine, this endpoint is having a moment. Fail over, retry at the same width.
     Transient,
     /// This endpoint will not serve us until something changes outside the process. Long cooldown,
@@ -156,7 +163,8 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
         413 => FailureClass::Narrowable {
             suggested: suggested_range(body),
         },
-        429 => FailureClass::RateLimited,
+        // The `Retry-After` header is not visible here; `send_classified` fills it in.
+        429 => FailureClass::RateLimited { retry_after: None },
         // A 400 carrying cap language is a refusal to serve the *range*, not a malformed request.
         // Measured on Alchemy: `HTTP 400 {"error":{"code":-32602,"message":"Log response size
         // exceeded. You can make eth_getLogs requests with up to a 10,000 block range…"}}`.
@@ -203,7 +211,7 @@ fn batch_is_narrowable(err: &anyhow::Error) -> bool {
         // Auth and rate limits are positive findings about something other than size: splitting an
         // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
         // limit doubles the request count in exactly the wrong direction.
-        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited) => false,
+        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
         _ => true,
     }
 }
@@ -324,7 +332,9 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
     // Alchemy putting the HTTP status in the body.
     let code = err.get("code").and_then(Value::as_i64);
     if matches!(code, Some(429) | Some(-32005)) || RATE_LIMITED.iter().any(|p| msg.contains(p)) {
-        return FailureClass::RateLimited;
+        return FailureClass::RateLimited {
+            retry_after: retry_hint_of(err),
+        };
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
@@ -344,8 +354,8 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
 /// Pull a provider-suggested block range out of an error message.
 ///
 /// Alchemy answers an oversized `eth_getLogs` with *"…this block range should work: [0x1000000,
-/// 0x1007fff]"*. That is authoritative and precise, so honouring it turns a shrinking search into one
-/// corrective retry (RFC-0028 §5).
+/// 0x1007fff]"*. That is authoritative and precise, so honouring it turns a shrinking search into
+/// one corrective retry (RFC-0028 §5).
 ///
 /// Parsed defensively - this is provider prose, not a contract. A malformed or inverted pair yields
 /// `None` and the caller falls back to halving. Whether the range is actually *narrower* than what we
@@ -361,6 +371,84 @@ pub(crate) fn suggested_range(msg: &str) -> Option<(u64, u64)> {
     };
     let (from, to) = (parse(a)?, parse(b)?);
     (from <= to).then_some((from, to))
+}
+
+/// The longest provider-suggested pause we will actually take (#361).
+///
+/// A hint is advice, not an instruction. A provider answering `try_again_in: 3600s` should stall the
+/// run **loudly** rather than silently parking a backfill for an hour, so anything past this is
+/// logged and clamped rather than obeyed. Clamping down is safe because [`clamp_retry_hint`] floors
+/// the result at the caller's own pacing, so a shortened hint can never undercut it.
+pub(crate) const MAX_RETRY_HINT: Duration = Duration::from_secs(30);
+
+/// Clamp a provider's retry hint into `[own_pacing, MAX_RETRY_HINT]`, saying so when the cap bites
+/// (#361).
+///
+/// A hint is advice. Obeying `try_again_in: 3600s` verbatim would park a backfill for an hour with
+/// nothing in the log to explain the silence - so the pause is capped and the fact is recorded at
+/// `warn`, which is the difference between a run that stalls loudly and one that looks hung.
+///
+/// **`own_pacing` is a floor, and it is the half that is easy to forget.** A hint is only ever a
+/// reason to wait *longer* than we already would; it is never a licence to wait less. Without the
+/// floor, a provider or CDN answering `Retry-After: 0` - and they do - parses to `Some(0s)`, passes
+/// the cap untouched, and replaces our backoff with `sleep(0)`, so we would hammer a limiter with no
+/// pacing at all precisely while it was telling us we were over its limit. The cap protects the run
+/// from the provider; the floor protects the provider from us.
+pub(crate) fn clamp_retry_hint(hint: Duration, own_pacing: Duration) -> Duration {
+    let capped = if hint > MAX_RETRY_HINT {
+        tracing::warn!(
+            requested_s = hint.as_secs_f64(),
+            capped_s = MAX_RETRY_HINT.as_secs_f64(),
+            "provider asked us to wait longer than the cap; pausing for the cap instead - if this \
+             repeats, the plan's rate limit is the bottleneck, not a blip"
+        );
+        MAX_RETRY_HINT
+    } else {
+        hint
+    };
+    capped.max(own_pacing)
+}
+
+/// Parse a provider's "come back in" duration string into a [`Duration`].
+///
+/// Measured on Chainstack (2026-08-07), which answers an over-rate request with
+/// `{"code":-32005,"data":{"try_again_in":"560.270157ms"}}`. Go's duration syntax, so the unit is a
+/// suffix and the value may be fractional.
+///
+/// Parsed defensively - this is provider prose, not a contract. Anything unrecognised yields `None`
+/// and the caller keeps its own pacing, which is the behaviour every provider that says nothing
+/// already gets.
+pub(crate) fn parse_retry_hint(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    // Longest suffix first: `ms` must win over `s`, and `µs`/`us` over `s`.
+    const UNITS: &[(&str, f64)] = &[
+        ("ms", 1e-3),
+        ("us", 1e-6),
+        ("\u{b5}s", 1e-6),
+        ("ns", 1e-9),
+        ("m", 60.0),
+        ("h", 3600.0),
+        ("s", 1.0),
+    ];
+    let (value, secs_per_unit) = UNITS
+        .iter()
+        .find_map(|(suffix, mult)| raw.strip_suffix(suffix).map(|v| (v, *mult)))
+        // A bare number is seconds, matching `Retry-After`.
+        .unwrap_or((raw, 1.0));
+    let n: f64 = value.trim().parse().ok()?;
+    // NaN, negatives and absurd values are all "the provider said something we do not understand".
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(n * secs_per_unit).ok()
+}
+
+/// The `try_again_in` hint out of a JSON-RPC error object, if the provider sent one.
+fn retry_hint_of(err: &Value) -> Option<Duration> {
+    err.get("data")?
+        .get("try_again_in")
+        .and_then(Value::as_str)
+        .and_then(parse_retry_hint)
 }
 
 pub struct RpcClient {
@@ -506,7 +594,7 @@ impl RpcClient {
                     return Ok(v);
                 }
                 Err(e) => {
-                    if class_of(&e) == Some(FailureClass::RateLimited) {
+                    if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
                     self.record_failure(j, method, &e);
@@ -538,7 +626,7 @@ impl RpcClient {
                     return Ok(v);
                 }
                 Err(e) => {
-                    if class_of(&e) == Some(FailureClass::RateLimited) {
+                    if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
                     self.record_failure(j, "batch", &e);
@@ -567,6 +655,14 @@ impl RpcClient {
                 classified(FailureClass::Transient, format!("transport error: {e}"))
             })?;
         let status = resp.status();
+        // Read `Retry-After` before the body consumes the response (#361). Seconds-form only: the
+        // HTTP-date form needs a clock comparison to be meaningful, and no provider we have measured
+        // sends it on a 429.
+        let header_hint = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_hint);
         if !status.is_success() {
             // Read the body before classifying: a 413 can carry a suggested range, and the text is
             // what makes an otherwise opaque status actionable in the log.
@@ -588,6 +684,14 @@ impl RpcClient {
                     definite => definite,
                 },
                 None => classify_status(status.as_u16(), &text),
+            };
+            // The body's own `try_again_in` wins - it is the more specific statement, and the one
+            // Chainstack actually sends. `Retry-After` fills in when the body said nothing.
+            let class = match class {
+                FailureClass::RateLimited { retry_after: None } => FailureClass::RateLimited {
+                    retry_after: header_hint,
+                },
+                other => other,
             };
             let mut detail = format!("HTTP {status}");
             if !text.is_empty() {
@@ -1050,7 +1154,19 @@ impl RpcClient {
             // Linear rather than exponential: a compute-units-per-second budget refills on a clock, so
             // waiting longer than the window buys nothing, and the first pause should be short enough
             // that an isolated blip costs milliseconds.
-            tokio::time::sleep(std::time::Duration::from_millis(250 * (round as u64 + 1))).await;
+            //
+            // …but a guess is strictly worse than the number the provider just handed us (#361), and
+            // OBIB case 3 is 100,001 of these calls, where pacing is the only lever that helps. If the
+            // failure carried `try_again_in` or `Retry-After`, honour it instead.
+            let linear = Duration::from_millis(250 * (round as u64 + 1));
+            let pause = match last_err.as_ref().and_then(class_of) {
+                Some(FailureClass::RateLimited {
+                    retry_after: Some(hint),
+                }) => clamp_retry_hint(hint, linear),
+                // No hint, or a failure that was not a rate limit: our own pacing stands.
+                _ => linear,
+            };
+            tokio::time::sleep(pause).await;
         }
         // Same COR-3 reasoning as `block_timestamps`: a partial map must be an error rather than a
         // short map. A missing header would seal a *missing block row*, and "no row" is
@@ -1124,11 +1240,16 @@ impl RpcClient {
                 }
                 Err(e) => {
                     tracing::debug!("block_timestamps attempt {} failed: {e:#}", attempt + 1);
+                    // Same as `block_headers` (#361): prefer the provider's own number to our guess.
+                    let own_pacing = Duration::from_millis(200 * (attempt as u64 + 1));
+                    let pause = match class_of(&e) {
+                        Some(FailureClass::RateLimited {
+                            retry_after: Some(hint),
+                        }) => clamp_retry_hint(hint, own_pacing),
+                        _ => own_pacing,
+                    };
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        200 * (attempt as u64 + 1),
-                    ))
-                    .await;
+                    tokio::time::sleep(pause).await;
                 }
             }
         }
@@ -1641,7 +1762,7 @@ mod tests {
         // is unchanged: a lone 429 is not narrowable.
         assert_eq!(
             super::classify_status(429, ""),
-            super::FailureClass::RateLimited
+            super::FailureClass::RateLimited { retry_after: None }
         );
         assert!(!matches!(
             super::classify_status(429, ""),
@@ -2176,7 +2297,10 @@ mod tests {
             })
         };
         let terminal = classified(FailureClass::Terminal, "HTTP 401".into());
-        let limited = classified(FailureClass::RateLimited, "HTTP 429".into());
+        let limited = classified(
+            FailureClass::RateLimited { retry_after: None },
+            "HTTP 429".into(),
+        );
         assert!(!batch_is_narrowable(&terminal));
         assert!(!batch_is_narrowable(&limited));
 
@@ -2192,6 +2316,191 @@ mod tests {
 #[cfg(test)]
 mod rfc0036_tests {
     use super::*;
+
+    /// A provider that says **when** to come back is honoured instead of guessed at (#361).
+    ///
+    /// The payload is the one measured against Chainstack on 2026-08-07, verbatim from the issue.
+    /// Go duration syntax, so the unit is a suffix and the value is fractional.
+    #[test]
+    fn a_providers_own_retry_hint_is_parsed_from_the_error_body() {
+        let chainstack = serde_json::json!({
+            "code": -32005,
+            "message": "You've exceeded the RPS limit available on the current plan",
+            "data": {"try_again_in": "560.270157ms"}
+        });
+        let class = classify_rpc_error(&chainstack);
+        let FailureClass::RateLimited { retry_after } = class else {
+            panic!("a rate limit must classify as RateLimited, got {class:?}");
+        };
+        let hint = retry_after.expect("the provider named a time; it must not be discarded");
+        // Milliseconds, not seconds: reading `560.270157ms` as 560s would stall a backfill for nine
+        // minutes on what is a half-second pause.
+        assert!(
+            hint >= Duration::from_millis(560) && hint < Duration::from_millis(561),
+            "expected ~560ms, got {hint:?}"
+        );
+    }
+
+    /// Every unit shape a provider might send, and every shape that must be refused.
+    ///
+    /// Refusal matters as much as parsing: an unparseable hint has to fall back to our own pacing,
+    /// not to zero. A `Some(0s)` here would turn a rate limit into a hot loop against the limiter.
+    #[test]
+    fn retry_hints_parse_by_unit_and_refuse_nonsense() {
+        for (raw, expected_ms) in [
+            ("560.270157ms", 560),
+            ("1s", 1_000),
+            ("250ms", 250),
+            ("2m", 120_000),
+            ("1500ns", 0),
+            ("  3s  ", 3_000),
+            // Bare number is seconds, matching `Retry-After`.
+            ("5", 5_000),
+        ] {
+            let got = parse_retry_hint(raw).unwrap_or_else(|| panic!("{raw} must parse"));
+            assert_eq!(got.as_millis() as u64, expected_ms, "{raw}");
+        }
+        for raw in ["", "soon", "-1s", "NaN", "1 fortnight", "1e400s"] {
+            assert!(
+                parse_retry_hint(raw).is_none(),
+                "{raw:?} is not a duration we understand - it must fall back to our own pacing"
+            );
+        }
+    }
+
+    /// An absurd hint is capped rather than obeyed, so a backfill stalls loudly (#361).
+    #[test]
+    fn an_absurd_retry_hint_is_capped() {
+        let none = Duration::ZERO;
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            clamp_retry_hint(hour, none),
+            MAX_RETRY_HINT,
+            "obeying an hour-long hint would park a backfill with nothing to explain the silence"
+        );
+        // Anything within the cap passes through untouched - the provider knows its own limiter.
+        let modest = Duration::from_millis(560);
+        assert_eq!(clamp_retry_hint(modest, none), modest);
+    }
+
+    /// A hint may only ever make us wait **longer** than our own pacing, never less (#361).
+    ///
+    /// Without the floor, `Retry-After: 0` - which proxies and CDNs do send - parses to `Some(0s)`,
+    /// passes the cap untouched, and *replaces* the caller's backoff, so we would retry with no
+    /// pacing at all precisely while a limiter was telling us to slow down.
+    #[test]
+    fn a_retry_hint_can_never_undercut_our_own_pacing() {
+        let ours = Duration::from_millis(250);
+        for zero in ["0s", "0", "0ms", "0ns"] {
+            let hint = parse_retry_hint(zero).expect("a parseable zero is still a parse");
+            assert_eq!(
+                clamp_retry_hint(hint, ours),
+                ours,
+                "{zero:?} must floor to our own pacing, not turn a rate limit into a hot loop"
+            );
+        }
+        // A hint shorter than our pacing but non-zero is the same hazard, less obviously.
+        assert_eq!(clamp_retry_hint(Duration::from_millis(1), ours), ours);
+        // The floor must not become a floor on everything: a longer hint still wins.
+        let longer = Duration::from_millis(900);
+        assert_eq!(clamp_retry_hint(longer, ours), longer);
+        // Both bounds at once: capped from above, floored from below.
+        assert_eq!(
+            clamp_retry_hint(Duration::from_secs(3600), ours),
+            MAX_RETRY_HINT
+        );
+    }
+
+    /// The hint is actually **wired to the pause** - the half of #361 the parser tests do not reach.
+    ///
+    /// Deleting the honouring at both call sites, leaving parser, cap and classifier intact, left the
+    /// suite at 488 passed / 0 failed: the entire behavioural delta was invisible to its own tests.
+    /// That is our most-repeated failure - a criterion phrased as the absence of an effect passes
+    /// trivially when the mechanism is missing - so this asserts the effect instead.
+    ///
+    /// **Self-calibrating, deliberately.** The obvious version - one mock, assert elapsed exceeds a
+    /// fixed threshold - does not work under `start_paused`: reqwest's own 20s timeout is a tokio
+    /// timer too, so virtual time leaps through it while the runtime waits on a real socket and the
+    /// measurement is swamped (observed: 721s where the arithmetic says 35s). So run the same
+    /// scenario twice against mocks identical but for the header. Whatever the timeouts contribute,
+    /// they contribute to both, and the difference is the hint. Measured with the wiring deleted:
+    /// 467.168s vs 466.944s, a gap of 224ms.
+    ///
+    /// `block_headers` runs `ROUNDS = 8`, so seven pauses: ~7s of linear pacing without the hint,
+    /// ~35s with a 5s hint honoured. This also covers the `Retry-After` **header** path, which
+    /// nothing else exercises - neither mock sends `try_again_in`, so the header is the only source.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_retry_hint_actually_lengthens_the_pause() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+
+        async fn hinted() -> impl IntoResponse {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "5")],
+                "rate limited",
+            )
+        }
+        async fn bare() -> impl IntoResponse {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited")
+        }
+        async fn time_a_run(app: Router) -> Duration {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let client = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+            let start = tokio::time::Instant::now();
+            client
+                .block_headers(&[1])
+                .await
+                .expect_err("a permanently rate-limited endpoint must exhaust its rounds");
+            let elapsed = start.elapsed();
+            server.abort();
+            elapsed
+        }
+
+        let with_hint = time_a_run(
+            Router::new()
+                .route("/", post(hinted))
+                .route("/{*rest}", post(hinted)),
+        )
+        .await;
+        let without_hint = time_a_run(
+            Router::new()
+                .route("/", post(bare))
+                .route("/{*rest}", post(bare)),
+        )
+        .await;
+
+        // Seven pauses of (5s - linear) extra; worst case 7 x (5s - 1.75s) = 22.75s. Half of that is
+        // a wide margin that still cannot be reached by ignoring the hint.
+        let gap = with_hint.saturating_sub(without_hint);
+        assert!(
+            gap >= Duration::from_secs(11),
+            "the provider's 5s Retry-After was not honoured: hinted {with_hint:?} vs unhinted \
+             {without_hint:?} (gap {gap:?}). Identical mocks but for the header, so a real gap is \
+             the hint and no gap means the wiring is missing."
+        );
+    }
+
+    /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is
+    /// the common case: most providers say nothing, and inventing a number for them would be the
+    /// same guess this change removes.
+    #[test]
+    fn a_rate_limit_without_a_hint_carries_none() {
+        let bare = serde_json::json!({"code": -32005, "message": "rate limit exceeded"});
+        assert_eq!(
+            classify_rpc_error(&bare),
+            FailureClass::RateLimited { retry_after: None }
+        );
+        // A `data` block that exists but names something else must not be mined for a number.
+        let unrelated = serde_json::json!({"code": 429, "message": "too many requests", "data": {"plan": "free"}});
+        assert_eq!(
+            classify_rpc_error(&unrelated),
+            FailureClass::RateLimited { retry_after: None }
+        );
+    }
 
     /// A rate limit delivered **inside** a JSON-RPC error body must classify as `RateLimited`, not
     /// `Transient`.
@@ -2209,11 +2518,17 @@ mod rfc0036_tests {
             "message": "Your app has exceeded its compute units per second capacity. If you have \
                         retries enabled, you can safely ignore this message."
         });
-        assert_eq!(classify_rpc_error(&alchemy), FailureClass::RateLimited);
+        assert_eq!(
+            classify_rpc_error(&alchemy),
+            FailureClass::RateLimited { retry_after: None }
+        );
 
         // By message alone too, for a provider that does not set the numeric code.
         let by_message = serde_json::json!({"code": -32000, "message": "rate limit exceeded"});
-        assert_eq!(classify_rpc_error(&by_message), FailureClass::RateLimited);
+        assert_eq!(
+            classify_rpc_error(&by_message),
+            FailureClass::RateLimited { retry_after: None }
+        );
 
         // Chainstack: neither a 429 nor any phrase Alchemy uses. Matching one provider's spelling is
         // how this bug survives a provider switch, so both the code and the wording are covered.
@@ -2222,11 +2537,14 @@ mod rfc0036_tests {
             "message": "You've exceeded the RPS limit available on the current plan. Learn more how \
                         to increase the limit, visit https://docs.chainstack.com/docs/pricing"
         });
-        assert_eq!(classify_rpc_error(&chainstack), FailureClass::RateLimited);
+        assert_eq!(
+            classify_rpc_error(&chainstack),
+            FailureClass::RateLimited { retry_after: None }
+        );
 
         // And the consequence that actually matters: never split under one.
         let err = anyhow::Error::new(ClassifiedError {
-            class: FailureClass::RateLimited,
+            class: FailureClass::RateLimited { retry_after: None },
             detail: "429".into(),
         });
         assert!(
