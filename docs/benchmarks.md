@@ -118,4 +118,37 @@ Reports:
 Same house rule as the backfill matrix: numbers come from a committed `bench-report.json` with date,
 provider, hardware and commit, or they are not quoted. Run it before and after any change to the
 serving or storage path - a persistent DuckDB connection, a bounded hot scan, or a compact row format
-would all show up here first.
+would all show up here first. A `query` report carries `hardware` and `commit` but no `provider`,
+because it runs entirely offline against a store on disk: no endpoint is involved, and the machine is
+what makes two of these numbers comparable at all.
+
+### The point-read gate (issue #283)
+
+Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail the build, so
+`bench query` also takes limits, and exits non-zero when one is breached:
+
+```sh
+nuthatch bench query --dir <nest> --reads 8004 \
+  --min-reads 8004 --max-point-read-p50-us 200 --max-point-read-p99-us 2000
+```
+
+Pass none of them and the bench only reports, which is what an operator poking at their own nest
+wants. Pass any of them and it is a gate.
+
+**Always pass `--min-reads` alongside a ceiling.** A nest with nothing indexed samples no keys and
+reports `p50 = 0µs`, and zero is under every ceiling anyone would ever write - so a gate without a
+floor is greenest exactly when it has measured nothing. The `footprint` check learned the same lesson
+and asserts its row count before it compares a peak.
+
+CI runs this as the **`point-read latency`** job (`.github/workflows/point-read.sh`), on the same
+hermetic fixture the `footprint` job uses: `footprint-rpc.py` serves the chain, the nest is written
+inline, and every run indexes exactly 8,004 rows. No secret and no third party, so a fork's pull
+request can satisfy it, and a change in p99 is a change in nuthatch rather than in somebody's rate
+limiter. The report uploads as an artifact on every run, including a failing one.
+
+The ceilings (200µs p50, 2,000µs p99) are set to catch a *structural* regression - a scan where there
+was a seek, a per-read store open, a lock in the path - not to police the noise of a shared runner,
+where a point-read out of page cache measures single-digit microseconds. They tighten once a few
+releases' committed reports say what the spread across releases actually is.
+
+Baseline: `docs/bench/point-read.json`.
