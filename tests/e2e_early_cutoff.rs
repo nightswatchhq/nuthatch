@@ -171,7 +171,9 @@ async fn bring_up(
     heights
 }
 
-/// Every transfer a nest has decoded, hot and cold, in chain order.
+/// Every transfer a nest has sealed, in chain order. A nest that indexed nothing has no table at
+/// all, and that is an empty history rather than a broken fixture - reported as `[]` so the
+/// assertion that cares can say what it wanted instead of unwrapping a catalog error.
 fn transfers(dir: &Path, nest: &str) -> Vec<serde_json::Value> {
     analytics::query(
         dir,
@@ -180,7 +182,7 @@ fn transfers(dir: &Path, nest: &str) -> Vec<serde_json::Value> {
             transfer_table(nest)
         ),
     )
-    .unwrap()
+    .unwrap_or_default()
 }
 
 /// Install an edited copy of a dataset's inputs under the identity they now hash to - what any
