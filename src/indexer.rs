@@ -5600,6 +5600,111 @@ template = "pool"
         assert!(calls.iter().all(|(_, f, t)| *f == 7 && *t == 7));
     }
 
+    /// The same recovery, but reached the way production reaches it: through the real
+    /// [`runtime_index_loop`], whose cap branch is the only caller that matters. The unit test above
+    /// proves the recovery works; this one proves the tip loop takes it - a distinction worth a test,
+    /// because deleting the call site leaves that test green and the operator's nest dead.
+    ///
+    /// Against `main` this hangs on the poll and fails on the deadline: the cursor quarantines the
+    /// factory nest terminally and block 7 is never indexed by anyone.
+    #[tokio::test]
+    async fn the_tip_loop_takes_the_cap_recovery_rather_than_quarantining() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+
+        let token = "0x0000000000000000000000000000000000000011";
+        let factory_addr = "0x0000000000000000000000000000000000000022";
+        let child = "0x0000000000000000000000000000000000000033";
+        let pad = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
+        let source: Arc<dyn Source> = Arc::new(CappedSource {
+            logs: vec![
+                crate::rpc::Log {
+                    address: factory_addr.into(),
+                    topics: vec![nest_topic0(&fact, "fac__child_created"), pad(child)],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt1".into(),
+                    log_index: 0,
+                },
+                crate::rpc::Log {
+                    address: child.into(),
+                    topics: vec![nest_topic0(&fact, "child__ping")],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt2".into(),
+                    log_index: 1,
+                },
+                crate::rpc::Log {
+                    address: token.into(),
+                    topics: vec![
+                        nest_topic0(&stat, "tok__transfer"),
+                        pad("0x00000000000000000000000000000000000000aa"),
+                        pad("0x00000000000000000000000000000000000000bb"),
+                    ],
+                    data: format!("0x{:064x}", 42u64),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt3".into(),
+                    log_index: 2,
+                },
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // Keep the stores; the loop takes the nests.
+        let fact_store = fact.store.clone();
+        let stat_store = stat.store.clone();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        // `--backfill 0` starts both nests at the tip, and a 1-block window puts the cursor straight
+        // on block 7 with nothing left to shrink - the exact `global_next >= to` corner COR-5 lives in.
+        let loop_task = tokio::spawn(runtime_index_loop(
+            source.clone(),
+            vec![stat, fact],
+            Some(0),
+            false,
+            1,
+            1,
+            health.clone(),
+            false,
+            None,
+        ));
+
+        // Poll rather than sleep a fixed time: the loop is a real tip-follower and this is the only
+        // honest way to wait for it. A dead cursor fails here on the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut fact_rows = Vec::new();
+        while std::time::Instant::now() < deadline {
+            fact_rows = fact_store.entities_in_range(7, 7).unwrap();
+            if fact_rows.iter().any(|r| r.contains("child__ping")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        loop_task.abort();
+
+        assert!(
+            fact_rows.iter().any(|r| r.contains("child__ping")),
+            "the tip loop must recover the over-cap block, children and all: {fact_rows:?}"
+        );
+        assert_eq!(
+            health.json_for("f").0,
+            "indexing",
+            "the factory nest must not be quarantined on the operator's health surface"
+        );
+        assert!(
+            stat_store
+                .entities_in_range(7, 7)
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("tok__transfer")),
+            "the static co-tenant indexes the same block off the same narrowed fetch"
+        );
+    }
+
     /// The other side of the "not both, and not neither" rule: when the narrowed fetch cannot clear the
     /// cap either, the factory nest is quarantined **terminally**, and the log the operator reads names
     /// the two things that would actually fix it. The static co-tenant is still not faulted for it.
