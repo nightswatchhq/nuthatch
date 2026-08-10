@@ -552,7 +552,7 @@ poller into a service-wide outage.
 For operators who need per-caller rate limiting, the right place is the reverse proxy in front:
 
 ```caddyfile
-# Caddy (github.com/mholt/caddy-ratelimit or the official rate_limit directive)
+# Caddy with mholt/caddy-ratelimit (compile with xcaddy; not in the stock binary)
 your-domain.example {
     reverse_proxy localhost:8288
 
