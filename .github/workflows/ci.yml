@@ -386,13 +386,27 @@ jobs:
         env:
           BIN: bin/nuthatch
           MAX_RSS_MB: "2048"
-          # 180 = max observed (143) + 25%, over 15 runs of this exact scenario on a 32-core Linux
-          # box, spanning two bases: 111, 132, 133 x7, 134, 140, 141, 141, 143. Quiet on that spread,
-          # red on a >26% regression. Re-derive with scripts/multinest-rss-spread.sh before ever
-          # moving it - a threshold picked from a single run is folklore.
+          # 180, with BOTH halves measured on this runner - the baseline it must stay above and the
+          # regression it must catch:
           #
-          # These are one box's numbers and the runner is a 2-vCPU machine, so re-baseline from this
-          # job's own uploaded reports once runs exist on the hardware that enforces it.
+          #   runner baseline           131 MB     ceiling is 1.37x above it
+          #   REGRESSION_MB             180 MB
+          #   runner, with a real leak  323 MB     ceiling is 1.79x below it
+          #
+          # The spread behind the baseline is 15 runs on a 32-core box across two bases - 111, 132,
+          # 133 x7, 134, 140, 141, 141, 143 - so an 8 MB band with the runner sitting inside it.
+          # Re-derive with scripts/multinest-rss-spread.sh before ever moving this; a threshold picked
+          # from a single run is folklore.
+          #
+          # The regression half was measured by probe PR #404: a synthetic retention leak in the
+          # multi-nest fan-out, which reported **323 MB on the runner and 323 MB on the 32-core box**.
+          # Worth knowing *why* they agree, because the sister gate does not behave this way. The
+          # #283 point-read ceiling was set from a dev-box mutation and lost a third of its assumed
+          # margin on the runner, because a cache-resident scan is a memory walk that does not scale
+          # with cores. This regression is data-size-driven over a deterministic fixture - identical
+          # 240,200 rows on both machines - so it lands on the same number either side. Do not
+          # generalise from this gate to that one, in either direction: measure both halves where the
+          # gate runs.
           REGRESSION_MB: "180"
           NESTS: "20"
           LOGS_PER_BLOCK: "10"
