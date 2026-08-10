@@ -358,6 +358,19 @@ impl Source for TapeSource {
 /// `finalized()` controls sealing) plus `abis/erc20.json` copied from the vendored example ABI. Returns
 /// the loaded [`Config`]. One `Transfer`-only ERC-20 contract at `address`, backfilling from block 1.
 pub fn scaffold_nest(dir: &Path, name: &str, address: &str) -> Config {
+    scaffold_nest_on_chain(dir, name, address, "arbitrum-one")
+}
+
+/// [`scaffold_nest`] on a named chain rather than the default `arbitrum-one`.
+///
+/// A multichain test needs its cursors to differ in the field the runtime keys them by: health
+/// quarantines a *cursor* by chain name (`RuntimeHealth::quarantine_cursor`), so two nests scaffolded
+/// on one chain share a cursor's fate whatever the test intended. `base` is the only other registered
+/// chain with the same `FinalizedTag` finality, so sealing behaves identically on both.
+pub fn scaffold_nest_on_chain(dir: &Path, name: &str, address: &str, chain: &str) -> Config {
+    let chain_id = nuthatch::chains::lookup(chain)
+        .unwrap_or_else(|| panic!("chain '{chain}' is not in the registry"))
+        .chain_id;
     let abi_dir = dir.join("abis");
     std::fs::create_dir_all(&abi_dir).expect("create abis dir");
     let example_abi = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/erc20.json");
@@ -367,8 +380,8 @@ pub fn scaffold_nest(dir: &Path, name: &str, address: &str) -> Config {
     let toml = format!(
         r#"[nest]
 name = "{name}"
-chain = "arbitrum-one"
-chain_id = 42161
+chain = "{chain}"
+chain_id = {chain_id}
 rpc_urls = []
 
 [[contracts]]
