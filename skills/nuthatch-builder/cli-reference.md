@@ -61,10 +61,13 @@ Measure the read path: entity point-read latency (p50/p99) and the `/sql` hot∪
 
 - `--dir <DIR>` - Nest directory (must contain an indexed `nuthatch.redb`). Stop `dev` first - the bench opens the store directly
 - `--sql <SQL>` - The `/sql` query to time (over hot∪cold). Defaults to `SELECT count(*)` on the largest hot table - the full-tip-materialising scan whose cost is the #1 RAM risk on deep-finality L2s
-- `--reads <READS>` - Entity point-reads to time (keys sampled evenly across the hot store)
+- `--reads <READS>` - Entity point-reads to time (keys in chain order from the oldest - a prefix, so set this at or above the hot row count to cover the whole store)
 - `--iters <ITERS>` - `/sql` query repetitions to time (the report is the p50/p99 across them)
 - `--out <OUT>` - Write the bench-report JSON here. Prints to stdout regardless
 - `--label <LABEL>` - A label for the report (e.g. "R1: horizon tip 12k rows")
+- `--max-point-read-p50-us <MAX_POINT_READ_P50_US>` - Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only reports; passed, it is a gate (CI uses it - CLAUDE.md: benchmark regressions fail the build)
+- `--max-point-read-p99-us <MAX_POINT_READ_P99_US>` - Fail if the entity point-read p99 exceeds this many microseconds
+- `--min-reads <MIN_READS>` - Fail unless at least this many point-reads were actually timed. **Pass this whenever you pass a ceiling.** An empty nest samples no keys and reports p50 = 0µs, which is under every ceiling anyone would set - so without a floor the gate passes most confidently when it has measured nothing at all
 
 ## `nuthatch check`
 
