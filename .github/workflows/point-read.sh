@@ -76,7 +76,18 @@ TIP=20000
 # therefore failed *every* run: it was reasoned from the backfill size rather than run. 256 is what
 # the fixture actually leaves hot. If nuthatch's finality or sealing changes, this goes red and wants
 # a human, which is the correct outcome rather than a silently shrinking sample.
-HOT_EXPECT=$(( 64 * 4 ))
+#
+# Named rather than left as a bare `64 * 4`, because both numbers are quotations from elsewhere and a
+# reader who cannot see the source cannot check them: mainnet is `Finality::Depth(64)`
+# (`src/chains.rs:77`) and the mock serves `LOGS_PER_BLOCK = 4` (`footprint-rpc.py:25`) up to a fixed
+# `TIP = 20_000`, so the settled hot tip is blocks 19937..=20000.
+#
+# It is a **floor, not an equality**. A run whose seal loop has not caught up holds *more* than this,
+# never fewer, so the check is satisfied at any point after the backfill completes rather than only in
+# the settled state. Asserting equality would turn the seal loop's timing into a flaky gate.
+FINALITY_DEPTH=64
+LOGS_PER_BLOCK=4
+HOT_EXPECT=$(( FINALITY_DEPTH * LOGS_PER_BLOCK ))
 
 "$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$DIR/dev.log" 2>&1 &
 DEV_PID=$!
