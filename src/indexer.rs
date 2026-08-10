@@ -1497,11 +1497,13 @@ async fn build_nest(
             &dir,
             store.as_ref(),
             &registry,
-            &labels,
-            &balances,
-            &exposure,
-            velocity_cfg.map(|(_, w)| w),
-            &velocity,
+            &DerivedViews {
+                labels: &labels,
+                balances: &balances,
+                exposure: &exposure,
+                velocity: &velocity,
+                velocity_window: velocity_cfg.map(|(_, w)| w),
+            },
         ) {
             tracing::warn!("view rebuild failed (will re-derive as it indexes): {e:#}");
         }
@@ -2750,11 +2752,13 @@ impl NestIngest {
                     &self.dir,
                     &self.store,
                     &self.registry,
-                    &self.labels,
-                    &self.balances,
-                    &self.exposure,
-                    self.velocity_cfg.map(|(_, w)| w),
-                    &self.velocity,
+                    &DerivedViews {
+                        labels: &self.labels,
+                        balances: &self.balances,
+                        exposure: &self.exposure,
+                        velocity: &self.velocity,
+                        velocity_window: self.velocity_cfg.map(|(_, w)| w),
+                    },
                 ) {
                     tracing::warn!("view rebuild after seal-direct failed: {e:#}");
                 }
@@ -3528,6 +3532,20 @@ fn velocity_retraction_batch(
     batch
 }
 
+/// The derived IVM views a restart has to reconstruct, and the two things that decide whether each is
+/// fed at all. They travel together because they are always rebuilt together, off one pass over the
+/// same facts - passed singly they made `rebuild_views` an eight-argument function.
+#[derive(Clone, Copy)]
+struct DerivedViews<'a> {
+    /// Exposure joins transfers against this; empty means the view can only ever be empty.
+    labels: &'a LabelSet,
+    balances: &'a BalanceView,
+    exposure: &'a ExposureView,
+    velocity: &'a VelocityView,
+    /// `Some(window)` only when a velocity flag is configured (RFC-0008 C3).
+    velocity_window: Option<u64>,
+}
+
 /// Rebuild every derived IVM view - balances, exposure and velocity - from stored facts, in a single
 /// pass over the hot store.
 ///
@@ -3554,12 +3572,16 @@ fn rebuild_views(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
-    labels: &LabelSet,
-    balances: &BalanceView,
-    exposure: &ExposureView,
-    velocity_window: Option<u64>,
-    velocity: &VelocityView,
+    into: &DerivedViews<'_>,
 ) -> Result<()> {
+    let DerivedViews {
+        labels,
+        balances,
+        exposure,
+        velocity,
+        velocity_window,
+    } = *into;
+
     // Each transfer table with its (from, to, value) column names - which vary by token (USDC:
     // from/to/value; WETH: src/dst/wad), so we read them from the registry, never hardcode them.
     // Velocity uses the same list and simply ignores `to`.
@@ -3594,7 +3616,8 @@ fn rebuild_views(
     let mut cold_exposure = 0usize;
     let mut cold_velocity = 0usize;
     for (table, from_col, to_col, val_col) in &transfer_tables {
-        match crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through) {
+        match crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through)
+        {
             Ok(nets) => {
                 cold_balances += nets.len();
                 for (addr, net) in nets {
@@ -5962,7 +5985,9 @@ rpc_urls = ["https://rpc.example"]
         let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
         DecodeRegistry::build(vec![crate::registry::ContractSpec {
             alias: "usdc".into(),
-            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse().unwrap(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
             abi,
             events: Vec::new(),
         }])
@@ -5981,7 +6006,11 @@ rpc_urls = ["https://rpc.example"]
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join(crate::labels::LABELS_DIR);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("snap.json"), serde_json::to_string(&entries).unwrap()).unwrap();
+        std::fs::write(
+            d.join("snap.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
         crate::labels::load(dir.path())
     }
 
@@ -6012,12 +6041,18 @@ rpc_urls = ["https://rpc.example"]
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         for (b, li, from, to, val) in fixture {
             store
-                .put_entity(&Store::entity_key(b, li), &transfer_row(b, li, from, to, val))
+                .put_entity(
+                    &Store::entity_key(b, li),
+                    &transfer_row(b, li, from, to, val),
+                )
                 .unwrap();
         }
         let registry = erc20_registry();
         let labels = labelset(&[(MIXER, "mixer")]);
-        assert!(!labels.is_empty(), "fixture needs labels or exposure no-ops");
+        assert!(
+            !labels.is_empty(),
+            "fixture needs labels or exposure no-ops"
+        );
 
         // Under test: one pass, all three views.
         let balances = BalanceView::start().unwrap();
@@ -6027,11 +6062,13 @@ rpc_urls = ["https://rpc.example"]
             dir.path(),
             &store,
             &registry,
-            &labels,
-            &balances,
-            &exposure_v,
-            Some(WINDOW),
-            &velocity_v,
+            &DerivedViews {
+                labels: &labels,
+                balances: &balances,
+                exposure: &exposure_v,
+                velocity: &velocity_v,
+                velocity_window: Some(WINDOW),
+            },
         )
         .unwrap();
 
