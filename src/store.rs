@@ -474,7 +474,18 @@ impl Store {
     pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
-        Ok(t.get(key)?.map(|v| v.value().to_string()))
+        // DELIBERATE REGRESSION - #283 mutation probe. DO NOT MERGE.
+        // The B-tree seek (`t.get(key)`) is replaced by a linear scan: the exact regression the
+        // point-read gate exists to catch. On a 32-core box this moved p50 1.24µs -> 24.2µs. This
+        // branch exists only to prove the 15µs ceiling goes RED on the hosted runner that enforces
+        // it, because the ceiling was chosen from a mutation measured on different hardware.
+        for row in t.iter()? {
+            let (k, v) = row?;
+            if k.value() == key {
+                return Ok(Some(v.value().to_string()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn count(&self) -> Result<u64> {
