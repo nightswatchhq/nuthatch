@@ -658,9 +658,24 @@ pub fn holds_data(dir: &Path) -> bool {
 ///   a subset of the set the NID excludes, so the destination's identity is the same after adoption as
 ///   before. An adoption that moved the identity would be a drift report a moment later.
 ///
-/// Returns what was adopted, for logging. A failed copy is an error: half a dataset is worse than
-/// none, and the re-index it replaces is still available once the fault is fixed.
+/// - **All of it, or none of it.** [`crate::blob::DERIVED_STATE`] is copied into a staging sibling
+///   first and committed by rename, so a fault part-way through leaves the destination exactly as it
+///   was: inputs only, `holds_data` false, adoptable again on the next start. Copying straight in
+///   would be worse than not adopting at all - a complete store carrying `sealed_through = N` beside
+///   a partial `segments/` is a permanent hole in `/sql` that nothing ever repairs, because the
+///   destination now holds data and can neither adopt nor backfill from the start block.
+///
+/// Returns what was adopted, for logging. A failed copy is an error, and the re-index it replaces is
+/// genuinely still available once the fault is fixed.
 pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Adoption>> {
+    // A staging directory left behind means a previous adoption died mid-copy. It is scratch that
+    // nothing outside this function reads, and clearing it before the `holds_data` check is what
+    // makes a killed adoption recoverable rather than merely a failed one.
+    let staging = adopt_staging(dataset);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("clearing stale adoption staging {}", staging.display()))?;
+    }
     if !dataset.is_dir() || holds_data(dataset) {
         return Ok(None);
     }
@@ -672,30 +687,84 @@ pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Ad
     let Some((from_nid, from)) = adoptable(root, &want, nid) else {
         return Ok(None);
     };
+    let outcome = stage_derived_state(&from, &staging)
+        .and_then(|staged| commit_derived_state(&staging, dataset, &staged));
+    // Scratch in every outcome. If this removal fails, the next start clears it before deciding
+    // anything, so a leftover staging directory can never read as an adoption that happened.
+    let _ = std::fs::remove_dir_all(&staging);
+    outcome.with_context(|| format!("adopting {} into {}", from.display(), dataset.display()))?;
+    Ok(Some(Adoption {
+        nid: nid.to_string(),
+        from_nid,
+    }))
+}
+
+/// Where an adoption assembles its copy before committing it: a sibling of the destination, so the
+/// commit is a same-filesystem rename rather than a second copy.
+///
+/// The suffix keeps it out of [`adoptable`]'s scan, which takes 64-hex names only - a staging
+/// directory must never be a candidate for anything.
+fn adopt_staging(dataset: &Path) -> PathBuf {
+    let mut name = dataset.file_name().unwrap_or_default().to_os_string();
+    name.push(".adopting");
+    dataset.with_file_name(name)
+}
+
+/// Copy the source's derived state into `staging`, returning the names that actually landed there.
+///
+/// Nothing here touches `dataset`. That is the whole point: every way this can fail - disk full,
+/// permissions, an unreadable segment - leaves the destination untouched.
+fn stage_derived_state(from: &Path, staging: &Path) -> Result<Vec<&'static str>> {
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("cannot create {}", staging.display()))?;
+    let mut staged = Vec::new();
     for name in crate::blob::DERIVED_STATE {
         let src = from.join(name);
         if !src.exists() {
             continue;
         }
-        let dst = dataset.join(name);
+        let dst = staging.join(name);
         if src.is_dir() {
             crate::project::copy_dir(&src, &dst)
         } else {
             std::fs::copy(&src, &dst).map(|_| ()).map_err(Into::into)
         }
-        .with_context(|| {
-            format!(
-                "adopting {} from {} into {}",
-                name,
-                from.display(),
-                dataset.display()
-            )
-        })?;
+        .with_context(|| format!("staging {} from {}", name, src.display()))?;
+        staged.push(*name);
     }
-    Ok(Some(Adoption {
-        nid: nid.to_string(),
-        from_nid,
-    }))
+    Ok(staged)
+}
+
+/// Move the staged set into the destination, unwinding what already moved if one of them fails.
+///
+/// These are metadata-only renames within one directory tree, so this is the narrow end of the
+/// funnel by design - the copy, which is the part that runs out of disk, is already done.
+fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str]) -> Result<()> {
+    let mut moved: Vec<&'static str> = Vec::new();
+    for name in staged {
+        let Err(e) = std::fs::rename(staging.join(name), dataset.join(name)) else {
+            moved.push(name);
+            continue;
+        };
+        let mut err = anyhow::Error::new(e).context(format!("committing {name}"));
+        for done in moved.iter().rev() {
+            let landed = dataset.join(done);
+            let undo = if landed.is_dir() {
+                std::fs::remove_dir_all(&landed)
+            } else {
+                std::fs::remove_file(&landed)
+            };
+            if let Err(u) = undo {
+                err = err.context(format!(
+                    "and {done} could not be unwound ({u}) - {} may now hold a partial adoption and \
+                     must be emptied by hand before it will index correctly",
+                    dataset.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Resolve every mounted dataset to `(route key, directory, config)` - the list the cursors are built
@@ -717,8 +786,9 @@ pub fn load_mounted(
             match adopt_dataset(dir, &ds.dir, nid) {
                 Ok(Some(a)) => tracing::info!("early cutoff: {a}"),
                 Ok(None) => {}
-                // A dataset that could not adopt still indexes - slowly, and correctly. Refusing to
-                // start over a failed optimisation would turn a disk-full into an outage.
+                // A dataset that could not adopt still indexes - slowly, and correctly, because
+                // `adopt_dataset` is all-or-nothing and has left it inputs-only. Refusing to start
+                // over a failed optimisation would turn a disk-full into an outage.
                 Err(e) => tracing::warn!(
                     "{} could not adopt an existing dataset ({e:#}) - it will index from its start block",
                     ds.canonical()
@@ -2051,6 +2121,84 @@ mod tests {
         assert!(
             !dest.join(crate::config::DB_FILE).exists(),
             "and nothing must have been copied into it"
+        );
+    }
+
+    /// Adoption is all-or-nothing, and a half-copied one is the failure this guards.
+    ///
+    /// `DERIVED_STATE` is `[nuthatch.redb, segments]`. Copying them into the destination in order
+    /// means a fault while `segments/` is in flight leaves a **complete** store carrying
+    /// `sealed_through = N` beside a **partial** `segments/`. Rows up to `N` were pruned from hot
+    /// when they sealed, so they now exist only in the segments that never arrived; indexing resumes
+    /// from the copied `last_block` and never re-fetches them; and `holds_data` is true, so the
+    /// dataset can neither adopt again nor start over. `/sql` answers with a permanent silent hole.
+    ///
+    /// The fault injected here is a dangling symlink inside the source's `segments/`, which is a
+    /// deterministic stand-in for the disk-full this exists for: `copy_dir` reaches it after the
+    /// store has already been copied, and fails. What must survive it is the destination being back
+    /// to inputs-only - and *actually* adoptable, which the second half asserts by clearing the
+    /// fault and adopting for real.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_adoption_leaves_the_dataset_inputs_only_and_still_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        std::fs::create_dir_all(src.join("segments")).unwrap();
+        std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        // Injected after the sibling is staged, so only the adoption trips over it. Copied after the
+        // store, and unreadable: `fs::copy` on a dangling symlink fails with ENOENT.
+        std::os::unix::fs::symlink("nowhere", src.join("segments").join("9999.parquet")).unwrap();
+
+        let err = adopt_dataset(root, &dest, &new).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("adopting"),
+            "the failure must name the adoption, got: {err:#}"
+        );
+        assert!(
+            !holds_data(&dest),
+            "a failed adoption must leave the dataset inputs-only, not half a dataset it can never \
+             repair - found {:?}",
+            crate::blob::DERIVED_STATE
+                .iter()
+                .filter(|n| dest.join(n).exists())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::blob::nest_nid(&dest).unwrap(),
+            new,
+            "and it must not have moved the identity on the way out"
+        );
+
+        // "The re-index it replaces is still available once the fault is fixed" - as a claim that is
+        // checked, not one the doc comment merely makes.
+        std::fs::remove_file(src.join("segments").join("9999.parquet")).unwrap();
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            Some(Adoption {
+                nid: new.clone(),
+                from_nid: old.clone()
+            }),
+            "the next start must adopt, or the failure was permanent after all"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("segments").join("0000.parquet")).unwrap(),
+            "sealed rows",
+            "and the whole set must arrive, not just the store"
+        );
+        assert!(
+            !adopt_staging(&dest).exists(),
+            "staging is scratch and must not outlive the adoption"
         );
     }
 
