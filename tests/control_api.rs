@@ -180,6 +180,12 @@ async fn workers_are_listed_with_their_budgets() {
 
 /// With a token configured, **every** state-changing and state-revealing route demands it. A control
 /// plane that authenticated writes but leaked the fleet's shape would still be a disclosure.
+///
+/// The list below is every non-`/health` entry in [`routes`], method by method, and it has to stay
+/// that way: a route added there and forgotten here is a guard nothing pins, which this project treats
+/// as a guard that is deletable with the suite green (#292). It previously covered five of the nine,
+/// and the four it omitted were `resolve`, `pin` and **both halves of the secrets API** - the most
+/// sensitive routes on the surface.
 #[tokio::test]
 async fn every_route_demands_the_token_when_one_is_set() {
     let Some((app, _)) = fixture(Some("s3cret")) else {
@@ -191,6 +197,21 @@ async fn every_route_demands_the_token_when_one_is_set() {
         ("GET", "/plan", None),
         ("DELETE", "/nests/x", None),
         ("POST", "/nests", Some(r#"{"name":"a","chain":"c"}"#)),
+        ("GET", "/nests/x/resolve", None),
+        // Bodies have to deserialize: axum runs the `Json` extractor before the handler, so a
+        // malformed one would 422 and the assertion would pass for the wrong reason.
+        (
+            "PUT",
+            "/nests/x/pin",
+            Some(r#"{"version":"1","bundle_hash":"0xabc"}"#),
+        ),
+        ("GET", "/nests/x/secrets", None),
+        (
+            "PUT",
+            "/nests/x/secrets",
+            Some(r#"{"key":"k","value":"v"}"#),
+        ),
+        ("DELETE", "/nests/x/secrets/k", None),
     ] {
         let (s, _) = call(&app, method, uri, body).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {uri} was unguarded");
