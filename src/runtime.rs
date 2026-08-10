@@ -628,14 +628,33 @@ pub fn adoptable(
     })
 }
 
-/// Does this dataset hold indexed state of its own - a hot store, or sealed segments?
+/// Does this dataset hold indexed state of its own - a hot store with rows in it, or sealed segments?
 ///
 /// The question adoption turns on in both directions: a destination that holds data must never be
 /// written over, and a source that holds none is not worth adopting.
+///
+/// **It asks about data, not about files** (issue #408). This was a presence check over
+/// [`crate::blob::DERIVED_STATE`], and both of those paths appear before anything has been indexed:
+/// `Store::open` creates and commits an empty `nuthatch.redb` as soon as a cursor starts, and
+/// `segments/` is created before the first segment lands in it. So a runtime that was started and
+/// stopped before its first block left a dataset that read as holding data, which cost both sides of
+/// the decision: an empty candidate was adopted and consumed the one chance to adopt the sibling that
+/// held the real history, and a destination that had once been started could never adopt again.
+///
+/// **An unreadable store counts as holding data.** The two directions want opposite defaults - the
+/// destination must never be written over on a maybe, the candidate is merely not worth adopting -
+/// and the destination's is the one where being wrong destroys something. Costing a re-index is the
+/// cheaper way to be wrong.
 pub fn holds_data(dir: &Path) -> bool {
-    crate::blob::DERIVED_STATE
-        .iter()
-        .any(|n| dir.join(n).exists())
+    // Sealed segments are data and need no lock to see. An *empty* `segments/` is not data.
+    if std::fs::read_dir(dir.join("segments"))
+        .map(|mut e| e.next().is_some())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let db = dir.join(crate::config::DB_FILE);
+    db.exists() && crate::store::store_holds_rows(&db).unwrap_or(true)
 }
 
 /// Early cutoff on the **mount path** (RFC-0033 §5, issue #364).
@@ -2224,6 +2243,71 @@ mod tests {
             adopt_dataset(root, &dest, &new).unwrap(),
             None,
             "adopting an empty dataset reports a cutoff and still re-indexes"
+        );
+    }
+
+    /// Issue #408, the candidate side. The case above covers a dataset with **no** store file; this
+    /// one covers a dataset with a store file that holds nothing, which is what a runtime started and
+    /// stopped before its first block leaves behind. A presence check cannot tell the two apart, and
+    /// the empty one is the case that actually occurs in the field.
+    #[test]
+    fn a_dataset_whose_store_was_created_but_never_written_is_not_an_adoption_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        // A real redb, opened the way a starting cursor opens it, and closed before it indexed
+        // anything. Scoped so the handle is dropped: redb holds a file lock for as long as it lives.
+        {
+            crate::store::Store::open(
+                &MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            )
+            .expect("an empty store must be creatable");
+        }
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a store that was created and never written holds no history, so adopting it burns the \
+             one chance to adopt on nothing"
+        );
+    }
+
+    /// Issue #408, the destination side, and the lasting half of it. An interrupted start leaves the
+    /// destination with an empty store of its own; under a presence check that dataset then read as
+    /// holding data and could **never** adopt again, including from the sibling that holds the real
+    /// history. The cost was permanent rather than one-off, which is what made it worth fixing.
+    #[test]
+    fn an_interrupted_start_does_not_cost_a_dataset_its_cutoff() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        std::fs::create_dir_all(src.join("segments")).unwrap();
+        std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        // The interrupted start: a cursor came up here once, created its store, and got nowhere.
+        {
+            crate::store::Store::open(&dest.join(crate::config::DB_FILE))
+                .expect("an empty store must be creatable");
+        }
+        // The other path the same interrupted start leaves behind, which #408 flagged and did not
+        // trace: `segments/` is created before the first segment is written into it.
+        std::fs::create_dir_all(dest.join("segments")).unwrap();
+
+        let adoption = adopt_dataset(root, &dest, &new)
+            .unwrap()
+            .expect("an empty store is not history, so it must not block the cutoff");
+        assert_eq!(adoption.from_nid, old);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history",
+            "and the adopted store must replace the empty one"
         );
     }
 
