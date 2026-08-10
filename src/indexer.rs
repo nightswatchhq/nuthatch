@@ -577,6 +577,180 @@ fn topic0_only_culprits<'a>(nests: impl Iterator<Item = (usize, &'a NestIngest)>
         .collect()
 }
 
+/// The address filter to retry a cap-breached topic0-only union fetch with (COR-5).
+///
+/// [`union_filter`] drops the address filter entirely for a factory nest, because a factory nest does
+/// not know its children up front. But it is not true that *nothing* is known: a factory nest knows its
+/// declared base contracts (the emitters of the creation events) and every child discovered so far. So
+/// the narrowed filter is, per live nest, the static nest's own addresses or the factory nest's
+/// `base ∪ discovered children` - which is exactly the filter
+/// [`backfill_direct_factory`]'s pass 1 uses, brought to the tip loop.
+///
+/// This is strictly narrower than "any address", so it is worth trying against a provider cap the wide
+/// fetch just broke. It is not *equivalent* on its own: it cannot see a child created in this very
+/// block, which is why the caller pairs it with the same in-block discovery fixpoint the backfill path
+/// runs ([`refetch_address_filtered`]).
+///
+/// Returns empty when there is nothing to narrow *to* - a factory nest with no base contracts and no
+/// discovered children. An empty list means "any address" to `getLogs`, i.e. the identical fetch, so
+/// the caller must treat empty as "no fallback available" rather than issuing it.
+fn narrowed_union_addresses<'a>(nests: impl Iterator<Item = &'a NestIngest>) -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+    for n in nests {
+        // An empty address list is the factory / topic0-only signal (see `build_nest`).
+        let nest_addrs: Vec<String> = if n.addresses.is_empty() {
+            n.registry
+                .addresses()
+                .iter()
+                .map(|a| format!("0x{}", hex::encode(a)))
+                .chain(n.children.addresses().iter().map(|c| c.to_string()))
+                .collect()
+        } else {
+            n.addresses.clone()
+        };
+        for a in nest_addrs {
+            if !addr_in(&addrs, &a) {
+                addrs.push(a);
+            }
+        }
+    }
+    addrs
+}
+
+/// Refetch one over-cap block with an address filter instead of topic0-only, running the in-block
+/// child-discovery fixpoint so the result is what the wide fetch would have yielded (COR-5).
+///
+/// Per round: fetch, decode the batch into every factory nest's child registry (discovery only - the
+/// rows are discarded, [`NestIngest::process_window`] does the authoritative decode), then refetch the
+/// same block for children discovered in this round but not yet fetched. Nested factories converge here
+/// exactly as they do in [`backfill_direct_factory`], and the loop terminates because every round adds
+/// strictly-new addresses to a set that only grows from decoded events (and `FactorySet::build` caps the
+/// chain at depth 3).
+///
+/// **Discovery is preserved, not traded away.** A child created in this block announces itself from its
+/// factory's address, which round 1 fetched, so round 2 picks up its own logs in the same block - the
+/// case `process_window`'s inline discovery exists for. That is the difference between this and simply
+/// narrowing the filter, which would keep the nest ingesting while quietly going blind to new children.
+///
+/// **Determinism** (non-negotiable 4) does not depend on how many rounds it took: the merged logs go
+/// through the same [`fan_out_window`] → `process_window` → [`decode_window`] path, and `decode_window`
+/// sorts by `(block, log_index)` before decoding. Discovery having run early only means a child is
+/// already in the registry when the authoritative decode reaches its creation event, and re-inserting a
+/// known child is a no-op (`ChildRegistry::insert` keeps the earliest discovery).
+async fn refetch_address_filtered(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    live: &[usize],
+    addresses: &[String],
+    topics: &[String],
+    block: u64,
+) -> Result<Vec<crate::rpc::Log>> {
+    use std::collections::HashSet;
+    // Discovery decodes without timestamps, as the backfill's pass-1 decode does: these rows are
+    // thrown away, and the stamped decode happens later in `process_window`.
+    let empty_ts = std::collections::HashMap::new();
+    let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
+    let mut all: Vec<crate::rpc::Log> = Vec::new();
+    let mut batch = source.logs(addresses, topics, block, block).await?;
+    loop {
+        let mut new: Vec<String> = Vec::new();
+        for &i in live {
+            let n = live_nest(nests, i);
+            let Some(fs) = n.factory.clone() else {
+                continue;
+            };
+            let registry = n.registry.clone();
+            let _ = decode_window(&registry, Some(&fs), &mut n.children, &batch, &empty_ts);
+            for c in n.children.addresses() {
+                if !fetched.contains(&c.to_ascii_lowercase()) && !addr_in(&new, c) {
+                    new.push(c.to_string());
+                }
+            }
+        }
+        all.append(&mut batch);
+        if new.is_empty() {
+            return Ok(all);
+        }
+        for c in &new {
+            fetched.insert(c.to_ascii_lowercase());
+        }
+        batch = source.logs(&new, topics, block, block).await?;
+    }
+}
+
+/// COR-5: a single block whose topic0-only union fetch broke the provider's `getLogs` cap. Recover it
+/// address-filtered if we can, and quarantine the factory nests that forced the wide filter if we
+/// cannot. Exactly one of those happens - the cursor never both recovers and faults, and never neither.
+///
+/// The wide fetch cannot be reissued (the range is one block, so there is nothing left to shrink) and
+/// the quarantine it used to take instead is **terminal by design**: re-admission would re-issue the
+/// identical fetch against the identical block and fail identically. That reasoning is sound only while
+/// the fetch stays identical, and it does not have to. `getLogs` was asked for *any address* because one
+/// nest is a factory; asking again for `base ∪ discovered children` is a strictly narrower question the
+/// same provider may well answer, and it is the question the backfill path has always asked
+/// ([`backfill_direct_factory`] §3). A busy chain with a common template topic0 is the ordinary case for
+/// a factory nest, so "dead until a human intervenes" was the common outcome, not the exotic one.
+///
+/// **Why one narrowed union rather than pulling the factory nest onto its own fetch.** Either would
+/// work. A per-nest fetch multiplies request volume per block by the number of nests, which the cursor's
+/// pacing budget has to absorb on precisely the blocks that are already the heaviest; and it would give
+/// one nest a second cursor in all but name. The narrowed union keeps one fetch for the whole cursor -
+/// the RFC-0012 density win - and static co-tenants keep being served by the very same call, so the
+/// property that they carry on indexing is preserved structurally rather than re-argued.
+///
+/// The cost is honest and bounded: on a block that breaches, the cursor pays a failed wide fetch plus
+/// the narrowed one (plus a round per nesting depth, capped at 3). It does **not** latch - the next
+/// window goes wide again, because the wide fetch is the discovery-complete one and a cap breach on one
+/// block is not evidence about the next. If that ever shows up in the pacing budget, latching with
+/// hysteresis is the fix, not a per-nest cursor.
+#[allow(clippy::too_many_arguments)]
+async fn recover_over_cap_block(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    nexts: &mut [u64],
+    sup: &mut Supervisor,
+    live: &[usize],
+    factories: &[usize],
+    topics: &[String],
+    block: u64,
+    tip: u64,
+    cause: &anyhow::Error,
+) -> Result<()> {
+    let narrowed = narrowed_union_addresses(live.iter().map(|&i| live_ref(nests, i)));
+    // Empty means "any address" to `getLogs` - the identical fetch, so there is nothing to try.
+    if !narrowed.is_empty() {
+        match refetch_address_filtered(source, nests, live, &narrowed, topics, block).await {
+            Ok(logs) => {
+                tracing::warn!(
+                    "block {block} broke the provider's getLogs cap topic0-only; refetched it \
+                     address-filtered ({} addresses, {} logs) and carried on",
+                    narrowed.len(),
+                    logs.len()
+                );
+                return fan_out_window(source, nests, nexts, sup, live, &logs, block, tip).await;
+            }
+            // The narrowed fetch is over the cap too (a factory with more children than one block's
+            // cap allows), or the provider rejected the filter itself (some cap the number of
+            // addresses). Either way the fallback is spent; fall through and fault the factories.
+            Err(e) => {
+                tracing::warn!("block {block}: the address-filtered fallback failed as well: {e:#}")
+            }
+        }
+    }
+    for &i in factories {
+        // Terminal: everything this cursor can ask the provider has now been asked, and every retry
+        // re-asks it. A retryable fault would spin at the backoff ceiling forever and bury the one
+        // thing that does move: an operator. Name what they must do.
+        let fault = anyhow::Error::new(TerminalFault(format!(
+            "{}, and an address-filtered refetch of it did not fit either - raise the provider's \
+             getLogs cap, or narrow this nest's topic0 set with an `events` allowlist: {cause:#}",
+            single_block_over_cap(block)
+        )));
+        sup.quarantine(i, &fault)?;
+    }
+    Ok(())
+}
+
 /// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
 /// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
 /// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
@@ -861,6 +1035,61 @@ fn fan_out_rollback(
     for &i in live {
         match live_nest(nests, i).rollback_reorg(ancestor) {
             Ok(()) => nexts[i] = nexts[i].min(ancestor + 1),
+            Err(e) => sup.quarantine(i, &e)?,
+        }
+    }
+    Ok(())
+}
+
+/// Hand each live nest exactly the logs it owns within its own un-processed range, through the same
+/// per-window path a solo nest runs. A nest already past this window is skipped; a nest with zero owned
+/// logs still advances + checkpoints + seals (identical to solo - a window with no matching logs still
+/// moves the cursor).
+///
+/// The `logs` may come from the union fetch or, when that fetch broke the provider's cap, from the
+/// address-filtered refetch ([`refetch_address_filtered`]) - the fan-out is the same either way, which
+/// is the point of it being one function: the recovery path must not become a second, divergent way of
+/// committing a window.
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_window(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    nexts: &mut [u64],
+    sup: &mut Supervisor,
+    live: &[usize],
+    logs: &[crate::rpc::Log],
+    to: u64,
+    tip: u64,
+) -> Result<()> {
+    for &i in live {
+        if nexts[i] > to {
+            continue;
+        }
+        let nest_logs: Vec<crate::rpc::Log> = logs
+            .iter()
+            .filter(|l| l.block_number >= nexts[i] && live_ref(nests, i).owns(l))
+            .cloned()
+            .collect();
+        // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
+        // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
+        // iteration re-fetches, and this nest retries while nests that did advance simply
+        // process the forward remainder - never re-processing.
+        //
+        // An `Err` is this nest's fault alone (decode, store, seal, a dead IVM circuit, a
+        // webhook sink): quarantine it and let its co-tenants finish the window. Before
+        // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
+        match live_nest(nests, i)
+            .process_window(source, &nest_logs, nexts[i], to, tip)
+            .await
+        {
+            Ok(Some(_)) => {
+                nexts[i] = to + 1;
+                // Real progress clears the nest's record, so a nest that fails every third window
+                // is degraded, not escalating towards permanent quarantine (RFC-0026 §4).
+                // Re-admission alone must NOT reset this.
+                sup.mark_progress(i);
+            }
+            Ok(None) => {}
             Err(e) => sup.quarantine(i, &e)?,
         }
     }
@@ -1170,42 +1399,17 @@ async fn runtime_index_loop(
         match source.logs(&u_addrs, &u_topics, global_next, to).await {
             Ok(logs) => {
                 chunker.observed(logs.len() as u64);
-                // Fan-out: hand each nest exactly the logs it owns within its own un-processed range,
-                // through the same per-window path a solo nest runs. A nest already past this window is
-                // skipped; a nest with zero owned logs still advances + checkpoints + seals (identical
-                // to solo - a window with no matching logs still moves the cursor).
-                for &i in &live {
-                    if nexts[i] > to {
-                        continue;
-                    }
-                    let nest_logs: Vec<crate::rpc::Log> = logs
-                        .iter()
-                        .filter(|l| l.block_number >= nexts[i] && live_ref(&nests, i).owns(l))
-                        .cloned()
-                        .collect();
-                    // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
-                    // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
-                    // iteration re-fetches, and this nest retries while nests that did advance simply
-                    // process the forward remainder - never re-processing.
-                    //
-                    // An `Err` is this nest's fault alone (decode, store, seal, a dead IVM circuit, a
-                    // webhook sink): quarantine it and let its co-tenants finish the window. Before
-                    // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
-                    match live_nest(&mut nests, i)
-                        .process_window(source.as_ref(), &nest_logs, nexts[i], to, tip)
-                        .await
-                    {
-                        Ok(Some(_)) => {
-                            nexts[i] = to + 1;
-                            // Real progress clears the nest's record, so a nest that fails every
-                            // third window is degraded, not escalating towards permanent quarantine
-                            // (RFC-0026 §4). Re-admission alone must NOT reset this.
-                            sup.mark_progress(i);
-                        }
-                        Ok(None) => {}
-                        Err(e) => sup.quarantine(i, &e)?,
-                    }
-                }
+                fan_out_window(
+                    source.as_ref(),
+                    &mut nests,
+                    &mut nexts,
+                    &mut sup,
+                    &live,
+                    &logs,
+                    to,
+                    tip,
+                )
+                .await?;
             }
             Err(e) if chunker::is_result_too_large(&e) => {
                 if global_next >= to {
@@ -1220,8 +1424,9 @@ async fn runtime_index_loop(
                     //
                     // It is attributable in one direction, though. `union_filter` drops the address
                     // filter only when a live nest is a factory nest, so a topic0-only union is the
-                    // factory nests' doing and a static nest's addresses cannot have caused it. Fault
-                    // them, leave the static co-tenants indexing, and the cursor survives.
+                    // factory nests' doing and a static nest's addresses cannot have caused it. They
+                    // are the nests `recover_over_cap_block` narrows for, and the ones it faults if
+                    // the narrowed fetch cannot clear the cap either.
                     let factories =
                         topic0_only_culprits(live.iter().map(|&i| (i, live_ref(&nests, i))));
                     if factories.is_empty() {
@@ -1229,17 +1434,19 @@ async fn runtime_index_loop(
                         // filter is not available either. Unchanged behaviour: fail loudly.
                         return Err(e).with_context(|| single_block_over_cap(global_next));
                     }
-                    for i in factories {
-                        // Terminal: re-admission would re-issue the identical fetch against the
-                        // identical block and fail identically, so a retryable fault would spin at
-                        // the backoff ceiling forever. This needs an operator (a provider with a
-                        // higher cap, or an `events` allowlist that narrows the topic0 set).
-                        let fault = anyhow::Error::new(TerminalFault(format!(
-                            "{}: {e:#}",
-                            single_block_over_cap(global_next)
-                        )));
-                        sup.quarantine(i, &fault)?;
-                    }
+                    recover_over_cap_block(
+                        source.as_ref(),
+                        &mut nests,
+                        &mut nexts,
+                        &mut sup,
+                        &live,
+                        &factories,
+                        &u_topics,
+                        global_next,
+                        tip,
+                        &e,
+                    )
+                    .await?;
                     continue;
                 }
                 chunker.too_large();
@@ -5152,6 +5359,421 @@ template = "pool"
             msg.contains("block 19000000 alone exceeds"),
             "the operator needs the block named: {msg}"
         );
+    }
+
+    /// An address-aware source that **refuses the topic0-only fetch** the way a capped provider does:
+    /// an empty address filter (= "any address") returns the cap error, anything narrower is answered.
+    /// That is the shape of the COR-5 failure - the fetch is not too big for the provider, the *filter*
+    /// is - and it is what lets a test tell a real address-filtered fallback apart from a retry.
+    struct CappedSource {
+        logs: Vec<crate::rpc::Log>,
+        /// Every `getLogs` call, as `(addresses, from, to)` - so a test can assert the fallback
+        /// narrowed rather than reissued, and that the in-block fixpoint ran.
+        calls: std::sync::Mutex<Vec<(Vec<String>, u64, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for CappedSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            addrs: &[String],
+            _t: &[String],
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.calls.lock().unwrap().push((addrs.to_vec(), from, to));
+            if addrs.is_empty() {
+                anyhow::bail!("query returned more than 10000 results");
+            }
+            let allow: std::collections::HashSet<String> =
+                addrs.iter().map(|a| a.to_ascii_lowercase()).collect();
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .filter(|l| allow.contains(&l.address.to_ascii_lowercase()))
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// The topic0 of a nest's table, from its own built registry (never a hand-copied hash).
+    fn nest_topic0(nest: &NestIngest, table: &str) -> String {
+        format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == table)
+                    .unwrap_or_else(|| panic!("no table '{table}' in this nest's registry"))
+                    .topic0
+            )
+        )
+    }
+
+    /// COR-5, the half that was missing: a factory nest whose topic0-only tip fetch breaks the
+    /// provider's cap on a single block **recovers without an operator**.
+    ///
+    /// The block is refetched with `base ∪ discovered children` and the in-block discovery fixpoint,
+    /// so the nest keeps ingesting *and* keeps discovering - a fallback that quietly stopped finding
+    /// children would be worse than the loud quarantine it replaces, because it would look healthy.
+    ///
+    /// Against `main` this test fails on its first assertion: the factory nest is terminally
+    /// quarantined and neither it nor its co-tenant indexes block 7 at all.
+    #[tokio::test]
+    async fn an_over_cap_factory_block_recovers_address_filtered() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+
+        let token = "0x0000000000000000000000000000000000000011";
+        let factory_addr = "0x0000000000000000000000000000000000000022";
+        let child = "0x0000000000000000000000000000000000000033";
+        let pad = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
+
+        // Block 7, the hot one. The child is created and pings *in the same block* - the case the tip
+        // loop exists to catch, and the one a naive "just narrow the filter" fallback would miss: the
+        // child is in nobody's address list until log 0 is decoded.
+        let source = CappedSource {
+            logs: vec![
+                crate::rpc::Log {
+                    address: factory_addr.into(),
+                    topics: vec![nest_topic0(&fact, "fac__child_created"), pad(child)],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt1".into(),
+                    log_index: 0,
+                },
+                crate::rpc::Log {
+                    address: child.into(),
+                    topics: vec![nest_topic0(&fact, "child__ping")],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt2".into(),
+                    log_index: 1,
+                },
+                crate::rpc::Log {
+                    address: token.into(),
+                    topics: vec![
+                        nest_topic0(&stat, "tok__transfer"),
+                        pad("0x00000000000000000000000000000000000000aa"),
+                        pad("0x00000000000000000000000000000000000000bb"),
+                    ],
+                    data: format!("0x{:064x}", 42u64),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt3".into(),
+                    log_index: 2,
+                },
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        // Exactly the state the loop is in when it enters the recovery: the union went topic0-only,
+        // the window has collapsed to one block, and that fetch came back over the cap.
+        let (u_addrs, u_topics) = union_filter(
+            [
+                (stat.addresses.as_slice(), stat.topic0s.as_slice()),
+                (fact.addresses.as_slice(), fact.topic0s.as_slice()),
+            ]
+            .into_iter(),
+        );
+        assert!(u_addrs.is_empty(), "premise: the union is topic0-only");
+        let cause = anyhow::anyhow!("query returned more than 10000 results");
+        assert!(
+            chunker::is_result_too_large(&cause),
+            "premise: this is the cap error the loop branches on"
+        );
+
+        let mut nests = vec![Some(stat), Some(fact)];
+        let mut nexts = vec![7u64, 7];
+        let mut sup = test_supervisor(2);
+        recover_over_cap_block(
+            &source,
+            &mut nests,
+            &mut nexts,
+            &mut sup,
+            &[0, 1],
+            &[1],
+            &u_topics,
+            7,
+            7,
+            &cause,
+        )
+        .await
+        .unwrap();
+
+        // The factory nest survived the block that used to end it - no operator involved.
+        assert!(
+            matches!(sup.states[1], NestState::Live),
+            "the factory nest must recover, not quarantine: {:?}",
+            sup.states[1]
+        );
+        assert!(matches!(sup.states[0], NestState::Live));
+        assert_eq!(nexts, vec![8, 8], "both nests advanced past the hot block");
+
+        // Discovery survived too: the child's own `Ping`, emitted in the block it was created in, is
+        // stored. This is the assertion a filter-narrowing fallback without the fixpoint fails.
+        let fact_rows = nests[1]
+            .as_ref()
+            .unwrap()
+            .store
+            .entities_in_range(7, 7)
+            .unwrap();
+        assert!(
+            fact_rows.iter().any(|r| r.contains("child__ping")),
+            "the child created in this block must still be discovered and indexed: {fact_rows:?}"
+        );
+        assert!(
+            fact_rows.iter().any(|r| r.contains("fac__child_created")),
+            "the factory event itself is indexed: {fact_rows:?}"
+        );
+
+        // The static co-tenant indexed the same block off the same narrowed fetch - the one-fetch
+        // density win is preserved, not paid for with a second cursor.
+        let stat_rows = nests[0]
+            .as_ref()
+            .unwrap()
+            .store
+            .entities_in_range(7, 7)
+            .unwrap();
+        assert!(
+            stat_rows.iter().any(|r| r.contains("tok__transfer")),
+            "the static nest keeps indexing throughout: {stat_rows:?}"
+        );
+
+        // And the shape of the recovery: never a reissue of the wide fetch, and a second round for
+        // the child that round 1 discovered.
+        let calls = source.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|(a, _, _)| !a.is_empty()),
+            "the fallback must never reissue the topic0-only fetch: {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "one narrowed fetch, one fixpoint round: {calls:?}"
+        );
+        assert!(
+            calls[0].0.iter().any(|a| a.eq_ignore_ascii_case(token))
+                && calls[0]
+                    .0
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(factory_addr)),
+            "round 1 asks for every live nest's known addresses: {:?}",
+            calls[0].0
+        );
+        assert_eq!(
+            calls[1].0,
+            vec![child.to_string()],
+            "round 2 asks for exactly the child discovered in round 1"
+        );
+        assert!(calls.iter().all(|(_, f, t)| *f == 7 && *t == 7));
+    }
+
+    /// The same recovery, but reached the way production reaches it: through the real
+    /// [`runtime_index_loop`], whose cap branch is the only caller that matters. The unit test above
+    /// proves the recovery works; this one proves the tip loop takes it - a distinction worth a test,
+    /// because deleting the call site leaves that test green and the operator's nest dead.
+    ///
+    /// Against `main` this hangs on the poll and fails on the deadline: the cursor quarantines the
+    /// factory nest terminally and block 7 is never indexed by anyone.
+    #[tokio::test]
+    async fn the_tip_loop_takes_the_cap_recovery_rather_than_quarantining() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+
+        let token = "0x0000000000000000000000000000000000000011";
+        let factory_addr = "0x0000000000000000000000000000000000000022";
+        let child = "0x0000000000000000000000000000000000000033";
+        let pad = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
+        let source: Arc<dyn Source> = Arc::new(CappedSource {
+            logs: vec![
+                crate::rpc::Log {
+                    address: factory_addr.into(),
+                    topics: vec![nest_topic0(&fact, "fac__child_created"), pad(child)],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt1".into(),
+                    log_index: 0,
+                },
+                crate::rpc::Log {
+                    address: child.into(),
+                    topics: vec![nest_topic0(&fact, "child__ping")],
+                    data: "0x".into(),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt2".into(),
+                    log_index: 1,
+                },
+                crate::rpc::Log {
+                    address: token.into(),
+                    topics: vec![
+                        nest_topic0(&stat, "tok__transfer"),
+                        pad("0x00000000000000000000000000000000000000aa"),
+                        pad("0x00000000000000000000000000000000000000bb"),
+                    ],
+                    data: format!("0x{:064x}", 42u64),
+                    block_number: 7,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt3".into(),
+                    log_index: 2,
+                },
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // Keep the stores; the loop takes the nests.
+        let fact_store = fact.store.clone();
+        let stat_store = stat.store.clone();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        // `--backfill 0` starts both nests at the tip, and a 1-block window puts the cursor straight
+        // on block 7 with nothing left to shrink - the exact `global_next >= to` corner COR-5 lives in.
+        let loop_task = tokio::spawn(runtime_index_loop(
+            source.clone(),
+            vec![stat, fact],
+            Some(0),
+            false,
+            1,
+            1,
+            health.clone(),
+            false,
+            None,
+        ));
+
+        // Poll rather than sleep a fixed time: the loop is a real tip-follower and this is the only
+        // honest way to wait for it. A dead cursor fails here on the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut fact_rows = Vec::new();
+        while std::time::Instant::now() < deadline {
+            fact_rows = fact_store.entities_in_range(7, 7).unwrap();
+            if fact_rows.iter().any(|r| r.contains("child__ping")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        loop_task.abort();
+
+        assert!(
+            fact_rows.iter().any(|r| r.contains("child__ping")),
+            "the tip loop must recover the over-cap block, children and all: {fact_rows:?}"
+        );
+        assert_eq!(
+            health.json_for("f").0,
+            "indexing",
+            "the factory nest must not be quarantined on the operator's health surface"
+        );
+        assert!(
+            stat_store
+                .entities_in_range(7, 7)
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("tok__transfer")),
+            "the static co-tenant indexes the same block off the same narrowed fetch"
+        );
+    }
+
+    /// The other side of the "not both, and not neither" rule: when the narrowed fetch cannot clear the
+    /// cap either, the factory nest is quarantined **terminally**, and the log the operator reads names
+    /// the two things that would actually fix it. The static co-tenant is still not faulted for it.
+    #[tokio::test]
+    async fn an_over_cap_block_with_no_narrowing_left_quarantines_with_the_operator_action() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+
+        // A provider that is over the cap however the question is asked.
+        struct AlwaysOverCap;
+        #[async_trait::async_trait]
+        impl Source for AlwaysOverCap {
+            async fn tip(&self) -> Result<u64> {
+                Ok(7)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _a: &[String],
+                _t: &[String],
+                _f: u64,
+                _t2: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                anyhow::bail!("query returned more than 10000 results")
+            }
+        }
+
+        let (_, u_topics) = union_filter(
+            [
+                (stat.addresses.as_slice(), stat.topic0s.as_slice()),
+                (fact.addresses.as_slice(), fact.topic0s.as_slice()),
+            ]
+            .into_iter(),
+        );
+        let mut nests = vec![Some(stat), Some(fact)];
+        let mut nexts = vec![7u64, 7];
+        let mut sup = test_supervisor(2);
+        let cause = anyhow::anyhow!("query returned more than 10000 results");
+        recover_over_cap_block(
+            &AlwaysOverCap,
+            &mut nests,
+            &mut nexts,
+            &mut sup,
+            &[0, 1],
+            &[1],
+            &u_topics,
+            7,
+            7,
+            &cause,
+        )
+        .await
+        .unwrap();
+
+        match &sup.states[1] {
+            NestState::Quarantined { reason, retry_at } => {
+                assert!(
+                    retry_at.is_none(),
+                    "retrying re-asks a question already answered twice"
+                );
+                assert!(
+                    reason.contains("block 7 alone exceeds"),
+                    "the operator needs the block named: {reason}"
+                );
+                assert!(
+                    reason.contains("address-filtered refetch"),
+                    "and needs to know the cheap fix was already tried: {reason}"
+                );
+                assert!(
+                    reason.contains("higher/no cap") && reason.contains("`events` allowlist"),
+                    "and needs the exact actions available to them: {reason}"
+                );
+            }
+            other => panic!("the factory nest must be terminally quarantined, got {other:?}"),
+        }
+        // The static nest forced nothing and is faulted for nothing; it simply has not indexed this
+        // block, and the cursor is still alive to retry it.
+        assert!(matches!(sup.states[0], NestState::Live));
+        assert_eq!(nexts, vec![7, 7], "an unfetched block advances nobody");
     }
 
     /// Issue #147, the headline scenario, on the real fan-out path: a reorg drops below one nest's
