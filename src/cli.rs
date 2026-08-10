@@ -450,7 +450,8 @@ pub struct QueryBenchArgs {
     #[arg(long)]
     pub sql: Option<String>,
 
-    /// Entity point-reads to time (keys sampled evenly across the hot store).
+    /// Entity point-reads to time (keys in chain order from the oldest - a prefix, so set this at or
+    /// above the hot row count to cover the whole store).
     #[arg(long, default_value_t = 1000)]
     pub reads: usize,
 
@@ -465,6 +466,22 @@ pub struct QueryBenchArgs {
     /// A label for the report (e.g. "R1: horizon tip 12k rows").
     #[arg(long)]
     pub label: Option<String>,
+
+    /// Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only
+    /// reports; passed, it is a gate (CI uses it - CLAUDE.md: benchmark regressions fail the build).
+    #[arg(long)]
+    pub max_point_read_p50_us: Option<f64>,
+
+    /// Fail if the entity point-read p99 exceeds this many microseconds.
+    #[arg(long)]
+    pub max_point_read_p99_us: Option<f64>,
+
+    /// Fail unless at least this many point-reads were actually timed. **Pass this whenever you pass
+    /// a ceiling.** An empty nest samples no keys and reports p50 = 0µs, which is under every ceiling
+    /// anyone would set - so without a floor the gate passes most confidently when it has measured
+    /// nothing at all.
+    #[arg(long)]
+    pub min_reads: Option<usize>,
 }
 
 #[derive(Args)]
