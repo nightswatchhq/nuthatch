@@ -4,26 +4,25 @@ Successor to [boisterous-badger](sprint-boisterous-badger.md), which closed on 2
 2.0.0 release. Companion to [prod-readiness.md](prod-readiness.md) (the grades this sprint is trying
 to move) and [verification.md](verification.md) (where the evidence lands).
 
-**Scope is exactly the thirteen issues below and nothing else.** Every one carries the
-[`circumspect-capybara`](https://github.com/nightswatchhq/nuthatch/issues?q=is%3Aopen+label%3Acircumspect-capybara)
-label, which is the machine-readable form of this document - verified 2026-08-10 to be exactly these
-thirteen and nothing else. This is a queue, not a plan: the reasoning for the ordering is here, the
-work lives in the issues, and the issues are the source of truth for status.
+**This document ranks thirteen issues and says why they are in that order.** Every one carries the
+[`circumspect-capybara`](https://github.com/nightswatchhq/nuthatch/issues?q=label%3Acircumspect-capybara)
+label, and the label is what defines membership. It has picked up follow-ups filed mid-sprint, so the
+query returns more than the thirteen ranked below; that is the label doing its job, not a discrepancy
+to reconcile. This is a queue, not a plan: the reasoning for the ordering is here, the work lives in
+the issues, and the issues are the source of truth for both membership and status.
 
-**Status as of 2026-08-10: 3 of 13 closed** - #362 (branch protection), #361 (retry hints, PR #369)
-and #294 (single-pass rebuild, PR #372). The count is stated here only so that a reader running the
-query below is not surprised to get 10; do not maintain a status table in this file, because it will
-be wrong before it is read.
+**No count lives in this file.** Run the query for it. A number written down here is wrong before it
+is read - the one that stood in this paragraph went stale inside a day - and the same goes for a
+status table.
 
 **Two weeks, not one.** The predecessors ran four and seven days, but this one carries a real feature
 build (item 1) alongside the standing queue, and a one-week window would only produce a slipped
 deadline and a document nobody trusts. If it finishes early, close it early.
 
-> **Listing quirk, noted so nobody concludes the label failed.** `gh issue list --label
-> circumspect-capybara` returns **zero** while `gh issue view <n>` shows the label present. The REST
-> route is correct and is what the count above comes from:
-> `gh api "repos/nightswatchhq/nuthatch/issues?labels=circumspect-capybara&state=open&per_page=50"`.
-> The web UI filter is also correct.
+> **The query.** `gh issue list --repo nightswatchhq/nuthatch --label circumspect-capybara --state all`,
+> or the REST route
+> `gh api "repos/nightswatchhq/nuthatch/issues?labels=circumspect-capybara&state=all&per_page=60"`.
+> Both routes and the web UI filter agree, re-checked 2026-08-10.
 
 ## Definition of done, for every item in this sprint
 
