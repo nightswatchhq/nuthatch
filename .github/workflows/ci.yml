@@ -383,6 +383,13 @@ jobs:
         # No secret and no third party - multinest-rpc.py serves the chain, the nests are written
         # inline, and topic0s are derived from the same ABI file the harness writes. A fork PR can
         # satisfy it, which was the whole lesson of #260.
+        #
+        # The scenario itself - nests, event rate, block span, tip - is **not** set here. It is the
+        # harness's own defaults, so that the bare command in docs/benchmarks.md, the re-baseline
+        # tool the FAIL message tells an operator to run, and this gate all describe one scenario
+        # (#395). Restating them here would let the two copies drift, and the copy every human reads
+        # is the one in the harness. Set below: only what belongs to the job - the enforcement
+        # policy, and where to write the artifact.
         env:
           BIN: bin/nuthatch
           MAX_RSS_MB: "2048"
@@ -394,11 +401,6 @@ jobs:
           # These are one box's numbers and the runner is a 2-vCPU machine, so re-baseline from this
           # job's own uploaded reports once runs exist on the hardware that enforces it.
           REGRESSION_MB: "180"
-          NESTS: "20"
-          LOGS_PER_BLOCK: "10"
-          BACKFILL_BLOCKS: "1000"
-          INITIAL_TIP: "20000"
-          FINAL_TIP: "20200"
           REPORT: multinest-footprint.json
         run: |
           chmod +x bin/nuthatch
