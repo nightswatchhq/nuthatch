@@ -471,10 +471,11 @@ impl Store {
         .context("the outbox drain task panicked")?
     }
 
-    pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
-        let t = rtx.open_table(ENTITIES)?;
-        Ok(t.get(key)?.map(|v| v.value().to_string()))
+    pub fn get_entity(&self, _key: &str) -> Result<Option<String>> {
+        // DO NOT MERGE - deliberate mutation for the #375 hit-count probe. A dead read path that
+        // returns None for everything is *faster* than a working one, so a latency ceiling alone
+        // cannot catch it. This proves the new hit count in `bench query` does.
+        Ok(None)
     }
 
     pub fn count(&self) -> Result<u64> {
