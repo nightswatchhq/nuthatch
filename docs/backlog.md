@@ -52,8 +52,15 @@ honest tip-lag number, and RFC-0023 tier 3's pinned-block verification.
 in both modes. RFC-0013 §2's destination is *unmet, not repudiated* - re-run the gate before planning
 around it, and do not re-argue it from first principles in the meantime.
 
-**Turso is triple-gated**, not rejected: a production-ready release, a permissive (non-BSL) licence,
-and a measured win over redb that federation does not already provide. Until all three, no.
+**Turso is double-gated**, not rejected: a production-ready release, and a measured win over redb
+that federation does not already provide. Until both, no.
+
+The third gate - *a permissive, non-BSL licence* - is **dead, and was wrong when written**
+(2026-07-17; corrected 2026-08-10). `tursodatabase/turso` and `tursodatabase/libsql` are both MIT,
+checked against the GitHub API on 2026-08-10, so the licence never barred anything. Of the two that
+remain, production-readiness is arguable rather than settled (production use is claimed at several
+organisations, but it is pre-1.0 and some features are marked experimental), and the measured win has
+**never been attempted**. #366 carries the measurement.
 
 **Scaled mode is no longer infra-blocked.** RFC-0022 turned it into ordinary work - the `HotStore`
 trait, a Postgres backend with a redb-parity suite, the query-FE role, and ownership fencing. The old
