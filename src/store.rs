@@ -258,6 +258,41 @@ pub struct Store {
     held: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Does the store at `path` hold indexed rows, as opposed to merely existing?
+///
+/// [`Store::open`] materialises all four tables and commits before a cursor has fetched anything, so
+/// the presence of the file proves only that a runtime once started here - not that it got anywhere.
+/// Adoption turns on the difference in both directions (issue #408): an empty store counted as data
+/// costs a dataset its one early cutoff, permanently.
+///
+/// Opens **read-only and non-creating** - `Database::open` rather than `Database::create` - because a
+/// question about whether a store holds data must not be able to answer itself by creating one.
+///
+/// The three signals are the ones a cursor writes as it progresses: `last_block` once it has indexed
+/// anything, `sealed_through` once it has sealed past finality, and rows in `entities`/`blocks` for
+/// the tip that is not yet sealed. A dataset that has sealed everything and pruned hot has empty
+/// tables and a non-zero watermark, which is why the meta keys are checked and not just the tables.
+///
+/// Errors are returned rather than folded into `false`: an unreadable store is not an empty one, and
+/// the caller is the only one who knows which way to be wrong about it.
+pub fn store_holds_rows(path: &Path) -> Result<bool> {
+    let db = Database::open(path)
+        .with_context(|| format!("failed to open redb read-only at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    for key in ["last_block", "sealed_through"] {
+        if let Some(v) = meta.get(key)? {
+            // `sealed_through = 0` is the "nothing sealed" default and is not progress; any
+            // `last_block` at all is, including block 0.
+            let v = v.value().to_string();
+            if key == "last_block" || v.parse::<u64>().unwrap_or(0) > 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(!rtx.open_table(ENTITIES)?.is_empty()? || !rtx.open_table(BLOCKS)?.is_empty()?)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let db = Database::create(path)
@@ -1269,6 +1304,73 @@ mod tests {
             store.put_entity(&key, "{}").unwrap();
         }
         store.set_block_hash(block, hash).unwrap();
+    }
+
+    /// Issue #408. `Store::open` creates the file and commits four empty tables before a cursor has
+    /// fetched anything, so existence is not evidence of history. Each arm here is a state adoption
+    /// can actually meet on disk, and the sealed-and-pruned one is the dangerous direction: its
+    /// tables are empty, and a check that only looked at them would call a dataset holding real
+    /// history empty and let adoption write over it.
+    #[test]
+    fn store_holds_rows_distinguishes_an_empty_store_from_one_with_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+
+        // Created and never written: the interrupted start.
+        {
+            Store::open(&path).unwrap();
+        }
+        assert!(
+            !store_holds_rows(&path).unwrap(),
+            "a store that was opened and never written holds nothing"
+        );
+
+        // Sealed to Parquet and pruned from hot: empty tables, non-zero watermark.
+        {
+            let s = Store::open(&path).unwrap();
+            s.set_meta("sealed_through", "5000").unwrap();
+        }
+        assert!(
+            store_holds_rows(&path).unwrap(),
+            "a dataset that sealed its history and pruned hot still holds it"
+        );
+
+        // `sealed_through = 0` is the "nothing sealed" default, not progress.
+        let dir2 = tempfile::tempdir().unwrap();
+        let zeroed = dir2.path().join("t.redb");
+        {
+            let s = Store::open(&zeroed).unwrap();
+            s.set_meta("sealed_through", "0").unwrap();
+        }
+        assert!(
+            !store_holds_rows(&zeroed).unwrap(),
+            "a zero watermark is the default and must not read as history"
+        );
+
+        // Rows at the tip, nothing sealed.
+        let dir3 = tempfile::tempdir().unwrap();
+        let hot = dir3.path().join("t.redb");
+        {
+            let s = Store::open(&hot).unwrap();
+            apply_block(&s, 1, 1, "h1");
+        }
+        assert!(
+            store_holds_rows(&hot).unwrap(),
+            "unsealed rows at the tip are history too"
+        );
+    }
+
+    /// Asking the question must not answer it: a non-creating open, or `holds_data` would leave a
+    /// store behind in every dataset it inspected and make itself true everywhere.
+    #[test]
+    fn store_holds_rows_does_not_create_the_store_it_inspects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.redb");
+        assert!(
+            store_holds_rows(&path).is_err(),
+            "an absent store is an error, not a false"
+        );
+        assert!(!path.exists(), "and asking must not have created it");
     }
 
     #[test]
