@@ -128,8 +128,8 @@ Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail
 `bench query` also takes limits, and exits non-zero when one is breached:
 
 ```sh
-nuthatch bench query --dir <nest> --reads 8004 \
-  --min-reads 8004 --max-point-read-p50-us 200 --max-point-read-p99-us 2000
+nuthatch bench query --dir <nest> --reads 256 \
+  --min-reads 256 --max-point-read-p50-us 200 --max-point-read-p99-us 2000
 ```
 
 Pass none of them and the bench only reports, which is what an operator poking at their own nest
@@ -140,15 +140,31 @@ reports `p50 = 0µs`, and zero is under every ceiling anyone would ever write - 
 floor is greenest exactly when it has measured nothing. The `footprint` check learned the same lesson
 and asserts its row count before it compares a peak.
 
+**A point-read is a hot-store read, so the number to size `--min-reads` against is the unsealed tip,
+not the rows indexed.** The gate found this itself on its first real run: it asked for 8,004 reads,
+got 256, and refused. Everything past finality had sealed to Parquet and been pruned out of redb,
+which is the design working. On mainnet's `Finality::Depth(64)` fixture that leaves 64 blocks × 4
+logs = 256 rows, and it is a floor rather than an equality - a run whose sealing has not caught up
+holds more, never fewer.
+
 CI runs this as the **`point-read latency`** job (`.github/workflows/point-read.sh`), on the same
 hermetic fixture the `footprint` job uses: `footprint-rpc.py` serves the chain, the nest is written
-inline, and every run indexes exactly 8,004 rows. No secret and no third party, so a fork's pull
-request can satisfy it, and a change in p99 is a change in nuthatch rather than in somebody's rate
-limiter. The report uploads as an artifact on every run, including a failing one.
+inline, and every run indexes exactly 8,004 rows and reads the same 256-row tip. No secret and no
+third party, so a fork's pull request can satisfy it, and a change in p99 is a change in nuthatch
+rather than in somebody's rate limiter. The report uploads as an artifact on every run, including a
+failing one.
 
-The ceilings (200µs p50, 2,000µs p99) are set to catch a *structural* regression - a scan where there
-was a seek, a per-read store open, a lock in the path - not to police the noise of a shared runner,
-where a point-read out of page cache measures single-digit microseconds. They tighten once a few
-releases' committed reports say what the spread across releases actually is.
+Measured on the Linux dev box (32 cores, 62 GB), release build, commit `c72fa88`:
+
+| | p50 | p99 | p99.9 |
+|---|---|---|---|
+| entity point-read, 256-row hot tip | **1.01µs** | **1.35µs** | 2.99µs |
+
+The ceilings (200µs p50, 2,000µs p99) sit two to three orders of magnitude above that on purpose.
+They catch a *structural* regression - a scan where there was a seek, a per-read store open, a lock
+in the path - and do not police the noise of a shared runner with a cold page cache, which is how a
+required check turns flaky and then gets waved through. Tighten them once several releases' committed
+reports say what the across-release and across-runner spread actually is; there is one report so far,
+and one report is not a spread.
 
 Baseline: `docs/bench/point-read.json`.

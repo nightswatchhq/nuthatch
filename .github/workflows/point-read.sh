@@ -66,6 +66,21 @@ BACKFILL_BLOCKS=2000
 EXPECT=$(( BACKFILL_BLOCKS * 4 + 4 ))
 TIP=20000
 
+# **A point-read is a hot-store read, so its population is the unsealed tip, not the 8004 rows
+# indexed.** Found by running this rather than reasoning about it: the first version of this script
+# asked for 8004 reads and the gate correctly refused the run - `timed 256 point-read(s)`. Everything
+# past finality had sealed to Parquet and been pruned out of redb, exactly as designed.
+#
+# mainnet is `Finality::Depth(64)` (src/chains.rs), the mock serves 4 logs a block, and its tip is
+# fixed at 20000 - so the settled hot tip is blocks 19937..=20000, which is 256 rows.
+#
+# It is a *floor*, not an equality: a run whose sealing has not caught up holds **more** than this,
+# never fewer, so the check is satisfied at every point after the backfill completes rather than only
+# in the settled state. Asserting equality would turn the seal loop's timing into a flaky gate.
+FINALITY_DEPTH=64
+LOGS_PER_BLOCK=4
+HOT_EXPECT=$(( FINALITY_DEPTH * LOGS_PER_BLOCK ))
+
 "$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$DIR/dev.log" 2>&1 &
 DEV_PID=$!
 trap 'kill "$DEV_PID" 2>/dev/null || true; kill "$RPC_PID" 2>/dev/null || true' EXIT
@@ -92,12 +107,14 @@ if [ "$rows" -lt "$EXPECT" ]; then
   exit 1
 fi
 
-# `--min-reads` is not belt-and-braces on top of the row check above: an empty store samples no keys
-# and reports p50 = 0µs, which passes any ceiling. The floor is what makes a green run mean something.
+# `--min-reads` is not belt-and-braces on top of the row check above: the row count is served from
+# hot ∪ cold and stays 8004 however much of the store has sealed away, while an empty *hot* store
+# samples no keys and reports p50 = 0µs, which passes any ceiling. The floor is the thing that makes
+# a green run mean something.
 set +e
-"$BIN" bench query --dir "$DIR" --reads "$EXPECT" --iters 5 --out "$OUT" \
-  --label "CI point-read gate: $EXPECT rows, locally-served chain" \
-  --min-reads "$EXPECT" \
+"$BIN" bench query --dir "$DIR" --reads "$HOT_EXPECT" --iters 5 --out "$OUT" \
+  --label "CI point-read gate: $HOT_EXPECT-row hot tip of a $EXPECT-row index, locally-served chain" \
+  --min-reads "$HOT_EXPECT" \
   --max-point-read-p50-us "$MAX_P50_US" \
   --max-point-read-p99-us "$MAX_P99_US" | tee "$DIR/bench.log"
 status="${PIPESTATUS[0]}"
@@ -105,11 +122,11 @@ set -e
 
 p50="$(grep -o '"point_read_p50_us": [0-9.]*' "$OUT" 2>/dev/null | grep -o '[0-9.]*$' || echo '?')"
 p99="$(grep -o '"point_read_p99_us": [0-9.]*' "$OUT" 2>/dev/null | grep -o '[0-9.]*$' || echo '?')"
-echo "point-read over $rows rows: p50 ${p50}µs (ceiling ${MAX_P50_US}µs), p99 ${p99}µs (ceiling ${MAX_P99_US}µs)"
+echo "point-read over the ${HOT_EXPECT}-row hot tip of a ${rows}-row index: p50 ${p50}µs (ceiling ${MAX_P50_US}µs), p99 ${p99}µs (ceiling ${MAX_P99_US}µs)"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     echo "### point-read latency"
-    echo "p50 **${p50}µs** (ceiling ${MAX_P50_US}µs), p99 **${p99}µs** (ceiling ${MAX_P99_US}µs) over $rows rows"
+    echo "p50 **${p50}µs** (ceiling ${MAX_P50_US}µs), p99 **${p99}µs** (ceiling ${MAX_P99_US}µs) over the ${HOT_EXPECT}-row hot tip of a ${rows}-row index"
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
