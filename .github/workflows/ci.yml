@@ -348,3 +348,67 @@ jobs:
           name: point-read-report
           path: point-read-report.json
           retention-days: 30
+
+
+  multinest-footprint:
+    name: per-cursor RAM budget (dense multi-nest)
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: nuthatch-release
+          path: bin
+      - name: measure peak RSS at tip
+        # The ≤2 GB per-cursor budget (CLAUDE.md non-negotiable 2, RFC-0021) measured on the case
+        # most likely to break it: 20 nests on ONE cursor, the real 10-event Uniswap V4 PoolManager
+        # ABI, 200 logs per block across the cursor, and 200 blocks of live tip-following after the
+        # backfill drains. Issues #286 (measure it) and #284 (stop the answer rotting).
+        #
+        # **This does not duplicate the `footprint (RAM budget)` job above, and the two ceilings must
+        # not be reconciled into one.** That job is the single-nest backfill regression tripwire: one
+        # contract, one event type, 8004 rows, 256 MB. Its sensitivity comes from its scenario being
+        # small. This job is the product budget on the adversarial scenario. Neither subsumes the
+        # other, and no single number can be both a tight tripwire and a 2 GB product promise.
+        #
+        # Two ceilings here, saying different things:
+        #   MAX_RSS_MB=2048    the budget. A promise, not a tuning parameter. Never raise it.
+        #   REGRESSION_MB      the regression ceiling, set outside the measured run-to-run noise
+        #                      band (see scripts/multinest-rss-spread.sh). The budget alone cannot
+        #                      be a regression gate: the scenario measures ~145 MB, so a change
+        #                      could cost ten times the memory and still pass 2048.
+        #
+        # No secret and no third party - multinest-rpc.py serves the chain, the nests are written
+        # inline, and topic0s are derived from the same ABI file the harness writes. A fork PR can
+        # satisfy it, which was the whole lesson of #260.
+        env:
+          BIN: bin/nuthatch
+          MAX_RSS_MB: "2048"
+          # 180 = max observed (143) + 25%, over 15 runs of this exact scenario on a 32-core Linux
+          # box, spanning two bases: 111, 132, 133 x7, 134, 140, 141, 141, 143. Quiet on that spread,
+          # red on a >26% regression. Re-derive with scripts/multinest-rss-spread.sh before ever
+          # moving it - a threshold picked from a single run is folklore.
+          #
+          # These are one box's numbers and the runner is a 2-vCPU machine, so re-baseline from this
+          # job's own uploaded reports once runs exist on the hardware that enforces it.
+          REGRESSION_MB: "180"
+          NESTS: "20"
+          LOGS_PER_BLOCK: "10"
+          BACKFILL_BLOCKS: "1000"
+          INITIAL_TIP: "20000"
+          FINAL_TIP: "20200"
+          REPORT: multinest-footprint.json
+        run: |
+          chmod +x bin/nuthatch
+          bash .github/workflows/multinest-footprint.sh
+      - name: upload the report
+        # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
+        # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multinest-footprint-report
+          path: multinest-footprint.json
+          retention-days: 30

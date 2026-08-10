@@ -197,3 +197,76 @@ ceiling was set against: that is the `ubuntu-latest` table above (p50 0.59-0.82�
 8µs is 9.8x above. Committing a runner-produced artifact instead would remove the need for this
 caveat, and #385 tracks it. Saying so here rather than leaving a reader to notice the `hardware`
 field disagrees with the argument.
+
+
+## The per-cursor RAM budget (≤2 GB)
+
+CLAUDE.md non-negotiable 2: **≤2 GB RAM per active-chain cursor**, shared across whatever nests sit on
+that cursor. RFC-0021 makes it per-cursor rather than per-runtime. Density is RAM-bounded, not free,
+and this is the measurement that says whether we hold it.
+
+It is measured on the adversarial case, because a pass on a quiet contract tells us nothing: a large
+ABI, a high event rate, many nests on **one** cursor, and **at tip** rather than mid-backfill.
+
+```sh
+bash .github/workflows/multinest-footprint.sh          # measure + enforce
+scripts/multinest-rss-spread.sh 7                      # the noise band, before moving a ceiling
+```
+
+### Two ceilings, and why they are not one
+
+| | ceiling | what a breach means |
+|---|---|---|
+| `MAX_RSS_MB` | 2048 MB | the **budget** was broken. A product promise, not a tuning parameter. |
+| `REGRESSION_MB` | just outside the noise band | this scenario got materially more expensive. |
+
+The budget alone cannot be a regression gate. The scenario measures ~145 MB against 2048, so a change
+could cost ten times the memory and still pass. A gate that cannot fail is not coverage, so the
+regression ceiling is set from the observed run-to-run spread and is the one that actually catches
+drift. They are nested and must not be reconciled into a single number.
+
+The same logic separates this from the `footprint (RAM budget)` CI job, which is **not** redundant
+with it. That one is a tight tripwire on a deliberately small scenario (one nest, one event type,
+8004 rows, 256 MB); its sensitivity comes from being small. This one is the product budget on the
+scenario most likely to break it. Neither subsumes the other.
+
+### What the measurement found
+
+| | |
+|---|---|
+| nests on one cursor | 20 |
+| ABI | Uniswap V4 `PoolManager` - 10 events, `Initialize`/`Swap` 8 inputs each |
+| event rate | 200 logs/block across the cursor |
+| blocks | 1000 backfill, then 200 of live tip-following |
+| rows | 240,200 |
+| **peak RSS** | **143 MB**, against the 2048 MB budget |
+| at-tip RSS | 143 MB |
+
+**History is close to free in RAM, and that is the sealing design working rather than luck.** At a 4x
+event rate (608,800 rows) peak went only 143 → 198 MB, and the at-tip figure (173 MB) came in *below*
+the peak - so the peak is a backfill burst, not a steady-state cost. RSS tracks the near-tip window
+and the per-window fan-out, not the size of history, because past finality the rows are sealed to
+Parquet and leave the heap.
+
+**The runtime's own projection is ~13x too pessimistic.** `estimate_nest_rss_mb` projected 1920 MB for
+this exact cursor (`120 + 20 × 90`) against a measured 143 MB, and it is a flat per-nest constant - it
+cannot see ABI size, table count, or event rate, so a ten-event nest is projected identically to a
+one-event one. Since a cursor whose *projected* RSS exceeds `max_rss_mb` is refused before it starts,
+admission control currently caps a cursor at ~22 nests on a model an order of magnitude out. Worth
+revisiting; not changed here, because loosening a refusal path wants more than one scenario behind it.
+
+### The fixture
+
+`multinest-rpc.py` serves the chain locally, the nests are written inline, and topic0s are derived by
+hashing the signatures in the same ABI file the harness writes. No secret, no third party, and a fork
+PR can satisfy the check - the lesson of issue #260, which this inherits rather than relearns.
+
+The tip **moves**: `eth_blockNumber` advances a fixed step per call once the backfill has drained,
+so the cursor genuinely spends the run's second half on the live path. It is deterministic in its
+*endpoint* rather than its schedule - a faster machine arrives sooner, but every run serves exactly
+the same logs, so peak RSS stays comparable between runs.
+
+**The check refuses to pass unless it can show it did the work**: every nest reached the final tip,
+every nest cleared a row floor, and **all ten tables of every nest hold rows**. That last one also
+proves each topic0 landed - a wrong topic0 does not error, it yields an empty table, which is exactly
+how a footprint check passes having measured nothing.
