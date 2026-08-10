@@ -728,9 +728,9 @@ async fn recover_over_cap_block(
             // The narrowed fetch is over the cap too (a factory with more children than one block's
             // cap allows), or the provider rejected the filter itself (some cap the number of
             // addresses). Either way the fallback is spent; fall through and fault the factories.
-            Err(e) => tracing::warn!(
-                "block {block}: the address-filtered fallback failed as well: {e:#}"
-            ),
+            Err(e) => {
+                tracing::warn!("block {block}: the address-filtered fallback failed as well: {e:#}")
+            }
         }
     }
     for &i in factories {
@@ -1046,6 +1046,7 @@ fn fan_out_rollback(
 /// address-filtered refetch ([`refetch_address_filtered`]) - the fan-out is the same either way, which
 /// is the point of it being one function: the recovery path must not become a second, divergent way of
 /// committing a window.
+#[allow(clippy::too_many_arguments)]
 async fn fan_out_window(
     source: &dyn Source,
     nests: &mut [Option<NestIngest>],
@@ -5413,10 +5414,7 @@ template = "pool"
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((addrs.to_vec(), from, to));
+            self.calls.lock().unwrap().push((addrs.to_vec(), from, to));
             if addrs.is_empty() {
                 anyhow::bail!("query returned more than 10000 results");
             }
@@ -5534,7 +5532,16 @@ template = "pool"
         let mut nexts = vec![7u64, 7];
         let mut sup = test_supervisor(2);
         recover_over_cap_block(
-            &source, &mut nests, &mut nexts, &mut sup, &[0, 1], &[1], &u_topics, 7, 7, &cause,
+            &source,
+            &mut nests,
+            &mut nexts,
+            &mut sup,
+            &[0, 1],
+            &[1],
+            &u_topics,
+            7,
+            7,
+            &cause,
         )
         .await
         .unwrap();
@@ -5585,10 +5592,17 @@ template = "pool"
             calls.iter().all(|(a, _, _)| !a.is_empty()),
             "the fallback must never reissue the topic0-only fetch: {calls:?}"
         );
-        assert_eq!(calls.len(), 2, "one narrowed fetch, one fixpoint round: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            2,
+            "one narrowed fetch, one fixpoint round: {calls:?}"
+        );
         assert!(
             calls[0].0.iter().any(|a| a.eq_ignore_ascii_case(token))
-                && calls[0].0.iter().any(|a| a.eq_ignore_ascii_case(factory_addr)),
+                && calls[0]
+                    .0
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(factory_addr)),
             "round 1 asks for every live nest's known addresses: {:?}",
             calls[0].0
         );
