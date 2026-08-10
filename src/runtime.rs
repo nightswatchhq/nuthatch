@@ -566,6 +566,271 @@ impl MountTable {
     }
 }
 
+/// One dataset that started with no data of its own and took an existing one's (RFC-0033 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    /// The identity that adopted - the one the mount record claims.
+    pub nid: String,
+    /// The identity it adopted from.
+    pub from_nid: String,
+}
+
+impl std::fmt::Display for Adoption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} adopted the dataset of {} - same data identity, so no re-index",
+            &self.nid[..12.min(self.nid.len())],
+            &self.from_nid[..12.min(self.from_nid.len())],
+        )
+    }
+}
+
+/// An existing dataset whose inputs imply **byte-identical data** to `want`, and which actually holds
+/// some (RFC-0033 §5, early cutoff).
+///
+/// Shared by the two paths that can face a new identity over old data: `migrate`, which meets it when
+/// a staged nest is edited between runs, and the mount path, which meets it when an edited nest is
+/// installed under the identity it now hashes to. One definition, so the two cannot drift into
+/// answering the question differently.
+///
+/// Two independent conditions, both required. The data identity is the general check; `registry_hash`
+/// is a second, narrower one that pins the decode. Requiring both means a bug in the exclusion list
+/// cannot on its own cause an adoption - and the failure of either costs only a re-index.
+///
+/// **A candidate with no derived state is not a candidate.** Adopting an empty dataset copies nothing
+/// and still consumes the one chance to adopt, leaving a re-index that looks like a cutoff.
+///
+/// Skips `want_nid` itself: a dataset that already exists is not an adoption.
+pub fn adoptable(
+    root: &Path,
+    want: &crate::blob::Manifest,
+    want_nid: &str,
+) -> Option<(String, PathBuf)> {
+    let entries = std::fs::read_dir(root.join(DATA_DIR)).ok()?;
+    let mut candidates: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .filter(|(nid, _)| nid != want_nid && nid.len() == 64)
+        .collect();
+    // Deterministic: two equally-adoptable datasets must not depend on directory order.
+    candidates.sort();
+
+    candidates.into_iter().find(|(_, dir)| {
+        if !holds_data(dir) {
+            return false;
+        }
+        let Ok(m) = crate::blob::build_manifest(dir, None) else {
+            return false;
+        };
+        m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
+    })
+}
+
+/// Does this dataset hold indexed state of its own - a hot store with rows in it, or sealed segments?
+///
+/// The question adoption turns on in both directions: a destination that holds data must never be
+/// written over, and a source that holds none is not worth adopting.
+///
+/// **It asks about data, not about files** (issue #408). This was a presence check over
+/// [`crate::blob::DERIVED_STATE`], and both of those paths appear before anything has been indexed:
+/// `Store::open` creates and commits an empty `nuthatch.redb` as soon as a cursor starts, and
+/// `segments/` is created before the first segment lands in it. So a runtime that was started and
+/// stopped before its first block left a dataset that read as holding data, which cost both sides of
+/// the decision: an empty candidate was adopted and consumed the one chance to adopt the sibling that
+/// held the real history, and a destination that had once been started could never adopt again.
+///
+/// **An unreadable store counts as holding data.** The two directions want opposite defaults - the
+/// destination must never be written over on a maybe, the candidate is merely not worth adopting -
+/// and the destination's is the one where being wrong destroys something. Costing a re-index is the
+/// cheaper way to be wrong.
+pub fn holds_data(dir: &Path) -> bool {
+    // Sealed segments are data and need no lock to see. An *empty* `segments/` is not data.
+    if std::fs::read_dir(dir.join("segments"))
+        .map(|mut e| e.next().is_some())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let db = dir.join(crate::config::DB_FILE);
+    db.exists() && crate::store::store_holds_rows(&db).unwrap_or(true)
+}
+
+/// Early cutoff on the **mount path** (RFC-0033 §5, issue #364).
+///
+/// A cosmetic edit moves the NID and leaves the data identity alone, so `data/<new-nid>` is a
+/// directory holding the edited inputs and nothing else. The runtime used to mount it exactly like
+/// that and re-fetch the whole chain, because nothing outside `migrate` ever consulted
+/// `data_identity()`. The cost RFC-0033 §5 exists to remove was being paid by every path except the
+/// one an operator actually uses.
+///
+/// Three properties this holds deliberately:
+///
+/// - **Never over data.** A dataset holding a store or segments is left alone, whatever it hashes to.
+///   That makes this a no-op on every ordinary restart, and it means a partial index is resumed rather
+///   than silently replaced.
+/// - **Copies, never moves.** The source may still be mounted - by another tenant, or by the
+///   pre-edit record somebody has not removed yet. Early cutoff must not take data away from a mount
+///   that is using it (`migrate.rs` holds the same line).
+/// - **Cannot change what it adopts into.** It copies exactly [`crate::blob::DERIVED_STATE`], which is
+///   a subset of the set the NID excludes, so the destination's identity is the same after adoption as
+///   before. An adoption that moved the identity would be a drift report a moment later.
+///
+/// - **All of it, or none of it.** [`crate::blob::DERIVED_STATE`] is copied into a staging sibling
+///   first and committed by rename, so a fault part-way through leaves the destination exactly as it
+///   was: inputs only, `holds_data` false, adoptable again on the next start. Copying straight in
+///   would be worse than not adopting at all - a complete store carrying `sealed_through = N` beside
+///   a partial `segments/` is a permanent hole in `/sql` that nothing ever repairs, because the
+///   destination now holds data and can neither adopt nor backfill from the start block.
+///
+/// Returns what was adopted, for logging. A failed copy is an error, and the re-index it replaces is
+/// genuinely still available once the fault is fixed.
+pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Adoption>> {
+    // A staging directory left behind means a previous adoption died mid-copy. It is scratch that
+    // nothing outside this function reads, and clearing it before the `holds_data` check is what
+    // makes a killed adoption recoverable rather than merely a failed one.
+    let staging = adopt_staging(dataset);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("clearing stale adoption staging {}", staging.display()))?;
+    }
+    if !dataset.is_dir() || holds_data(dataset) {
+        return Ok(None);
+    }
+    let Ok(want) = crate::blob::build_manifest(dataset, None) else {
+        // Unhashable inputs are a different fault, and `Config::load` reports it with a better
+        // message a moment later. Not adopting is the safe answer to a question we cannot ask.
+        return Ok(None);
+    };
+    let Some((from_nid, from)) = adoptable(root, &want, nid) else {
+        return Ok(None);
+    };
+    let outcome = stage_derived_state(&from, &staging)
+        .and_then(|staged| commit_derived_state(&staging, dataset, &staged));
+    // Scratch in every outcome. If this removal fails, the next start clears it before deciding
+    // anything, so a leftover staging directory can never read as an adoption that happened.
+    let _ = std::fs::remove_dir_all(&staging);
+    outcome.with_context(|| format!("adopting {} into {}", from.display(), dataset.display()))?;
+    Ok(Some(Adoption {
+        nid: nid.to_string(),
+        from_nid,
+    }))
+}
+
+/// Where an adoption assembles its copy before committing it: a sibling of the destination, so the
+/// commit is a same-filesystem rename rather than a second copy.
+///
+/// The suffix keeps it out of [`adoptable`]'s scan and of `prune::collectable`, both of which take
+/// 64-hex names only - a staging directory must never be a candidate for anything. `prune` removes it
+/// alongside the dataset it belongs to, so a copy interrupted by a kill cannot outlive its owner.
+pub(crate) fn adopt_staging(dataset: &Path) -> PathBuf {
+    let mut name = dataset.file_name().unwrap_or_default().to_os_string();
+    name.push(".adopting");
+    dataset.with_file_name(name)
+}
+
+/// Copy the source's derived state into `staging`, returning the names that actually landed there.
+///
+/// Nothing here touches `dataset`. That is the whole point: every way this can fail - disk full,
+/// permissions, an unreadable segment - leaves the destination untouched.
+fn stage_derived_state(from: &Path, staging: &Path) -> Result<Vec<&'static str>> {
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("cannot create {}", staging.display()))?;
+    let mut staged = Vec::new();
+    for name in crate::blob::DERIVED_STATE {
+        let src = from.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = staging.join(name);
+        if src.is_dir() {
+            crate::project::copy_dir(&src, &dst)
+        } else {
+            std::fs::copy(&src, &dst).map(|_| ()).map_err(Into::into)
+        }
+        .with_context(|| format!("staging {} from {}", name, src.display()))?;
+        staged.push(*name);
+    }
+    Ok(staged)
+}
+
+/// Move the staged set into the destination, unwinding what already moved if one of them fails.
+///
+/// These are metadata-only renames within one directory tree, so this is the narrow end of the
+/// funnel by design - the copy, which is the part that runs out of disk, is already done.
+fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str]) -> Result<()> {
+    let mut moved: Vec<&'static str> = Vec::new();
+    for name in staged {
+        let Err(e) = std::fs::rename(staging.join(name), dataset.join(name)) else {
+            moved.push(name);
+            continue;
+        };
+        let mut err = anyhow::Error::new(e).context(format!("committing {name}"));
+        for done in moved.iter().rev() {
+            let landed = dataset.join(done);
+            let undo = if landed.is_dir() {
+                std::fs::remove_dir_all(&landed)
+            } else {
+                std::fs::remove_file(&landed)
+            };
+            if let Err(u) = undo {
+                err = err.context(format!(
+                    "and {done} could not be unwound ({u}) - {} may now hold a partial adoption and \
+                     must be emptied by hand before it will index correctly",
+                    dataset.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Resolve every mounted dataset to `(route key, directory, config)` - the list the cursors are built
+/// from (RFC-0032 §4).
+///
+/// This is the mount path. `dev` gets its nests from here and cannot get them anywhere else, which is
+/// what makes the early-cutoff step below reachable in production rather than in `migrate` only.
+///
+/// Adoption runs **before** the config load, because a dataset that adopts is one whose store the
+/// loader is about to open.
+pub fn load_mounted(
+    dir: &Path,
+    datasets: &[Dataset],
+    multi_tenant: bool,
+) -> Result<Vec<(String, PathBuf, Config)>> {
+    let mut out = Vec::with_capacity(datasets.len());
+    for ds in datasets {
+        if let Some(nid) = &ds.nid {
+            match adopt_dataset(dir, &ds.dir, nid) {
+                Ok(Some(a)) => tracing::info!("early cutoff: {a}"),
+                Ok(None) => {}
+                // A dataset that could not adopt still indexes - slowly, and correctly, because
+                // `adopt_dataset` is all-or-nothing and has left it inputs-only. Refusing to start
+                // over a failed optimisation would turn a disk-full into an outage.
+                Err(e) => tracing::warn!(
+                    "{} could not adopt an existing dataset ({e:#}) - it will index from its start block",
+                    ds.canonical()
+                ),
+            }
+        }
+        let config = Config::load(&ds.dir).with_context(|| {
+            format!(
+                "loading mounted nest '{}' from {}",
+                ds.canonical(),
+                ds.dir.display()
+            )
+        })?;
+        out.push((
+            ds.canonical().route_key(multi_tenant),
+            ds.dir.clone(),
+            config,
+        ));
+    }
+    Ok(out)
+}
+
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
 fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
     datasets
@@ -766,21 +1031,7 @@ pub async fn dev(
     }
 
     let multi_tenant = mounts.is_multi_tenant();
-    let mut mounted = Vec::with_capacity(datasets.len());
-    for ds in &datasets {
-        let config = Config::load(&ds.dir).with_context(|| {
-            format!(
-                "loading mounted nest '{}' from {}",
-                ds.canonical(),
-                ds.dir.display()
-            )
-        })?;
-        mounted.push((
-            ds.canonical().route_key(multi_tenant),
-            ds.dir.clone(),
-            config,
-        ));
-    }
+    let mounted = load_mounted(&dir, &datasets, multi_tenant)?;
     let groups = group_by_chain(&endpoints, mounted)?;
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
@@ -1099,7 +1350,14 @@ pub async fn dev(
 /// This returns - ending the runtime - only when **every** cursor is gone, because at that point nothing
 /// will ever advance again and a restart is the only thing that can help. Exiting non-zero under a
 /// supervisor beats staying up serving permanently-frozen data.
-async fn supervise_cursors(
+///
+/// `pub` for one reason: this is the *only* point at which a dead cursor's fate is decided, and
+/// [`dev`] reaches it through a real RPC endpoint set, so no integration test can drive the property
+/// through `dev` with a fixture chain. `tests/e2e_cursor_death_isolation.rs` hands it the genuine
+/// [`crate::indexer::ChainCursor::ingest`] handles of two live cursors instead (issue #387). Keeping it
+/// private would only have moved that test onto handles it fabricated itself, which is the coverage
+/// that already existed and the coverage the issue was filed about.
+pub async fn supervise_cursors(
     ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
     health: &crate::health::RuntimeHealth,
     fail_fast: bool,
@@ -1749,6 +2007,308 @@ mod tests {
         assert!(!MountTable::is_identity_keyed(
             &root.join(DATA_DIR).join("zz11".repeat(16))
         ));
+    }
+
+    /// Stage a second dataset from `nid`'s inputs plus a cosmetic edit, and return the identity it
+    /// hashes to. The two datasets then share a data identity and differ in NID - the shape early
+    /// cutoff exists for.
+    fn cosmetic_sibling(root: &Path, nid: &str) -> String {
+        let staging = root.join("staging");
+        crate::project::copy_dir(&MountTable::data_dir(root, nid), &staging).unwrap();
+        // Inputs only - a freshly installed nest package carries no store and no segments.
+        for name in crate::blob::DERIVED_STATE {
+            let p = staging.join(name);
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+        // `views/**` is excluded from the data identity, so this moves the NID and nothing else.
+        std::fs::create_dir_all(staging.join("views")).unwrap();
+        std::fs::write(staging.join("views").join("10-note.sql"), "-- a note\n").unwrap();
+
+        let new_nid = crate::blob::nest_nid(&staging).unwrap();
+        std::fs::rename(&staging, MountTable::data_dir(root, &new_nid)).unwrap();
+        new_nid
+    }
+
+    /// Early cutoff on the mount path (#364): a dataset with no data of its own takes the data of one
+    /// whose inputs imply the same bytes.
+    #[test]
+    fn a_dataset_with_no_data_adopts_a_data_identical_one() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "indexed history",
+        )
+        .unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        let adopted = adopt_dataset(root, &dest, &new).unwrap();
+
+        assert_eq!(
+            adopted,
+            Some(Adoption {
+                nid: new.clone(),
+                from_nid: old.clone()
+            }),
+            "a cosmetic edit must adopt the dataset it came from"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history",
+            "the data must actually arrive - reporting an adoption that copied nothing is worse than \
+             not adopting"
+        );
+        assert!(
+            MountTable::data_dir(root, &old)
+                .join(crate::config::DB_FILE)
+                .is_file(),
+            "adoption must COPY - the source may still be mounted by another tenant"
+        );
+        // And it must not have moved the identity it adopted into, or the next start reports drift.
+        assert_eq!(
+            crate::blob::nest_nid(&dest).unwrap(),
+            new,
+            "copying derived state must not change what the destination's inputs hash to"
+        );
+    }
+
+    /// The guard that makes this safe to run on **every** start: a dataset that already holds data is
+    /// left exactly as it is. Without it, early cutoff would overwrite a live nest's store with
+    /// another dataset's the moment two identities shared a data identity - which is the ordinary case
+    /// after an edit, not a rare one.
+    #[test]
+    fn adoption_never_writes_over_a_dataset_that_holds_data() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "the other dataset's history",
+        )
+        .unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        // This one has indexed on its own - a restart, or a partial backfill that was interrupted.
+        std::fs::write(dest.join(crate::config::DB_FILE), "my own history").unwrap();
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a dataset holding data must not adopt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "my own history",
+            "its store must be untouched"
+        );
+    }
+
+    /// The dangerous direction, at the point the decision is made: different data identity, no
+    /// adoption. `e2e_early_cutoff` drives the same rule through the whole mount path.
+    #[test]
+    fn a_dataset_whose_data_identity_differs_is_not_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "indexed history",
+        )
+        .unwrap();
+
+        // A different contract: same shape, different bytes stored.
+        let staging = root.join("staging");
+        crate::project::copy_dir(&MountTable::data_dir(root, &old), &staging).unwrap();
+        std::fs::remove_file(staging.join(crate::config::DB_FILE)).unwrap();
+        let cfg = std::fs::read_to_string(staging.join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            staging.join(CONFIG_FILE),
+            cfg.replace(
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+            ),
+        )
+        .unwrap();
+        let new = crate::blob::nest_nid(&staging).unwrap();
+        let dest = MountTable::data_dir(root, &new);
+        std::fs::rename(&staging, &dest).unwrap();
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a nest indexing a different contract must not inherit another contract's data"
+        );
+        assert!(
+            !dest.join(crate::config::DB_FILE).exists(),
+            "and nothing must have been copied into it"
+        );
+    }
+
+    /// Adoption is all-or-nothing, and a half-copied one is the failure this guards.
+    ///
+    /// `DERIVED_STATE` is `[nuthatch.redb, segments]`. Copying them into the destination in order
+    /// means a fault while `segments/` is in flight leaves a **complete** store carrying
+    /// `sealed_through = N` beside a **partial** `segments/`. Rows up to `N` were pruned from hot
+    /// when they sealed, so they now exist only in the segments that never arrived; indexing resumes
+    /// from the copied `last_block` and never re-fetches them; and `holds_data` is true, so the
+    /// dataset can neither adopt again nor start over. `/sql` answers with a permanent silent hole.
+    ///
+    /// The fault injected here is a dangling symlink inside the source's `segments/`, which is a
+    /// deterministic stand-in for the disk-full this exists for: `copy_dir` reaches it after the
+    /// store has already been copied, and fails. What must survive it is the destination being back
+    /// to inputs-only - and *actually* adoptable, which the second half asserts by clearing the
+    /// fault and adopting for real.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_adoption_leaves_the_dataset_inputs_only_and_still_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        std::fs::create_dir_all(src.join("segments")).unwrap();
+        std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        // Injected after the sibling is staged, so only the adoption trips over it. Copied after the
+        // store, and unreadable: `fs::copy` on a dangling symlink fails with ENOENT.
+        std::os::unix::fs::symlink("nowhere", src.join("segments").join("9999.parquet")).unwrap();
+
+        let err = adopt_dataset(root, &dest, &new).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("adopting"),
+            "the failure must name the adoption, got: {err:#}"
+        );
+        assert!(
+            !holds_data(&dest),
+            "a failed adoption must leave the dataset inputs-only, not half a dataset it can never \
+             repair - found {:?}",
+            crate::blob::DERIVED_STATE
+                .iter()
+                .filter(|n| dest.join(n).exists())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::blob::nest_nid(&dest).unwrap(),
+            new,
+            "and it must not have moved the identity on the way out"
+        );
+
+        // "The re-index it replaces is still available once the fault is fixed" - as a claim that is
+        // checked, not one the doc comment merely makes.
+        std::fs::remove_file(src.join("segments").join("9999.parquet")).unwrap();
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            Some(Adoption {
+                nid: new.clone(),
+                from_nid: old.clone()
+            }),
+            "the next start must adopt, or the failure was permanent after all"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("segments").join("0000.parquet")).unwrap(),
+            "sealed rows",
+            "and the whole set must arrive, not just the store"
+        );
+        assert!(
+            !adopt_staging(&dest).exists(),
+            "staging is scratch and must not outlive the adoption"
+        );
+    }
+
+    /// An empty dataset is not worth adopting, and adopting it would consume the one chance to adopt
+    /// the dataset that does hold the history.
+    #[test]
+    fn an_empty_dataset_is_not_an_adoption_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc"); // no store written: inputs only
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "adopting an empty dataset reports a cutoff and still re-indexes"
+        );
+    }
+
+    /// Issue #408, the candidate side. The case above covers a dataset with **no** store file; this
+    /// one covers a dataset with a store file that holds nothing, which is what a runtime started and
+    /// stopped before its first block leaves behind. A presence check cannot tell the two apart, and
+    /// the empty one is the case that actually occurs in the field.
+    #[test]
+    fn a_dataset_whose_store_was_created_but_never_written_is_not_an_adoption_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        // A real redb, opened the way a starting cursor opens it, and closed before it indexed
+        // anything. Scoped so the handle is dropped: redb holds a file lock for as long as it lives.
+        {
+            crate::store::Store::open(
+                &MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            )
+            .expect("an empty store must be creatable");
+        }
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a store that was created and never written holds no history, so adopting it burns the \
+             one chance to adopt on nothing"
+        );
+    }
+
+    /// Issue #408, the destination side, and the lasting half of it. An interrupted start leaves the
+    /// destination with an empty store of its own; under a presence check that dataset then read as
+    /// holding data and could **never** adopt again, including from the sibling that holds the real
+    /// history. The cost was permanent rather than one-off, which is what made it worth fixing.
+    #[test]
+    fn an_interrupted_start_does_not_cost_a_dataset_its_cutoff() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        std::fs::create_dir_all(src.join("segments")).unwrap();
+        std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        // The interrupted start: a cursor came up here once, created its store, and got nowhere.
+        {
+            crate::store::Store::open(&dest.join(crate::config::DB_FILE))
+                .expect("an empty store must be creatable");
+        }
+        // The other path the same interrupted start leaves behind, which #408 flagged and did not
+        // trace: `segments/` is created before the first segment is written into it.
+        std::fs::create_dir_all(dest.join("segments")).unwrap();
+
+        let adoption = adopt_dataset(root, &dest, &new)
+            .unwrap()
+            .expect("an empty store is not history, so it must not block the cutoff");
+        assert_eq!(adoption.from_nid, old);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history",
+            "and the adopted store must replace the empty one"
+        );
     }
 
     /// The baseline: an untouched dataset must report nothing, or the check is just noise.

@@ -224,7 +224,15 @@ smaller band and a ceiling below the healthy enforced figure (#395).
 | | ceiling | what a breach means |
 |---|---|---|
 | `MAX_RSS_MB` | 2048 MB | the **budget** was broken. A product promise, not a tuning parameter. |
-| `REGRESSION_MB` | just outside the noise band | this scenario got materially more expensive. |
+| `REGRESSION_MB` | 180 MB | this scenario got materially more expensive. |
+
+Both halves of that 180 are measured **on the runner that enforces it**, which is the only place the
+margin is real:
+
+| | |
+|---|---|
+| runner baseline | 131 MB (ceiling sits 1.37x above) |
+| runner, carrying a deliberate leak | 323 MB (ceiling sits 1.79x below) |
 
 The budget alone cannot be a regression gate. The scenario measures ~145 MB against 2048, so a change
 could cost ten times the memory and still pass. A gate that cannot fail is not coverage, so the

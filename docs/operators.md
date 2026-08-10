@@ -59,8 +59,9 @@ WorkingDirectory=/var/lib/nuthatch/mynest        # the nest directory (holds nut
 ExecStart=/usr/local/bin/nuthatch dev --listen 127.0.0.1:8288 --seal-direct --concurrency 8
 Restart=on-failure
 RestartSec=5
-# Off-localhost the admin UI requires this; unset it and bind 127.0.0.1 to disable remote admin.
-Environment=NUTHATCH_ADMIN_TOKEN=change-me
+# Remote admin is OFF as written: the bind above is localhost, so the admin UI needs no token.
+# To enable it you must change the bind AND choose a token — generate one, never paste a literal:
+#   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
 # Keep it inside the footprint budget; the box needs headroom for DuckDB queries.
 MemoryMax=2G
 
@@ -80,9 +81,13 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  -e NUTHATCH_ADMIN_TOKEN=change-me \
   ghcr.io/nightswatchhq/nuthatch:2.0.0
 ```
+
+> **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
+> the bind is not localhost and `NUTHATCH_ADMIN_TOKEN` decides whether the admin routes exist at all.
+> Without one they are **not mounted** — the right default for a command people copy-paste. Turning
+> remote admin on is a deliberate second step: see [Enabling remote admin](#enabling-remote-admin).
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
 build, so the two cannot drift. It runs as an unprivileged user (uid 10001), carries only
@@ -524,6 +529,32 @@ with the reason rather than reporting on sealed data alone, which would bind aga
 schema than a following `/sql` would see. Anywhere you bound `/sql`, bound `/explain` with it: a
 guard on one and not the other leaves the cheaper-looking route as the expensive one.
 
+### Enabling remote admin
+
+The recipes above ship with remote admin off. Not caution for its own sake: the admin surface mounts
+and unmounts nests, so a reachable one behind a guessable token is full control of what the runtime
+serves.
+
+If you need it, generate the token. Never copy a literal out of documentation, including this page:
+
+```sh
+openssl rand -hex 32
+```
+
+Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port on `127.0.0.1`, reach it through a reverse
+proxy with TLS, and treat the value as a credential — not in shell history, not in a committed compose
+file, and not in a world-readable unit file (`chmod 600`, or `EnvironmentFile=` pointing at a
+root-owned file).
+
+Two things worth knowing first:
+
+- **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
+  off-localhost *unless* a token is set. So setting one is not purely "adding auth" — it also lifts
+  the guard that was protecting you. Correct behaviour, but it means the token is the only thing
+  between the network and `POST /_admin/nests`.
+- **Anything on the same Docker network reaches it** regardless of `-p 127.0.0.1:...`, because the
+  publish flag governs the host, not the container network.
+
 **Admin surface.** Off-localhost the admin UI requires `NUTHATCH_ADMIN_TOKEN` on every request; token
 comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
 
@@ -538,6 +569,50 @@ else.
 file's hash, and that the decode registry regenerated from the inputs matches the manifest. A nest
 that does not reproduce its own decode registry is refused. Compliance packs are ed25519-signed
 (`nuthatch pack keygen|build|verify`). Licensed `MIT OR Apache-2.0`; `cargo-deny` runs in CI.
+
+**Per-caller rate limiting is the gateway's job, not nuthatch's.** The node cannot rate-limit by caller
+because nothing it serves carries a caller identity: the data routes (`/entities`, `/sql`, `/explain`
+and the rest) have no accounts and no API keys. `NUTHATCH_ADMIN_TOKEN` above is not a counter-example
+- it is one shared operator credential gating `/_admin`, not a per-caller identity you could meter,
+and every caller who has it is the same caller as far as the node can tell. The query guards above
+bound the cost of a single request and the total concurrent load; they say nothing about how many
+requests a given caller may make. An in-process request-per-second counter with no identity would be
+worse than nothing: the first caller to hit it blocks every other caller, converting an accidental
+poller into a service-wide outage.
+
+For operators who need per-caller rate limiting, the right place is the reverse proxy in front:
+
+```caddyfile
+# Caddy with mholt/caddy-ratelimit (compile with xcaddy; not in the stock binary)
+your-domain.example {
+    reverse_proxy localhost:8288
+
+    rate_limit {
+        zone api {
+            key     {remote_host}
+            events  60
+            window  1m
+        }
+    }
+}
+```
+
+```nginx
+# nginx (ngx_http_limit_req_module, standard in most packages)
+http {
+    limit_req_zone $binary_remote_addr zone=api:10m rate=60r/m;
+
+    server {
+        location / {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://127.0.0.1:8288;
+        }
+    }
+}
+```
+
+Neither is a complete security configuration - TLS, authentication, and an allowlist belong in front
+too. The rate limit is one layer of a stack, not the stack. See [The division of labour](#the-division-of-labour).
 
 ---
 
