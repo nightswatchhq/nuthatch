@@ -66,6 +66,13 @@ zero drama. Revisit criteria: Turso reaches a production-ready release, its lice
 clears the permissive/no-BSL rule, and a measured win over redb exists that federation
 doesn't already provide. Until all three, no.
 
+> **Correction, 2026-08-10.** The licence criterion was wrong on the day it was written.
+> `tursodatabase/turso` and `tursodatabase/libsql` are both **MIT**, checked against the GitHub API
+> on 2026-08-10, so there was never a BSL rule for Turso to clear. Two criteria remain, not three,
+> and the measured win has never been attempted. The decision itself stands - it rested on maturity
+> and on §3 delivering SQL-over-the-tip without a store swap, neither of which the licence affected.
+> `docs/backlog.md` carries the corrected wording; #366 carries the measurement.
+
 ### §2 - Query engine: converge on DataFusion (as destination)
 
 DataFusion is the correct long-term analytical engine for Nuthatch:
