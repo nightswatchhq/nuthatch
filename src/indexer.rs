@@ -6129,8 +6129,17 @@ rpc_urls = ["https://rpc.example"]
         assert!(exposure_v.entries() > 0, "fixture must build exposure");
 
         // Velocity: bucket count and every flagged bucket.
-        assert_eq!(velocity_v.entries(), want_velocity.entries());
-        assert_eq!(velocity_v.flags(1), want_velocity.flags(1));
+        assert_eq!(
+            velocity_v.entries(),
+            want_velocity.entries(),
+            "velocity bucket count differs from the replay - a missing bucket means the rebuild \
+             skipped a sender the live loop would have counted"
+        );
+        assert_eq!(
+            velocity_v.flags(1),
+            want_velocity.flags(1),
+            "velocity flags differ from the replay"
+        );
         assert!(
             velocity_v.entries() > 1,
             "fixture must land in more than one window bucket"
