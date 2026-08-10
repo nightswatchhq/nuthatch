@@ -290,7 +290,8 @@ if [ -n "$REPORT" ]; then
   "budget_mb": $MAX_RSS_MB,
   "regression_ceiling_mb": ${REGRESSION_MB:-null},
   "seconds_to_final_tip": ${done_at:-null},
-  "commit": "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  "commit": "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)",
+  "hardware": "$(nproc 2>/dev/null || echo '?') cores, $(awk '/MemTotal/ {printf "%d GB", int($2/1024/1024 + 0.5)}' /proc/meminfo 2>/dev/null || echo '? GB'), $(uname -s)"
 }
 JSON
   echo "report:       $REPORT"
