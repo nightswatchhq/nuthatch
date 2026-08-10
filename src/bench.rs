@@ -249,6 +249,30 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         );
     }
 
+    // `--keep` clears its directory on every run, so refuse the one path a caller is most likely to
+    // type by mistake: the nest itself, which would delete `nuthatch.toml` and the indexed data it
+    // was pointed at. Checked before the first run, not on the way out.
+    let keep: Option<std::path::PathBuf> = match &args.keep {
+        None => None,
+        Some(p) => {
+            let p = std::path::PathBuf::from(p);
+            if p.join(crate::config::CONFIG_FILE).exists() {
+                anyhow::bail!(
+                    "--keep {} is a nest directory (it holds {}), and every bench run clears its \
+                     work dir before starting. Point --keep at a new or dedicated path, then query \
+                     it with `nuthatch sql --dir <that path>`.",
+                    p.display(),
+                    crate::config::CONFIG_FILE
+                );
+            }
+            println!(
+                "  --keep: writing run data to {} (last run survives)",
+                p.display()
+            );
+            Some(p)
+        }
+    };
+
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
         let r = one_run(
@@ -263,6 +287,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             args.seal_direct,
             args.concurrency,
             run,
+            keep.as_deref(),
         )
         .await?;
         println!(
@@ -587,10 +612,19 @@ async fn one_run(
     seal_direct: bool,
     concurrency: usize,
     run: usize,
+    keep: Option<&std::path::Path>,
 ) -> Result<Run> {
     let source = RpcClient::new(rpc_urls.to_vec())?;
-    // A throwaway work dir per run (redb and/or Parquet segments) - never the nest's own database.
-    let work = std::env::temp_dir().join(format!("nuthatch-bench-{}-{run}", std::process::id()));
+    // Normally a throwaway work dir per run (redb and/or Parquet segments) - never the nest's own
+    // database. `--keep` points it somewhere durable instead, because a case whose criterion is a
+    // ROW COUNT cannot be answered by a harness that deletes its rows: OBIB case 3 asks for 100,001
+    // block records, and until this existed the only way to produce them threw them away
+    // (RFC-0036 §5.1). Every run clears and rewrites the directory, so what survives is the last
+    // run's data - stated because a median over 3 runs and a row count from 1 are different things.
+    let work = match keep {
+        Some(p) => p.to_path_buf(),
+        None => std::env::temp_dir().join(format!("nuthatch-bench-{}-{run}", std::process::id())),
+    };
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
 
@@ -653,7 +687,11 @@ async fn one_run(
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
     let peak_rss_mb = rss.stop();
-    let _ = std::fs::remove_dir_all(&work);
+    // Keep the data when asked. Without this the flag would create the directory, fill it, and then
+    // delete it — which is the whole defect it exists to fix, just relocated.
+    if keep.is_none() {
+        let _ = std::fs::remove_dir_all(&work);
+    }
 
     Ok(Run {
         events,
@@ -682,19 +720,46 @@ async fn hot_store_backfill(
     to: u64,
     window: u64,
 ) -> Result<u64> {
-    let store = Store::open(&dir.join("bench.redb"))?;
+    // `DB_FILE`, not a bench-specific name: with `--keep` this directory is meant to be opened by
+    // `nuthatch sql --dir <path>`, which looks for the standard store. A private filename would
+    // persist the data and still leave it unqueryable, which is the failure this flag exists to fix.
+    let store = Store::open(&dir.join(crate::config::DB_FILE))?;
     let mut events = 0u64;
     let mut next = from;
     while next <= to {
         let chunk_to = (next + window - 1).min(to);
-        let logs = source
-            .logs(addresses, topic0s, next, chunk_to)
-            .await
-            .with_context(|| format!("getLogs {next}..={chunk_to}"))?;
+        // Same rule as `indexer.rs`: an empty address AND topic filter means *every log on the
+        // chain*, not none. A blocks-only nest has neither, and no log could decode without them.
+        let logs = if addresses.is_empty() && topic0s.is_empty() {
+            Vec::new()
+        } else {
+            source
+                .logs(addresses, topic0s, next, chunk_to)
+                .await
+                .with_context(|| format!("getLogs {next}..={chunk_to}"))?
+        };
         let mut rows: Vec<_> = logs
             .iter()
             .filter_map(|log| registry.decode(log).ok().flatten())
             .collect();
+        // RFC-0036 §4.2, mirroring `indexer.rs`: a `blocks` nest must cover blocks that emitted
+        // nothing, so the rows are enumerated from the WINDOW, not from `logs`. Deriving them from
+        // logs is what produced "zero rows and a green run" - the exact failure the indexer's own
+        // comment warns about, which this harness reimplemented rather than shared.
+        if registry.blocks() {
+            let want: Vec<u64> = (next..=chunk_to).collect();
+            let headers = source.block_headers(&want).await?;
+            let mut block_rows: Vec<_> = want
+                .iter()
+                .filter_map(|b| {
+                    headers
+                        .get(b)
+                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                })
+                .collect();
+            block_rows.sort_by_key(|r| r.block_number);
+            rows.append(&mut block_rows);
+        }
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
         blocks.sort_unstable();
         blocks.dedup();

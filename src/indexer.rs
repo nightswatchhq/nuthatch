@@ -2170,20 +2170,30 @@ pub async fn backfill_direct(
     };
     while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
-        let logs = match source.logs(addresses, topic0s, next, chunk_to).await {
-            Ok(logs) => {
-                chunker.observed(logs.len() as u64);
-                logs
-            }
-            Err(e) if chunker::is_result_too_large(&e) => {
-                if next >= chunk_to {
-                    return Err(e).with_context(|| single_block_over_cap(next)); // H3: can't shrink a block
+        // Nothing to decode means nothing to ask for. An empty address AND topic filter is not
+        // "no logs" to a node - it is *every log on the chain*, which a blocks-only nest (OBIB case
+        // 3: no contract at all) would otherwise request for every window and then discard, since
+        // no log can decode without a matching address or topic. Public endpoints answer that with
+        // a timeout rather than data.
+        let logs = if addresses.is_empty() && topic0s.is_empty() {
+            Vec::new()
+        } else {
+            match source.logs(addresses, topic0s, next, chunk_to).await {
+                Ok(logs) => {
+                    chunker.observed(logs.len() as u64);
+                    logs
                 }
-                chunker.too_large();
-                tracing::debug!("range {next}..={chunk_to} too large; shrinking and retrying");
-                continue; // retry the same `next` with a smaller window
+                Err(e) if chunker::is_result_too_large(&e) => {
+                    if next >= chunk_to {
+                        return Err(e).with_context(|| single_block_over_cap(next));
+                        // H3: can't shrink a block
+                    }
+                    chunker.too_large();
+                    tracing::debug!("range {next}..={chunk_to} too large; shrinking and retrying");
+                    continue; // retry the same `next` with a smaller window
+                }
+                Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
             }
-            Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
         };
         let mut rows: Vec<_> = logs
             .iter()
