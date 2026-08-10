@@ -354,12 +354,31 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
 /// Pull a provider-suggested block range out of an error message.
 ///
 /// Alchemy answers an oversized `eth_getLogs` with *"…this block range should work: [0x1000000,
+/// 0x1007fff]"*. That is authoritative and precise, so honouring it turns a shrinking search into
+/// one corrective retry (RFC-0028 §5).
+///
+/// Parsed defensively - this is provider prose, not a contract. A malformed or inverted pair yields
+/// `None` and the caller falls back to halving. Whether the range is actually *narrower* than what we
+/// asked for is the caller's check, since only the caller knows what it asked for.
+pub(crate) fn suggested_range(msg: &str) -> Option<(u64, u64)> {
+    let open = msg.find('[')?;
+    let close = msg[open..].find(']')? + open;
+    let (a, b) = msg[open + 1..close].split_once(',')?;
+    let parse = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+        u64::from_str_radix(s, 16).ok()
+    };
+    let (from, to) = (parse(a)?, parse(b)?);
+    (from <= to).then_some((from, to))
+}
+
 /// The longest provider-suggested pause we will actually take (#361).
 ///
 /// A hint is advice, not an instruction. A provider answering `try_again_in: 3600s` should stall the
 /// run **loudly** rather than silently parking a backfill for an hour, so anything past this is
-/// logged and clamped rather than obeyed - and clamping down is always safe, because the caller's own
-/// pacing already applies on top.
+/// logged and clamped rather than obeyed. Clamping down is safe because [`clamp_retry_hint`] floors
+/// the result at the caller's own pacing, so a shortened hint can never undercut it.
 pub(crate) const MAX_RETRY_HINT: Duration = Duration::from_secs(30);
 
 /// Clamp a provider's retry hint into `[own_pacing, MAX_RETRY_HINT]`, saying so when the cap bites
@@ -430,25 +449,6 @@ fn retry_hint_of(err: &Value) -> Option<Duration> {
         .get("try_again_in")
         .and_then(Value::as_str)
         .and_then(parse_retry_hint)
-}
-
-/// 0x1007fff]"*. That is authoritative and precise, so honouring it turns a shrinking search into one
-/// corrective retry (RFC-0028 §5).
-///
-/// Parsed defensively - this is provider prose, not a contract. A malformed or inverted pair yields
-/// `None` and the caller falls back to halving. Whether the range is actually *narrower* than what we
-/// asked for is the caller's check, since only the caller knows what it asked for.
-pub(crate) fn suggested_range(msg: &str) -> Option<(u64, u64)> {
-    let open = msg.find('[')?;
-    let close = msg[open..].find(']')? + open;
-    let (a, b) = msg[open + 1..close].split_once(',')?;
-    let parse = |s: &str| -> Option<u64> {
-        let s = s.trim();
-        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-        u64::from_str_radix(s, 16).ok()
-    };
-    let (from, to) = (parse(a)?, parse(b)?);
-    (from <= to).then_some((from, to))
 }
 
 pub struct RpcClient {
