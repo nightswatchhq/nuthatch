@@ -602,7 +602,11 @@ impl std::fmt::Display for Adoption {
 /// and still consumes the one chance to adopt, leaving a re-index that looks like a cutoff.
 ///
 /// Skips `want_nid` itself: a dataset that already exists is not an adoption.
-pub fn adoptable(root: &Path, want: &crate::blob::Manifest, want_nid: &str) -> Option<(String, PathBuf)> {
+pub fn adoptable(
+    root: &Path,
+    want: &crate::blob::Manifest,
+    want_nid: &str,
+) -> Option<(String, PathBuf)> {
     let entries = std::fs::read_dir(root.join(DATA_DIR)).ok()?;
     let mut candidates: Vec<(String, PathBuf)> = entries
         .flatten()

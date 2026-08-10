@@ -127,10 +127,9 @@ async fn bring_up(
 
     let want = tip.to_string();
     let landed = wait_until(POLL_TIMEOUT, || {
-        cursor
-            .states
-            .iter()
-            .all(|(_, s)| s.store.get_meta("last_block").ok().flatten().as_deref() == Some(want.as_str()))
+        cursor.states.iter().all(|(_, s)| {
+            s.store.get_meta("last_block").ok().flatten().as_deref() == Some(want.as_str())
+        })
     })
     .await;
     assert!(landed, "the runtime did not reach block {tip} in time");
@@ -148,7 +147,10 @@ async fn bring_up(
             .all(|(_, s)| s.store.sealed_through() >= finalized)
     })
     .await;
-    assert!(sealed, "the runtime did not seal through {finalized} in time");
+    assert!(
+        sealed,
+        "the runtime did not seal through {finalized} in time"
+    );
 
     // Read the heights off the live states: reopening a store the aborted cursor still holds would
     // answer `None` and say nothing about the run.
@@ -193,7 +195,10 @@ fn install_edited(root: &Path, alias: &str, old_nid: &str, edit: impl FnOnce(&Pa
     edit(&staging);
 
     let nid = nuthatch::blob::nest_nid(&staging).expect("the edited nest must hash");
-    assert_ne!(nid, old_nid, "the edit must move the NID, or nothing is being tested");
+    assert_ne!(
+        nid, old_nid,
+        "the edit must move the NID, or nothing is being tested"
+    );
     let dest = MountTable::data_dir(root, &nid);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::rename(&staging, &dest).unwrap();
@@ -263,13 +268,20 @@ async fn a_cosmetic_edit_adopts_the_dataset_it_came_from_instead_of_re_indexing(
     let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
         let views = dir.join("views");
         std::fs::create_dir_all(&views).unwrap();
-        std::fs::write(views.join("10-note.sql"), "-- a comment, and nothing else\n").unwrap();
+        std::fs::write(
+            views.join("10-note.sql"),
+            "-- a comment, and nothing else\n",
+        )
+        .unwrap();
     });
 
     // The premise, asserted rather than assumed: the new identity resolves onto a directory with the
     // nest's inputs and **no data**. This is the state that costs a full backfill.
     let dest = MountTable::data_dir(root, &new_nid);
-    assert!(dest.join("nuthatch.toml").is_file(), "the edited inputs must be installed");
+    assert!(
+        dest.join("nuthatch.toml").is_file(),
+        "the edited inputs must be installed"
+    );
     assert!(
         !dest.join("nuthatch.redb").exists(),
         "the fixture must start with no store, or it is not reproducing a re-index"
@@ -310,7 +322,9 @@ async fn a_cosmetic_edit_adopts_the_dataset_it_came_from_instead_of_re_indexing(
     );
     // Adoption **copies**: the source dataset may still be mounted by another tenant.
     assert!(
-        MountTable::data_dir(root, &alpha_nid).join("nuthatch.redb").is_file(),
+        MountTable::data_dir(root, &alpha_nid)
+            .join("nuthatch.redb")
+            .is_file(),
         "adoption must not take data away from the dataset it came from"
     );
     // And it is scoped to the dataset that moved: beta was never touched.
