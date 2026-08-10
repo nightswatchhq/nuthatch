@@ -184,6 +184,14 @@ pub struct TapeSource {
     /// aliases return the same rows would pass just as happily with two identical backfills running
     /// side by side - which is the bug, not the fix.
     logs_calls: std::sync::atomic::AtomicUsize,
+    /// When set, every [`Source`] call fails - the tape is "dark".
+    ///
+    /// This models the ordinary operational fault, not an exotic one: every RPC endpoint for this
+    /// chain is unreachable, which is what `escalate_stall` exists to report. It fails *all* the
+    /// methods rather than only `tip`, because an endpoint that cannot answer `eth_blockNumber`
+    /// cannot answer `eth_getLogs` either, and a knob that darkened only the tip poll would leave
+    /// the test asserting against a chain state no provider outage produces.
+    dark: std::sync::atomic::AtomicBool,
 }
 
 impl Default for TapeSource {
@@ -201,12 +209,34 @@ impl TapeSource {
                 finalized: 0,
             }),
             logs_calls: std::sync::atomic::AtomicUsize::new(0),
+            dark: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// How many `logs` calls have been made against this tape.
     pub fn logs_call_count(&self) -> usize {
         self.logs_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take this chain's provider offline: every subsequent [`Source`] call returns an error, exactly
+    /// as a cursor whose whole endpoint set is unreachable sees. The tape keeps its blocks, so
+    /// [`restore`](Self::restore) brings the same chain back rather than a different one.
+    pub fn go_dark(&self) {
+        self.dark.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Bring the provider back. `escalate_stall` promises indexing "resumes automatically when an
+    /// endpoint recovers"; this is what lets a test hold it to that.
+    pub fn restore(&self) {
+        self.dark.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `Err` while this tape is dark, so each `Source` method can start with `self.online()?`.
+    fn online(&self) -> Result<()> {
+        if self.dark.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("all RPC endpoints unreachable (tape is dark)");
+        }
+        Ok(())
     }
 
     /// Insert/overwrite a block. Raises the tip to `number` if it was behind (does not lower it).
@@ -256,10 +286,12 @@ impl TapeSource {
 #[async_trait]
 impl Source for TapeSource {
     async fn tip(&self) -> Result<u64> {
+        self.online()?;
         Ok(self.inner.lock().unwrap().tip)
     }
 
     async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+        self.online()?;
         Ok(self
             .inner
             .lock()
@@ -270,10 +302,12 @@ impl Source for TapeSource {
     }
 
     async fn finalized(&self) -> Result<Option<u64>> {
+        self.online()?;
         Ok(Some(self.inner.lock().unwrap().finalized))
     }
 
     async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+        self.online()?;
         let t = self.inner.lock().unwrap();
         Ok(blocks
             .iter()
@@ -288,6 +322,7 @@ impl Source for TapeSource {
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
+        self.online()?;
         self.logs_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = self.inner.lock().unwrap();
