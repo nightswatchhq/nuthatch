@@ -347,6 +347,69 @@ pub struct QueryBenchReport {
     pub sql_p99_ms: f64,
     pub sql_peak_rss_mb: u64,
     pub commit: Option<String>,
+    /// Cores and total RAM, as [`BenchReport`] records. A point-read latency is *entirely* a property
+    /// of the machine's storage and cache, so two of these reports are not comparable at all without
+    /// it - more so than for backfill, where the provider dominates. It was already on the write-path
+    /// report and missing here.
+    pub hardware: Option<String>,
+}
+
+/// Enforce the `--min-reads` floor and the `--max-point-read-*` ceilings, listing **every** breach
+/// rather than the first.
+///
+/// This is what makes the bench a gate rather than a print statement: CLAUDE.md requires benchmark
+/// regressions to fail the build, and until now nothing compared a point-read number to anything.
+/// The comparison lives here, in Rust, rather than in the CI shell script (as `footprint.sh` does its
+/// own) precisely so `cargo test --lib` covers it - an untested gate is how a gate silently stops
+/// gating.
+///
+/// **`--min-reads` is the important one, not the ceilings.** A nest with no sampled keys reports
+/// `p50 = 0.0`, and zero is under every ceiling anyone would ever set - so the gate would pass
+/// loudest exactly when it had measured nothing at all. That is the "a criterion phrased as the
+/// absence of an effect passes trivially when the mechanism is missing" failure this project has hit
+/// five times, and `footprint.sh` guards its own version of it by asserting the row count before
+/// comparing the peak. Requiring the reads is the same guard.
+///
+/// A limit that is not passed is neither a pass nor a failure: it is simply not asked for, which is
+/// how an operator running the bench by hand should experience it.
+fn check_gate(
+    report: &QueryBenchReport,
+    max_p50_us: Option<f64>,
+    max_p99_us: Option<f64>,
+    min_reads: Option<usize>,
+) -> Result<()> {
+    let mut breaches: Vec<String> = Vec::new();
+    if let Some(min) = min_reads {
+        if report.reads < min {
+            breaches.push(format!(
+                "timed {} point-read(s), below the --min-reads floor of {min} - the nest is empty or \
+                 barely indexed, so its latencies are not a measurement and passing a ceiling with \
+                 them would be a false pass",
+                report.reads
+            ));
+        }
+    }
+    for (name, measured, max) in [
+        ("point-read p50", report.point_read_p50_us, max_p50_us),
+        ("point-read p99", report.point_read_p99_us, max_p99_us),
+    ] {
+        if let Some(max) = max {
+            if measured > max {
+                breaches.push(format!(
+                    "{name} {measured:.1}µs exceeds the {max:.1}µs ceiling"
+                ));
+            }
+        }
+    }
+    if breaches.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "point-read gate failed - {}.\nThis is a gate, not a warning: either the change made \
+         point-reads slower, or the ceiling needs re-baselining against a committed report and a \
+         stated reason.",
+        breaches.join("; ")
+    )
 }
 
 /// `nuthatch bench query` - measure the read path against an already-indexed nest (run offline: it
@@ -450,6 +513,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         sql_p99_ms: round2(percentile(&ms, 99.0)),
         sql_peak_rss_mb,
         commit: git_commit(),
+        hardware: hardware_summary(),
     };
     let json = serde_json::to_string_pretty(&report)?;
     println!("\n{json}");
@@ -457,7 +521,15 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         std::fs::write(out, &json).with_context(|| format!("failed to write {out}"))?;
         println!("\nwrote {out}");
     }
-    Ok(())
+
+    // The gate last, and **after** the artifact is written: a run that fails the gate is the run whose
+    // report you most want to read, so failing before writing it would throw away the evidence.
+    check_gate(
+        &report,
+        args.max_point_read_p50_us,
+        args.max_point_read_p99_us,
+        args.min_reads,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +860,178 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A report with the two numbers the gate reads and nothing else that matters.
+    fn report(reads: usize, p50: f64, p99: f64) -> QueryBenchReport {
+        QueryBenchReport {
+            bench: "query",
+            label: None,
+            nest: "t".into(),
+            chain: "mainnet".into(),
+            hot_rows: 0,
+            sealed_through: 0,
+            reads,
+            point_read_p50_us: p50,
+            point_read_p99_us: p99,
+            point_read_p999_us: p99,
+            sql: "SELECT 1".into(),
+            sql_iters: 1,
+            sql_p50_ms: 0.0,
+            sql_p99_ms: 0.0,
+            sql_peak_rss_mb: 0,
+            commit: None,
+            hardware: None,
+        }
+    }
+
+    /// The gate has to bite on each percentile independently, and only when asked. A ceiling nobody
+    /// passed is not a ceiling of zero.
+    #[test]
+    fn a_point_read_ceiling_fails_the_run_and_only_when_asked() {
+        let r = report(1000, 12.0, 90.0);
+        // Nothing asked for → nothing enforced, however slow the run was.
+        assert!(check_gate(&r, None, None, None).is_ok());
+        // Under, and exactly on, the ceiling both pass; over fails.
+        assert!(check_gate(&r, Some(12.0), Some(90.0), None).is_ok());
+        assert!(check_gate(&r, Some(20.0), Some(100.0), None).is_ok());
+        assert!(check_gate(&r, Some(11.9), None, None).is_err());
+        assert!(check_gate(&r, None, Some(89.9), None).is_err());
+
+        // Both breached → both named, so one CI run tells you everything rather than the first thing.
+        let err = check_gate(&r, Some(1.0), Some(2.0), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("p50"), "{err}");
+        assert!(err.contains("p99"), "{err}");
+    }
+
+    /// **The false pass this gate would otherwise have.** An unindexed nest samples no keys, so
+    /// `query` reports p50 = p99 = 0µs, and zero sits under every ceiling anyone would ever write.
+    /// Without `--min-reads` the gate is green precisely when it measured nothing, which is how the
+    /// footprint check used to false-pass before it asserted its row count.
+    #[test]
+    fn a_nest_that_measured_nothing_cannot_pass_the_gate() {
+        let measured_nothing = report(0, 0.0, 0.0);
+        // The trap: ceilings alone are satisfied by an empty run.
+        assert!(check_gate(&measured_nothing, Some(50.0), Some(500.0), None).is_ok());
+        // The floor is what refuses it.
+        let err = check_gate(&measured_nothing, Some(50.0), Some(500.0), Some(1000))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed 0 point-read"), "{err}");
+        // A partially-indexed nest is refused too - 12 reads is not a p99.
+        assert!(check_gate(&report(12, 1.0, 1.0), None, None, Some(1000)).is_err());
+        // And a full run clears it.
+        assert!(check_gate(&report(1000, 1.0, 1.0), None, None, Some(1000)).is_ok());
+    }
+
+    /// An indexed nest on disk: config, ABI, and `rows` entities in the hot store.
+    fn indexed_nest(dir: &std::path::Path, rows: u64) {
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            r#"[nest]
+name = "t"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://x"]
+schema_version = 1
+
+[[contracts]]
+alias = "c"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join("abis/c.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let store = Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        let batch: Vec<(String, String)> = (0..rows)
+            .map(|i| {
+                (
+                    Store::entity_key(i + 1, 0),
+                    format!(
+                        r#"{{"table":"c__transfer","block_number":{},"log_index":0,"value":"1"}}"#,
+                        i + 1
+                    ),
+                )
+            })
+            .collect();
+        store.commit_window(&batch, None, rows).unwrap();
+    }
+
+    fn gated_args(
+        dir: &std::path::Path,
+        max_p50: Option<f64>,
+        min_reads: Option<usize>,
+    ) -> crate::cli::QueryBenchArgs {
+        crate::cli::QueryBenchArgs {
+            dir: dir.to_string_lossy().into_owned(),
+            sql: None,
+            reads: 1000,
+            iters: 1,
+            out: None,
+            label: None,
+            max_point_read_p50_us: max_p50,
+            max_point_read_p99_us: None,
+            min_reads,
+        }
+    }
+
+    /// **The wiring, not the mechanism.** `check_gate` can be correct and complete while `query`
+    /// never calls it, which is the exact shape the board caught in PR #369: a parser with tests and
+    /// a call site with none, deletable at 488 green. So this drives the real `bench query` against a
+    /// real indexed nest on disk and asserts the process-level outcome - a breached ceiling must come
+    /// back as `Err`, because `Ok` is what CI reads as a pass.
+    #[test]
+    fn bench_query_fails_when_a_ceiling_is_breached() {
+        let dir = tempfile::tempdir().unwrap();
+        indexed_nest(dir.path(), 64);
+
+        // No ceiling: the same run must succeed, so the failure below is the gate and not the fixture.
+        query(gated_args(dir.path(), None, None)).unwrap();
+
+        // A ceiling no real point-read can meet. redb serves these from page cache in single-digit
+        // microseconds; 0µs is unreachable by construction, so this asserts the gate, not the machine.
+        let err = query(gated_args(dir.path(), Some(0.0), None))
+            .expect_err("a breached ceiling must fail the run, not just print")
+            .to_string();
+        assert!(err.contains("point-read p50"), "{err}");
+
+        // And the floor is wired too: 64 rows cannot satisfy --min-reads 1000.
+        let err = query(gated_args(dir.path(), None, Some(1000)))
+            .expect_err("--min-reads must fail a nest that measured too little")
+            .to_string();
+        assert!(err.contains("timed 64 point-read"), "{err}");
+    }
+
+    /// The report is the artifact, so it carries its own provenance. `hardware` was on the write-path
+    /// report and missing here, and a point-read latency without the machine it was measured on is
+    /// not comparable to the next release's number - which is the whole point of #283.
+    #[test]
+    fn the_query_report_carries_its_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        indexed_nest(dir.path(), 8);
+        let out = dir.path().join("report.json");
+        let mut args = gated_args(dir.path(), None, None);
+        args.out = Some(out.to_string_lossy().into_owned());
+        query(args).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert!(
+            json["hardware"]
+                .as_str()
+                .is_some_and(|h| h.contains("cores")),
+            "report must name the hardware: {json}"
+        );
+        assert_eq!(json["reads"], 8);
+        assert!(json["point_read_p50_us"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
