@@ -55,6 +55,15 @@ impl NestMetrics {
     pub fn last_poll_ok(&self) -> u64 {
         self.last_poll_ok.load(Relaxed)
     }
+    /// Test seam: force this nest's last successful poll to an absolute unix time, so a test can make
+    /// one cursor *look* dark without waiting out `serve`'s 90-second stall threshold. Deliberately
+    /// does NOT touch the process-global aggregate, unlike [`NestMetrics::mark_poll_ok`] - the point of
+    /// a cross-cursor stall test is that a healthy chain keeps the global fresh while a dead one does
+    /// not, and reading the global is the bug being guarded against (RFC-0021, #356).
+    #[cfg(test)]
+    pub fn set_last_poll_ok_for_test(&self, t: u64) {
+        self.last_poll_ok.store(t, Relaxed);
+    }
     pub fn last_block(&self) -> u64 {
         self.last_block.load(Relaxed)
     }
