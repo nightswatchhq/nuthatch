@@ -27,6 +27,17 @@ pub const BLOB_FORMAT_VERSION: u32 = 1;
 /// at any depth.
 const EXCLUDE: &[&str] = &[DB_FILE, "segments", ".git", ".DS_Store"];
 
+/// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
+///
+/// Named separately from [`EXCLUDE`] because it is read in the other direction. `EXCLUDE` answers
+/// "what is not an input"; this answers "what *is* the data" - the set early cutoff copies when one
+/// identity adopts another's dataset ([`crate::runtime::adopt_dataset`]).
+///
+/// It is a **subset of [`EXCLUDE`]**, and that is what makes adoption safe: copying only these can
+/// never change what the destination's inputs hash to, so an adopted dataset still is the identity its
+/// mount record claims. `derived_state_is_excluded_from_the_identity` holds the two together.
+pub const DERIVED_STATE: &[&str] = &[DB_FILE, "segments"];
+
 /// One packed input file: its path relative to the nest root and the hash of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {

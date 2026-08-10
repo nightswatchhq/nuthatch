@@ -566,6 +566,177 @@ impl MountTable {
     }
 }
 
+/// One dataset that started with no data of its own and took an existing one's (RFC-0033 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    /// The identity that adopted - the one the mount record claims.
+    pub nid: String,
+    /// The identity it adopted from.
+    pub from_nid: String,
+}
+
+impl std::fmt::Display for Adoption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} adopted the dataset of {} - same data identity, so no re-index",
+            &self.nid[..12.min(self.nid.len())],
+            &self.from_nid[..12.min(self.from_nid.len())],
+        )
+    }
+}
+
+/// An existing dataset whose inputs imply **byte-identical data** to `want`, and which actually holds
+/// some (RFC-0033 §5, early cutoff).
+///
+/// Shared by the two paths that can face a new identity over old data: `migrate`, which meets it when
+/// a staged nest is edited between runs, and the mount path, which meets it when an edited nest is
+/// installed under the identity it now hashes to. One definition, so the two cannot drift into
+/// answering the question differently.
+///
+/// Two independent conditions, both required. The data identity is the general check; `registry_hash`
+/// is a second, narrower one that pins the decode. Requiring both means a bug in the exclusion list
+/// cannot on its own cause an adoption - and the failure of either costs only a re-index.
+///
+/// **A candidate with no derived state is not a candidate.** Adopting an empty dataset copies nothing
+/// and still consumes the one chance to adopt, leaving a re-index that looks like a cutoff.
+///
+/// Skips `want_nid` itself: a dataset that already exists is not an adoption.
+pub fn adoptable(root: &Path, want: &crate::blob::Manifest, want_nid: &str) -> Option<(String, PathBuf)> {
+    let entries = std::fs::read_dir(root.join(DATA_DIR)).ok()?;
+    let mut candidates: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .filter(|(nid, _)| nid != want_nid && nid.len() == 64)
+        .collect();
+    // Deterministic: two equally-adoptable datasets must not depend on directory order.
+    candidates.sort();
+
+    candidates.into_iter().find(|(_, dir)| {
+        if !holds_data(dir) {
+            return false;
+        }
+        let Ok(m) = crate::blob::build_manifest(dir, None) else {
+            return false;
+        };
+        m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
+    })
+}
+
+/// Does this dataset hold indexed state of its own - a hot store, or sealed segments?
+///
+/// The question adoption turns on in both directions: a destination that holds data must never be
+/// written over, and a source that holds none is not worth adopting.
+pub fn holds_data(dir: &Path) -> bool {
+    crate::blob::DERIVED_STATE
+        .iter()
+        .any(|n| dir.join(n).exists())
+}
+
+/// Early cutoff on the **mount path** (RFC-0033 §5, issue #364).
+///
+/// A cosmetic edit moves the NID and leaves the data identity alone, so `data/<new-nid>` is a
+/// directory holding the edited inputs and nothing else. The runtime used to mount it exactly like
+/// that and re-fetch the whole chain, because nothing outside `migrate` ever consulted
+/// `data_identity()`. The cost RFC-0033 §5 exists to remove was being paid by every path except the
+/// one an operator actually uses.
+///
+/// Three properties this holds deliberately:
+///
+/// - **Never over data.** A dataset holding a store or segments is left alone, whatever it hashes to.
+///   That makes this a no-op on every ordinary restart, and it means a partial index is resumed rather
+///   than silently replaced.
+/// - **Copies, never moves.** The source may still be mounted - by another tenant, or by the
+///   pre-edit record somebody has not removed yet. Early cutoff must not take data away from a mount
+///   that is using it (`migrate.rs` holds the same line).
+/// - **Cannot change what it adopts into.** It copies exactly [`crate::blob::DERIVED_STATE`], which is
+///   a subset of the set the NID excludes, so the destination's identity is the same after adoption as
+///   before. An adoption that moved the identity would be a drift report a moment later.
+///
+/// Returns what was adopted, for logging. A failed copy is an error: half a dataset is worse than
+/// none, and the re-index it replaces is still available once the fault is fixed.
+pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Adoption>> {
+    if !dataset.is_dir() || holds_data(dataset) {
+        return Ok(None);
+    }
+    let Ok(want) = crate::blob::build_manifest(dataset, None) else {
+        // Unhashable inputs are a different fault, and `Config::load` reports it with a better
+        // message a moment later. Not adopting is the safe answer to a question we cannot ask.
+        return Ok(None);
+    };
+    let Some((from_nid, from)) = adoptable(root, &want, nid) else {
+        return Ok(None);
+    };
+    for name in crate::blob::DERIVED_STATE {
+        let src = from.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = dataset.join(name);
+        if src.is_dir() {
+            crate::project::copy_dir(&src, &dst)
+        } else {
+            std::fs::copy(&src, &dst).map(|_| ()).map_err(Into::into)
+        }
+        .with_context(|| {
+            format!(
+                "adopting {} from {} into {}",
+                name,
+                from.display(),
+                dataset.display()
+            )
+        })?;
+    }
+    Ok(Some(Adoption {
+        nid: nid.to_string(),
+        from_nid,
+    }))
+}
+
+/// Resolve every mounted dataset to `(route key, directory, config)` - the list the cursors are built
+/// from (RFC-0032 §4).
+///
+/// This is the mount path. `dev` gets its nests from here and cannot get them anywhere else, which is
+/// what makes the early-cutoff step below reachable in production rather than in `migrate` only.
+///
+/// Adoption runs **before** the config load, because a dataset that adopts is one whose store the
+/// loader is about to open.
+pub fn load_mounted(
+    dir: &Path,
+    datasets: &[Dataset],
+    multi_tenant: bool,
+) -> Result<Vec<(String, PathBuf, Config)>> {
+    let mut out = Vec::with_capacity(datasets.len());
+    for ds in datasets {
+        if let Some(nid) = &ds.nid {
+            match adopt_dataset(dir, &ds.dir, nid) {
+                Ok(Some(a)) => tracing::info!("early cutoff: {a}"),
+                Ok(None) => {}
+                // A dataset that could not adopt still indexes - slowly, and correctly. Refusing to
+                // start over a failed optimisation would turn a disk-full into an outage.
+                Err(e) => tracing::warn!(
+                    "{} could not adopt an existing dataset ({e:#}) - it will index from its start block",
+                    ds.canonical()
+                ),
+            }
+        }
+        let config = Config::load(&ds.dir).with_context(|| {
+            format!(
+                "loading mounted nest '{}' from {}",
+                ds.canonical(),
+                ds.dir.display()
+            )
+        })?;
+        out.push((
+            ds.canonical().route_key(multi_tenant),
+            ds.dir.clone(),
+            config,
+        ));
+    }
+    Ok(out)
+}
+
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
 fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
     datasets
@@ -766,21 +937,7 @@ pub async fn dev(
     }
 
     let multi_tenant = mounts.is_multi_tenant();
-    let mut mounted = Vec::with_capacity(datasets.len());
-    for ds in &datasets {
-        let config = Config::load(&ds.dir).with_context(|| {
-            format!(
-                "loading mounted nest '{}' from {}",
-                ds.canonical(),
-                ds.dir.display()
-            )
-        })?;
-        mounted.push((
-            ds.canonical().route_key(multi_tenant),
-            ds.dir.clone(),
-            config,
-        ));
-    }
+    let mounted = load_mounted(&dir, &datasets, multi_tenant)?;
     let groups = group_by_chain(&endpoints, mounted)?;
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any

@@ -23,7 +23,9 @@
 //! data"; rename serves it better than the mechanism the RFC named.
 
 use crate::blob;
-use crate::runtime::{Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR};
+use crate::runtime::{
+    adoptable, Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR,
+};
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -259,38 +261,6 @@ fn breaking_against_current(
             .map(|c| c.describe())
             .collect(),
     )
-}
-
-/// An existing dataset whose inputs produce **byte-identical data** to `want` (RFC-0033 §5).
-///
-/// Early cutoff, concretely: a cosmetic edit moves the NID, so `data/<new-nid>/` does not exist and
-/// the naive answer is to re-index the chain. If some existing dataset was built from inputs with the
-/// same *data* identity, its segments are what a re-index would produce, so it is adopted instead.
-///
-/// Two independent conditions, both required. The data identity is the general check; `registry_hash`
-/// is a second, narrower one that pins the decode specifically. Requiring both means a bug in the
-/// exclusion list cannot on its own cause an adoption - and the failure of either costs only a
-/// re-index.
-///
-/// Skips `want`'s own NID: a dataset that already exists is [`Plan::AlreadyMigrated`], not an
-/// adoption.
-fn adoptable(root: &Path, want: &blob::Manifest, want_nid: &str) -> Option<(String, PathBuf)> {
-    let entries = std::fs::read_dir(root.join(DATA_DIR)).ok()?;
-    let mut candidates: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
-        .filter(|(nid, _)| nid != want_nid && nid.len() == 64)
-        .collect();
-    // Deterministic: two equally-adoptable datasets must not depend on directory order.
-    candidates.sort();
-
-    candidates.into_iter().find(|(_, dir)| {
-        let Ok(m) = blob::build_manifest(dir, None) else {
-            return false;
-        };
-        m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
-    })
 }
 
 /// A nest's identity, refusing one whose packed manifest no longer matches its inputs.
