@@ -132,11 +132,17 @@ Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail
 
 ```sh
 nuthatch bench query --dir <nest> --reads 8004 \
-  --min-reads 8004 --max-point-read-p50-us 200 --max-point-read-p99-us 2000
+  --min-reads 256 --max-point-read-p50-us 15 --max-point-read-p99-us 150
 ```
 
 Pass none of them and the bench only reports, which is what an operator poking at their own nest
 wants. Pass any of them and it is a gate.
+
+**Point-reads see the unsealed tip, not the backfill.** `get_entity` is a hot-store read, and rows
+past finality are sealed to Parquet and pruned out of redb - so of the fixture's 8,004 indexed rows
+only 256 (64 blocks x 4 logs) are still readable this way, which is what `--min-reads` is set against.
+The first version of this gate asserted `--min-reads 8004`, reasoned from the backfill size, and
+therefore failed every run.
 
 **Always pass `--min-reads` alongside a ceiling.** A nest with nothing indexed samples no keys and
 reports `p50 = 0µs`, and zero is under every ceiling anyone would ever write - so a gate without a
@@ -149,9 +155,34 @@ inline, and every run indexes exactly 8,004 rows. No secret and no third party, 
 request can satisfy it, and a change in p99 is a change in nuthatch rather than in somebody's rate
 limiter. The report uploads as an artifact on every run, including a failing one.
 
-The ceilings (200µs p50, 2,000µs p99) are set to catch a *structural* regression - a scan where there
-was a seek, a per-read store open, a lock in the path - not to police the noise of a shared runner,
-where a point-read out of page cache measures single-digit microseconds. They tighten once a few
-releases' committed reports say what the spread across releases actually is.
+### Where the ceilings come from
+
+They were chosen by **breaking the read path on purpose and measuring what happened**, not by leaving
+generous headroom. Replacing the B-tree seek in `Store::get_entity` with a linear scan - the exact
+regression the gate claims to catch - gives, on a 32-core/62 GB Linux box over the 256-row hot store:
+
+| | p50 | p99 |
+|---|---|---|
+| baseline, 15 runs at one commit | 0.66 - 1.59µs | 0.77 - 1.88µs |
+| linear scan in place of the seek | 24.2 - 43.2µs | 53.8 - 84.0µs |
+
+The first version of this gate used 200µs/2,000µs. The scan sits comfortably under both, so that gate
+reported `OK: within the point-read ceilings` **with a full scan in the read path** - a number, not a
+gate.
+
+- **p50, ceiling 15µs, is the gate that discriminates.** It sits 9.4x above the worst baseline run and
+  below every mutated run. Because a slower runner scales baseline and regression together, a ~15x
+  separation survives the hardware difference between this box and a CI runner in a way that an
+  absolute number tuned to one machine would not.
+- **p99, ceiling 150µs, is a catastrophe backstop and nothing more** - 80x baseline, and it did *not*
+  catch the scan mutation (84µs < 150µs). p99 over 256 samples is the 4th-worst read, so on a shared
+  2-vCPU runner it is preemption-dominated; one local baseline run saw p99.9 reach 33.6µs while p99
+  stayed at 1.88µs. A tight p99 here buys a flaky check, and a flaky gate gets waved through until it
+  means nothing.
+
+What this gate does **not** catch: anything under roughly a 10x regression, cold-start latency (it
+measures warm - see `warm_cache` in the report), point-reads against the Postgres backend, and
+anything about the sealed/DuckDB path. And the ceilings are this box's numbers - re-baseline them from
+the job's own uploaded reports once runs exist on the runner that actually enforces them.
 
 Baseline: `docs/bench/point-read.json`.

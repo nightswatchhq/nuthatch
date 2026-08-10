@@ -292,14 +292,33 @@ jobs:
         # nest is written inline - so there is no secret, no third party, and a fork PR can satisfy
         # it. Every run reads exactly 8004 rows.
         #
-        # The ceilings are structural, not tight: a redb point-read out of page cache is single-digit
-        # microseconds, and a shared runner's noise is not worth failing a build over. 200µs/2000µs
-        # catches the shape of regression that matters (a per-read open, a lock, a scan) and will be
-        # tightened once the committed reports say what the across-release spread actually is.
+        # **The ceilings come from a measured mutation, not from a guess.** The first version of this
+        # job used 200µs/2000µs, reasoned from "a point-read is single-digit microseconds, leave
+        # headroom". Replacing the B-tree seek in `get_entity` with a linear scan - the exact
+        # regression this is meant to catch - moved p50 to 24.2µs and p99 to 53.8µs, both comfortably
+        # *under* those ceilings. The gate printed "OK: within the point-read ceilings" with a full
+        # scan in the read path, which is the decoration this project keeps shipping by accident.
+        #
+        # Measured on a 32-core/62 GB Linux box at commit 850844a, 8,004 rows indexed, 256 hot:
+        #
+        #   baseline, 15 runs   p50 0.66-1.59µs   p99 0.77-1.88µs
+        #   scan mutation       p50 24.17µs       p99 53.79µs
+        #
+        # p50 is the gate that discriminates: 15µs sits 9.4x above the worst baseline run and 1.6x
+        # below the mutation, and because a slower runner scales baseline and regression together, a
+        # ~15x separation survives hardware variation that a 4x-slower CI box would introduce.
+        #
+        # p99 is a catastrophe backstop only, deliberately loose at 80x baseline. p99 over 256 samples
+        # is the 4th-worst read, so on a shared 2-vCPU runner it is preemption-dominated - one local
+        # run saw p99.9 hit 33.6µs while p99 stayed at 1.88µs. Gating tightly on it would buy a flaky
+        # check, and a flaky gate gets waved through until it means nothing.
+        #
+        # These are this box's numbers. Re-baseline from the job's own uploaded reports once a few
+        # runs exist on the runner that actually enforces them - see #283.
         env:
           BIN: bin/nuthatch
-          MAX_P50_US: "200"
-          MAX_P99_US: "2000"
+          MAX_P50_US: "15"
+          MAX_P99_US: "150"
           OUT: point-read-report.json
         run: |
           chmod +x bin/nuthatch

@@ -12,18 +12,19 @@
 # third party**. A fork PR can satisfy this check, and every run reads exactly the same 8,004 rows -
 # so a change in p99 is a change in nuthatch and not in somebody's rate limiter.
 #
-# Two orders of magnitude of headroom is deliberate. A point-read is a redb B-tree lookup out of page
-# cache and measures single-digit microseconds; the ceiling catches a *structural* regression - a scan
-# where there was a seek, a per-read open, a lock in the path - rather than policing the noise of a
-# shared CI runner. Tighten it when the numbers across releases say what the spread actually is.
+# The ceilings were chosen by breaking the code on purpose and seeing what the numbers did, rather
+# than by leaving "plenty of headroom" - see the justification in ci.yml. Short version: a linear scan
+# in place of the B-tree seek moves p50 from ~1µs to 24µs, so p50 gates at 15µs; p99 over 256 samples
+# is preemption-dominated on a shared runner, so it is a loose backstop at 150µs and nothing more.
 #
-# Env: BIN (default target/release/nuthatch), MAX_P50_US (default 200), MAX_P99_US (default 2000),
-#      PORT (default 8289), RPC_PORT (default 8546), OUT (default point-read-report.json).
+# Env: BIN (default target/release/nuthatch), MAX_P50_US, MAX_P99_US (see ci.yml for the values CI
+#      uses and why), PORT (default 8289), RPC_PORT (default 8546), OUT (default
+#      point-read-report.json), LABEL (default names the fixture).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
-MAX_P50_US="${MAX_P50_US:-200}"
-MAX_P99_US="${MAX_P99_US:-2000}"
+MAX_P50_US="${MAX_P50_US:-15}"
+MAX_P99_US="${MAX_P99_US:-150}"
 PORT="${PORT:-8289}"
 RPC_PORT="${RPC_PORT:-8546}"
 OUT="${OUT:-point-read-report.json}"
@@ -66,6 +67,17 @@ BACKFILL_BLOCKS=2000
 EXPECT=$(( BACKFILL_BLOCKS * 4 + 4 ))
 TIP=20000
 
+# **Point-reads see the unsealed tip, not the whole backfill.** Rows past finality are sealed to
+# Parquet and pruned out of redb, so of the 8,004 rows indexed only the last finality window is still
+# in the hot store - and `get_entity` is a hot-store read. Measured: sealed_through 19,936 against a
+# 20,000 tip, so 64 blocks x 4 logs = 256 rows.
+#
+# This is written down because the first version of this script asserted `--min-reads 8004` and
+# therefore failed *every* run: it was reasoned from the backfill size rather than run. 256 is what
+# the fixture actually leaves hot. If nuthatch's finality or sealing changes, this goes red and wants
+# a human, which is the correct outcome rather than a silently shrinking sample.
+HOT_EXPECT=$(( 64 * 4 ))
+
 "$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$DIR/dev.log" 2>&1 &
 DEV_PID=$!
 trap 'kill "$DEV_PID" 2>/dev/null || true; kill "$RPC_PID" 2>/dev/null || true' EXIT
@@ -96,8 +108,8 @@ fi
 # and reports p50 = 0µs, which passes any ceiling. The floor is what makes a green run mean something.
 set +e
 "$BIN" bench query --dir "$DIR" --reads "$EXPECT" --iters 5 --out "$OUT" \
-  --label "CI point-read gate: $EXPECT rows, locally-served chain" \
-  --min-reads "$EXPECT" \
+  --label "${LABEL:-point-read gate: $EXPECT rows indexed, $HOT_EXPECT hot, locally-served chain}" \
+  --min-reads "$HOT_EXPECT" \
   --max-point-read-p50-us "$MAX_P50_US" \
   --max-point-read-p99-us "$MAX_P99_US" | tee "$DIR/bench.log"
 status="${PIPESTATUS[0]}"

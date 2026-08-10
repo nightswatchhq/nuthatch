@@ -434,15 +434,18 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let (p50_us, p99_us, p999_us, n_reads) = if keys.is_empty() {
         (0.0, 0.0, 0.0, 0)
     } else {
-        // **Warm the cache first, and discard it** - the `/sql` half below has always done this and
-        // the point-read half never did, which is why its p99 was the least stable number the harness
-        // produced. An unwarmed first pass faults every redb page in from disk, so p99 was measuring
-        // the page cache's state rather than the read path, and it moved with whatever else the
-        // machine had been doing. MEASURED-SPREAD-PLACEHOLDER
+        // **Warm the cache first, and discard it.** The `/sql` half below has always done this and the
+        // point-read half never did, so a timed read could be paying for a redb page fault - which
+        // makes it a measurement of the page cache's state rather than of the read path, and a gate
+        // needs the same workload every run to mean anything.
         //
         // Warm is therefore what the gate measures, and `warm_cache` records that so nobody reads
-        // these as cold-start latencies. Cold-start is a real and different question - see
-        // docs/benchmarks.md; it is not the one a regression gate can ask.
+        // these as cold-start latencies. Cold-start is a real and different question - it is not the
+        // one a regression gate can ask, and it is not asked here.
+        //
+        // Measured warm on a 32-core Linux box, 256 hot rows, 15 runs at one commit: p50 0.66-1.59µs,
+        // p99 0.77-1.88µs. The unwarmed spread was *not* measured, so this is a correctness argument
+        // about what is being timed, not a claim of a stability improvement.
         for k in &keys {
             let _ = store.get_entity(k)?;
         }
