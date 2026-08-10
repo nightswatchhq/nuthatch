@@ -401,9 +401,13 @@ jobs:
           #   runner, with a real leak  323 MB     ceiling is 1.79x below it
           #
           # The spread behind the baseline is 15 runs on a 32-core box across two bases - 111, 132,
-          # 133 x7, 134, 140, 141, 141, 143 - so an 8 MB band with the runner sitting inside it.
-          # Re-derive with scripts/multinest-rss-spread.sh before ever moving this; a threshold picked
-          # from a single run is folklore.
+          # 133 x7, 134, 140, 141, 141, 143 - so an 8 MB band with the runner sitting inside it. All
+          # 15 were run against this enforced scenario, which at the time meant exporting the knobs;
+          # since #395 the harness defaults *are* this scenario, so re-derive with a bare
+          # scripts/multinest-rss-spread.sh and set nothing. Setting a knob measures a smaller run,
+          # and peak RSS here is size-sensitive, so the band - and the ceiling taken off the top of
+          # it - come out below the healthy enforced figure. Re-derive before ever moving this; a
+          # threshold picked from a single run is folklore.
           #
           # The regression half was measured by probe PR #404: a synthetic retention leak in the
           # multi-nest fan-out, which reported **323 MB on the runner and 323 MB on the 32-core box**.
