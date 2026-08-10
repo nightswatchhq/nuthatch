@@ -19,6 +19,16 @@
 //!
 //! It then restores A and holds `escalate_stall`'s own promise - "it resumes automatically when an
 //! endpoint recovers" - to account, which also distinguishes a stall from a cursor death.
+//!
+//! **Why this drives `spawn_runtime` and not `spawn_nest`.** `spawn_nest` runs `index_loop`
+//! (`indexer.rs:3174`), the *solo* path, which publishes poll freshness to the process-global
+//! `METRICS` only. The multichain runtime runs `runtime_index_loop` (`indexer.rs:1004`) via
+//! `spawn_runtime`, and only that one marks the **per-nest** clock `/ready` reads. Written the
+//! obvious way - copying `e2e_reorg`'s `spawn_nest` scaffolding - every per-nest metric assertion
+//! here compares `0` with `0` and passes vacuously, and a mutation that converts the stall into a
+//! cursor death goes undetected. The two cursors therefore also share one `RuntimeHealth`, exactly
+//! as `runtime::dev` clones one across every cursor, so the genuinely shared state is in the test's
+//! path rather than designed out of it.
 
 mod common;
 
@@ -40,36 +50,42 @@ fn canonical_block(b: u64) -> BlockFixture {
     )
 }
 
-/// Spawn a nest named `name` over `tape` and wait until it has indexed through `tip`.
-async fn spawn_indexed(
+/// Bring up one **cursor** over `tape` hosting a single nest named `name`, sharing `health` with
+/// every other cursor in this runtime, and wait until it has indexed through `tip`.
+async fn spawn_cursor(
     dir: &std::path::Path,
     name: &str,
     tape: Arc<TapeSource>,
+    health: Arc<nuthatch::health::RuntimeHealth>,
     tip: u64,
 ) -> (
-    indexer::NestRuntime,
+    indexer::ChainCursor,
     std::sync::Arc<dyn nuthatch::store::HotStore>,
 ) {
     let cfg = scaffold_nest(dir, name, USDC);
-    let rt = indexer::spawn_nest(
+    health.register(name, &cfg.nest.chain);
+    let cursor = indexer::spawn_runtime(
         tape,
-        dir.to_path_buf(),
-        cfg,
+        vec![(name.to_string(), dir.to_path_buf(), cfg)],
         None,
         false,
         1,
         Some(2),
         false,
         None,
+        health,
+        // Production's default. `--fail-fast` deliberately couples cursor fate and is not what a
+        // multichain runtime runs; see the note on `supervise_cursors` in this test's report.
+        false,
     )
     .await
-    .expect("spawn_nest");
-    let store = rt.state.store.clone();
+    .expect("spawn_runtime");
+    let store = cursor.states[0].1.store.clone();
     assert!(
         at_block(&store, tip).await,
         "nest {name} did not index to block {tip} in time"
     );
-    (rt, store)
+    (cursor, store)
 }
 
 /// Bounded wait for `store`'s `last_block` to reach exactly `n`.
@@ -85,9 +101,9 @@ fn last_block(store: &std::sync::Arc<dyn nuthatch::store::HotStore>) -> Option<S
     store.get_meta("last_block").ok().flatten()
 }
 
-fn shutdown(rt: indexer::NestRuntime) {
-    rt.ingest.abort();
-    if let Some(w) = rt.alert_worker {
+fn shutdown(cursor: indexer::ChainCursor) {
+    cursor.ingest.abort();
+    for (_, w) in cursor.alert_workers {
         w.abort();
     }
 }
@@ -105,13 +121,22 @@ async fn a_dead_chain_does_not_stall_its_co_tenant_cursor() {
     tape_a.advance_tip_to(10);
     tape_b.advance_tip_to(10);
 
-    // Two cursors, one per chain, in one process - the multichain runtime's shape.
-    let (rt_a, store_a) = spawn_indexed(dir_a.path(), "chain-a", tape_a.clone(), 10).await;
-    let (rt_b, store_b) = spawn_indexed(dir_b.path(), "chain-b", tape_b.clone(), 10).await;
+    // Two cursors, one per chain, one shared RuntimeHealth - the multichain runtime's shape.
+    let health = Arc::new(nuthatch::health::RuntimeHealth::new());
+    let (rt_a, store_a) =
+        spawn_cursor(dir_a.path(), "chain-a", tape_a.clone(), health.clone(), 10).await;
+    let (rt_b, store_b) =
+        spawn_cursor(dir_b.path(), "chain-b", tape_b.clone(), health.clone(), 10).await;
 
     // Chain A's whole endpoint set goes unreachable.
     tape_a.go_dark();
     let a_poll_when_dark = METRICS.nest("chain-a").last_poll_ok();
+    // Guard the guard: the per-nest clock must actually be running, or every assertion below that
+    // reads it compares 0 with 0. This is what caught the solo-vs-cursor path confusion.
+    assert!(
+        a_poll_when_dark > 0,
+        "chain-a's per-nest poll clock was never marked - this test would be vacuous"
+    );
 
     // Both chains genuinely progress from here - A simply cannot see that it has. Extending A's tape
     // too is what makes A's freeze attributable to the outage rather than to an idle chain.
@@ -146,7 +171,7 @@ async fn a_dead_chain_does_not_stall_its_co_tenant_cursor() {
         "chain A's last successful poll must not advance while its provider is dark"
     );
     assert!(
-        b_poll >= a_poll,
+        b_poll > a_poll,
         "chain B's poll clock ({b_poll}) must keep ticking past chain A's frozen one ({a_poll})"
     );
 
