@@ -17,7 +17,6 @@
 //! definition while still being loopback - the off-localhost path gets exercised without this suite
 //! ever opening a port to the network.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nuthatch::cli::ServeArgs;
@@ -29,8 +28,8 @@ use common::tape::{scaffold_nest, USDC};
 const POLL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `NUTHATCH_ADMIN_TOKEN` is process-wide and both tests below depend on its value, so they take turns
-/// rather than racing. Held across each test body, not just the write.
-static ENV: Mutex<()> = Mutex::new(());
+/// rather than racing. Held across each test body - which spans awaits - hence the async mutex.
+static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A nest `serve_role` can load: `scaffold_nest` writes `rpc_urls = []`, and the FE constructs an
 /// `RpcClient` it never polls, which refuses an empty URL list.
@@ -87,7 +86,7 @@ async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::J
 /// not serve the admin UI. Reverting `serve_role` to `admin_token_env()` turns this red with a 200.
 #[tokio::test]
 async fn the_fe_admin_ui_is_not_open_on_an_off_localhost_bind() {
-    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV.lock().await;
     // Removing it makes the "no token configured" premise true regardless of the developer's shell,
     // rather than the test quietly asserting something else on a machine that exports one.
     std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
@@ -115,7 +114,7 @@ async fn the_fe_admin_ui_is_not_open_on_an_off_localhost_bind() {
 /// token configured the surface is live and *gated*, which is what an operator behind a tunnel wants.
 #[tokio::test]
 async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
-    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV.lock().await;
     std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
 
     let dir = tempfile::tempdir().unwrap();
