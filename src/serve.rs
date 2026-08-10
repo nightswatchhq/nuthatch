@@ -1529,6 +1529,80 @@ mod tests {
         (status, body)
     }
 
+    /// RFC-0021's fourth testing criterion, and the one nothing covered (#356): **stall isolation
+    /// across cursors**. The RFC's words are "killing chain A's RPC escalates for A only; B keeps
+    /// serving and ingesting", and the serving half is where an actual mechanism can be broken.
+    ///
+    /// The trap this guards is specific and was live once. `/ready`'s stall verdict comes from
+    /// `last_poll_ok`, and the process-global aggregate is written by *whichever cursor polled last*.
+    /// A runtime hosting a dead chain alongside a healthy one therefore has a permanently fresh global
+    /// - so reading it would report the dead chain **ready**, and an operator watching
+    /// `/<dead-chain>/ready` would see 200 while nothing was being indexed. The handler reads the
+    /// per-nest counter instead, and this pins that.
+    ///
+    /// Note the shape of the assertions: "chain B still answers 200" is the half that passes trivially
+    /// when the mechanism is missing (a fresh global says ready to everyone). The load-bearing half is
+    /// that chain **A** answers 503 *at the same time*, which only per-nest attribution can produce.
+    #[tokio::test]
+    async fn one_chains_dead_endpoints_leave_its_co_tenant_serving_and_report_only_itself_stalled()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        // Names unique to this test: `METRICS.nest(..)` is a process-global map shared by every test
+        // in the binary, so reusing `alpha`/`beta` would have them writing each other's counters.
+        let (dead, live) = ("stall-iso-dead", "stall-iso-live");
+        std::fs::create_dir_all(dir.path().join(dead)).unwrap();
+        std::fs::create_dir_all(dir.path().join(live)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": dead}, {"name": live}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        // Stamp each state with its own name + the shared health surface, exactly as
+        // `indexer::spawn_runtime` does. That stamp is what makes `/ready` answer for THIS nest rather
+        // than from the process globals, so a mounts test that omits it is quietly testing the solo
+        // path under a mounts URL - which is why this gap survived.
+        let nests: Vec<(String, AppState)> = [dead, live]
+            .into_iter()
+            .map(|name| {
+                let mut st = test_state(&dir.path().join(name), 4);
+                st.runtime_health = Some((name.to_string(), health.clone()));
+                (name.to_string(), st)
+            })
+            .collect();
+        let router = compose_runtime(roster, nests, health);
+
+        // Chain A's endpoints went dark ten minutes ago. Chain B polled a second ago - and, being
+        // healthy, is still writing the global aggregate. That is the trap, set deliberately.
+        let now = crate::metrics::now_unix();
+        crate::metrics::METRICS
+            .nest(dead)
+            .set_last_poll_ok_for_test(now.saturating_sub(600));
+        crate::metrics::METRICS
+            .nest(live)
+            .set_last_poll_ok_for_test(now.saturating_sub(1));
+        crate::metrics::METRICS.mark_poll_ok();
+
+        let (code_dead, body_dead) = get(router.clone(), &format!("/{dead}/ready")).await;
+        let (code_live, body_live) = get(router, &format!("/{live}/ready")).await;
+        let json_of = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+        let (dead_json, live_json) = (json_of(&body_dead), json_of(&body_live));
+
+        // The load-bearing half: the dead chain is reported dead, despite a fresh global.
+        assert_eq!(
+            code_dead,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the stalled cursor must fail readiness: {dead_json}"
+        );
+        assert_eq!(dead_json["stalled"], json!(true));
+        assert_eq!(dead_json["ready"], json!(false));
+
+        // …and the isolation half: its co-tenant is untouched by the neighbour's dead provider.
+        assert_eq!(
+            code_live,
+            StatusCode::OK,
+            "the healthy cursor must keep serving: {live_json}"
+        );
+        assert_eq!(live_json["stalled"], json!(false));
+        assert_eq!(live_json["ready"], json!(true));
+    }
+
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
     fn two_nest_roost(dir: &std::path::Path, health: Arc<crate::health::RuntimeHealth>) -> Router {
         let roster = json!({"runtime": "t", "nests": [{"name": "alpha"}, {"name": "beta"}]});
