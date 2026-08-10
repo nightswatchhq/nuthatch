@@ -446,14 +446,34 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         // Measured warm on a 32-core Linux box, 256 hot rows, 15 runs at one commit: p50 0.66-1.59µs,
         // p99 0.77-1.88µs. The unwarmed spread was *not* measured, so this is a correctness argument
         // about what is being timed, not a claim of a stability improvement.
+        //
+        // **Every read is required to hit, and that is a gate condition rather than a sanity check.**
+        // The keys come from `sample_entity_keys` over this same store, so a miss is impossible unless
+        // the read path is broken - and a broken read path is *faster* than a working one. Timing a
+        // `get_entity` that returns `None` for everything would sail under any ceiling, so a gate that
+        // discards the result passes most loudly exactly when the thing it guards has been removed.
+        // Counting hits is what stops the measurement from being vacuous.
+        let mut hits = 0usize;
         for k in &keys {
-            let _ = store.get_entity(k)?;
+            hits += usize::from(store.get_entity(k)?.is_some());
         }
         let mut us: Vec<f64> = Vec::with_capacity(keys.len());
         for k in &keys {
             let t = Instant::now();
-            let _ = store.get_entity(k)?;
+            let found = store.get_entity(k)?.is_some();
+            // `elapsed` is read before the counter moves, so the bookkeeping is outside the window.
             us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+            hits += usize::from(found);
+        }
+        let expected = keys.len() * 2;
+        if hits != expected {
+            bail!(
+                "point-read gate failed - {} of {} reads returned no entity. The keys were sampled \
+                 from this store, so every read must hit: these numbers time a read path that is \
+                 not returning data, and a broken read is faster than a working one.",
+                expected - hits,
+                expected
+            );
         }
         us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         (
@@ -523,7 +543,9 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         hot_rows,
         sealed_through,
         reads: n_reads,
-        warm_cache: true,
+        // False on the no-keys branch, where no warm pass runs. `--min-reads` refuses that run
+        // anyway, but the field exists to be trusted rather than to be usually right.
+        warm_cache: n_reads > 0,
         point_read_p50_us: round2(p50_us),
         point_read_p99_us: round2(p99_us),
         point_read_p999_us: round2(p999_us),

@@ -132,7 +132,7 @@ Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail
 
 ```sh
 nuthatch bench query --dir <nest> --reads 8004 \
-  --min-reads 256 --max-point-read-p50-us 15 --max-point-read-p99-us 150
+  --min-reads 256 --max-point-read-p50-us 8 --max-point-read-p99-us 150
 ```
 
 Pass none of them and the bench only reports, which is what an operator poking at their own nest
@@ -191,4 +191,9 @@ hot store is much smaller than 256 rows - cold-start latency (it measures warm, 
 report), point-reads against the Postgres backend, and anything about the sealed/DuckDB path. It is a
 floor on gross regressions, not a microbenchmark.
 
-Baseline: `docs/bench/point-read.json`.
+Baseline: `docs/bench/point-read.json` - **measured on the 32-core/62 GB dev box, which is not the
+machine that enforces this gate.** Read it as the dev-box reference point, not as the number the
+ceiling was set against: that is the `ubuntu-latest` table above (p50 0.59-0.82µs), and it is the one
+8µs is 9.8x above. Committing a runner-produced artifact instead would remove the need for this
+caveat, and #385 tracks it. Saying so here rather than leaving a reader to notice the `hardware`
+field disagrees with the argument.
