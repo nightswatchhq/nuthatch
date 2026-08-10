@@ -570,6 +570,50 @@ file's hash, and that the decode registry regenerated from the inputs matches th
 that does not reproduce its own decode registry is refused. Compliance packs are ed25519-signed
 (`nuthatch pack keygen|build|verify`). Licensed `MIT OR Apache-2.0`; `cargo-deny` runs in CI.
 
+**Per-caller rate limiting is the gateway's job, not nuthatch's.** The node cannot rate-limit by caller
+because nothing it serves carries a caller identity: the data routes (`/entities`, `/sql`, `/explain`
+and the rest) have no accounts and no API keys. `NUTHATCH_ADMIN_TOKEN` above is not a counter-example
+- it is one shared operator credential gating `/_admin`, not a per-caller identity you could meter,
+and every caller who has it is the same caller as far as the node can tell. The query guards above
+bound the cost of a single request and the total concurrent load; they say nothing about how many
+requests a given caller may make. An in-process request-per-second counter with no identity would be
+worse than nothing: the first caller to hit it blocks every other caller, converting an accidental
+poller into a service-wide outage.
+
+For operators who need per-caller rate limiting, the right place is the reverse proxy in front:
+
+```caddyfile
+# Caddy with mholt/caddy-ratelimit (compile with xcaddy; not in the stock binary)
+your-domain.example {
+    reverse_proxy localhost:8288
+
+    rate_limit {
+        zone api {
+            key     {remote_host}
+            events  60
+            window  1m
+        }
+    }
+}
+```
+
+```nginx
+# nginx (ngx_http_limit_req_module, standard in most packages)
+http {
+    limit_req_zone $binary_remote_addr zone=api:10m rate=60r/m;
+
+    server {
+        location / {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://127.0.0.1:8288;
+        }
+    }
+}
+```
+
+Neither is a complete security configuration - TLS, authentication, and an allowlist belong in front
+too. The rate limit is one layer of a stack, not the stack. See [The division of labour](#the-division-of-labour).
+
 ---
 
 ## Observability
