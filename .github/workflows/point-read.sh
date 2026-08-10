@@ -19,6 +19,14 @@
 # a full scan. p99 over 256 samples is preemption-dominated on a shared runner, so it is a loose
 # backstop at 150µs and nothing more.
 #
+# **Running this on your own machine:** 8µs is `ubuntu-latest`'s number, and applying a ceiling
+# measured on one machine to a different one is the mistake this gate already made once. A slower or
+# busier box can fail it without anything being wrong, so raise it - `MAX_P50_US=200 bash
+# .github/workflows/point-read.sh` reports the numbers without gating on them in any useful sense.
+# There is deliberately no "off": this script always passes both ceilings, and `MAX_P50_US=0` would
+# fail every run rather than disable the check. What CI enforces is set in ci.yml and is not affected
+# by this default.
+#
 # Env: BIN (default target/release/nuthatch), MAX_P50_US, MAX_P99_US (see ci.yml for the values CI
 #      uses and why), PORT (default 8289), RPC_PORT (default 8546), OUT (default
 #      point-read-report.json), LABEL (default names the fixture).
