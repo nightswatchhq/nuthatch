@@ -891,6 +891,26 @@ abi = "abis/c.json"
         assert_ne!(m.nid(), m.blob_hash());
     }
 
+    /// The invariant adoption rests on (#364): everything early cutoff copies is something the
+    /// identity ignores. Break it and `runtime::adopt_dataset` would change what the destination
+    /// hashes to while filling it - an adoption that immediately reports itself as identity drift.
+    #[test]
+    fn derived_state_is_excluded_from_the_identity() {
+        for name in DERIVED_STATE {
+            assert!(
+                EXCLUDE.contains(name),
+                "'{name}' is copied by adoption but counted in the identity - copying it would move \
+                 the NID of the dataset that adopted it"
+            );
+        }
+        // And it is the whole of the derived state, not a subset: a dataset's data is its hot store
+        // and its segments. `.git`/`.DS_Store` are excluded for a different reason and are not data.
+        assert!(
+            DERIVED_STATE.contains(&DB_FILE) && DERIVED_STATE.contains(&"segments"),
+            "adoption must carry both halves of a dataset - hot store and sealed segments"
+        );
+    }
+
     /// RFC-0033 §5. The whole point of early cutoff: a cosmetic edit moves the **package** identity
     /// and leaves the **data** identity alone, so the new NID can adopt the old dataset instead of
     /// re-indexing the chain.

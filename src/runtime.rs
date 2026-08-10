@@ -1908,6 +1908,165 @@ mod tests {
         ));
     }
 
+    /// Stage a second dataset from `nid`'s inputs plus a cosmetic edit, and return the identity it
+    /// hashes to. The two datasets then share a data identity and differ in NID - the shape early
+    /// cutoff exists for.
+    fn cosmetic_sibling(root: &Path, nid: &str) -> String {
+        let staging = root.join("staging");
+        crate::project::copy_dir(&MountTable::data_dir(root, nid), &staging).unwrap();
+        // Inputs only - a freshly installed nest package carries no store and no segments.
+        for name in crate::blob::DERIVED_STATE {
+            let p = staging.join(name);
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+        // `views/**` is excluded from the data identity, so this moves the NID and nothing else.
+        std::fs::create_dir_all(staging.join("views")).unwrap();
+        std::fs::write(staging.join("views").join("10-note.sql"), "-- a note\n").unwrap();
+
+        let new_nid = crate::blob::nest_nid(&staging).unwrap();
+        std::fs::rename(&staging, MountTable::data_dir(root, &new_nid)).unwrap();
+        new_nid
+    }
+
+    /// Early cutoff on the mount path (#364): a dataset with no data of its own takes the data of one
+    /// whose inputs imply the same bytes.
+    #[test]
+    fn a_dataset_with_no_data_adopts_a_data_identical_one() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "indexed history",
+        )
+        .unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        let adopted = adopt_dataset(root, &dest, &new).unwrap();
+
+        assert_eq!(
+            adopted,
+            Some(Adoption {
+                nid: new.clone(),
+                from_nid: old.clone()
+            }),
+            "a cosmetic edit must adopt the dataset it came from"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "indexed history",
+            "the data must actually arrive - reporting an adoption that copied nothing is worse than \
+             not adopting"
+        );
+        assert!(
+            MountTable::data_dir(root, &old)
+                .join(crate::config::DB_FILE)
+                .is_file(),
+            "adoption must COPY - the source may still be mounted by another tenant"
+        );
+        // And it must not have moved the identity it adopted into, or the next start reports drift.
+        assert_eq!(
+            crate::blob::nest_nid(&dest).unwrap(),
+            new,
+            "copying derived state must not change what the destination's inputs hash to"
+        );
+    }
+
+    /// The guard that makes this safe to run on **every** start: a dataset that already holds data is
+    /// left exactly as it is. Without it, early cutoff would overwrite a live nest's store with
+    /// another dataset's the moment two identities shared a data identity - which is the ordinary case
+    /// after an edit, not a rare one.
+    #[test]
+    fn adoption_never_writes_over_a_dataset_that_holds_data() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "the other dataset's history",
+        )
+        .unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        // This one has indexed on its own - a restart, or a partial backfill that was interrupted.
+        std::fs::write(dest.join(crate::config::DB_FILE), "my own history").unwrap();
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a dataset holding data must not adopt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
+            "my own history",
+            "its store must be untouched"
+        );
+    }
+
+    /// The dangerous direction, at the point the decision is made: different data identity, no
+    /// adoption. `e2e_early_cutoff` drives the same rule through the whole mount path.
+    #[test]
+    fn a_dataset_whose_data_identity_differs_is_not_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        std::fs::write(
+            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
+            "indexed history",
+        )
+        .unwrap();
+
+        // A different contract: same shape, different bytes stored.
+        let staging = root.join("staging");
+        crate::project::copy_dir(&MountTable::data_dir(root, &old), &staging).unwrap();
+        std::fs::remove_file(staging.join(crate::config::DB_FILE)).unwrap();
+        let cfg = std::fs::read_to_string(staging.join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            staging.join(CONFIG_FILE),
+            cfg.replace(
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+            ),
+        )
+        .unwrap();
+        let new = crate::blob::nest_nid(&staging).unwrap();
+        let dest = MountTable::data_dir(root, &new);
+        std::fs::rename(&staging, &dest).unwrap();
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a nest indexing a different contract must not inherit another contract's data"
+        );
+        assert!(
+            !dest.join(crate::config::DB_FILE).exists(),
+            "and nothing must have been copied into it"
+        );
+    }
+
+    /// An empty dataset is not worth adopting, and adopting it would consume the one chance to adopt
+    /// the dataset that does hold the history.
+    #[test]
+    fn an_empty_dataset_is_not_an_adoption_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc"); // no store written: inputs only
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "adopting an empty dataset reports a cutoff and still re-indexes"
+        );
+    }
+
     /// The baseline: an untouched dataset must report nothing, or the check is just noise.
     #[test]
     fn an_intact_dataset_reports_no_identity_drift() {
