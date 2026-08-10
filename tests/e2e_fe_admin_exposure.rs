@@ -140,3 +140,64 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
     assert_eq!(without.as_u16(), 401, "no credential must be refused");
     assert_eq!(with.as_u16(), 200, "the configured token must be accepted");
 }
+
+/// #292, the second half: `--no-admin` promises *"no routes"* (`cli.rs`, `DevArgs::no_admin`), and the
+/// runtime's lifecycle half delivers exactly that - `lifecycle_routes` returns an empty `Router` when
+/// the admin surface is off, so `/_admin/nests` is not a path that exists. The per-nest half of the
+/// same surface only ever *answered* 404, from a handler that was mounted either way.
+///
+/// A disabled route that still replies in its own words is a different thing from a route that is not
+/// there: it confirms to an unauthenticated caller that this is a nuthatch with the admin UI switched
+/// off, which is the one fact `--no-admin` exists to withhold from a hosted deployment fronting its own
+/// dashboard.
+///
+/// Stated as the property rather than as the body string, so it survives a reworded fallback: with the
+/// admin surface disabled, every `/_admin*` path must be **indistinguishable** from a path that was
+/// never registered. Re-mounting the routes unconditionally turns this red on the body.
+#[tokio::test]
+async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
+    let _env = ENV.lock().await;
+    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_fe_nest(dir.path());
+    // `admin: false` is the FE's spelling of `--no-admin`: both land on `admin_enabled == false` and
+    // both compose the same `serve::router`, so the claim is tested where it is implemented.
+    let (base, task) = start_fe(dir.path(), false).await;
+
+    let client = reqwest::Client::new();
+    let probe = |path: &'static str| {
+        let client = client.clone();
+        let url = format!("{base}{path}");
+        async move {
+            let resp = client.get(url).send().await.expect("probe request");
+            (
+                resp.status().as_u16(),
+                resp.text().await.unwrap_or_default(),
+            )
+        }
+    };
+
+    // What an unregistered path looks like on this router - the baseline every admin path must match.
+    let unrouted = probe("/_not_a_route_at_all").await;
+    let admin = probe("/_admin").await;
+    let admin_slash = probe("/_admin/").await;
+    let admin_events = probe("/_admin/events").await;
+    task.abort();
+
+    assert_eq!(
+        unrouted.0, 404,
+        "premise: an unregistered path must 404, else the baseline means nothing"
+    );
+    for (path, got) in [
+        ("/_admin", admin),
+        ("/_admin/", admin_slash),
+        ("/_admin/events", admin_events),
+    ] {
+        assert_eq!(
+            got, unrouted,
+            "with the admin surface disabled, {path} must be indistinguishable from an unregistered \
+             path - got {got:?}, unregistered paths answer {unrouted:?}"
+        );
+    }
+}
