@@ -367,8 +367,6 @@ pub async fn run(
     result
 }
 
-/// Whether the built-in admin UI should be served, given `--no-admin` and the bind address. Extracted
-/// so the runtime computes it once for the whole process (RFC-0010 Part A semantics unchanged).
 /// The admin token from the environment, treating unset OR empty/whitespace as "no token": an empty
 /// `NUTHATCH_ADMIN_TOKEN=` must neither enable the admin route off-localhost nor become a null
 /// credential that a bare `?token=` satisfies (SEC).
@@ -378,6 +376,12 @@ fn admin_token_env() -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
+/// Whether the built-in admin UI should be served, given `--no-admin` and the bind address. Extracted
+/// so the runtime computes it once for the whole process (RFC-0010 Part A semantics unchanged).
+///
+/// **Every** role that serves the admin surface must route its decision through here rather than
+/// reading the env var directly: this is the only place that turns "off-localhost with no token" into
+/// *off* instead of *open*, and a role that skips it publishes an unauthenticated admin UI (#292).
 pub fn admin_enabled(no_admin: bool, listen: &str) -> bool {
     let enabled = !no_admin && (serve::is_localhost(listen) || admin_token_env().is_some());
     if !no_admin && !enabled {
@@ -1958,13 +1962,19 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     let source: Arc<dyn Source> =
         Arc::new(crate::rpc::RpcClient::new(config.nest.rpc_urls.clone())?);
 
-    let admin_token = admin_token_env();
+    // The FE role gets the *same* admin derivation as `dev` and the roost runtime, not a bare read of
+    // the env var. Reading it directly left `--admin` on an off-localhost bind serving `/_admin/` with
+    // `admin_token: None`, which `admin_authorized` treats as "localhost, open" - so the query FE, the
+    // one role an operator actually puts on a network, was the one role with no credential (#292).
+    // `--admin` is opt-in here and opt-out on `dev`, which is the only asymmetry that survives.
+    let admin_enabled = admin_enabled(!args.admin, &args.listen);
+    let admin_token = admin_required_token(admin_enabled, &args.listen);
     let (_ingest, state, alert_worker, _window) = build_nest(
         &source,
         dir.clone(),
         &config,
         None,
-        args.admin,
+        admin_enabled,
         admin_token,
         store_override,
     )
