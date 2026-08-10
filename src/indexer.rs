@@ -1179,6 +1179,13 @@ async fn runtime_index_loop(
                         .filter(|l| l.block_number >= nexts[i] && live_ref(&nests, i).owns(l))
                         .cloned()
                         .collect();
+                    // PROBE (DO NOT MERGE): synthetic retention leak, to measure the regression half
+                    // of the multinest RSS gate on the runner that enforces it.
+                    {
+                        static LEAK: std::sync::Mutex<Vec<crate::rpc::Log>> =
+                            std::sync::Mutex::new(Vec::new());
+                        LEAK.lock().unwrap().extend(nest_logs.iter().cloned());
+                    }
                     // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
                     // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
                     // iteration re-fetches, and this nest retries while nests that did advance simply
