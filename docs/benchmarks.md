@@ -213,6 +213,12 @@ bash .github/workflows/multinest-footprint.sh          # measure + enforce
 scripts/multinest-rss-spread.sh 7                      # the noise band, before moving a ceiling
 ```
 
+Both commands are bare on purpose: the harness's defaults **are** the scenario CI enforces (20 nests,
+1000 backfill blocks, tip-follow to 20200), and the spread tool inherits them, so what you measure
+here is what the gate measures. Export a knob and you are measuring something else - which matters
+most in the one case you would want to, re-baselining a ceiling, because a smaller scenario yields a
+smaller band and a ceiling below the healthy enforced figure (#395).
+
 ### Two ceilings, and why they are not one
 
 | | ceiling | what a breach means |
@@ -241,6 +247,13 @@ scenario most likely to break it. Neither subsumes the other.
 | rows | 240,200 |
 | **peak RSS** | **143 MB**, against the 2048 MB budget |
 | at-tip RSS | 143 MB |
+
+The 143 above is the **top of the measured band** - the worst of the 15-run spread the regression
+ceiling was derived from (111, 132, 133 x7, 134, 140, 141, 141, 143), because a ceiling is set from
+the top of a band and not from its middle. The committed artifact
+`docs/bench/multinest-footprint.json` is a **single run** of the same scenario, so it reads lower:
+139 peak, 134 at-tip. Both are correct and they are not meant to match; if you have compared one
+against the other and found them disagreeing, that is the reason.
 
 **History is close to free in RAM, and that is the sealing design working rather than luck.** At a 4x
 event rate (608,800 rows) peak went only 143 → 198 MB, and the at-tip figure (173 MB) came in *below*
