@@ -450,7 +450,8 @@ pub struct QueryBenchArgs {
     #[arg(long)]
     pub sql: Option<String>,
 
-    /// Entity point-reads to time (keys sampled evenly across the hot store).
+    /// Entity point-reads to time (keys in chain order from the oldest - a prefix, so set this at or
+    /// above the hot row count to cover the whole store).
     #[arg(long, default_value_t = 1000)]
     pub reads: usize,
 

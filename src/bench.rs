@@ -338,6 +338,10 @@ pub struct QueryBenchReport {
     pub hot_rows: u64,
     pub sealed_through: u64,
     pub reads: usize,
+    /// Whether the timed point-reads ran against an already-warmed cache. Always true, and recorded
+    /// rather than assumed: a point-read latency means nothing without it, and a reader comparing two
+    /// releases has no other way to know these are not cold-start numbers.
+    pub warm_cache: bool,
     pub point_read_p50_us: f64,
     pub point_read_p99_us: f64,
     pub point_read_p999_us: f64,
@@ -430,6 +434,18 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let (p50_us, p99_us, p999_us, n_reads) = if keys.is_empty() {
         (0.0, 0.0, 0.0, 0)
     } else {
+        // **Warm the cache first, and discard it** - the `/sql` half below has always done this and
+        // the point-read half never did, which is why its p99 was the least stable number the harness
+        // produced. An unwarmed first pass faults every redb page in from disk, so p99 was measuring
+        // the page cache's state rather than the read path, and it moved with whatever else the
+        // machine had been doing. MEASURED-SPREAD-PLACEHOLDER
+        //
+        // Warm is therefore what the gate measures, and `warm_cache` records that so nobody reads
+        // these as cold-start latencies. Cold-start is a real and different question - see
+        // docs/benchmarks.md; it is not the one a regression gate can ask.
+        for k in &keys {
+            let _ = store.get_entity(k)?;
+        }
         let mut us: Vec<f64> = Vec::with_capacity(keys.len());
         for k in &keys {
             let t = Instant::now();
@@ -504,6 +520,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         hot_rows,
         sealed_through,
         reads: n_reads,
+        warm_cache: true,
         point_read_p50_us: round2(p50_us),
         point_read_p99_us: round2(p99_us),
         point_read_p999_us: round2(p999_us),
@@ -872,6 +889,7 @@ mod tests {
             hot_rows: 0,
             sealed_through: 0,
             reads,
+            warm_cache: true,
             point_read_p50_us: p50,
             point_read_p99_us: p99,
             point_read_p999_us: p99,

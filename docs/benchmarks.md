@@ -110,7 +110,10 @@ nuthatch bench query --dir <nest> [--sql "<query>"] [--reads N] [--iters N] [--o
 
 Reports:
 
-- **entity point-read p50/p99** - keys sampled evenly across the hot store.
+- **entity point-read p50/p99** - `--reads N` keys in chain order from the oldest, read once to warm
+  the cache and then timed. It is a **prefix, not an even spread**: pass `--reads` at or above the hot
+  row count (as the CI gate does) and it covers every key, but a smaller `--reads` over a large hot
+  store times a contiguous run of the B-tree and will flatter itself.
 - **`/sql` query latency p50/p99 and peak RSS** over the hot ∪ cold union. The default query is a
   `SELECT count(*)` on the largest hot table: deliberately the full-tip-materialising scan, because
   that is the **#1 RAM risk on a deep-finality L2** and the number most worth watching.
