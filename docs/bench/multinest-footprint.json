@@ -7,11 +7,11 @@
   "backfill_blocks": 1000,
   "tip_follow_blocks": 200,
   "rows_total": 240200,
-  "peak_rss_mb": 133,
-  "at_tip_rss_mb": 133,
+  "peak_rss_mb": 139,
+  "at_tip_rss_mb": 134,
   "budget_mb": 2048,
   "regression_ceiling_mb": 180,
   "seconds_to_final_tip": 141,
-  "commit": "4f380dc",
+  "commit": "38a8506",
   "hardware": "32 cores, 62 GB, Linux"
 }
