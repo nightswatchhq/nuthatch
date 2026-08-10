@@ -74,8 +74,9 @@ async fn spawn_cursor(
         false,
         None,
         health,
-        // Production's default. `--fail-fast` deliberately couples cursor fate and is not what a
-        // multichain runtime runs; see the note on `supervise_cursors` in this test's report.
+        // Production's default. `--fail-fast` (`runtime.rs:1128`) deliberately couples cursor fate,
+        // aborting every sibling when one cursor dies, so it is the one configuration under which
+        // this isolation property is not expected to hold.
         false,
     )
     .await
