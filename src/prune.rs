@@ -187,6 +187,9 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     // unreferenced bytes (recoverable, just disk) rather than dangling references (not).
     for c in &found {
         std::fs::remove_dir_all(&c.dir).with_context(|| format!("removing {}", c.dir.display()))?;
+        // An adoption killed part-way leaves a staging sibling. It is not a dataset, so `collectable`
+        // never lists it, and it would otherwise outlive the only thing that clears it.
+        let _ = std::fs::remove_dir_all(crate::runtime::adopt_staging(&c.dir));
         println!("Removed data/{}", &c.nid[..12]);
     }
 
@@ -294,6 +297,38 @@ mod tests {
         assert!(
             d.path().join(DATA_DIR).join(&a).is_dir(),
             "prune removed a MOUNTED dataset"
+        );
+    }
+
+    /// An adoption killed part-way leaves `data/<nid>.adopting/` - a full copy of a dataset's derived
+    /// state. `adopt_dataset` clears it on the dataset's next start, but a dataset that is unmounted
+    /// and pruned never has one, so the scratch would sit there at dataset size forever.
+    #[test]
+    fn a_pruned_dataset_takes_its_adoption_staging_with_it() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (nid("aa"), nid("bb"));
+        fixture(d.path(), &[&a], &[&b]);
+        let staging = crate::runtime::adopt_staging(&d.path().join(DATA_DIR).join(&b));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("nuthatch.redb"), vec![0u8; 1024]).unwrap();
+        let kept = crate::runtime::adopt_staging(&d.path().join(DATA_DIR).join(&a));
+        std::fs::create_dir_all(&kept).unwrap();
+
+        assert!(
+            collectable(d.path())
+                .unwrap()
+                .iter()
+                .all(|c| c.nid.len() == 64 && c.nid != format!("{b}.adopting")),
+            "staging must never be listed as a dataset"
+        );
+        run(d.path(), true).unwrap();
+        assert!(
+            !staging.exists(),
+            "the pruned dataset's staging outlived it, and nothing else ever clears it"
+        );
+        assert!(
+            kept.is_dir(),
+            "prune removed the staging of a dataset it did not collect"
         );
     }
 

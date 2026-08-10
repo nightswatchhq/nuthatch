@@ -27,6 +27,17 @@ pub const BLOB_FORMAT_VERSION: u32 = 1;
 /// at any depth.
 const EXCLUDE: &[&str] = &[DB_FILE, "segments", ".git", ".DS_Store"];
 
+/// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
+///
+/// Named separately from [`EXCLUDE`] because it is read in the other direction. `EXCLUDE` answers
+/// "what is not an input"; this answers "what *is* the data" - the set early cutoff copies when one
+/// identity adopts another's dataset ([`crate::runtime::adopt_dataset`]).
+///
+/// It is a **subset of [`EXCLUDE`]**, and that is what makes adoption safe: copying only these can
+/// never change what the destination's inputs hash to, so an adopted dataset still is the identity its
+/// mount record claims. `derived_state_is_excluded_from_the_identity` holds the two together.
+pub const DERIVED_STATE: &[&str] = &[DB_FILE, "segments"];
+
 /// One packed input file: its path relative to the nest root and the hash of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
@@ -878,6 +889,26 @@ abi = "abis/c.json"
         // And a NID is never a blob hash, even for the same nest - the domain separator sees to it.
         let m = build_manifest(a.path(), None).unwrap();
         assert_ne!(m.nid(), m.blob_hash());
+    }
+
+    /// The invariant adoption rests on (#364): everything early cutoff copies is something the
+    /// identity ignores. Break it and `runtime::adopt_dataset` would change what the destination
+    /// hashes to while filling it - an adoption that immediately reports itself as identity drift.
+    #[test]
+    fn derived_state_is_excluded_from_the_identity() {
+        for name in DERIVED_STATE {
+            assert!(
+                EXCLUDE.contains(name),
+                "'{name}' is copied by adoption but counted in the identity - copying it would move \
+                 the NID of the dataset that adopted it"
+            );
+        }
+        // And it is the whole of the derived state, not a subset: a dataset's data is its hot store
+        // and its segments. `.git`/`.DS_Store` are excluded for a different reason and are not data.
+        assert!(
+            DERIVED_STATE.contains(&DB_FILE) && DERIVED_STATE.contains(&"segments"),
+            "adoption must carry both halves of a dataset - hot store and sealed segments"
+        );
     }
 
     /// RFC-0033 §5. The whole point of early cutoff: a cosmetic edit moves the **package** identity
