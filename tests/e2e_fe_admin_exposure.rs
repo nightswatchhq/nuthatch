@@ -266,9 +266,20 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 /// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
 /// it has teeth there: adding the nest directory to `nest_info` turns it red.
 ///
-/// The sweep is over the *whole* served surface rather than the two routes the issue names. A secret
-/// leaking from `/schema` is the same disclosure as one leaking from `/nest`, and enumerating the
-/// router costs nothing - whereas checking two routes would have proved two routes.
+/// The sweep is over every route the issue does *not* name, as well as the two it does. A secret
+/// leaking from `/schema` is the same disclosure as one leaking from `/nest`, and probing the rest
+/// costs nothing - whereas checking two routes would have proved two routes.
+///
+/// **The list is hand-maintained, and that is a real limit - do not read it as "the whole surface".**
+/// `axum::Router` exposes no route table, so nothing here can enumerate what `serve::router`
+/// registers. The list below was written against that function and covers all 22 of its GETs as of
+/// this commit: the 19 base routes, plus `/_admin` and `/_admin/` (two distinct registrations of
+/// `admin_index`), plus `/_admin/events`, which is an SSE stream and is probed separately. A route
+/// added to `serve::router` and not added here is a route this sweep does not check, and no
+/// assertion in this file will say so. An earlier revision claimed to enumerate the router while
+/// omitting six of them - `/table/{name}`, `/entity/{id}`, `/q/{name}`, `/balance/{address}`,
+/// `/exposure/{address}` and bare `/_admin` - which is the failure mode this paragraph exists to
+/// stop repeating.
 ///
 /// Deliberately run with a valid admin token: the question is what a credentialed caller receives, so
 /// gating the surface is not an answer here.
@@ -287,6 +298,8 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
     let client = reqwest::Client::new();
     // Every GET the router registers, plus a deliberately failing `/sql` - the error path is where an
     // absolute path escapes if `sanitize_sql_error` is not actually wired in.
+    let balance = format!("/balance/{USDC}");
+    let exposure = format!("/exposure/{USDC}");
     let paths = [
         "/",
         "/nest",
@@ -306,7 +319,19 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
         "/sql?q=SELECT%20*%20FROM%20no_such_table",
         "/explain?q=SELECT%20*%20FROM%20no_such_table",
         "/sql?q=SELECT%20*%20FROM%20usdc__transfer",
-        "/_admin/?token=s3cret",
+        // The parameterised routes. They are here because a path parameter is the one input a caller
+        // controls that a handler is most likely to echo back, and because `/entity/{id}` is the only
+        // probe that reaches `analytics::get_row` - i.e. the sealed-segment path, which formats
+        // absolute globs. `1-0` parses as (block 1, log 0) so it gets that far rather than being
+        // rejected as malformed.
+        "/table/usdc__transfer?limit=10",
+        "/entity/1-0",
+        "/q/transfers",
+        balance.as_str(),
+        exposure.as_str(),
+        // Bare `/_admin`, distinct from the `/_admin/` above: they are two registered routes and
+        // `admin_index` is reached by both.
+        "/_admin?token=s3cret",
     ];
     let mut bodies: Vec<(String, String)> = Vec::new();
     for p in paths {
@@ -338,13 +363,19 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
     drop(sse);
     task.abort();
 
-    // Premise: the sweep actually read something. Without this a router rename would silently reduce
-    // the test to asserting over empty strings, which passes for the wrong reason.
-    let served: usize = bodies.iter().filter(|(_, b)| !b.is_empty()).count();
+    // Premise: the sweep actually read something *from every route it probed*. Without this a router
+    // rename would silently reduce the test to asserting over empty strings, which passes for the
+    // wrong reason. Named per path rather than counted: a count tolerates the one empty body that
+    // matters, and reports "n of m" when what a reader needs is which one.
+    let empty: Vec<&str> = bodies
+        .iter()
+        .filter(|(_, b)| b.is_empty())
+        .map(|(p, _)| p.as_str())
+        .collect();
     assert!(
-        served >= paths.len(),
-        "the sweep must have read real payloads, got {served} non-empty of {}",
-        bodies.len()
+        empty.is_empty(),
+        "every probed route must return a payload, else the assertions below hold vacuously for it - \
+         these answered with an empty body: {empty:?}"
     );
     // ...and that the nest whose secrets we planted is the one being served.
     let (_, nest_body) = bodies.iter().find(|(p, _)| p == "/nest").unwrap();
