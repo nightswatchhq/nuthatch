@@ -702,9 +702,10 @@ pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Ad
 /// Where an adoption assembles its copy before committing it: a sibling of the destination, so the
 /// commit is a same-filesystem rename rather than a second copy.
 ///
-/// The suffix keeps it out of [`adoptable`]'s scan, which takes 64-hex names only - a staging
-/// directory must never be a candidate for anything.
-fn adopt_staging(dataset: &Path) -> PathBuf {
+/// The suffix keeps it out of [`adoptable`]'s scan and of `prune::collectable`, both of which take
+/// 64-hex names only - a staging directory must never be a candidate for anything. `prune` removes it
+/// alongside the dataset it belongs to, so a copy interrupted by a kill cannot outlive its owner.
+pub(crate) fn adopt_staging(dataset: &Path) -> PathBuf {
     let mut name = dataset.file_name().unwrap_or_default().to_os_string();
     name.push(".adopting");
     dataset.with_file_name(name)
