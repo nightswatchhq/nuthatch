@@ -290,7 +290,9 @@ jobs:
         #
         # Same hermetic shape as `footprint` above - the chain is served by footprint-rpc.py and the
         # nest is written inline - so there is no secret, no third party, and a fork PR can satisfy
-        # it. Every run reads exactly 8004 rows.
+        # it. Every run indexes exactly 8,004 rows, of which 256 sit in the hot store and are the
+        # only ones a point-read can reach - the rest are sealed past finality and pruned. That is
+        # why `--reads` is 8,004 (keys offered) but the `--min-reads` floor is 256 (keys sampled).
         #
         # **The ceilings come from a measured mutation, not from a guess.** The first version of this
         # job used 200µs/2000µs, reasoned from "a point-read is single-digit microseconds, leave
