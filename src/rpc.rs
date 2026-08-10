@@ -2411,6 +2411,79 @@ mod rfc0036_tests {
         );
     }
 
+    /// The hint is actually **wired to the pause** - the half of #361 the parser tests do not reach.
+    ///
+    /// Deleting the honouring at both call sites, leaving parser, cap and classifier intact, left the
+    /// suite at 488 passed / 0 failed: the entire behavioural delta was invisible to its own tests.
+    /// That is our most-repeated failure - a criterion phrased as the absence of an effect passes
+    /// trivially when the mechanism is missing - so this asserts the effect instead.
+    ///
+    /// **Self-calibrating, deliberately.** The obvious version - one mock, assert elapsed exceeds a
+    /// fixed threshold - does not work under `start_paused`: reqwest's own 20s timeout is a tokio
+    /// timer too, so virtual time leaps through it while the runtime waits on a real socket and the
+    /// measurement is swamped (observed: 721s where the arithmetic says 35s). So run the same
+    /// scenario twice against mocks identical but for the header. Whatever the timeouts contribute,
+    /// they contribute to both, and the difference is the hint. Measured with the wiring deleted:
+    /// 467.168s vs 466.944s, a gap of 224ms.
+    ///
+    /// `block_headers` runs `ROUNDS = 8`, so seven pauses: ~7s of linear pacing without the hint,
+    /// ~35s with a 5s hint honoured. This also covers the `Retry-After` **header** path, which
+    /// nothing else exercises - neither mock sends `try_again_in`, so the header is the only source.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_retry_hint_actually_lengthens_the_pause() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+
+        async fn hinted() -> impl IntoResponse {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "5")],
+                "rate limited",
+            )
+        }
+        async fn bare() -> impl IntoResponse {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited")
+        }
+        async fn time_a_run(app: Router) -> Duration {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let client = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+            let start = tokio::time::Instant::now();
+            client
+                .block_headers(&[1])
+                .await
+                .expect_err("a permanently rate-limited endpoint must exhaust its rounds");
+            let elapsed = start.elapsed();
+            server.abort();
+            elapsed
+        }
+
+        let with_hint = time_a_run(
+            Router::new()
+                .route("/", post(hinted))
+                .route("/{*rest}", post(hinted)),
+        )
+        .await;
+        let without_hint = time_a_run(
+            Router::new()
+                .route("/", post(bare))
+                .route("/{*rest}", post(bare)),
+        )
+        .await;
+
+        // Seven pauses of (5s - linear) extra; worst case 7 x (5s - 1.75s) = 22.75s. Half of that is
+        // a wide margin that still cannot be reached by ignoring the hint.
+        let gap = with_hint.saturating_sub(without_hint);
+        assert!(
+            gap >= Duration::from_secs(11),
+            "the provider's 5s Retry-After was not honoured: hinted {with_hint:?} vs unhinted \
+             {without_hint:?} (gap {gap:?}). Identical mocks but for the header, so a real gap is \
+             the hint and no gap means the wiring is missing."
+        );
+    }
+
     /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is
     /// the common case: most providers say nothing, and inventing a number for them would be the
     /// same guess this change removes.
