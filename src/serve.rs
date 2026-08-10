@@ -137,33 +137,51 @@ impl axum::extract::FromRef<SharedNest> for AppState {
 /// [`SharedNest`]. Split out of [`run`] so a runtime (RFC-0012) can mount many of these under
 /// `/<nest>/…` prefixes; a solo `dev` serves exactly one at the root. Identical routes either way - a
 /// nest can't tell it's co-hosted, nor that its backing can be hot-swapped underneath it.
+///
+/// The one route set that is *not* identical either way is the admin UI: with the surface disabled
+/// (`--no-admin`, or a public bind with no token) the `/_admin*` routes are never registered, so those
+/// paths fall through to the ordinary not-found - which is what `--no-admin` promises and what the
+/// runtime's [`crate::runtime::lifecycle_routes`] already did for the mount/unmount half. Handing back
+/// a 404 *in the admin UI's own words* still tells an unauthenticated caller that this is a nuthatch
+/// with the admin surface switched off (#292).
 pub fn router(backing: SharedNest) -> Router {
-    Router::new()
-        .route("/", get(summary))
-        .route("/health", get(|| async { "ok" }))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics_handler))
-        .route("/tables", get(tables))
-        .route("/schema", get(schema_doc))
-        .route("/table/{name}", get(table))
-        .route("/entities", get(entities))
-        .route("/entity/{id}", get(entity))
-        .route("/sql", get(sql))
-        .route("/explain", get(explain))
-        .route("/queries", get(queries))
-        .route("/q/{name}", get(named_query))
-        .route("/balances", get(balances))
-        .route("/balance/{address}", get(balance))
-        .route("/exposure/{address}", get(exposure))
-        .route("/flags", get(flags))
-        .route("/nest", get(nest))
-        .route("/shape", get(shape))
-        .route("/_admin", get(admin_index))
-        .route("/_admin/", get(admin_index))
-        .route("/_admin/events", get(admin_events))
-        // Count every served request for `/metrics` (the operator's billing signal).
-        .layer(axum::middleware::from_fn(count_request))
-        .with_state(backing)
+    // Read once, at composition time: `admin_enabled` is derived from the process's flags and bind
+    // (`indexer::admin_enabled`), so it is constant for the life of the endpoint - a hot swap (RFC-0020
+    // slice 2) re-points the *data*, never the admin decision.
+    let admin_enabled = backing.current().admin_enabled;
+    let admin = |r: Router<SharedNest>| {
+        if !admin_enabled {
+            return r;
+        }
+        r.route("/_admin", get(admin_index))
+            .route("/_admin/", get(admin_index))
+            .route("/_admin/events", get(admin_events))
+    };
+    admin(
+        Router::new()
+            .route("/", get(summary))
+            .route("/health", get(|| async { "ok" }))
+            .route("/ready", get(ready))
+            .route("/metrics", get(metrics_handler))
+            .route("/tables", get(tables))
+            .route("/schema", get(schema_doc))
+            .route("/table/{name}", get(table))
+            .route("/entities", get(entities))
+            .route("/entity/{id}", get(entity))
+            .route("/sql", get(sql))
+            .route("/explain", get(explain))
+            .route("/queries", get(queries))
+            .route("/q/{name}", get(named_query))
+            .route("/balances", get(balances))
+            .route("/balance/{address}", get(balance))
+            .route("/exposure/{address}", get(exposure))
+            .route("/flags", get(flags))
+            .route("/nest", get(nest))
+            .route("/shape", get(shape)),
+    )
+    // Count every served request for `/metrics` (the operator's billing signal).
+    .layer(axum::middleware::from_fn(count_request))
+    .with_state(backing)
 }
 
 pub async fn run(listen: &str, state: AppState) -> Result<()> {
@@ -476,6 +494,9 @@ async fn admin_index(
     Query(q): Query<AdminQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Not reachable over HTTP any more - [`router`] does not mount this handler when the surface is
+    // disabled - and kept deliberately: the handler states its own precondition, so wiring it up from
+    // somewhere new cannot serve the admin UI by omission.
     if !s.admin_enabled {
         return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
     }
@@ -700,6 +721,8 @@ async fn admin_events(
     Query(q): Query<AdminQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Same as [`admin_index`]: unreachable while the route is unmounted, kept as the handler's own
+    // precondition rather than a rule that lives only in the router.
     if !s.admin_enabled {
         return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
     }
