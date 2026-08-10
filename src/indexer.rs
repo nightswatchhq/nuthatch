@@ -1514,18 +1514,19 @@ async fn build_nest(
     // Warm restart: the derived views (balances, exposure, velocity) aren't persisted, so rebuild
     // them from stored facts before serving or ingesting. Cold start → nothing stored → no-op.
     if store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-        if let Err(e) = rebuild_balances(&dir, store.as_ref(), &registry, &balances) {
-            tracing::warn!("balance view rebuild failed (will re-derive as it indexes): {e:#}");
-        }
-        if let Err(e) = rebuild_exposure(&dir, store.as_ref(), &registry, &labels, &exposure) {
-            tracing::warn!("exposure view rebuild failed (will re-derive as it indexes): {e:#}");
-        }
-        if let Some((_, w)) = velocity_cfg {
-            if let Err(e) = rebuild_velocity(&dir, store.as_ref(), &registry, w, &velocity) {
-                tracing::warn!(
-                    "velocity view rebuild failed (will re-derive as it indexes): {e:#}"
-                );
-            }
+        if let Err(e) = rebuild_views(
+            &dir,
+            store.as_ref(),
+            &registry,
+            &DerivedViews {
+                labels: &labels,
+                balances: &balances,
+                exposure: &exposure,
+                velocity: &velocity,
+                velocity_window: velocity_cfg.map(|(_, w)| w),
+            },
+        ) {
+            tracing::warn!("view rebuild failed (will re-derive as it indexes): {e:#}");
         }
     }
 
@@ -2768,26 +2769,19 @@ impl NestIngest {
                     .set_meta(SEALED_THROUGH_KEY, &finalized_through.to_string())?;
                 self.store
                     .set_meta(LAST_BLOCK_KEY, &finalized_through.to_string())?;
-                if let Err(e) =
-                    rebuild_balances(&self.dir, &self.store, &self.registry, &self.balances)
-                {
-                    tracing::warn!("balance rebuild after seal-direct failed: {e:#}");
-                }
-                if let Err(e) = rebuild_exposure(
+                if let Err(e) = rebuild_views(
                     &self.dir,
                     &self.store,
                     &self.registry,
-                    &self.labels,
-                    &self.exposure,
+                    &DerivedViews {
+                        labels: &self.labels,
+                        balances: &self.balances,
+                        exposure: &self.exposure,
+                        velocity: &self.velocity,
+                        velocity_window: self.velocity_cfg.map(|(_, w)| w),
+                    },
                 ) {
-                    tracing::warn!("exposure rebuild after seal-direct failed: {e:#}");
-                }
-                if let Some((_, w)) = self.velocity_cfg {
-                    if let Err(e) =
-                        rebuild_velocity(&self.dir, &self.store, &self.registry, w, &self.velocity)
-                    {
-                        tracing::warn!("velocity rebuild after seal-direct failed: {e:#}");
-                    }
+                    tracing::warn!("view rebuild after seal-direct failed: {e:#}");
                 }
                 // Fire webhooks for the freshly-sealed history (a `since = "genesis"`/block webhook wants
                 // it; a `since = "registration"` one is cursored past it, so this is a no-op there).
@@ -3559,21 +3553,59 @@ fn velocity_retraction_batch(
     batch
 }
 
-/// Rebuild the in-memory IVM balance view from stored facts on a warm restart. The view is derived
-/// state, not durable state - so rather than persist it (and risk drift from the canonical store),
-/// we reconstruct it from the facts that *are* durable, using the same circuit that maintains it
-/// live. Cold (sealed, immutable) segments are folded to one net-per-address row directly in DuckDB
-/// (no need to replay millions of transfers), and only the small un-sealed hot tail is replayed
-/// transfer-by-transfer. Hot and cold are disjoint (sealed rows are pruned from hot), so nothing is
-/// double-counted; the result is identical to a view grown from genesis.
-fn rebuild_balances(
+/// The derived IVM views a restart has to reconstruct, and the two things that decide whether each is
+/// fed at all. They travel together because they are always rebuilt together, off one pass over the
+/// same facts - passed singly they made `rebuild_views` an eight-argument function.
+#[derive(Clone, Copy)]
+struct DerivedViews<'a> {
+    /// Exposure joins transfers against this; empty means the view can only ever be empty.
+    labels: &'a LabelSet,
+    balances: &'a BalanceView,
+    exposure: &'a ExposureView,
+    velocity: &'a VelocityView,
+    /// `Some(window)` only when a velocity flag is configured (RFC-0008 C3).
+    velocity_window: Option<u64>,
+}
+
+/// Rebuild every derived IVM view - balances, exposure and velocity - from stored facts, in a single
+/// pass over the hot store.
+///
+/// The views are derived state, not durable state: rather than persist them (and risk drift from the
+/// canonical store) we reconstruct them from the facts that *are* durable, through the same circuits
+/// that maintain them live. All three are built the same way. Cold (sealed, immutable) segments fold
+/// to one pre-summed row per key directly in DuckDB - no need to replay millions of transfers - and
+/// only the small un-sealed hot tail is replayed transfer by transfer. Hot and cold are disjoint
+/// (sealed rows are pruned from hot), so nothing is double-counted, and the result is identical to
+/// views grown from genesis.
+///
+/// This was three functions, each opening its own scan (issue #294). That was never *three* scans: it
+/// was `3 × transfer_tables`, because `recent_by_table` walks the whole entity table and JSON-parses
+/// every row just to test its `table` field, and each rebuild then parsed the rows it got back a
+/// second time. `hot_rows_by_table` walks once, parses each row once, and returns them already
+/// grouped, so one scan now feeds all three views. This runs on every restart and every crash
+/// recovery, which is precisely when an operator is watching.
+///
+/// The scan is deliberately **unbounded**, unlike `/sql` and `/explain` which cap it and answer 503.
+/// A query may refuse and be retried; a rebuild may not. Dropping hot rows here would leave a view
+/// quietly missing its tip for the life of the process - those transfers are never decoded again - and
+/// a silently wrong balance is far worse than a slow start.
+fn rebuild_views(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
-    balances: &BalanceView,
+    into: &DerivedViews<'_>,
 ) -> Result<()> {
+    let DerivedViews {
+        labels,
+        balances,
+        exposure,
+        velocity,
+        velocity_window,
+    } = *into;
+
     // Each transfer table with its (from, to, value) column names - which vary by token (USDC:
     // from/to/value; WETH: src/dst/wad), so we read them from the registry, never hardcode them.
+    // Velocity uses the same list and simply ignores `to`.
     let transfer_tables: Vec<(String, String, String, String)> = registry
         .tables()
         .iter()
@@ -3586,214 +3618,145 @@ fn rebuild_balances(
         return Ok(());
     }
 
-    let mut batch: views::WeightedBatch = Vec::new();
+    // The gates the three separate rebuilds each applied. Exposure joins transfers against the
+    // labeled set, so with no labels it can only ever be empty - there is nothing to be exposed *to*.
+    // Velocity is fed only when a velocity flag is configured (RFC-0008 C3).
+    let want_exposure = !labels.is_empty();
 
-    // Cold seed: net balance per address, summed in DuckDB (HUGEINT = i128). A table with no sealed
-    // segment yet has no view - that just means it has nothing cold to seed, so skip on error.
-    let mut cold_addrs = 0usize;
+    let sealed_through = store.sealed_through();
+
+    let mut balance_batch: views::WeightedBatch = Vec::new();
+    let mut exposure_batch: exposure::ExposureBatch = Vec::new();
+    let mut velocity_batch: velocity::VelocityBatch = Vec::new();
+
+    // Cold seed. Three different aggregations over the same segments, so this stays three DuckDB
+    // queries per table - they are pre-summed server-side and cheap, and it is the hot store, not
+    // DuckDB, that #294 was about. A table with no sealed segment yet has no view; that just means it
+    // has nothing cold to seed, so an error here is a debug line, not a failure.
+    let mut cold_balances = 0usize;
+    let mut cold_exposure = 0usize;
+    let mut cold_velocity = 0usize;
     for (table, from_col, to_col, val_col) in &transfer_tables {
-        match crate::analytics::net_balances(
-            dir,
-            table,
-            from_col,
-            to_col,
-            val_col,
-            store.sealed_through(),
-        ) {
+        match crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through)
+        {
             Ok(nets) => {
-                cold_addrs += nets.len();
+                cold_balances += nets.len();
                 for (addr, net) in nets {
-                    batch.push(views::seed_delta(addr, net));
+                    balance_batch.push(views::seed_delta(addr, net));
                 }
             }
             Err(e) => tracing::debug!("no cold seed for {table}: {e:#}"),
         }
+        if want_exposure {
+            match crate::analytics::cold_exposure(
+                dir,
+                table,
+                from_col,
+                to_col,
+                val_col,
+                sealed_through,
+            ) {
+                Ok(rows) => {
+                    cold_exposure += rows.len();
+                    for (key, amount, count) in rows {
+                        exposure_batch.push(exposure::seed_item(key, amount, count));
+                    }
+                }
+                Err(e) => tracing::debug!("no cold exposure seed for {table}: {e:#}"),
+            }
+        }
+        if let Some(window) = velocity_window {
+            match crate::analytics::cold_velocity(
+                dir,
+                table,
+                from_col,
+                val_col,
+                window,
+                sealed_through,
+            ) {
+                Ok(rows) => {
+                    cold_velocity += rows.len();
+                    for (key, volume, count) in rows {
+                        velocity_batch.push(velocity::seed_item(key, volume, count));
+                    }
+                }
+                Err(e) => tracing::debug!("no cold velocity seed for {table}: {e:#}"),
+            }
+        }
     }
 
-    // Hot replay: the un-sealed tip transfers, fed through the circuit exactly as the live loop does.
-    let mut hot = 0usize;
+    // Hot replay: the un-sealed tip, fed through the same delta paths the live loop uses. One scan,
+    // one parse, fanned out to all three views.
+    //
+    // A read failure propagates rather than being swallowed into an empty tail. The old per-view
+    // `unwrap_or_default()` would have applied the cold seed alone and logged nothing - a view short
+    // of its entire hot tail, presented as a successful rebuild. The caller warns and carries on.
+    let hot_rows = store.hot_rows_by_table()?;
+    let mut hot_balances = 0usize;
+    let mut hot_exposure = 0usize;
+    let mut hot_velocity = 0usize;
     for (table, from_col, to_col, val_col) in &transfer_tables {
-        for raw in store.recent_by_table(table, usize::MAX).unwrap_or_default() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
+        let Some(rows) = hot_rows.get(table) else {
+            continue;
+        };
+        // Newest first, matching the order `recent_by_table` returned. The circuits fold weighted
+        // deltas, so the summed result does not depend on it - but keeping the order identical means
+        // "same views as the three-scan build" holds structurally rather than by argument.
+        for v in rows.iter().rev() {
             if let (Some(from), Some(to), Some(val)) = (
                 v[from_col].as_str(),
                 v[to_col].as_str(),
                 v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
             ) {
-                batch.extend(views::transfer_deltas(from, to, val, 1));
-                hot += 1;
-            }
-        }
-    }
-
-    if batch.is_empty() {
-        return Ok(());
-    }
-    balances.apply(batch);
-    balances.flush();
-    tracing::info!(
-        "rebuilt balance view: {} holders ({cold_addrs} cold-seeded net(s) + {hot} hot transfer(s) replayed)",
-        balances.holders()
-    );
-    Ok(())
-}
-
-/// Rebuild the derived exposure view on a warm restart (RFC-0008 C1), mirroring `rebuild_balances`:
-/// cold (sealed) segments are folded to pre-summed (key, amount, count) aggregates directly in DuckDB
-/// (joined against the `labels` view) and seeded; only the un-sealed hot tail is replayed transfer by
-/// transfer. Hot and cold are disjoint (sealed rows are pruned), so nothing is double-counted. With no
-/// labels imported this is a no-op - there is nothing to be exposed *to*.
-fn rebuild_exposure(
-    dir: &std::path::Path,
-    store: &dyn crate::store::HotStore,
-    registry: &DecodeRegistry,
-    labels: &LabelSet,
-    exposure: &ExposureView,
-) -> Result<()> {
-    if labels.is_empty() {
-        return Ok(());
-    }
-    let transfer_tables: Vec<(String, String, String, String)> = registry
-        .tables()
-        .iter()
-        .filter_map(|d| {
-            d.transfer_columns()
-                .map(|(f, t, v)| (d.table.clone(), f.to_string(), t.to_string(), v.to_string()))
-        })
-        .collect();
-    if transfer_tables.is_empty() {
-        return Ok(());
-    }
-
-    let mut batch: exposure::ExposureBatch = Vec::new();
-
-    // Cold seed: pre-summed exposure per (address, label, direction), folded in DuckDB.
-    let mut cold = 0usize;
-    for (table, from_col, to_col, val_col) in &transfer_tables {
-        match crate::analytics::cold_exposure(
-            dir,
-            table,
-            from_col,
-            to_col,
-            val_col,
-            store.sealed_through(),
-        ) {
-            Ok(rows) => {
-                cold += rows.len();
-                for (key, amount, count) in rows {
-                    batch.push(exposure::seed_item(key, amount, count));
+                balance_batch.extend(views::transfer_deltas(from, to, val, 1));
+                hot_balances += 1;
+                if want_exposure {
+                    let d = exposure::exposure_deltas(from, to, val, 1, labels);
+                    if !d.is_empty() {
+                        hot_exposure += 1;
+                        exposure_batch.extend(d);
+                    }
                 }
             }
-            Err(e) => tracing::debug!("no cold exposure seed for {table}: {e:#}"),
-        }
-    }
-
-    // Hot replay: the un-sealed tip transfers, re-derived through the same delta path.
-    let mut hot = 0usize;
-    for (table, from_col, to_col, val_col) in &transfer_tables {
-        for raw in store.recent_by_table(table, usize::MAX).unwrap_or_default() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
-            if let (Some(from), Some(to), Some(val)) = (
-                v[from_col].as_str(),
-                v[to_col].as_str(),
-                v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
-            ) {
-                let d = exposure::exposure_deltas(from, to, val, 1, labels);
-                if !d.is_empty() {
-                    hot += 1;
-                    batch.extend(d);
+            // Velocity needs (from, block, value) and not `to`, so it is judged on its own terms: a
+            // row with an unreadable `to` still carries outbound volume.
+            if let Some(window) = velocity_window {
+                if let (Some(from), Some(block), Some(val)) = (
+                    v[from_col].as_str(),
+                    v["block_number"].as_u64(),
+                    v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
+                ) {
+                    velocity_batch.extend(velocity::velocity_deltas(from, block, val, 1, window));
+                    hot_velocity += 1;
                 }
             }
         }
     }
 
-    if batch.is_empty() {
-        return Ok(());
+    if !balance_batch.is_empty() {
+        balances.apply(balance_batch);
+        balances.flush();
+        tracing::info!(
+            "rebuilt balance view: {} holders ({cold_balances} cold-seeded net(s) + {hot_balances} hot transfer(s) replayed)",
+            balances.holders()
+        );
     }
-    exposure.apply(batch);
-    exposure.flush();
-    tracing::info!(
-        "rebuilt exposure view: {} entries ({cold} cold-seeded + {hot} hot transfer(s) replayed)",
-        exposure.entries()
-    );
-    Ok(())
-}
-
-/// Rebuild the derived velocity view on a warm restart (RFC-0008 C3), mirroring `rebuild_exposure`:
-/// cold sealed segments fold to pre-summed (address, window) volume+count in DuckDB and seed; only
-/// the un-sealed hot tail replays. Windowing is by `window` (the same block-bucketing the live path
-/// uses), so cold and hot land in identical buckets.
-fn rebuild_velocity(
-    dir: &std::path::Path,
-    store: &dyn crate::store::HotStore,
-    registry: &DecodeRegistry,
-    window: u64,
-    velocity: &VelocityView,
-) -> Result<()> {
-    let transfer_tables: Vec<(String, String, String)> = registry
-        .tables()
-        .iter()
-        .filter_map(|d| {
-            d.transfer_columns()
-                .map(|(f, _t, v)| (d.table.clone(), f.to_string(), v.to_string()))
-        })
-        .collect();
-    if transfer_tables.is_empty() {
-        return Ok(());
+    if !exposure_batch.is_empty() {
+        exposure.apply(exposure_batch);
+        exposure.flush();
+        tracing::info!(
+            "rebuilt exposure view: {} entries ({cold_exposure} cold-seeded + {hot_exposure} hot transfer(s) replayed)",
+            exposure.entries()
+        );
     }
-
-    let mut batch: velocity::VelocityBatch = Vec::new();
-
-    let mut cold = 0usize;
-    for (table, from_col, val_col) in &transfer_tables {
-        match crate::analytics::cold_velocity(
-            dir,
-            table,
-            from_col,
-            val_col,
-            window,
-            store.sealed_through(),
-        ) {
-            Ok(rows) => {
-                cold += rows.len();
-                for (key, volume, count) in rows {
-                    batch.push(velocity::seed_item(key, volume, count));
-                }
-            }
-            Err(e) => tracing::debug!("no cold velocity seed for {table}: {e:#}"),
-        }
+    if !velocity_batch.is_empty() {
+        velocity.apply(velocity_batch);
+        velocity.flush();
+        tracing::info!(
+            "rebuilt velocity view: {} bucket(s) ({cold_velocity} cold-seeded + {hot_velocity} hot transfer(s) replayed)",
+            velocity.entries()
+        );
     }
-
-    let mut hot = 0usize;
-    for (table, from_col, val_col) in &transfer_tables {
-        for raw in store.recent_by_table(table, usize::MAX).unwrap_or_default() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
-            if let (Some(from), Some(block), Some(val)) = (
-                v[from_col].as_str(),
-                v["block_number"].as_u64(),
-                v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
-            ) {
-                batch.extend(velocity::velocity_deltas(from, block, val, 1, window));
-                hot += 1;
-            }
-        }
-    }
-
-    if batch.is_empty() {
-        return Ok(());
-    }
-    velocity.apply(batch);
-    velocity.flush();
-    tracing::info!(
-        "rebuilt velocity view: {} bucket(s) ({cold} cold-seeded + {hot} hot transfer(s) replayed)",
-        velocity.entries()
-    );
     Ok(())
 }
 
@@ -6020,6 +5983,252 @@ rpc_urls = ["https://rpc.example"]
         assert!(
             widest <= 2_500,
             "dense history must not push the window toward the ceiling (widest was {widest})"
+        );
+    }
+
+    // --- restart rebuild: one pass over the hot store (issue #294) -------------------------------
+
+    /// A transfer row shaped exactly as `DecodedRow::to_json` writes one: `value` is a decimal
+    /// *string* (uint256 does not fit a JSON number) and `block_number` is a number.
+    ///
+    /// `to` is optional and writes JSON `null` when absent, which is how an undecodable recipient
+    /// reaches the hot store. Such a row still carries outbound volume, so the rebuild must feed it
+    /// to velocity while withholding it from balances and exposure.
+    fn transfer_row(
+        block: u64,
+        log_index: u64,
+        from: &str,
+        to: Option<&str>,
+        value: &str,
+    ) -> String {
+        let to = to.map_or("null".to_string(), |t| format!("\"{t}\""));
+        format!(
+            r#"{{"table":"usdc__transfer","block_number":{block},"block_hash":"0xbh","block_timestamp":{ts},"tx_hash":"0xtx","log_index":{log_index},"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","from":"{from}","to":{to},"value":"{value}"}}"#,
+            ts = 1_700_000_000 + block
+        )
+    }
+
+    /// A registry with one ERC-20 table, so `transfer_columns()` yields `("from","to","value")`.
+    fn erc20_registry() -> DecodeRegistry {
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        DecodeRegistry::build(vec![crate::registry::ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap()
+    }
+
+    /// A `LabelSet` containing `pairs`, built the only way one can be: written to disk and loaded.
+    fn labelset(pairs: &[(&str, &str)]) -> crate::labels::LabelSet {
+        let entries: Vec<crate::labels::LabelEntry> = pairs
+            .iter()
+            .map(|(a, l)| crate::labels::LabelEntry {
+                address: a.to_string(),
+                label: l.to_string(),
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(crate::labels::LABELS_DIR);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("snap.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+        crate::labels::load(dir.path())
+    }
+
+    /// The acceptance test for #294: collapsing three scans into one must leave the views **the same**,
+    /// not merely arrive faster.
+    ///
+    /// The reference is a transfer-by-transfer replay through the live delta paths - which is exactly
+    /// what the three separate rebuilds did, and what the views would hold had they been grown from
+    /// genesis. Every observable of all three views is compared, so dropping any one view's fan-out
+    /// from the merged loop fails here rather than being discovered on an operator's restart.
+    #[test]
+    fn rebuild_views_matches_a_transfer_by_transfer_replay() {
+        const MIXER: &str = "0x3333333333333333333333333333333333333333";
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        const CAROL: &str = "0x4444444444444444444444444444444444444444";
+        const WINDOW: u64 = 100;
+
+        // Two blocks in one velocity bucket and one far outside it, so bucketing is exercised; a
+        // labelled counterparty on both sides, so exposure has "out" and "in" rows to build.
+        //
+        // CAROL's row has an unreadable `to` (JSON null) with `from` and `value` intact. It is the
+        // row that pins the shape of the hot-replay guard: balances and exposure need a counterparty
+        // and must skip it, velocity needs only (from, block, value) and must still count its
+        // outbound volume. Without such a row, folding velocity inside the `(from, to, val)` guard
+        // silently drops outbound volume with every assertion still green.
+        let fixture = [
+            (10u64, 0u64, ALICE, Some(MIXER), "100"),
+            (11, 0, ALICE, Some(BOB), "250"),
+            (11, 1, BOB, Some(MIXER), "7"),
+            (210, 0, MIXER, Some(ALICE), "42"),
+            (12, 0, CAROL, None, "500"),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for (b, li, from, to, val) in fixture {
+            store
+                .put_entity(
+                    &Store::entity_key(b, li),
+                    &transfer_row(b, li, from, to, val),
+                )
+                .unwrap();
+        }
+        let registry = erc20_registry();
+        let labels = labelset(&[(MIXER, "mixer")]);
+        assert!(
+            !labels.is_empty(),
+            "fixture needs labels or exposure no-ops"
+        );
+
+        // Under test: one pass, all three views.
+        let balances = BalanceView::start().unwrap();
+        let exposure_v = ExposureView::start(true).unwrap();
+        let velocity_v = VelocityView::start(true).unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &registry,
+            &DerivedViews {
+                labels: &labels,
+                balances: &balances,
+                exposure: &exposure_v,
+                velocity: &velocity_v,
+                velocity_window: Some(WINDOW),
+            },
+        )
+        .unwrap();
+
+        // Reference: the same facts, fed one transfer at a time exactly as the live loop feeds them.
+        // Nothing is sealed, so there is no cold seed on either side - this is purely the hot tail.
+        let want_balances = BalanceView::start().unwrap();
+        let want_exposure = ExposureView::start(true).unwrap();
+        let want_velocity = VelocityView::start(true).unwrap();
+        for (b, _li, from, to, val) in fixture {
+            let v: i128 = val.parse().unwrap();
+            // Balances and exposure are both two-sided, so a row with no readable `to` has nothing
+            // to move between and nothing to be exposed to - the live loop never feeds them one.
+            if let Some(to) = to {
+                want_balances.apply(views::transfer_deltas(from, to, v, 1));
+                want_exposure.apply(exposure::exposure_deltas(from, to, v, 1, &labels));
+            }
+            // Velocity is one-sided - "how much did `from` push out" - so it is fed unconditionally,
+            // `to` readable or not. This asymmetry is the thing under test.
+            want_velocity.apply(velocity::velocity_deltas(from, b, v, 1, WINDOW));
+        }
+        want_balances.flush();
+        want_exposure.flush();
+        want_velocity.flush();
+
+        // Balances: every holder, not just a spot check.
+        assert_eq!(balances.holders(), want_balances.holders());
+        assert_eq!(balances.top(usize::MAX), want_balances.top(usize::MAX));
+        assert!(balances.holders() > 0, "fixture must move some balance");
+
+        // Exposure: entry count and the full row set for every address in the fixture.
+        assert_eq!(exposure_v.entries(), want_exposure.entries());
+        for addr in [ALICE, BOB, MIXER] {
+            assert_eq!(
+                exposure_v.exposure(addr),
+                want_exposure.exposure(addr),
+                "exposure rows differ for {addr}"
+            );
+        }
+        assert!(exposure_v.entries() > 0, "fixture must build exposure");
+
+        // Velocity: bucket count and every flagged bucket.
+        assert_eq!(
+            velocity_v.entries(),
+            want_velocity.entries(),
+            "velocity bucket count differs from the replay - a missing bucket means the rebuild \
+             skipped a sender the live loop would have counted"
+        );
+        assert_eq!(
+            velocity_v.flags(1),
+            want_velocity.flags(1),
+            "velocity flags differ from the replay"
+        );
+        assert!(
+            velocity_v.entries() > 1,
+            "fixture must land in more than one window bucket"
+        );
+
+        // The unreadable-`to` row, asserted directly rather than only against the reference, so both
+        // sides of the guard's asymmetry are pinned even if the reference above drifts.
+        let carol = velocity_v
+            .flags(1)
+            .into_iter()
+            .find(|f| f.address == CAROL)
+            .expect("velocity must count outbound volume for a transfer with an unreadable `to`");
+        assert_eq!(
+            carol.volume, 500,
+            "velocity must count the whole outbound value of an unreadable-`to` transfer"
+        );
+        assert!(
+            !balances.top(usize::MAX).iter().any(|(a, _)| a == CAROL),
+            "balances must not move value for a transfer with no readable counterparty"
+        );
+        assert!(
+            exposure_v.exposure(CAROL).is_empty(),
+            "exposure must not build a row for a transfer with no readable counterparty"
+        );
+    }
+
+    /// #294 itself: the restart rebuild must walk the hot store **once**.
+    ///
+    /// The correctness test above is deliberately blind to this - it passes just as well against the
+    /// three-scan version, because three scans produce the same answer, only slower. This is the test
+    /// that goes red if the scans come back.
+    ///
+    /// `recent_by_table` is the expensive shape: it iterates the entire entity table and JSON-parses
+    /// every row merely to compare its `table` field, so one call per view per transfer table is
+    /// `3 × tables` full walks on a path that runs at every restart and every crash recovery.
+    #[test]
+    fn the_restart_rebuild_walks_the_hot_store_once() {
+        let src = include_str!("indexer.rs");
+        let start = src
+            .find("\nfn rebuild_views(")
+            .expect("rebuild_views must exist - if it was renamed, retarget this test");
+        // The function ends where the next item at column 0 begins.
+        let body = &src[start + 1..];
+        let end = body.find("\n}\n").expect("unterminated rebuild_views") + 2;
+        let body = &body[..end];
+
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect();
+        let count = |needle: &str| code.iter().filter(|l| l.contains(needle)).count();
+
+        // Split so these needles never match the line they are written on.
+        let scans = count(concat!("hot_rows_by", "_table()"));
+        let per_table = count(concat!("recent_by", "_table("));
+
+        assert_eq!(
+            scans, 1,
+            "the restart rebuild must walk the hot store exactly once and fan the rows out to all \
+             three views; found {scans} unbounded scan(s) in rebuild_views"
+        );
+        assert_eq!(
+            per_table, 0,
+            "rebuild_views must not use recent_by_table: it re-walks and re-parses the whole entity \
+             table per call, which is what issue #294 removed; found {per_table} call(s)"
         );
     }
 }
