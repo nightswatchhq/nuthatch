@@ -13,8 +13,15 @@
 # ceiling. Sequential by construction: concurrent runs contend for CPU and page cache, which measures
 # the harness rather than nuthatch.
 #
+# Run it bare. This forwards only BIN, PORT and REPORT, so every scenario knob falls through to the
+# harness's defaults - and those defaults are exactly what the CI gate enforces (#395). Export one
+# and you are re-baselining against a scenario nobody enforces, which is how a ceiling ends up
+# *below* the healthy enforced figure: peak RSS here is size-sensitive, so a smaller run yields a
+# smaller band, and the suggested ceiling comes off the top of whatever band you measured.
+#
 # Usage: scripts/multinest-rss-spread.sh [runs]        (default 7)
-# Env:   BIN, plus every scenario knob multinest-footprint.sh takes.
+# Env:   BIN, plus every scenario knob multinest-footprint.sh takes - but read the paragraph above
+#        before setting one.
 set -euo pipefail
 
 RUNS="${1:-7}"

@@ -60,19 +60,35 @@
 # They are nested, never reconciled: REGRESSION_MB << MAX_RSS_MB, and a breach of each says something
 # different. Unset REGRESSION_MB to report without enforcing it.
 #
+# ## The defaults are the enforced scenario, deliberately (#395)
+#
+# Every scenario knob below defaults to exactly what the `per-cursor RAM budget` CI job runs, so
+# `bash .github/workflows/multinest-footprint.sh` with no environment measures the thing the gate
+# enforces - and so does `scripts/multinest-rss-spread.sh`, which forwards only BIN/PORT/RPC_PORT and
+# otherwise inherits these. That is not tidiness. The defaults were once a fifth of the enforced
+# scenario (8 nests / 641 blocks / ~51k rows against 20 / 1201 / 240k), on a metric this same file
+# shows to be size-sensitive, so anyone following the FAIL message's own re-baseline instruction
+# measured a smaller run and derived a ceiling *below* the healthy enforced figure. Applying it
+# reddens the gate permanently; distrusting it makes the tooling folklore. A knob whose default is a
+# scenario nobody enforces is a trap with a comment on it, so the knobs stay and the defaults moved.
+#
+# CI therefore sets only what is genuinely the job's own: the enforcement policy (REGRESSION_MB) and
+# where to write the artifact (REPORT). It must not restate the scenario - two copies drift, and the
+# copy in the harness is the one every human and every tool reads.
+#
 # Env: BIN (target/release/nuthatch), MAX_RSS_MB (2048), REGRESSION_MB (unset = report only),
-#      NESTS (8), LOGS_PER_BLOCK (10), BACKFILL_BLOCKS (600), INITIAL_TIP (20000),
-#      FINAL_TIP (20240), TIP_STEP (8), PORT (8290), RPC_PORT (8547), REPORT (JSON report path).
+#      NESTS (20), LOGS_PER_BLOCK (10), BACKFILL_BLOCKS (1000), INITIAL_TIP (20000),
+#      FINAL_TIP (20200), TIP_STEP (8), PORT (8290), RPC_PORT (8547), REPORT (JSON report path).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
 MAX_RSS_MB="${MAX_RSS_MB:-2048}"
 REGRESSION_MB="${REGRESSION_MB:-}"
-NESTS="${NESTS:-8}"
+NESTS="${NESTS:-20}"
 LOGS_PER_BLOCK="${LOGS_PER_BLOCK:-10}"
-BACKFILL_BLOCKS="${BACKFILL_BLOCKS:-600}"
+BACKFILL_BLOCKS="${BACKFILL_BLOCKS:-1000}"
 INITIAL_TIP="${INITIAL_TIP:-20000}"
-FINAL_TIP="${FINAL_TIP:-20240}"
+FINAL_TIP="${FINAL_TIP:-20200}"
 TIP_STEP="${TIP_STEP:-8}"
 PORT="${PORT:-8290}"
 RPC_PORT="${RPC_PORT:-8547}"
@@ -323,8 +339,10 @@ if [ -n "$REGRESSION_MB" ] && [ "$PEAK_MB" -gt "$REGRESSION_MB" ]; then
   echo "      understanding while the cause is one PR wide rather than a year of drift."
   echo
   echo "      If the increase is understood and wanted, re-baseline: run the scenario enough times to"
-  echo "      re-establish the noise band (scripts/multinest-rss-spread.sh) and move the ceiling with"
-  echo "      the new numbers written down. Do not just nudge it up until it passes."
+  echo "      re-establish the noise band (scripts/multinest-rss-spread.sh, bare - its defaults are"
+  echo "      this scenario) and move the ceiling with the new numbers written down. Run it on the"
+  echo "      hardware that enforces the ceiling: a band from a different box is not this box's band."
+  echo "      Do not just nudge it up until it passes."
   exit 1
 fi
 
