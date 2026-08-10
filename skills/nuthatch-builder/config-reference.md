@@ -1,8 +1,10 @@
 # nuthatch config reference
 
-The three config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in `src/config.rs`,
-`src/semantic.rs`, and `src/roost.rs`; a CI check fails the build if this file names a key those
-structs don't have.
+The three config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in
+`src/config.rs`, `src/semantic.rs`, and `src/runtime.rs` (mount config moved there when RFC-0032
+retired the roost). CI checks this **both ways**: the build fails if this file names a key those
+structs don't have, and equally if a struct grows a key this file never mentions — a shipped key an
+agent cannot see is one it will never use.
 
 ## `nuthatch.toml` - a nest
 
@@ -85,7 +87,16 @@ value = "Amount, base units (6 decimals). Use value_dec for arithmetic."
 [table.usdc__transfer.footguns]   # DERIVED - do not edit
 reserved_words = ["from", "to"]   # double-quote these in SQL
 big_ints = ["value"]              # use value_dec for SUM/AVG/compare
+overflows_dec = []                # the subset of big_ints too wide for DECIMAL(38,0) - their
+                                  # _dec companion is NULL past 38 digits, so exact-decimal math
+                                  # silently drops those rows. CAST(col AS DOUBLE) instead.
+
+[view.top_recipients]             # optional (RFC-0018): what an authored view means
+description = "The 100 addresses receiving the most USDC, by total value."
 ```
+
+`[view.*]` is rendered into `/schema` and the MCP exactly like a table, so an agent sees the
+derivation by name and what it means rather than rediscovering it from SQL.
 
 ## `mounts.toml` - many nests, one runtime (RFC-0012; multichain RFC-0021; renamed in 2.0)
 
@@ -107,6 +118,8 @@ chain = "mainnet"             # the one chain (one cursor)
 chain_id = 1
 rpc_urls = ["https://…"]
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048)
+default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say
+                              # (default "default"). Opaque - nuthatch refcounts it, nothing more.
 
 [[mounts]]                    # what is mounted; `nests = [...]` is gone
 alias = "usdc"

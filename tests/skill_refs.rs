@@ -136,3 +136,196 @@ fn metric_names_in(text: &str) -> BTreeSet<String> {
     }
     out
 }
+
+// ── The other direction: a real key the reference never mentions (#353) ──────────────
+//
+// The two tests above catch a *hallucinated* flag or metric. They cannot catch the opposite —
+// something real that the skill never names — and that is the failure that actually shipped:
+// `[[templates]].events` (#347) was a live config key documented nowhere a user or an agent reads,
+// with CI green throughout. An agent that cannot see a key will not use it, and will confidently
+// write config without it.
+//
+// Enumeration is the hard half. This scans `src/*.rs` for `pub` fields on structs that derive
+// `Deserialize`, which is the honest definition of "config": a key is authored config exactly when
+// it can be deserialised from a file. That rule drops server-assembled types (`Coverage` is
+// `Serialize`-only) without needing an entry in the opt-out list, and it fails loudly when a field
+// is added — the property the issue asked for, and the reason this scans source rather than
+// serialising a populated `Config`, where a `skip_serializing_if` field would vanish and the test
+// would pass for the wrong reason.
+
+/// Config surfaces the reference claims to mirror, and the structs that matter in each.
+/// `None` means every `Deserialize` struct in the file.
+const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
+    ("src/config.rs", None),
+    ("src/semantic.rs", None),
+    // Mount config lives here since RFC-0032 retired the roost; the rest of runtime.rs is not config.
+    (
+        "src/runtime.rs",
+        Some(&["Mount", "MountTable", "RuntimeMeta", "ChainEndpoint"]),
+    ),
+];
+
+/// Keys that are deliberately absent from the reference, each with the reason it is absent.
+///
+/// This list is the useful artifact, not an escape hatch: a key belongs here only when *not*
+/// documenting it is the decision. It is checked for staleness below, so an entry that becomes
+/// documented fails rather than lingering.
+const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
+    ("Config.extract", "RFC-0014 traces/state: parses, then refused at startup - no extraction source exists yet (#277)"),
+    ("Extract.blocks", "field of `[extract]`, same reason"),
+    ("Extract.state", "field of `[extract]`, same reason"),
+    ("Extract.traces", "field of `[extract]`, same reason"),
+    ("Extract.selectors", "field of `[extract]`, same reason"),
+    ("Extract.unbounded", "field of `[extract]`, same reason"),
+    ("Config.calls", "RFC-0023 tier 3: parses but is never executed (#268)"),
+];
+
+#[test]
+fn config_reference_names_every_real_config_key() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let reference = std::fs::read_to_string(skill_dir().join("config-reference.md"))
+        .expect("config-reference.md must be committed");
+
+    let excused: std::collections::BTreeMap<&str, &str> =
+        KNOWN_UNDOCUMENTED.iter().copied().collect();
+    let mut undocumented = Vec::new();
+    let mut all_keys = Vec::new();
+
+    for (file, only) in CONFIG_SOURCES {
+        let src = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| {
+            panic!("{file} is named as a config surface but cannot be read: {e}")
+        });
+        for (struct_name, key) in config_keys_in(&src, *only) {
+            let qualified = format!("{struct_name}.{key}");
+            all_keys.push(qualified.clone());
+            if names_key(&reference, &key) || excused.contains_key(qualified.as_str()) {
+                continue;
+            }
+            undocumented.push(format!(
+                "{qualified} (from {file}) — a real config key the reference never names"
+            ));
+        }
+    }
+
+    assert!(
+        all_keys.len() > 40,
+        "the scanner found only {} keys, so it has stopped matching the structs - fix the scan \
+         rather than the assertion, or this gate silently passes forever",
+        all_keys.len()
+    );
+    assert!(
+        undocumented.is_empty(),
+        "config keys exist that `config-reference.md` never mentions. An agent cannot use a key it \
+         cannot see. Document each, or add it to KNOWN_UNDOCUMENTED with the reason:\n{}",
+        undocumented.join("\n")
+    );
+
+    // An opt-out that is no longer needed must not linger: it would hide the next real gap.
+    let stale: Vec<&str> = KNOWN_UNDOCUMENTED
+        .iter()
+        .filter(|(k, _)| {
+            let key = k.split_once('.').map(|(_, f)| f).unwrap_or(k);
+            all_keys.iter().any(|q| q == k) && names_key(&reference, key)
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these keys are documented now, so remove them from KNOWN_UNDOCUMENTED: {stale:?}"
+    );
+}
+
+/// Whether the reference documents `key` **as a TOML key** — an assignment (`key = …`) or a table
+/// header component (`[key]`, `[[key]]`, `[table.key.columns]`).
+///
+/// Deliberately not a plain token search. Mentioning a key in prose or in a trailing `#` comment is
+/// not documenting it, and a looser match makes the gate self-defeating: while writing this, the
+/// comment "the subset of big_ints too wide for DECIMAL(38,0)" was enough to keep the test green
+/// after `big_ints = […]` had been deleted outright. A drift gate that passes when the thing it
+/// guards is gone is the exact failure #353 is about.
+fn names_key(reference: &str, key: &str) -> bool {
+    reference.lines().any(|line| {
+        let line = line.trim();
+        // `key = value`, ignoring anything after a `#` comment marker.
+        let code = line.split('#').next().unwrap_or("").trim();
+        if let Some((lhs, _)) = code.split_once('=') {
+            if lhs.trim() == key {
+                return true;
+            }
+        }
+        // `[key]` / `[[key]]` / `[table.key.columns]` - dot-separated header components.
+        if let Some(header) = code
+            .strip_prefix("[[")
+            .and_then(|h| h.strip_suffix("]]"))
+            .or_else(|| code.strip_prefix('[').and_then(|h| h.strip_suffix(']')))
+        {
+            return header.split('.').any(|part| part == key);
+        }
+        false
+    })
+}
+
+/// `pub` field names on `Deserialize` structs, honouring `#[serde(rename = "…")]` — the TOML key is
+/// what the reference has to name, not the Rust identifier.
+fn config_keys_in(src: &str, only: Option<&[&str]>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (idx, _) in src.match_indices("pub struct ") {
+        let head = &src[..idx];
+        // The derive list is the attribute block immediately above the struct.
+        let derives = head.rsplit("#[derive(").next().unwrap_or("");
+        let derives = derives.split(")]").next().unwrap_or("");
+        let after = &src[idx + "pub struct ".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if let Some(list) = only {
+            if !list.contains(&name.as_str()) {
+                continue;
+            }
+        }
+        // Only a struct that can be deserialised is authored config; the rest is output.
+        if !derives.contains("Deserialize") || !head.trim_end().ends_with("]") {
+            continue;
+        }
+        let Some(body_start) = after.find('{') else {
+            continue;
+        };
+        let Some(body_len) = after[body_start..].find("\n}") else {
+            continue;
+        };
+        let body = &after[body_start..body_start + body_len];
+
+        for (fidx, _) in body.match_indices("pub ") {
+            let rest = &body[fidx + 4..];
+            let field: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // A field, not `pub fn` / `pub struct` nested in a doc comment.
+            if field.is_empty() || !rest[field.len()..].starts_with(':') {
+                continue;
+            }
+            // `#[serde(rename = "x")]` on the lines just above renames the TOML key.
+            let preceding = &body[..fidx];
+            let key = preceding
+                .rsplit("#[serde(")
+                .next()
+                .and_then(|attr| attr.split(")]").next())
+                .filter(|attr| !attr.contains('\n') || attr.matches('\n').count() < 3)
+                .and_then(|attr| attr.split("rename = \"").nth(1))
+                .and_then(|r| r.split('"').next())
+                .map(|s| s.to_string())
+                .filter(|_| {
+                    // Only if that attribute block is the one attached to this field.
+                    preceding
+                        .rsplit("#[serde(")
+                        .next()
+                        .is_some_and(|a| !a.contains("pub "))
+                })
+                .unwrap_or_else(|| field.clone());
+            out.push((name.clone(), key));
+        }
+    }
+    out
+}
