@@ -13,9 +13,11 @@
 # so a change in p99 is a change in nuthatch and not in somebody's rate limiter.
 #
 # The ceilings were chosen by breaking the code on purpose and seeing what the numbers did, rather
-# than by leaving "plenty of headroom" - see the justification in ci.yml. Short version: a linear scan
-# in place of the B-tree seek moves p50 from ~1µs to 24µs, so p50 gates at 15µs; p99 over 256 samples
-# is preemption-dominated on a shared runner, so it is a loose backstop at 150µs and nothing more.
+# than by leaving "plenty of headroom" - see the justification in ci.yml. Short version, all measured
+# on the `ubuntu-latest` runner that enforces this: a linear scan in place of the B-tree seek moves
+# p50 from 0.59-0.82µs to 18.15µs, so p50 gates at 8µs - 9.8x above the worst baseline and 2.3x below
+# a full scan. p99 over 256 samples is preemption-dominated on a shared runner, so it is a loose
+# backstop at 150µs and nothing more.
 #
 # Env: BIN (default target/release/nuthatch), MAX_P50_US, MAX_P99_US (see ci.yml for the values CI
 #      uses and why), PORT (default 8289), RPC_PORT (default 8546), OUT (default
@@ -23,7 +25,7 @@
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
-MAX_P50_US="${MAX_P50_US:-15}"
+MAX_P50_US="${MAX_P50_US:-8}"
 MAX_P99_US="${MAX_P99_US:-150}"
 PORT="${PORT:-8289}"
 RPC_PORT="${RPC_PORT:-8546}"

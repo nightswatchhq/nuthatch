@@ -301,25 +301,40 @@ jobs:
         # *under* those ceilings. The gate printed "OK: within the point-read ceilings" with a full
         # scan in the read path, which is the decoration this project keeps shipping by accident.
         #
-        # Measured on a 32-core/62 GB Linux box at commit 850844a, 8,004 rows indexed, 256 hot:
+        # **Both sides are measured on `ubuntu-latest`, the runner that enforces this.** An earlier
+        # revision set 15µs from a 32-core/62 GB dev box (baseline p50 0.66-1.59µs, scan mutation
+        # 24.17µs) and hedged that a "4x-slower CI box" would still be caught. That was an assumption
+        # about hardware nobody had tested, so it was tested - PR #381, since closed, put the linear
+        # scan back and let this job judge it. On `ubuntu-latest` (4 cores, 16 GB), 8,004 rows
+        # indexed, 256 hot:
         #
-        #   baseline, 15 runs   p50 0.66-1.59µs   p99 0.77-1.88µs
-        #   scan mutation       p50 24.17µs       p99 53.79µs
+        #   baseline, 3 runs   p50 0.59-0.82µs   p99 0.70-1.00µs   p99.9 0.77-3.96µs
+        #   scan mutation      p50 18.15µs       p99 34.45µs       p99.9 49.78µs
         #
-        # p50 is the gate that discriminates: 15µs sits 9.4x above the worst baseline run and 1.6x
-        # below the mutation, and because a slower runner scales baseline and regression together, a
-        # ~15x separation survives hardware variation that a 4x-slower CI box would introduce.
+        # Two things that only measuring could tell us, both of which moved the ceiling:
         #
-        # p99 is a catastrophe backstop only, deliberately loose at 80x baseline. p99 over 256 samples
-        # is the 4th-worst read, so on a shared 2-vCPU runner it is preemption-dominated - one local
-        # run saw p99.9 hit 33.6µs while p99 stayed at 1.88µs. Gating tightly on it would buy a flaky
-        # check, and a flaky gate gets waved through until it means nothing.
+        # 1. The runner is **not** slower than the dev box - it is at or below its baseline range.
+        #    256 rows sit in page cache and there is no parallelism for 32 cores to exploit.
+        # 2. The mutation is *faster* here (18.15µs vs 24.17µs), so the regression and the baseline do
+        #    **not** scale together the way the old comment assumed. 15µs left only a 1.21x margin
+        #    below the regression on the box that enforces it, against the 1.61x claimed.
         #
-        # These are this box's numbers. Re-baseline from the job's own uploaded reports once a few
-        # runs exist on the runner that actually enforces them - see #283.
+        # So p50 gates at **8µs**, which is better on both sides at once: 9.8x above the worst
+        # observed baseline, and 2.3x below a full scan. It tolerates a runner ~10x slower than any
+        # yet seen before it would false-positive, and p50 is the robust statistic here - the observed
+        # p50 spread is 1.4x while p99.9 spans 5.1x.
+        #
+        # Known sensitivity boundary: this discriminates a *full* linear scan over a 256-row hot
+        # store. A regression that lands under 8µs - a partial scan, or a scan when the hot store is
+        # much smaller - passes. The gate is a floor on gross regressions, not a microbenchmark.
+        #
+        # p99 stays a catastrophe backstop at 150µs, deliberately loose at ~150x baseline. p99 over
+        # 256 samples is the 4th-worst read, so on a shared runner it is preemption-dominated.
+        # p99.9 is reported and gated on by nothing: it swung 0.77-3.96µs at fixed commits, and a
+        # flaky gate gets waved through until it means nothing.
         env:
           BIN: bin/nuthatch
-          MAX_P50_US: "15"
+          MAX_P50_US: "8"
           MAX_P99_US: "150"
           OUT: point-read-report.json
         run: |

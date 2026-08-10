@@ -158,31 +158,37 @@ limiter. The report uploads as an artifact on every run, including a failing one
 ### Where the ceilings come from
 
 They were chosen by **breaking the read path on purpose and measuring what happened**, not by leaving
-generous headroom. Replacing the B-tree seek in `Store::get_entity` with a linear scan - the exact
-regression the gate claims to catch - gives, on a 32-core/62 GB Linux box over the 256-row hot store:
+generous headroom - and both halves were measured on `ubuntu-latest`, the runner that enforces the
+gate, rather than on a dev box. Replacing the B-tree seek in `Store::get_entity` with a linear scan -
+the exact regression the gate claims to catch - gives, over the 256-row hot store:
 
-| | p50 | p99 |
-|---|---|---|
-| baseline, 15 runs at one commit | 0.66 - 1.59µs | 0.77 - 1.88µs |
-| linear scan in place of the seek | 24.2 - 43.2µs | 53.8 - 84.0µs |
+| | p50 | p99 | p99.9 |
+|---|---|---|---|
+| baseline, 3 CI runs | 0.59 - 0.82µs | 0.70 - 1.00µs | 0.77 - 3.96µs |
+| linear scan in place of the seek | 18.15µs | 34.45µs | 49.78µs |
 
 The first version of this gate used 200µs/2,000µs. The scan sits comfortably under both, so that gate
 reported `OK: within the point-read ceilings` **with a full scan in the read path** - a number, not a
 gate.
 
-- **p50, ceiling 15µs, is the gate that discriminates.** It sits 9.4x above the worst baseline run and
-  below every mutated run. Because a slower runner scales baseline and regression together, a ~15x
-  separation survives the hardware difference between this box and a CI runner in a way that an
-  absolute number tuned to one machine would not.
-- **p99, ceiling 150µs, is a catastrophe backstop and nothing more** - 80x baseline, and it did *not*
-  catch the scan mutation (84µs < 150µs). p99 over 256 samples is the 4th-worst read, so on a shared
-  2-vCPU runner it is preemption-dominated; one local baseline run saw p99.9 reach 33.6µs while p99
-  stayed at 1.88µs. A tight p99 here buys a flaky check, and a flaky gate gets waved through until it
-  means nothing.
+A second version used 15µs, measured the same way but on a 32-core/62 GB dev box (baseline 0.66-1.59µs,
+scan 24.2µs), on the assumption that a slower CI runner would scale baseline and regression together.
+Measuring both on the runner showed that it does not: the runner's baseline is *at or below* the dev
+box's, while its mutation is *faster* (18.15µs against 24.2µs), leaving 15µs only a 1.21x margin below
+a real regression rather than the 1.61x claimed.
 
-What this gate does **not** catch: anything under roughly a 10x regression, cold-start latency (it
-measures warm - see `warm_cache` in the report), point-reads against the Postgres backend, and
-anything about the sealed/DuckDB path. And the ceilings are this box's numbers - re-baseline them from
-the job's own uploaded reports once runs exist on the runner that actually enforces them.
+- **p50, ceiling 8µs, is the gate that discriminates.** 9.8x above the worst observed baseline and 2.3x
+  below a full scan - better on both sides at once than 15µs was on either. p50 is the robust
+  statistic here: its observed spread is 1.4x where p99.9's is 5.1x.
+- **p99, ceiling 150µs, is a catastrophe backstop and nothing more** - ~150x baseline, and it does
+  *not* catch the scan mutation (34.45µs < 150µs). p99 over 256 samples is the 4th-worst read, so on a
+  shared runner it is preemption-dominated. A tight p99 here buys a flaky check, and a flaky gate gets
+  waved through until it means nothing.
+- **p99.9 is reported and gated on by nothing.** It swung 0.77-3.96µs at fixed commits.
+
+What this gate does **not** catch: a regression landing under 8µs - a partial scan, or a scan when the
+hot store is much smaller than 256 rows - cold-start latency (it measures warm, see `warm_cache` in the
+report), point-reads against the Postgres backend, and anything about the sealed/DuckDB path. It is a
+floor on gross regressions, not a microbenchmark.
 
 Baseline: `docs/bench/point-read.json`.
