@@ -271,3 +271,44 @@ jobs:
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/footprint.sh
+
+  point-read:
+    name: point-read latency
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: nuthatch-release
+          path: bin
+      - name: measure entity point-read p50/p99
+        # Issue #283. CLAUDE.md names entity point-read p50/p99 as a CI artifact whose regressions
+        # fail the build; `nuthatch bench query` measured it and nothing compared the number to
+        # anything, so a scan where there was a seek could land unnoticed.
+        #
+        # Same hermetic shape as `footprint` above - the chain is served by footprint-rpc.py and the
+        # nest is written inline - so there is no secret, no third party, and a fork PR can satisfy
+        # it. Every run reads exactly 8004 rows.
+        #
+        # The ceilings are structural, not tight: a redb point-read out of page cache is single-digit
+        # microseconds, and a shared runner's noise is not worth failing a build over. 200µs/2000µs
+        # catches the shape of regression that matters (a per-read open, a lock, a scan) and will be
+        # tightened once the committed reports say what the across-release spread actually is.
+        env:
+          BIN: bin/nuthatch
+          MAX_P50_US: "200"
+          MAX_P99_US: "2000"
+          OUT: point-read-report.json
+        run: |
+          chmod +x bin/nuthatch
+          bash .github/workflows/point-read.sh
+      - name: upload report
+        # Always: a run that failed the gate is the report you most want to read.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: point-read-report
+          path: point-read-report.json
+          retention-days: 30
