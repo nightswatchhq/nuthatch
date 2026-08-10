@@ -540,11 +540,14 @@ that does not reproduce its own decode registry is refused. Compliance packs are
 (`nuthatch pack keygen|build|verify`). Licensed `MIT OR Apache-2.0`; `cargo-deny` runs in CI.
 
 **Per-caller rate limiting is the gateway's job, not nuthatch's.** The node cannot rate-limit by caller
-because it has no concept of caller identity - there are no accounts, no API keys, and no authn
-surface inside the binary. The query guards above bound the cost of a single request and the total
-concurrent load; they say nothing about how many requests a given caller may make. An in-process
-request-per-second counter with no identity would be worse than nothing: the first caller to hit it
-blocks every other caller, converting an accidental poller into a service-wide outage.
+because nothing it serves carries a caller identity: the data routes (`/entities`, `/sql`, `/explain`
+and the rest) have no accounts and no API keys. `NUTHATCH_ADMIN_TOKEN` above is not a counter-example
+- it is one shared operator credential gating `/_admin`, not a per-caller identity you could meter,
+and every caller who has it is the same caller as far as the node can tell. The query guards above
+bound the cost of a single request and the total concurrent load; they say nothing about how many
+requests a given caller may make. An in-process request-per-second counter with no identity would be
+worse than nothing: the first caller to hit it blocks every other caller, converting an accidental
+poller into a service-wide outage.
 
 For operators who need per-caller rate limiting, the right place is the reverse proxy in front:
 
