@@ -410,6 +410,71 @@ impl MountTable {
         dir.join(DATA_DIR).join(nid)
     }
 
+    /// Is `dir` an identity-keyed dataset - `<root>/data/<nid>` - rather than an authored nest?
+    ///
+    /// The path *is* the identity under RFC-0032 §4, which is why this can be answered from the shape
+    /// alone; `migrate`'s `adoptable` already enumerates datasets by the same rule (a 64-character
+    /// directory name under [`DATA_DIR`]).
+    ///
+    /// The distinction matters because a dataset's bytes are hashed into the NID its mount record
+    /// claims. Anything that rewrites a file in here - even a derived one - silently invalidates that
+    /// claim, so the layer that regenerates artifacts for *authored* nests must not run here.
+    pub fn is_identity_keyed(dir: &Path) -> bool {
+        let looks_like_nid = |n: &std::ffi::OsStr| {
+            let n = n.to_string_lossy();
+            n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit())
+        };
+        dir.file_name().is_some_and(looks_like_nid)
+            && dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|p| p == DATA_DIR)
+    }
+
+    /// Datasets whose inputs no longer hash to the identity their mount record claims (RFC-0032 §3).
+    ///
+    /// Content addressing is only worth anything if somebody checks it. Before this, nothing did: the
+    /// runtime resolved `data/<nid>` straight out of the mount record and never recomputed it, so
+    /// editing a file under a mounted dataset left the same directory, the same data, no re-index -
+    /// and a record whose `nid` was simply false. Every mechanism keyed on that value (sharing,
+    /// refcounting, `prune`, adoption) was then reasoning from a stale identity.
+    ///
+    /// `migrate`'s `nid_of` has always refused a nest whose inputs no longer reproduce its packed
+    /// manifest. This is the same check on the serving path, where it was missing.
+    ///
+    /// **Reported per dataset, not per mount.** Two tenants sharing one drifted dataset is one fault,
+    /// not two - and the canonical mount is the one that indexes it.
+    ///
+    /// Un-migrated nests (`nests/<alias>`, no `nid` in the record) are skipped: they claim no
+    /// identity, so there is nothing to contradict.
+    pub fn identity_drift(&self, dir: &Path) -> Vec<IdentityDrift> {
+        let mut out = Vec::new();
+        for ds in self.datasets(dir) {
+            let Some(claimed) = ds.nid.clone() else {
+                continue;
+            };
+            match crate::blob::nest_nid(&ds.dir) {
+                Ok(actual) if actual == claimed => {}
+                Ok(actual) => out.push(IdentityDrift {
+                    alias: ds.canonical().to_string(),
+                    dir: ds.dir.clone(),
+                    claimed,
+                    actual: Some(actual),
+                }),
+                // Unreadable inputs are a different fault and `Config::load` reports it with a better
+                // message a moment later. Recording it here as "cannot be verified" keeps this
+                // function total, and a dataset we cannot hash is not one we should claim is intact.
+                Err(_) => out.push(IdentityDrift {
+                    alias: ds.canonical().to_string(),
+                    dir: ds.dir.clone(),
+                    claimed,
+                    actual: None,
+                }),
+            }
+        }
+        out
+    }
+
     /// The distinct **datasets** this runtime mounts, each with every alias serving it (RFC-0032 §4).
     ///
     /// This is the function that makes sharing real. Two aliases naming one nest identity are one
@@ -574,6 +639,46 @@ impl Dataset {
     }
 }
 
+/// A mounted dataset whose inputs no longer hash to the identity its mount record claims.
+///
+/// See [`MountTable::identity_drift`]. `actual` is `None` when the inputs could not be hashed at all,
+/// which is a different fault with the same consequence: the claimed identity is unverified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityDrift {
+    /// The canonical mount serving this dataset - the one that indexes it.
+    pub alias: String,
+    /// The dataset directory, which is `data/<claimed>` by construction.
+    pub dir: PathBuf,
+    /// What the mount record says this dataset is.
+    pub claimed: String,
+    /// What its inputs actually hash to, or `None` if they could not be hashed.
+    pub actual: Option<String>,
+}
+
+impl std::fmt::Display for IdentityDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.actual {
+            Some(actual) => write!(
+                f,
+                "'{}' claims identity {} but its inputs hash to {} - the dataset at {} has been \
+                 edited in place, so its mount record is describing a nest that no longer exists",
+                self.alias,
+                &self.claimed[..12.min(self.claimed.len())],
+                &actual[..12.min(actual.len())],
+                self.dir.display()
+            ),
+            None => write!(
+                f,
+                "'{}' claims identity {} and its inputs at {} could not be hashed, so that claim is \
+                 unverified",
+                self.alias,
+                &self.claimed[..12.min(self.claimed.len())],
+                self.dir.display()
+            ),
+        }
+    }
+}
+
 /// A chain's cursor unit (RFC-0021): the endpoint (RPC) plus the mounted nests that follow that chain.
 /// Each becomes one isolated cursor - the single-cursor law, held per chain.
 #[derive(Debug)]
@@ -645,6 +750,21 @@ pub async fn dev(
     // identity share one store and one place in the cursor; only the canonical one indexes, and the
     // rest become extra routes onto it further down.
     let datasets = mounts.datasets(&dir);
+
+    // RFC-0032 §3: does each dataset still hash to the identity its mount record claims? Nothing
+    // checked this before, so a dataset edited in place kept its data, kept its directory, and left
+    // the record describing a nest that no longer existed - while sharing, refcounting and `prune`
+    // all went on keying off that value.
+    //
+    // **A warning, not a refusal, and deliberately so.** There is currently no supported flow for
+    // editing a nest inside a runtime, which makes editing in place the only flow an operator has.
+    // Refusing to start would take away the only route they have and would break a runtime that was
+    // serving correctly a moment earlier. Once an edit-and-adopt path exists this should become a
+    // refusal on the mount path; until then, the operator needs to *know*, not to be locked out.
+    for d in mounts.identity_drift(&dir) {
+        tracing::warn!("identity drift: {d}");
+    }
+
     let multi_tenant = mounts.is_multi_tenant();
     let mut mounted = Vec::with_capacity(datasets.len());
     for ds in &datasets {
@@ -1560,6 +1680,153 @@ mod tests {
 
     fn aliases(ds: &Dataset) -> Vec<String> {
         ds.mounts.iter().map(|m| m.alias.clone()).collect()
+    }
+
+    /// Build a real, hashable nest under `data/<nid>` and a `mounts.toml` claiming that identity.
+    /// Returns the NID it genuinely hashes to.
+    fn migrated_nest(root: &Path, alias: &str) -> String {
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"{alias}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                 rpc_urls = []\n\n[[contracts]]\nalias = \"t\"\n\
+                 address = \"0x0000000000000000000000000000000000000001\"\nabi = \"abi.json\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(staging.join("abi.json"), "[]").unwrap();
+
+        let nid = crate::blob::nest_nid(&staging).expect("a minimal nest must be hashable");
+        let dest = MountTable::data_dir(root, &nid);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::rename(&staging, &dest).unwrap();
+
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n\
+                 [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                 [[mounts]]\ntenant = \"default\"\nalias = \"{alias}\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+        nid
+    }
+
+    /// The guard that stops `dev` rewriting a dataset's derived artifacts, which used to move the NID
+    /// its own mount record claims - so a runtime started twice, with no operator action between the
+    /// starts, reported drift on the second. See the call site in `indexer.rs`.
+    ///
+    /// Both directions matter: an authored nest **must** still be refreshable, or a hand-written
+    /// `nuthatch.toml` silently never gets a schema (issue #241 item 2).
+    #[test]
+    fn only_identity_keyed_dataset_dirs_are_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let nid = "aa11".repeat(16);
+
+        assert!(
+            MountTable::is_identity_keyed(&MountTable::data_dir(root, &nid)),
+            "data/<64-hex> is a dataset and must not be rewritten"
+        );
+        assert!(
+            !MountTable::is_identity_keyed(&MountTable::nest_dir(root, "usdc")),
+            "an authored nest under nests/ must still be refreshable"
+        );
+        assert!(
+            !MountTable::is_identity_keyed(root),
+            "a bare project directory (`nuthatch dev` on one nest) must still be refreshable"
+        );
+        // Shape checks: the right length in the wrong place, and the right place with a non-NID name.
+        assert!(!MountTable::is_identity_keyed(
+            &root.join("elsewhere").join(&nid)
+        ));
+        assert!(!MountTable::is_identity_keyed(
+            &root.join(DATA_DIR).join("usdc")
+        ));
+        assert!(!MountTable::is_identity_keyed(
+            &root.join(DATA_DIR).join("zz11".repeat(16))
+        ));
+    }
+
+    /// The baseline: an untouched dataset must report nothing, or the check is just noise.
+    #[test]
+    fn an_intact_dataset_reports_no_identity_drift() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        migrated_nest(root, "usdc");
+
+        let mounts = MountTable::load(root).unwrap();
+        assert_eq!(
+            mounts.identity_drift(root),
+            vec![],
+            "a dataset whose inputs are untouched must not be reported as drifted"
+        );
+    }
+
+    /// RFC-0032 §3, and the defect this check exists for: `mount()` resolves `data/<nid>` straight
+    /// out of the mount record and never recomputes it, so editing a file under a mounted dataset
+    /// left the record claiming an identity that no longer described anything. Content addressing
+    /// nobody verifies is not content addressing.
+    ///
+    /// **This test fails against the build before `identity_drift` existed** - nothing anywhere in
+    /// `runtime.rs` called `nest_nid`, `nid_of` or `verify_registry_reproduces`.
+    #[test]
+    fn editing_a_mounted_dataset_in_place_is_caught_as_identity_drift() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let claimed = migrated_nest(root, "usdc");
+
+        // Exactly the operator action that used to go unnoticed: edit an input under the live dataset.
+        let views = MountTable::data_dir(root, &claimed).join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(views.join("10-example.sql"), "-- added after mounting\n").unwrap();
+
+        let mounts = MountTable::load(root).unwrap();
+        let drift = mounts.identity_drift(root);
+
+        assert_eq!(
+            drift.len(),
+            1,
+            "the edited dataset must be reported: {drift:?}"
+        );
+        // The canonical mount is displayed tenant-qualified (`<tenant>/<alias>`), which is what an
+        // operator sees in the routes, so assert on containment rather than pinning the shape here.
+        assert!(
+            drift[0].alias.contains("usdc"),
+            "the report must name the mount: {}",
+            drift[0].alias
+        );
+        assert_eq!(drift[0].claimed, claimed);
+        assert_eq!(
+            drift[0].actual.as_deref().map(|a| a != claimed),
+            Some(true),
+            "the edit must change what the inputs hash to, or the fixture is not exercising anything"
+        );
+        // The message has to name both identities, or an operator cannot tell what happened.
+        let msg = drift[0].to_string();
+        assert!(
+            msg.contains(&claimed[..12]),
+            "message must name the claim: {msg}"
+        );
+    }
+
+    /// A pre-2.0 nest under `nests/<alias>` claims no identity, so there is nothing to contradict.
+    /// Reporting it would make `migrate`'s supported half-migrated state look like a fault.
+    #[test]
+    fn an_un_migrated_nest_claims_no_identity_so_cannot_drift() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, "arbitrum-one", 42161, "arbitrum-one", 42161);
+
+        let mounts = MountTable::load(root).unwrap();
+        assert_eq!(
+            mounts.identity_drift(root),
+            vec![],
+            "a nest with no nid in its record must not be reported as drifted"
+        );
     }
 
     /// The unmount path rewrites `mounts.toml` from **route keys**, which are tenant-qualified in a
