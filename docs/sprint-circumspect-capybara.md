@@ -93,7 +93,7 @@ the whole ranking untrustworthy:
 
 | # | Issue | Why here |
 |---|-------|----------|
-| 1 | [#364](https://github.com/nightswatchhq/nuthatch/issues/364) Early cutoff never runs in the runtime | Slice 5 shipped the mechanism and `Manifest::data_identity()` has **exactly one non-test caller**: `migrate.rs:292` (the other six call sites are all tests in `src/blob.rs`). So adoption happens during the one-time layout migration and the runtime's mount path never consults it. The published "~0.14s adoption on a 428 MB nest" figure is `nuthatch migrate`, not a live edit. |
+| 1 | [#364](https://github.com/nightswatchhq/nuthatch/issues/364) Early cutoff never runs in the runtime | Slice 5 shipped the mechanism and `Manifest::data_identity()` **had exactly one non-test caller**: `migrate.rs:292` (the other six call sites were all tests in `src/blob.rs`). So adoption happened during the one-time layout migration and the runtime's mount path never consulted it. The published "~0.14s adoption on a 428 MB nest" figure is `nuthatch migrate`, not a live edit. |
 | 2 | [#365](https://github.com/nightswatchhq/nuthatch/issues/365) DDoS: a flat request ceiling, or the gateway's job | Closed by a **decision**, not necessarily by code. A single expensive query is well bounded (50k rows, 2 concurrent, 16 KB, timeout); request *volume* is not bounded at all, and the answer currently lives in a log line. Either answer is defensible; having neither written down is not. |
 | 3 | [#366](https://github.com/nightswatchhq/nuthatch/issues/366) SQL everywhere: test the case for replacing redb | We answered a different question. RFC-0035 §5 measured whether DuckDB can `ATTACH` SQLite (it cannot, re-confirmed against `duckdb` 1.10505.0) and then treated the topic as settled. The one-mental-model argument is untouched by that measurement, and **#296 is partly an artefact of using a key-value store** - a connection drawn nowhere. Sequenced behind #283. |
 
@@ -121,7 +121,10 @@ takes a minute. Do these while something else compiles.
 **1 is where the real build is.** It was item 2 until 2026-08-07, when the item above it (#357,
 cross-nest grafting reuse) was re-parked: its acceptance criterion could not fail, because two nests
 with identical derivation keys necessarily share a data identity and therefore become one dataset
-under this very item. See the #357 thread.
+under this very item. See the #357 thread. Done on 2026-08-10: `adoptable` in `src/runtime.rs` now
+consults `data_identity()` on the mount path and `migrate.rs` no longer does, so the rationale above
+is why this was ranked first, not a description of the tree. Past tense throughout that row for
+exactly that reason.
 
 **4 and 5 are one piece of work.** Prove the budget on a dense nest, then gate what you proved. Doing
 them apart means measuring twice. **These are the items that must not slip**, per the recorded tension
