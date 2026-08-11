@@ -292,8 +292,14 @@ nests = ["usdc", "arb"]
 ///
 /// This is Guard 1 of the two guards named in issue #400. Guard 2 (the credential check on an
 /// enabled surface) is covered by `the_lifecycle_routes_demand_the_admin_token_before_they_act`.
+///
+/// The test includes a premise block that confirms the routes DO exist when `admin_enabled: true`.
+/// Without that block the test passes trivially against a `lifecycle_routes` that always returns
+/// an empty router, which is exactly the false-green condition the sprint theme names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
+    const TOKEN: &str = "gate-test-token";
+
     let roost_dir = tempfile::tempdir().unwrap();
     let usdc_dir = roost_dir.path().join("nests/usdc");
     let arb_dir = roost_dir.path().join("nests/arb");
@@ -301,6 +307,25 @@ async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
     std::fs::create_dir_all(&arb_dir).unwrap();
     let (handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
+
+    // Premise: with admin_enabled: true the routes exist - an unauthenticated call gets 401, not
+    // 404. This rules out a `lifecycle_routes` that always returns Router::new().
+    let enabled_routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let (premise_status, _) = call(
+        &enabled_routes,
+        "POST",
+        "/_admin/nests",
+        None,
+        Some(r#"{"name":"premise"}"#),
+    )
+    .await;
+    assert_ne!(
+        premise_status,
+        axum::http::StatusCode::NOT_FOUND,
+        "premise: POST /_admin/nests must exist (non-404) when admin is enabled - \
+         if this fails the gate test is testing nothing"
+    );
+    drop(enabled_routes);
 
     // admin_enabled: false - this is the posture for any localhost bind without an explicit token
     // or any remote bind that omits --admin-token.
