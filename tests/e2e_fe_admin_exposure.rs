@@ -154,10 +154,17 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
 /// Stated as the property rather than as the body string, so it survives a reworded fallback: with the
 /// admin surface disabled, every `/_admin*` path must be **indistinguishable** from a path that was
 /// never registered. Re-mounting the routes unconditionally turns this red on the body.
+///
+/// **The token is set, not removed, and that is the whole point.** `admin_enabled` is
+/// `!no_admin && (is_localhost || token_set)`, so on this suite's off-localhost `127.0.0.2` bind an
+/// *unset* token disables the surface on its own - and a test that unset it passed just as well against
+/// a `serve_role` that ignored `--no-admin` altogether (verified: replacing `admin_enabled(!args.admin,
+/// ..)` with `admin_enabled(false, ..)` left this suite 3/3 green). Configuring a token leaves the flag
+/// as the only thing that can still turn the surface off, which is the claim in this test's name.
 #[tokio::test]
 async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
     let _env = ENV.lock().await;
-    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+    std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest(dir.path());
@@ -184,6 +191,9 @@ async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
     let admin_slash = probe("/_admin/").await;
     let admin_events = probe("/_admin/events").await;
     task.abort();
+    // Cleared before the assertions, like the sibling test: a panic must not leave the variable set
+    // for whatever runs next.
+    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
 
     assert_eq!(
         unrouted.0, 404,
