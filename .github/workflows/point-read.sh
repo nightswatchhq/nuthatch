@@ -303,7 +303,29 @@ if [ -n "$BASELINE" ] && [ -f "$OUT" ]; then
     echo "      and say so in docs/benchmarks.md. Do not edit the hardware field."
     exit 1
   fi
-  echo "OK: baseline $BASELINE was measured on this machine ('$base_hw')"
+
+  # **And the same scenario, not just the same machine** (issue #424). The hardware check alone would
+  # have stayed green through this very change: swapping the fixture from a 256-row settled tip to a
+  # 12,800-row hot store leaves the runner spec untouched, so the committed baseline would go on
+  # describing a scenario nobody measures any more while still passing its own provenance check. The
+  # label is generated from the scenario parameters, so it drifts exactly when the scenario does.
+  label_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("label") or "")' "$1"; }
+  base_label="$(label_of "$BASELINE")"
+  this_label="$(label_of "$OUT")"
+  if [ "$base_label" != "$this_label" ]; then
+    echo "FAIL: $BASELINE was measured on a different scenario."
+    echo "      baseline: $base_label"
+    echo "      this run: $this_label"
+    echo "      A baseline for a scenario the gate no longer runs is not a baseline. The label is"
+    echo "      derived from the fixture, so this fires when the fixture moves and the committed"
+    echo "      artifact does not - which is how #424's 256-row hot store outlived the design call"
+    echo "      that asked for a realistic one."
+    echo "      Fix: refresh docs/bench/point-read.json from a green run of this job, and re-measure"
+    echo "      the ceiling - a different hot-store size moves the baseline and the regression by"
+    echo "      different factors."
+    exit 1
+  fi
+  echo "OK: baseline $BASELINE matches this machine ('$base_hw') and this scenario"
 fi
 
 if [ "$status" -ne 0 ]; then
