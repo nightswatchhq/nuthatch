@@ -137,13 +137,19 @@ Sentio, which is also going over RPC.
 | # | Slice | Acceptance |
 |---|---|---|
 | 1 | ~~Split the `[extract]` refusal~~ **Done** (PR #360). Turned out to be free: `Extract::enabled()` was already exactly `traces \|\| state`, so adding `blocks` beside them without touching it gives the right behaviour. | Met |
-| 2 | `blocks` table from the existing header batch, with the row-identity convention of §4.2 | **Built, NOT met.** Blocks 0-2,000 yields exactly 2,001 rows and reads via `nuthatch sql`. The stated criterion - 100,001 rows over OBIB's range - **has never been achieved**, so this slice is open. See §5.1 |
+| 2 | `blocks` table from the existing header batch, with the row-identity convention of §4.2 | **Met** (2026-08-10). 100,001 rows over OBIB's range 0-100,000, contiguous and distinct, verified from the store rather than the timing line: `docs/bench/obib-case3.json`. Took a fourth defect to get there - see §5.1 |
 | 3 | `transactions` table from full bodies, inside `scope_check`, with a loud pre-backfill estimate | OBIB case 4 range yields exactly **1,696,641** rows (inclusive end block) and **493,181** unique senders / **315,861** unique recipients, matching Envio's published aggregates |
 | 4 | Round-trip economics: measure, then decide whether receipts and a concurrent header fan-out are worth it | A number, and a decision recorded either way |
 
-### 5.1 Why slice 2's criterion is unmet, and what is left
+### 5.1 What slice 2's criterion cost, and the defect only it could find
 
-Not a design problem, as far as the evidence goes: a paced full-range run.
+**Met 2026-08-10:** 100,001 rows over blocks 0-100,000, in a 162-minute paced run against a free
+public endpoint.
+
+This section used to open *"not a design problem, as far as the evidence goes: a paced full-range
+run."* That was half right, and the half it got wrong is the useful part. Pacing was necessary and
+the run is what produced the rows - but a paced run on its own would still have returned **100,000**,
+because a fourth defect sat underneath the first three where only a row count could reach it.
 
 Case 3 is **100,001 individual `eth_getBlockByNumber` calls** by definition. Proving it consumed a
 meaningful share of the project's provider quota - the full range was run six times in twenty minutes
@@ -151,7 +157,7 @@ while debugging, each attempt issuing tens of thousands of requests before faili
 classifier fix below it was *splitting batches under a rate limit* and multiplying them further. The
 provider noticed and said so.
 
-Three defects were found and fixed on the way, all of which would have surfaced identically on a
+Four defects were found and fixed on the way. The first three would have surfaced identically on a
 2,000-block range that completes in 1.2 seconds:
 
 1. **Per-item 429s inside an HTTP 200 batch were invisible** to the failure classifier, reported as
@@ -162,10 +168,30 @@ Three defects were found and fixed on the way, all of which would have surfaced 
 3. **The window ceiling was sized on logs**, so a zero-log range grew widest and demanded the most
    headers - backwards for this workload (§4.4's prediction, arriving early).
 
-**The lesson, recorded because it is the expensive one:** validate a per-block workload on a *small*
-range first. The mechanism is identical at 2,000 blocks and at 100,001; only the bill differs. This
+The fourth did not, and could not:
+
+4. **The genesis row was ingested and then unreadable.** `Store::sealed_through()` returns 0 both when
+   the watermark sits at block 0 and when nothing has ever been sealed, and the hot/cold union filtered
+   hot rows to `block_number > sealed_through` - so with nothing sealed, block 0 belonged to neither
+   half. The store held it the whole time; the read path could not return it. Any nest indexed from
+   block 0 loses exactly its first block until something seals.
+
+   **Why a small range would not have caught this one.** It only manifests while nothing has sealed, so
+   a `--seal-direct` validation run reads back the correct count and looks clean - the row comes from
+   cold, where the watermark filter does not apply. Case 3 ran without seal-direct, which is the only
+   reason the hole was exposed. A short unsealed run from block 0 would have shown it; a short sealed
+   one would have hidden it just as thoroughly as a long one.
+
+**Two lessons, recorded because they were the expensive ones.** First: validate a per-block workload on
+a *small* range. The mechanism is identical at 2,000 blocks and at 100,001; only the bill differs. This
 RFC predicted "expect the first measurement to be bad and to be informative" and was right about both,
 but the informative part cost far more than it needed to.
+
+Second, and the one that generalises past this RFC: **count from the store, never from the harness.**
+The bench line reported `events: 100001` - the number ingested - while `nuthatch sql` reported 100,000.
+Both were accurate about different things, and a benchmark that only reports timing and its own
+throughput counter cannot tell them apart. This is the concrete argument for #306's rule that record
+counts must match OBIB's published totals exactly.
 
 ## 6. Non-goals
 
@@ -178,7 +204,9 @@ but the informative part cost far more than it needed to.
 
 ## 7. Status
 
-Draft, **slice 1 done and slice 2 built but unverified** (PR #360). Written after reading the code rather than before: §3's coupling table is measured, and it is
+Draft, **slices 1 and 2 done and verified** (PR #360, then #421 for the row count and the genesis
+fix). Slice 3 (`transactions`, OBIB case 4) is unstarted: `[extract]` parses `blocks` only, and
+`transactions = true` has no implementation behind it. Written after reading the code rather than before: §3's coupling table is measured, and it is
 what makes this a slice instead of a refactor. Slice 1 is a precondition, not a feature - it should not
 ship on its own, because a config key that parses and produces nothing is the defect issue #262 spent a
 release being.
