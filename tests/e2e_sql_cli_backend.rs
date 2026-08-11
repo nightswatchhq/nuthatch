@@ -52,8 +52,13 @@ async fn serving_instance() -> Instance {
     Instance { url, hits }
 }
 
-/// Run `nuthatch sql <query> --dir <dir> --url <url>` and return its stdout+stderr.
-async fn run_sql(dir: &Path, url: &str, query: &str) -> String {
+/// Run `nuthatch sql <query> --dir <dir> --url <url>` and return its exit status with its
+/// stdout+stderr.
+///
+/// The status is returned rather than dropped because without it every assertion here is a *negative*
+/// one - "the instance was not asked" - and a backend that was chosen and then failed outright
+/// satisfies those just as well as one that worked. See `a_store_that_is_here_and_unheld_is_queried_locally`.
+async fn run_sql(dir: &Path, url: &str, query: &str) -> (std::process::ExitStatus, String) {
     let (dir, url, query) = (dir.to_path_buf(), url.to_string(), query.to_string());
     tokio::task::spawn_blocking(move || {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
@@ -62,10 +67,13 @@ async fn run_sql(dir: &Path, url: &str, query: &str) -> String {
             .args(["--url", &url])
             .output()
             .expect("running the nuthatch binary");
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        (
+            out.status,
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
         )
     })
     .await
@@ -81,8 +89,12 @@ async fn no_local_store_asks_the_running_instance_and_creates_nothing() {
     let instance = serving_instance().await;
     let empty = tempfile::tempdir().unwrap();
 
-    let output = run_sql(empty.path(), &instance.url, "SELECT 1 AS n").await;
+    let (status, output) = run_sql(empty.path(), &instance.url, "SELECT 1 AS n").await;
 
+    assert!(
+        status.success(),
+        "the fallback must answer, not merely be chosen, got:\n{output}"
+    );
     assert!(
         output.contains(MARKER),
         "with no store here the answer must come from the running instance, got:\n{output}"
@@ -109,8 +121,18 @@ async fn a_store_that_is_here_and_unheld_is_queried_locally() {
     // A real store, closed again so nothing holds redb's lock.
     drop(nuthatch::store::Store::open(&db).unwrap());
 
-    let output = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
 
+    // Positive first. The two assertions below are both negative, and a local backend that was chosen
+    // and then died satisfies each of them - so on their own they prove *not-HTTP*, not *local*.
+    assert!(
+        status.success(),
+        "the local backend must answer, not merely be chosen, got:\n{output}"
+    );
+    assert!(
+        output.contains('n') && output.contains('1'),
+        "and the answer must be the query's, got:\n{output}"
+    );
     assert!(
         !output.contains(MARKER),
         "a store that is present and free is queried locally, got:\n{output}"
@@ -132,8 +154,12 @@ async fn a_store_held_by_another_process_falls_back_to_the_instance() {
     // Held open for the duration, exactly as `nuthatch dev` holds it.
     let _held = nuthatch::store::Store::open(&db).unwrap();
 
-    let output = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
 
+    assert!(
+        status.success(),
+        "the fallback must answer, not merely be chosen, got:\n{output}"
+    );
     assert!(
         output.contains(MARKER),
         "a store held by `dev` falls back to the running instance, got:\n{output}"

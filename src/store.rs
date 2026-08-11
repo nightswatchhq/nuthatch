@@ -312,6 +312,17 @@ impl Store {
     /// Absent and locked both come back as errors, which is what the routing callers want: neither is
     /// a store they may read here. Callers that need to tell the two apart should check the path -
     /// [`store_holds_rows`] is the read-only variant for "does it hold anything".
+    ///
+    /// **This still writes.** It goes through [`Store::from_db`], which commits a write txn, so
+    /// opening a store you only mean to read rewrites its bytes. The locking is *not* the reason: redb
+    /// takes the exclusive `flock` in `FileBackend::new`, i.e. inside `Database::open`, before any
+    /// transaction exists - so a store held by `dev` is refused here whether or not a write txn
+    /// follows, and the fallback to HTTP does not depend on this. The reason is table materialisation:
+    /// a store written by an older nuthatch that lacks one of the four tables would otherwise fail on
+    /// the first read rather than at open. The price is that every `nuthatch sql` against a free store
+    /// rewrites the file **at the same length with different bytes**, which anything caching on
+    /// `(mtime, len)` will read as unchanged. Making this read-only is a real question and a separate
+    /// one - see #471.
     pub fn open_existing(path: &Path) -> Result<Store> {
         let db = Database::open(path)
             .with_context(|| format!("failed to open an existing redb at {}", path.display()))?;
@@ -319,7 +330,8 @@ impl Store {
     }
 
     fn from_db(db: Database) -> Result<Store> {
-        // Materialise both tables up front so read txns never hit a missing table.
+        // Materialise all four tables up front so read txns never hit a missing one. This is the only
+        // reason the write txn is here - see [`Store::open_existing`] for what it costs a reader.
         let wtx = db.begin_write()?;
         {
             wtx.open_table(ENTITIES)?;
