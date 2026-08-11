@@ -180,6 +180,17 @@ async fn workers_are_listed_with_their_budgets() {
 
 /// With a token configured, **every** state-changing and state-revealing route demands it. A control
 /// plane that authenticated writes but leaked the fleet's shape would still be a disclosure.
+///
+/// The list below is every non-`/health` entry in [`routes`], method by method. It previously covered
+/// five of the ten, omitting `resolve`, `pin` and **both halves of the secrets API** - the most
+/// sensitive routes on the surface - which left the guard on `put_secret` deletable with the suite
+/// green (#292).
+///
+/// Completing the list closed that hole; it did not close the *class*, because the list still had to
+/// be kept in step by hand. The guard is now one `route_layer` over the whole API instead of four
+/// lines in each of ten handlers, so a new route is guarded by being registered rather than by being
+/// remembered here. What this test now pins is that the layer is mounted and that both credential
+/// forms reach it - a weaker obligation, deliberately, because the strong one moved into the router.
 #[tokio::test]
 async fn every_route_demands_the_token_when_one_is_set() {
     let Some((app, _)) = fixture(Some("s3cret")) else {
@@ -191,6 +202,21 @@ async fn every_route_demands_the_token_when_one_is_set() {
         ("GET", "/plan", None),
         ("DELETE", "/nests/x", None),
         ("POST", "/nests", Some(r#"{"name":"a","chain":"c"}"#)),
+        ("GET", "/nests/x/resolve", None),
+        // Bodies have to deserialize: axum runs the `Json` extractor before the handler, so a
+        // malformed one would 422 and the assertion would pass for the wrong reason.
+        (
+            "PUT",
+            "/nests/x/pin",
+            Some(r#"{"version":"1","bundle_hash":"0xabc"}"#),
+        ),
+        ("GET", "/nests/x/secrets", None),
+        (
+            "PUT",
+            "/nests/x/secrets",
+            Some(r#"{"key":"k","value":"v"}"#),
+        ),
+        ("DELETE", "/nests/x/secrets/k", None),
     ] {
         let (s, _) = call(&app, method, uri, body).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {uri} was unguarded");
@@ -213,6 +239,44 @@ async fn every_route_demands_the_token_when_one_is_set() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// A credential that satisfies the guard reaches a handler that takes a **body**, and the body
+/// survives the trip.
+///
+/// The guard used to run inside each handler, after axum had already extracted the request. It is now
+/// a layer in front of them, which is the one thing that shape can get wrong: a middleware that
+/// buffers or consumes the body would leave every write endpoint failing to deserialize while the
+/// 401 assertions above stayed green. Proven on a secrets write, which is both the most sensitive
+/// route and the one whose guard #292 found deletable.
+#[tokio::test]
+async fn an_authorised_write_reaches_its_handler_with_its_body_intact() {
+    let Some((app, cp)) = fixture(Some("s3cret")) else {
+        return;
+    };
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/nests?token=s3cret",
+        Some(r#"{"name":"n1","chain":"mainnet"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = call(
+        &app,
+        "PUT",
+        "/nests/n1/secrets?token=s3cret",
+        Some(r#"{"key":"RPC_URL","value":"https://example.invalid"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the guard swallowed the body: {body}");
+    assert_eq!(body["key"], "RPC_URL");
+    assert_eq!(
+        cp.secret_keys("n1").unwrap(),
+        vec!["RPC_URL".to_string()],
+        "a 200 that stored nothing would be the same bug one layer down"
+    );
 }
 
 /// A wrong token is refused - the guard compares, it does not merely check for presence.
