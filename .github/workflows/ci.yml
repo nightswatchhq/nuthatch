@@ -328,14 +328,23 @@ jobs:
         # store. A regression that lands under 8µs - a partial scan, or a scan when the hot store is
         # much smaller - passes. The gate is a floor on gross regressions, not a microbenchmark.
         #
-        # p99 stays a catastrophe backstop at 150µs, deliberately loose at ~150x baseline. p99 over
-        # 256 samples is the 4th-worst read, so on a shared runner it is preemption-dominated.
-        # p99.9 is reported and gated on by nothing: it swung 0.77-3.96µs at fixed commits, and a
-        # flaky gate gets waved through until it means nothing.
+        # **The tail is tracked, not gated - CI enforces p50 and nothing else.** Gating loosely and
+        # tracking precisely are two different jobs, and one ceiling cannot do both: a p99 tight
+        # enough to catch a regression flakes on a shared VM, and one loose enough to survive catches
+        # nothing. This job used to carry a 150µs p99 backstop at ~150x baseline on the second horn of
+        # that, and the measurement above settles it - the linear-scan mutation p50 catches at 18.15µs
+        # only moved **p99 to 34.45µs**, so that backstop did not fire on the single regression this
+        # gate exists to catch. A ceiling that passes the known break is not a weak gate; it is
+        # decoration that reads as coverage, and a required check that reads as coverage is worse than
+        # no check because it stops anyone looking.
+        #
+        # So p99 and p99.9 go in the artifact and the step summary, and nothing compares them to a
+        # number. They are what we read across releases. p99 over 256 samples is the 4th-worst read
+        # and preemption-dominated here; p99.9 swung 0.77-3.96µs at fixed commits. Neither is a
+        # property of the read path on this hardware, which is exactly why neither can fail a build.
         env:
           BIN: bin/nuthatch
           MAX_P50_US: "8"
-          MAX_P99_US: "150"
           OUT: point-read-report.json
         run: |
           chmod +x bin/nuthatch

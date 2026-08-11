@@ -892,12 +892,27 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
             .unwrap_or_default();
         // Only tip rows strictly past the watermark (COR-1 disjointness; belt-and-braces with the
         // atomic seal→prune, which already keeps sealed rows out of hot).
+        //
+        // ...but only where cold actually covers something. `sealed_through` is 0 both when the
+        // watermark sits at block 0 AND when nothing has ever been sealed (`Store::sealed_through`
+        // documents that fallback), and `> 0` drops the genesis row in the second case: block 0
+        // lands in neither half of the union and is unreadable. Invisible on any chain indexed from
+        // a later block, fatal on one indexed from 0 - OBIB case 3 wants 100,001 rows for blocks
+        // 0-100,000 and we returned 100,000, starting at block 1.
+        //
+        // Gating on this table's own sealed segments is what makes it exact rather than a special
+        // case for zero: a row is withheld from hot only when cold genuinely holds that range, so
+        // disjointness is preserved in every other state (and a table that has never sealed - newly
+        // added, or lagging its siblings - stops being silently truncated at its first block too).
         let hot_rows: Vec<&Value> = hot
             .get(table)
             .map(Vec::as_slice)
             .unwrap_or(&[])
             .iter()
-            .filter(|r| r.get("block_number").and_then(Value::as_u64).unwrap_or(0) > sealed_through)
+            .filter(|r| {
+                sealed_files.is_empty()
+                    || r.get("block_number").and_then(Value::as_u64).unwrap_or(0) > sealed_through
+            })
             .collect();
 
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
@@ -1540,6 +1555,82 @@ template="pool"
         )
         .unwrap();
         assert_eq!(out.rows[0]["n"], Value::from(2u64));
+    }
+
+    #[test]
+    fn sql_serves_the_genesis_row_when_nothing_has_been_sealed() {
+        // Regression for OBIB case 3. `sealed_through` reads 0 both when the watermark sits at block
+        // 0 and when nothing has ever been sealed, so filtering hot to `block_number > sealed_through`
+        // silently dropped block 0 - it belonged to neither half of the union. A backfill of blocks
+        // 0-100,000 returned 100,000 rows starting at block 1 against an expected 100,001.
+        let dir = tempfile::tempdir().unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__b".into(),
+            vec![
+                serde_json::json!({"table":"t__b","block_number":0,"log_index":0,"x":"genesis"}),
+                serde_json::json!({"table":"t__b","block_number":1,"log_index":0,"x":"one"}),
+                serde_json::json!({"table":"t__b","block_number":2,"log_index":0,"x":"two"}),
+            ],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT count(*) AS n, min(block_number) AS lo FROM "t__b""#,
+            guard,
+            &hot,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows[0]["n"],
+            Value::from(3u64),
+            "block 0 must be readable when nothing has been sealed"
+        );
+        assert_eq!(
+            out.rows[0]["lo"],
+            Value::from(0u64),
+            "the served range must start at genesis, not block 1"
+        );
+    }
+
+    #[test]
+    fn sql_excludes_hot_genesis_once_cold_actually_holds_it() {
+        // The other side of the fix: serving block 0 from hot must not reopen the double-count it
+        // sits beside. Once genesis IS sealed, the hot copy has to stay excluded - and the watermark
+        // is still 0, so only the presence of a real segment can tell the two states apart.
+        let dir = tempfile::tempdir().unwrap();
+        let cold =
+            vec![r#"{"table":"t__b","block_number":0,"log_index":0,"x":"genesis"}"#.to_string()];
+        crate::seal::seal_range(dir.path(), &cold, 0, 0).unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__b".into(),
+            vec![
+                serde_json::json!({"table":"t__b","block_number":0,"log_index":0,"x":"genesis"}),
+                serde_json::json!({"table":"t__b","block_number":1,"log_index":0,"x":"one"}),
+            ],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT count(*) AS n FROM "t__b""#,
+            guard,
+            &hot,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows[0]["n"],
+            Value::from(2u64),
+            "a sealed genesis row must not also be served from hot"
+        );
     }
 
     #[test]

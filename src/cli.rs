@@ -523,6 +523,18 @@ pub struct BackfillBenchArgs {
     /// still consumed in block order so segments are identical. Try 8-16 against your own node.
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
+
+    /// Keep the run's data at this path instead of a temp dir that is discarded.
+    ///
+    /// The bench normally measures throughput and throws the rows away, which is right for a timing
+    /// number and wrong for a benchmark whose criterion is a **row count** - OBIB case 3 asks for
+    /// 100,001 block records, and a harness that deletes them can never demonstrate one. Query the
+    /// result with `nuthatch sql --dir <that path>`.
+    ///
+    /// Every run clears this directory first, so the data left behind is the **last** run's. Refuses
+    /// a path holding a `nuthatch.toml`, since clearing a nest is never what was meant.
+    #[arg(long)]
+    pub keep: Option<String>,
 }
 
 #[derive(Args)]
