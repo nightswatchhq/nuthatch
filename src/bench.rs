@@ -168,6 +168,32 @@ fn total_ram_gb() -> Option<u64> {
     None
 }
 
+/// Resolve `--keep`, refusing the one path a caller is most likely to type by mistake.
+///
+/// Every run clears this directory before starting, so pointing it at the nest itself would delete
+/// `nuthatch.toml` and the indexed data it was aimed at - the worst outcome available from this
+/// flag. The check runs before the first run rather than on the way out, because the wipe is the
+/// first thing `one_run` does with the path.
+///
+/// Split out of `backfill` so it is *reachable*: inline, the only way to reach the guard was a full
+/// backfill against a live RPC, which is why it shipped on inspection alone. A guard nobody
+/// exercises is the argument this whole change is built on, so it does not get an exemption.
+fn resolve_keep(keep: &Option<String>) -> Result<Option<PathBuf>> {
+    let Some(p) = keep.as_ref().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if p.join(crate::config::CONFIG_FILE).exists() {
+        bail!(
+            "--keep {} is a nest directory (it holds {}), and every bench run clears its work dir \
+             before starting. Point --keep at a new or dedicated path, then query it with \
+             `nuthatch sql --dir <that path>`.",
+            p.display(),
+            crate::config::CONFIG_FILE
+        );
+    }
+    Ok(Some(p))
+}
+
 pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     if args.to < args.from {
         bail!("--to ({}) is before --from ({})", args.to, args.from);
@@ -249,6 +275,14 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         );
     }
 
+    let keep = resolve_keep(&args.keep)?;
+    if let Some(p) = keep.as_deref() {
+        println!(
+            "  --keep: writing run data to {} (last run survives)",
+            p.display()
+        );
+    }
+
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
         let r = one_run(
@@ -263,6 +297,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             args.seal_direct,
             args.concurrency,
             run,
+            keep.as_deref(),
         )
         .await?;
         println!(
@@ -602,10 +637,19 @@ async fn one_run(
     seal_direct: bool,
     concurrency: usize,
     run: usize,
+    keep: Option<&std::path::Path>,
 ) -> Result<Run> {
     let source = RpcClient::new(rpc_urls.to_vec())?;
-    // A throwaway work dir per run (redb and/or Parquet segments) - never the nest's own database.
-    let work = std::env::temp_dir().join(format!("nuthatch-bench-{}-{run}", std::process::id()));
+    // Normally a throwaway work dir per run (redb and/or Parquet segments) - never the nest's own
+    // database. `--keep` points it somewhere durable instead, because a case whose criterion is a
+    // ROW COUNT cannot be answered by a harness that deletes its rows: OBIB case 3 asks for 100,001
+    // block records, and until this existed the only way to produce them threw them away
+    // (RFC-0036 §5.1). Every run clears and rewrites the directory, so what survives is the last
+    // run's data - stated because a median over 3 runs and a row count from 1 are different things.
+    let work = match keep {
+        Some(p) => p.to_path_buf(),
+        None => std::env::temp_dir().join(format!("nuthatch-bench-{}-{run}", std::process::id())),
+    };
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
 
@@ -635,7 +679,10 @@ async fn one_run(
             )
             .await?
         }
-        // Pipelined seal-direct: concurrent fetch, in-order deterministic sealing.
+        // Pipelined seal-direct: concurrent fetch, in-order deterministic sealing. **This is the
+        // production seal-direct path** - `nuthatch dev` on a static nest reaches
+        // `backfill_direct_pipelined` regardless of concurrency; the branch above it selects on
+        // `factory.is_some()`. Benching `Direct` instead measures a path only the bench takes.
         BackfillPath::Pipelined => {
             crate::indexer::backfill_direct_pipelined(
                 &source,
@@ -652,7 +699,9 @@ async fn one_run(
             )
             .await?
         }
-        // Seal-direct: decode → Parquet, bypassing the hot store. Exactly the production path.
+        // Sequential seal-direct: decode → Parquet, bypassing the hot store. Reachable only from the
+        // bench (`backfill_direct` has no other non-test caller) - it is the sequential control for
+        // `Pipelined`, not what production runs.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
                 &source, registry, &work, addresses, topic0s, from, to, window,
@@ -668,7 +717,11 @@ async fn one_run(
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
     let peak_rss_mb = rss.stop();
-    let _ = std::fs::remove_dir_all(&work);
+    // Keep the data when asked. Without this the flag would create the directory, fill it, and then
+    // delete it — which is the whole defect it exists to fix, just relocated.
+    if keep.is_none() {
+        let _ = std::fs::remove_dir_all(&work);
+    }
 
     Ok(Run {
         events,
@@ -697,19 +750,46 @@ async fn hot_store_backfill(
     to: u64,
     window: u64,
 ) -> Result<u64> {
-    let store = Store::open(&dir.join("bench.redb"))?;
+    // `DB_FILE`, not a bench-specific name: with `--keep` this directory is meant to be opened by
+    // `nuthatch sql --dir <path>`, which looks for the standard store. A private filename would
+    // persist the data and still leave it unqueryable, which is the failure this flag exists to fix.
+    let store = Store::open(&dir.join(crate::config::DB_FILE))?;
     let mut events = 0u64;
     let mut next = from;
     while next <= to {
         let chunk_to = (next + window - 1).min(to);
-        let logs = source
-            .logs(addresses, topic0s, next, chunk_to)
-            .await
-            .with_context(|| format!("getLogs {next}..={chunk_to}"))?;
+        // Same rule as `indexer.rs`: an empty address AND topic filter means *every log on the
+        // chain*, not none. A blocks-only nest has neither, and no log could decode without them.
+        let logs = if addresses.is_empty() && topic0s.is_empty() {
+            Vec::new()
+        } else {
+            source
+                .logs(addresses, topic0s, next, chunk_to)
+                .await
+                .with_context(|| format!("getLogs {next}..={chunk_to}"))?
+        };
         let mut rows: Vec<_> = logs
             .iter()
             .filter_map(|log| registry.decode(log).ok().flatten())
             .collect();
+        // RFC-0036 §4.2, mirroring `indexer.rs`: a `blocks` nest must cover blocks that emitted
+        // nothing, so the rows are enumerated from the WINDOW, not from `logs`. Deriving them from
+        // logs is what produced "zero rows and a green run" - the exact failure the indexer's own
+        // comment warns about, which this harness reimplemented rather than shared.
+        if registry.blocks() {
+            let want: Vec<u64> = (next..=chunk_to).collect();
+            let headers = source.block_headers(&want).await?;
+            let mut block_rows: Vec<_> = want
+                .iter()
+                .filter_map(|b| {
+                    headers
+                        .get(b)
+                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                })
+                .collect();
+            block_rows.sort_by_key(|r| r.block_number);
+            rows.append(&mut block_rows);
+        }
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
         blocks.sort_unstable();
         blocks.dedup();
@@ -1122,6 +1202,43 @@ abi = "abis/c.json"
         );
         assert_eq!(json["reads"], 8);
         assert!(json["point_read_p50_us"].as_f64().unwrap() > 0.0);
+    }
+
+    /// **`--keep` wipes what it is given, so the guard is the only thing between a typo and a
+    /// deleted nest.** The refusal has to fire on the *presence of `nuthatch.toml`*, not on
+    /// anything about the run, because by the time a run has started the directory is already
+    /// cleared. Absent this test the guard was reachable only through a live-RPC backfill, so
+    /// nothing would have noticed it being weakened or dropped.
+    #[test]
+    fn keep_refuses_a_nest_directory_and_accepts_anything_else() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Not asked for: no path, and no error.
+        assert!(resolve_keep(&None).unwrap().is_none());
+
+        // A bare directory is fine - this is the intended use, a dedicated scratch path.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(
+            resolve_keep(&Some(scratch.to_string_lossy().into_owned())).unwrap(),
+            Some(scratch.clone())
+        );
+
+        // So is a path that does not exist yet: the run creates it.
+        let fresh = dir.path().join("not-yet");
+        assert_eq!(
+            resolve_keep(&Some(fresh.to_string_lossy().into_owned())).unwrap(),
+            Some(fresh)
+        );
+
+        // A directory holding a nuthatch.toml is refused, and the message says where to point
+        // instead - the one thing someone who has just hit this needs to know.
+        std::fs::write(scratch.join(crate::config::CONFIG_FILE), "[nest]\n").unwrap();
+        let err = resolve_keep(&Some(scratch.to_string_lossy().into_owned()))
+            .expect_err("--keep at a nest directory must be refused, not cleared")
+            .to_string();
+        assert!(err.contains("is a nest directory"), "{err}");
+        assert!(err.contains(crate::config::CONFIG_FILE), "{err}");
     }
 
     #[test]

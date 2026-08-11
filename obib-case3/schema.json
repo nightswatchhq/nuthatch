@@ -1,0 +1,90 @@
+{
+  "registry_hash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tables": [
+    {
+      "alias": "chain",
+      "columns": [
+        {
+          "indexed": false,
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32"
+        },
+        {
+          "indexed": false,
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32"
+        },
+        {
+          "indexed": false,
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address"
+        },
+        {
+          "indexed": false,
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "parent_hash",
+          "sol_type": "bytes32",
+          "storage": "fixed_bytes"
+        },
+        {
+          "indexed": false,
+          "name": "miner",
+          "sol_type": "address",
+          "storage": "address"
+        },
+        {
+          "indexed": false,
+          "name": "gas_used",
+          "sol_type": "uint64",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "gas_limit",
+          "sol_type": "uint64",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "base_fee_per_gas",
+          "sol_type": "uint64",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "size",
+          "sol_type": "uint64",
+          "storage": "u64"
+        },
+        {
+          "indexed": false,
+          "name": "transaction_count",
+          "sol_type": "uint64",
+          "storage": "u64"
+        }
+      ],
+      "kind": "block",
+      "table": "blocks"
+    }
+  ]
+}
