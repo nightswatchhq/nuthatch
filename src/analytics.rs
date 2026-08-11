@@ -2032,11 +2032,7 @@ template="pool"
         assert_eq!(d[0]["value_overflow"], Value::from(false));
         // And the non-declared columns the segments do carry are untouched.
         assert_eq!(d.len(), 2);
-        let f = query(
-            dir.path(),
-            r#"SELECT "from" FROM "t__transfer" LIMIT 1"#,
-        )
-        .unwrap();
+        let f = query(dir.path(), r#"SELECT "from" FROM "t__transfer" LIMIT 1"#).unwrap();
         assert_eq!(f[0]["from"], Value::from("0xa"));
     }
 
