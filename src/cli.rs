@@ -577,11 +577,12 @@ pub struct SqlArgs {
     /// an interactive REPL (`.tables`, `.schema <t>`, history; `.exit` to quit).
     pub query: Option<String>,
 
-    /// Nest directory (queried directly when no `nuthatch dev` holds the store).
+    /// Nest directory. Queried directly when it holds a store no `nuthatch dev` has open; never
+    /// created by the query, so a directory without one falls back to --url.
     #[arg(long, default_value = ".")]
     pub dir: String,
 
-    /// The running instance's API, used when the local store is locked by `nuthatch dev`.
+    /// The running instance's API, used when --dir holds no store or `nuthatch dev` has it open.
     #[arg(long, default_value = "http://127.0.0.1:8288")]
     pub url: String,
 
