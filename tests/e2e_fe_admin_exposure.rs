@@ -276,16 +276,21 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 ///   the table vanished from `/sql` entirely). Either way the failing statement never returns to the
 ///   caller, so the path it carries is not formatted into a response.
 /// - `analytics::run` opens a fresh in-memory connection per query, so views are defined and executed
-///   inside one call. There is no window in which a view binds and then fails at execution against a
-///   file that changed underneath it.
+///   inside one call. The window in which a view binds and then fails at execution against a file
+///   that changed underneath it is one call wide, not the lifetime of a connection, and something
+///   outside the process has to move the file to open it - nothing in-process removes a segment while
+///   serving (`seal::verify_and_quarantine` is a startup pass).
 ///
 /// So on the sealed-segment route `sanitize_sql_error` is defence-in-depth, not a live control - an
 /// assertion here would be green whether or not the redactor is wired in, which is the vacuous
-/// absence this comment exists to refuse. It is not dead code: the `allowed_directories` lockdown in
-/// `analytics::run` propagates through `?` carrying the absolute nest paths in the statement it
-/// failed on. But that route is not reachable on demand from a request, so the redaction remains
-/// covered by its unit tests in `serve.rs` alone. Anyone wanting the wiring pinned should take the
-/// lockdown path, not the segment path.
+/// absence this comment exists to refuse. No request-reachable route on the bundled DuckDB has been
+/// found that carries a path into it, which is why the coverage stays in `serve.rs`'s unit tests
+/// alone. If you want a named lever rather than a negative, the honest one is the one-call window in
+/// the third bullet above - not the `allowed_directories` lockdown, which an earlier revision of this
+/// paragraph offered: `SET` errors do not echo the failing statement, the option accepts nonexistent
+/// directories and empty lists so it barely fails at all, and
+/// `analytics::tests::the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read` already
+/// records that it does not enforce on this build.
 ///
 /// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
 /// it has teeth there: adding the nest directory to `nest_info` turns it red.
