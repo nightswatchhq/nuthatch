@@ -168,6 +168,32 @@ fn total_ram_gb() -> Option<u64> {
     None
 }
 
+/// Resolve `--keep`, refusing the one path a caller is most likely to type by mistake.
+///
+/// Every run clears this directory before starting, so pointing it at the nest itself would delete
+/// `nuthatch.toml` and the indexed data it was aimed at - the worst outcome available from this
+/// flag. The check runs before the first run rather than on the way out, because the wipe is the
+/// first thing `one_run` does with the path.
+///
+/// Split out of `backfill` so it is *reachable*: inline, the only way to reach the guard was a full
+/// backfill against a live RPC, which is why it shipped on inspection alone. A guard nobody
+/// exercises is the argument this whole change is built on, so it does not get an exemption.
+fn resolve_keep(keep: &Option<String>) -> Result<Option<PathBuf>> {
+    let Some(p) = keep.as_ref().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if p.join(crate::config::CONFIG_FILE).exists() {
+        bail!(
+            "--keep {} is a nest directory (it holds {}), and every bench run clears its work dir \
+             before starting. Point --keep at a new or dedicated path, then query it with \
+             `nuthatch sql --dir <that path>`.",
+            p.display(),
+            crate::config::CONFIG_FILE
+        );
+    }
+    Ok(Some(p))
+}
+
 pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     if args.to < args.from {
         bail!("--to ({}) is before --from ({})", args.to, args.from);
@@ -249,29 +275,13 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         );
     }
 
-    // `--keep` clears its directory on every run, so refuse the one path a caller is most likely to
-    // type by mistake: the nest itself, which would delete `nuthatch.toml` and the indexed data it
-    // was pointed at. Checked before the first run, not on the way out.
-    let keep: Option<std::path::PathBuf> = match &args.keep {
-        None => None,
-        Some(p) => {
-            let p = std::path::PathBuf::from(p);
-            if p.join(crate::config::CONFIG_FILE).exists() {
-                anyhow::bail!(
-                    "--keep {} is a nest directory (it holds {}), and every bench run clears its \
-                     work dir before starting. Point --keep at a new or dedicated path, then query \
-                     it with `nuthatch sql --dir <that path>`.",
-                    p.display(),
-                    crate::config::CONFIG_FILE
-                );
-            }
-            println!(
-                "  --keep: writing run data to {} (last run survives)",
-                p.display()
-            );
-            Some(p)
-        }
-    };
+    let keep = resolve_keep(&args.keep)?;
+    if let Some(p) = keep.as_deref() {
+        println!(
+            "  --keep: writing run data to {} (last run survives)",
+            p.display()
+        );
+    }
 
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
@@ -1140,6 +1150,43 @@ abi = "abis/c.json"
         );
         assert_eq!(json["reads"], 8);
         assert!(json["point_read_p50_us"].as_f64().unwrap() > 0.0);
+    }
+
+    /// **`--keep` wipes what it is given, so the guard is the only thing between a typo and a
+    /// deleted nest.** The refusal has to fire on the *presence of `nuthatch.toml`*, not on
+    /// anything about the run, because by the time a run has started the directory is already
+    /// cleared. Absent this test the guard was reachable only through a live-RPC backfill, so
+    /// nothing would have noticed it being weakened or dropped.
+    #[test]
+    fn keep_refuses_a_nest_directory_and_accepts_anything_else() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Not asked for: no path, and no error.
+        assert!(resolve_keep(&None).unwrap().is_none());
+
+        // A bare directory is fine - this is the intended use, a dedicated scratch path.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(
+            resolve_keep(&Some(scratch.to_string_lossy().into_owned())).unwrap(),
+            Some(scratch.clone())
+        );
+
+        // So is a path that does not exist yet: the run creates it.
+        let fresh = dir.path().join("not-yet");
+        assert_eq!(
+            resolve_keep(&Some(fresh.to_string_lossy().into_owned())).unwrap(),
+            Some(fresh)
+        );
+
+        // A directory holding a nuthatch.toml is refused, and the message says where to point
+        // instead - the one thing someone who has just hit this needs to know.
+        std::fs::write(scratch.join(crate::config::CONFIG_FILE), "[nest]\n").unwrap();
+        let err = resolve_keep(&Some(scratch.to_string_lossy().into_owned()))
+            .expect_err("--keep at a nest directory must be refused, not cleared")
+            .to_string();
+        assert!(err.contains("is a nest directory"), "{err}");
+        assert!(err.contains(crate::config::CONFIG_FILE), "{err}");
     }
 
     #[test]
