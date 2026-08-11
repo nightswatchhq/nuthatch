@@ -271,9 +271,10 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 ///   `analytics::define_views` before the DDL is assembled, with a `warn!`. No path is formatted, so
 ///   none can escape.
 /// - a sealed segment that is **present but unreadable** throws while `read_parquet` binds the view,
-///   and `define_views` swallows that DDL failure at `debug!`. What the caller receives is
-///   `Catalog Error: Table with name ... does not exist!` - no path, because the statement carrying
-///   the path never ran.
+///   and `define_views` catches that DDL failure, drops the segments that will not bind and rebuilds
+///   the view from what remains (#419/#430 - before that fix it swallowed the failure at `debug!` and
+///   the table vanished from `/sql` entirely). Either way the failing statement never returns to the
+///   caller, so the path it carries is not formatted into a response.
 /// - `analytics::run` opens a fresh in-memory connection per query, so views are defined and executed
 ///   inside one call. There is no window in which a view binds and then fails at execution against a
 ///   file that changed underneath it.
