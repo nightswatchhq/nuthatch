@@ -760,13 +760,13 @@ async fn hot_store_backfill(
         let chunk_to = (next + window - 1).min(to);
         // Same rule as `indexer.rs`: an empty address AND topic filter means *every log on the
         // chain*, not none. A blocks-only nest has neither, and no log could decode without them.
-        let logs = if addresses.is_empty() && topic0s.is_empty() {
-            Vec::new()
-        } else {
-            source
-                .logs(addresses, topic0s, next, chunk_to)
+        // The rule is now carried by `LogFilter` rather than restated here (#432).
+        let logs = match crate::source::LogFilter::new(addresses, topic0s) {
+            None => Vec::new(),
+            Some(filter) => source
+                .logs(&filter, next, chunk_to)
                 .await
-                .with_context(|| format!("getLogs {next}..={chunk_to}"))?
+                .with_context(|| format!("getLogs {next}..={chunk_to}"))?,
         };
         let mut rows: Vec<_> = logs
             .iter()

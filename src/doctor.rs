@@ -124,13 +124,28 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
     // --- getLogs width -------------------------------------------------------------------------
     // Doubling from a small span, over a range just behind the tip. Probing *at* the tip risks the
     // endpoint refusing for reorg reasons rather than width, which would misreport the cap.
+    //
+    // A topic0 no event can produce, for the no-address case. Without it this probe sends an empty
+    // address AND topic filter, which is not a width probe at all - it asks for *every log on the
+    // chain* over the span (#432), so the endpoint refuses on result count and `doctor` reports that
+    // as the provider's *width* cap. Filtering on a topic that matches nothing keeps the response
+    // empty at every span, so the loop measures the range limit it claims to measure.
+    const NO_MATCH_TOPIC0: &str =
+        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     let addrs: Vec<String> = address.map(|a| vec![a.to_string()]).unwrap_or_default();
     let mut max_window = None;
     let mut span = 10u64;
     while span <= 200_000 {
         let to = tip.saturating_sub(100);
         let from = to.saturating_sub(span - 1);
-        match rpc.logs(&addrs, &[], from, to).await {
+        // Probing the provider's window cap needs a filter that is actually asked: with no address to
+        // probe with, an empty-on-both-halves filter would be the every-log-on-the-chain request
+        // rather than a width probe (#432), so the probe uses a topic0 that matches nothing instead.
+        let probe = crate::source::LogFilter::new(&addrs, &[]).unwrap_or_else(|| {
+            crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
+                .expect("a one-topic filter is non-empty")
+        });
+        match rpc.logs(&probe, from, to).await {
             Ok(_) => max_window = Some(span),
             Err(e) => {
                 let msg = format!("{e:#}");
