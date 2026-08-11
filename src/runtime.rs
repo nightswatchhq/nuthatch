@@ -771,7 +771,12 @@ impl PreparedDataset {
 /// bring a nest up over a failed *optimisation* would turn a disk-full into an outage. That policy
 /// used to live inside `load_mounted`, which meant the mount path would have had to re-derive it;
 /// it lives here now so both paths get it without deciding again.
-pub fn prepare_dataset(root: &Path, dir: PathBuf, nid: Option<&str>, label: &str) -> PreparedDataset {
+pub fn prepare_dataset(
+    root: &Path,
+    dir: PathBuf,
+    nid: Option<&str>,
+    label: &str,
+) -> PreparedDataset {
     let Some(nid) = nid else {
         return PreparedDataset::without_nid(dir);
     };

@@ -467,7 +467,11 @@ async fn a_nest_mounted_into_a_running_runtime_gets_the_early_cutoff_too() {
     let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
         let views = dir.join("views");
         std::fs::create_dir_all(&views).unwrap();
-        std::fs::write(views.join("10-note.sql"), "-- a comment, and nothing else\n").unwrap();
+        std::fs::write(
+            views.join("10-note.sql"),
+            "-- a comment, and nothing else\n",
+        )
+        .unwrap();
     });
     let dest = MountTable::data_dir(root, &new_nid);
     assert!(
@@ -527,7 +531,11 @@ async fn a_live_candidate_is_not_copied_out_from_under_its_cursor() {
     let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
         let views = dir.join("views");
         std::fs::create_dir_all(&views).unwrap();
-        std::fs::write(views.join("10-note.sql"), "-- a comment, and nothing else\n").unwrap();
+        std::fs::write(
+            views.join("10-note.sql"),
+            "-- a comment, and nothing else\n",
+        )
+        .unwrap();
     });
 
     // Beta stays up and keeps the cursor alive; the edited alpha is mounted into it.
@@ -536,9 +544,7 @@ async fn a_live_candidate_is_not_copied_out_from_under_its_cursor() {
 
     // Whatever adoption decided, the destination must never be left holding a half-copied store: a
     // staging directory outliving the mount is the observable form of that fault.
-    let staging = root
-        .join(DATA_DIR)
-        .join(format!("{new_nid}.adopting"));
+    let staging = root.join(DATA_DIR).join(format!("{new_nid}.adopting"));
     assert!(
         !staging.exists(),
         "an adoption staging directory outlived the mount - a partial copy is worse than no cutoff"
