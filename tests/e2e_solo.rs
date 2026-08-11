@@ -816,3 +816,159 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
         "the fresh new nest serves exactly the reused sealed segments"
     );
 }
+
+/// **Issue #419, on the serving surface.** A sealed segment corrupted under a *running* node must
+/// reduce the table over HTTP `/sql`, not delete it.
+///
+/// The unit test in `analytics` pins `define_views`; this pins the path an operator actually hits.
+/// Startup quarantine (`seal::verify_and_quarantine`) catches a segment that is already bad when the
+/// node boots, so the case that reaches `define_views` is the one that goes bad *after* boot - a disk
+/// fault, or a file replaced under a live process. That is what this drives: two segments sealed and
+/// serving, one of them scribbled over, and the query re-run against the same running server.
+///
+/// The assertion is the exact surviving set, not merely "the table still exists": the reduction has
+/// to be confined to the blocks the dead segment carried, with the other segment and the hot tip
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    let tape = Arc::new(TapeSource::new());
+
+    // Ten blocks, one USDC transfer each.
+    let a1 = account(1);
+    let a2 = account(2);
+    for b in 1..=10u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(10);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let store = rt.state.store.clone();
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            store.get_meta("last_block").ok().flatten().as_deref() == Some("10")
+        })
+        .await,
+        "nest did not index to the tip in time"
+    );
+
+    // Seal in two steps so the table has *two* segments - one bad segment can only be shown to
+    // reduce a table if there is a surviving one to reduce it to.
+    tape.advance_finalized_to(3);
+    tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
+    tape.advance_tip_to(11);
+    assert!(
+        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 3).await,
+        "range [1,3] did not seal in time"
+    );
+    tape.advance_finalized_to(6);
+    tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
+    tape.advance_tip_to(12);
+    assert!(
+        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 6).await,
+        "range [4,6] did not seal in time"
+    );
+
+    let table = transfer_table("usdc");
+    let segs = seal::load_manifest(dir.path())
+        .unwrap()
+        .tables
+        .get(&table)
+        .cloned()
+        .expect("transfer table sealed");
+    assert_eq!(segs.len(), 2, "expected two sealed segments, got {segs:?}");
+
+    // Freeze ingestion: from here the served rows are fixed, so a changed count is the corruption
+    // and nothing else.
+    rt.ingest.abort();
+    if let Some(w) = rt.alert_worker {
+        w.abort();
+    }
+
+    // Serve the real router.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(rt.state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let q = format!("SELECT block_number FROM \"{table}\" ORDER BY block_number");
+
+    let blocks_over_http = |client: reqwest::Client, base: String, q: String| async move {
+        let v: serde_json::Value = client
+            .get(format!("{base}/sql"))
+            .query(&[("q", q)])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v
+    };
+
+    // Healthy: both segments (blocks 1..=6) plus the hot tip (7..=10).
+    let healthy = blocks_over_http(client.clone(), base.clone(), q.clone()).await;
+    let got: BTreeSet<u64> = healthy["rows"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|r| r["block_number"].as_u64())
+        .collect();
+    assert_eq!(
+        got,
+        (1..=10).collect::<BTreeSet<u64>>(),
+        "healthy /sql must span both segments and the hot tip, got {healthy}"
+    );
+
+    // Scribble over the segment carrying blocks [4,6], leaving the file present and the manifest
+    // untouched - exactly what a bad sector or a half-written restore looks like to `read_parquet`.
+    let bad = segs
+        .iter()
+        .find(|s| s.from_block == 4)
+        .expect("a segment sealed from block 4");
+    let bad_path = seal::segment_path(dir.path(), &bad.file, &bad.hash);
+    std::fs::write(&bad_path, b"this is not a parquet file").unwrap();
+
+    let reduced = blocks_over_http(client.clone(), base.clone(), q.clone()).await;
+    let got: BTreeSet<u64> = reduced["rows"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|r| r["block_number"].as_u64())
+        .collect();
+    assert!(
+        reduced["error"].is_null(),
+        "a corrupt segment must not fault the query: {reduced}"
+    );
+    assert_eq!(
+        got,
+        [1, 2, 3, 7, 8, 9, 10].into_iter().collect::<BTreeSet<u64>>(),
+        "the corrupt segment's blocks must be the *only* rows lost - the surviving segment and the \
+         hot tip stay, and the table does not vanish. Got {reduced}"
+    );
+
+    server.abort();
+}

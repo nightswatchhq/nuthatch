@@ -915,49 +915,97 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
             })
             .collect();
 
-        let mut parts: Vec<String> = Vec::new();
-        if !sealed_files.is_empty() {
-            // COR-2: `union_by_name=true` NULL-fills columns that differ across segments - segment
-            // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
-            // without this a single drifted column makes `read_parquet` throw and the whole table's view
-            // silently vanish.
-            parts.push(format!(
-                "SELECT *{} FROM read_parquet([{}], union_by_name=true)",
-                derived_bigint_cols(cols),
-                sealed_files.join(", ")
-            ));
-        }
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
-        if !hot_rows.is_empty() {
+        let hot_part: Option<String> = if hot_rows.is_empty() {
+            None
+        } else {
             let hot_tbl = format!("__hot_{table}");
             match load_hot_temp(conn, &hot_tbl, &hot_rows) {
-                Ok(()) => parts.push(format!(
+                Ok(()) => Some(format!(
                     "SELECT *{} FROM \"{hot_tbl}\"",
                     derived_bigint_cols(cols)
                 )),
-                Err(e) => tracing::debug!("hot rows for {table} skipped: {e:#}"),
+                Err(e) => {
+                    tracing::debug!("hot rows for {table} skipped: {e:#}");
+                    None
+                }
             }
-        }
-
-        let ddl = if parts.is_empty() {
-            // Nothing sealed and nothing hot: an empty typed view so nest views resolve to zero rows
-            // instead of cascade-failing (skip a table with no declared columns).
-            if cols.is_empty() {
-                continue;
-            }
-            empty_view_ddl(table, cols)
-        } else {
-            // `UNION ALL BY NAME` aligns columns by name and NULL-fills any a side lacks (a column all-
-            // null over the sealed range is dropped from its Parquet schema; hot may still carry it).
-            format!(
-                "CREATE VIEW \"{table}\" AS {}",
-                parts.join(" UNION ALL BY NAME ")
-            )
         };
-        if let Err(e) = conn.execute_batch(&ddl) {
-            tracing::debug!("view {table} skipped: {e}");
+
+        // The view over a given set of sealed files plus whatever hot rows loaded. Built as a closure
+        // because a segment that will not bind is dropped and the view rebuilt from what remains, below.
+        let view_ddl = |files: &[String]| -> Option<String> {
+            let mut parts: Vec<String> = Vec::new();
+            if !files.is_empty() {
+                // COR-2: `union_by_name=true` NULL-fills columns that differ across segments - segment
+                // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
+                // without this a single drifted column makes `read_parquet` throw and the whole table's
+                // view silently vanish.
+                parts.push(format!(
+                    "SELECT *{} FROM read_parquet([{}], union_by_name=true)",
+                    derived_bigint_cols(cols),
+                    files.join(", ")
+                ));
+            }
+            parts.extend(hot_part.clone());
+            if parts.is_empty() {
+                // Nothing sealed and nothing hot: an empty typed view so nest views resolve to zero rows
+                // instead of cascade-failing (skip a table with no declared columns).
+                if cols.is_empty() {
+                    return None;
+                }
+                Some(empty_view_ddl(table, cols))
+            } else {
+                // `UNION ALL BY NAME` aligns columns by name and NULL-fills any a side lacks (a column
+                // all-null over the sealed range is dropped from its Parquet schema; hot may still
+                // carry it).
+                Some(format!(
+                    "CREATE VIEW \"{table}\" AS {}",
+                    parts.join(" UNION ALL BY NAME ")
+                ))
+            }
+        };
+
+        let Some(ddl) = view_ddl(&sealed_files) else {
+            continue;
+        };
+        let Err(e) = conn.execute_batch(&ddl) else {
+            continue;
+        };
+        // A sealed segment that is present but *unreadable* throws while `read_parquet` binds its
+        // footer, which happens at DDL time. Swallowing that used to delete the table from the SQL
+        // surface outright, so the caller was told the table does not exist and a corrupt file on disk
+        // read as a naming fault (#419). Treat it the way a missing file is treated above: drop the
+        // segments that will not bind and rebuild the view from what remains, so one bad file *reduces*
+        // the table rather than deleting it. The probe is free on the healthy path - it only runs once
+        // the whole-view DDL has already failed.
+        let readable: Vec<String> = sealed_files
+            .iter()
+            .filter(|f| {
+                let probe = format!("SELECT 1 FROM read_parquet([{f}], union_by_name=true) LIMIT 0");
+                match conn.prepare(&probe) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            "segment {f} for {table} will not bind - skipping (cold data reduced): {err}"
+                        );
+                        false
+                    }
+                }
+            })
+            .cloned()
+            .collect();
+        if readable.len() == sealed_files.len() {
+            // Every segment binds, so the failure is something else entirely: report it and leave the
+            // table undefined, as before. `warn!` rather than `debug!` - a table vanishing from `/sql`
+            // is not a debugging detail.
+            tracing::warn!("view {table} skipped: {e}");
+            continue;
+        }
+        if let Some(Err(e)) = view_ddl(&readable).map(|retry| conn.execute_batch(&retry)) {
+            tracing::warn!("view {table} skipped after dropping bad segments: {e}");
         }
     }
     Ok(())
@@ -2321,6 +2369,82 @@ template="pool"
             all.len(),
             100,
             "unguarded trusted queries are not byte-capped"
+        );
+    }
+
+    /// **Issue #419.** A sealed segment that is present on disk but unreadable must *reduce* the
+    /// table, not delete it.
+    ///
+    /// `read_parquet` binds every listed file's footer while the view is being created, so one
+    /// corrupt segment throws at DDL time. That failure used to be swallowed, which meant the view was
+    /// never created and `/sql` answered `Table with name ... does not exist` - sending an operator to
+    /// hunt for a config or naming fault when the actual fault is a file on disk. It also leaked the
+    /// internal `__hot_<table>` temp table through DuckDB's did-you-mean, to an untrusted caller.
+    ///
+    /// The missing-segment case one screen up in `define_views` has always done the right thing (drop
+    /// it, `warn!`, carry on). Present-but-corrupt is the more alarming of the two and was the quieter,
+    /// which is the asymmetry this pins.
+    #[test]
+    fn a_corrupt_sealed_segment_reduces_the_table_rather_than_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // A schema, so that dropping *every* sealed file still yields the empty **typed** view rather
+        // than no view at all. Without it the rebuild-from-nothing case deletes the table, and the
+        // assertions below could not tell "rebuilt from the good segment" from "rebuilt from nothing" -
+        // both would fail on the `expect` above them. With it, the two are distinguishable, which is
+        // what makes the row assertions load-bearing.
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        // Two segments, one block each, so a query can tell which survived.
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xa","value":"1","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xb","value":"2","block_number":2,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            2,
+            2,
+        )
+        .unwrap();
+
+        // Both segments read before anything is touched - otherwise the assertions below could pass on
+        // a table that was never whole.
+        let rows = query(
+            dir.path(),
+            r#"SELECT "from" FROM "t__transfer" ORDER BY block_number"#,
+        )
+        .expect("both segments readable");
+        assert_eq!(rows.len(), 2, "two segments, two rows");
+
+        // Corrupt the second segment in place, as an operator would find it: still listed in the
+        // manifest, still on disk, no longer a Parquet file. No restart, so the startup integrity pass
+        // has not quarantined it.
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let segs = &manifest.tables["t__transfer"];
+        let victim = segs
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        std::fs::write(&path, b"not parquet, not even close").unwrap();
+
+        // The table still answers, from the segment that is still good.
+        let rows = query(dir.path(), r#"SELECT "from" FROM "t__transfer""#)
+            .expect("a corrupt segment must not delete the table from the SQL surface");
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        assert_eq!(
+            rows[0]["from"],
+            Value::from("0xa"),
+            "and it is the block-1 row, not the corrupt one"
         );
     }
 

@@ -269,9 +269,38 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 /// rewrites the nest directory out of DuckDB errors, and the `/sql` and `/explain` probes below do
 /// *not* exercise it: an unknown table is a Catalog Error carrying no path, and a table the registry
 /// declares resolves against the hot store and succeeds. Making `sanitize_sql_error` a no-op leaves
-/// this test green - verified, not assumed. Provoking the `IO Error` that names an absolute parquet
-/// glob needs a nest with sealed segments missing underneath it, which this FE fixture has no way to
-/// build. That redaction remains covered by its unit tests in `serve.rs` alone.
+/// this test green - verified, not assumed.
+///
+/// An earlier revision of this paragraph blamed the fixture: provoking the `IO Error` that names an
+/// absolute parquet glob needs sealed segments this FE harness cannot build. That fixture was
+/// afterwards built (the `e2e_solo` tape drives land -> seal), and the reason turns out to be
+/// structural rather than a limit of this file - which is a better thing to inherit, so it is
+/// recorded here instead:
+///
+/// - a sealed segment that is **missing** is filtered out of the glob list in
+///   `analytics::define_views` before the DDL is assembled, with a `warn!`. No path is formatted, so
+///   none can escape.
+/// - a sealed segment that is **present but unreadable** throws while `read_parquet` binds the view,
+///   and `define_views` catches that DDL failure, drops the segments that will not bind and rebuilds
+///   the view from what remains (#419/#430 - before that fix it swallowed the failure at `debug!` and
+///   the table vanished from `/sql` entirely). Either way the failing statement never returns to the
+///   caller, so the path it carries is not formatted into a response.
+/// - `analytics::run` opens a fresh in-memory connection per query, so views are defined and executed
+///   inside one call. The window in which a view binds and then fails at execution against a file
+///   that changed underneath it is one call wide, not the lifetime of a connection, and something
+///   outside the process has to move the file to open it - nothing in-process removes a segment while
+///   serving (`seal::verify_and_quarantine` is a startup pass).
+///
+/// So on the sealed-segment route `sanitize_sql_error` is defence-in-depth, not a live control - an
+/// assertion here would be green whether or not the redactor is wired in, which is the vacuous
+/// absence this comment exists to refuse. No request-reachable route on the bundled DuckDB has been
+/// found that carries a path into it, which is why the coverage stays in `serve.rs`'s unit tests
+/// alone. If you want a named lever rather than a negative, the honest one is the one-call window in
+/// the third bullet above - not the `allowed_directories` lockdown, which an earlier revision of this
+/// paragraph offered: `SET` errors do not echo the failing statement, the option accepts nonexistent
+/// directories and empty lists so it barely fails at all, and
+/// `analytics::tests::the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read` already
+/// records that it does not enforce on this build.
 ///
 /// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
 /// it has teeth there: adding the nest directory to `nest_info` turns it red.
@@ -329,8 +358,8 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
         "/flags",
         "/queries",
         // Both SQL probes are here for the error *body*, not the happy path - a query error is the
-        // classic place an absolute path escapes. See the note on `sanitize_sql_error` below for what
-        // this does and does not reach.
+        // classic place an absolute path escapes. See the note on `sanitize_sql_error` in this test's
+        // doc comment for what this does and does not reach.
         "/sql?q=SELECT%20*%20FROM%20no_such_table",
         "/explain?q=SELECT%20*%20FROM%20no_such_table",
         "/sql?q=SELECT%20*%20FROM%20usdc__transfer",
