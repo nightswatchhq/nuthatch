@@ -290,8 +290,9 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// the key cannot see an in-place same-length overwrite - which is precisely the corruption this
 /// function exists to catch. A cache that reports `intact` about a corrupt segment, inside the fix for
 /// reporting healthy about corrupt data, is the bug wearing the fix's clothes. It was removed rather
-/// than tuned: `seal::tests::segments_failing_verification_catches_page_corruption_that_still_binds`
-/// is the test that caught it, and it fails if the memo comes back.
+/// than tuned, and `seal::tests::a_corrupt_segment_is_caught_even_when_its_mtime_is_unchanged` is
+/// what stops it coming back. That test exists because my first claim here - that the page-corruption
+/// test already covered it - was **false**: mutating the memo back in left the whole suite green.
 ///
 /// If sweep cost ever does need bounding, bound it on something that cannot be stale - a coalescing
 /// flag so concurrent queries share one sweep, or the gateway, which is already where this project
@@ -490,6 +491,69 @@ mod tests {
             "exactly the corrupt segment, and not its healthy sibling"
         );
         assert!(bad.contains(&victim.hash), "and it is the one we corrupted");
+    }
+
+    /// **Issue #433, and the reason there is no cache in `segments_failing_verification`.**
+    ///
+    /// A verdict about a segment's bytes must not be keyed on the segment's timestamp. Measured on
+    /// this box (btrfs, Linux 6.12): rewriting a file in place with the same length inside one kernel
+    /// timer tick leaves `st_mtime_ns` **byte-identical**, because writes are stamped from a per-tick
+    /// cached clock. So a `(mtime, len)` memo cannot see an in-place same-length overwrite - exactly
+    /// the corruption this is for.
+    ///
+    /// I know this because I wrote that memo, and then wrote in its doc comment that the test above
+    /// would catch it coming back. **It would not**: mutating the memo back in left the whole suite
+    /// green, because the two sweeps in that test happen to straddle a tick. A claim about a
+    /// mechanism, with nothing behind it, in the fix for claims with nothing behind them.
+    ///
+    /// So this constructs the condition deterministically instead of hoping for it: corrupt the bytes
+    /// and put the original timestamp back, which is what a same-tick overwrite does anyway. Linux
+    /// only - it needs GNU `touch -d @<epoch.nanos>` - and CI is Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_corrupt_segment_is_caught_even_when_its_mtime_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(200, 0, "9")], 200, 200).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+
+        // Ask once while it is healthy: this is what would populate any cache.
+        assert!(segments_failing_verification(dir.path()).is_empty());
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        bytes[4..len - 8 - footer_len].fill(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Put the clock back, so the file is byte-different and timestamp-identical.
+        let d = before.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ok = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{}.{:09}", d.as_secs(), d.subsec_nanos()))
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "the fixture needs GNU touch to restore the timestamp");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "the whole point of this test is that the timestamp did not move"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len as u64,
+            "and neither did the length"
+        );
+
+        assert_eq!(
+            segments_failing_verification(dir.path()).len(),
+            1,
+            "corruption must be caught from the bytes - a verdict cached on (mtime, len) would call \
+             this segment intact, which is the failure this whole issue is about"
+        );
     }
 
     #[test]
