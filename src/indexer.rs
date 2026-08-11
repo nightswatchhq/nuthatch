@@ -1422,8 +1422,8 @@ async fn runtime_index_loop(
         // "no logs" but *every log on the chain* - and unlike the backfill instance of this defect, a
         // tip loop asks forever, every couple of seconds, for as long as the cursor runs (#432).
         // `LogFilter::new` is what makes that unaskable; the `None` arm is this site deciding what
-        // "nothing to ask for" means, which here is an empty window that still gets processed - block
-        // rows for a `blocks` nest are derived from the window, not from the logs.
+        // "nothing to ask for" means, which here is an empty window that still gets fanned out to the
+        // live nests rather than skipped, so the shared cursor advances in step for all of them.
         let filter = LogFilter::new(&u_addrs, &u_topics);
         let fetched = match &filter {
             Some(f) => source.logs(f, global_next, to).await,
@@ -3536,8 +3536,13 @@ async fn index_loop(
         // A contract-free nest (`blocks = true`, no `[[contracts]]` - OBIB case 3) has both halves of
         // its filter empty, which asks a node for every log on the chain. #421 and #429 guarded the
         // backfill paths and left this one, which is the worse of the two: it repeats for as long as
-        // `nuthatch dev` runs (#432). `process_window` still runs on the empty window, because a
-        // blocks nest derives its rows from the window itself rather than from the logs in it.
+        // `nuthatch dev` runs (#432).
+        //
+        // The empty window is still *processed* rather than skipped - the cursor advances, the reorg
+        // check runs, and sealing proceeds off the same window bookkeeping. Note what that does NOT
+        // currently include: `process_window` derives its block list from `logs`, so a blocks nest
+        // writes no rows for a window nothing matched. That is #447, not this fix, and it is why the
+        // fall-through matters more once #447 lands than it does today.
         let filter = LogFilter::new(&nest.addresses, &nest.topic0s);
         let fetched = match &filter {
             Some(f) => source.logs(f, next, to).await,
@@ -6776,6 +6781,63 @@ template = "pool"
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         f()
+    }
+
+    /// The tip loops write **no block rows at all** for a window, which is #447 - found by writing the
+    /// test Mabel asked for during review and having it fail.
+    ///
+    /// The claim under test was mine and it was wrong: I had commented that an empty window still has
+    /// to be processed because a blocks nest derives its rows from the window. The three backfill
+    /// paths do that (`src/indexer.rs`, `if registry.blocks()` → `source.block_headers(&want)`, over
+    /// `next..=chunk_to`). `process_window`, which is what both tip loops call, derives its block list
+    /// from `logs` instead and never asks for a header - the exact thing the backfill's own comment
+    /// warns produces "zero rows and a green run".
+    ///
+    /// So this pins the behaviour as it actually is, rather than asserting the fix I have not made:
+    /// the loop runs, the cursor advances, and no block row appears. It fails when #447 lands, which
+    /// is when it should be replaced by the presence assertion (rows appear for the tip window) that
+    /// this test was originally written to make.
+    #[tokio::test]
+    async fn the_tip_loop_writes_no_block_rows_for_a_window_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(dir.path(), "0x1111111111111111111111111111111111111111").await;
+        nest.registry = Arc::new(DecodeRegistry::build(Vec::new()).unwrap().with_blocks(true));
+        nest.addresses = Vec::new();
+        nest.topic0s = Vec::new();
+        assert!(
+            LogFilter::new(&nest.addresses, &nest.topic0s).is_none(),
+            "the fixture must be in the state where no getLogs can be issued at all"
+        );
+        let store = nest.store.clone();
+
+        let src = Arc::new(LogCountingSource::new());
+        let counter = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(10),
+            false,
+            1,
+            5,
+        ));
+        // `LogCountingSource` tips at 100, so `--backfill 10` puts the loop on blocks 90..=100. Give
+        // it the same deadline the other loop tests use, then look.
+        let wrote_rows =
+            within_deadline(|| !store.entities_in_range(90, 100).unwrap().is_empty()).await;
+        task.abort();
+
+        assert!(
+            !wrote_rows,
+            "if the tip loop now writes block rows, #447 is fixed - replace this test with the \
+             presence assertion it was written to make"
+        );
+        assert_eq!(
+            counter.calls(),
+            0,
+            "whatever it does with the window, it must get there without asking for logs at all: an \
+             empty address AND topic filter is every log on the chain (#432)"
+        );
     }
 
     /// #432 assumes a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) reaches the
