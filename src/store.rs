@@ -294,9 +294,31 @@ pub fn store_holds_rows(path: &Path) -> Result<bool> {
 }
 
 impl Store {
+    /// Open the store at `path`, **creating it if it is not there**. What a cursor starting up wants.
     pub fn open(path: &Path) -> Result<Store> {
         let db = Database::create(path)
             .with_context(|| format!("failed to open redb at {}", path.display()))?;
+        Store::from_db(db)
+    }
+
+    /// Open a store that **already exists**, and fail rather than bring one into being.
+    ///
+    /// The distinction is the whole of issue #413. [`Store::open`] is `Database::create`, so a caller
+    /// asking *"is there a store here?"* by opening one gets to answer its own question: `nuthatch
+    /// sql` reported a local nest for any directory at all, queried the empty store it had just made
+    /// instead of falling back to the running instance that held the data, and left the file behind
+    /// to be mistaken for a dataset later. A probe must not be able to make itself true.
+    ///
+    /// Absent and locked both come back as errors, which is what the routing callers want: neither is
+    /// a store they may read here. Callers that need to tell the two apart should check the path -
+    /// [`store_holds_rows`] is the read-only variant for "does it hold anything".
+    pub fn open_existing(path: &Path) -> Result<Store> {
+        let db = Database::open(path)
+            .with_context(|| format!("failed to open an existing redb at {}", path.display()))?;
+        Store::from_db(db)
+    }
+
+    fn from_db(db: Database) -> Result<Store> {
         // Materialise both tables up front so read txns never hit a missing table.
         let wtx = db.begin_write()?;
         {
@@ -1371,6 +1393,31 @@ mod tests {
             "an absent store is an error, not a false"
         );
         assert!(!path.exists(), "and asking must not have created it");
+    }
+
+    /// Issue #413. The two opens differ in exactly one thing and every routing decision built on top
+    /// of them turns on it: `open` brings a store into being, `open_existing` refuses to. A probe that
+    /// creates gets to answer its own question - and leaves the evidence behind for the next reader.
+    #[test]
+    fn open_existing_refuses_to_create_the_store_it_was_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.redb");
+
+        assert!(
+            Store::open_existing(&path).is_err(),
+            "there is no store here, so there is nothing to open"
+        );
+        assert!(
+            !path.exists(),
+            "and asking must not have created one at {path:?}"
+        );
+
+        // The same call succeeds once a store is actually there, so the error above is about absence
+        // and not about `open_existing` being broken outright.
+        drop(Store::open(&path).unwrap());
+        let store = Store::open_existing(&path).expect("an existing store opens");
+        store.set_meta("last_block", "7").unwrap();
+        assert_eq!(store.get_meta("last_block").unwrap().as_deref(), Some("7"));
     }
 
     #[test]

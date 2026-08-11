@@ -280,19 +280,33 @@ enum SqlBackend {
     Http {
         url: String,
         client: reqwest::Client,
+        /// Why we are not local. `None` when a store is there but held by `dev` - the ordinary case,
+        /// and not worth mentioning. `Some(path)` when there is no store at all, which is the case
+        /// that used to be silently invented (#413) and the one a failed connection needs to name:
+        /// "no instance running" is only half the truth when the directory has no nest in it either.
+        absent_store: Option<std::path::PathBuf>,
     },
 }
 
 impl SqlBackend {
     fn open(dir: &str, url: &str) -> Result<Self> {
         let dir = std::path::PathBuf::from(dir);
+        let db = dir.join(config::DB_FILE);
         // Prefer local files; redb is single-writer, so if `dev` holds the store the open fails and we
         // fall back to the running instance's API - the same command works either way.
-        match store::Store::open(&dir.join(config::DB_FILE)) {
+        //
+        // The open is **non-creating** (#413). `Store::open` is `Database::create`, so this probe used
+        // to answer its own question: in any directory without a nest it created an empty store,
+        // reported `local nest at .`, returned no rows from the store it had just made, and never
+        // reached the running instance that had the data. `--dir` defaults to `.`, so running one
+        // directory up from the nest was enough. Non-creating, the three cases separate: absent →
+        // HTTP, locked by `dev` → HTTP, present and free → local.
+        match store::Store::open_existing(&db) {
             Ok(store) => Ok(SqlBackend::Local { dir, store }),
             Err(_) => Ok(SqlBackend::Http {
                 url: url.trim_end_matches('/').to_string(),
                 client: reqwest::Client::new(),
+                absent_store: (!db.exists()).then_some(db),
             }),
         }
     }
@@ -338,13 +352,26 @@ impl SqlBackend {
                     }
                 }
             }
-            SqlBackend::Http { url, client } => {
+            SqlBackend::Http {
+                url,
+                client,
+                absent_store,
+            } => {
                 let resp = client
                     .get(format!("{url}/sql"))
                     .query(&[("q", sql)])
                     .send()
                     .await
-                    .with_context(|| format!("querying {url} - is `nuthatch dev` running?"))?;
+                    .with_context(|| match absent_store {
+                        // Both halves are missing, so name both. Previously this said only "is dev
+                        // running?" for a user whose real mistake was the directory (#413).
+                        Some(db) => format!(
+                            "querying {url} - no store at {} and nothing answering there. \
+                             Is `nuthatch dev` running, and is --dir the nest directory?",
+                            db.display()
+                        ),
+                        None => format!("querying {url} - is `nuthatch dev` running?"),
+                    })?;
                 let status = resp.status();
                 let body: serde_json::Value =
                     resp.json().await.context("reading the API response")?;
@@ -518,7 +545,12 @@ fn print_table(rows: &[serde_json::Value]) {
 fn run_transform(args: cli::TransformArgs) -> Result<()> {
     use std::path::{Path, PathBuf};
     let dir = PathBuf::from(&args.dir);
-    let store = store::Store::open(&dir.join(config::DB_FILE))?;
+    // Non-creating, for the reason `nuthatch sql` is (#413): this reads a nest's stored transfers, so
+    // a directory with no store has none to run over. Creating one got the same three things wrong -
+    // it reported `0 transfers` and `✓ 0 facts out` for what is really "there is no nest here", and it
+    // left an empty `nuthatch.redb` behind for a later `holds_data` to misread.
+    let store = store::Store::open_existing(&dir.join(config::DB_FILE))
+        .with_context(|| format!("no nest to transform at {}", dir.display()))?;
     let entities = store.recent(args.limit)?;
     println!(
         "→ running {} over {} transfers…",
