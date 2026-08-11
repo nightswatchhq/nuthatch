@@ -2627,15 +2627,20 @@ template="pool"
         );
     }
 
-    /// **Issue #433, the half that bounds the cost.** A query that fails to *bind* must not provoke the
-    /// integrity sweep.
+    /// **Issue #433, the half that bounds the cost.** `collect` must report *which phase* a query
+    /// died in, because that is what decides whether the integrity sweep runs at all.
     ///
-    /// `/sql` is untrusted and the caller writes the query, so "any failure hashes every segment in the
-    /// nest" would be a denial-of-service amplifier built out of an integrity check. A binder error
-    /// cannot have been caused by a corrupt page, so it is returned as-is - and it must keep saying
-    /// what it always said, because a caller's typo is the commonest error on this surface.
+    /// `/sql` is untrusted and the caller writes the query, so "any failure hashes every segment in
+    /// the nest" would be a denial-of-service amplifier built out of an integrity check - and a bind
+    /// failure cannot have been caused by a corrupt page, so it must never provoke one.
+    ///
+    /// This asserts the discriminator **directly** rather than through a query's error message. I
+    /// wrote the message version first and then killed it: with the phase split deleted, a binder
+    /// error still comes back with the same text (the sweep finds nothing to change and the error is
+    /// returned either way), so that test passed with the mechanism gone. Which is the exact failure
+    /// this sprint is about, in my own new fixture.
     #[test]
-    fn a_binder_error_is_returned_as_itself_and_does_not_reach_the_integrity_sweep() {
+    fn collect_separates_a_bind_failure_from_a_read_failure() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -2651,15 +2656,31 @@ template="pool"
             1,
         )
         .unwrap();
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["t__transfer"][0];
+        let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
+        corrupt_pages_leaving_the_footer_intact(&path);
 
-        let err = format!(
-            "{:#}",
-            query(dir.path(), r#"SELECT no_such_column FROM "t__transfer""#)
-                .expect_err("a missing column is still an error")
-        );
+        let conn = Connection::open_in_memory().unwrap();
+        let empty = HotRows::new();
+        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+
+        // A name the catalogue does not have: refused by the binder, before a page is touched.
         assert!(
-            err.contains("no_such_column"),
-            "the caller's own mistake must come back naming their column, got: {err}"
+            matches!(
+                collect(&conn, r#"SELECT no_such_column FROM "t__transfer""#, None),
+                Err(Died::Binding(_))
+            ),
+            "a missing column is a bind failure - it cannot have been caused by a corrupt page"
+        );
+
+        // The same connection, a query that binds and then reads the corrupt pages.
+        assert!(
+            matches!(
+                collect(&conn, r#"SELECT * FROM "t__transfer""#, None),
+                Err(Died::Executing(_))
+            ),
+            "reading a page-corrupt segment is an execution failure - the only shape worth sweeping for"
         );
     }
 

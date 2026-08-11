@@ -276,23 +276,27 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// nothing on disk and so is safe for a shared segment, which is why this returns hashes rather than
 /// calling the startup pass.
 ///
-/// ## Cost, and why it is memoised
+/// ## Cost, and the cache that is deliberately not here
 ///
-/// `/sql` is untrusted, and the caller chooses the query. Without a memo, any caller who can provoke
-/// an execution-phase error - `SELECT CAST(col AS INT)` over text is enough - would make the process
-/// read and hash every segment in the nest, once per request. That is a denial-of-service amplifier
-/// built out of an integrity check.
+/// This reads and hashes every catalogued segment, every time it is called. That is not free, and the
+/// thing keeping it affordable is the *caller*: `run` only asks after a query has **bound and then
+/// died reading rows**. A bind failure - a typo, a missing column, the commonest error on this
+/// surface - never reaches here, so the cheap way to provoke a sweep does not exist.
 ///
-/// The memo is keyed on the path's `(mtime, len)`, so a segment already verified in this process is a
-/// `stat` rather than a read. Sealed segments never change, so the entry is valid until something
-/// rewrites the file - which is exactly the event that must invalidate it. The bound is therefore one
-/// full hash per segment per process, not per request.
+/// **There was a memo here keyed on the file's `(mtime, len)`, and it was wrong.** The idea was that a
+/// segment already verified in this process is a `stat` rather than a read. Measured on this box
+/// (btrfs, Linux 6.12): rewriting a file in place with the same length inside one timer tick leaves
+/// `st_mtime_ns` **byte-identical**, because the kernel stamps writes from a per-tick cached clock. So
+/// the key cannot see an in-place same-length overwrite - which is precisely the corruption this
+/// function exists to catch. A cache that reports `intact` about a corrupt segment, inside the fix for
+/// reporting healthy about corrupt data, is the bug wearing the fix's clothes. It was removed rather
+/// than tuned: `seal::tests::segments_failing_verification_catches_page_corruption_that_still_binds`
+/// is the test that caught it, and it fails if the memo comes back.
+///
+/// If sweep cost ever does need bounding, bound it on something that cannot be stale - a coalescing
+/// flag so concurrent queries share one sweep, or the gateway, which is already where this project
+/// puts per-caller rate limiting (#365). Not on a filesystem timestamp.
 pub fn segments_failing_verification(dir: &Path) -> BTreeSet<String> {
-    static VERIFIED: std::sync::OnceLock<
-        std::sync::Mutex<BTreeMap<PathBuf, (u128, u64, bool)>>,
-    > = std::sync::OnceLock::new();
-    let memo = VERIFIED.get_or_init(Default::default);
-
     let Ok(manifest) = load_manifest(dir) else {
         return BTreeSet::new();
     };
@@ -301,36 +305,13 @@ pub fn segments_failing_verification(dir: &Path) -> BTreeSet<String> {
         for s in segs {
             let path = segment_path(dir, &s.file, &s.hash);
             // An absent file is not corruption, and `define_views` already skips it by existence.
-            let Ok(md) = std::fs::metadata(&path) else {
+            if !path.exists() {
                 continue;
-            };
-            let stamp = (
-                md.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
-                md.len(),
-            );
-            let cached = memo
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&path).copied())
-                .filter(|(m, l, _)| (*m, *l) == stamp)
-                .map(|(_, _, intact)| intact);
-            let intact = match cached {
-                Some(intact) => intact,
-                None => {
-                    // An unreadable segment is not intact: it cannot serve rows either way, and saying
-                    // "fine" about a file we could not read is the failure this whole issue is about.
-                    let intact = std::fs::read(&path)
-                        .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash);
-                    if let Ok(mut g) = memo.lock() {
-                        g.insert(path.clone(), (stamp.0, stamp.1, intact));
-                    }
-                    intact
-                }
-            };
+            }
+            // An unreadable segment is not intact: it cannot serve rows either way, and saying
+            // "fine" about a file we could not read is the failure this whole issue is about.
+            let intact = std::fs::read(&path)
+                .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash);
             if !intact {
                 tracing::error!(
                     "segment {} for table {table} does not match its content address - dropping it \
@@ -454,6 +435,61 @@ mod tests {
         format!(
             r#"{{"table":"usdc__approval","owner":"0xaaaa","spender":"0xdddd","value":"1","block_number":{block},"tx_hash":"0xcc","log_index":{li}}}"#
         )
+    }
+
+    /// **Issue #433.** The serving-path discriminator must catch page corruption that every cheap
+    /// DuckDB probe waves through, and must not accuse a healthy segment.
+    ///
+    /// The fixture asserts its own premise. Corrupting the data region while leaving the footer and
+    /// magic bytes intact is the whole condition - if the file stopped binding it would be #430's
+    /// case, already covered, and this test would be proving something else under this name. So it
+    /// checks `read_parquet` still binds the corrupt file before asserting the hash catches it. That
+    /// gap between "binds" and "hashes wrong" is exactly the ground #433 sits on.
+    #[test]
+    fn segments_failing_verification_catches_page_corruption_that_still_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        assert_eq!(segs.len(), 2);
+
+        // Nothing is wrong yet, and saying so is half the test: a discriminator that always answered
+        // "corrupt" would reduce every table on the first execution error in a healthy nest.
+        assert!(
+            segments_failing_verification(dir.path()).is_empty(),
+            "a healthy tree must accuse nothing"
+        );
+
+        // Destroy the pages of the block-101 segment, keeping footer and magic bytes.
+        let victim = segs.iter().find(|s| s.from_block == 101).unwrap();
+        let path = segment_path(dir.path(), &victim.file, &victim.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let end = len - 8 - footer_len;
+        assert!(end > 4, "the fixture needs a data region to corrupt");
+        bytes[4..end].fill(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+
+        // **The fixture is the condition it names.** Still a Parquet file as far as binding goes.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_ok(),
+            "if this no longer binds, the fixture has become #430's footer-corrupt case and this \
+             test has stopped testing #433"
+        );
+
+        let bad = segments_failing_verification(dir.path());
+        assert_eq!(
+            bad.len(),
+            1,
+            "exactly the corrupt segment, and not its healthy sibling"
+        );
+        assert!(bad.contains(&victim.hash), "and it is the one we corrupted");
     }
 
     #[test]
