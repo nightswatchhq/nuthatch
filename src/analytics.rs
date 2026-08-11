@@ -2040,6 +2040,46 @@ template="pool"
         assert_eq!(f[0]["from"], Value::from("0xa"));
     }
 
+    /// The hot half of #434, which the issue does not cover. The hot temp table derives its columns
+    /// from the rows themselves, so a tip batch that carries no `value` key leaves the same derived
+    /// cast bound to nothing - and the view dies with every sealed segment healthy. Same wrap, and it
+    /// wants its own test because the sealed test above passes with the hot side still broken.
+    #[test]
+    fn declared_bigint_column_no_hot_row_carries_keeps_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"registry_hash":"0x0","tables":[{"table":"t__transfer","alias":"t","event":"Transfer","topic0":"0x","columns":[{"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__transfer".into(),
+            vec![serde_json::json!({"table":"t__transfer","from":"0xa","to":"0xb","block_number":100,"tx_hash":"0xt","log_index":0})],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT "from", value, value_dec, value_overflow FROM "t__transfer""#,
+            guard,
+            &hot,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows.len(),
+            1,
+            "a tip batch missing a declared big-int column must not delete the table"
+        );
+        assert_eq!(out.rows[0]["from"], Value::from("0xa"));
+        assert_eq!(out.rows[0]["value"], Value::Null);
+        assert_eq!(out.rows[0]["value_dec"], Value::Null);
+        assert_eq!(out.rows[0]["value_overflow"], Value::from(false));
+    }
+
     #[test]
     fn query_guard_sees_past_leading_comments() {
         assert_eq!(
