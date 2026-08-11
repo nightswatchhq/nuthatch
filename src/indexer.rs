@@ -1585,7 +1585,11 @@ pub struct ChainCursor {
 #[allow(clippy::too_many_arguments)]
 pub async fn build_and_prepare_nest(
     source: &Arc<dyn Source>,
-    dir: PathBuf,
+    // A [`crate::runtime::PreparedDataset`] rather than a `PathBuf`, so the RFC-0033 §5 early cutoff
+    // cannot be skipped by a call site that simply did not think of it - which is precisely how this
+    // path came to re-index datasets it already had (#414). The only ways to hold one are
+    // `runtime::prepare_dataset` and the explicitly-named `PreparedDataset::without_nid`.
+    dataset: crate::runtime::PreparedDataset,
     config: &Config,
     backfill: Option<u64>,
     seal_direct: bool,
@@ -1605,7 +1609,7 @@ pub async fn build_and_prepare_nest(
 )> {
     let (mut nest, state, worker, window) = build_nest(
         source,
-        dir,
+        dataset.into_dir(),
         config,
         window_override,
         admin_enabled,
