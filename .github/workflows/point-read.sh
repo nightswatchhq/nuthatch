@@ -38,14 +38,34 @@
 # rather than disable the check. What CI enforces is set in ci.yml and is not affected by this
 # default.
 #
+# **`BASELINE` checks the committed reference came from this machine** (issue #385).
+# `docs/bench/point-read.json` is the number anyone re-baselining the ceiling will reach for, and for
+# a year it was a 32-core dev-box artifact while the gate ran on a 4-core runner. Nothing detected
+# that, because a committed JSON file cannot go stale loudly - it can only be read and believed. So
+# CI now points `BASELINE` at it and this script compares the `hardware` the baseline records against
+# the `hardware` the run it just did records. Mismatch is a hard failure.
+#
+# It compares provenance and **not values**, deliberately. A "measured p50 must be within Nx of the
+# baseline" check is a second, much tighter ceiling wearing a different hat: the runner's own p50 has
+# been seen from 0.58µs to 0.82µs at fixed commits and its p99.9 from 0.77µs to 23.02µs, so any factor
+# loose enough not to flake is looser than the 8µs gate already is, and any factor tight enough to
+# add information flakes. The one thing a committed baseline can be *definitively* wrong about is
+# which machine produced it, so that is what is enforced.
+#
+# Unset by default, because the answer is machine-dependent and this script is documented for running
+# by hand: on your own box the check would fail correctly and uselessly every time. What CI enforces
+# is set in ci.yml.
+#
 # Env: BIN (default target/release/nuthatch), MAX_P50_US (see ci.yml for the value CI uses and why),
 #      MAX_P99_US (unset: recorded, not gated), PORT (default 8289), RPC_PORT (default 8546), OUT
-#      (default point-read-report.json), LABEL (default names the fixture).
+#      (default point-read-report.json), LABEL (default names the fixture),
+#      BASELINE (unset: not checked; CI sets docs/bench/point-read.json).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
 MAX_P50_US="${MAX_P50_US:-8}"
 MAX_P99_US="${MAX_P99_US:-}"
+BASELINE="${BASELINE:-}"
 PORT="${PORT:-8289}"
 RPC_PORT="${RPC_PORT:-8546}"
 OUT="${OUT:-point-read-report.json}"
@@ -182,6 +202,37 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo ""
     echo "Tail, recorded and not gated: p99 **${p99}µs** ($p99_note), p99.9 **${p999}µs**."
   } >> "$GITHUB_STEP_SUMMARY"
+fi
+
+# The provenance check runs whatever the ceiling did, and reports separately: a run that is both
+# slow *and* baselined against the wrong machine wants to be told both things, and the second is the
+# reason to distrust the first.
+# `-f "$OUT"` because a run that died before writing its report has no hardware string to compare,
+# and `status` is already non-zero on that path - reporting a bogus mismatch would bury the real
+# failure under a second one.
+if [ -n "$BASELINE" ] && [ -f "$OUT" ]; then
+  if [ ! -f "$BASELINE" ]; then
+    echo "FAIL: BASELINE=$BASELINE does not exist. The committed reference is what a re-baseline is"
+    echo "      derived from; a missing one is not a pass."
+    exit 1
+  fi
+  hw_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("hardware") or "")' "$1"; }
+  base_hw="$(hw_of "$BASELINE")"
+  this_hw="$(hw_of "$OUT")"
+  if [ "$base_hw" != "$this_hw" ]; then
+    echo "FAIL: $BASELINE records hardware '$base_hw', this run measured on '$this_hw'."
+    echo "      The committed baseline has to come from the machine that enforces the gate. It did"
+    echo "      not once before (#385): a 32-core dev-box artifact sat in docs/bench/point-read.json"
+    echo "      while this job ran on a 4-core runner, and baseline and regression do not scale"
+    echo "      together across hardware - the linear-scan mutation this gate exists to catch runs"
+    echo "      *faster* on the runner (18.15µs) than on the dev box (24.17µs), so a ceiling derived"
+    echo "      from the dev box left 1.21x of real margin rather than the 1.61x it claimed."
+    echo "      Fix: take point-read-report.json from a green 'point-read latency' run on main and"
+    echo "      commit it, or - if the runner spec genuinely changed - re-measure the ceiling here"
+    echo "      and say so in docs/benchmarks.md. Do not edit the hardware field."
+    exit 1
+  fi
+  echo "OK: baseline $BASELINE was measured on this machine ('$base_hw')"
 fi
 
 if [ "$status" -ne 0 ]; then

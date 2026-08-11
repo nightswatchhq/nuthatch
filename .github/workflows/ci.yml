@@ -349,9 +349,20 @@ jobs:
         # number. They are what we read across releases. p99 over 256 samples is the 4th-worst read
         # and preemption-dominated here; p99.9 swung 0.77-3.96µs at fixed commits. Neither is a
         # property of the read path on this hardware, which is exactly why neither can fail a build.
+        #
+        # **`BASELINE` is what stops the reference rotting again** (issue #385).
+        # `docs/bench/point-read.json` is now this job's own artifact - taken verbatim from a green
+        # `main` run, commit a53565a, p50 0.78µs - rather than the 32-core dev-box report (p50 1.24µs)
+        # that sat there while the gate ran here. Nothing caught that, because a committed number
+        # cannot go stale loudly: it can only be read and believed, which is why `bench query`'s FAIL
+        # message had to spend four lines telling readers not to believe it. The script now compares
+        # the `hardware` the baseline records against the `hardware` this run records, and fails on a
+        # mismatch. If GitHub changes what `ubuntu-latest` is, this goes red and wants a human -
+        # correct, because the 8µs ceiling above was measured on the old spec.
         env:
           BIN: bin/nuthatch
           MAX_P50_US: "8"
+          BASELINE: docs/bench/point-read.json
           OUT: point-read-report.json
         run: |
           chmod +x bin/nuthatch
