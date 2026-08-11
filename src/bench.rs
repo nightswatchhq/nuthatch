@@ -664,7 +664,10 @@ async fn one_run(
             )
             .await?
         }
-        // Pipelined seal-direct: concurrent fetch, in-order deterministic sealing.
+        // Pipelined seal-direct: concurrent fetch, in-order deterministic sealing. **This is the
+        // production seal-direct path** - `nuthatch dev` on a static nest reaches
+        // `backfill_direct_pipelined` regardless of concurrency; the branch above it selects on
+        // `factory.is_some()`. Benching `Direct` instead measures a path only the bench takes.
         BackfillPath::Pipelined => {
             crate::indexer::backfill_direct_pipelined(
                 &source,
@@ -681,7 +684,9 @@ async fn one_run(
             )
             .await?
         }
-        // Seal-direct: decode → Parquet, bypassing the hot store. Exactly the production path.
+        // Sequential seal-direct: decode → Parquet, bypassing the hot store. Reachable only from the
+        // bench (`backfill_direct` has no other non-test caller) - it is the sequential control for
+        // `Pipelined`, not what production runs.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
                 &source, registry, &work, addresses, topic0s, from, to, window,

@@ -2307,6 +2307,19 @@ fn fetch_logs_splitting<'a>(
     to: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
 {
+    // Nothing to decode means nothing to ask for. An empty address AND topic filter is not "no logs"
+    // to a node - it is *every log on the chain*, which a blocks-only nest (OBIB case 3: no contract
+    // at all) would otherwise request per window and then discard, since no log can decode without a
+    // matching address or topic. Worse here than in `backfill_direct`: the response trips the
+    // provider's result cap and the splitting below then *amplifies* it into a fan-out of retries.
+    //
+    // The guard sits here rather than at the call site because `backfill_direct` grew the same guard
+    // inline and this path was missed - putting it in the shared entry point covers every caller by
+    // construction. It is deliberately on the outer function, not `_inner`: the recursive halves
+    // inherit a filter that is already known non-empty, so re-checking it per split is dead work.
+    if addresses.is_empty() && topic0s.is_empty() {
+        return Box::pin(std::future::ready(Ok(Vec::new())));
+    }
     fetch_logs_splitting_inner(source, addresses, topic0s, from, to, true)
 }
 
@@ -4227,14 +4240,20 @@ mod tests {
                     .collect())
             }
         }
+        // A non-empty filter throughout: an empty address *and* topic filter short-circuits to no
+        // request at all (see `fetch_logs_splitting`), which would make every assertion below vacuous.
+        let filter = ["0xabc".to_string()];
+
         // A 100-block range against an 8-block cap splits all the way down and returns every log.
         let src = CappedSource { cap: 8 };
-        let logs = fetch_logs_splitting(&src, &[], &[], 1, 100).await.unwrap();
+        let logs = fetch_logs_splitting(&src, &filter, &[], 1, 100)
+            .await
+            .unwrap();
         assert_eq!(logs.len(), 100);
 
         // A single block that itself exceeds the cap can't be split → a clear, loud error.
         let tiny = CappedSource { cap: 0 };
-        let err = fetch_logs_splitting(&tiny, &[], &[], 42, 42)
+        let err = fetch_logs_splitting(&tiny, &filter, &[], 42, 42)
             .await
             .unwrap_err()
             .to_string();
@@ -4299,7 +4318,9 @@ mod tests {
             cap: 5,
             calls: AtomicU64::new(0),
         };
-        let logs = fetch_logs_splitting(&src, &[], &[], 1, 10)
+        // Non-empty throughout - an empty address *and* topic filter never reaches the source at all.
+        let filter = ["0xabc".to_string()];
+        let logs = fetch_logs_splitting(&src, &filter, &[], 1, 10)
             .await
             .expect("a speculative split must rescue an unclassifiable range failure");
         assert_eq!(logs.len(), 10, "every log is returned, none dropped");
@@ -4331,7 +4352,7 @@ mod tests {
         let dead = DeadSource {
             calls: AtomicU64::new(0),
         };
-        let err = fetch_logs_splitting(&dead, &[], &[], 1, 1024)
+        let err = fetch_logs_splitting(&dead, &filter, &[], 1, 1024)
             .await
             .unwrap_err()
             .to_string();
@@ -6292,6 +6313,173 @@ template = "pool"
         assert_eq!(
             expected, without_cols,
             "every other column must be identical, values included"
+        );
+    }
+
+    /// A `Source` that counts `getLogs` calls and answers `block_headers` with a real header, so a
+    /// blocks-only backfill still produces rows while the log traffic is observable.
+    struct LogCountingSource {
+        log_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LogCountingSource {
+        fn new() -> LogCountingSource {
+            LogCountingSource {
+                log_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.log_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for LogCountingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _a: &[String],
+            _t: &[String],
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.log_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        serde_json::json!({
+                            "hash": format!("0x{b:064x}"),
+                            "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                            "miner": "0x0000000000000000000000000000000000000000",
+                            "gasUsed": "0x0",
+                            "gasLimit": "0x1388",
+                            "size": "0x220",
+                            "timestamp": format!("0x{:x}", 1_700_000_000 + b),
+                            "transactions": [],
+                        }),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    /// #429: a nest with **no contract at all** must not issue a single `getLogs`, on **any** backfill
+    /// path.
+    ///
+    /// An empty address *and* topic filter is not "no logs" to a node, it is *every log on the chain* -
+    /// so a blocks-only nest (OBIB case 3) asked for the lot, per window, and discarded all of it. The
+    /// pipelined path then made it worse: an over-cap response is *split and retried*, so the mistake
+    /// amplified into a fan-out.
+    ///
+    /// Parameterised over both seal-direct paths deliberately. The guard was first written inline in
+    /// `backfill_direct` and the pipelined path - the one production actually takes for a static nest -
+    /// was missed, precisely because one path was tested and the other was not.
+    #[tokio::test]
+    async fn a_contract_free_nest_issues_no_getlogs_on_any_backfill_path() {
+        let blocks_only = DecodeRegistry::build(Vec::new()).unwrap().with_blocks(true);
+
+        // Sequential.
+        let seq_src = LogCountingSource::new();
+        let d_seq = tempfile::tempdir().unwrap();
+        let n_seq = backfill_direct(&seq_src, &blocks_only, d_seq.path(), &[], &[], 1, 20, 5)
+            .await
+            .unwrap();
+
+        // Pipelined - the path `nuthatch dev` takes for a static nest.
+        let pipe_src = LogCountingSource::new();
+        let d_pipe = tempfile::tempdir().unwrap();
+        let n_pipe = backfill_direct_pipelined(
+            &pipe_src,
+            &blocks_only,
+            d_pipe.path(),
+            &[],
+            &[],
+            1,
+            20,
+            5,
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        for (path, src, rows) in [
+            ("backfill_direct", &seq_src, n_seq),
+            ("backfill_direct_pipelined", &pipe_src, n_pipe),
+        ] {
+            assert_eq!(
+                src.calls(),
+                0,
+                "{path}: a nest with no address and no topic filter must not ask for logs at all - \
+                 an unfiltered getLogs is every log on the chain"
+            );
+            // Not an inert backfill: it still did its actual job, one row per block.
+            assert_eq!(
+                rows, 20,
+                "{path}: the blocks table must still cover every block in the range"
+            );
+        }
+
+        // Control. With a contract in the nest the same paths *do* fetch logs - without this the
+        // assertions above would pass just as well against a backfill that fetches nothing ever.
+        let with_contract = transfer_registry();
+        let addr = ["0x1111111111111111111111111111111111111111".to_string()];
+
+        let ctl_seq = LogCountingSource::new();
+        let d_ctl_seq = tempfile::tempdir().unwrap();
+        backfill_direct(
+            &ctl_seq,
+            &with_contract,
+            d_ctl_seq.path(),
+            &addr,
+            &[],
+            1,
+            20,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let ctl_pipe = LogCountingSource::new();
+        let d_ctl_pipe = tempfile::tempdir().unwrap();
+        backfill_direct_pipelined(
+            &ctl_pipe,
+            &with_contract,
+            d_ctl_pipe.path(),
+            &addr,
+            &[],
+            1,
+            20,
+            5,
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ctl_seq.calls() > 0,
+            "control: backfill_direct must fetch logs when the nest has a contract"
+        );
+        assert!(
+            ctl_pipe.calls() > 0,
+            "control: backfill_direct_pipelined must fetch logs when the nest has a contract"
         );
     }
 
