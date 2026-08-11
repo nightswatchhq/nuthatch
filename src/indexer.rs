@@ -6560,6 +6560,211 @@ template = "pool"
         );
     }
 
+    /// A `Source` with a deep backlog that records the span of every `getLogs` it is asked for, so a
+    /// test can see how wide the window controller grew. Returns no logs, which is what makes the
+    /// controller grow: `observed(0)` is its "nothing there, cover more ground" signal.
+    struct WindowRecordingSource {
+        spans: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl WindowRecordingSource {
+        fn new() -> WindowRecordingSource {
+            WindowRecordingSource {
+                spans: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn widest(&self) -> u64 {
+            self.spans
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        }
+        fn count(&self) -> usize {
+            self.spans.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for WindowRecordingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(1_000_000)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.spans.lock().unwrap().push(to - from + 1);
+            Ok(Vec::new())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        serde_json::json!({
+                            "hash": format!("0x{b:064x}"),
+                            "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                            "miner": "0x0000000000000000000000000000000000000000",
+                            "gasUsed": "0x0",
+                            "gasLimit": "0x1388",
+                            "size": "0x220",
+                            "timestamp": format!("0x{:x}", 1_700_000_000 + b),
+                            "transactions": [],
+                        }),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    /// A nest with a contract *and* `[extract] blocks = true`: one header request per block, so its
+    /// window ceiling is header cost rather than log density (RFC-0036).
+    async fn build_blocks_nest_with_contract(dir: &std::path::Path, addr: &str) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"tok\"\naddress = \"{addr}\"\nabi = \"abis/tok.json\"\n\n\
+                 [extract]\nblocks = true\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        assert!(config.extract.blocks, "the fixture must be a blocks nest");
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
+    /// Drive `index_loop` over a deep backlog and report the widest `getLogs` span it asked for.
+    async fn widest_window_over_a_backlog(nest: NestIngest) -> u64 {
+        let src = Arc::new(WindowRecordingSource::new());
+        let recorder = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            // 20,000 blocks behind a 1,000,000 tip: a real backlog, so the window controller has
+            // room to grow rather than being clipped by `.min(tip)` after one step.
+            Some(20_000),
+            false,
+            1,
+            5,
+        ));
+        // Six windows is past the point where 4x growth from a seed of 5 clears the header ceiling
+        // (5, 20, 80, 320, 1280, ...), so an uncapped controller has visibly exceeded it by here.
+        let grew = within_deadline(|| recorder.count() >= 6).await;
+        task.abort();
+        assert!(grew, "the loop must have asked for at least six windows");
+        recorder.widest()
+    }
+
+    /// The same, through `runtime_index_loop`. Worth driving separately rather than trusting the
+    /// solo loop's result: the two apply the ceiling by different mechanisms. A cursor's nest set
+    /// changes under it, so the runtime bounds each window as it is used rather than picking a
+    /// controller once, and that is the half a reviewer should be able to see fail.
+    async fn widest_runtime_window_over_a_backlog(nest: NestIngest) -> u64 {
+        let src = Arc::new(WindowRecordingSource::new());
+        let recorder = src.clone();
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![nest],
+            Some(20_000),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let grew = within_deadline(|| recorder.count() >= 6).await;
+        task.abort();
+        assert!(grew, "the cursor must have asked for at least six windows");
+        recorder.widest()
+    }
+
+    /// RFC-0036's window ceiling applies to the tip loop, not only to the three backfill paths.
+    ///
+    /// This is the other half of the #432 fix, and it is only *reachable* because of it. While a
+    /// contract-free nest was fetching every log on the chain, the enormous result count shrank the
+    /// window and hid the omission. Fetching nothing feeds `observed(0)` instead, which grows the
+    /// window 4x per step to `MAX_WINDOW` (100,000) - so fixing the filter alone would trade a
+    /// getLogs pathology for the header fan-out pathology RFC-0036 exists to prevent: one window
+    /// demanding a hundred thousand `eth_getBlockByNumber` calls, which is how OBIB case 3
+    /// rate-limited itself into partial responses.
+    ///
+    /// The control is the point of the test. A blocks nest capped at `HEADER_WINDOW_CAP` proves
+    /// nothing on its own - a loop whose window never grew would pass it too - so the same source and
+    /// the same backlog are driven with a non-blocks nest, which must grow *past* the ceiling.
+    #[tokio::test]
+    async fn the_tip_loop_caps_a_blocks_nest_window_at_the_header_ceiling() {
+        let addr = "0x1111111111111111111111111111111111111111";
+
+        let d_blocks = tempfile::tempdir().unwrap();
+        let blocks_nest = build_blocks_nest_with_contract(d_blocks.path(), addr).await;
+        let blocks_widest = widest_window_over_a_backlog(blocks_nest).await;
+
+        let d_plain = tempfile::tempdir().unwrap();
+        let plain_nest = build_test_nest(d_plain.path(), addr).await;
+        let plain_widest = widest_window_over_a_backlog(plain_nest).await;
+
+        let d_rt_blocks = tempfile::tempdir().unwrap();
+        let rt_blocks_nest = build_blocks_nest_with_contract(d_rt_blocks.path(), addr).await;
+        let rt_blocks_widest = widest_runtime_window_over_a_backlog(rt_blocks_nest).await;
+
+        let d_rt_plain = tempfile::tempdir().unwrap();
+        let rt_plain_nest = build_test_nest(d_rt_plain.path(), addr).await;
+        let rt_plain_widest = widest_runtime_window_over_a_backlog(rt_plain_nest).await;
+
+        assert!(
+            blocks_widest <= crate::chunker::HEADER_WINDOW_CAP,
+            "a blocks nest pays one header request per block, so the tip loop must not grow its \
+             window past {} - grew to {blocks_widest}",
+            crate::chunker::HEADER_WINDOW_CAP
+        );
+        assert!(
+            plain_widest > crate::chunker::HEADER_WINDOW_CAP,
+            "control: the same loop on a non-blocks nest must grow past {} - only got to \
+             {plain_widest}, so the assertion above is about a window that never grew",
+            crate::chunker::HEADER_WINDOW_CAP
+        );
+        assert!(
+            rt_blocks_widest <= crate::chunker::HEADER_WINDOW_CAP,
+            "the runtime cursor must cap a live blocks nest's window at {} - grew to \
+             {rt_blocks_widest}",
+            crate::chunker::HEADER_WINDOW_CAP
+        );
+        assert!(
+            rt_plain_widest > crate::chunker::HEADER_WINDOW_CAP,
+            "control: the runtime cursor on a non-blocks nest must grow past {} - only got to \
+             {rt_plain_widest}",
+            crate::chunker::HEADER_WINDOW_CAP
+        );
+    }
+
     /// Wait for `f` to hold, or give up after 20s. The tip loops never return, so every assertion
     /// about them is really an assertion about what has happened *by* some point.
     async fn within_deadline(mut f: impl FnMut() -> bool) -> bool {
