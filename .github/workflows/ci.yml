@@ -30,8 +30,15 @@ jobs:
       # reading survives the failure it explains.
       #
       # Deliberately not `$AGENT_TOOLSDIRECTORY`: the hosted tool cache is where the runner keeps
-      # tooling other steps may resolve through, and the four directories below are ~25 GB on their
+      # tooling other steps may resolve through, and the four directories below are enough on their
       # own. Reclaiming disk must not be able to break the job it is protecting.
+      #
+      # Measured on this job (run 31519107067), so the next person reads figures rather than deriving
+      # them: 145G disk, 75G used after the cache restore; the reclaim below frees 16G; the four
+      # build steps then take it to 128G used, finishing on 18G free. The job's own footprint is
+      # ~69G against the 70G the runner offered before the reclaim - which is the whole of #464, and
+      # why it read as a flake: at that margin a couple of GB of cache variance decides it. There is
+      # now room for the builds to grow by about a quarter before this is back at the cliff.
       - name: reclaim runner disk
         run: |
           df -h /
