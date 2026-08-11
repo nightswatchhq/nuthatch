@@ -279,13 +279,16 @@ async fn nest_with_a_sealed_range(
 /// guard was never in a position to be wrong and the columnar layer's append-only claim was
 /// unexercised - unproven rather than false, which is this sprint's whole point.
 ///
-/// The forks here are all **strictly above** the watermark, so the block they roll back to is still
-/// hot and its checkpoint still exists. `fork == 8` - exactly the watermark - is the case the guard's
-/// own rule permits and the implementation refuses; it is issue #461 and lives in the `#[ignore]`d
-/// test below rather than here, because it fails today.
+/// The forks here are the ones the ancestor-walk can actually resolve above the watermark: this
+/// fixture's surviving checkpoints are `[14, 10, 2]`, so a fork at 11 or 13 leaves checkpoint 10
+/// canonical and `rollback_reorg` is handed 10, which is above `sealed_through = 8`.
+///
+/// A fork at 9 is *also* strictly above the watermark and still halts, because the walk can only
+/// answer at a checkpoint it holds and the next one down is 2. That is issue #461, and it lives in
+/// the `#[ignore]`d test below rather than here, because it fails today.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
-    for fork in [9u64, 11, 13] {
+    for fork in [11u64, 13] {
         let dir = tempfile::tempdir().unwrap();
         let tape = Arc::new(TapeSource::new());
         let (rt, store, before) = nest_with_a_sealed_range(dir.path(), &tape).await;
@@ -319,9 +322,13 @@ async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
             };
             panic!(
                 "fork={fork}: a reorg above the sealed watermark must still converge, not halt. \
-                 last_block={:?} sealed_through={} {halted}",
+                 last_block={:?} sealed_through={} checkpoints={:?} {halted}",
                 store.get_meta("last_block").ok().flatten(),
                 store.sealed_through(),
+                store.checkpoints_desc().map(|c| c
+                    .into_iter()
+                    .map(|(b, _)| b)
+                    .collect::<Vec<_>>()),
             );
         }
 
@@ -343,32 +350,38 @@ async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
 /// **Issue #461 - the repro, and it fails.** `#[ignore]`d so the build stays honest rather than red;
 /// remove the attribute to watch it.
 ///
-/// A reorg forking at *exactly* the sealed watermark rewrites only hot, unsealed blocks, and the
-/// guard in `rollback_reorg` (`ancestor < sealed_through`) permits it by its own arithmetic. It halts
-/// anyway. Sealing prunes the sealed range's checkpoints out of the hot store, and `detect_reorg`
-/// resolves the ancestor as "the newest checkpoint I still hold that is canonical" - which after
-/// pruning is not the newest canonical *block*. On this fixture the true fork is 8 and the walk
-/// returns **2**, so the guard is handed an under-estimate and reads a finality violation into a
-/// reorg that never went near finality.
+/// The fork is block 9, *strictly above* the sealed watermark of 8. Blocks 10..=14 are rewritten and
+/// every one of them is hot and unsealed, so this is squarely inside the mutable range the reorg
+/// model exists to repair. It halts anyway.
 ///
-/// It is left failing deliberately. #291 asked for the depths we had not tried, and this is one of
-/// them answering wrongly rather than not being asked - which is worth more as a standing repro than
-/// as a test quietly narrowed to the depths that already worked.
+/// The cause is not the guard, which is correct about the number it is handed. It is that
+/// `detect_reorg` can only answer at a **checkpoint it holds**, and checkpoints are sparse - one per
+/// processed window, not one per block. This fixture's are `[14, 10, 2]`. Fork 9 invalidates 14 and
+/// 10, so the walk falls through to 2 and returns that as the common ancestor. `rollback_reorg` then
+/// reads `2 < 8` and terminally faults with "a finality violation this indexer cannot repair",
+/// naming a watermark the reorg never approached.
+///
+/// The under-estimate is harmless *without* sealing - rolling back further than necessary just
+/// re-indexes - which is exactly why the existing proptest never caught it: it ran entirely with
+/// `sealed_through == 0`. Sealing is what turns a conservative answer into a fatal one.
+///
+/// Left failing deliberately. #291 asked for the depths we had not tried, and this is one of them
+/// answering wrongly rather than not being asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "issue #461: a reorg forking at the sealed watermark halts instead of converging"]
-async fn a_reorg_forking_at_the_sealed_watermark_should_not_halt() {
+#[ignore = "issue #461: a reorg above the sealed watermark halts when the ancestor-walk cannot resolve above it"]
+async fn a_reorg_above_the_sealed_watermark_should_not_halt() {
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     let (rt, store, before) = nest_with_a_sealed_range(dir.path(), &tape).await;
     assert_eq!(
         store.sealed_through(),
         8,
-        "the fixture's premise: the watermark this reorg forks at"
+        "the fixture's premise: the watermark this reorg stays above"
     );
 
-    // Fork at the watermark itself: blocks 9..=14 are rewritten, all of them hot and none sealed.
-    let replacement: Vec<BlockFixture> = (9..=14).map(replacement_block).collect();
-    tape.reorg(8, replacement);
+    // Fork at 9, above the watermark: blocks 10..=14 are rewritten, all hot and none sealed.
+    let replacement: Vec<BlockFixture> = (10..=14).map(replacement_block).collect();
+    tape.reorg(9, replacement);
 
     let want_hash = block_hash(14, 1);
     let converged = wait_until(POLL_TIMEOUT, || {
@@ -392,9 +405,12 @@ async fn a_reorg_forking_at_the_sealed_watermark_should_not_halt() {
     };
     assert!(
         converged,
-        "a reorg forking at the sealed watermark rewrites only hot blocks and must converge. \
-         sealed_through={} {halted}",
+        "a reorg above the sealed watermark rewrites only hot blocks and must converge. \
+         sealed_through={} checkpoints={:?} {halted}",
         store.sealed_through(),
+        store
+            .checkpoints_desc()
+            .map(|c| c.into_iter().map(|(b, _)| b).collect::<Vec<_>>()),
     );
     assert_eq!(
         sealed_bytes(dir.path()),
