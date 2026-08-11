@@ -293,7 +293,10 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
         .prepare(sql)
         .context("failed to prepare query")
         .map_err(Died::Binding)?;
-    let mut rows = stmt.query([]).context("query failed").map_err(Died::Executing)?;
+    let mut rows = stmt
+        .query([])
+        .context("query failed")
+        .map_err(Died::Executing)?;
     // Column metadata is only materialised once the statement has executed - read it off the
     // executed result, not the prepared statement.
     let column_names: Vec<String> = rows
@@ -2539,8 +2542,7 @@ template="pool"
         let mut bytes = std::fs::read(path).unwrap();
         let len = bytes.len();
         assert!(len > 12 && &bytes[..4] == b"PAR1" && &bytes[len - 4..] == b"PAR1");
-        let footer_len =
-            u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
         let end = len - 8 - footer_len;
         assert!(end > 4, "the fixture must have a data region to corrupt");
         bytes[4..end].fill(0xFF);
@@ -2562,8 +2564,8 @@ template="pool"
     /// If it did not, this test would be a second copy of the #430 test wearing a different name, and
     /// would pass with the #433 mechanism deleted.
     #[test]
-    fn a_page_corrupt_segment_with_an_intact_footer_reduces_the_table_rather_than_failing_the_query()
-    {
+    fn a_page_corrupt_segment_with_an_intact_footer_reduces_the_table_rather_than_failing_the_query(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         // A schema, for the reason the #419 test above gives: it makes "rebuilt from the good segment"
         // distinguishable from "rebuilt from nothing".
