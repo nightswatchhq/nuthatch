@@ -19,6 +19,24 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # This job compiles four full artifact sets into one `target/` - clippy and test, each of them
+      # twice for `exex` - and the last of them ran the runner out of disk: `ld` died with
+      # `signal 7 [Bus error]` linking a test binary, twice on the same commit (#464, on PR #448).
+      # SIGBUS is what a write to a full filesystem looks like through a memory-mapped output file,
+      # so the remedy is headroom rather than a re-run, and a re-run is what it invites.
+      #
+      # The `df` lines are the load-bearing half. Nothing in this job measured the disk, so the first
+      # failure had to be *inferred* from the signal - and the second one too. `if: always()` so the
+      # reading survives the failure it explains.
+      #
+      # Deliberately not `$AGENT_TOOLSDIRECTORY`: the hosted tool cache is where the runner keeps
+      # tooling other steps may resolve through, and the four directories below are ~25 GB on their
+      # own. Reclaiming disk must not be able to break the job it is protecting.
+      - name: reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
       - name: fmt
         run: cargo fmt --check
       - name: clippy
@@ -32,6 +50,11 @@ jobs:
         run: cargo test --locked
       - name: test (exex)
         run: cargo test --features exex --locked
+      # What was left when the longest step finished, or when it died. A job that can fail of
+      # exhaustion has to report what it had, or the next failure is guessed at like the last two.
+      - name: disk after the builds
+        if: always()
+        run: df -h /
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
