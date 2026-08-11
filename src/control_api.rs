@@ -22,12 +22,20 @@
 //! `NUTHATCH_CONTROL_TOKEN`, and **refuses to start without one**. A control plane is strictly more
 //! dangerous than the read API - it decides what the fleet runs - so an unauthenticated one on a
 //! public interface is not a warning, it is a refusal.
+//!
+//! The guard is a [`route_layer`](Router::route_layer) over every route except `/health`, so a route
+//! is authenticated by virtue of being registered there. It used to be four lines at the top of each
+//! handler, which made "every route is guarded" a claim ten separate copies had to keep - and the
+//! test that asserted it named five of them, leaving the secrets API's guard deletable with the suite
+//! green until #412 completed the list.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -98,8 +106,19 @@ struct UnplaceableView {
 /// nest with no views, so an unestimated nest is costed as a small one rather than a free one.
 const DEFAULT_NEST_RSS_MB: u64 = 90;
 
-fn authed(api: &Api, q: &TokenQuery, headers: &HeaderMap) -> bool {
-    crate::serve::token_ok(api.token.as_deref(), q.token.as_deref(), headers)
+/// The token guard, applied to the whole API rather than repeated inside it.
+///
+/// Sits under `route_layer`, so it runs only for routes this router actually matches: an unknown path
+/// still 404s without being told whether a token would have helped.
+async fn require_token(State(api): State<Api>, req: Request, next: Next) -> Response {
+    let from_query = Query::<TokenQuery>::try_from_uri(req.uri())
+        .ok()
+        .and_then(|Query(q)| q.token);
+    if crate::serve::token_ok(api.token.as_deref(), from_query.as_deref(), req.headers()) {
+        next.run(req).await
+    } else {
+        unauthorised().into_response()
+    }
 }
 
 fn unauthorised() -> (StatusCode, Json<serde_json::Value>) {
@@ -109,14 +128,7 @@ fn unauthorised() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-async fn list_nests(
-    State(api): State<Api>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
+async fn list_nests(State(api): State<Api>) -> (StatusCode, Json<serde_json::Value>) {
     match api.cp.desired() {
         Ok(nests) => (
             StatusCode::OK,
@@ -133,13 +145,8 @@ async fn list_nests(
 
 async fn declare(
     State(api): State<Api>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
     Json(body): Json<DeclareBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     let nest = DesiredNest {
         name: body.name,
         chain: body.chain,
@@ -169,12 +176,7 @@ async fn declare(
 async fn undeclare(
     State(api): State<Api>,
     Path(name): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.undeclare_nest(&name) {
         Ok(true) => (
             StatusCode::OK,
@@ -192,14 +194,7 @@ async fn undeclare(
     }
 }
 
-async fn list_workers(
-    State(api): State<Api>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
+async fn list_workers(State(api): State<Api>) -> (StatusCode, Json<serde_json::Value>) {
     match api.cp.live_workers(DEFAULT_WORKER_TTL_SECS) {
         Ok(ws) => (
             StatusCode::OK,
@@ -215,14 +210,7 @@ async fn list_workers(
     }
 }
 
-async fn current_plan(
-    State(api): State<Api>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
+async fn current_plan(State(api): State<Api>) -> (StatusCode, Json<serde_json::Value>) {
     let (desired, workers) = match (
         api.cp.desired(),
         api.cp.live_workers(DEFAULT_WORKER_TTL_SECS),
@@ -277,13 +265,8 @@ async fn current_plan(
 async fn pin(
     State(api): State<Api>,
     Path(name): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
     Json(body): Json<PinBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.pin_version(&name, &body.version, &body.bundle_hash) {
         Ok(true) => (
             StatusCode::OK,
@@ -310,12 +293,7 @@ async fn pin(
 async fn resolve(
     State(api): State<Api>,
     Path(name): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.resolve(&name) {
         Ok(Some(r)) => (
             StatusCode::OK,
@@ -341,13 +319,8 @@ async fn resolve(
 async fn put_secret(
     State(api): State<Api>,
     Path(nest): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
     Json(body): Json<SecretBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.set_secret(&nest, &body.key, &body.value) {
         Ok(()) => (
             StatusCode::OK,
@@ -368,12 +341,7 @@ async fn put_secret(
 async fn list_secret_keys(
     State(api): State<Api>,
     Path(nest): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.secret_keys(&nest) {
         Ok(keys) => (
             StatusCode::OK,
@@ -386,12 +354,7 @@ async fn list_secret_keys(
 async fn drop_secret(
     State(api): State<Api>,
     Path((nest, key)): Path<(String, String)>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !authed(&api, &q, &headers) {
-        return unauthorised();
-    }
     match api.cp.delete_secret(&nest, &key) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": key }))),
         Ok(false) => (
@@ -410,10 +373,13 @@ fn internal(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// The router, exposed so tests can drive it without binding a port.
+///
+/// Everything except `/health` is registered on `guarded`, which carries [`require_token`]. Adding a
+/// route there is the whole of authenticating it; the only way to ship an open one is to register it
+/// outside that block, next to the route whose doc comment says it is unauthenticated on purpose.
 pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
     let api = Api { cp, token };
-    Router::new()
-        .route("/health", get(|| async { "ok" }))
+    let guarded = Router::new()
         .route("/nests", get(list_nests).post(declare))
         .route("/nests/{name}", delete(undeclare))
         .route("/nests/{name}/resolve", get(resolve))
@@ -425,6 +391,13 @@ pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
         .route("/nests/{name}/secrets/{key}", delete(drop_secret))
         .route("/workers", get(list_workers))
         .route("/plan", get(current_plan))
+        .route_layer(middleware::from_fn_with_state(api.clone(), require_token));
+
+    Router::new()
+        // Unauthenticated on purpose: a load balancer must be able to probe it, and it reveals
+        // nothing about the fleet. The only route outside `guarded`.
+        .route("/health", get(|| async { "ok" }))
+        .merge(guarded)
         .with_state(api)
 }
 
