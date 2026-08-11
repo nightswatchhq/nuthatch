@@ -250,6 +250,101 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
     }
 }
 
+/// The **serving-path** counterpart to [`verify_and_quarantine`]: which of `dir`'s manifest segments
+/// no longer hash to their content address. Returns their hashes, for `analytics::define_views` to
+/// drop from a rebuilt view (issue #433).
+///
+/// ## Why the hash and not a DuckDB probe
+///
+/// #430 drops a segment that will not **bind**, probing with `conn.prepare` over `read_parquet`. That
+/// catches footer corruption and nothing else. Measured in the DuckDB CLI (1.5.3) against a segment
+/// whose data region is overwritten but whose footer is intact:
+///
+/// - `SELECT 1 FROM read_parquet([f]) LIMIT 0` - the #430 probe - **succeeds**;
+/// - `count(*)` and `max(col)` **succeed**, answered from Parquet metadata without reading a page;
+/// - `SELECT * … LIMIT 1` fails on that file, and **succeeds** on one where only the late row groups
+///   are corrupt, because it never reads them.
+///
+/// So the only sound DuckDB-side discriminator is a full scan of every column of every segment, and
+/// it would be pinned to whatever the query planner prunes this release. The content address is not:
+/// sealed segments are immutable, so any changed byte is unambiguous corruption, and this is already
+/// the check `verify_and_quarantine` makes at startup. Using the same one here is what stops the
+/// serving path and the startup path disagreeing about the same file, which was half of #419.
+///
+/// **Reduce here, never quarantine.** Quarantine moves bytes, and the shared store's bytes belong to
+/// every dataset referencing them (RFC-0033 §11a). Dropping a segment from one query's view changes
+/// nothing on disk and so is safe for a shared segment, which is why this returns hashes rather than
+/// calling the startup pass.
+///
+/// ## Cost, and why it is memoised
+///
+/// `/sql` is untrusted, and the caller chooses the query. Without a memo, any caller who can provoke
+/// an execution-phase error - `SELECT CAST(col AS INT)` over text is enough - would make the process
+/// read and hash every segment in the nest, once per request. That is a denial-of-service amplifier
+/// built out of an integrity check.
+///
+/// The memo is keyed on the path's `(mtime, len)`, so a segment already verified in this process is a
+/// `stat` rather than a read. Sealed segments never change, so the entry is valid until something
+/// rewrites the file - which is exactly the event that must invalidate it. The bound is therefore one
+/// full hash per segment per process, not per request.
+pub fn segments_failing_verification(dir: &Path) -> BTreeSet<String> {
+    static VERIFIED: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, (u128, u64, bool)>>,
+    > = std::sync::OnceLock::new();
+    let memo = VERIFIED.get_or_init(Default::default);
+
+    let Ok(manifest) = load_manifest(dir) else {
+        return BTreeSet::new();
+    };
+    let mut bad = BTreeSet::new();
+    for (table, segs) in &manifest.tables {
+        for s in segs {
+            let path = segment_path(dir, &s.file, &s.hash);
+            // An absent file is not corruption, and `define_views` already skips it by existence.
+            let Ok(md) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let stamp = (
+                md.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                md.len(),
+            );
+            let cached = memo
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&path).copied())
+                .filter(|(m, l, _)| (*m, *l) == stamp)
+                .map(|(_, _, intact)| intact);
+            let intact = match cached {
+                Some(intact) => intact,
+                None => {
+                    // An unreadable segment is not intact: it cannot serve rows either way, and saying
+                    // "fine" about a file we could not read is the failure this whole issue is about.
+                    let intact = std::fs::read(&path)
+                        .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash);
+                    if let Ok(mut g) = memo.lock() {
+                        g.insert(path.clone(), (stamp.0, stamp.1, intact));
+                    }
+                    intact
+                }
+            };
+            if !intact {
+                tracing::error!(
+                    "segment {} for table {table} does not match its content address - dropping it \
+                     from this query (cold data reduced). Restart to quarantine it, or re-seal the \
+                     range to restore it.",
+                    s.file
+                );
+                bad.insert(s.hash.clone());
+            }
+        }
+    }
+    bad
+}
+
 /// Startup integrity pass: verify every manifest segment's file exists and its bytes hash to the
 /// recorded content address. A file that's missing, unreadable, or hash-mismatched is corrupt or
 /// tampered with - quarantine it (move to a sibling `quarantine/` dir so `define_views` skips it) and
