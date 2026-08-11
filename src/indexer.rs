@@ -19,7 +19,7 @@ use crate::rpc::RpcClient;
 use crate::screen::{self, LiveScreener, TransferRow};
 use crate::seal;
 use crate::serve;
-use crate::source::Source;
+use crate::source::{LogFilter, Source};
 use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
@@ -651,7 +651,13 @@ async fn refetch_address_filtered(
     let empty_ts = std::collections::HashMap::new();
     let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
     let mut all: Vec<crate::rpc::Log> = Vec::new();
-    let mut batch = source.logs(addresses, topics, block, block).await?;
+    // COR-5 recovery narrows a wide fetch to `base u discovered children`, so it always has an
+    // address half; the `?` on a filter that cannot be built would be a bug in that reasoning rather
+    // than a runtime condition, and the caller only reaches here with addresses to narrow to.
+    let Some(filter) = LogFilter::new(addresses, topics) else {
+        return Ok(Vec::new());
+    };
+    let mut batch = source.logs(&filter, block, block).await?;
     loop {
         let mut new: Vec<String> = Vec::new();
         for &i in live {
@@ -674,7 +680,12 @@ async fn refetch_address_filtered(
         for c in &new {
             fetched.insert(c.to_ascii_lowercase());
         }
-        batch = source.logs(&new, topics, block, block).await?;
+        // `new` is non-empty here (the loop returns above when it is not), so the narrowed child
+        // fetch always carries an address filter.
+        let Some(child_filter) = LogFilter::new(&new, topics) else {
+            return Ok(all);
+        };
+        batch = source.logs(&child_filter, block, block).await?;
     }
 }
 
@@ -1387,7 +1398,18 @@ async fn runtime_index_loop(
             sleep_secs(2).await;
             continue;
         }
-        let to = (global_next + chunker.window() - 1).min(tip);
+        // A blocks nest pays one header request per block, so a window that is cheap in logs can still
+        // be ruinous in headers (RFC-0036). The backfill paths pick their controller once, from a
+        // single registry; a cursor's nest set changes under it as mounts arrive and retire, so the
+        // ceiling is applied per window instead - a blocks nest mounted an hour in must not inherit a
+        // window that grew to `MAX_WINDOW` while only log-shaped nests were live. Bounding the *use*
+        // rather than the controller also means the ceiling lifts by itself when that nest retires.
+        let window_cap = if live.iter().any(|&i| live_ref(&nests, i).registry.blocks()) {
+            crate::chunker::HEADER_WINDOW_CAP
+        } else {
+            u64::MAX
+        };
+        let to = (global_next + chunker.window().min(window_cap) - 1).min(tip);
 
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
@@ -1396,7 +1418,18 @@ async fn runtime_index_loop(
             let n = live_ref(&nests, i);
             (n.addresses.as_slice(), n.topic0s.as_slice())
         }));
-        match source.logs(&u_addrs, &u_topics, global_next, to).await {
+        // The union of a set of nests that are all contract-free is empty on both halves, which is not
+        // "no logs" but *every log on the chain* - and unlike the backfill instance of this defect, a
+        // tip loop asks forever, every couple of seconds, for as long as the cursor runs (#432).
+        // `LogFilter::new` is what makes that unaskable; the `None` arm is this site deciding what
+        // "nothing to ask for" means, which here is an empty window that still gets processed - block
+        // rows for a `blocks` nest are derived from the window, not from the logs.
+        let filter = LogFilter::new(&u_addrs, &u_topics);
+        let fetched = match &filter {
+            Some(f) => source.logs(f, global_next, to).await,
+            None => Ok(Vec::new()),
+        };
+        match fetched {
             Ok(logs) => {
                 chunker.observed(logs.len() as u64);
                 fan_out_window(
@@ -2175,10 +2208,12 @@ pub async fn backfill_direct(
         // 3: no contract at all) would otherwise request for every window and then discard, since
         // no log can decode without a matching address or topic. Public endpoints answer that with
         // a timeout rather than data.
-        let logs = if addresses.is_empty() && topic0s.is_empty() {
-            Vec::new()
-        } else {
-            match source.logs(addresses, topic0s, next, chunk_to).await {
+        //
+        // The condition used to be spelled out here, and separately at each other fetch. It is now
+        // `LogFilter::new` returning `None` (#432), so the sites that forgot it cannot.
+        let logs = match LogFilter::new(addresses, topic0s) {
+            None => Vec::new(),
+            Some(filter) => match source.logs(&filter, next, chunk_to).await {
                 Ok(logs) => {
                     chunker.observed(logs.len() as u64);
                     logs
@@ -2193,7 +2228,7 @@ pub async fn backfill_direct(
                     continue; // retry the same `next` with a smaller window
                 }
                 Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
-            }
+            },
         };
         let mut rows: Vec<_> = logs
             .iter()
@@ -2301,26 +2336,19 @@ fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64>
 
 fn fetch_logs_splitting<'a>(
     source: &'a dyn Source,
-    addresses: &'a [String],
-    topic0s: &'a [String],
+    filter: &'a LogFilter,
     from: u64,
     to: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
 {
-    // Nothing to decode means nothing to ask for. An empty address AND topic filter is not "no logs"
-    // to a node - it is *every log on the chain*, which a blocks-only nest (OBIB case 3: no contract
-    // at all) would otherwise request per window and then discard, since no log can decode without a
-    // matching address or topic. Worse here than in `backfill_direct`: the response trips the
-    // provider's result cap and the splitting below then *amplifies* it into a fan-out of retries.
-    //
-    // The guard sits here rather than at the call site because `backfill_direct` grew the same guard
-    // inline and this path was missed - putting it in the shared entry point covers every caller by
-    // construction. It is deliberately on the outer function, not `_inner`: the recursive halves
-    // inherit a filter that is already known non-empty, so re-checking it per split is dead work.
-    if addresses.is_empty() && topic0s.is_empty() {
-        return Box::pin(std::future::ready(Ok(Vec::new())));
-    }
-    fetch_logs_splitting_inner(source, addresses, topic0s, from, to, true)
+    // The empty-filter guard that used to stand here is gone because it moved into the type: a
+    // `LogFilter` cannot be empty on both halves, so this function can no longer be handed the request
+    // for every log on the chain. Holding the guard here was already the second attempt at it - the
+    // first lived inline in `backfill_direct` and missed this path, and this one in turn missed both
+    // tip loops (#432). The caller now decides what "nothing to ask for" means, at the point where it
+    // has the context to decide it, and the amplification risk this comment used to warn about (a
+    // capped response fanning out into a tree of retries below) is unreachable rather than guarded.
+    fetch_logs_splitting_inner(source, filter, from, to, true)
 }
 
 /// The body of [`fetch_logs_splitting`], plus whether a *speculative* split is still allowed for an
@@ -2342,15 +2370,14 @@ fn fetch_logs_splitting<'a>(
 /// genuine size failure re-triggers the *classified* path on the halves anyway, which recurses properly.
 fn fetch_logs_splitting_inner<'a>(
     source: &'a dyn Source,
-    addresses: &'a [String],
-    topic0s: &'a [String],
+    filter: &'a LogFilter,
     from: u64,
     to: u64,
     speculative: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
 {
     Box::pin(async move {
-        match source.logs(addresses, topic0s, from, to).await {
+        match source.logs(filter, from, to).await {
             Ok(logs) => Ok(logs),
             Err(e) if chunker::is_result_too_large(&e) => {
                 if from >= to {
@@ -2363,11 +2390,9 @@ fn fetch_logs_splitting_inner<'a>(
                 let split_at =
                     suggested_split_point(&e, from, to).unwrap_or(from + (to - from) / 2);
                 let mut left =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, from, split_at, true)
-                        .await?;
+                    fetch_logs_splitting_inner(source, filter, from, split_at, true).await?;
                 let right =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, split_at + 1, to, true)
-                        .await?;
+                    fetch_logs_splitting_inner(source, filter, split_at + 1, to, true).await?;
                 left.extend(right);
                 Ok(left)
             }
@@ -2377,11 +2402,8 @@ fn fetch_logs_splitting_inner<'a>(
                 tracing::debug!(
                     "getLogs {from}..={to} failed unclassifiably ({e:#}); trying one speculative split"
                 );
-                let left =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, from, mid, false).await;
-                let right =
-                    fetch_logs_splitting_inner(source, addresses, topic0s, mid + 1, to, false)
-                        .await;
+                let left = fetch_logs_splitting_inner(source, filter, from, mid, false).await;
+                let right = fetch_logs_splitting_inner(source, filter, mid + 1, to, false).await;
                 match (left, right) {
                     (Ok(mut l), Ok(r)) => {
                         tracing::info!(
@@ -2448,14 +2470,13 @@ where
 /// exactly what building the Uniswap-v3 nest surfaced.
 async fn logs_with_retry(
     source: &dyn Source,
-    addresses: &[String],
-    topic0s: &[String],
+    filter: &LogFilter,
     from: u64,
     to: u64,
 ) -> Result<Vec<crate::rpc::Log>> {
     let mut attempt = 1usize;
     loop {
-        match source.logs(addresses, topic0s, from, to).await {
+        match source.logs(filter, from, to).await {
             Ok(l) => return Ok(l),
             // A result cap is not transient - hand it back so the caller shrinks the window.
             Err(e) if chunker::is_result_too_large(&e) => return Err(e),
@@ -2533,6 +2554,10 @@ pub async fn backfill_direct_pipelined(
     // makes the whole backfill future carry a higher-ranked lifetime that `tokio::spawn` cannot
     // satisfy - which shows up far from here, as a "one type is more general than the other" error on
     // the `index_loop` spawn.
+    // Built once for the whole backfill: the filter is fixed for the run, and `LogFilter::new`
+    // returning `None` is the contract-free nest that must not fetch at all (#432).
+    let filter = LogFilter::new(addresses, topic0s);
+    let filter = &filter;
     let windows = futures::stream::unfold((from, chunker.clone()), move |(next, ch)| async move {
         if next > to {
             return None;
@@ -2550,13 +2575,21 @@ pub async fn backfill_direct_pipelined(
             // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
             // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
             // blip) so one bad window doesn't abort the run.
-            let logs = retry_transient(
-                &format!("seal-direct getLogs {w_from}..={w_to}"),
-                BACKFILL_RETRY_ATTEMPTS,
-                BACKFILL_RETRY_BASE,
-                || fetch_logs_splitting(source, addresses, topic0s, w_from, w_to),
-            )
-            .await?;
+            let logs = match &filter {
+                // Nothing to match on either half means nothing to ask for - and asking anyway is
+                // asking for every log on the chain (#432). The window still flows through the rest
+                // of the pipeline, because a `blocks` nest derives its rows from the window itself.
+                None => Vec::new(),
+                Some(f) => {
+                    retry_transient(
+                        &format!("seal-direct getLogs {w_from}..={w_to}"),
+                        BACKFILL_RETRY_ATTEMPTS,
+                        BACKFILL_RETRY_BASE,
+                        || fetch_logs_splitting(source, f, w_from, w_to),
+                    )
+                    .await?
+                }
+            };
             // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
             // log that matches no decoder still costs bytes on the wire and still counts against the
             // provider's result cap. Feeding it `rows.len()` would make a nest with a narrow event
@@ -2723,19 +2756,28 @@ pub async fn backfill_direct_factory(
         if use_topic0 {
             // Topic0-only: every matching log (contract + all children) is in hand in one fetch, so
             // there is no second pass; `decode_window` filters locally by registry membership.
-            all_logs = match logs_with_retry(source, &[], topic0s, next, chunk_to).await {
-                Ok(l) => {
-                    chunker.observed(l.len() as u64);
-                    l
-                }
-                Err(e) if chunker::is_result_too_large(&e) => {
-                    if next >= chunk_to {
-                        return Err(e).with_context(|| single_block_over_cap(next));
+            // A factory nest with no events declared has nothing to match on either half, and asking
+            // for that asks for every log on the chain (#432). An empty window falls through to the
+            // per-window tail unchanged, as it does in `backfill_direct`: the decode below discovers
+            // nothing from no logs, and the seal/progress bookkeeping still has to run.
+            all_logs = match LogFilter::new(&[], topic0s) {
+                None => Vec::new(),
+                Some(wide) => match logs_with_retry(source, &wide, next, chunk_to).await {
+                    Ok(l) => {
+                        chunker.observed(l.len() as u64);
+                        l
                     }
-                    chunker.too_large();
-                    continue;
-                }
-                Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
+                    Err(e) if chunker::is_result_too_large(&e) => {
+                        if next >= chunk_to {
+                            return Err(e).with_context(|| single_block_over_cap(next));
+                        }
+                        chunker.too_large();
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
+                    }
+                },
             };
             let _ = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
         } else {
@@ -2748,19 +2790,27 @@ pub async fn backfill_direct_factory(
                     current.push(c.to_string());
                 }
             }
-            let logs1 = match logs_with_retry(source, &current, topic0s, next, chunk_to).await {
-                Ok(l) => {
-                    chunker.observed(l.len() as u64);
-                    l
-                }
-                Err(e) if chunker::is_result_too_large(&e) => {
-                    if next >= chunk_to {
-                        return Err(e).with_context(|| single_block_over_cap(next));
+            // No base contract, no child discovered yet and no topic0 either: nothing this chunk
+            // could match, and the unfiltered fetch it would otherwise issue means every log on the
+            // chain (#432). Empty window, same fall-through as above.
+            let logs1 = match LogFilter::new(&current, topic0s) {
+                None => Vec::new(),
+                Some(pass1) => match logs_with_retry(source, &pass1, next, chunk_to).await {
+                    Ok(l) => {
+                        chunker.observed(l.len() as u64);
+                        l
                     }
-                    chunker.too_large();
-                    continue; // retry the same range with a smaller window
-                }
-                Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
+                    Err(e) if chunker::is_result_too_large(&e) => {
+                        if next >= chunk_to {
+                            return Err(e).with_context(|| single_block_over_cap(next));
+                        }
+                        chunker.too_large();
+                        continue; // retry the same range with a smaller window
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
+                    }
+                },
             };
             all_logs = logs1;
             // Decode to discover children (rows discarded here; the authoritative decode is below once
@@ -2781,7 +2831,11 @@ pub async fn backfill_direct_factory(
                 for c in &new {
                     fetched.insert(c.to_ascii_lowercase());
                 }
-                let more = logs_with_retry(source, &new, topic0s, next, chunk_to)
+                // `new` is non-empty two lines up, so the filter has an address half and cannot be
+                // the every-log-on-the-chain request that `LogFilter` refuses to build.
+                let child_filter = LogFilter::new(&new, topic0s)
+                    .expect("child filter has a non-empty address list");
+                let more = logs_with_retry(source, &child_filter, next, chunk_to)
                     .await
                     .with_context(|| format!("getLogs (children) {next}..={chunk_to}"))?;
                 let _ = decode_window(registry, Some(factory), children, &more, &empty_ts);
@@ -3419,7 +3473,20 @@ async fn index_loop(
         .await?;
 
     // Adaptive getLogs sizing (RFC-0004 §2), seeded from the chain's default window.
-    let mut chunker = AdaptiveWindow::for_window(window);
+    //
+    // A blocks nest pays one header request per *block*, so its ceiling is header cost rather than log
+    // density (RFC-0036) - the same branch all three backfill paths take. This loop did not, and the
+    // omission only became reachable with the #432 fix above: while a contract-free nest was fetching
+    // every log on the chain, the enormous count shrank the window and hid this. Fetching nothing feeds
+    // `observed(0)` instead, which grows 4x per window to `MAX_WINDOW` (100,000) and would ask for a
+    // hundred thousand headers in one window - trading a getLogs pathology for the header fan-out
+    // pathology RFC-0036 exists to prevent. Capped, `observed(0)` settles at `HEADER_WINDOW_CAP`, which
+    // is the intended steady state for a nest whose windows are all zero-log by construction.
+    let mut chunker = if nest.registry.blocks() {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    };
     // Live catch-up feedback (RFC-0015 slice 3): a single progress line while the hot loop chases
     // the tip for the *first* time, ending on a crisp "caught up". `None` until there's actually a
     // backlog to report; `caught_up` latches after the first catch-up so steady-state tip-following
@@ -3466,7 +3533,17 @@ async fn index_loop(
                 .get_or_insert_with(|| crate::progress::Backfill::new("backfilling", next, tip));
         }
         let to = (next + chunker.window() - 1).min(tip);
-        match source.logs(&nest.addresses, &nest.topic0s, next, to).await {
+        // A contract-free nest (`blocks = true`, no `[[contracts]]` - OBIB case 3) has both halves of
+        // its filter empty, which asks a node for every log on the chain. #421 and #429 guarded the
+        // backfill paths and left this one, which is the worse of the two: it repeats for as long as
+        // `nuthatch dev` runs (#432). `process_window` still runs on the empty window, because a
+        // blocks nest derives its rows from the window itself rather than from the logs in it.
+        let filter = LogFilter::new(&nest.addresses, &nest.topic0s);
+        let fetched = match &filter {
+            Some(f) => source.logs(f, next, to).await,
+            None => Ok(Vec::new()),
+        };
+        match fetched {
             Ok(logs) => {
                 chunker.observed(logs.len() as u64);
                 let n = logs.len() as u64;
@@ -4219,8 +4296,7 @@ mod tests {
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 from: u64,
                 to: u64,
             ) -> Result<Vec<Log>> {
@@ -4240,20 +4316,19 @@ mod tests {
                     .collect())
             }
         }
-        // A non-empty filter throughout: an empty address *and* topic filter short-circuits to no
-        // request at all (see `fetch_logs_splitting`), which would make every assertion below vacuous.
-        let filter = ["0xabc".to_string()];
+        // A non-empty filter throughout. The empty-on-both-halves case cannot reach this function at
+        // all any more - `LogFilter` refuses to represent it (#432) - so a filter built here is
+        // always one the source is actually asked for, and no assertion below is vacuous.
+        let filter = LogFilter::new(&["0xabc".to_string()], &[]).expect("non-empty filter");
 
         // A 100-block range against an 8-block cap splits all the way down and returns every log.
         let src = CappedSource { cap: 8 };
-        let logs = fetch_logs_splitting(&src, &filter, &[], 1, 100)
-            .await
-            .unwrap();
+        let logs = fetch_logs_splitting(&src, &filter, 1, 100).await.unwrap();
         assert_eq!(logs.len(), 100);
 
         // A single block that itself exceeds the cap can't be split → a clear, loud error.
         let tiny = CappedSource { cap: 0 };
-        let err = fetch_logs_splitting(&tiny, &filter, &[], 42, 42)
+        let err = fetch_logs_splitting(&tiny, &filter, 42, 42)
             .await
             .unwrap_err()
             .to_string();
@@ -4288,8 +4363,7 @@ mod tests {
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 from: u64,
                 to: u64,
             ) -> Result<Vec<Log>> {
@@ -4318,9 +4392,10 @@ mod tests {
             cap: 5,
             calls: AtomicU64::new(0),
         };
-        // Non-empty throughout - an empty address *and* topic filter never reaches the source at all.
-        let filter = ["0xabc".to_string()];
-        let logs = fetch_logs_splitting(&src, &filter, &[], 1, 10)
+        // Non-empty throughout - the empty-on-both-halves filter is unrepresentable (#432), so it
+        // cannot silently turn these assertions into assertions about a request never made.
+        let filter = LogFilter::new(&["0xabc".to_string()], &[]).expect("non-empty filter");
+        let logs = fetch_logs_splitting(&src, &filter, 1, 10)
             .await
             .expect("a speculative split must rescue an unclassifiable range failure");
         assert_eq!(logs.len(), 10, "every log is returned, none dropped");
@@ -4340,8 +4415,7 @@ mod tests {
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 _f: u64,
                 _t2: u64,
             ) -> Result<Vec<Log>> {
@@ -4352,7 +4426,7 @@ mod tests {
         let dead = DeadSource {
             calls: AtomicU64::new(0),
         };
-        let err = fetch_logs_splitting(&dead, &filter, &[], 1, 1024)
+        let err = fetch_logs_splitting(&dead, &filter, 1, 1024)
             .await
             .unwrap_err()
             .to_string();
@@ -4381,11 +4455,11 @@ mod tests {
         }
         async fn logs(
             &self,
-            addrs: &[String],
-            _t: &[String],
+            filter: &crate::source::LogFilter,
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
+            let addrs = filter.addresses();
             let allow: std::collections::HashSet<String> =
                 addrs.iter().map(|a| a.to_ascii_lowercase()).collect();
             Ok(self
@@ -4635,10 +4709,19 @@ template="pool"
             swap(14, 0, pool_b, 250),
         ];
 
+        // The nest's real topic0s, which is what `build_nest` hands this function in production. It
+        // used to be `&[]`, and the topic0-flip half of this test only passed because an empty
+        // address *and* topic filter is "every log on the chain" - so the flipped fetch was answered
+        // by the mock returning everything, rather than by the filter it is supposed to be flipping
+        // to. The filter is unrepresentable now (#432), which turned that into a failure: a fixture
+        // that passed without exercising what it names.
+        let nest_topic0s = [topic0("factory__pool_created"), topic0("pool__swap")];
+
         async fn seal_sig(
             logs: Vec<crate::rpc::Log>,
             reg: &crate::registry::DecodeRegistry,
             fs: &FactorySet,
+            topic0s: &[String],
             force_topic0: bool,
         ) -> (tempfile::TempDir, Vec<String>) {
             let source = FilteringSource { logs };
@@ -4650,7 +4733,7 @@ template="pool"
                 fs,
                 &mut children,
                 dir.path(),
-                &[],
+                topic0s,
                 10,
                 20,
                 100,
@@ -4672,9 +4755,9 @@ template="pool"
 
         // Address-list mode is reproducible; and the RFC-0009 §4 topic0-flip produces byte-identical
         // segments (the flip changes only the fetch strategy, never the output).
-        let (_d1, sig1) = seal_sig(logs.clone(), &reg, &fs, false).await;
-        let (_d2, sig2) = seal_sig(logs.clone(), &reg, &fs, false).await;
-        let (_d3, sig3) = seal_sig(logs.clone(), &reg, &fs, true).await;
+        let (_d1, sig1) = seal_sig(logs.clone(), &reg, &fs, &nest_topic0s, false).await;
+        let (_d2, sig2) = seal_sig(logs.clone(), &reg, &fs, &nest_topic0s, false).await;
+        let (_d3, sig3) = seal_sig(logs.clone(), &reg, &fs, &nest_topic0s, true).await;
         assert!(!sig1.is_empty(), "something was sealed");
         assert_eq!(
             sig1, sig3,
@@ -5413,11 +5496,11 @@ template = "pool"
         }
         async fn logs(
             &self,
-            addrs: &[String],
-            _t: &[String],
+            filter: &crate::source::LogFilter,
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
+            let addrs = filter.addresses();
             self.calls.lock().unwrap().push((addrs.to_vec(), from, to));
             if addrs.is_empty() {
                 anyhow::bail!("query returned more than 10000 results");
@@ -5745,8 +5828,7 @@ template = "pool"
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 _f: u64,
                 _t2: u64,
             ) -> Result<Vec<crate::rpc::Log>> {
@@ -5892,8 +5974,7 @@ template = "pool"
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 _f: u64,
                 _to: u64,
             ) -> Result<Vec<crate::rpc::Log>> {
@@ -5939,8 +6020,7 @@ template = "pool"
             }
             async fn logs(
                 &self,
-                _a: &[String],
-                _t: &[String],
+                _filter: &crate::source::LogFilter,
                 _f: u64,
                 _to: u64,
             ) -> Result<Vec<crate::rpc::Log>> {
@@ -6033,8 +6113,7 @@ template = "pool"
         }
         async fn logs(
             &self,
-            _a: &[String],
-            _t: &[String],
+            _filter: &crate::source::LogFilter,
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
@@ -6174,8 +6253,7 @@ template = "pool"
         }
         async fn logs(
             &self,
-            _a: &[String],
-            _t: &[String],
+            _filter: &crate::source::LogFilter,
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
@@ -6343,8 +6421,7 @@ template = "pool"
         }
         async fn logs(
             &self,
-            _a: &[String],
-            _t: &[String],
+            _filter: &crate::source::LogFilter,
             _from: u64,
             _to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
@@ -6480,6 +6557,129 @@ template = "pool"
         assert!(
             ctl_pipe.calls() > 0,
             "control: backfill_direct_pipelined must fetch logs when the nest has a contract"
+        );
+    }
+
+    /// Wait for `f` to hold, or give up after 20s. The tip loops never return, so every assertion
+    /// about them is really an assertion about what has happened *by* some point.
+    async fn within_deadline(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        f()
+    }
+
+    /// #432 assumes a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) reaches the
+    /// tip loops, and it does not: `build_nest` is the only way any nest is constructed - solo `dev`
+    /// and the runtime both go through it - and it refuses this config outright, because `AppState`
+    /// wants `config.primary()`. So OBIB case 3 runs today only through the bench harness, which
+    /// builds a registry directly and never calls `build_nest`.
+    ///
+    /// That is worth a test rather than a note, in both directions. It pins the reason the
+    /// empty-filter guard on the tip loops is currently unreachable defence rather than a live fix,
+    /// and it fails loudly the day someone makes case 3 startable - which is the day the guard starts
+    /// carrying weight, and the day this test should be replaced by one that drives the loops with a
+    /// real contract-free nest.
+    #[tokio::test]
+    async fn a_contract_free_nest_cannot_be_built_at_all_today() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"b\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+
+        // The config itself is perfectly legal - it parses, and `blocks = true` is a supported key.
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            config.contracts.is_empty() && config.extract.blocks,
+            "the fixture is the contract-free blocks nest, not a stand-in"
+        );
+
+        // It is nest *construction* that refuses it, and the message names contracts rather than the
+        // thing the operator asked for.
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        // `match` rather than `expect_err`: neither `NestIngest` nor `AppState` is `Debug`.
+        let err = match build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a contract-free nest now builds - the tip-loop empty-filter guard has become \
+                 reachable, so replace this test with one that drives the loops (#432)"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("no contracts"),
+            "expected the primary-contract refusal, got: {err}"
+        );
+    }
+
+    /// #432 on the two paths its sibling test does not reach - the **live tip loops**.
+    ///
+    /// The empty-and-empty filter is now unrepresentable (`LogFilter::new` returns `None`), so what is
+    /// left to prove about the loops is that the conversion did not break the case that *does* fetch:
+    /// a real nest must still ask for its logs through both loops. Combined with
+    /// `a_contract_free_nest_cannot_be_built_at_all_today`, which pins why the empty case cannot be
+    /// driven end-to-end yet, and `the_empty_filter_is_unrepresentable`, which proves the guard
+    /// itself, this is the honest coverage available today - a test that faked a contract-free
+    /// `NestIngest` would prove the fixture, not the wiring.
+    #[tokio::test]
+    async fn both_tip_loops_still_fetch_logs_for_a_nest_with_contracts() {
+        let d_solo = tempfile::tempdir().unwrap();
+        let solo_nest =
+            build_test_nest(d_solo.path(), "0x1111111111111111111111111111111111111111").await;
+        let solo_src = Arc::new(LogCountingSource::new());
+        let solo_counter = solo_src.clone();
+        let solo_task = tokio::spawn(index_loop(
+            solo_src as Arc<dyn Source>,
+            solo_nest,
+            Some(0),
+            false,
+            1,
+            5,
+        ));
+        let solo_fetched = within_deadline(|| solo_counter.calls() > 0).await;
+        solo_task.abort();
+        assert!(
+            solo_fetched,
+            "index_loop must still fetch logs for a nest with a contract"
+        );
+
+        let d_rt = tempfile::tempdir().unwrap();
+        let rt_nest =
+            build_test_nest(d_rt.path(), "0x1111111111111111111111111111111111111111").await;
+        let rt_src = Arc::new(LogCountingSource::new());
+        let rt_counter = rt_src.clone();
+        let rt_task = tokio::spawn(runtime_index_loop(
+            rt_src as Arc<dyn Source>,
+            vec![rt_nest],
+            Some(0),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let rt_fetched = within_deadline(|| rt_counter.calls() > 0).await;
+        rt_task.abort();
+        assert!(
+            rt_fetched,
+            "runtime_index_loop must still fetch logs for a live nest with a contract"
         );
     }
 
@@ -6692,8 +6892,7 @@ rpc_urls = ["https://rpc.example"]
         }
         async fn logs(
             &self,
-            _a: &[String],
-            _t: &[String],
+            _filter: &crate::source::LogFilter,
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
