@@ -529,32 +529,6 @@ with the reason rather than reporting on sealed data alone, which would bind aga
 schema than a following `/sql` would see. Anywhere you bound `/sql`, bound `/explain` with it: a
 guard on one and not the other leaves the cheaper-looking route as the expensive one.
 
-### Enabling remote admin
-
-The recipes above ship with remote admin off. Not caution for its own sake: the admin surface mounts
-and unmounts nests, so a reachable one behind a guessable token is full control of what the runtime
-serves.
-
-If you need it, generate the token. Never copy a literal out of documentation, including this page:
-
-```sh
-openssl rand -hex 32
-```
-
-Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port on `127.0.0.1`, reach it through a reverse
-proxy with TLS, and treat the value as a credential — not in shell history, not in a committed compose
-file, and not in a world-readable unit file (`chmod 600`, or `EnvironmentFile=` pointing at a
-root-owned file).
-
-Two things worth knowing first:
-
-- **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
-  off-localhost *unless* a token is set. So setting one is not purely "adding auth" — it also lifts
-  the guard that was protecting you. Correct behaviour, but it means the token is the only thing
-  between the network and `POST /_admin/nests`.
-- **Anything on the same Docker network reaches it** regardless of `-p 127.0.0.1:...`, because the
-  publish flag governs the host, not the container network.
-
 **Admin surface.** Off-localhost the admin UI requires `NUTHATCH_ADMIN_TOKEN` on every request; token
 comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
 
@@ -575,10 +549,11 @@ because nothing it serves carries a caller identity: the data routes (`/entities
 and the rest) have no accounts and no API keys. `NUTHATCH_ADMIN_TOKEN` above is not a counter-example
 - it is one shared operator credential gating `/_admin`, not a per-caller identity you could meter,
 and every caller who has it is the same caller as far as the node can tell. The query guards above
-bound the cost of a single request and the total concurrent load; they say nothing about how many
-requests a given caller may make. An in-process request-per-second counter with no identity would be
-worse than nothing: the first caller to hit it blocks every other caller, converting an accidental
-poller into a service-wide outage.
+bound the cost of a single request and the total concurrent analytical load; they say nothing about
+how many requests a given caller may make. The concurrency semaphore releases each permit when its
+query finishes. An in-process request-per-second counter with no identity would be worse than
+nothing: one caller can exhaust the whole window and block every other caller until it resets,
+converting an accidental poller into a service-wide outage.
 
 For operators who need per-caller rate limiting, the right place is the reverse proxy in front:
 
@@ -613,6 +588,32 @@ http {
 
 Neither is a complete security configuration - TLS, authentication, and an allowlist belong in front
 too. The rate limit is one layer of a stack, not the stack. See [The division of labour](#the-division-of-labour).
+
+### Enabling remote admin
+
+The recipes above ship with remote admin off. Not caution for its own sake: the admin surface mounts
+and unmounts nests, so a reachable one behind a guessable token is full control of what the runtime
+serves.
+
+If you need it, generate the token. Never copy a literal out of documentation, including this page:
+
+```sh
+openssl rand -hex 32
+```
+
+Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port on `127.0.0.1`, reach it through a reverse
+proxy with TLS, and treat the value as a credential — not in shell history, not in a committed compose
+file, and not in a world-readable unit file (`chmod 600`, or `EnvironmentFile=` pointing at a
+root-owned file).
+
+Two things worth knowing first:
+
+- **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
+  off-localhost *unless* a token is set. So setting one is not purely "adding auth" — it also lifts
+  the guard that was protecting you. Correct behaviour, but it means the token is the only thing
+  between the network and `POST /_admin/nests`.
+- **Anything on the same Docker network reaches it** regardless of `-p 127.0.0.1:...`, because the
+  publish flag governs the host, not the container network.
 
 ---
 
