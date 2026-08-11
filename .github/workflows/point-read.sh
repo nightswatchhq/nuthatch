@@ -16,25 +16,36 @@
 # than by leaving "plenty of headroom" - see the justification in ci.yml. Short version, all measured
 # on the `ubuntu-latest` runner that enforces this: a linear scan in place of the B-tree seek moves
 # p50 from 0.59-0.82µs to 18.15µs, so p50 gates at 8µs - 9.8x above the worst baseline and 2.3x below
-# a full scan. p99 over 256 samples is preemption-dominated on a shared runner, so it is a loose
-# backstop at 150µs and nothing more.
+# a full scan.
+#
+# **p99 and p99.9 are recorded and gated on by nothing**, and that is a deliberate design call rather
+# than an omission. Gating p50 loosely and tracking the tail precisely are two different jobs: a p99
+# ceiling tight enough to catch a real regression flakes on a shared runner, and one loose enough not
+# to flake catches nothing. This is not a judgement call here - it was measured. The linear-scan
+# mutation that p50 catches at 18.15µs against an 8µs ceiling only moved p99 to 34.45µs, so the 150µs
+# p99 backstop this script used to apply did **not** fire on the one regression the gate exists to
+# catch. A ceiling that passes the known break is not a weak gate, it is decoration that reads as
+# coverage. The tail is the number we track across releases and read with our eyes, in the artifact.
+#
+# `MAX_P99_US` therefore has no default. Set it to gate the tail deliberately (an operator on a quiet
+# machine may well want to); leave it unset and p99 is reported and not enforced.
 #
 # **Running this on your own machine:** 8µs is `ubuntu-latest`'s number, and applying a ceiling
 # measured on one machine to a different one is the mistake this gate already made once. A slower or
 # busier box can fail it without anything being wrong, so raise it - `MAX_P50_US=200 bash
 # .github/workflows/point-read.sh` reports the numbers without gating on them in any useful sense.
-# There is deliberately no "off": this script always passes both ceilings, and `MAX_P50_US=0` would
-# fail every run rather than disable the check. What CI enforces is set in ci.yml and is not affected
-# by this default.
+# There is deliberately no "off" for p50: it always applies, and `MAX_P50_US=0` would fail every run
+# rather than disable the check. What CI enforces is set in ci.yml and is not affected by this
+# default.
 #
-# Env: BIN (default target/release/nuthatch), MAX_P50_US, MAX_P99_US (see ci.yml for the values CI
-#      uses and why), PORT (default 8289), RPC_PORT (default 8546), OUT (default
-#      point-read-report.json), LABEL (default names the fixture).
+# Env: BIN (default target/release/nuthatch), MAX_P50_US (see ci.yml for the value CI uses and why),
+#      MAX_P99_US (unset: recorded, not gated), PORT (default 8289), RPC_PORT (default 8546), OUT
+#      (default point-read-report.json), LABEL (default names the fixture).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
 MAX_P50_US="${MAX_P50_US:-8}"
-MAX_P99_US="${MAX_P99_US:-150}"
+MAX_P99_US="${MAX_P99_US:-}"
 PORT="${PORT:-8289}"
 RPC_PORT="${RPC_PORT:-8546}"
 OUT="${OUT:-point-read-report.json}"
@@ -127,22 +138,41 @@ fi
 
 # `--min-reads` is not belt-and-braces on top of the row check above: an empty store samples no keys
 # and reports p50 = 0µs, which passes any ceiling. The floor is what makes a green run mean something.
+#
+# p99 is passed only when asked for. An unset `--max-point-read-p99-us` is not a ceiling of infinity
+# dressed up as a number: `check_gate` treats an absent limit as "not asked for" and reports the
+# measurement, which is the whole point of recording the tail without enforcing it.
+p99_arg=()
+if [ -n "$MAX_P99_US" ]; then
+  p99_arg=(--max-point-read-p99-us "$MAX_P99_US")
+fi
+
 set +e
 "$BIN" bench query --dir "$DIR" --reads "$EXPECT" --iters 5 --out "$OUT" \
   --label "${LABEL:-point-read gate: $EXPECT rows indexed, $HOT_EXPECT hot, locally-served chain}" \
   --min-reads "$HOT_EXPECT" \
   --max-point-read-p50-us "$MAX_P50_US" \
-  --max-point-read-p99-us "$MAX_P99_US" | tee "$DIR/bench.log"
+  "${p99_arg[@]}" | tee "$DIR/bench.log"
 status="${PIPESTATUS[0]}"
 set -e
 
 p50="$(grep -o '"point_read_p50_us": [0-9.]*' "$OUT" 2>/dev/null | grep -o '[0-9.]*$' || echo '?')"
 p99="$(grep -o '"point_read_p99_us": [0-9.]*' "$OUT" 2>/dev/null | grep -o '[0-9.]*$' || echo '?')"
-echo "point-read over $rows rows: p50 ${p50}µs (ceiling ${MAX_P50_US}µs), p99 ${p99}µs (ceiling ${MAX_P99_US}µs)"
+p999="$(grep -o '"point_read_p999_us": [0-9.]*' "$OUT" 2>/dev/null | grep -o '[0-9.]*$' || echo '?')"
+# The tail is labelled "tracked" rather than given a fake ceiling, so a reader can see at a glance
+# which number failed a build and which one is here to be read across releases.
+if [ -n "$MAX_P99_US" ]; then
+  p99_note="ceiling ${MAX_P99_US}µs"
+else
+  p99_note="tracked, not gated"
+fi
+echo "point-read over $rows rows: p50 ${p50}µs (ceiling ${MAX_P50_US}µs), p99 ${p99}µs ($p99_note), p99.9 ${p999}µs (tracked, not gated)"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     echo "### point-read latency"
-    echo "p50 **${p50}µs** (ceiling ${MAX_P50_US}µs), p99 **${p99}µs** (ceiling ${MAX_P99_US}µs) over $rows rows"
+    echo "p50 **${p50}µs** (ceiling ${MAX_P50_US}µs) over $rows rows"
+    echo ""
+    echo "Tail, recorded and not gated: p99 **${p99}µs** ($p99_note), p99.9 **${p999}µs**."
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
