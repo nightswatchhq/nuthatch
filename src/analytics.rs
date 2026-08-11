@@ -2387,6 +2387,19 @@ template="pool"
     #[test]
     fn a_corrupt_sealed_segment_reduces_the_table_rather_than_deleting_it() {
         let dir = tempfile::tempdir().unwrap();
+        // A schema, so that dropping *every* sealed file still yields the empty **typed** view rather
+        // than no view at all. Without it the rebuild-from-nothing case deletes the table, and the
+        // assertions below could not tell "rebuilt from the good segment" from "rebuilt from nothing" -
+        // both would fail on the `expect` above them. With it, the two are distinguishable, which is
+        // what makes the row assertions load-bearing.
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
         // Two segments, one block each, so a query can tell which survived.
         crate::seal::seal_range(
             dir.path(),
