@@ -247,6 +247,11 @@ fn attempt(
     // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
     define_children_views(&conn, dir);
 
+    // Every view this query could be reading now exists, so the names it used can be widened to the
+    // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
+    // happen here rather than beside the security walk: at that point the catalogue was empty.
+    let referenced = referenced.map(|names| expand_through_views(&conn, &names));
+
     // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
     // query once it outlives the guard's timeout (a cartesian blow-up can't be stopped by the memory
     // cap alone). `interrupt()` makes the running query fail; we translate that into a clear timeout
@@ -620,6 +625,101 @@ fn reject_unknown_table_refs(
         Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
         None => Ok(Some(referenced)),
     }
+}
+
+/// Widen the names a query used to the names those names *read*, following the views this connection
+/// has just defined.
+///
+/// Without this, bounding the sweep by reachability would quietly cost authored views their reduction
+/// (RFC-0001 `views/*.sql`, plus the generated `labels` and `{template}__children` views): a query
+/// over `big_transfers` names `big_transfers`, which is no table in the manifest, so nothing would be
+/// verified and a page-corrupt segment under that view would fail the query instead of reducing it -
+/// exactly the behaviour #433 is fixing, reintroduced one layer up. Measured, not assumed: the test
+/// `a_page_corrupt_segment_under_an_authored_view_still_reduces` fails with this function removed.
+///
+/// Widening is safe in the direction it goes: it can only add tables the query genuinely reads. The
+/// attacker's case is a query that names *nothing*, and nothing expands to nothing.
+///
+/// Best-effort by design. A view whose definition cannot be re-parsed is skipped rather than treated
+/// as "could be anything" - the cost of a miss is a lost reduction on that one query (loud: the query
+/// fails with DuckDB's own error), and the cost of the other choice is the unbounded sweep coming
+/// back in through a fallback, which is the defect this whole change exists to remove.
+fn expand_through_views(
+    conn: &Connection,
+    named: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut defs: std::collections::BTreeMap<String, String> = Default::default();
+    let listed = conn
+        .prepare("SELECT view_name, sql FROM duckdb_views()")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for (name, sql) in rows.flatten() {
+                defs.insert(name.to_ascii_lowercase(), sql);
+            }
+            Ok(())
+        });
+    if listed.is_err() {
+        return named.clone();
+    }
+
+    let mut out = named.clone();
+    let mut frontier: Vec<String> = named.iter().cloned().collect();
+    // A view built on a view built on a view: follow the chain, but never in circles. DuckDB refuses
+    // to create a cyclic view, so this bound is a backstop rather than the mechanism.
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(sql) = defs.get(&name) else { continue };
+            let Some(body) = view_body(sql) else { continue };
+            let Some(inner) = base_tables_in(conn, body) else {
+                continue;
+            };
+            for t in inner {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// The `SELECT` inside a stored `CREATE VIEW … AS …`, which is all `json_serialize_sql` will accept
+/// (it answers `Only SELECT statements can be serialized to json!` for the whole statement - measured
+/// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
+fn view_body(create_view_sql: &str) -> Option<&str> {
+    let lower = create_view_sql.to_ascii_lowercase();
+    let view = lower.find(" view ")?;
+    // The first ` as ` past the name. A view *name* cannot be bare `as`, and one containing it - say
+    // `as_of` - does not match, because the match needs a space on both sides.
+    let as_at = lower[view..].find(" as ")? + view;
+    Some(create_view_sql[as_at + 4..].trim())
+}
+
+/// The base tables a statement reads, lowercased. The security walk collects the same set for the
+/// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
+fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+    let literal = format!("'{}'", sql.replace('\'', "''"));
+    let ast = conn
+        .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let v = serde_json::from_str::<Value>(&ast).ok()?;
+    if v.get("error").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk_table_refs(&v, &mut |kind, name| {
+        if kind == "BASE_TABLE" {
+            out.insert(name.to_ascii_lowercase());
+        }
+    });
+    Some(out)
 }
 
 /// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
@@ -3004,6 +3104,62 @@ template="pool"
             "the same corrupt segment must be found when the query does name its table - if this is \
              0 the capture is broken and the assertion above proves nothing"
         );
+    }
+
+    /// The other edge of the same bound, and the regression it would otherwise have caused. A query
+    /// over an **authored view** (RFC-0001 `views/*.sql`) names the view, which is no table in the
+    /// manifest - so a sweep bounded on the named set alone would verify nothing, and a page-corrupt
+    /// segment under that view would fail the query instead of reducing it. That is #433's own defect,
+    /// reintroduced one layer up by its own cost bound.
+    ///
+    /// I did not find this from the review; I found it reading my own fix back, which is the only
+    /// reason it is not shipping. `expand_through_views` is what this fails without.
+    #[test]
+    fn a_page_corrupt_segment_under_an_authored_view_still_reduces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-senders.sql"),
+            "CREATE VIEW senders AS SELECT \"from\", block_number FROM t__transfer;",
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+
+        // Whole first, through the view, or the reduction assertion below proves nothing.
+        let rows = query(dir.path(), "SELECT \"from\" FROM senders").expect("the view resolves");
+        assert_eq!(rows.len(), 2, "two segments, two rows, through the view");
+
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(corrupt_pages_leaving_the_footer_intact(&path) > 0);
+
+        let rows = query(dir.path(), "SELECT \"from\" FROM senders").expect(
+            "a query that reaches the corrupt segment through a view must still reduce - if this \
+             errors, the reachability bound cannot see through views",
+        );
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        assert_eq!(rows[0]["from"], Value::from("0xa"));
     }
 
     /// The input to that bound: what the security walk reports a statement reaches. One parse feeds
