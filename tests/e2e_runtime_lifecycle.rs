@@ -284,3 +284,141 @@ nests = ["usdc", "arb"]
     assert_eq!(reloaded.runtime.chain.as_deref(), Some("arbitrum-one"));
     assert_eq!(reloaded.runtime.chain_id, Some(42161));
 }
+
+/// Drive one request through the lifecycle routes as an HTTP caller would, and return
+/// (status, body). Built from `lifecycle_routes` itself rather than from the handlers, so route
+/// registration and extractor order are part of what is under test.
+async fn call(
+    routes: &axum::Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<&str>,
+) -> (axum::http::StatusCode, String) {
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::builder().method(method).uri(uri);
+    if let Some(t) = bearer {
+        req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    let req = match body {
+        Some(b) => req
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(b.to_string()))
+            .unwrap(),
+        None => req.body(axum::body::Body::empty()).unwrap(),
+    };
+    let resp = routes.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// RFC-0027 §5: mount and unmount are the highest-privilege operations the runtime exposes - they add
+/// and remove nests on a live process - and off-localhost they are gated by the admin credential.
+///
+/// **Nothing exercised that gate.** Every lifecycle test above calls `handles.mount`/`unmount`
+/// directly, which is the handler-free path, and `lifecycle_routes` was never constructed by any
+/// test in the repo. Deleting either `token_ok` line therefore broke nothing, and an unauthenticated
+/// caller could mount a nest on a public bind.
+///
+/// The assertion is the refusal **and its silence**: the call must be turned away *before* the
+/// effect, so the running set is unchanged afterwards. A 401 that mounted the nest anyway would pass
+/// a status-code test and fail the only property that matters. Both credential forms are exercised
+/// (`?token=` on one route, `Authorization: Bearer` on the other) because both are accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
+    const TOKEN: &str = "s3cret-admin-token";
+
+    let roost_dir = tempfile::tempdir().unwrap();
+    let usdc_dir = roost_dir.path().join("nests/usdc");
+    let arb_dir = roost_dir.path().join("nests/arb");
+    std::fs::create_dir_all(&usdc_dir).unwrap();
+    std::fs::create_dir_all(&arb_dir).unwrap();
+    let (handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
+
+    // A genuinely mountable nest: same chain, within budget. So with the guard removed the
+    // unauthenticated call does not merely reach the handler, it *succeeds* - which is the finding.
+    let third = roost_dir.path().join("nests/third");
+    std::fs::create_dir_all(&third).unwrap();
+    scaffold_nest(&third, "third", ARB);
+
+    let live_service = handles.live.service();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    // The posture an off-localhost bind derives: surface on, credential required.
+    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+
+    // 1. An unauthenticated mount is refused, and mounts nothing.
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/nests",
+        None,
+        Some(r#"{"name":"third"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNAUTHORIZED,
+        "an unauthenticated POST /_admin/nests must be refused"
+    );
+    let names: Vec<String> = handles
+        .lock()
+        .await
+        .states
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["usdc".to_string(), "arb".to_string()],
+        "the refusal must land before the effect - an unauthenticated caller mounted a nest"
+    );
+
+    // 2. An unauthenticated unmount is refused, and the nest keeps serving.
+    let (status, _) = call(&routes, "DELETE", "/_admin/nests/arb", None, None).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNAUTHORIZED,
+        "an unauthenticated DELETE /_admin/nests/{{name}} must be refused"
+    );
+    let (status, _) = call(&live_service, "GET", "/arb/health", None, None).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "the refused unmount must have left the nest serving"
+    );
+
+    // 3. Positive controls: with the credential the same two routes reach their handlers, so the 401s
+    //    above are the guard talking and not a broken route. `usdc` is already mounted, which is
+    //    RFC-0027 §3's AlreadyMounted refusal - it proves the mount logic ran.
+    let (status, body) = call(
+        &routes,
+        "POST",
+        &format!("/_admin/nests?token={TOKEN}"),
+        None,
+        Some(r#"{"name":"usdc"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "with the token the mount must reach the handler: {body}"
+    );
+    // The unmount half, via the header form, on a name that is not mounted: idempotent no-op, so the
+    // control costs the fixture nothing.
+    let (status, body) = call(
+        &routes,
+        "DELETE",
+        "/_admin/nests/not-mounted",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "with the token the unmount must reach the handler: {body}"
+    );
+}
