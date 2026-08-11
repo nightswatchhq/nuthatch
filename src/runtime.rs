@@ -653,6 +653,13 @@ pub enum Adopting {
     /// store that exists and errors - so the destination holds data, can never adopt again, and must
     /// be emptied by hand. That is issue #408's permanently-stuck shape reached through the error
     /// path, and unlike the destination's mistake it is not repaired by a re-index.
+    ///
+    /// Corruption is not the only way to reach it, and the other way is why this side matters more
+    /// once the cutoff runs on the mount path (#414): redb takes an **exclusive file lock**, so a
+    /// candidate held open by a live cursor answers `Err` too. A runtime that mounts a nest while
+    /// its sibling is indexing would otherwise nominate the one dataset that must never be copied,
+    /// and copying a redb mid-write does not yield a slightly-stale store, it yields a torn file
+    /// that is not a store at all.
     From,
 }
 
