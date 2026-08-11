@@ -432,11 +432,20 @@ fn format_sql_result(raw: &str) -> String {
     if let Some(tables) = v.get("degraded_tables").and_then(Value::as_array) {
         if !tables.is_empty() {
             let names: Vec<&str> = tables.iter().filter_map(Value::as_str).collect();
+            // A statement about the nest rather than about these rows, because that is all the flag
+            // knows: `degraded_tables` comes from schema ∪ manifest ∪ hot and never from the SQL. An
+            // agent told "these rows are a subset" about a complete answer over a healthy table does
+            // the damage this notice exists to prevent, in the other direction - it is instructed to
+            // *say so in any answer*, so it qualifies a correct total as understated. Cause-neutral
+            // too: an undefinable view lands in this set with every segment binding fine (#434).
             out.push_str(&format!(
-                "⚠ incomplete: sealed data for {} could not be read, so these rows are a subset of \
-                 the real history. Totals and aggregates over {} are understated - say so in any \
-                 answer, and check the node's logs.\n\n",
+                "⚠ incomplete: this nest could not serve complete cold data for {}. Any result \
+                 drawing on {} is a subset of the real history, and totals or aggregates over {} \
+                 are understated - say so in any answer that draws on {}, and check the node's \
+                 logs.\n\n",
                 names.join(", "),
+                if names.len() == 1 { "it" } else { "them" },
+                if names.len() == 1 { "it" } else { "them" },
                 if names.len() == 1 { "it" } else { "them" }
             ));
         }

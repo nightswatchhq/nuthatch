@@ -201,9 +201,12 @@ async function runSql(){
     // The degraded caveat rides in the same meta line as truncation (#435). Without it a reduced
     // table renders here as a perfectly healthy small one, and the operator reads a wrong total off
     // their own admin page. `textContent`, so a table name is never markup.
+    //
+    // Named tables, and no claim about *these* rows: the flag is nest-wide, so this result may well
+    // be complete. Nor about the cause - an undefinable view is in the set with its segments intact.
     const deg = d.degraded_tables || [];
     $('#sqlmeta').textContent = `${fmt(d.count)} row(s)` + (d.truncated?' (truncated)':'')
-      + (deg.length?` - INCOMPLETE: sealed data for ${deg.join(', ')} could not be read`:'');
+      + (deg.length?` - INCOMPLETE cold data in this nest for ${deg.join(', ')}`:'');
     $('#sqlrows').innerHTML = rowsTable(d.rows);
   } catch(e){ $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent=''; }
 }

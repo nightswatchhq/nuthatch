@@ -52,6 +52,14 @@ pub struct QueryGuard {
 /// parsing the SQL for table references, which is exactly the kind of guess that produces a
 /// confidently wrong answer. Over-reporting *with the names attached* lets the caller judge; silence
 /// does not.
+///
+/// **Which constrains how a surface may word it.** Because this is a property of the nest and not of
+/// the answer, a caveat must be a statement about the nest - "this nest could not serve complete cold
+/// data for X" - and never about these rows. A query over a healthy table on a nest with one bad
+/// segment is complete and correct, and `SELECT 1` and `.tables` have no rows drawn from these tables
+/// at all. Nor may it name a cause: the undefinable-view arm above lands here with every segment
+/// binding fine. Both mistakes shipped in the first rendering of this field and neither test nor
+/// mutation could see them, because every fixture had exactly one table.
 #[derive(Debug, Default)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,

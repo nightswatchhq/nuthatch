@@ -2121,6 +2121,13 @@ mod tests {
             ADMIN_HTML.contains("startPolling"),
             "admin UI keeps a polling fallback"
         );
+        // The #435 caveat, pinned the same way and for the same reason as the three above: substring,
+        // no render. Of the four surfaces carrying the reduced-cold-data signal this is the only one
+        // with no coverage of any kind, so deleting the caveat here would be silent.
+        assert!(
+            ADMIN_HTML.contains("degraded_tables"),
+            "admin UI renders the reduced-cold-data caveat (#435)"
+        );
     }
 
     #[tokio::test]

@@ -290,14 +290,34 @@ fn caveats(out: &analytics::QueryOutput) -> Vec<String> {
         lines.push("(result truncated at 50000 rows)".to_string());
     }
     if out.degraded() {
+        // Phrased about the *nest*, not about this result, and it has to be. `define_views` builds
+        // its table set from schema ∪ manifest ∪ hot and never sees the SQL, so `degraded_tables` is
+        // a property of the nest - on a two-table nest with one bad segment, a query over the healthy
+        // table is complete and correct, and "these rows are INCOMPLETE" would be a false statement
+        // about a true flag. `SELECT 1` and `.tables` make it plainer: neither has rows drawn from any
+        // of these tables, and neither has a total to understate.
+        //
+        // Cause-neutral for the same reason. The degraded set also carries the view whose whole-table
+        // DDL failed with every segment binding fine (issue #434's shape), so "could not be read"
+        // sends the operator hunting a corrupt file that provably is not there.
         lines.push(format!(
-            "warning: sealed data for {} could not be read - these rows are INCOMPLETE and any \
-             total over them is understated. Check the node's logs for the segment.",
+            "warning: this nest could not serve complete cold data for {}. Any result drawing on {} \
+             is INCOMPLETE and totals over {} are understated. Check the node's logs for the cause.",
             out.degraded_tables
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            if out.degraded_tables.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+            if out.degraded_tables.len() == 1 {
+                "it"
+            } else {
+                "them"
+            }
         ));
     }
     lines
