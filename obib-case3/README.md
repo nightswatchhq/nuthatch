@@ -18,6 +18,41 @@ nuthatch bench backfill --dir . --from 0 --to 100000 --runs 1 \
 nuthatch sql 'SELECT count(*) FROM "blocks"' --dir /tmp/case3
 ```
 
+## Result
+
+**100,001 records — the criterion, exactly.** Blocks 0-100,000, contiguous, no duplicates.
+
+| | |
+|---|---|
+| Records | **100,001** (OBIB expects 100,001) |
+| Range | `min=0  max=100,000  distinct=100,001` |
+| Wall clock | 162 min (10.29 blocks/s) |
+| Peak RSS | 55 MB |
+| RPC requests | 19,300 (~5.2 blocks/call) |
+
+Full artifact with the honest caveats: [`docs/bench/obib-case3.json`](../docs/bench/obib-case3.json).
+The 162 minutes is not competitive with OBIB's 3.19 s reference and the artifact says so plainly —
+this run used concurrency 1, a non-adaptive window and a free public endpoint, chosen for a
+trustworthy row count on an 8 GB machine rather than for speed.
+
+### The row count earned its keep
+
+The first run reported `events: 100001` on the timing line and served **100,000** rows starting at
+block 1. Genesis was ingested and then unreadable:
+
+`Store::sealed_through()` returns 0 both when the watermark sits at block 0 **and when nothing has
+ever been sealed**. The hot/cold union filtered hot rows to `block_number > sealed_through`, so with
+nothing sealed block 0 belonged to neither half. Any nest indexed from block 0 lost exactly its first
+block until something sealed — invisible on a nest starting later, which is how it survived.
+
+The fix gates the hot filter on whether the table *has* sealed segments rather than on the
+watermark's numeric value, so a row is withheld from hot only when cold genuinely covers it and
+COR-1 disjointness holds everywhere else. Re-querying the same kept store returned 100,001 with no
+re-ingest, which is the tell that the store was always right and only the read path was wrong.
+
+This is the argument for the rule in #306 that record counts must match exactly. A timing-only
+benchmark passes straight over a defect like this.
+
 ## Why `--keep`
 
 The criterion is a row count, and `bench backfill` writes to a temp directory it deletes on the way
