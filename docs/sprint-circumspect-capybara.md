@@ -1,5 +1,35 @@
 # Sprint: circumspect-capybara (2026-08-07 - 2026-08-21)
 
+---
+
+## CLOSED 2026-08-11: 13 of 13
+
+Shipped as [v2.1.0](https://github.com/nightswatchhq/nuthatch/releases/tag/v2.1.0). 56 commits, 27
+merged PRs, two of them from outside contributors (#421, #440).
+
+**What the sprint built, and what it then found.** The gates landed - the ≤2 GB per-cursor budget
+measured at 131 MB on the adversarial scenario, entity point-read p50 at 0.59-0.82µs, both gated
+against regressions derived by breaking the code on purpose. Then the firm turned round and found
+**four of its own gates could not fail**: the RAM job was not a required check, its ceiling came from
+the wrong hardware, a whole feature was never linted, and a fixture leaked secrets so an assertion
+passed against last run's rows. All four are fixed.
+
+One of those went deeper than filed. #426 was reported as a test-fixture defect; the cause was that
+`undeclare_nest` left a deleted nest's provider credentials in the control plane permanently,
+inheritable by the next nest of the same name. Fixing the fixture would have hidden it.
+
+**The lesson worth carrying forward** came from the two probe PRs the firm opened unprompted -
+throwaway branches that reinstated a regression purely to watch a gate fire on the runner that
+enforces it. The point-read gate had 1.21x of real margin where 1.61x was written down; the RAM gate
+survived the same test at 322 MB against 323 on the dev box. **CPU-bound regressions need
+re-measuring per machine; memory-bound ones largely do not.**
+
+**Left open deliberately:** #428 and #441, both `board-only` - the live disclosure probe and
+production verification of v2.1.0. The two-machine rule is unmet on this release and that is recorded
+rather than quietly passed.
+
+Follow-on sprint: [diligent-dormouse](sprint-diligent-dormouse.md).
+
 Successor to [boisterous-badger](sprint-boisterous-badger.md), which closed on 2026-08-06 with the
 2.0.0 release. Companion to [prod-readiness.md](prod-readiness.md) (the grades this sprint is trying
 to move) and [verification.md](verification.md) (where the evidence lands).
