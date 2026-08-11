@@ -317,11 +317,12 @@ impl Source for TapeSource {
 
     async fn logs(
         &self,
-        addresses: &[String],
-        topic0s: &[String],
+        filter: &nuthatch::source::LogFilter,
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
+        let addresses = filter.addresses();
+        let topic0s = filter.topic0s();
         self.online()?;
         self.logs_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

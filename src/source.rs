@@ -15,6 +15,57 @@ use std::collections::HashMap;
 
 use crate::rpc::{Log, RpcClient};
 
+/// A `getLogs` filter that is known not to mean *every log on the chain*.
+///
+/// An `eth_getLogs` with an empty address list **and** an empty topic list does not mean "no logs" to
+/// a node - it matches everything. A nest with no contract at all (`[extract] blocks = true` and no
+/// `[[contracts]]`, OBIB case 3) produces exactly that pair, so the request succeeds and returns an
+/// answer that is wrong rather than absent: every log on the chain, fetched and then discarded, since
+/// no log can decode without a matching address or topic. The bench harness builds such a registry
+/// directly and does reach it; `build_nest` currently refuses the config outright, so the *nest*
+/// paths are guarded ahead of the configuration rather than behind it - see
+/// `a_contract_free_nest_cannot_be_built_at_all_today` in `indexer.rs`.
+///
+/// This type exists because the per-call-site guard was written **three times and missed a path each
+/// time** - #421 guarded `backfill_direct`, #429 guarded `fetch_logs_splitting`, and both left the two
+/// live tip loops issuing it forever (#432). Enumerating call sites is the losing move: the set grows,
+/// and a new one is a silent regression rather than a compile error.
+///
+/// So the guard moves into the type. [`LogFilter::new`] is the only constructor and returns `None` for
+/// the empty-and-empty case, and [`Source::logs`] takes a `&LogFilter` rather than two slices. A caller
+/// therefore *cannot* hold a value that means every log on the chain, and a new call site cannot ask
+/// for one without first deciding what "nothing to ask for" means there. The check is at the type
+/// boundary, not at each of the places that fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFilter {
+    addresses: Vec<String>,
+    topic0s: Vec<String>,
+}
+
+impl LogFilter {
+    /// The only way to build one. `None` when both halves are empty, which is the case that would
+    /// otherwise ask a node for the entire chain's logs.
+    ///
+    /// Note that *one* empty half is fine and load-bearing: a factory nest deliberately drops the
+    /// address filter and matches on topic0 alone, because its children are not known in advance.
+    pub fn new(addresses: &[String], topic0s: &[String]) -> Option<Self> {
+        (!addresses.is_empty() || !topic0s.is_empty()).then(|| Self {
+            addresses: addresses.to_vec(),
+            topic0s: topic0s.to_vec(),
+        })
+    }
+
+    /// The addresses to match. Possibly empty - a factory nest matches on topic0 alone.
+    pub fn addresses(&self) -> &[String] {
+        &self.addresses
+    }
+
+    /// The topic0s to match. Possibly empty - a nest may filter by address alone.
+    pub fn topic0s(&self) -> &[String] {
+        &self.topic0s
+    }
+}
+
 /// Everything the indexer needs from an ingestion source. Pull-shaped: the single-cursor loop asks
 /// for the tip, verifies canonical hashes (reorg detection), and requests decoded logs for a range.
 #[async_trait::async_trait]
@@ -60,14 +111,11 @@ pub trait Source: Send + Sync {
     /// silently getting it wrong.
     fn forget_cached_above(&self, _block: u64) {}
 
-    /// Logs matching any of `addresses` + any of `topic0s` over the inclusive range `[from, to]`.
-    async fn logs(
-        &self,
-        addresses: &[String],
-        topic0s: &[String],
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<Log>>;
+    /// Logs matching `filter` over the inclusive range `[from, to]`.
+    ///
+    /// Takes a [`LogFilter`] rather than two slices so that "match everything" is not expressible
+    /// here: a caller with nothing to ask for cannot construct one, and so cannot ask (#432).
+    async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>>;
 }
 
 #[async_trait::async_trait]
@@ -97,14 +145,9 @@ impl Source for RpcClient {
         RpcClient::block_headers(self, blocks).await
     }
 
-    async fn logs(
-        &self,
-        addresses: &[String],
-        topic0s: &[String],
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<Log>> {
-        self.get_logs(addresses, topic0s, from, to).await
+    async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
+        self.get_logs(filter.addresses(), filter.topic0s(), from, to)
+            .await
     }
 }
 
@@ -192,24 +235,19 @@ pub mod exex {
                 .map(|c| c.hash.clone()))
         }
 
-        async fn logs(
-            &self,
-            addresses: &[String],
-            topic0s: &[String],
-            from: u64,
-            to: u64,
-        ) -> Result<Vec<Log>> {
+        async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
             let blocks = self.blocks.lock().unwrap();
             let mut out = Vec::new();
             for (_, c) in blocks.range(from..=to) {
                 for log in &c.logs {
-                    let matches_addr = addresses
+                    let matches_addr = filter
+                        .addresses()
                         .iter()
                         .any(|a| log.address.eq_ignore_ascii_case(a));
                     let matches_topic = log
                         .topics
                         .first()
-                        .map(|t| topic0s.iter().any(|s| s.eq_ignore_ascii_case(t)))
+                        .map(|t| filter.topic0s().iter().any(|s| s.eq_ignore_ascii_case(t)))
                         .unwrap_or(false);
                     if matches_addr && matches_topic {
                         out.push(log.clone());
@@ -243,15 +281,60 @@ pub mod exex {
             assert_eq!(s.tip().await.unwrap(), 10);
             assert_eq!(s.block_hash(10).await.unwrap().as_deref(), Some("0xhash10"));
             assert_eq!(
-                s.logs(&["0xABC".to_string()], std::slice::from_ref(&topic), 0, 20)
-                    .await
-                    .unwrap()
-                    .len(),
+                s.logs(
+                    &LogFilter::new(&["0xABC".to_string()], std::slice::from_ref(&topic)).unwrap(),
+                    0,
+                    20,
+                )
+                .await
+                .unwrap()
+                .len(),
                 1
             );
 
             s.revert(10); // reorg drops block 10
             assert_eq!(s.tip().await.unwrap(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::LogFilter;
+
+    /// The whole point of the type (#432): the one filter that means *every log on the chain* cannot
+    /// be built, so no call site can issue it - present or future.
+    ///
+    /// The three cases below are not symmetric and the asymmetry is the design. One empty half is
+    /// legitimate and load-bearing: a factory nest drops the address filter deliberately, because its
+    /// children are not known in advance, and a nest can equally filter by address alone. Only both
+    /// halves empty is the unbounded request, so only that case is refused.
+    #[test]
+    fn the_empty_filter_is_unrepresentable() {
+        let addr = ["0xabc".to_string()];
+        let topic = ["0xddf2".to_string()];
+
+        assert!(
+            LogFilter::new(&[], &[]).is_none(),
+            "an empty address AND topic filter is every log on the chain, and must not be buildable"
+        );
+        assert!(
+            LogFilter::new(&addr, &topic).is_some(),
+            "an ordinary nest's filter is fine"
+        );
+        assert!(
+            LogFilter::new(&[], &topic).is_some(),
+            "topic0-only is a factory nest's filter, not the unbounded one"
+        );
+        assert!(
+            LogFilter::new(&addr, &[]).is_some(),
+            "address-only is bounded by the address list"
+        );
+
+        // What went in comes back out: the type narrows what is representable without editing the
+        // filter, so a refusal is the only behaviour it adds.
+        let f = LogFilter::new(&addr, &topic).unwrap();
+        assert_eq!(f.addresses(), addr);
+        assert_eq!(f.topic0s(), topic);
     }
 }

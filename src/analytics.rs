@@ -1053,8 +1053,9 @@ fn define_views(
             let hot_tbl = format!("__hot_{table}");
             match load_hot_temp(conn, &hot_tbl, &hot_rows) {
                 Ok(()) => Some(format!(
-                    "SELECT *{} FROM \"{hot_tbl}\"",
-                    derived_bigint_cols(cols)
+                    "SELECT *{} FROM {}",
+                    derived_bigint_cols(cols),
+                    with_bigint_base_cols(&format!("\"{hot_tbl}\""), cols)
                 )),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
@@ -1073,9 +1074,12 @@ fn define_views(
                 // without this a single drifted column makes `read_parquet` throw and the whole table's
                 // view silently vanish.
                 parts.push(format!(
-                    "SELECT *{} FROM read_parquet([{}], union_by_name=true)",
+                    "SELECT *{} FROM {}",
                     derived_bigint_cols(cols),
-                    files.join(", ")
+                    with_bigint_base_cols(
+                        &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
+                        cols
+                    )
                 ));
             }
             parts.extend(hot_part.clone());
@@ -1442,6 +1446,36 @@ fn derived_bigint_cols(cols: &[(String, String)]) -> String {
         ));
     }
     s
+}
+
+/// Wrap a row source so every declared big-integer column is present in its schema, NULL-filled where
+/// no input carries it.
+///
+/// COR-2's `union_by_name=true` only unions the schemas of the *listed inputs*, and `derived_bigint_cols`
+/// projects its casts one level above them - so a `word16`/`word32` column that **no** input carries is
+/// referenced by a cast and bound by nothing, the whole-view DDL fails on `Referenced column not found`,
+/// and the table disappears from `/sql` entirely (#434). That is not an exotic state: it is every nest
+/// between `schema.json` gaining a big-int column and the first segment carrying it sealing. One input
+/// out of N carrying the column already worked, which is what made this easy to believe was covered.
+///
+/// A zero-row typed branch fixes it where the drift belongs - inside the union, so the column is
+/// NULL-filled exactly as a partially-present one is, rather than by weakening the cast. `WHERE false`
+/// contributes schema and no rows, and it costs no extra scan or bind of the segments themselves.
+/// Types come from `hot_col_type` (COR-4: by column *name*), matching `empty_view_ddl` and the hot temp
+/// table, so a column does not change type the instant its first segment seals.
+fn with_bigint_base_cols(from_item: &str, cols: &[(String, String)]) -> String {
+    let stubs: Vec<String> = cols
+        .iter()
+        .filter(|(_, s)| is_bigint(s))
+        .map(|(c, _)| format!("CAST(NULL AS {}) AS \"{c}\"", hot_col_type(c)))
+        .collect();
+    if stubs.is_empty() {
+        return from_item.to_string();
+    }
+    format!(
+        "(SELECT * FROM {from_item} UNION ALL BY NAME SELECT {} WHERE false)",
+        stubs.join(", ")
+    )
 }
 
 /// An empty but correctly-typed view for a declared table that has no sealed segment yet, so a nest
@@ -2084,6 +2118,117 @@ template="pool"
         )
         .unwrap();
         assert_eq!(s[0]["s"], Value::from(fits));
+    }
+
+    /// #434: a declared big-int column that **no** sealed segment carries must not delete the table.
+    /// `union_by_name` NULL-fills a column some segments lack, but `derived_bigint_cols` casts one level
+    /// above it, so 0-of-N left the cast bound to nothing and the whole view DDL failed - the table
+    /// vanished from `/sql` with `Table with name ... does not exist`, no corrupt file involved. That is
+    /// the state of every nest between a `schema.json` big-int column landing and the first segment
+    /// carrying it sealing. 1-of-N always worked, which is what made it look covered.
+    #[test]
+    fn declared_bigint_column_no_segment_carries_keeps_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"registry_hash":"0x0","tables":[{"table":"t__transfer","alias":"t","event":"Transfer","topic0":"0x","columns":[{"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        // Two sealed segments, neither carrying `value` - the ABI bump that added it has not sealed yet.
+        for b in [1u64, 2] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"0xa","to":"0xb","block_number":{b},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                b,
+                b,
+            )
+            .unwrap();
+        }
+
+        // The table is still there and still answers over the segments that do exist.
+        let rows = query(dir.path(), r#"SELECT count(*) AS n FROM "t__transfer""#).unwrap();
+        assert_eq!(
+            rows[0]["n"],
+            Value::from(2u64),
+            "a declared big-int column carried by no segment must reduce to NULLs, not delete the table"
+        );
+        // The declared column and its derived siblings keep the shape they have at 1-of-N: present,
+        // NULL, not flagged as an overflow. A caller's `value_dec` query must not become a naming error.
+        let d = query(
+            dir.path(),
+            r#"SELECT value, value_dec, value_overflow FROM "t__transfer" ORDER BY block_number"#,
+        )
+        .unwrap();
+        assert_eq!(d[0]["value"], Value::Null);
+        assert_eq!(d[0]["value_dec"], Value::Null);
+        assert_eq!(d[0]["value_overflow"], Value::from(false));
+        // And the non-declared columns the segments do carry are untouched.
+        assert_eq!(d.len(), 2);
+        let f = query(dir.path(), r#"SELECT "from" FROM "t__transfer" LIMIT 1"#).unwrap();
+        assert_eq!(f[0]["from"], Value::from("0xa"));
+    }
+
+    /// The hot half of #434, which the issue does not cover. The hot temp table derives its columns
+    /// from the rows themselves, so a tip batch that carries no `value` key leaves the same derived
+    /// cast bound to nothing - and the view dies with every sealed segment healthy. Same wrap, and it
+    /// wants its own test because the sealed test above passes with the hot side still broken.
+    #[test]
+    fn declared_bigint_column_no_hot_row_carries_keeps_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"registry_hash":"0x0","tables":[{"table":"t__transfer","alias":"t","event":"Transfer","topic0":"0x","columns":[{"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__transfer".into(),
+            vec![serde_json::json!({"table":"t__transfer","from":"0xa","to":"0xb","block_number":100,"tx_hash":"0xt","log_index":0})],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT "from", value, value_dec, value_overflow FROM "t__transfer""#,
+            guard,
+            &hot,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows.len(),
+            1,
+            "a tip batch missing a declared big-int column must not delete the table"
+        );
+        assert_eq!(out.rows[0]["from"], Value::from("0xa"));
+        assert_eq!(out.rows[0]["value"], Value::Null);
+        assert_eq!(out.rows[0]["value_dec"], Value::Null);
+        assert_eq!(out.rows[0]["value_overflow"], Value::from(false));
+    }
+
+    #[test]
+    fn bigint_stub_types_columns_by_name_not_storage() {
+        // COR-4, third site. The two tests above assert the stubbed column is NULL, and a wrongly-typed
+        // stub is NULL too - so they pass with `hot_col_type` replaced by a constant. Type by column
+        // NAME, matching `empty_view_ddl` and `seal::rows_to_batch`: a `word32` column with a
+        // non-counter name stubs VARCHAR, so `WHERE value LIKE '7%'` does not become a binder error on
+        // the 0-of-N state this stub exists to make survivable (#467).
+        let s = with_bigint_base_cols("src", &[("fee".to_string(), "word32".to_string())]);
+        assert!(
+            s.contains(r#"CAST(NULL AS VARCHAR) AS "fee""#),
+            "word32-storage non-counter column must stub VARCHAR, got: {s}"
+        );
+        // The four counter columns stay UBIGINT (by name).
+        let s2 =
+            with_bigint_base_cols("src", &[("block_number".to_string(), "word32".to_string())]);
+        assert!(
+            s2.contains(r#"CAST(NULL AS UBIGINT) AS "block_number""#),
+            "got: {s2}"
+        );
     }
 
     #[test]

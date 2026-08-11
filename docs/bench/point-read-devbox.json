@@ -1,0 +1,20 @@
+{
+  "bench": "query",
+  "label": "#283 baseline: 8,004 rows indexed, 256 hot (unsealed tip), hermetic footprint-rpc fixture",
+  "nest": "point-read",
+  "chain": "mainnet",
+  "hot_rows": 256,
+  "sealed_through": 19936,
+  "reads": 256,
+  "warm_cache": true,
+  "point_read_p50_us": 1.24,
+  "point_read_p99_us": 1.57,
+  "point_read_p999_us": 1.72,
+  "sql": "SELECT count(*) FROM usdc__transfer",
+  "sql_iters": 5,
+  "sql_p50_ms": 10.81,
+  "sql_p99_ms": 12.83,
+  "sql_peak_rss_mb": 44,
+  "commit": "f1c9f58",
+  "hardware": "32 cores, 62 GB RAM"
+}
