@@ -295,45 +295,28 @@ jobs:
         # fail the build; `nuthatch bench query` measured it and nothing compared the number to
         # anything, so a scan where there was a seek could land unnoticed.
         #
-        # Same hermetic shape as `footprint` above - the chain is served by footprint-rpc.py and the
+        # Same hermetic shape as `footprint` above - the chain is served by multinest-rpc.py and the
         # nest is written inline - so there is no secret, no third party, and a fork PR can satisfy
-        # it. Every run indexes exactly 8,004 rows, of which 256 sit in the hot store and are the
-        # only ones a point-read can reach - the rest are sealed past finality and pruned. That is
-        # why `--reads` is 8,004 (keys offered) but the `--min-reads` floor is 256 (keys sampled).
+        # it. Every run indexes 200,200 rows across ten tables (real 10-event Uniswap V4 PoolManager
+        # ABI, 200 logs/block), of which 12,800 stay hot once everything past finality has sealed.
+        # That is the same fixture the `per-cursor RAM budget` job runs (#424).
         #
-        # **The ceilings come from a measured mutation, not from a guess.** The first version of this
-        # job used 200µs/2000µs, reasoned from "a point-read is single-digit microseconds, leave
-        # headroom". Replacing the B-tree seek in `get_entity` with a linear scan - the exact
-        # regression this is meant to catch - moved p50 to 24.2µs and p99 to 53.8µs, both comfortably
-        # *under* those ceilings. The gate printed "OK: within the point-read ceilings" with a full
-        # scan in the read path, which is the decoration this project keeps shipping by accident.
+        # **The ceiling comes from a measured mutation, not from a guess.** Replacing the B-tree seek
+        # in `get_entity` with a linear scan - the exact regression this gate exists to catch - was
+        # run as a draft PR on `ubuntu-latest` (4 cores, 16 GB), 200,200 rows indexed, 12,800 hot:
         #
-        # **Both sides are measured on `ubuntu-latest`, the runner that enforces this.** An earlier
-        # revision set 15µs from a 32-core/62 GB dev box (baseline p50 0.66-1.59µs, scan mutation
-        # 24.17µs) and hedged that a "4x-slower CI box" would still be caught. That was an assumption
-        # about hardware nobody had tested, so it was tested - PR #381, since closed, put the linear
-        # scan back and let this job judge it. On `ubuntu-latest` (4 cores, 16 GB), 8,004 rows
-        # indexed, 256 hot:
+        #   baseline             p50 0.94µs    p99 1.50µs    p99.9 4.23µs
+        #   scan mutation        p50 697.67µs  p99 1397.32µs
+        #   contrast (256 hot)   p50 14.38µs   p99 28.31µs
         #
-        #   baseline, 3 runs   p50 0.59-0.82µs   p99 0.70-1.00µs   p99.9 0.77-3.96µs
-        #   scan mutation      p50 18.15µs       p99 34.45µs       p99.9 49.78µs
+        # So p50 gates at **8µs**. The healthy baseline is 8.5x below it; the linear-scan mutation
+        # is 87x above it. The 256-hot-row control shows the same mutation at only 14µs - 1.8x above
+        # an 8µs ceiling - demonstrating that the realistic fixture is 50x more sensitive to this
+        # regression. Both sides measured on the same runner, with the enforcement runner enforcing.
         #
-        # Two things that only measuring could tell us, both of which moved the ceiling:
-        #
-        # 1. The runner is **not** slower than the dev box - it is at or below its baseline range.
-        #    256 rows sit in page cache and there is no parallelism for 32 cores to exploit.
-        # 2. The mutation is *faster* here (18.15µs vs 24.17µs), so the regression and the baseline do
-        #    **not** scale together the way the old comment assumed. 15µs left only a 1.21x margin
-        #    below the regression on the box that enforces it, against the 1.61x claimed.
-        #
-        # So p50 gates at **8µs**, which is better on both sides at once: 9.8x above the worst
-        # observed baseline, and 2.3x below a full scan. It tolerates a runner ~10x slower than any
-        # yet seen before it would false-positive, and p50 is the robust statistic here - the observed
-        # p50 spread is 1.4x while p99.9 spans 5.1x.
-        #
-        # Known sensitivity boundary: this discriminates a *full* linear scan over a 256-row hot
-        # store. A regression that lands under 8µs - a partial scan, or a scan when the hot store is
-        # much smaller - passes. The gate is a floor on gross regressions, not a microbenchmark.
+        # Known sensitivity boundary: this discriminates a full linear scan over a 12,800-row hot
+        # store. A regression that lands under 8µs - a very partial scan, or one over a much smaller
+        # store - passes. The gate is a floor on gross regressions, not a microbenchmark.
         #
         # **The tail is tracked, not gated - CI enforces p50 and nothing else.** Gating loosely and
         # tracking precisely are two different jobs, and one ceiling cannot do both: a p99 tight
@@ -352,7 +335,7 @@ jobs:
         #
         # **`BASELINE` is what stops the reference rotting again** (issue #385).
         # `docs/bench/point-read.json` is now this job's own artifact - taken verbatim from a green
-        # `main` run, commit a53565a, p50 0.78µs - rather than the 32-core dev-box report (p50 1.24µs)
+        # CI run on this PR, commit 6de5647, p50 0.94µs - rather than the 32-core dev-box report (p50 1.24µs)
         # that sat there while the gate ran here. Nothing caught that, because a committed number
         # cannot go stale loudly: it can only be read and believed, which is why `bench query`'s FAIL
         # message had to spend four lines telling readers not to believe it. The script now compares
