@@ -89,11 +89,22 @@ pub fn query_hot_cold(
 /// The distinction that matters for #433 is `DiedExecuting`: a query that fails to **bind** is a
 /// question about names - a typo, a missing column, an unknown table - and no corrupt page can cause
 /// one, so it must never trigger the integrity sweep. Only a query that bound and then died while
-/// reading rows is worth paying for. Without the split, `SELECT CAST(col AS INT)` over text data on
-/// the untrusted `/sql` surface would hash every segment in the nest, once per request.
+/// reading rows is worth paying for.
+///
+/// **That split rules out a typo and nothing else, and on its own it does not bound the sweep.** It
+/// was claimed here that it did. `SELECT CAST('x' AS INTEGER)` binds, dies executing, names no table
+/// and is 27 bytes; measured, it hashed every segment of a healthy nest, once per request, on a
+/// surface with no auth and two concurrency permits. What bounds the sweep is `tables` below: the
+/// tables the failed query actually referenced, which for that query is none.
 enum Attempt {
     Ok(QueryOutput),
-    DiedExecuting(anyhow::Error),
+    DiedExecuting {
+        error: anyhow::Error,
+        /// The base tables the query named, lowercased - the reachability bound on the sweep. `None`
+        /// when DuckDB could not serialize the statement, i.e. when we do not know what it reached;
+        /// see `run` for why that skips the sweep rather than widening it.
+        tables: Option<std::collections::BTreeSet<String>>,
+    },
 }
 
 fn run(
@@ -104,9 +115,9 @@ fn run(
     sealed_through: u64,
 ) -> Result<QueryOutput> {
     let nothing_excluded = std::collections::BTreeSet::new();
-    let e = match attempt(dir, sql, guard, hot, sealed_through, &nothing_excluded)? {
+    let (e, tables) = match attempt(dir, sql, guard, hot, sealed_through, &nothing_excluded)? {
         Attempt::Ok(out) => return Ok(out),
-        Attempt::DiedExecuting(e) => e,
+        Attempt::DiedExecuting { error, tables } => (error, tables),
     };
     // **A segment that binds but will not read takes the whole query down** (#433). `read_parquet`
     // validates the footer while the view is being created, which is where #430's reduction hooks in;
@@ -118,13 +129,29 @@ fn run(
     // which segments no longer match their content address, and if any do not, rebuild the views
     // without them and answer from what remains. Only once - a second execution failure is not about
     // segment integrity, because we just verified every segment we kept.
-    let corrupt = crate::seal::segments_failing_verification(dir);
+    //
+    // Ask only about the segments backing the tables this query **named** - the sweep reads and
+    // hashes files, and a segment the query never read cannot be what killed it. Bounding it by
+    // reachability rather than by a cache is what keeps this affordable without anything that can go
+    // stale (a memo keyed on mtime was tried here and was wrong; see `segments_failing_verification`).
+    let Some(tables) = tables else {
+        // DuckDB would not serialize the statement, so we do not know what it reached. Sweeping
+        // everything on the strength of not knowing is how the unbounded version comes back in
+        // through the fallback; the query fails with its own error instead, which is what it did
+        // before any of this existed. Loud and bounded beats quiet and expensive.
+        tracing::warn!(
+            "query died executing but its statement could not be parsed for table references - \
+             skipping the segment integrity sweep (cold data, if corrupt, is not reduced here)"
+        );
+        return Err(e);
+    };
+    let corrupt = crate::seal::segments_failing_verification(dir, &tables);
     if corrupt.is_empty() {
         return Err(e);
     }
     match attempt(dir, sql, guard, hot, sealed_through, &corrupt)? {
         Attempt::Ok(out) => Ok(out),
-        Attempt::DiedExecuting(e) => Err(e),
+        Attempt::DiedExecuting { error, .. } => Err(error),
     }
 }
 
@@ -177,7 +204,7 @@ fn attempt(
     //
     // Kept *beside* the denylist rather than replacing it: two independent controls that must both
     // pass, so a gap in either is covered while this one earns trust.
-    reject_unknown_table_refs(&conn, sql)?;
+    let referenced = reject_unknown_table_refs(&conn, sql)?;
     conn.execute_batch(&format!(
         "SET memory_limit='{MEM_LIMIT}'; SET threads={MAX_THREADS};"
     ))
@@ -260,8 +287,13 @@ fn attempt(
                 bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
             }
             // Handed back rather than returned: the caller decides whether a corrupt segment explains
-            // it and is worth one reduced retry (#433).
-            return Ok(Attempt::DiedExecuting(e));
+            // it and is worth one reduced retry (#433). The tables ride along because they come from
+            // the security walk that already ran above - one parse, one answer about what this query
+            // reaches, used by both controls.
+            return Ok(Attempt::DiedExecuting {
+                error: e,
+                tables: referenced,
+            });
         }
     };
 
@@ -531,20 +563,31 @@ const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 /// Fails **open** if the parse is unavailable: `json_serialize_sql` is a DuckDB feature and this is the
 /// newer of two controls. A parse failure must not take down `/sql` while the denylist - which has
 /// guarded this surface since RFC-0008 - is still in front of it.
-fn reject_unknown_table_refs(conn: &Connection, sql: &str) -> Result<()> {
+///
+/// Returns the **base tables the statement referenced**, lowercased (DuckDB matches identifiers
+/// case-insensitively), or `None` where the parse was unavailable and the answer is therefore not
+/// known. That set is the integrity sweep's reachability bound (see [`Attempt`]), and it comes from
+/// this walk rather than a second one so the two can never disagree about what a query reaches. CTE
+/// names parse as `BASE_TABLE` too and are included; a CTE named after a real table can only widen
+/// the set to a table that exists, which is the safe direction.
+fn reject_unknown_table_refs(
+    conn: &Connection,
+    sql: &str,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
         r.get::<_, String>(0)
     }) else {
-        return Ok(());
+        return Ok(None);
     };
     let Ok(v) = serde_json::from_str::<Value>(&ast) else {
-        return Ok(());
+        return Ok(None);
     };
     if v.get("error").and_then(Value::as_bool) == Some(true) {
         // DuckDB could not parse it. Let it say so itself, with its own error message.
-        return Ok(());
+        return Ok(None);
     }
+    let mut referenced = std::collections::BTreeSet::new();
     let mut bad: Option<String> = None;
     walk_table_refs(&v, &mut |kind, name| {
         if bad.is_some() {
@@ -567,12 +610,15 @@ fn reject_unknown_table_refs(conn: &Connection, sql: &str) -> Result<()> {
                     "`{name}` is not a table name - a quoted path in table position reads a file"
                 ));
             }
+            "BASE_TABLE" => {
+                referenced.insert(name.to_ascii_lowercase());
+            }
             _ => {}
         }
     });
     match bad {
         Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
-        None => Ok(()),
+        None => Ok(Some(referenced)),
     }
 }
 
@@ -2828,6 +2874,169 @@ template="pool"
                 Err(Died::Executing(_))
             ),
             "reading a page-corrupt segment is an execution failure - the only shape worth sweeping for"
+        );
+    }
+
+    /// Collect every event message a closure logs. Used below to observe whether the integrity sweep
+    /// touched a segment at all - the sweep has no return value a caller can see and no semantic
+    /// effect when it looks at a table the query never named, so cost is the only thing that changes
+    /// and the log line is the only place it surfaces. `with_default` is thread-local, so this is
+    /// unaffected by tests running in parallel.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        fn mentioning(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(
+                    &mut self,
+                    _f: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{value:?}");
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Msg(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    /// **Issue #433, the cost bound as reviewed.** The phase split was claimed to make "the cheap way
+    /// to provoke a sweep" nonexistent. It did not: `SELECT CAST('x' AS INTEGER)` is 27 bytes, names
+    /// no table, passes every gate, binds, and dies executing - and it hashed every segment in a
+    /// healthy nest, once per request, on a surface with no auth and two concurrency permits.
+    ///
+    /// So the sweep is bounded by **reachability**: only segments backing tables the failed query
+    /// named. A query that names nothing sweeps nothing.
+    ///
+    /// The measurement is the log line `segments_failing_verification` emits when it rejects a
+    /// segment, because the sweep has no other observable: looking at a table the query never
+    /// referenced changes no answer, only cost. **The positive control is in this test on purpose** -
+    /// an absence assertion whose mechanism is missing passes for the wrong reason, which is the
+    /// failure this whole sprint is about.
+    #[test]
+    fn a_query_that_names_no_table_reaches_no_segment() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+
+        const REJECTED: &str = "does not match its content address";
+
+        // The attack: no table named, so nothing is reachable, so nothing may be hashed - even though
+        // this nest does hold a corrupt segment and the query does die in the execution phase.
+        let quiet = CapturedLogs::default();
+        let err = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(quiet.clone()),
+            || query(dir.path(), "SELECT CAST('x' AS INTEGER)").unwrap_err(),
+        );
+        // `{:#}` for the whole chain: the outermost context is just "query failed", and asserting on
+        // that would pass for any execution failure at all, including one this test did not cause.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Conversion Error"),
+            "expected the cast itself to be what failed, got: {chain}"
+        );
+        assert_eq!(
+            quiet.mentioning(REJECTED),
+            0,
+            "a query naming no table must not read or hash a single segment - this is the 27-byte \
+             amplifier the review found"
+        );
+
+        // The positive control, in the same test with the same capture: a query that *does* name the
+        // table sweeps it, finds the corrupt segment and says so. Without this, the assertion above
+        // would pass just as happily with the log line renamed or the sweep deleted entirely.
+        let loud = CapturedLogs::default();
+        let rows = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(loud.clone()),
+            || query(dir.path(), r#"SELECT "from" FROM "t__transfer""#).expect("reduces"),
+        );
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        assert_eq!(
+            loud.mentioning(REJECTED),
+            1,
+            "the same corrupt segment must be found when the query does name its table - if this is \
+             0 the capture is broken and the assertion above proves nothing"
+        );
+    }
+
+    /// The input to that bound: what the security walk reports a statement reaches. One parse feeds
+    /// both controls, so this pins the half `reject_unknown_table_refs` did not used to have.
+    #[test]
+    fn the_table_refs_walk_reports_what_the_statement_reached() {
+        let conn = Connection::open_in_memory().unwrap();
+        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap();
+
+        assert!(
+            refs("SELECT CAST('x' AS INTEGER)").is_empty(),
+            "a constant expression reaches no table"
+        );
+        assert_eq!(
+            refs(r#"SELECT * FROM "t__transfer""#),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        // DuckDB matches identifiers case-insensitively, so the sweep's lookup must too - otherwise a
+        // shouted table name silently loses its reduction.
+        assert_eq!(
+            refs("SELECT * FROM T__TRANSFER"),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        assert_eq!(
+            refs("SELECT (SELECT max(a) FROM u) FROM t"),
+            ["t".to_string(), "u".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a table reached from a subquery is still reached"
         );
     }
 
