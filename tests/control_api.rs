@@ -307,3 +307,39 @@ async fn health_needs_no_token() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+/// Undeclaring a nest takes its secrets with it.
+///
+/// A deleted nest that leaves credentials behind is a live exposure, not untidiness: the rows are
+/// unreachable through any surface that lists nests, so nobody sees them again, and the next nest
+/// declared under the same name silently inherits them.
+///
+/// This is the root of #426, which surfaced one layer up as a test-fixture defect - the fixture
+/// cleans up by undeclaring every nest, so a `put_secret` mutated to write nothing still passed
+/// against the rows a previous run had orphaned. Fixing the fixture would have hidden this.
+#[tokio::test]
+async fn undeclaring_a_nest_removes_its_secrets() {
+    let Some((_app, cp)) = fixture(None) else {
+        return;
+    };
+    cp.declare_nest(&nuthatch::scheduler::DesiredNest {
+        name: "ghost".into(),
+        chain: "mainnet".into(),
+        estimated_rss_mb: 64,
+    })
+    .unwrap();
+    cp.set_secret("ghost", "RPC_URL", "https://example.invalid/k/SUPERSECRET")
+        .unwrap();
+    assert_eq!(
+        cp.secret_keys("ghost").unwrap(),
+        vec!["RPC_URL".to_string()],
+        "fixture must actually store a secret, or this test proves nothing"
+    );
+
+    cp.undeclare_nest("ghost").unwrap();
+
+    assert!(
+        cp.secret_keys("ghost").unwrap().is_empty(),
+        "a nest's secrets must not outlive the nest - they are unreachable and inheritable"
+    );
+}

@@ -243,7 +243,7 @@ pub mod exex {
             assert_eq!(s.tip().await.unwrap(), 10);
             assert_eq!(s.block_hash(10).await.unwrap().as_deref(), Some("0xhash10"));
             assert_eq!(
-                s.logs(&["0xABC".to_string()], &[topic.clone()], 0, 20)
+                s.logs(&["0xABC".to_string()], std::slice::from_ref(&topic), 0, 20)
                     .await
                     .unwrap()
                     .len(),
