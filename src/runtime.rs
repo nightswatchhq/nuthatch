@@ -2161,11 +2161,7 @@ mod tests {
             None,
             "a dataset holding data must not adopt"
         );
-        assert_eq!(
-            history_head(&dest),
-            Some(17),
-            "its store must be untouched"
-        );
+        assert_eq!(history_head(&dest), Some(17), "its store must be untouched");
     }
 
     /// The dangerous direction, at the point the decision is made: different data identity, no
@@ -2397,7 +2393,9 @@ mod tests {
         std::fs::remove_file(src.join(crate::config::DB_FILE)).unwrap();
         seed_history(&src, 4242);
         assert_eq!(
-            adopt_dataset(root, &dest, &new).unwrap().map(|a| a.from_nid),
+            adopt_dataset(root, &dest, &new)
+                .unwrap()
+                .map(|a| a.from_nid),
             Some(old),
             "declining an unreadable candidate must cost nothing once it is readable"
         );
