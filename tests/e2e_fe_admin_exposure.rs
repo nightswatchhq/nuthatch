@@ -259,9 +259,32 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 /// rewrites the nest directory out of DuckDB errors, and the `/sql` and `/explain` probes below do
 /// *not* exercise it: an unknown table is a Catalog Error carrying no path, and a table the registry
 /// declares resolves against the hot store and succeeds. Making `sanitize_sql_error` a no-op leaves
-/// this test green - verified, not assumed. Provoking the `IO Error` that names an absolute parquet
-/// glob needs a nest with sealed segments missing underneath it, which this FE fixture has no way to
-/// build. That redaction remains covered by its unit tests in `serve.rs` alone.
+/// this test green - verified, not assumed.
+///
+/// An earlier revision of this paragraph blamed the fixture: provoking the `IO Error` that names an
+/// absolute parquet glob needs sealed segments this FE harness cannot build. That fixture was
+/// afterwards built (the `e2e_solo` tape drives land -> seal), and the reason turns out to be
+/// structural rather than a limit of this file - which is a better thing to inherit, so it is
+/// recorded here instead:
+///
+/// - a sealed segment that is **missing** is filtered out of the glob list in
+///   `analytics::define_views` before the DDL is assembled, with a `warn!`. No path is formatted, so
+///   none can escape.
+/// - a sealed segment that is **present but unreadable** throws while `read_parquet` binds the view,
+///   and `define_views` swallows that DDL failure at `debug!`. What the caller receives is
+///   `Catalog Error: Table with name ... does not exist!` - no path, because the statement carrying
+///   the path never ran.
+/// - `analytics::run` opens a fresh in-memory connection per query, so views are defined and executed
+///   inside one call. There is no window in which a view binds and then fails at execution against a
+///   file that changed underneath it.
+///
+/// So on the sealed-segment route `sanitize_sql_error` is defence-in-depth, not a live control - an
+/// assertion here would be green whether or not the redactor is wired in, which is the vacuous
+/// absence this comment exists to refuse. It is not dead code: the `allowed_directories` lockdown in
+/// `analytics::run` propagates through `?` carrying the absolute nest paths in the statement it
+/// failed on. But that route is not reachable on demand from a request, so the redaction remains
+/// covered by its unit tests in `serve.rs` alone. Anyone wanting the wiring pinned should take the
+/// lockdown path, not the segment path.
 ///
 /// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
 /// it has teeth there: adding the nest directory to `nest_info` turns it red.
@@ -319,8 +342,8 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
         "/flags",
         "/queries",
         // Both SQL probes are here for the error *body*, not the happy path - a query error is the
-        // classic place an absolute path escapes. See the note on `sanitize_sql_error` below for what
-        // this does and does not reach.
+        // classic place an absolute path escapes. See the note on `sanitize_sql_error` in this test's
+        // doc comment for what this does and does not reach.
         "/sql?q=SELECT%20*%20FROM%20no_such_table",
         "/explain?q=SELECT%20*%20FROM%20no_such_table",
         "/sql?q=SELECT%20*%20FROM%20usdc__transfer",
