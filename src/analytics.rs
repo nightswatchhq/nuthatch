@@ -2764,7 +2764,11 @@ template="pool"
         let dir = two_segment_nest();
         // Present, listed in the manifest, no longer a Parquet file - and not quarantined, because
         // nothing has restarted.
-        std::fs::write(block_two_segment(dir.path()), b"not parquet, not even close").unwrap();
+        std::fs::write(
+            block_two_segment(dir.path()),
+            b"not parquet, not even close",
+        )
+        .unwrap();
 
         let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
         assert_eq!(out.rows.len(), 1, "reduced to the readable segment (#430)");
@@ -2774,7 +2778,9 @@ template="pool"
         );
         assert_eq!(
             out.degraded_tables,
-            ["t__transfer".to_string()].into_iter().collect(),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
             "the reduced table is named, so a caller can tell which of its numbers to distrust"
         );
     }
@@ -2812,7 +2818,9 @@ template="pool"
         assert_eq!(out.rows.len(), 1, "reduced on the retry (#433)");
         assert_eq!(
             out.degraded_tables,
-            ["t__transfer".to_string()].into_iter().collect(),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
             "the retry's exclusions are degradation too - the query succeeded with less data"
         );
     }
