@@ -132,11 +132,14 @@ Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail
 
 ```sh
 nuthatch bench query --dir <nest> --reads 8004 \
-  --min-reads 256 --max-point-read-p50-us 8 --max-point-read-p99-us 150
+  --min-reads 256 --max-point-read-p50-us 8
 ```
 
 Pass none of them and the bench only reports, which is what an operator poking at their own nest
 wants. Pass any of them and it is a gate.
+
+That is the command CI runs, and it deliberately sets no p99 ceiling - see below for why the tail is
+tracked rather than gated. `--max-point-read-p99-us` still exists for an operator who wants it.
 
 **Point-reads see the unsealed tip, not the backfill.** `get_entity` is a hot-store read, and rows
 past finality are sealed to Parquet and pruned out of redb - so of the fixture's 8,004 indexed rows
@@ -180,11 +183,23 @@ a real regression rather than the 1.61x claimed.
 - **p50, ceiling 8µs, is the gate that discriminates.** 9.8x above the worst observed baseline and 2.3x
   below a full scan - better on both sides at once than 15µs was on either. p50 is the robust
   statistic here: its observed spread is 1.4x where p99.9's is 5.1x.
-- **p99, ceiling 150µs, is a catastrophe backstop and nothing more** - ~150x baseline, and it does
-  *not* catch the scan mutation (34.45µs < 150µs). p99 over 256 samples is the 4th-worst read, so on a
-  shared runner it is preemption-dominated. A tight p99 here buys a flaky check, and a flaky gate gets
-  waved through until it means nothing.
-- **p99.9 is reported and gated on by nothing.** It swung 0.77-3.96µs at fixed commits.
+- **p99 and p99.9 are tracked and gated on by nothing.** This is the design call, not an oversight:
+  gating loosely and tracking precisely are two different jobs, and one ceiling cannot do both. A p99
+  tight enough to catch a regression flakes on a shared VM; one loose enough to survive catches
+  nothing. This gate briefly carried a 150µs p99 backstop on the second horn of that, and the table
+  above is what retired it - the scan mutation only moved p99 to 34.45µs, so a 150µs ceiling did not
+  fire on the one regression the gate exists to catch. A ceiling that passes the known break is not a
+  weak gate, it is decoration that reads as coverage, and on a *required* check that is worse than no
+  check because it stops anyone looking.
+
+  The tail is still the number worth having - it is simply read with our eyes across releases rather
+  than compared to a threshold. p99 over 256 samples is the 4th-worst read and preemption-dominated
+  here; p99.9 swung 0.77-3.96µs at fixed commits. Neither is a property of the read path on this
+  hardware, which is precisely why neither can fail a build. Both are in the uploaded report and the
+  step summary.
+
+  `MAX_P99_US` is still there for an operator on a quiet machine who wants the tail enforced
+  deliberately; it just has no default and CI does not set it.
 
 What this gate does **not** catch: a regression landing under 8µs - a partial scan, or a scan when the
 hot store is much smaller than 256 rows - cold-start latency (it measures warm, see `warm_cache` in the

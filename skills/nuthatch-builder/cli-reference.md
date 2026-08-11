@@ -54,6 +54,7 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--label <LABEL>` - A label for the workload in the report (e.g. "W1: USDC 100k dense")
 - `--seal-direct` - Measure the seal-direct path (decode → Parquet, bypassing the hot store) instead of the default decode → redb hot-store path. Use to compare the two backfill storage paths
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches (seal-direct only). >1 overlaps RPC round-trip latency; results are still consumed in block order so segments are identical. Try 8-16 against your own node
+- `--keep <KEEP>` - Keep the run's data at this path instead of a temp dir that is discarded
 
 ## `nuthatch bench query`
 

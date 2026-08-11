@@ -1,0 +1,22 @@
+[nest]
+name = "obib-case3"
+chain = "mainnet"
+chain_id = 1
+# Keyless defaults, so this file is safe to commit. The published number is measured against an
+# endpoint passed on the command line (`--rpc "$RPC"`), which is what OBIB's own methodology uses.
+# Verified 2026-08-10 to serve BATCHED eth_getBlockByNumber, which this case is by definition.
+# eth-pokt.nodies.app is deliberately absent: it answers 403 on batch, which surfaces here as
+# "N of N headers still missing" rather than as an auth error.
+rpc_urls = [
+    "https://eth.drpc.org",
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.api.onfinality.io/public",
+]
+schema_version = 2
+# The blocks table carries its own timestamp, so the separate timestamp fetch would be a second
+# round trip for a field we already have (RFC-0036 §1).
+block_timestamps = false
+
+# OBIB case 3 is header data only — no contract, no events. One row per block over 0-100,000.
+[extract]
+blocks = true
