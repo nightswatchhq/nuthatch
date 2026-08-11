@@ -2,9 +2,13 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Sprint branches get the full gate too. The firm merges into `sprint/**` without peer
+    # review - the review requirement was the jam, not the writing - and CI is what still
+    # catches real breakage. It runs on GitHub's machines, so it costs no Claude allowance:
+    # it is the one gate that is free, and therefore the one to keep.
+    branches: [main, 'sprint/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'sprint/**']
 
 env:
   CARGO_TERM_COLOR: always
