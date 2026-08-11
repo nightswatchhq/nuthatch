@@ -290,8 +290,13 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest_with_secrets(dir.path());
-    // The absolute path an error message would embed. Canonicalised because that is the form DuckDB
-    // and `std::fs` report on macOS, where `/tmp` is a symlink to `/private/tmp`.
+    // The absolute paths a disclosure would embed, in *both* forms. `config.rs` and `indexer.rs`
+    // canonicalise nothing, so the payload routes echo the raw `dir` they were handed, while DuckDB
+    // and `std::fs` report the resolved one. The two are the same string only where TMPDIR resolves
+    // without a symlink; on macOS (`/tmp` -> `/private/tmp`) they differ, and checking either alone
+    // is decoration on that platform. Verified: with TMPDIR pointed at a symlink, the raw form is the
+    // one the dir-publishing mutation trips.
+    let raw_dir = dir.path().display().to_string();
     let nest_dir = dir.path().canonicalize().unwrap().display().to_string();
     let (base, task) = start_fe(dir.path(), true).await;
 
@@ -397,10 +402,12 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
                 "{path} disclosed {label} to a credentialed caller: {body}"
             );
         }
-        assert!(
-            !body.contains(&nest_dir),
-            "{path} disclosed the nest's absolute filesystem path ({nest_dir}): {body}"
-        );
+        for candidate in [&raw_dir, &nest_dir] {
+            assert!(
+                !body.contains(candidate),
+                "{path} disclosed the nest's absolute filesystem path ({candidate}): {body}"
+            );
+        }
     }
 
     std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
