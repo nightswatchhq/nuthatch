@@ -198,7 +198,12 @@ async function runSql(){
   try {
     const d = await api('/sql?q='+encodeURIComponent(q));
     if(d.error){ $('#sqlrows').innerHTML = `<div class="err">${esc(d.error)}</div>`; $('#sqlmeta').textContent=''; return; }
-    $('#sqlmeta').textContent = `${fmt(d.count)} row(s)` + (d.truncated?' (truncated)':'');
+    // The degraded caveat rides in the same meta line as truncation (#435). Without it a reduced
+    // table renders here as a perfectly healthy small one, and the operator reads a wrong total off
+    // their own admin page. `textContent`, so a table name is never markup.
+    const deg = d.degraded_tables || [];
+    $('#sqlmeta').textContent = `${fmt(d.count)} row(s)` + (d.truncated?' (truncated)':'')
+      + (deg.length?` - INCOMPLETE: sealed data for ${deg.join(', ')} could not be read`:'');
     $('#sqlrows').innerHTML = rowsTable(d.rows);
   } catch(e){ $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent=''; }
 }

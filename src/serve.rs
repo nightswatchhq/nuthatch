@@ -1093,6 +1093,19 @@ async fn run_sql_query(
         Ok(Ok(out)) => Json(json!({
             "count": out.rows.len(),
             "truncated": out.truncated,
+            // Cold data was incomplete when this answer was computed (#435): a sealed segment the
+            // manifest lists could not be read, so its table was *reduced* and the query succeeded
+            // with quietly less data. Reduction is the right policy (#430) - a bad segment must not
+            // delete a table - but it is only defensible if the caller is told, or `SUM(value)`
+            // comes back wrong rather than absent. Always present, so a caller cannot mistake the
+            // healthy shape for an older build that never reported it.
+            //
+            // `degraded_tables` names the tables and nothing else. Table names are already public on
+            // this surface (`/schema` lists them, and you must name one to query it); segment paths
+            // and content addresses are not, and must never appear here - `/sql` is untrusted, which
+            // is the same reason errors go through `sanitize_sql_error`.
+            "degraded": out.degraded(),
+            "degraded_tables": out.degraded_tables,
             "rows": out.rows,
             // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
             // were decoded; it does not say **which dataset answered**, and since RFC-0033's early

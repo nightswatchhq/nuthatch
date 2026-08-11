@@ -423,6 +423,24 @@ fn format_sql_result(raw: &str) -> String {
         .unwrap_or_default();
 
     let mut out = String::new();
+    // Ahead of the rows, unlike the truncation notice below. An agent silently consuming reduced cold
+    // data is the worse half of #435: truncation explains a cut the agent can *see* in the row count,
+    // whereas degradation explains rows that are not there at all and leave no trace in the table -
+    // trailing a 200-row result it would be competing with the data for attention. Stated as guidance
+    // for the same reason the truncation notice is: an agent told what is wrong can qualify its answer
+    // or re-query, one told nothing reports a wrong total in confident prose.
+    if let Some(tables) = v.get("degraded_tables").and_then(Value::as_array) {
+        if !tables.is_empty() {
+            let names: Vec<&str> = tables.iter().filter_map(Value::as_str).collect();
+            out.push_str(&format!(
+                "⚠ incomplete: sealed data for {} could not be read, so these rows are a subset of \
+                 the real history. Totals and aggregates over {} are understated - say so in any \
+                 answer, and check the node's logs.\n\n",
+                names.join(", "),
+                if names.len() == 1 { "it" } else { "them" }
+            ));
+        }
+    }
     if rows.is_empty() {
         out.push_str("(0 rows)\n");
     } else {
@@ -758,6 +776,45 @@ mod tests {
         assert!(
             out.contains("GROUP BY") && out.contains("`limit`"),
             "tells the agent how to adapt"
+        );
+    }
+
+    /// **Issue #435.** An agent must be told when the rows it is about to reason over are a subset of
+    /// the history, and told *before* it reads them.
+    ///
+    /// This is the worse half of #435: a human at least sees the row count and may wonder, whereas an
+    /// agent asked "how much moved?" will sum the column and answer in confident prose. The notice
+    /// leads the result for that reason - after a long table it is competing with the data.
+    #[test]
+    fn sql_degradation_leads_the_result_for_an_agent() {
+        let raw = r#"{"count":1,"truncated":false,"degraded":true,"degraded_tables":["t__transfer"],"rows":[{"n":1}],"provenance":{"as_of":9,"sealed_through":9,"source":"hot+sealed","registry_hash":"0xabcd1234"}}"#;
+        let out = format_sql_result(raw);
+        assert!(
+            out.contains("incomplete") && out.contains("t__transfer"),
+            "the notice names the affected table: {out}"
+        );
+        assert!(
+            out.contains("understated"),
+            "and says what it does to a total, which is the thing an agent is about to report"
+        );
+        let notice = out.find("incomplete").expect("the notice");
+        let table = out.find("n\n").expect("the rendered table's header");
+        assert!(
+            notice < table,
+            "the notice must precede the rows, not trail them: {out}"
+        );
+    }
+
+    /// The control for the test above. A healthy result carries no caveat, or the caveat means
+    /// nothing - and `degraded_tables` present-but-empty must read as healthy, not as a bare
+    /// truthiness check on the field.
+    #[test]
+    fn a_healthy_sql_result_carries_no_degradation_notice() {
+        let raw = r#"{"count":1,"truncated":false,"degraded":false,"degraded_tables":[],"rows":[{"n":1}],"provenance":{"as_of":9,"sealed_through":9,"source":"hot+sealed","registry_hash":"0xabcd1234"}}"#;
+        let out = format_sql_result(raw);
+        assert!(
+            !out.contains("incomplete"),
+            "an intact nest must not warn: {out}"
         );
     }
 

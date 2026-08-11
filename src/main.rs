@@ -253,21 +253,54 @@ async fn run_sql(args: cli::SqlArgs) -> Result<()> {
     let backend = SqlBackend::open(&args.dir, &args.url)?;
     match args.query.clone() {
         Some(query) => {
-            let (rows, truncated) = backend.query(&query).await?;
+            let out = backend.query(&query).await?;
             if args.json {
-                for row in &rows {
+                for row in &out.rows {
                     println!("{row}");
                 }
             } else {
-                print_table(&rows);
+                print_table(&out.rows);
             }
-            if truncated {
-                eprintln!("(result truncated at 50000 rows)");
-            }
+            report_caveats(&out);
             Ok(())
         }
         None => repl(backend).await,
     }
+}
+
+/// Everything about a result that the rows themselves do not say. To **stderr**, so `--json` stays a
+/// clean pipe and the caveat still reaches a human watching the terminal.
+///
+/// The degraded line is the one that matters (#435). `nuthatch sql`'s default rendering is a table of
+/// rows, and a `degraded` field the CLI declined to print would be exactly the invisible signal the
+/// issue is about - the whole point is that a caller who ignores the flag still gets told. A reduced
+/// table looks identical to a small one from here, so absent the line the operator sums a column and
+/// gets a confident wrong number off their own machine.
+fn report_caveats(out: &analytics::QueryOutput) {
+    for line in caveats(out) {
+        eprintln!("{line}");
+    }
+}
+
+/// The caveat lines themselves, split out from the printing so they can be asserted. A test that had
+/// to capture stderr would be asserting the plumbing; this asserts the decision.
+fn caveats(out: &analytics::QueryOutput) -> Vec<String> {
+    let mut lines = Vec::new();
+    if out.truncated {
+        lines.push("(result truncated at 50000 rows)".to_string());
+    }
+    if out.degraded() {
+        lines.push(format!(
+            "warning: sealed data for {} could not be read - these rows are INCOMPLETE and any \
+             total over them is understated. Check the node's logs for the segment.",
+            out.degraded_tables
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines
 }
 
 /// Where `nuthatch sql` queries run: the local store (when `dev` is stopped) or the running instance's
@@ -304,7 +337,10 @@ impl SqlBackend {
         }
     }
 
-    async fn query(&self, sql: &str) -> Result<(Vec<serde_json::Value>, bool)> {
+    /// Both backends answer in the same shape, so the caveats a result carries (`truncated`,
+    /// `degraded_tables`) survive the local/HTTP split instead of being flattened away at the boundary
+    /// - the HTTP branch reconstructs them from the JSON the node already sends.
+    async fn query(&self, sql: &str) -> Result<analytics::QueryOutput> {
         match self {
             SqlBackend::Local { dir, store } => {
                 // Live tip ∪ sealed history, disjoint by the sealed watermark (COR-1).
@@ -320,7 +356,7 @@ impl SqlBackend {
                     &hot,
                     sealed_through,
                 ) {
-                    Ok(out) => Ok((out.rows, out.truncated)),
+                    Ok(out) => Ok(out),
                     Err(e) => {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
                         // nest's schema and append a fix hint. Schema is loaded only on the error path.
@@ -365,7 +401,24 @@ impl SqlBackend {
                     .get("truncated")
                     .and_then(|t| t.as_bool())
                     .unwrap_or(false);
-                Ok((rows, truncated))
+                // Absent (an older node) reads as healthy, which is the only safe default here: this
+                // branch cannot distinguish "no degradation" from "does not report it", and inventing
+                // a warning on every query against an older node would train the operator to ignore
+                // the one that matters.
+                let degraded_tables = body
+                    .get("degraded_tables")
+                    .and_then(|t| t.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(analytics::QueryOutput {
+                    rows,
+                    truncated,
+                    degraded_tables,
+                })
             }
         }
     }
@@ -393,11 +446,9 @@ async fn repl(backend: SqlBackend) -> Result<()> {
                 }
                 // A query error is printed, never fatal - the session stays open.
                 match backend.query(line).await {
-                    Ok((rows, truncated)) => {
-                        print_table(&rows);
-                        if truncated {
-                            eprintln!("(result truncated at 50000 rows)");
-                        }
+                    Ok(out) => {
+                        print_table(&out.rows);
+                        report_caveats(&out);
                     }
                     Err(e) => eprintln!("error: {e:#}"),
                 }
@@ -450,7 +501,13 @@ async fn repl_meta(line: &str, backend: &SqlBackend) -> bool {
 
 async fn run_meta_query(backend: &SqlBackend, sql: &str) {
     match backend.query(sql).await {
-        Ok((rows, _)) => print_table(&rows),
+        Ok(out) => {
+            print_table(&out.rows);
+            // The dot-commands get the caveats too. `.tables` is the sharpest case: a table whose
+            // view could not be defined is simply *absent* from the catalogue listing, which is the
+            // naming-fault misread of #419 in its purest form - the warning names it.
+            report_caveats(&out);
+        }
         Err(e) => eprintln!("error: {e:#}"),
     }
 }
@@ -559,4 +616,51 @@ fn hostname_or_bail() -> anyhow::Result<String> {
                  an id would each believe they hold their own lease."
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn out(truncated: bool, degraded: &[&str]) -> analytics::QueryOutput {
+        analytics::QueryOutput {
+            rows: vec![],
+            truncated,
+            degraded_tables: degraded.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// **Issue #435, on the terminal.** `nuthatch sql`'s default rendering is a table of rows, and a
+    /// `degraded` field the CLI declined to print is exactly the invisible signal the issue is about -
+    /// a reduced table looks identical to a small one from here, so the operator sums a column on
+    /// their own machine and gets a confident wrong number.
+    #[test]
+    fn a_reduced_result_warns_on_the_terminal_and_names_the_table() {
+        let lines = caveats(&out(false, &["usdc__transfer"]));
+        assert_eq!(lines.len(), 1, "one caveat, the degraded one: {lines:?}");
+        assert!(
+            lines[0].contains("INCOMPLETE") && lines[0].contains("usdc__transfer"),
+            "the warning must name what is short: {lines:?}"
+        );
+    }
+
+    /// The control. A CLI that warns on every query is a CLI whose warnings are ignored, and the
+    /// assertion above would pass just as well against an unconditional `eprintln!`.
+    #[test]
+    fn a_healthy_result_prints_no_caveats() {
+        assert!(
+            caveats(&out(false, &[])).is_empty(),
+            "an intact nest must print nothing"
+        );
+    }
+
+    /// Truncation and degradation are independent, and a result can be both: the caller capped the
+    /// rows *and* the cold data behind them was short. Reporting only the first would hide the one
+    /// they cannot fix by re-querying.
+    #[test]
+    fn truncation_and_degradation_are_reported_independently() {
+        assert_eq!(caveats(&out(true, &[])).len(), 1);
+        assert_eq!(caveats(&out(true, &["a", "b"])).len(), 2);
+        assert!(caveats(&out(true, &["a", "b"]))[1].contains("a, b"));
+    }
 }

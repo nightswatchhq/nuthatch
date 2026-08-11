@@ -829,6 +829,13 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
 /// The assertion is the exact surviving set, not merely "the table still exists": the reduction has
 /// to be confined to the blocks the dead segment carried, with the other segment and the hot tip
 /// untouched.
+///
+/// **It also pins #435: the response has to *say* it was reduced.** The two responses this test
+/// already produces are the whole of that question - one healthy, one short - and to a caller reading
+/// only `rows` they are indistinguishable, which is how `SELECT SUM(value)` comes back quietly wrong.
+/// Asserted here rather than in a fixture of its own because the flag is worth nothing unless it
+/// survives the real router, the real `spawn_nest` state and the real serialisation; a hand-built
+/// `AppState` would prove the handler and never the wiring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() {
     let dir = tempfile::tempdir().unwrap();
@@ -942,6 +949,20 @@ async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() 
         (1..=10).collect::<BTreeSet<u64>>(),
         "healthy /sql must span both segments and the hot tip, got {healthy}"
     );
+    // #435's control, and the half that carries the weight: a flag that is always on is worse than
+    // none, because an operator learns to ignore it. The fields must also be *present* on the healthy
+    // response - a caller cannot treat "absent" as "fine" without also treating an older node that
+    // never reports as fine.
+    assert_eq!(
+        healthy["degraded"],
+        serde_json::json!(false),
+        "an intact nest must report itself intact: {healthy}"
+    );
+    assert_eq!(
+        healthy["degraded_tables"],
+        serde_json::json!([]),
+        "and name nothing: {healthy}"
+    );
 
     // Scribble over the segment carrying blocks [4,6], leaving the file present and the manifest
     // untouched - exactly what a bad sector or a half-written restore looks like to `read_parquet`.
@@ -968,6 +989,19 @@ async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() 
         [1, 2, 3, 7, 8, 9, 10].into_iter().collect::<BTreeSet<u64>>(),
         "the corrupt segment's blocks must be the *only* rows lost - the surviving segment and the \
          hot tip stay, and the table does not vanish. Got {reduced}"
+    );
+    // #435. Same status, same shape, three fewer blocks: without this the caller has no way to tell
+    // this answer from the healthy one above, and the reduction policy #430 chose is only defensible
+    // if the reduction is visible above the log.
+    assert_eq!(
+        reduced["degraded"],
+        serde_json::json!(true),
+        "a reduced answer must say it is reduced: {reduced}"
+    );
+    assert_eq!(
+        reduced["degraded_tables"],
+        serde_json::json!([table]),
+        "and name the table whose totals are now understated: {reduced}"
     );
 
     server.abort();
