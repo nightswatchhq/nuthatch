@@ -154,9 +154,9 @@ use proptest::prelude::*;
 /// `depth_bands_are_all_reachable` asserts on this strategy directly; keep them in step.
 fn reorg_depth() -> impl Strategy<Value = u64> {
     prop_oneof![
-        1u64..=2,                        // shallow: the everyday tip flutter
-        3u64..=(CHAIN_LEN / 2),          // mid
-        (CHAIN_LEN / 2 + 1)..CHAIN_LEN,  // deep: unwinds most of the chain
+        1u64..=2,                       // shallow: the everyday tip flutter
+        3u64..=(CHAIN_LEN / 2),         // mid
+        (CHAIN_LEN / 2 + 1)..CHAIN_LEN, // deep: unwinds most of the chain
     ]
 }
 
@@ -325,10 +325,9 @@ async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
                  last_block={:?} sealed_through={} checkpoints={:?} {halted}",
                 store.get_meta("last_block").ok().flatten(),
                 store.sealed_through(),
-                store.checkpoints_desc().map(|c| c
-                    .into_iter()
-                    .map(|(b, _)| b)
-                    .collect::<Vec<_>>()),
+                store
+                    .checkpoints_desc()
+                    .map(|c| c.into_iter().map(|(b, _)| b).collect::<Vec<_>>()),
             );
         }
 
