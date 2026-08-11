@@ -2159,6 +2159,27 @@ template="pool"
     }
 
     #[test]
+    fn bigint_stub_types_columns_by_name_not_storage() {
+        // COR-4, third site. The two tests above assert the stubbed column is NULL, and a wrongly-typed
+        // stub is NULL too - so they pass with `hot_col_type` replaced by a constant. Type by column
+        // NAME, matching `empty_view_ddl` and `seal::rows_to_batch`: a `word32` column with a
+        // non-counter name stubs VARCHAR, so `WHERE value LIKE '7%'` does not become a binder error on
+        // the 0-of-N state this stub exists to make survivable (#467).
+        let s = with_bigint_base_cols("src", &[("fee".to_string(), "word32".to_string())]);
+        assert!(
+            s.contains(r#"CAST(NULL AS VARCHAR) AS "fee""#),
+            "word32-storage non-counter column must stub VARCHAR, got: {s}"
+        );
+        // The four counter columns stay UBIGINT (by name).
+        let s2 =
+            with_bigint_base_cols("src", &[("block_number".to_string(), "word32".to_string())]);
+        assert!(
+            s2.contains(r#"CAST(NULL AS UBIGINT) AS "block_number""#),
+            "got: {s2}"
+        );
+    }
+
+    #[test]
     fn query_guard_sees_past_leading_comments() {
         assert_eq!(
             strip_leading_sql_comments("  \n-- hi\nSELECT 1").trim_start(),
