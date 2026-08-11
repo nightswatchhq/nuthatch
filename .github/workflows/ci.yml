@@ -23,8 +23,15 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # Feature-gated code is invisible to the default lint, and `exex` had never been built
+      # here at all - so its only test had been failing `-D warnings` unnoticed (#423). A
+      # feature nobody lints is a feature that rots silently.
+      - name: clippy (exex)
+        run: cargo clippy --features exex --all-targets -- -D warnings
       - name: test
         run: cargo test --locked
+      - name: test (exex)
+        run: cargo test --features exex --locked
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)

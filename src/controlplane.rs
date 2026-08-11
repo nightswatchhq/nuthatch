@@ -185,6 +185,19 @@ impl ControlPlane {
     pub fn undeclare_nest(&self, name: &str) -> Result<bool> {
         let name = name.to_string();
         self.conn.with(move |c| {
+            // The secrets go with the nest. Without this a deleted nest leaves its provider
+            // credentials in the control plane forever: unreachable through any surface that
+            // lists nests, so nobody sees them again, and silently inherited by the next nest
+            // declared under the same name.
+            //
+            // Found auditing #426, which reported this one layer up as a test-fixture defect -
+            // the fixture cleans up by undeclaring every nest, so a `put_secret` mutated to
+            // write nothing still passed against rows a previous run had orphaned. Fixing the
+            // fixture would have hidden this.
+            c.execute(
+                &format!("DELETE FROM \"{SCHEMA}\".nest_secret WHERE nest = $1"),
+                &[&name],
+            )?;
             let n = c.execute(
                 &format!("DELETE FROM \"{SCHEMA}\".desired_nest WHERE name = $1"),
                 &[&name],
