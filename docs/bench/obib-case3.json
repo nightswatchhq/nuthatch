@@ -1,0 +1,52 @@
+{
+  "bench": "backfill",
+  "label": "OBIB case 3: Ethereum block, blocks 0-100,000",
+  "nest": "obib-case3",
+  "chain": "mainnet",
+  "from_block": 0,
+  "to_block": 100000,
+  "blocks": 100001,
+  "initial_window": 20,
+  "window_adaptive": false,
+  "seal_direct": false,
+  "concurrency": 1,
+  "runs": 1,
+  "events": 100001,
+  "wall_clock_s": 9721.94,
+  "events_per_sec": 10.29,
+  "peak_rss_mb": 55,
+  "rpc_requests": 19300,
+  "factory": false,
+  "children": 0,
+  "commit": "4540e25",
+  "provider": "ethereum-rpc.publicnode.com",
+  "hardware": "8 cores, 8 GB RAM",
+  "obib_case": 3,
+  "obib_expected_records": 100001,
+  "records_produced": 100001,
+  "record_definition": "one row per block for blocks 0-100,000 inclusive - header metadata only, no contract involved. 100,001 rather than 100,000 because the range is inclusive at both ends and genesis counts.",
+  "correctness": {
+    "row_count": "100,001 exact, verified by `nuthatch sql 'SELECT count(*) FROM \"blocks\"'` against the kept store rather than read off the bench timing line.",
+    "range": "min(block_number)=0, max=100,000, count(DISTINCT block_number)=100,001 - contiguous, no gaps, no duplicates.",
+    "genesis": "Block 0 is present. It was not, on the first run: the read path served 100,000 rows starting at block 1. See `read_path_defect` below - the row count is the reason the case caught it and a timing-only benchmark would not have.",
+    "verified_against": "OBIB's published expected total of 100,001, which Envio, Ponder, Subsquid and Subgraph all match exactly."
+  },
+  "read_path_defect": {
+    "symptom": "count(*) returned 100,000 with min(block_number)=1 while the bench harness reported 100,001 events ingested.",
+    "cause": "`Store::sealed_through()` returns 0 both when the watermark sits at block 0 and when nothing has ever been sealed. The hot/cold union filtered hot rows to `block_number > sealed_through`, so with nothing sealed the genesis row fell into neither half and was unreadable. The data was ingested correctly throughout - this was a query-side hole, not a gap in the store.",
+    "blast_radius": "Any nest indexed from block 0 loses exactly its first block until something seals. Invisible on a nest starting at a later block, which is why it survived this long.",
+    "fix": "Gate the hot filter on whether the table has sealed segments at all, rather than on the watermark's numeric value. A row is withheld from hot only when cold genuinely covers that range, so COR-1 disjointness is preserved in every other state.",
+    "verified": "Re-queried the same kept store after the fix - 100,001 rows, no re-ingest. Regression tests: `sql_serves_the_genesis_row_when_nothing_has_been_sealed` and `sql_excludes_hot_genesis_once_cold_actually_holds_it`."
+  },
+  "not_apples_to_apples": "The 162-minute wall clock is not competitive and should not be presented as if it were. OBIB's reference for this case is 3.19s (Sentio), and Envio, Ponder and Subsquid serve it from their own pre-indexed networks; we ran against a free public RPC endpoint. Case 3 is one eth_getBlockByNumber per block by definition, so it is the most endpoint-bound of the six - and this run was deliberately conservative on top of that: concurrency 1, non-adaptive window, no seal-direct. Those were chosen to get a trustworthy row count on an 8 GB machine, not a fast one. Whether a tuned run closes the gap is untested, and we are not claiming it would.",
+  "endpoint_sensitivity": {
+    "note": "Measured 2026-08-10 on the same work (blocks 0-200 unless stated), showing the wall clock above is mostly a property of the endpoint rather than the indexer.",
+    "ethereum-rpc.publicnode.com": "1.4 s, 22 requests (batches ~10 blocks/call)",
+    "eth.drpc.org": "171 s for blocks 0-100, 362 requests",
+    "eth-pokt.nodies.app": "HTTP 403 on batch - surfaces as 'N of N headers still missing', not as an auth error"
+  },
+  "obib_reference_times_s": {
+    "sentio": 3.19
+  },
+  "reproduce": "git checkout the obib-case3/ nest, then: nuthatch bench backfill --dir . --from 0 --to 100000 --runs 1 --keep /tmp/case3 --rpc \"$RPC\". The criterion is a row count, so verify it directly and do not trust the timing line: nuthatch sql 'SELECT count(*) FROM \"blocks\"' --dir /tmp/case3"
+}
