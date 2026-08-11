@@ -607,6 +607,12 @@ mod tests {
 
     use super::*;
 
+    /// The `last_block` [`write_roost`] seeds into nest `i`'s store. Distinct per nest, so an
+    /// assertion that the right history arrived cannot be satisfied by another nest's.
+    fn fixture_head(i: usize) -> u64 {
+        1000 + i as u64
+    }
+
     /// A mounts with `n` nests, all on one chain, in the pre-2.0 layout.
     fn write_roost(dir: &Path, nests: &[(&str, &str)]) {
         let names: Vec<String> = nests.iter().map(|(n, _)| format!("\"{n}\"")).collect();
@@ -619,7 +625,7 @@ mod tests {
             ),
         )
         .unwrap();
-        for (name, addr) in nests {
+        for (i, (name, addr)) in nests.iter().enumerate() {
             let nest = dir.join(NESTS_DIR).join(name);
             std::fs::create_dir_all(&nest).unwrap();
             std::fs::write(
@@ -632,8 +638,11 @@ mod tests {
             )
             .unwrap();
             std::fs::write(nest.join("abi.json"), "[]").unwrap();
-            // Stand-in for indexed data, to prove migration moves it rather than re-deriving it.
-            std::fs::write(nest.join("nuthatch.redb"), format!("data for {name}")).unwrap();
+            // Indexed data, to prove migration moves it rather than re-deriving it. A real store
+            // with rows: the text file this replaced was unopenable, so it read as history through
+            // the error path and the adoption tests passed without a readable store ever existing
+            // (issue #415).
+            crate::runtime::seed_history(&nest, fixture_head(i));
         }
     }
 
@@ -673,17 +682,18 @@ mod tests {
 
         let mounts = MountTable::load(d.path()).unwrap();
         assert_eq!(mounts.mounts.len(), 2);
-        for (alias, expected) in [("a", "data for a"), ("b", "data for b")] {
+        for (i, alias) in ["a", "b"].into_iter().enumerate() {
             let dir = mounts.dir_for(d.path(), alias);
             assert!(
                 dir.starts_with(d.path().join(DATA_DIR)),
                 "{alias} did not move under data/"
             );
             // The indexed data came across untouched. Had migration re-derived anything, this is
-            // where it would show.
+            // where it would show - and the head is per-nest, so a crossed pair fails here too.
             assert_eq!(
-                std::fs::read_to_string(dir.join("nuthatch.redb")).unwrap(),
-                expected
+                crate::runtime::history_head(&dir),
+                Some(fixture_head(i)),
+                "{alias}'s indexed history did not arrive intact"
             );
             assert!(
                 !d.path().join(NESTS_DIR).join(alias).exists(),
@@ -738,9 +748,8 @@ mod tests {
         );
         assert_eq!(MountTable::load(d.path()).unwrap().mounts[0].nid, nid);
         assert_eq!(
-            std::fs::read_to_string(d.path().join(DATA_DIR).join(&nid).join("nuthatch.redb"))
-                .unwrap(),
-            "data for a"
+            crate::runtime::history_head(&d.path().join(DATA_DIR).join(&nid)),
+            Some(fixture_head(0))
         );
     }
 
@@ -804,8 +813,8 @@ mod tests {
         let first = MountTable::load(root).unwrap().mounts[0].nid.clone();
         let dataset = root.join(DATA_DIR).join(&first);
         assert_eq!(
-            std::fs::read_to_string(dataset.join("nuthatch.redb")).unwrap(),
-            "data for a",
+            crate::runtime::history_head(&dataset),
+            Some(fixture_head(0)),
             "the fixture's indexed history should be in place"
         );
 
@@ -851,9 +860,8 @@ mod tests {
         let after = MountTable::load(root).unwrap().mounts[0].nid.clone();
         assert_ne!(after, first);
         assert_eq!(
-            std::fs::read_to_string(root.join(DATA_DIR).join(&after).join("nuthatch.redb"))
-                .unwrap(),
-            "data for a",
+            crate::runtime::history_head(&root.join(DATA_DIR).join(&after)),
+            Some(fixture_head(0)),
             "the indexed history must be present under the new identity - if it is absent, the \
              nest re-backfills, which is the entire cost early cutoff exists to remove"
         );
