@@ -228,8 +228,17 @@ pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
 // magnitude estimates for the pre-mount projection, not measurements - the roster reports the real
 // `rss_bytes()` alongside so an operator can calibrate. The shared serving/runtime cost is paid once;
 // each nest adds its hot-store working set + decode registry, plus a chunk per active IVM view.
+//
+// NEST_BASE_RSS_MB is fitted against the 20-nest Uniswap V4 PoolManager scenario
+// (docs/bench/multinest-footprint.json): peak_rss=139 MB on a 120 MB base → ~1 MB/nest observed.
+// 5 MB/nest gives a 5x safety margin above that observation; the IVM view terms are untested in
+// that scenario and remain conservative. The known limitation: the dominant cost at high event
+// rates is the near-tip window fan-out (a cursor-level term), not per-nest fixed cost, so a
+// workload with a single very-high-rate nest will underrun the projection and one with many
+// very-high-rate nests may overrun it. The per-cursor RAM budget job (CI) measures actual RSS
+// against a ceiling and is the primary guard; this projection is the pre-mount admission check.
 pub const RUNTIME_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
-const NEST_BASE_RSS_MB: u64 = 90; // redb hot store + decode registry + the always-on balance view
+const NEST_BASE_RSS_MB: u64 = 5; // fitted: ~1 MB/nest observed, 5x margin (see comment above)
 const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity view, or child registry
 
 /// Rough projected RSS (MB) for one nest: base + a chunk per active IVM view / factory child registry.
@@ -2729,6 +2738,24 @@ mod tests {
         assert_eq!(
             estimate_nest_rss_mb(&all, true),
             NEST_BASE_RSS_MB + 3 * NEST_VIEW_RSS_MB
+        );
+    }
+
+    /// NEST_BASE_RSS_MB > 0 is the only thing that makes this refusal meaningful. A 400-nest cursor
+    /// must project above the 2 GB default ceiling; if the per-nest constant is zeroed out the
+    /// estimate collapses to the 120 MB base and the gate lets it through.
+    #[test]
+    fn a_cursor_with_too_many_nests_trips_the_budget() {
+        let cfg: Config = toml::from_str(
+            "[nest]\nname = \"n\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = []\n\
+             \n[[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n",
+        )
+        .unwrap();
+        let per_nest = estimate_nest_rss_mb(&cfg, false);
+        let cursor_mb = RUNTIME_BASE_RSS_MB + 400 * per_nest;
+        assert!(
+            cursor_mb > DEFAULT_MAX_RSS_MB,
+            "400-nest cursor projects {cursor_mb} MB, expected > {DEFAULT_MAX_RSS_MB} MB"
         );
     }
 
