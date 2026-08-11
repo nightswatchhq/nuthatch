@@ -359,21 +359,34 @@ jobs:
         # the `hardware` the baseline records against the `hardware` this run records, and fails on a
         # mismatch. If GitHub changes what `ubuntu-latest` is, this goes red and wants a human -
         # correct, because the 8µs ceiling above was measured on the old spec.
+        # MUTATION (#424, do not merge): both fixtures, same broken binary, reporting rather than
+        # gating, so the pair can be read side by side. `BASELINE` is unset because the committed
+        # baseline is a *working* read path and neither of these runs is one.
         env:
           BIN: bin/nuthatch
-          MAX_P50_US: "8"
-          BASELINE: docs/bench/point-read.json
-          OUT: point-read-report.json
         run: |
           chmod +x bin/nuthatch
-          bash .github/workflows/point-read.sh
+          echo "=== realistic fixture: 12,800 hot rows (the enforced scenario) ==="
+          MAX_P50_US=1000000 OUT=scan-12800.json bash .github/workflows/point-read.sh
+          echo "=== control: 256 hot rows, same ABI and same script, only the event rate differs ==="
+          LOGS_PER_BLOCK=4 BACKFILL_BLOCKS=2000 PORT=8291 RPC_PORT=8548 \
+            MAX_P50_US=1000000 OUT=scan-256.json bash .github/workflows/point-read.sh
+          echo "=== the contrast, against the 8µs ceiling in force on main ==="
+          python3 - <<'PY'
+          import json
+          for f, hot in (("scan-12800.json", 12800), ("scan-256.json", 256)):
+              r = json.load(open(f))
+              p50 = r["point_read_p50_us"]
+              print(f"{hot:>6} hot rows: p50 {p50}µs  p99 {r['point_read_p99_us']}µs  "
+                    f"-> {'TRIPS' if p50 > 8 else 'PASSES'} an 8µs ceiling")
+          PY
       - name: upload report
         # Always: a run that failed the gate is the report you most want to read.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: point-read-report
-          path: point-read-report.json
+          path: scan-*.json
           retention-days: 30
 
 

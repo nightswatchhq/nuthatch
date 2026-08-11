@@ -507,9 +507,18 @@ impl Store {
     }
 
     pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
+        // MUTATION (#424, do not merge): the B-tree seek replaced by a linear scan that stops at the
+        // match - the exact regression this gate exists to catch, and the one #375 measured at
+        // 18.15µs over a 256-row hot store on this runner.
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
-        Ok(t.get(key)?.map(|v| v.value().to_string()))
+        for row in t.iter()? {
+            let (k, v) = row?;
+            if k.value() == key {
+                return Ok(Some(v.value().to_string()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn count(&self) -> Result<u64> {
