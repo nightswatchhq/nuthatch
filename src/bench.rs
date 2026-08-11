@@ -411,6 +411,18 @@ pub struct QueryBenchReport {
 ///
 /// A limit that is not passed is neither a pass nor a failure: it is simply not asked for, which is
 /// how an operator running the bench by hand should experience it.
+///
+/// **The failure message names where to re-baseline, because the obvious place is the wrong one.**
+/// It used to say "re-baselining against a committed report", and the only committed report is
+/// `docs/bench/point-read.json` - a 32-core dev-box number (p50 1.24µs) that `docs/benchmarks.md`
+/// explicitly tells the reader is *not* what the ceiling was set against (the runner's baseline is
+/// 0.59-0.82µs). Following the instruction re-derives a runner ceiling from dev-box hardware, and
+/// this gate is the one that already proved baseline and regression do not scale together across
+/// machines: the scan mutation ran *faster* on the runner (18.15µs) than on the dev box (24.17µs).
+/// This is #395's lesson on the RSS harness in miniature - a FAIL message that points at a
+/// different scenario than the one it enforces is a trap with a comment on it - so the message
+/// points at the enforcing machine instead. #385 tracks committing a runner-produced artifact,
+/// which is what would let this instruction name a file again.
 fn check_gate(
     report: &QueryBenchReport,
     max_p50_us: Option<f64>,
@@ -445,8 +457,11 @@ fn check_gate(
     }
     bail!(
         "point-read gate failed - {}.\nThis is a gate, not a warning: either the change made \
-         point-reads slower, or the ceiling needs re-baselining against a committed report and a \
-         stated reason.",
+         point-reads slower, or the ceiling needs re-baselining - measured on the machine that \
+         enforces it, and with a stated reason.\nNot from docs/bench/point-read.json: that is a \
+         32-core dev-box reference point, and this ceiling was set on the CI runner, whose \
+         baseline and whose regression are both different numbers. See \"Where the ceilings come \
+         from\" in docs/benchmarks.md.",
         breaches.join("; ")
     )
 }
@@ -1125,6 +1140,38 @@ abi = "abis/c.json"
             .expect_err("a breached ceiling must fail the run, not just print")
             .to_string();
         assert!(err.contains("point-read p50"), "{err}");
+
+        // The re-baseline instruction has to name the machine that enforces the gate. The previous
+        // wording said "against a committed report", and the only committed report is a 32-core
+        // dev-box one that docs/benchmarks.md says the ceiling was *not* set against - so whoever
+        // followed the message re-derived a runner ceiling from the wrong hardware. Pinned here
+        // because a FAIL message nobody reads until CI is red is exactly the text that rots.
+        assert!(
+            err.contains("machine that enforces it"),
+            "the failure must say where to re-baseline, not just that one is needed: {err}"
+        );
+        // ...and it has to name the file, not just the principle. The assertion above stays green on
+        // a message that says "measure it yourself" and nothing more, which leaves the one sentence
+        // that actually prevents the mistake - naming docs/bench/point-read.json as the wrong
+        // artifact - deletable without this test noticing. That was the defect itself: the reader
+        // knew a re-baseline was wanted and reached for the only committed report there is.
+        assert!(
+            err.contains("Not from docs/bench/point-read.json"),
+            "the failure must name the report that is *not* the baseline, since that is the one a \
+             reader reaches for otherwise: {err}"
+        );
+
+        // The p99 flag still reaches the gate. CI stopped passing --max-point-read-p99-us when the
+        // 150µs default was dropped, so nothing else drives this argument end to end any more, and a
+        // deliberately-retained escape hatch with no coverage is the shape that rots unnoticed.
+        // `check_gate`'s own p99 branch is unit-tested above; what this pins is the CLI wiring into
+        // it, which is the half that went quiet.
+        let mut p99_args = gated_args(dir.path(), None, None);
+        p99_args.max_point_read_p99_us = Some(0.0);
+        let err = query(p99_args)
+            .expect_err("--max-point-read-p99-us must still gate when an operator asks for it")
+            .to_string();
+        assert!(err.contains("point-read p99"), "{err}");
 
         // And the floor is wired too: 64 rows cannot satisfy --min-reads 1000.
         let err = query(gated_args(dir.path(), None, Some(1000)))
