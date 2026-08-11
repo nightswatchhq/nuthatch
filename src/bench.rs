@@ -1070,6 +1070,28 @@ abi = "abis/c.json"
             err.contains("machine that enforces it"),
             "the failure must say where to re-baseline, not just that one is needed: {err}"
         );
+        // ...and it has to name the file, not just the principle. The assertion above stays green on
+        // a message that says "measure it yourself" and nothing more, which leaves the one sentence
+        // that actually prevents the mistake - naming docs/bench/point-read.json as the wrong
+        // artifact - deletable without this test noticing. That was the defect itself: the reader
+        // knew a re-baseline was wanted and reached for the only committed report there is.
+        assert!(
+            err.contains("Not from docs/bench/point-read.json"),
+            "the failure must name the report that is *not* the baseline, since that is the one a \
+             reader reaches for otherwise: {err}"
+        );
+
+        // The p99 flag still reaches the gate. CI stopped passing --max-point-read-p99-us when the
+        // 150µs default was dropped, so nothing else drives this argument end to end any more, and a
+        // deliberately-retained escape hatch with no coverage is the shape that rots unnoticed.
+        // `check_gate`'s own p99 branch is unit-tested above; what this pins is the CLI wiring into
+        // it, which is the half that went quiet.
+        let mut p99_args = gated_args(dir.path(), None, None);
+        p99_args.max_point_read_p99_us = Some(0.0);
+        let err = query(p99_args)
+            .expect_err("--max-point-read-p99-us must still gate when an operator asks for it")
+            .to_string();
+        assert!(err.contains("point-read p99"), "{err}");
 
         // And the floor is wired too: 64 rows cannot satisfy --min-reads 1000.
         let err = query(gated_args(dir.path(), None, Some(1000)))

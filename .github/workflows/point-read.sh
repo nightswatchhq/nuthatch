@@ -142,6 +142,14 @@ fi
 # p99 is passed only when asked for. An unset `--max-point-read-p99-us` is not a ceiling of infinity
 # dressed up as a number: `check_gate` treats an absent limit as "not asked for" and reports the
 # measurement, which is the whole point of recording the tail without enforcing it.
+#
+# The expansion below is `${p99_arg[@]+"${p99_arg[@]}"}` rather than the obvious `"${p99_arg[@]}"`,
+# because this script is `set -u` and bash treats an *empty* array as unset when it expands one.
+# Confirmed on `bash:3.2` (3.2.57, what macOS ships as `/bin/bash`): the bare form aborts with
+# `arr[@]: unbound variable` before the bench runs. That is the default path now that `MAX_P99_US`
+# has no value, and it is the path the header above tells operators to run by hand - so on a Mac the
+# documented invocation would have died rather than measured. Bash 4.4+ made the bare form legal,
+# which is why CI (ubuntu, bash 5.x) stays green either way and would never have caught this.
 p99_arg=()
 if [ -n "$MAX_P99_US" ]; then
   p99_arg=(--max-point-read-p99-us "$MAX_P99_US")
@@ -152,7 +160,7 @@ set +e
   --label "${LABEL:-point-read gate: $EXPECT rows indexed, $HOT_EXPECT hot, locally-served chain}" \
   --min-reads "$HOT_EXPECT" \
   --max-point-read-p50-us "$MAX_P50_US" \
-  "${p99_arg[@]}" | tee "$DIR/bench.log"
+  ${p99_arg[@]+"${p99_arg[@]}"} | tee "$DIR/bench.log"
 status="${PIPESTATUS[0]}"
 set -e
 
