@@ -6899,6 +6899,174 @@ template = "pool"
         );
     }
 
+    /// A source that counts tip polls as well as log fetches, so "the loop never asked for logs" can
+    /// be told apart from "the loop never ran".
+    struct TipAndLogCountingSource {
+        tip_calls: std::sync::atomic::AtomicUsize,
+        log_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TipAndLogCountingSource {
+        fn new() -> Self {
+            Self {
+                tip_calls: std::sync::atomic::AtomicUsize::new(0),
+                log_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn tips(&self) -> usize {
+            self.tip_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn logs_asked(&self) -> usize {
+            self.log_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TipAndLogCountingSource {
+        async fn tip(&self) -> Result<u64> {
+            self.tip_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(100)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.log_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        serde_json::json!({
+                            "hash": format!("0x{b:064x}"),
+                            "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                            "miner": "0x0000000000000000000000000000000000000000",
+                            "timestamp": format!("0x{:x}", 1_700_000_000u64 + b),
+                        }),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    /// The tip loops' empty filter is **reachable today** - just not by the route #432 assumed.
+    ///
+    /// `a_contract_free_nest_cannot_be_built_at_all_today` pins that `build_nest` refuses a nest with
+    /// no `[[contracts]]`, and that is right. The conclusion drawn from it - that the empty-filter case
+    /// therefore cannot be driven end-to-end, so a type-level test is the honest coverage available -
+    /// is not. `registry.addresses()` derives its address list from registered event **decoders**, not
+    /// from `config.contracts`, so an ABI that declares no events leaves *both* halves of the filter
+    /// empty while `config.primary()` still succeeds. The nest builds, starts, and reaches the loop.
+    ///
+    /// This shape is not contrived. It is the proxy trap `report_abi_fit` already warns about by name
+    /// ("the resolved ABI declares no events at all", "the usual cause is a proxy"), and it warns
+    /// rather than refuses - so the nest indexes. Before #432 this configuration asked a public
+    /// endpoint for every log on the chain, every couple of seconds, for as long as `nuthatch dev`
+    /// ran. This is the end-to-end wiring test, with a real `build_nest` nest and no faked fixture.
+    #[tokio::test]
+    async fn an_event_free_abi_reaches_the_tip_loop_with_an_empty_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"proxyish\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n\n[[contracts]]\nalias = \"p\"\n\
+             address = \"0x1111111111111111111111111111111111111111\"\nabi = \"abis/p.json\"\n",
+        )
+        .unwrap();
+        // A proxy's public ABI: functions, no events. Perfectly valid JSON ABI, and the resolvers
+        // return exactly this for a proxied contract.
+        std::fs::write(
+            dir.path().join("abis/p.json"),
+            r#"[{"type":"function","name":"implementation","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"}]"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            !config.contracts.is_empty(),
+            "the fixture has a contract - this is not the #445 shape"
+        );
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a nest with a contract whose ABI has no events builds - primary() is satisfied");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        // The point: a built, runnable nest whose getLogs filter is empty on both halves.
+        assert!(
+            nest.addresses.is_empty() && nest.topic0s.is_empty(),
+            "expected both filter halves empty (addresses come from event decoders, not from \
+             config.contracts) - got {} address(es) and {} topic0(s)",
+            nest.addresses.len(),
+            nest.topic0s.len()
+        );
+
+        let store = nest.store.clone();
+        let src = Arc::new(TipAndLogCountingSource::new());
+        let counter = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(0),
+            false,
+            1,
+            5,
+        ));
+        // Liveness first, so `logs_asked() == 0` below cannot be satisfied by a loop that never ran.
+        let alive = within_deadline(|| counter.tips() >= 3).await;
+        let advanced = within_deadline(|| {
+            store
+                .get_meta(LAST_BLOCK_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|b| b >= 100)
+        })
+        .await;
+        task.abort();
+
+        assert!(
+            alive,
+            "the loop must have polled the tip at least three times"
+        );
+        assert_eq!(
+            counter.logs_asked(),
+            0,
+            "a nest whose filter is empty on both halves must not issue getLogs at all - that \
+             request is every log on the chain (#432)"
+        );
+        assert!(
+            advanced,
+            "the empty window must still be processed: the cursor has to reach the tip, or a \
+             blocks-only nest never seals and never advances"
+        );
+    }
+
     /// #432 on the two paths its sibling test does not reach - the **live tip loops**.
     ///
     /// The empty-and-empty filter is now unrepresentable (`LogFilter::new` returns `None`), so what is
