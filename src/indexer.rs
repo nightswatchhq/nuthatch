@@ -3378,6 +3378,37 @@ impl NestIngest {
             to_store.push((key, row.to_json().to_string()));
             stored += 1;
         }
+
+        // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
+        // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
+        // a blocks table covers blocks that emitted no matching log at all (#447).
+        if self.registry.blocks() {
+            let want: Vec<u64> = (next..=to).collect();
+            match source.block_headers(&want).await {
+                Ok(headers) => {
+                    let mut block_rows: Vec<_> = want
+                        .iter()
+                        .filter_map(|b| {
+                            headers.get(b).and_then(|h| {
+                                crate::registry::block_row(*b, h, self.registry.timestamps())
+                            })
+                        })
+                        .collect();
+                    block_rows.sort_by_key(|r| r.block_number);
+                    for r in &block_rows {
+                        to_store.push((
+                            Store::entity_key(r.block_number, r.log_index),
+                            r.to_json().to_string(),
+                        ));
+                        stored += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("block_headers unavailable for {next}..={to}: {e:#} - block rows skipped this window");
+                }
+            }
+        }
+
         self.balances.apply(deltas);
         self.exposure.apply(exp_deltas);
         self.velocity.apply(vel_deltas);
@@ -3442,10 +3473,13 @@ impl NestIngest {
         if let Err(e) = maybe_seal(
             &self.dir,
             &self.store,
+            source,
             finalized_through,
             snapshot.as_deref(),
             &self.metrics,
-        ) {
+        )
+        .await
+        {
             tracing::warn!("sealing failed: {e:#}");
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
@@ -3705,9 +3739,10 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
 
 /// Seal every indexed block up to `finalized_through` (the finality-safe ceiling) that isn't sealed
 /// yet, advancing the `sealed_through` watermark and pruning the sealed range from the hot store.
-fn maybe_seal(
+async fn maybe_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
+    source: &dyn Source,
     finalized_through: u64,
     registry_snapshot: Option<&str>,
     metrics: &crate::metrics::NestMetrics,
@@ -3730,6 +3765,16 @@ fn maybe_seal(
     };
     if ceiling < from {
         return Ok(()); // nothing new has finalized
+    }
+
+    // Pin a checkpoint exactly at the new watermark. `detect_reorg` can only verify a checkpoint it
+    // holds, and checkpoints are otherwise sparse - one per processed window, not one per block. Without
+    // one pinned here, a reorg forking strictly above `sealed_through` can still walk past the watermark
+    // to some far older surviving checkpoint, under-shoot below it, and trip the finality guard on a
+    // block the reorg never touched (#461). Best-effort: a source hiccup here just leaves the walk as
+    // sparse as before, it doesn't block sealing.
+    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+        store.set_block_hash(ceiling, &hash)?;
     }
 
     let entities = store.entities_in_range(from, ceiling)?;
@@ -6787,22 +6832,12 @@ template = "pool"
         f()
     }
 
-    /// The tip loops write **no block rows at all** for a window, which is #447 - found by writing the
-    /// test Mabel asked for during review and having it fail.
-    ///
-    /// The claim under test was mine and it was wrong: I had commented that an empty window still has
-    /// to be processed because a blocks nest derives its rows from the window. The three backfill
-    /// paths do that (`src/indexer.rs`, `if registry.blocks()` → `source.block_headers(&want)`, over
-    /// `next..=chunk_to`). `process_window`, which is what both tip loops call, derives its block list
-    /// from `logs` instead and never asks for a header - the exact thing the backfill's own comment
-    /// warns produces "zero rows and a green run".
-    ///
-    /// So this pins the behaviour as it actually is, rather than asserting the fix I have not made:
-    /// the loop runs, the cursor advances, and no block row appears. It fails when #447 lands, which
-    /// is when it should be replaced by the presence assertion (rows appear for the tip window) that
-    /// this test was originally written to make.
+    /// `index_loop` writes one block row per block for a tip window on a blocks nest, including
+    /// windows where no log matched (#447). `LogCountingSource` tips at 100; `--backfill 10` starts
+    /// the cursor at block 90, so the loop must store rows for 90..=100 without issuing a single
+    /// `getLogs` (no address filter → every log on the chain, #432).
     #[tokio::test]
-    async fn the_tip_loop_writes_no_block_rows_for_a_window_yet() {
+    async fn the_tip_loop_writes_block_rows_for_every_block_in_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let mut nest =
             build_test_nest(dir.path(), "0x1111111111111111111111111111111111111111").await;
@@ -6825,22 +6860,52 @@ template = "pool"
             1,
             5,
         ));
-        // `LogCountingSource` tips at 100, so `--backfill 10` puts the loop on blocks 90..=100. Give
-        // it the same deadline the other loop tests use, then look.
+        // Wait until at least one block row lands in the hot store.
         let wrote_rows =
             within_deadline(|| !store.entities_in_range(90, 100).unwrap().is_empty()).await;
         task.abort();
 
         assert!(
-            !wrote_rows,
-            "if the tip loop now writes block rows, #447 is fixed - replace this test with the \
-             presence assertion it was written to make"
+            wrote_rows,
+            "the tip loop must write block rows for the window - #447 regressed"
         );
         assert_eq!(
             counter.calls(),
             0,
-            "whatever it does with the window, it must get there without asking for logs at all: an \
-             empty address AND topic filter is every log on the chain (#432)"
+            "must reach tip without a single getLogs: an empty address AND topic filter is every \
+             log on the chain (#432)"
+        );
+    }
+
+    /// Same as above, through `runtime_index_loop` (#447 acceptance criterion 2): the runtime cursor
+    /// writes block rows for the blocks nests on it.
+    #[tokio::test]
+    async fn the_runtime_tip_loop_writes_block_rows_for_every_block_in_the_window() {
+        let d_blocks = tempfile::tempdir().unwrap();
+        let blocks_nest =
+            build_blocks_nest_with_contract(d_blocks.path(), "0x1111111111111111111111111111111111111111")
+                .await;
+        let blocks_store = blocks_nest.store.clone();
+
+        let src = Arc::new(LogCountingSource::new());
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![blocks_nest],
+            Some(10),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let wrote_rows =
+            within_deadline(|| !blocks_store.entities_in_range(0, 100).unwrap().is_empty()).await;
+        task.abort();
+
+        assert!(
+            wrote_rows,
+            "runtime_index_loop must write block rows for a blocks nest - #447 regressed"
         );
     }
 

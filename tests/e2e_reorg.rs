@@ -346,28 +346,25 @@ async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
     }
 }
 
-/// **Issue #461 - the repro, and it fails.** `#[ignore]`d so the build stays honest rather than red;
-/// remove the attribute to watch it.
+/// **Issue #461.** The fork is block 9, *strictly above* the sealed watermark of 8. Blocks 10..=14 are
+/// rewritten and every one of them is hot and unsealed, so this is squarely inside the mutable range
+/// the reorg model exists to repair.
 ///
-/// The fork is block 9, *strictly above* the sealed watermark of 8. Blocks 10..=14 are rewritten and
-/// every one of them is hot and unsealed, so this is squarely inside the mutable range the reorg
-/// model exists to repair. It halts anyway.
-///
-/// The cause is not the guard, which is correct about the number it is handed. It is that
-/// `detect_reorg` can only answer at a **checkpoint it holds**, and checkpoints are sparse - one per
+/// The cause was not the guard, which is correct about the number it is handed. It was that
+/// `detect_reorg` can only answer at a **checkpoint it holds**, and checkpoints were sparse - one per
 /// processed window, not one per block. This fixture's are `[14, 10, 2]`. Fork 9 invalidates 14 and
-/// 10, so the walk falls through to 2 and returns that as the common ancestor. `rollback_reorg` then
-/// reads `2 < 8` and terminally faults with "a finality violation this indexer cannot repair",
+/// 10, so the walk used to fall through to 2 and return that as the common ancestor. `rollback_reorg`
+/// then read `2 < 8` and terminally faulted with "a finality violation this indexer cannot repair",
 /// naming a watermark the reorg never approached.
 ///
 /// The under-estimate is harmless *without* sealing - rolling back further than necessary just
 /// re-indexes - which is exactly why the existing proptest never caught it: it ran entirely with
 /// `sealed_through == 0`. Sealing is what turns a conservative answer into a fatal one.
 ///
-/// Left failing deliberately. #291 asked for the depths we had not tried, and this is one of them
-/// answering wrongly rather than not being asked.
+/// Fixed by pinning a checkpoint at the watermark itself every time sealing advances it (`maybe_seal`),
+/// so the walk always has a verifiable checkpoint to land on at or above `sealed_through` when the true
+/// fork sits above it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "issue #461: a reorg above the sealed watermark halts when the ancestor-walk cannot resolve above it"]
 async fn a_reorg_above_the_sealed_watermark_should_not_halt() {
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
