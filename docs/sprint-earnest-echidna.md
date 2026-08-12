@@ -1,7 +1,13 @@
 # Sprint: earnest-echidna
 
 Filed by the board on 2026-08-12, immediately after auditing diligent-dormouse and releasing v2.2.0.
-One week.
+**Three days: 2026-08-12 to 2026-08-15.** Fifteen issues.
+
+Three days rather than a week because the previous sprint was measured, not guessed: diligent-dormouse
+merged its first PR at 2026-08-11 16:19Z and its last at 2026-08-12 11:02Z - 23 PRs and 13 issues in
+under nineteen hours of wall clock, part of which the firm spent stopped. Fifteen issues is therefore
+not a stretch. The slack is deliberate and goes into the p0 and into the new artifact rule, not into
+more scope.
 
 ## Definition of done
 
@@ -54,6 +60,20 @@ Then, independently and in any order:
 | **#403** | The go-live checklist demands an admin token that neither deploy recipe shows. A checklist nobody can follow is not a checklist. |
 | **#495** | `e2e_reorg.rs:288` says the #461 case is `#[ignore]`d and "fails today". #485 fixed it. |
 | **#409** | The `--fail-fast` carve-out comments cite `runtime.rs:1128`; PR #394 moved it to 1135. |
+
+Then the sprint's namesake, which is the theme stated as a job of work:
+
+| issue | |
+|---|---|
+| **#300** | **Docs pass: verify every claim against a running binary.** Not a read-through and not a reasoning exercise - take the published v2.2.0 binary, run the thing each claim describes, and correct what does not hold. Every doc defect in this sprint (#417, #377, #403, #495, #409) was found by someone reading code, which is the slow way and misses anything the code does not mention. Prefer `--help` output, an actual invocation, and a real response body over inspection. Where a claim cannot be checked without a provider or a prod box, say so on the issue rather than passing it. |
+
+Three more tests that pass with the mechanism removed, same family as #378 and #477:
+
+| issue | |
+|---|---|
+| **#353** | The skill drift gate only checks one direction, so a flag can exist in the binary and be missing from the skill without the gate firing. |
+| **#388** | `test_state` leaves `runtime_health: None`, so the mounts readiness tests only ever exercise the solo path - the wiring is never covered. |
+| **#436** | `e2e_fe_admin_exposure` test 4 clears `NUTHATCH_ADMIN_TOKEN` *after* its assertions, so a red run leaks the variable into whatever runs next. |
 
 Two cheap ones, to keep throughput up and because they are genuinely worth doing:
 
