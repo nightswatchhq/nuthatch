@@ -130,6 +130,11 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
 
 - **`nuthatch sql`** queries the local store when `dev` is stopped, and transparently falls back to the
   running instance's API when `dev` holds it - the same command works either way.
+- **A degraded nest says so.** If a sealed segment is unreadable, nuthatch serves the rest of the table
+  rather than failing your query - but it will not let that pass silently. `/sql` returns `degraded`
+  and `degraded_tables` naming the affected tables, `nuthatch sql` prints a warning line, and the MCP
+  server carries the same notice. The caveat is a fact about the *nest*, not about the row count you
+  happened to get, so it appears whether or not this particular query touched the gap.
 - **Hot + cold in one surface.** Queries span the live unsealed tip (redb) *and* sealed history
   (Parquet), transparently - you never think about the boundary.
 - **Big-int friendly.** `uint256` values are exact text; each also gets a `{col}_dec` DECIMAL view, so
@@ -403,11 +408,11 @@ The guide covers the questions people actually hit:
 
 ---
 
-## What 1.0 means here
+## What a stable release means here
 
-1.0 is a promise about **stability**, not a claim of completeness.
+A major version is a promise about **stability**, not a claim of completeness.
 
-- **Semantic versioning.** Within 1.x we do not rename or remove a CLI flag, an HTTP route, a config
+- **Semantic versioning.** Within a major version we do not rename or remove a CLI flag, an HTTP route, a config
   key, or a generated column without a major bump. The one thing that has never needed a promise is
   on-disk state: a newer binary has always read an older release's hot store and sealed segments as
   they are, and that stays true.
@@ -441,7 +446,7 @@ the findings we closed as *not ours to fix* and why, is in
 
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0029); the north star and the CLI/UX direction are
+- **Design** lives in [RFCs](docs/rfcs/) (0001-0036); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
 - **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
