@@ -367,6 +367,29 @@ mod tests {
         );
     }
 
+    /// The prefix itself is load-bearing, not just the ordering.
+    ///
+    /// `a_query_echoing_the_phrase_is_not_reported_as_a_corrupt_file` uses a `Binder Error`, which an
+    /// earlier classifier claims - so it passes whether or not this branch requires the engine prefix,
+    /// and a bare `raw.contains("don't know what type:")` survives it. Found by mutation.
+    ///
+    /// This one carries the phrase in a message no earlier classifier matches, so it reaches the
+    /// corrupt-file branch and can only be turned away by the prefix. Drop `Invalid Error: ` from the
+    /// test at line ~119 and this goes red.
+    #[test]
+    fn the_corrupt_file_classifier_requires_the_engine_prefix_not_just_the_phrase() {
+        let raw = "Conversion Error: could not convert string \'don\'t know what type: \' to INT32";
+        let hint = enrich(raw, "SELECT CAST(x AS INT) FROM usdc__transfer", &schema());
+        assert!(
+            !hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("corrupt file on disk"),
+            "only the engine-prefixed form means segment corruption; caller text must never reach \
+             this branch: {hint:?}"
+        );
+    }
+
     /// DuckDB resolves unquoted identifiers case-insensitively, so the table must still be named.
     #[test]
     fn the_corrupt_segment_hint_names_the_table_whatever_its_casing() {
