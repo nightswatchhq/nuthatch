@@ -206,12 +206,40 @@ hot store is much smaller than 256 rows - cold-start latency (it measures warm, 
 report), point-reads against the Postgres backend, and anything about the sealed/DuckDB path. It is a
 floor on gross regressions, not a microbenchmark.
 
-Baseline: `docs/bench/point-read.json` - **measured on the 32-core/62 GB dev box, which is not the
-machine that enforces this gate.** Read it as the dev-box reference point, not as the number the
-ceiling was set against: that is the `ubuntu-latest` table above (p50 0.59-0.82µs), and it is the one
-8µs is 9.8x above. Committing a runner-produced artifact instead would remove the need for this
-caveat, and #385 tracks it. Saying so here rather than leaving a reader to notice the `hardware`
-field disagrees with the argument.
+### The baseline is the runner's own artifact (issue #385)
+
+`docs/bench/point-read.json` is the `point-read latency` job's uploaded report, taken verbatim from a
+green run on `main` (commit `a53565a`, run
+[31511769517](https://github.com/nightswatchhq/nuthatch/actions/runs/31511769517), p50 0.78µs, p99
+0.93µs) and committed with nothing edited but a trailing newline. Its `hardware` field reads
+`4 cores, 16 GB RAM`, which is the machine the table above was measured on and the machine the 8µs
+ceiling is enforced on. **The committed baseline and the enforcing surface are now the same box.**
+
+They were not, for as long as this gate has existed. The file recorded `32 cores, 62 GB RAM` and
+p50 1.24µs from the dev box, which is 1.5-2.1x the runner's own baseline - so anyone re-deriving the
+ceiling from the only committed report there was would have derived it from the wrong machine, on a
+gate that had already been bitten by exactly that: 15µs came from the dev box and left 1.21x of real
+margin below a regression rather than the 1.61x it claimed. The FAIL message in `bench query` had to
+spend four lines telling readers *not* to use the one file named "baseline", which is a workaround
+with a comment on it rather than a fix.
+
+- **The dev-box record is kept**, as `docs/bench/point-read-devbox.json`. The 32-core numbers are the
+  reference point for the footprint work and worth not losing; they are simply not what this gate is
+  measured against, and the filename now says so.
+- **`BASELINE` in `ci.yml` stops it drifting back.** The job compares the `hardware` its fresh report
+  records against the `hardware` the committed baseline records, and fails on a mismatch. A committed
+  number cannot go stale loudly - it can only be read and believed - so the check is the only thing
+  that would notice.
+- **Provenance is checked, values are not.** A "measured p50 within Nx of the baseline" rule is a
+  second and much tighter ceiling in disguise: the runner's p50 has been seen from 0.58µs to 0.82µs
+  at fixed commits, and its p99.9 from 0.77µs to 23.02µs, so any factor loose enough not to flake is
+  looser than the 8µs gate already is. Which machine produced a file is the one thing a committed
+  baseline can be definitively wrong about, so that is what is enforced.
+- **Refreshing it:** download `point-read-report` from a green `point-read latency` run on `main` and
+  commit it as `docs/bench/point-read.json`. `bench query` writes a trailing newline (#385), so the
+  committed file is byte-identical to the artifact and a hand-edit is never needed. Do not touch the
+  `hardware` field; if the runner spec has genuinely changed, the ceiling wants re-measuring, not the
+  baseline re-labelling.
 
 
 ## The per-cursor RAM budget (≤2 GB)

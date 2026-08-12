@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
 const MEM_LIMIT: &str = "512MB";
@@ -35,11 +35,44 @@ pub struct QueryGuard {
     pub max_rows: usize,
 }
 
-/// The result of a query: the rows, plus whether a guard's row cap truncated them.
-#[derive(Debug)]
+/// The result of a query: the rows, plus the two ways they can fail to be the whole answer.
+///
+/// `truncated` is the caller's own row cap biting. `degraded_tables` is the other one and it is not
+/// the caller's doing: the tables whose **cold data was incomplete** when the views were built for
+/// this query - a sealed segment the manifest lists but that could not be read, so the view was
+/// rebuilt from what remained (#430, #433), or a table whose view could not be defined at all.
+///
+/// Reduction is the right policy - a bad segment must not delete a table, see [`define_views`] - but
+/// it makes the query **succeed** with quietly less data, and `SELECT SUM(value)` then returns a
+/// number that is wrong rather than absent (#435). Empty on the healthy path, which is every query
+/// on a nest whose segments all match their content addresses.
+///
+/// Scope note: the views cover every table in the nest, not just the ones this SQL touches, so this
+/// over-reports - a bad segment on an untouched table still flags the query. Narrowing it would mean
+/// parsing the SQL for table references, which is exactly the kind of guess that produces a
+/// confidently wrong answer. Over-reporting *with the names attached* lets the caller judge; silence
+/// does not.
+///
+/// **Which constrains how a surface may word it.** Because this is a property of the nest and not of
+/// the answer, a caveat must be a statement about the nest - "this nest could not serve complete cold
+/// data for X" - and never about these rows. A query over a healthy table on a nest with one bad
+/// segment is complete and correct, and `SELECT 1` and `.tables` have no rows drawn from these tables
+/// at all. Nor may it name a cause: the undefinable-view arm above lands here with every segment
+/// binding fine. Both mistakes shipped in the first rendering of this field and neither test nor
+/// mutation could see them, because every fixture had exactly one table.
+#[derive(Debug, Default)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
     pub truncated: bool,
+    pub degraded_tables: std::collections::BTreeSet<String>,
+}
+
+impl QueryOutput {
+    /// Whether any table's cold data was incomplete for this query. The one-bit form of
+    /// `degraded_tables`, for surfaces with room to say only yes or no.
+    pub fn degraded(&self) -> bool {
+        !self.degraded_tables.is_empty()
+    }
 }
 
 /// Hot (unsealed) rows grouped by logical table - from [`crate::store::Store::hot_rows_by_table`].
@@ -84,6 +117,29 @@ pub fn query_hot_cold(
     run(dir, sql, Some(guard), hot, sealed_through)
 }
 
+/// How one attempt at a query ended.
+///
+/// The distinction that matters for #433 is `DiedExecuting`: a query that fails to **bind** is a
+/// question about names - a typo, a missing column, an unknown table - and no corrupt page can cause
+/// one, so it must never trigger the integrity sweep. Only a query that bound and then died while
+/// reading rows is worth paying for.
+///
+/// **That split rules out a typo and nothing else, and on its own it does not bound the sweep.** It
+/// was claimed here that it did. `SELECT CAST('x' AS INTEGER)` binds, dies executing, names no table
+/// and is 27 bytes; measured, it hashed every segment of a healthy nest, once per request, on a
+/// surface with no auth and two concurrency permits. What bounds the sweep is `tables` below: the
+/// tables the failed query actually referenced, which for that query is none.
+enum Attempt {
+    Ok(QueryOutput),
+    DiedExecuting {
+        error: anyhow::Error,
+        /// The base tables the query named, lowercased - the reachability bound on the sweep. `None`
+        /// when DuckDB could not serialize the statement, i.e. when we do not know what it reached;
+        /// see `run` for why that skips the sweep rather than widening it.
+        tables: Option<std::collections::BTreeSet<String>>,
+    },
+}
+
 fn run(
     dir: &Path,
     sql: &str,
@@ -91,6 +147,91 @@ fn run(
     hot: &HotRows,
     sealed_through: u64,
 ) -> Result<QueryOutput> {
+    // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
+    // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
+    // execution could run a full `timeout`, the sweep between the two attempts ran with nothing
+    // watching it at all, and the retry got its own fresh `timeout` on top - up to 2x the advertised
+    // budget in query execution alone, plus whatever the sweep cost. Sharing one deadline across both
+    // attempts and the sweep makes `guard.timeout` the actual wall-clock ceiling on the whole call.
+    let deadline = guard.map(|g| Instant::now() + g.timeout);
+    let nothing_excluded = std::collections::BTreeSet::new();
+    let (e, tables) = match attempt(
+        dir,
+        sql,
+        guard,
+        hot,
+        sealed_through,
+        &nothing_excluded,
+        deadline,
+    )? {
+        Attempt::Ok(out) => return Ok(out),
+        Attempt::DiedExecuting { error, tables } => (error, tables),
+    };
+    // **A segment that binds but will not read takes the whole query down** (#433). `read_parquet`
+    // validates the footer while the view is being created, which is where #430's reduction hooks in;
+    // corruption that leaves the footer intact and destroys the data region passes that probe and
+    // fails at execution instead, with `Invalid Error: don't know what type: ` and nothing named.
+    //
+    // The principle #430 established is that a bad segment *reduces* its table rather than deleting
+    // it, and it should not stop holding just because the corruption is deeper in the file. So: ask
+    // which segments no longer match their content address, and if any do not, rebuild the views
+    // without them and answer from what remains. Only once - a second execution failure is not about
+    // segment integrity, because we just verified every segment we kept.
+    //
+    // Ask only about the segments backing the tables this query **named** - the sweep reads and
+    // hashes files, and a segment the query never read cannot be what killed it. Bounding it by
+    // reachability rather than by a cache is what keeps this affordable without anything that can go
+    // stale (a memo keyed on mtime was tried here and was wrong; see `segments_failing_verification`).
+    let Some(tables) = tables else {
+        // DuckDB would not serialize the statement, so we do not know what it reached. Sweeping
+        // everything on the strength of not knowing is how the unbounded version comes back in
+        // through the fallback; the query fails with its own error instead, which is what it did
+        // before any of this existed. Loud and bounded beats quiet and expensive.
+        tracing::warn!(
+            "query died executing but its statement could not be parsed for table references - \
+             skipping the segment integrity sweep (cold data, if corrupt, is not reduced here)"
+        );
+        return Err(e);
+    };
+    // The budget may already be spent by the first attempt alone; say so plainly rather than silently
+    // skipping the sweep and returning `e`, which (for a guard-bound caller) could otherwise read as
+    // an ordinary query error rather than the timeout it actually is.
+    if let Some(secs) = timed_out(guard, deadline) {
+        bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+    }
+    let corrupt = crate::seal::segments_failing_verification(dir, &tables, deadline);
+    if corrupt.is_empty() {
+        if let Some(secs) = timed_out(guard, deadline) {
+            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        }
+        return Err(e);
+    }
+    match attempt(dir, sql, guard, hot, sealed_through, &corrupt, deadline)? {
+        Attempt::Ok(out) => Ok(out),
+        Attempt::DiedExecuting { error, .. } => Err(error),
+    }
+}
+
+/// `Some(guard.timeout.as_secs())` when `deadline` has already passed, else `None`. Shared by the two
+/// places in [`run`] that must turn "we ran out of the shared deadline" into the same wording
+/// `attempt`'s own watchdog uses, rather than leaking `e`'s unrelated error text as the reason.
+fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        Some(guard.map(|g| g.timeout.as_secs()).unwrap_or(0))
+    } else {
+        None
+    }
+}
+
+fn attempt(
+    dir: &Path,
+    sql: &str,
+    guard: Option<QueryGuard>,
+    hot: &HotRows,
+    sealed_through: u64,
+    excluded: &std::collections::BTreeSet<String>,
+    deadline: Option<Instant>,
+) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
     let head = strip_leading_sql_comments(sql).to_ascii_lowercase();
@@ -132,7 +273,7 @@ fn run(
     //
     // Kept *beside* the denylist rather than replacing it: two independent controls that must both
     // pass, so a gap in either is covered while this one earns trust.
-    reject_unknown_table_refs(&conn, sql)?;
+    let referenced = reject_unknown_table_refs(&conn, sql)?;
     conn.execute_batch(&format!(
         "SET memory_limit='{MEM_LIMIT}'; SET threads={MAX_THREADS};"
     ))
@@ -163,7 +304,7 @@ fn run(
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    define_views(&conn, dir, hot, sealed_through)?;
+    let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded)?;
     // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
     // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
     // this - they only touch the raw per-event tables.
@@ -175,20 +316,31 @@ fn run(
     // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
     define_children_views(&conn, dir);
 
+    // Every view this query could be reading now exists, so the names it used can be widened to the
+    // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
+    // happen here rather than beside the security walk: at that point the catalogue was empty.
+    let referenced = referenced.map(|names| expand_through_views(&conn, &names));
+
     // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
-    // query once it outlives the guard's timeout (a cartesian blow-up can't be stopped by the memory
-    // cap alone). `interrupt()` makes the running query fail; we translate that into a clear timeout
-    // error below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
+    // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
+    // alone). `interrupt()` makes the running query fail; we translate that into a clear timeout error
+    // below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
     // queries skip all of this and run to completion.
+    //
+    // Waits on `deadline`, not a fresh `guard.timeout`, so a second `attempt` (the #433 reduced retry)
+    // only gets whatever's left of the *first* attempt's budget rather than a brand-new full timeout
+    // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
+    // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let watchdog = guard.map(|g| {
+    let watchdog = guard.zip(deadline).map(|(_, d)| {
         let handle = conn.interrupt_handle();
         let flag = interrupted.clone();
         let (tx, rx) = mpsc::channel::<()>();
         let join = std::thread::spawn(move || {
+            let remaining = d.saturating_duration_since(Instant::now());
             // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
             // (panic) leaves the query alone.
-            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(g.timeout) {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
                 flag.store(true, Ordering::SeqCst);
                 handle.interrupt();
             }
@@ -208,12 +360,20 @@ fn run(
 
     let (mut rows, over_cap) = match outcome {
         Ok(v) => v,
-        Err(e) => {
+        Err(Died::Binding(e)) => return Err(e),
+        Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
                 bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
             }
-            return Err(e);
+            // Handed back rather than returned: the caller decides whether a corrupt segment explains
+            // it and is worth one reduced retry (#433). The tables ride along because they come from
+            // the security walk that already ran above - one parse, one answer about what this query
+            // reaches, used by both controls.
+            return Ok(Attempt::DiedExecuting {
+                error: e,
+                tables: referenced,
+            });
         }
     };
 
@@ -224,7 +384,19 @@ fn run(
         }
         _ => false,
     };
-    Ok(QueryOutput { rows, truncated })
+    Ok(Attempt::Ok(QueryOutput {
+        rows,
+        truncated,
+        degraded_tables,
+    }))
+}
+
+/// Which phase of [`collect`] a failure came from. See [`Attempt`] for why the split is load-bearing.
+enum Died {
+    /// `conn.prepare` refused it: a name the catalogue does not have, a type that does not check.
+    Binding(anyhow::Error),
+    /// It bound, then died running or materialising rows - the only shape a corrupt page produces.
+    Executing(anyhow::Error),
 }
 
 /// Prepare, execute and materialise the result. With `cap = Some(n)` it stops after `n + 1` rows so
@@ -232,9 +404,15 @@ fn run(
 /// i.e. more than `n` rows were available); the caller then truncates back to `n`. `cap = None`
 /// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
 /// so the cap is what actually bounds a `SELECT *` result buffer.
-fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool)> {
-    let mut stmt = conn.prepare(sql).context("failed to prepare query")?;
-    let mut rows = stmt.query([]).context("query failed")?;
+fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    let mut stmt = conn
+        .prepare(sql)
+        .context("failed to prepare query")
+        .map_err(Died::Binding)?;
+    let mut rows = stmt
+        .query([])
+        .context("query failed")
+        .map_err(Died::Executing)?;
     // Column metadata is only materialised once the statement has executed - read it off the
     // executed result, not the prepared statement.
     let column_names: Vec<String> = rows
@@ -252,10 +430,14 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
     let byte_cap = cap.map(|_| SQL_MAX_RESULT_BYTES);
     let mut out = Vec::new();
     let mut bytes = 0usize;
-    while let Some(row) = rows.next().context("row read failed")? {
+    while let Some(row) = rows
+        .next()
+        .context("row read failed")
+        .map_err(Died::Executing)?
+    {
         let mut obj = Map::new();
         for (i, name) in column_names.iter().enumerate() {
-            let v = value_to_json(row.get_ref(i)?);
+            let v = value_to_json(row.get_ref(i).map_err(|e| Died::Executing(e.into()))?);
             if byte_cap.is_some() {
                 bytes += name.len() + value_bytes(&v);
             }
@@ -465,20 +647,31 @@ const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 /// Fails **open** if the parse is unavailable: `json_serialize_sql` is a DuckDB feature and this is the
 /// newer of two controls. A parse failure must not take down `/sql` while the denylist - which has
 /// guarded this surface since RFC-0008 - is still in front of it.
-fn reject_unknown_table_refs(conn: &Connection, sql: &str) -> Result<()> {
+///
+/// Returns the **base tables the statement referenced**, lowercased (DuckDB matches identifiers
+/// case-insensitively), or `None` where the parse was unavailable and the answer is therefore not
+/// known. That set is the integrity sweep's reachability bound (see [`Attempt`]), and it comes from
+/// this walk rather than a second one so the two can never disagree about what a query reaches. CTE
+/// names parse as `BASE_TABLE` too and are included; a CTE named after a real table can only widen
+/// the set to a table that exists, which is the safe direction.
+fn reject_unknown_table_refs(
+    conn: &Connection,
+    sql: &str,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
         r.get::<_, String>(0)
     }) else {
-        return Ok(());
+        return Ok(None);
     };
     let Ok(v) = serde_json::from_str::<Value>(&ast) else {
-        return Ok(());
+        return Ok(None);
     };
     if v.get("error").and_then(Value::as_bool) == Some(true) {
         // DuckDB could not parse it. Let it say so itself, with its own error message.
-        return Ok(());
+        return Ok(None);
     }
+    let mut referenced = std::collections::BTreeSet::new();
     let mut bad: Option<String> = None;
     walk_table_refs(&v, &mut |kind, name| {
         if bad.is_some() {
@@ -501,13 +694,111 @@ fn reject_unknown_table_refs(conn: &Connection, sql: &str) -> Result<()> {
                     "`{name}` is not a table name - a quoted path in table position reads a file"
                 ));
             }
+            "BASE_TABLE" => {
+                referenced.insert(name.to_ascii_lowercase());
+            }
             _ => {}
         }
     });
     match bad {
         Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
-        None => Ok(()),
+        None => Ok(Some(referenced)),
     }
+}
+
+/// Widen the names a query used to the names those names *read*, following the views this connection
+/// has just defined.
+///
+/// Without this, bounding the sweep by reachability would quietly cost authored views their reduction
+/// (RFC-0001 `views/*.sql`, plus the generated `labels` and `{template}__children` views): a query
+/// over `big_transfers` names `big_transfers`, which is no table in the manifest, so nothing would be
+/// verified and a page-corrupt segment under that view would fail the query instead of reducing it -
+/// exactly the behaviour #433 is fixing, reintroduced one layer up. Measured, not assumed: the test
+/// `a_page_corrupt_segment_under_an_authored_view_still_reduces` fails with this function removed.
+///
+/// Widening is safe in the direction it goes: it can only add tables the query genuinely reads. The
+/// attacker's case is a query that names *nothing*, and nothing expands to nothing.
+///
+/// Best-effort by design. A view whose definition cannot be re-parsed is skipped rather than treated
+/// as "could be anything" - the cost of a miss is a lost reduction on that one query (loud: the query
+/// fails with DuckDB's own error), and the cost of the other choice is the unbounded sweep coming
+/// back in through a fallback, which is the defect this whole change exists to remove.
+fn expand_through_views(
+    conn: &Connection,
+    named: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut defs: std::collections::BTreeMap<String, String> = Default::default();
+    let listed = conn
+        .prepare("SELECT view_name, sql FROM duckdb_views()")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for (name, sql) in rows.flatten() {
+                defs.insert(name.to_ascii_lowercase(), sql);
+            }
+            Ok(())
+        });
+    if listed.is_err() {
+        return named.clone();
+    }
+
+    let mut out = named.clone();
+    let mut frontier: Vec<String> = named.iter().cloned().collect();
+    // A view built on a view built on a view: follow the chain, but never in circles. DuckDB refuses
+    // to create a cyclic view, so this bound is a backstop rather than the mechanism.
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(sql) = defs.get(&name) else { continue };
+            let Some(body) = view_body(sql) else { continue };
+            let Some(inner) = base_tables_in(conn, body) else {
+                continue;
+            };
+            for t in inner {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// The `SELECT` inside a stored `CREATE VIEW … AS …`, which is all `json_serialize_sql` will accept
+/// (it answers `Only SELECT statements can be serialized to json!` for the whole statement - measured
+/// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
+fn view_body(create_view_sql: &str) -> Option<&str> {
+    let lower = create_view_sql.to_ascii_lowercase();
+    let view = lower.find(" view ")?;
+    // The first ` as ` past the name. A view *name* cannot be bare `as`, and one containing it - say
+    // `as_of` - does not match, because the match needs a space on both sides.
+    let as_at = lower[view..].find(" as ")? + view;
+    Some(create_view_sql[as_at + 4..].trim())
+}
+
+/// The base tables a statement reads, lowercased. The security walk collects the same set for the
+/// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
+fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+    let literal = format!("'{}'", sql.replace('\'', "''"));
+    let ast = conn
+        .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let v = serde_json::from_str::<Value>(&ast).ok()?;
+    if v.get("error").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk_table_refs(&v, &mut |kind, name| {
+        if kind == "BASE_TABLE" {
+            out.insert(name.to_ascii_lowercase());
+        }
+    });
+    Some(out)
 }
 
 /// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
@@ -839,7 +1130,22 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
 /// SQL (RFC-0001 §2) each such column `c` gets two derived view columns: `c_dec` - the value as
 /// `DECIMAL(38,0)` when it fits, else NULL - and `c_overflow` - true when the exact value exceeds
 /// 38 digits (so `c_dec` is NULL but `c` isn't). Analytics can `SUM(c_dec)` without hand-casting.
-fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u64) -> Result<()> {
+///
+/// Returns the tables whose cold data ended up **incomplete** - a manifest segment dropped from the
+/// view, or a view that could not be defined at all. Every reduction below is already logged, but a
+/// log is not reachable by the caller who is about to sum the reduced column, so the same decision is
+/// handed back as data and rides out on [`QueryOutput::degraded_tables`] (#435).
+fn define_views(
+    conn: &Connection,
+    dir: &Path,
+    hot: &HotRows,
+    sealed_through: u64,
+    // Content addresses of segments to leave out of every view. Empty on the first attempt; on the
+    // retry after an execution-phase failure it holds whatever `seal::segments_failing_verification`
+    // found, so a page-corrupt segment *reduces* its table instead of failing the whole query (#433).
+    excluded: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
     let schema = schema_columns(dir);
     let cols_of = |table: &str| -> &[(String, String)] {
@@ -872,6 +1178,21 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
                     .filter_map(|s| {
                         // Resolve through the shared store when this dataset belongs to a runtime
                         // (RFC-0033 §11a), falling back to the per-dataset path.
+                        // Verified-bad on a previous attempt: its bytes no longer match its content
+                        // address, so it cannot contribute rows anyone should trust (#433). Dropped
+                        // from the view rather than moved on disk - see
+                        // `seal::segments_failing_verification` on why reduction, not quarantine.
+                        if excluded.contains(&s.hash) {
+                            // Present on disk and corrupt in its pages - never reported before this
+                            // query, unlike the missing-file case below, so `error!` to match
+                            // `verify_and_quarantine`'s level for the identical decision (#435).
+                            tracing::error!(
+                                "segment {} for {table} fails verification - skipping (cold data reduced)",
+                                s.file
+                            );
+                            degraded.insert(table.clone());
+                            return None;
+                        }
                         let p = crate::seal::segment_path(dir, &s.file, &s.hash);
                         // Skip a manifest segment whose file is gone from disk (quarantined as corrupt
                         // by the startup integrity pass, or externally removed). Without this, one
@@ -880,10 +1201,14 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
                         if p.exists() {
                             Some(format!("'{}'", p.display()))
                         } else {
+                            // Stays at `warn!`: the usual cause is `verify_and_quarantine` having
+                            // already moved this file aside and logged it at `error!` at startup, and
+                            // re-raising the consequence on every query would double-count it.
                             tracing::warn!(
                                 "segment {} for {table} missing on disk - skipping (cold data reduced)",
                                 s.file
                             );
+                            degraded.insert(table.clone());
                             None
                         }
                     })
@@ -992,9 +1317,12 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
                 match conn.prepare(&probe) {
                     Ok(_) => true,
                     Err(err) => {
-                        tracing::warn!(
+                        // Present and unreadable, same class as the excluded case above: `error!`,
+                        // and recorded so the caller learns the table came back short (#435).
+                        tracing::error!(
                             "segment {f} for {table} will not bind - skipping (cold data reduced): {err}"
                         );
+                        degraded.insert(table.clone());
                         false
                     }
                 }
@@ -1006,13 +1334,15 @@ fn define_views(conn: &Connection, dir: &Path, hot: &HotRows, sealed_through: u6
             // table undefined, as before. `warn!` rather than `debug!` - a table vanishing from `/sql`
             // is not a debugging detail.
             tracing::warn!("view {table} skipped: {e}");
+            degraded.insert(table.clone());
             continue;
         }
         if let Some(Err(e)) = view_ddl(&readable).map(|retry| conn.execute_batch(&retry)) {
             tracing::warn!("view {table} skipped after dropping bad segments: {e}");
+            degraded.insert(table.clone());
         }
     }
-    Ok(())
+    Ok(degraded)
 }
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
@@ -1200,7 +1530,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
-    let _ = define_views(&conn, dir, &empty_hot, u64::MAX);
+    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default());
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
 
@@ -2077,6 +2407,27 @@ template="pool"
     }
 
     #[test]
+    fn bigint_stub_types_columns_by_name_not_storage() {
+        // COR-4, third site. The two tests above assert the stubbed column is NULL, and a wrongly-typed
+        // stub is NULL too - so they pass with `hot_col_type` replaced by a constant. Type by column
+        // NAME, matching `empty_view_ddl` and `seal::rows_to_batch`: a `word32` column with a
+        // non-counter name stubs VARCHAR, so `WHERE value LIKE '7%'` does not become a binder error on
+        // the 0-of-N state this stub exists to make survivable (#467).
+        let s = with_bigint_base_cols("src", &[("fee".to_string(), "word32".to_string())]);
+        assert!(
+            s.contains(r#"CAST(NULL AS VARCHAR) AS "fee""#),
+            "word32-storage non-counter column must stub VARCHAR, got: {s}"
+        );
+        // The four counter columns stay UBIGINT (by name).
+        let s2 =
+            with_bigint_base_cols("src", &[("block_number".to_string(), "word32".to_string())]);
+        assert!(
+            s2.contains(r#"CAST(NULL AS UBIGINT) AS "block_number""#),
+            "got: {s2}"
+        );
+    }
+
+    #[test]
     fn query_guard_sees_past_leading_comments() {
         assert_eq!(
             strip_leading_sql_comments("  \n-- hi\nSELECT 1").trim_start(),
@@ -2572,6 +2923,616 @@ template="pool"
         );
     }
 
+    /// Overwrite a Parquet file's **data region** and leave its footer and magic bytes intact.
+    ///
+    /// The layout is `PAR1 | data | thrift footer | u32 footer_len | PAR1`, so the last eight bytes
+    /// give the footer length and everything from byte 4 up to it is pages. Corrupting exactly that
+    /// range is the condition #433 names: `read_parquet` binds the file happily and dies reading it.
+    ///
+    /// Returns the number of bytes it destroyed, so a caller can assert it actually did something -
+    /// a helper that silently corrupted nothing would make every test built on it vacuous.
+    fn corrupt_pages_leaving_the_footer_intact(path: &std::path::Path) -> usize {
+        let mut bytes = std::fs::read(path).unwrap();
+        let len = bytes.len();
+        assert!(len > 12 && &bytes[..4] == b"PAR1" && &bytes[len - 4..] == b"PAR1");
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let end = len - 8 - footer_len;
+        assert!(end > 4, "the fixture must have a data region to corrupt");
+        bytes[4..end].fill(0xFF);
+        std::fs::write(path, &bytes).unwrap();
+        end - 4
+    }
+
+    /// **Issue #433.** A sealed segment whose **pages** are corrupt but whose **footer reads fine**
+    /// must reduce its table, exactly as a footer-corrupt one does since #430 - not fail the whole
+    /// query with `Invalid Error: don't know what type: `.
+    ///
+    /// This is the other half of the class #430 opened, and it does not go through #430's machinery at
+    /// all. #430 discriminates with `conn.prepare` over `read_parquet`, which validates the **footer**
+    /// at DDL time. Corruption that leaves the footer intact passes that probe untouched, `CREATE
+    /// VIEW` succeeds, and the failure lands at execution - taking every table in the query down, not
+    /// just this one, with a message that names nothing.
+    ///
+    /// The fixture's own claim is asserted rather than assumed: the corrupt file must still **bind**.
+    /// If it did not, this test would be a second copy of the #430 test wearing a different name, and
+    /// would pass with the #433 mechanism deleted.
+    #[test]
+    fn a_page_corrupt_segment_with_an_intact_footer_reduces_the_table_rather_than_failing_the_query(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        // A schema, for the reason the #419 test above gives: it makes "rebuilt from the good segment"
+        // distinguishable from "rebuilt from nothing".
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","value":"{block}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+
+        // Whole before anything is touched, or the reduction assertions below prove nothing.
+        let rows = query(dir.path(), r#"SELECT "from" FROM "t__transfer""#)
+            .expect("both segments readable");
+        assert_eq!(rows.len(), 2, "two segments, two rows");
+
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        let destroyed = corrupt_pages_leaving_the_footer_intact(&path);
+        assert!(destroyed > 0, "the fixture must have corrupted something");
+
+        // **The fixture is the condition it claims to be.** #430's probe still says this file is fine,
+        // so nothing in the footer-corrupt path can be what makes the assertions below pass.
+        let conn = Connection::open_in_memory().unwrap();
+        let probe = format!(
+            "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+            path.display()
+        );
+        assert!(
+            conn.prepare(&probe).is_ok(),
+            "this test is about a segment that BINDS and then will not read - if it no longer binds \
+             it is #430's case and this test has stopped testing #433"
+        );
+
+        // The table still answers, from the segment that is still good.
+        let rows = query(dir.path(), r#"SELECT "from" FROM "t__transfer""#).expect(
+            "a page-corrupt segment must reduce the table, not fail the query with `don't know what \
+             type:`",
+        );
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        assert_eq!(
+            rows[0]["from"],
+            Value::from("0xa"),
+            "and it is the block-1 row, not the corrupt one"
+        );
+    }
+
+    /// A nest with a schema and two one-block segments for `t__transfer`, blocks 1 and 2, rows `0xa`
+    /// and `0xb`. The shape both reduction tests above build by hand; shared by the #435 tests below
+    /// so the healthy control and the degraded cases are provably the *same* fixture apart from the
+    /// corruption - a control built separately could differ in some other way and stop controlling.
+    fn two_segment_nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","value":"{block}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// The block-2 segment's file, for a test that wants to damage it.
+    fn block_two_segment(dir: &std::path::Path) -> std::path::PathBuf {
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        crate::seal::segment_path(dir, &victim.file, &victim.hash)
+    }
+
+    fn cold(dir: &std::path::Path, sql: &str) -> QueryOutput {
+        query_guarded(
+            dir,
+            sql,
+            QueryGuard {
+                timeout: Duration::from_secs(30),
+                max_rows: 10_000,
+            },
+        )
+        .expect("a reduced table must still answer")
+    }
+
+    /// **Issue #435, the control.** A nest whose segments are all intact must report **no**
+    /// degradation.
+    ///
+    /// This is the load-bearing half of the pair. Every other #435 test asserts that a flag is *set*,
+    /// and all of them would pass just as well if the flag were hard-wired to "always degraded" -
+    /// which would be worse than no flag at all, because a warning that fires on every healthy query
+    /// is a warning an operator learns to scroll past. Nothing downstream (the `/sql` field, the CLI
+    /// line, the MCP notice) is worth anything unless silence on the healthy path is pinned here.
+    #[test]
+    fn an_intact_nest_reports_no_degradation() {
+        let dir = two_segment_nest();
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 2, "two intact segments, two rows");
+        assert!(
+            out.degraded_tables.is_empty(),
+            "an intact nest must report nothing degraded, got {:?}",
+            out.degraded_tables
+        );
+        assert!(!out.degraded(), "and the one-bit form must agree");
+    }
+
+    /// **Issue #435, the footer-corrupt half (#419/#430's path).** A segment dropped at DDL time
+    /// reduces the table *and says so in the result*.
+    ///
+    /// #430 chose reduction over deletion and was right to, but it left the decision visible only in
+    /// a `warn!` the caller cannot read: the query returns `200` with fewer rows and nothing to
+    /// distinguish that from a table which genuinely holds one row. `SELECT SUM(value)` over this
+    /// nest answers `1` where the truth is `3`, and both a human and an agent will take it.
+    #[test]
+    fn a_footer_corrupt_segment_names_its_table_in_the_result() {
+        let dir = two_segment_nest();
+        // Present, listed in the manifest, no longer a Parquet file - and not quarantined, because
+        // nothing has restarted.
+        std::fs::write(
+            block_two_segment(dir.path()),
+            b"not parquet, not even close",
+        )
+        .unwrap();
+
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 1, "reduced to the readable segment (#430)");
+        assert!(
+            out.degraded(),
+            "and the caller is told the answer is short, not left to infer it from one row"
+        );
+        assert_eq!(
+            out.degraded_tables,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the reduced table is named, so a caller can tell which of its numbers to distrust"
+        );
+    }
+
+    /// **Issue #435, the page-corrupt half (#433's path).** The reduction that happens on the *retry*
+    /// must be reported too.
+    ///
+    /// Worth its own test rather than folding into the one above, because it enters `define_views`
+    /// through an entirely different door: the footer-corrupt segment is dropped by the `conn.prepare`
+    /// probe on the first attempt, whereas this one binds cleanly, kills the query at execution, and
+    /// is only excluded on the second attempt via `segments_failing_verification`. A `degraded_tables`
+    /// wired into the first path alone would pass the test above and leave the #433 case - the one
+    /// that motivated #435 in the first place - silent.
+    #[test]
+    fn a_page_corrupt_segment_names_its_table_in_the_result() {
+        let dir = two_segment_nest();
+        let path = block_two_segment(dir.path());
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+        // The fixture is the condition it claims to be: #430's probe still passes this file, so the
+        // footer-corrupt path cannot be what sets the flag below.
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_ok(),
+            "if it no longer binds this is #430's case and the test has stopped testing #433's"
+        );
+
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 1, "reduced on the retry (#433)");
+        assert_eq!(
+            out.degraded_tables,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the retry's exclusions are degradation too - the query succeeded with less data"
+        );
+    }
+
+    /// **Issue #433, the half that bounds the cost.** `collect` must report *which phase* a query
+    /// died in, because that is what decides whether the integrity sweep runs at all.
+    ///
+    /// `/sql` is untrusted and the caller writes the query, so "any failure hashes every segment in
+    /// the nest" would be a denial-of-service amplifier built out of an integrity check - and a bind
+    /// failure cannot have been caused by a corrupt page, so it must never provoke one.
+    ///
+    /// This asserts the discriminator **directly** rather than through a query's error message. I
+    /// wrote the message version first and then killed it: with the phase split deleted, a binder
+    /// error still comes back with the same text (the sweep finds nothing to change and the error is
+    /// returned either way), so that test passed with the mechanism gone. Which is the exact failure
+    /// this sprint is about, in my own new fixture.
+    #[test]
+    fn collect_separates_a_bind_failure_from_a_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xa","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["t__transfer"][0];
+        let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
+        corrupt_pages_leaving_the_footer_intact(&path);
+
+        let conn = Connection::open_in_memory().unwrap();
+        let empty = HotRows::new();
+        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+
+        // A name the catalogue does not have: refused by the binder, before a page is touched.
+        assert!(
+            matches!(
+                collect(&conn, r#"SELECT no_such_column FROM "t__transfer""#, None),
+                Err(Died::Binding(_))
+            ),
+            "a missing column is a bind failure - it cannot have been caused by a corrupt page"
+        );
+
+        // The same connection, a query that binds and then reads the corrupt pages.
+        assert!(
+            matches!(
+                collect(&conn, r#"SELECT * FROM "t__transfer""#, None),
+                Err(Died::Executing(_))
+            ),
+            "reading a page-corrupt segment is an execution failure - the only shape worth sweeping for"
+        );
+    }
+
+    /// Collect every event message a closure logs. Used below to observe whether the integrity sweep
+    /// touched a segment at all - the sweep has no return value a caller can see and no semantic
+    /// effect when it looks at a table the query never named, so cost is the only thing that changes
+    /// and the log line is the only place it surfaces.
+    ///
+    /// `with_default` being thread-local does **not** make this safe under parallel tests: `tracing`
+    /// caches each callsite's `Interest` globally and process-wide the first time it is evaluated, so
+    /// a callsite reached by another test on another thread with no subscriber installed can get
+    /// cached `Interest::never()` for the rest of the process - and a `with_default` scope here would
+    /// then never see that event regardless of what this layer wants. Confirmed on `segments_failing_
+    /// verification`'s `tracing::error!` call site, see #482. Prefer a return-value assertion over
+    /// `CapturedLogs` wherever the code under test exposes one; use this only as the last resort, and
+    /// only for a negative assertion (an event that fails to arrive because it was never worth logging
+    /// looks identical to one dropped by this race, so a positive assertion built on `CapturedLogs`
+    /// cannot tell those apart and is unreliable by construction).
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        fn mentioning(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(
+                    &mut self,
+                    _f: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{value:?}");
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Msg(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    /// **Issue #433, the cost bound as reviewed.** The phase split was claimed to make "the cheap way
+    /// to provoke a sweep" nonexistent. It did not: `SELECT CAST('x' AS INTEGER)` is 27 bytes, names
+    /// no table, passes every gate, binds, and dies executing - and it hashed every segment in a
+    /// healthy nest, once per request, on a surface with no auth and two concurrency permits.
+    ///
+    /// So the sweep is bounded by **reachability**: only segments backing tables the failed query
+    /// named. A query that names nothing sweeps nothing.
+    ///
+    /// The measurement is the log line `segments_failing_verification` emits when it rejects a
+    /// segment, because the sweep has no other observable: looking at a table the query never
+    /// referenced changes no answer, only cost. **The positive control is in this test on purpose** -
+    /// an absence assertion whose mechanism is missing passes for the wrong reason, which is the
+    /// failure this whole sprint is about.
+    #[test]
+    fn a_query_that_names_no_table_reaches_no_segment() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+
+        const REJECTED: &str = "does not match its content address";
+
+        // The attack: no table named, so nothing is reachable, so nothing may be hashed - even though
+        // this nest does hold a corrupt segment and the query does die in the execution phase.
+        let quiet = CapturedLogs::default();
+        let err = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(quiet.clone()),
+            || query(dir.path(), "SELECT CAST('x' AS INTEGER)").unwrap_err(),
+        );
+        // `{:#}` for the whole chain: the outermost context is just "query failed", and asserting on
+        // that would pass for any execution failure at all, including one this test did not cause.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Conversion Error"),
+            "expected the cast itself to be what failed, got: {chain}"
+        );
+        // Negative assertion via `CapturedLogs`, not a return value: this is the one place in the
+        // binary #482's grep sweep left on the log-capture path, because nothing else observes
+        // whether the sweep was reachability-bounded. Safe as a negative check only - see the
+        // `CapturedLogs` doc comment for why a positive assertion here would be unreliable.
+        assert_eq!(
+            quiet.mentioning(REJECTED),
+            0,
+            "a query naming no table must not read or hash a single segment - this is the 27-byte \
+             amplifier the review found"
+        );
+
+        // The positive control: a query that *does* name the table sweeps it and finds the corrupt
+        // segment. Without this, the assertion above would pass just as happily with the sweep
+        // deleted entirely.
+        //
+        // Asserted on `segments_failing_verification`'s own return value, computed via the same
+        // `reject_unknown_table_refs` walk `run()` uses - not by scraping its `tracing::error!` log
+        // line. `tracing`'s per-callsite interest is a *global, process-wide* cache: whichever test in
+        // this binary hits that callsite first while no subscriber is installed gets it permanently
+        // marked uninteresting, so a `with_default` scope elsewhere in the same test binary can miss
+        // the event nondeterministically depending on run order (reproduced on `main`, independent of
+        // this fix - see #482). The return value has no such race.
+        let rows = query(dir.path(), r#"SELECT "from" FROM "t__transfer""#).expect("reduces");
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let referenced = reject_unknown_table_refs(&conn, r#"SELECT "from" FROM "t__transfer""#)
+            .unwrap()
+            .map(|names| expand_through_views(&conn, &names))
+            .expect("the query names a table");
+        assert_eq!(
+            crate::seal::segments_failing_verification(dir.path(), &referenced, None),
+            std::collections::BTreeSet::from([victim.hash.clone()]),
+            "the same corrupt segment must be found when the query does name its table"
+        );
+    }
+
+    /// **Issue #476, end to end.** Before this fix, `run`'s watchdog covered only the query execution
+    /// either side of the sweep: the sweep itself ran with nothing watching it, and the #433 retry got
+    /// a brand-new `guard.timeout` rather than whatever was left of the first one. A genuinely degraded
+    /// nest could cost up to `2 x timeout` in execution alone, plus an unbounded sweep in between.
+    ///
+    /// Driven through the public surface (`query_guarded`, not `run` directly): three sealed segments,
+    /// the last corrupted, and `seal`'s test-only per-segment sweep delay (large relative to the query's
+    /// own timeout) so a sweep that actually obeys the shared deadline can only get through the first
+    /// segment before its budget is spent - it never reaches the corrupt one, so `corrupt` comes back
+    /// empty and the call must fail fast on the ORIGINAL error rather than pay for a second attempt.
+    /// An unbounded sweep would instead hash all three segments (3 x the injected delay) before ever
+    /// checking the clock, which the elapsed-time assertion below is wide enough to tell apart from the
+    /// bounded case but nowhere close to the unbounded one.
+    #[test]
+    fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
+        let _serial = crate::seal::test_sweep_serial().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        for block in [1u64, 2, 3] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"0xa","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .max_by_key(|s| s.from_block)
+            .expect("the block-3 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+
+        crate::seal::test_set_sweep_delay_ms(150);
+        let guard = QueryGuard {
+            timeout: Duration::from_millis(100),
+            max_rows: 10,
+        };
+        let start = Instant::now();
+        let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
+        let elapsed = start.elapsed();
+        crate::seal::test_set_sweep_delay_ms(0);
+
+        assert!(
+            result.is_err(),
+            "the sweep never reaches the corrupt (third) segment within budget, so there is nothing \
+             to exclude and this must fail the same way the un-reduced query does"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "an unbounded sweep hashes all 3 segments (>= 450ms at the injected 150ms/segment) before \
+             a fast retry; bound to the query's own 100ms budget it must return well under that - took \
+             {elapsed:?}"
+        );
+    }
+
+    /// The other edge of the same bound, and the regression it would otherwise have caused. A query
+    /// over an **authored view** (RFC-0001 `views/*.sql`) names the view, which is no table in the
+    /// manifest - so a sweep bounded on the named set alone would verify nothing, and a page-corrupt
+    /// segment under that view would fail the query instead of reducing it. That is #433's own defect,
+    /// reintroduced one layer up by its own cost bound.
+    ///
+    /// I did not find this from the review; I found it reading my own fix back, which is the only
+    /// reason it is not shipping. `expand_through_views` is what this fails without.
+    #[test]
+    fn a_page_corrupt_segment_under_an_authored_view_still_reduces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-senders.sql"),
+            "CREATE VIEW senders AS SELECT \"from\", block_number FROM t__transfer;",
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+
+        // Whole first, through the view, or the reduction assertion below proves nothing.
+        let rows = query(dir.path(), "SELECT \"from\" FROM senders").expect("the view resolves");
+        assert_eq!(rows.len(), 2, "two segments, two rows, through the view");
+
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(corrupt_pages_leaving_the_footer_intact(&path) > 0);
+
+        let rows = query(dir.path(), "SELECT \"from\" FROM senders").expect(
+            "a query that reaches the corrupt segment through a view must still reduce - if this \
+             errors, the reachability bound cannot see through views",
+        );
+        assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        assert_eq!(rows[0]["from"], Value::from("0xa"));
+    }
+
+    /// The input to that bound: what the security walk reports a statement reaches. One parse feeds
+    /// both controls, so this pins the half `reject_unknown_table_refs` did not used to have.
+    #[test]
+    fn the_table_refs_walk_reports_what_the_statement_reached() {
+        let conn = Connection::open_in_memory().unwrap();
+        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap();
+
+        assert!(
+            refs("SELECT CAST('x' AS INTEGER)").is_empty(),
+            "a constant expression reaches no table"
+        );
+        assert_eq!(
+            refs(r#"SELECT * FROM "t__transfer""#),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        // DuckDB matches identifiers case-insensitively, so the sweep's lookup must too - otherwise a
+        // shouted table name silently loses its reduction.
+        assert_eq!(
+            refs("SELECT * FROM T__TRANSFER"),
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        assert_eq!(
+            refs("SELECT (SELECT max(a) FROM u) FROM t"),
+            ["t".to_string(), "u".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a table reached from a subquery is still reached"
+        );
+    }
+
     /// **Issue #241 items 3 and 4.** On a cold nest an authored view must resolve to zero rows, not
     /// fail with `Table ... does not exist`.
     ///
@@ -2607,7 +3568,7 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
         define_nest_views(&conn, dir.path());
 
         // The base table exists as an empty typed view…
@@ -2639,7 +3600,7 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
         define_nest_views(&conn, dir.path());
 
         assert!(
@@ -2680,7 +3641,7 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX).unwrap();
+        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
         define_nest_views(&conn, dir.path());
 
         for v in ["ok_one", "ok_two"] {

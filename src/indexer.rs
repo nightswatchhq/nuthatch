@@ -532,6 +532,20 @@ fn union_filter<'a>(
     let mut topics: Vec<String> = Vec::new();
     let mut any_factory = false;
     for (nest_addrs, nest_topics) in nests {
+        // A nest with neither addresses nor topics can issue no `getLogs` at all (#432) - and wants
+        // none. Since #445 that is a real supported shape rather than an unbuildable one: a
+        // contract-free `[extract] blocks = true` nest, whose rows come from block headers. It
+        // contributes nothing to the union, and it must not reach the factory signal below.
+        //
+        // If it did, it would clear a co-tenant's address filter on behalf of a nest that wanted no
+        // logs in the first place - and then `topic0_only_culprits`, which asks `factory.is_some()`,
+        // would find nobody to blame for the wide fetch it caused, so COR-5 would end the cursor and
+        // take every sibling with it. The two functions encode the same rule from opposite ends; this
+        // is what keeps them encoding the *same* rule now that empty-addresses no longer implies
+        // factory.
+        if nest_addrs.is_empty() && nest_topics.is_empty() {
+            continue;
+        }
         // An empty address list is the factory / topic0-only signal (see `build_nest`).
         if nest_addrs.is_empty() {
             any_factory = true;
@@ -1401,15 +1415,28 @@ async fn runtime_index_loop(
         // A blocks nest pays one header request per block, so a window that is cheap in logs can still
         // be ruinous in headers (RFC-0036). The backfill paths pick their controller once, from a
         // single registry; a cursor's nest set changes under it as mounts arrive and retire, so the
-        // ceiling is applied per window instead - a blocks nest mounted an hour in must not inherit a
-        // window that grew to `MAX_WINDOW` while only log-shaped nests were live. Bounding the *use*
-        // rather than the controller also means the ceiling lifts by itself when that nest retires.
+        // ceiling is re-derived every iteration instead - a blocks nest mounted an hour in must not
+        // inherit a window that grew to `MAX_WINDOW` while only log-shaped nests were live.
+        //
+        // `set_max` bounds the controller itself, not only the span this iteration is allowed to
+        // issue (#458). Capping only the use left `chunker` fed `observed` results from an
+        // `HEADER_WINDOW_CAP`-wide fetch while its own `window` kept climbing toward `MAX_WINDOW`
+        // unseen - so retiring the blocks nest handed back the whole drift in `window_cap`'s single
+        // next-iteration jump from 800 to `MAX_WINDOW`, instead of the controller's own gradual 4x
+        // growth. Calling `set_max` every iteration keeps `window` clamped down live while the blocks
+        // nest is live, so the mount-late direction is unaffected and the retire direction now climbs
+        // back up through `observed`'s own damping rather than in one step.
+        // `MAX_WINDOW` here, not `u64::MAX`: `set_max` overwrites the controller's own ceiling
+        // rather than layering an extra cap on top of it, so the "no blocks nest live" arm has to
+        // name the controller's ordinary ceiling explicitly - `u64::MAX` would erase it and let a
+        // plain nest's window balloon past `MAX_WINDOW` for as long as no blocks nest is mounted.
         let window_cap = if live.iter().any(|&i| live_ref(&nests, i).registry.blocks()) {
             crate::chunker::HEADER_WINDOW_CAP
         } else {
-            u64::MAX
+            crate::chunker::MAX_WINDOW
         };
-        let to = (global_next + chunker.window().min(window_cap) - 1).min(tip);
+        chunker.set_max(window_cap);
+        let to = (global_next + chunker.window() - 1).min(tip);
 
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
@@ -1585,7 +1612,11 @@ pub struct ChainCursor {
 #[allow(clippy::too_many_arguments)]
 pub async fn build_and_prepare_nest(
     source: &Arc<dyn Source>,
-    dir: PathBuf,
+    // A [`crate::runtime::PreparedDataset`] rather than a `PathBuf`, so the RFC-0033 §5 early cutoff
+    // cannot be skipped by a call site that simply did not think of it - which is precisely how this
+    // path came to re-index datasets it already had (#414). The only ways to hold one are
+    // `runtime::prepare_dataset` and the explicitly-named `PreparedDataset::without_nid`.
+    dataset: crate::runtime::PreparedDataset,
     config: &Config,
     backfill: Option<u64>,
     seal_direct: bool,
@@ -1605,7 +1636,7 @@ pub async fn build_and_prepare_nest(
 )> {
     let (mut nest, state, worker, window) = build_nest(
         source,
-        dir,
+        dataset.into_dir(),
         config,
         window_override,
         admin_enabled,
@@ -1939,7 +1970,9 @@ async fn build_nest(
 
     let app_state = serve::AppState {
         store: shared_store.clone(),
-        address: config.primary()?.address.clone(),
+        // Not `primary()?`: that errors "nest has no contracts", which turned a field the summary
+        // renders into a hard refusal to build a contract-free blocks nest (#445).
+        address: config.contracts.first().map(|c| c.address.clone()),
         chain: config.nest.chain.clone(),
         dir: dir.clone(),
         balances,
@@ -3374,6 +3407,37 @@ impl NestIngest {
             to_store.push((key, row.to_json().to_string()));
             stored += 1;
         }
+
+        // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
+        // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
+        // a blocks table covers blocks that emitted no matching log at all (#447).
+        if self.registry.blocks() {
+            let want: Vec<u64> = (next..=to).collect();
+            match source.block_headers(&want).await {
+                Ok(headers) => {
+                    let mut block_rows: Vec<_> = want
+                        .iter()
+                        .filter_map(|b| {
+                            headers.get(b).and_then(|h| {
+                                crate::registry::block_row(*b, h, self.registry.timestamps())
+                            })
+                        })
+                        .collect();
+                    block_rows.sort_by_key(|r| r.block_number);
+                    for r in &block_rows {
+                        to_store.push((
+                            Store::entity_key(r.block_number, r.log_index),
+                            r.to_json().to_string(),
+                        ));
+                        stored += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("block_headers unavailable for {next}..={to}: {e:#} - block rows skipped this window");
+                }
+            }
+        }
+
         self.balances.apply(deltas);
         self.exposure.apply(exp_deltas);
         self.velocity.apply(vel_deltas);
@@ -3438,10 +3502,13 @@ impl NestIngest {
         if let Err(e) = maybe_seal(
             &self.dir,
             &self.store,
+            source,
             finalized_through,
             snapshot.as_deref(),
             &self.metrics,
-        ) {
+        )
+        .await
+        {
             tracing::warn!("sealing failed: {e:#}");
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
@@ -3701,9 +3768,10 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
 
 /// Seal every indexed block up to `finalized_through` (the finality-safe ceiling) that isn't sealed
 /// yet, advancing the `sealed_through` watermark and pruning the sealed range from the hot store.
-fn maybe_seal(
+async fn maybe_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
+    source: &dyn Source,
     finalized_through: u64,
     registry_snapshot: Option<&str>,
     metrics: &crate::metrics::NestMetrics,
@@ -3726,6 +3794,16 @@ fn maybe_seal(
     };
     if ceiling < from {
         return Ok(()); // nothing new has finalized
+    }
+
+    // Pin a checkpoint exactly at the new watermark. `detect_reorg` can only verify a checkpoint it
+    // holds, and checkpoints are otherwise sparse - one per processed window, not one per block. Without
+    // one pinned here, a reorg forking strictly above `sealed_through` can still walk past the watermark
+    // to some far older surviving checkpoint, under-shoot below it, and trip the finality guard on a
+    // block the reorg never touched (#461). Best-effort: a source hiccup here just leaves the walk as
+    // sparse as before, it doesn't block sealing.
+    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+        store.set_block_hash(ceiling, &hash)?;
     }
 
     let entities = store.entities_in_range(from, ceiling)?;
@@ -5051,6 +5129,29 @@ template = "pool"
         nest
     }
 
+    /// A contract-free `[extract] blocks = true` nest - OBIB case 3 - through the real `build_nest`
+    /// path. Buildable only since #445; before that this helper could not have existed, which is why
+    /// the shape is absent from every fixture that predates it.
+    async fn build_contract_free_test_nest(dir: &std::path::Path) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"b\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .expect("a contract-free blocks nest must build (#445)");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
@@ -5076,6 +5177,56 @@ template = "pool"
             w.abort();
         }
         nest
+    }
+
+    /// #445: a contract-free `[extract] blocks = true` nest - OBIB case 3, RFC-0036 §4.2 - is a
+    /// supported shape, and `build_nest` is the only way any nest is built. It used to refuse this
+    /// one with `nest has no contracts`: a message about contracts the operator deliberately did not
+    /// declare, raised because `AppState.address` was a `String` and so had to come from somewhere.
+    ///
+    /// Nothing caught it because case 3 had only ever run through the bench harness, which builds a
+    /// `DecodeRegistry` directly and never calls `build_nest`. So the config key parsed, the bench
+    /// path produced rows, and every operator-facing path - solo `dev` and the runtime alike - refused
+    /// to start.
+    #[tokio::test]
+    async fn a_contract_free_blocks_nest_builds_and_names_no_address() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"b\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            config.contracts.is_empty(),
+            "fixture must declare no contracts"
+        );
+        assert!(config.extract.blocks, "fixture must be a blocks nest");
+        // `blocks` is deliberately outside `Extract::enabled()` - it is sourceable from ordinary RPC -
+        // so this must not hit the node-gated startup refusal either.
+        assert!(!config.extract.enabled(), "blocks must not be node-gated");
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (_nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a contract-free blocks nest must build");
+        assert_eq!(
+            state.address, None,
+            "a nest with no contracts names no address"
+        );
+        if let Some(w) = worker {
+            w.abort();
+        }
     }
 
     /// Seed a nest's hot store with one row per block and set `LAST_BLOCK` to the max.
@@ -5457,6 +5608,40 @@ template = "pool"
             topic0_only_culprits([(0usize, &stat), (1usize, &fact)].into_iter()),
             vec![1],
             "the factory nest is answerable; the static co-tenant is not"
+        );
+
+        // #445 made a third shape buildable, and it is the one that breaks the old reading of the
+        // rule: a contract-free `[extract] blocks = true` nest has an empty address list *and* an
+        // empty topic list. Empty-addresses therefore no longer implies factory-ness, and the two
+        // functions read that signal from opposite ends - `union_filter` off the addresses,
+        // `topic0_only_culprits` off `factory.is_some()`.
+        //
+        // Left alone, such a nest would clear a co-tenant's address filter (widening a fetch on
+        // behalf of a nest that wants no logs at all), and then no nest would be answerable for the
+        // width - so a single over-cap block would end the cursor and every nest riding it, which is
+        // the RFC-0026 violation this whole mechanism exists to prevent. It wants no logs, so it
+        // takes no part in the union.
+        let db = tempfile::tempdir().unwrap();
+        let blocks = build_contract_free_test_nest(db.path()).await;
+        assert!(
+            blocks.addresses.is_empty() && blocks.topic0s.is_empty(),
+            "the fixture must be the no-filter shape, or this proves nothing"
+        );
+        let (addrs, _) = union_filter(
+            [
+                (stat.addresses.as_slice(), stat.topic0s.as_slice()),
+                (blocks.addresses.as_slice(), blocks.topic0s.as_slice()),
+            ]
+            .into_iter(),
+        );
+        assert!(
+            !addrs.is_empty(),
+            "a contract-free blocks nest must not clear its co-tenant's address filter"
+        );
+        assert!(
+            topic0_only_culprits([(0usize, &stat), (1usize, &blocks)].into_iter()).is_empty(),
+            "and with the union still address-filtered, nobody is to blame - which is consistent \
+             only because the union stayed narrow. The two ends agree again."
         );
     }
 
@@ -6595,7 +6780,11 @@ template = "pool"
     #[async_trait::async_trait]
     impl Source for WindowRecordingSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(1_000_000)
+            // Large enough that a controller growing unclamped toward `MAX_WINDOW` (100,000) across
+            // a couple of dozen 4x steps still has room before `global_next` catches it - the
+            // retirement test needs headroom past the point an uncapped controller would have
+            // saturated, not just past its own `--backfill` starting gap.
+            Ok(10_000_000)
         }
         async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
             Ok(None)
@@ -6770,6 +6959,78 @@ template = "pool"
         );
     }
 
+    /// #458: the previous test proves the *live* half of the header cap - it never retires a nest,
+    /// so a controller that is capped only at the use site (leaving its own `window` free to drift
+    /// toward `MAX_WINDOW` unseen) passes it too. This drives a runtime cursor with a blocks nest
+    /// co-mounted with a log-shaped nest well past the point an uncapped controller would have
+    /// saturated at `MAX_WINDOW`, retires the blocks nest mid-run, and asserts the windows issued
+    /// *after* that point climb back up gradually rather than jumping straight to the drifted value.
+    #[tokio::test]
+    async fn the_tip_loop_bounds_the_controller_through_a_blocks_nest_retirement() {
+        let addr = "0x1111111111111111111111111111111111111111";
+        let d_blocks = tempfile::tempdir().unwrap();
+        let mut blocks_nest = build_blocks_nest_with_contract(d_blocks.path(), addr).await;
+        blocks_nest.name = "blocks".to_string();
+
+        let d_plain = tempfile::tempdir().unwrap();
+        let mut plain_nest =
+            build_test_nest(d_plain.path(), "0x2222222222222222222222222222222222222222").await;
+        plain_nest.name = "plain".to_string();
+
+        let src = Arc::new(WindowRecordingSource::new());
+        let recorder = src.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // A generous `--backfill` gap (not the default-sized one the mount-late test uses): a
+        // controller that has silently drifted toward `MAX_WINDOW` while capped needs room past
+        // that drift to prove it does NOT resume from there in one step, and 20,000 blocks is only
+        // enough to observe the pre-retirement cap, not the recovery past it.
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![blocks_nest, plain_nest],
+            Some(2_000_000),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            Some(rx),
+        ));
+
+        // Growth from a seed of 5 under `observed(0)` is 5, 20, 80, 320, 1280, 5120, 20480, 81920,
+        // 100000(clamped)... - so an uncapped controller has already saturated at `MAX_WINDOW` well
+        // before twelve windows, while every span *issued* stays <= `HEADER_WINDOW_CAP` regardless,
+        // because the blocks nest is live throughout. The bug is invisible until retirement.
+        let drove = within_deadline(|| recorder.count() >= 12).await;
+        assert!(
+            drove,
+            "the cursor must have asked for at least twelve windows before retiring"
+        );
+        let before_retire = recorder.count();
+
+        tx.send(CursorCommand::unmount("blocks")).unwrap();
+
+        // One more window is enough to tell the two designs apart: bounding only the *use* leaves
+        // `window` free to have drifted toward `MAX_WINDOW` unseen while capped, so the very first
+        // post-retirement span jumps straight there. Bounding the controller keeps `window` clamped
+        // down live, so that same span is only the ordinary next 4x step up from the cap.
+        let advanced = within_deadline(|| recorder.count() > before_retire).await;
+        task.abort();
+        assert!(
+            advanced,
+            "the cursor must keep advancing after the blocks nest retires"
+        );
+
+        let first_post_retire = recorder.spans.lock().unwrap()[before_retire];
+        assert!(
+            first_post_retire <= 4 * crate::chunker::HEADER_WINDOW_CAP,
+            "the first window after the blocks nest retires must be the controller's ordinary next \
+             4x step up from {} (<= {}), not a jump to wherever it drifted to unseen while capped - \
+             got {first_post_retire}",
+            crate::chunker::HEADER_WINDOW_CAP,
+            4 * crate::chunker::HEADER_WINDOW_CAP
+        );
+    }
+
     /// Wait for `f` to hold, or give up after 20s. The tip loops never return, so every assertion
     /// about them is really an assertion about what has happened *by* some point.
     async fn within_deadline(mut f: impl FnMut() -> bool) -> bool {
@@ -6783,22 +7044,12 @@ template = "pool"
         f()
     }
 
-    /// The tip loops write **no block rows at all** for a window, which is #447 - found by writing the
-    /// test Mabel asked for during review and having it fail.
-    ///
-    /// The claim under test was mine and it was wrong: I had commented that an empty window still has
-    /// to be processed because a blocks nest derives its rows from the window. The three backfill
-    /// paths do that (`src/indexer.rs`, `if registry.blocks()` → `source.block_headers(&want)`, over
-    /// `next..=chunk_to`). `process_window`, which is what both tip loops call, derives its block list
-    /// from `logs` instead and never asks for a header - the exact thing the backfill's own comment
-    /// warns produces "zero rows and a green run".
-    ///
-    /// So this pins the behaviour as it actually is, rather than asserting the fix I have not made:
-    /// the loop runs, the cursor advances, and no block row appears. It fails when #447 lands, which
-    /// is when it should be replaced by the presence assertion (rows appear for the tip window) that
-    /// this test was originally written to make.
+    /// `index_loop` writes one block row per block for a tip window on a blocks nest, including
+    /// windows where no log matched (#447). `LogCountingSource` tips at 100; `--backfill 10` starts
+    /// the cursor at block 90, so the loop must store rows for 90..=100 without issuing a single
+    /// `getLogs` (no address filter → every log on the chain, #432).
     #[tokio::test]
-    async fn the_tip_loop_writes_no_block_rows_for_a_window_yet() {
+    async fn the_tip_loop_writes_block_rows_for_every_block_in_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let mut nest =
             build_test_nest(dir.path(), "0x1111111111111111111111111111111111111111").await;
@@ -6821,38 +7072,70 @@ template = "pool"
             1,
             5,
         ));
-        // `LogCountingSource` tips at 100, so `--backfill 10` puts the loop on blocks 90..=100. Give
-        // it the same deadline the other loop tests use, then look.
+        // Wait until at least one block row lands in the hot store.
         let wrote_rows =
             within_deadline(|| !store.entities_in_range(90, 100).unwrap().is_empty()).await;
         task.abort();
 
         assert!(
-            !wrote_rows,
-            "if the tip loop now writes block rows, #447 is fixed - replace this test with the \
-             presence assertion it was written to make"
+            wrote_rows,
+            "the tip loop must write block rows for the window - #447 regressed"
         );
         assert_eq!(
             counter.calls(),
             0,
-            "whatever it does with the window, it must get there without asking for logs at all: an \
-             empty address AND topic filter is every log on the chain (#432)"
+            "must reach tip without a single getLogs: an empty address AND topic filter is every \
+             log on the chain (#432)"
         );
     }
 
-    /// #432 assumes a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) reaches the
-    /// tip loops, and it does not: `build_nest` is the only way any nest is constructed - solo `dev`
-    /// and the runtime both go through it - and it refuses this config outright, because `AppState`
-    /// wants `config.primary()`. So OBIB case 3 runs today only through the bench harness, which
-    /// builds a registry directly and never calls `build_nest`.
-    ///
-    /// That is worth a test rather than a note, in both directions. It pins the reason the
-    /// empty-filter guard on the tip loops is currently unreachable defence rather than a live fix,
-    /// and it fails loudly the day someone makes case 3 startable - which is the day the guard starts
-    /// carrying weight, and the day this test should be replaced by one that drives the loops with a
-    /// real contract-free nest.
+    /// Same as above, through `runtime_index_loop` (#447 acceptance criterion 2): the runtime cursor
+    /// writes block rows for the blocks nests on it.
     #[tokio::test]
-    async fn a_contract_free_nest_cannot_be_built_at_all_today() {
+    async fn the_runtime_tip_loop_writes_block_rows_for_every_block_in_the_window() {
+        let d_blocks = tempfile::tempdir().unwrap();
+        let blocks_nest = build_blocks_nest_with_contract(
+            d_blocks.path(),
+            "0x1111111111111111111111111111111111111111",
+        )
+        .await;
+        let blocks_store = blocks_nest.store.clone();
+
+        let src = Arc::new(LogCountingSource::new());
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![blocks_nest],
+            Some(10),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let wrote_rows =
+            within_deadline(|| !blocks_store.entities_in_range(0, 100).unwrap().is_empty()).await;
+        task.abort();
+
+        assert!(
+            wrote_rows,
+            "runtime_index_loop must write block rows for a blocks nest - #447 regressed"
+        );
+    }
+
+    /// The replacement `a_contract_free_nest_cannot_be_built_at_all_today` asked for by name: #445 is
+    /// fixed, so a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) now builds and
+    /// reaches the tip loop, and this drives the loop with a real one.
+    ///
+    /// The distinction that matters is where the no-`getLogs` state comes from. Its sibling
+    /// (`the_tip_loop_writes_no_block_rows_for_a_window_yet`) has to *manufacture* it - emptying
+    /// `addresses` and `topic0s` on an already-built ERC20 nest - because until #445 no real config
+    /// could produce it. Here nothing is forced: the operator declares a blocks nest and no
+    /// contracts, `build_nest` accepts it, and the loop arrives at an unrepresentable filter on its
+    /// own. That is the day #432's empty-filter guard stops being unreachable defence and starts
+    /// carrying weight, which is exactly what the retired test said to check for.
+    #[tokio::test]
+    async fn a_contract_free_nest_reaches_the_tip_loop_and_asks_for_no_logs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(crate::config::CONFIG_FILE),
@@ -6860,19 +7143,15 @@ template = "pool"
              [extract]\nblocks = true\n",
         )
         .unwrap();
-
-        // The config itself is perfectly legal - it parses, and `blocks = true` is a supported key.
         let config = Config::load(dir.path()).unwrap();
         assert!(
             config.contracts.is_empty() && config.extract.blocks,
             "the fixture is the contract-free blocks nest, not a stand-in"
         );
 
-        // It is nest *construction* that refuses it, and the message names contracts rather than the
-        // thing the operator asked for.
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        // `match` rather than `expect_err`: neither `NestIngest` nor `AppState` is `Debug`.
-        let err = match build_nest(
+        // `match` rather than `unwrap`: neither `NestIngest` nor `AppState` is `Debug`.
+        let (nest, state, worker, _w) = match build_nest(
             &source,
             dir.path().to_path_buf(),
             &config,
@@ -6883,15 +7162,213 @@ template = "pool"
         )
         .await
         {
-            Ok(_) => panic!(
-                "a contract-free nest now builds - the tip-loop empty-filter guard has become \
-                 reachable, so replace this test with one that drives the loops (#432)"
-            ),
-            Err(e) => e.to_string(),
+            Ok(built) => built,
+            Err(e) => panic!("a contract-free nest must build (#445): {e:#}"),
         };
+        if let Some(w) = worker {
+            w.abort();
+        }
+        // The nest has no single contract to name, and the summary says so rather than inventing one.
+        assert_eq!(
+            state.address, None,
+            "a nest with no contracts names no address"
+        );
+        // Unforced, straight out of `build_nest`: no address filter and no topic filter, so there is
+        // no `getLogs` this nest could legally issue.
         assert!(
-            err.contains("no contracts"),
-            "expected the primary-contract refusal, got: {err}"
+            LogFilter::new(&nest.addresses, &nest.topic0s).is_none(),
+            "a contract-free nest must reach the loop with an unrepresentable filter, without a \
+             test having to empty it by hand"
+        );
+
+        let src = Arc::new(LogCountingSource::new());
+        let counter = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(10),
+            false,
+            1,
+            5,
+        ));
+        // Give the loop the same deadline the other loop tests use. There is nothing to wait *for* -
+        // the point is that a window passes without a log request - so wait for the cursor to move.
+        let _ = within_deadline(|| counter.calls() > 0).await;
+        task.abort();
+
+        assert_eq!(
+            counter.calls(),
+            0,
+            "whatever the loop does with the window, it must get there without asking for logs at \
+             all: an empty address AND topic filter is every log on the chain (#432)"
+        );
+    }
+
+    /// A source that counts tip polls as well as log fetches, so "the loop never asked for logs" can
+    /// be told apart from "the loop never ran".
+    struct TipAndLogCountingSource {
+        tip_calls: std::sync::atomic::AtomicUsize,
+        log_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TipAndLogCountingSource {
+        fn new() -> Self {
+            Self {
+                tip_calls: std::sync::atomic::AtomicUsize::new(0),
+                log_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn tips(&self) -> usize {
+            self.tip_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn logs_asked(&self) -> usize {
+            self.log_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TipAndLogCountingSource {
+        async fn tip(&self) -> Result<u64> {
+            self.tip_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(100)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.log_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        serde_json::json!({
+                            "hash": format!("0x{b:064x}"),
+                            "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                            "miner": "0x0000000000000000000000000000000000000000",
+                            "timestamp": format!("0x{:x}", 1_700_000_000u64 + b),
+                        }),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    /// The tip loops' empty filter is **reachable today** - just not by the route #432 assumed.
+    ///
+    /// `a_contract_free_nest_cannot_be_built_at_all_today` pins that `build_nest` refuses a nest with
+    /// no `[[contracts]]`, and that is right. The conclusion drawn from it - that the empty-filter case
+    /// therefore cannot be driven end-to-end, so a type-level test is the honest coverage available -
+    /// is not. `registry.addresses()` derives its address list from registered event **decoders**, not
+    /// from `config.contracts`, so an ABI that declares no events leaves *both* halves of the filter
+    /// empty while `config.primary()` still succeeds. The nest builds, starts, and reaches the loop.
+    ///
+    /// This shape is not contrived. It is the proxy trap `report_abi_fit` already warns about by name
+    /// ("the resolved ABI declares no events at all", "the usual cause is a proxy"), and it warns
+    /// rather than refuses - so the nest indexes. Before #432 this configuration asked a public
+    /// endpoint for every log on the chain, every couple of seconds, for as long as `nuthatch dev`
+    /// ran. This is the end-to-end wiring test, with a real `build_nest` nest and no faked fixture.
+    #[tokio::test]
+    async fn an_event_free_abi_reaches_the_tip_loop_with_an_empty_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"proxyish\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n\n[[contracts]]\nalias = \"p\"\n\
+             address = \"0x1111111111111111111111111111111111111111\"\nabi = \"abis/p.json\"\n",
+        )
+        .unwrap();
+        // A proxy's public ABI: functions, no events. Perfectly valid JSON ABI, and the resolvers
+        // return exactly this for a proxied contract.
+        std::fs::write(
+            dir.path().join("abis/p.json"),
+            r#"[{"type":"function","name":"implementation","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"}]"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            !config.contracts.is_empty(),
+            "the fixture has a contract - this is not the #445 shape"
+        );
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a nest with a contract whose ABI has no events builds - primary() is satisfied");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        // The point: a built, runnable nest whose getLogs filter is empty on both halves.
+        assert!(
+            nest.addresses.is_empty() && nest.topic0s.is_empty(),
+            "expected both filter halves empty (addresses come from event decoders, not from \
+             config.contracts) - got {} address(es) and {} topic0(s)",
+            nest.addresses.len(),
+            nest.topic0s.len()
+        );
+
+        let store = nest.store.clone();
+        let src = Arc::new(TipAndLogCountingSource::new());
+        let counter = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(0),
+            false,
+            1,
+            5,
+        ));
+        // Liveness first, so `logs_asked() == 0` below cannot be satisfied by a loop that never ran.
+        let alive = within_deadline(|| counter.tips() >= 3).await;
+        let advanced = within_deadline(|| {
+            store
+                .get_meta(LAST_BLOCK_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|b| b >= 100)
+        })
+        .await;
+        task.abort();
+
+        assert!(
+            alive,
+            "the loop must have polled the tip at least three times"
+        );
+        assert_eq!(
+            counter.logs_asked(),
+            0,
+            "a nest whose filter is empty on both halves must not issue getLogs at all - that \
+             request is every log on the chain (#432)"
+        );
+        assert!(
+            advanced,
+            "the empty window must still be processed: the cursor has to reach the tip, or a \
+             blocks-only nest never seals and never advances"
         );
     }
 

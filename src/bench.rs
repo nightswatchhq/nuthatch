@@ -352,9 +352,23 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     let json = serde_json::to_string_pretty(&report)?;
     println!("\n{json}");
     if let Some(out) = &args.out {
-        std::fs::write(out, &json).with_context(|| format!("failed to write {out}"))?;
-        println!("\nwrote {out}");
+        write_report(out, &json)?;
     }
+    Ok(())
+}
+
+/// Write a report where a `git diff` can read it: pretty JSON **with a trailing newline**.
+///
+/// `serde_json::to_string_pretty` ends at the closing brace, and these reports get committed under
+/// `docs/bench/` as the reference numbers - `docs/bench/point-read.json` shipped without one until
+/// #385. A committed file with no final newline is a file whose last line every diff, `cat` and
+/// review tool renders wrongly, and the only reason it stayed that way is that nobody wanted to
+/// hand-edit an artifact and thereby stop it being an artifact. Emitting the newline here is what
+/// lets the committed baseline be **byte-identical** to the one CI uploads, which is the property
+/// #385 is actually about: the file in the repo is the file the enforcing machine produced.
+fn write_report(out: &str, json: &str) -> Result<()> {
+    std::fs::write(out, format!("{json}\n")).with_context(|| format!("failed to write {out}"))?;
+    println!("\nwrote {out}");
     Ok(())
 }
 
@@ -412,17 +426,22 @@ pub struct QueryBenchReport {
 /// A limit that is not passed is neither a pass nor a failure: it is simply not asked for, which is
 /// how an operator running the bench by hand should experience it.
 ///
-/// **The failure message names where to re-baseline, because the obvious place is the wrong one.**
-/// It used to say "re-baselining against a committed report", and the only committed report is
+/// **The failure message names where to re-baseline, because the obvious place used to be the wrong
+/// one.** It once said "re-baselining against a committed report", and the only committed report was
 /// `docs/bench/point-read.json` - a 32-core dev-box number (p50 1.24µs) that `docs/benchmarks.md`
-/// explicitly tells the reader is *not* what the ceiling was set against (the runner's baseline is
-/// 0.59-0.82µs). Following the instruction re-derives a runner ceiling from dev-box hardware, and
+/// explicitly told the reader was *not* what the ceiling was set against (the runner's baseline is
+/// 0.59-0.82µs). Following the instruction re-derived a runner ceiling from dev-box hardware, and
 /// this gate is the one that already proved baseline and regression do not scale together across
 /// machines: the scan mutation ran *faster* on the runner (18.15µs) than on the dev box (24.17µs).
-/// This is #395's lesson on the RSS harness in miniature - a FAIL message that points at a
-/// different scenario than the one it enforces is a trap with a comment on it - so the message
-/// points at the enforcing machine instead. #385 tracks committing a runner-produced artifact,
-/// which is what would let this instruction name a file again.
+/// So the message pointed at the enforcing machine and explicitly away from the file.
+///
+/// #385 fixed the file rather than the sentence: `docs/bench/point-read.json` is now an artifact
+/// lifted from a green `main` run of the `point-read latency` job, so it records the runner's own
+/// numbers and the message can name it again. The dev-box record moved to
+/// `docs/bench/point-read-devbox.json` and is named here as the one *not* to re-derive from, because
+/// it is still in the tree and is still the artifact a reader might reach for. The instruction that
+/// carries the actual weight is neither filename: it is **check the `hardware` field matches the
+/// machine you are measuring on**, which is the only thing that made the old file wrong.
 fn check_gate(
     report: &QueryBenchReport,
     max_p50_us: Option<f64>,
@@ -458,10 +477,12 @@ fn check_gate(
     bail!(
         "point-read gate failed - {}.\nThis is a gate, not a warning: either the change made \
          point-reads slower, or the ceiling needs re-baselining - measured on the machine that \
-         enforces it, and with a stated reason.\nNot from docs/bench/point-read.json: that is a \
-         32-core dev-box reference point, and this ceiling was set on the CI runner, whose \
-         baseline and whose regression are both different numbers. See \"Where the ceilings come \
-         from\" in docs/benchmarks.md.",
+         enforces it, and with a stated reason.\nThe reference is docs/bench/point-read.json, \
+         which is a CI-runner artifact: check its `hardware` field matches the machine you are \
+         measuring on before you derive anything from it. Not from \
+         docs/bench/point-read-devbox.json: that is the 32-core dev-box record, and this ceiling \
+         was set on the CI runner, whose baseline and whose regression are both different \
+         numbers. See \"Where the ceilings come from\" in docs/benchmarks.md.",
         breaches.join("; ")
     )
 }
@@ -472,8 +493,17 @@ fn check_gate(
 pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     let config = Config::load(&dir)?;
-    let store = Store::open(&dir.join(crate::config::DB_FILE))
-        .context("open the nest store (stop `nuthatch dev` first - the bench needs the DB)")?;
+    // Non-creating (#413, #469): this reads an *already-indexed* nest, so a directory with no store
+    // has no baseline to measure. `Store::open` would create one, `sample_entity_keys` would find
+    // nothing in it, and the bench would report a baseline for the empty file it had just made -
+    // and leave that file behind for a later `holds_data` to misread.
+    let store = Store::open_existing(&dir.join(crate::config::DB_FILE)).with_context(|| {
+        format!(
+            "no indexed store at {} - either there is no nest here (check --dir), or `nuthatch \
+             dev` is running against it and needs to be stopped first",
+            dir.display()
+        )
+    })?;
 
     let keys = store.sample_entity_keys(args.reads)?;
     let hot = store.hot_rows_by_table()?;
@@ -610,8 +640,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let json = serde_json::to_string_pretty(&report)?;
     println!("\n{json}");
     if let Some(out) = &args.out {
-        std::fs::write(out, &json).with_context(|| format!("failed to write {out}"))?;
-        println!("\nwrote {out}");
+        write_report(out, &json)?;
     }
 
     // The gate last, and **after** the artifact is written: a run that fails the gate is the run whose
@@ -1065,7 +1094,9 @@ mod tests {
     }
 
     /// An indexed nest on disk: config, ABI, and `rows` entities in the hot store.
-    fn indexed_nest(dir: &std::path::Path, rows: u64) {
+    /// A nest directory with a config but no store - the state `bench query` must refuse rather
+    /// than invent (#469).
+    fn nest_config(dir: &std::path::Path) {
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
             r#"[nest]
@@ -1088,6 +1119,10 @@ abi = "abis/c.json"
             r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
         )
         .unwrap();
+    }
+
+    fn indexed_nest(dir: &std::path::Path, rows: u64) {
+        nest_config(dir);
         let store = Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
         let batch: Vec<(String, String)> = (0..rows)
             .map(|i| {
@@ -1121,6 +1156,31 @@ abi = "abis/c.json"
         }
     }
 
+    /// #413/#469: `Store::open` creates the file it is asked whether exists, so a probe against it
+    /// answers its own question. Against a directory with no store, `bench query` must refuse rather
+    /// than measure the empty store it just made - and must not leave that store behind either,
+    /// which is the half a message-only assertion cannot see.
+    #[test]
+    fn bench_query_refuses_a_directory_with_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let db = dir.path().join(crate::config::DB_FILE);
+        assert!(!db.exists(), "fixture must start with no store");
+
+        let err = query(gated_args(dir.path(), None, None))
+            .expect_err("a directory with no store must not produce a baseline")
+            .to_string();
+        assert!(
+            err.contains(&dir.path().display().to_string()),
+            "the error must name the directory that has no store: {err}"
+        );
+        assert!(
+            !db.exists(),
+            "a refused probe must not leave a nuthatch.redb behind - that is the litter #413 was \
+             about"
+        );
+    }
+
     /// **The wiring, not the mechanism.** `check_gate` can be correct and complete while `query`
     /// never calls it, which is the exact shape the board caught in PR #369: a parser with tests and
     /// a call site with none, deletable at 488 green. So this drives the real `bench query` against a
@@ -1141,8 +1201,8 @@ abi = "abis/c.json"
             .to_string();
         assert!(err.contains("point-read p50"), "{err}");
 
-        // The re-baseline instruction has to name the machine that enforces the gate. The previous
-        // wording said "against a committed report", and the only committed report is a 32-core
+        // The re-baseline instruction has to name the machine that enforces the gate. The original
+        // wording said "against a committed report", and the only committed report was a 32-core
         // dev-box one that docs/benchmarks.md says the ceiling was *not* set against - so whoever
         // followed the message re-derived a runner ceiling from the wrong hardware. Pinned here
         // because a FAIL message nobody reads until CI is red is exactly the text that rots.
@@ -1150,15 +1210,27 @@ abi = "abis/c.json"
             err.contains("machine that enforces it"),
             "the failure must say where to re-baseline, not just that one is needed: {err}"
         );
-        // ...and it has to name the file, not just the principle. The assertion above stays green on
-        // a message that says "measure it yourself" and nothing more, which leaves the one sentence
-        // that actually prevents the mistake - naming docs/bench/point-read.json as the wrong
-        // artifact - deletable without this test noticing. That was the defect itself: the reader
-        // knew a re-baseline was wanted and reached for the only committed report there is.
+        // ...and it has to name the files, not just the principle. The assertion above stays green on
+        // a message that says "measure it yourself" and nothing more, which leaves the sentences that
+        // actually prevent the mistake deletable without this test noticing. Both halves are pinned
+        // because #385 swapped which file is which: the runner artifact is now the reference, the
+        // dev-box record is the one still sitting in the tree for a reader to reach for by mistake.
         assert!(
-            err.contains("Not from docs/bench/point-read.json"),
+            err.contains("docs/bench/point-read.json"),
+            "the failure must name the committed reference, since a reader who is told to \
+             re-baseline will otherwise reach for whichever report they find first: {err}"
+        );
+        assert!(
+            err.contains("Not from docs/bench/point-read-devbox.json"),
             "the failure must name the report that is *not* the baseline, since that is the one a \
              reader reaches for otherwise: {err}"
+        );
+        // The instruction that survives a future file move is the hardware check, not either
+        // filename - the dev-box artifact was wrong for exactly one reason and it is this one.
+        assert!(
+            err.contains("`hardware` field"),
+            "the failure must tell the reader to check the machine the reference was measured on, \
+             which is the only thing that made the old reference wrong: {err}"
         );
 
         // The p99 flag still reaches the gate. CI stopped passing --max-point-read-p99-us when the
@@ -1202,6 +1274,19 @@ abi = "abis/c.json"
         );
         assert_eq!(json["reads"], 8);
         assert!(json["point_read_p50_us"].as_f64().unwrap() > 0.0);
+
+        // **The committed baseline is this file, byte for byte** (#385). `docs/bench/point-read.json`
+        // is lifted from a green `main` run of the `point-read latency` job rather than hand-written,
+        // so anything the writer does that a committed file cannot have - here, ending at `}` with no
+        // final newline - forces whoever commits it to edit the artifact, at which point it stops
+        // being one. Asserted on the bytes rather than the parse, because every JSON reader in the
+        // world is indifferent to the thing this pins.
+        let raw = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            raw.ends_with("}\n"),
+            "a committed artifact needs a trailing newline: {:?}",
+            &raw[raw.len().saturating_sub(8)..]
+        );
     }
 
     /// **`--keep` wipes what it is given, so the guard is the only thing between a typo and a
