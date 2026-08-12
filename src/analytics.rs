@@ -2980,8 +2980,18 @@ template="pool"
     /// Collect every event message a closure logs. Used below to observe whether the integrity sweep
     /// touched a segment at all - the sweep has no return value a caller can see and no semantic
     /// effect when it looks at a table the query never named, so cost is the only thing that changes
-    /// and the log line is the only place it surfaces. `with_default` is thread-local, so this is
-    /// unaffected by tests running in parallel.
+    /// and the log line is the only place it surfaces.
+    ///
+    /// `with_default` being thread-local does **not** make this safe under parallel tests: `tracing`
+    /// caches each callsite's `Interest` globally and process-wide the first time it is evaluated, so
+    /// a callsite reached by another test on another thread with no subscriber installed can get
+    /// cached `Interest::never()` for the rest of the process - and a `with_default` scope here would
+    /// then never see that event regardless of what this layer wants. Confirmed on `segments_failing_
+    /// verification`'s `tracing::error!` call site, see #482. Prefer a return-value assertion over
+    /// `CapturedLogs` wherever the code under test exposes one; use this only as the last resort, and
+    /// only for a negative assertion (an event that fails to arrive because it was never worth logging
+    /// looks identical to one dropped by this race, so a positive assertion built on `CapturedLogs`
+    /// cannot tell those apart and is unreliable by construction).
     #[derive(Clone, Default)]
     struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -3082,6 +3092,10 @@ template="pool"
             chain.contains("Conversion Error"),
             "expected the cast itself to be what failed, got: {chain}"
         );
+        // Negative assertion via `CapturedLogs`, not a return value: this is the one place in the
+        // binary #482's grep sweep left on the log-capture path, because nothing else observes
+        // whether the sweep was reachability-bounded. Safe as a negative check only - see the
+        // `CapturedLogs` doc comment for why a positive assertion here would be unreliable.
         assert_eq!(
             quiet.mentioning(REJECTED),
             0,
