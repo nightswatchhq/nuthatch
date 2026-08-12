@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
 const MEM_LIMIT: &str = "512MB";
@@ -114,8 +114,23 @@ fn run(
     hot: &HotRows,
     sealed_through: u64,
 ) -> Result<QueryOutput> {
+    // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
+    // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
+    // execution could run a full `timeout`, the sweep between the two attempts ran with nothing
+    // watching it at all, and the retry got its own fresh `timeout` on top - up to 2x the advertised
+    // budget in query execution alone, plus whatever the sweep cost. Sharing one deadline across both
+    // attempts and the sweep makes `guard.timeout` the actual wall-clock ceiling on the whole call.
+    let deadline = guard.map(|g| Instant::now() + g.timeout);
     let nothing_excluded = std::collections::BTreeSet::new();
-    let (e, tables) = match attempt(dir, sql, guard, hot, sealed_through, &nothing_excluded)? {
+    let (e, tables) = match attempt(
+        dir,
+        sql,
+        guard,
+        hot,
+        sealed_through,
+        &nothing_excluded,
+        deadline,
+    )? {
         Attempt::Ok(out) => return Ok(out),
         Attempt::DiedExecuting { error, tables } => (error, tables),
     };
@@ -145,13 +160,33 @@ fn run(
         );
         return Err(e);
     };
-    let corrupt = crate::seal::segments_failing_verification(dir, &tables);
+    // The budget may already be spent by the first attempt alone; say so plainly rather than silently
+    // skipping the sweep and returning `e`, which (for a guard-bound caller) could otherwise read as
+    // an ordinary query error rather than the timeout it actually is.
+    if let Some(secs) = timed_out(guard, deadline) {
+        bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+    }
+    let corrupt = crate::seal::segments_failing_verification(dir, &tables, deadline);
     if corrupt.is_empty() {
+        if let Some(secs) = timed_out(guard, deadline) {
+            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        }
         return Err(e);
     }
-    match attempt(dir, sql, guard, hot, sealed_through, &corrupt)? {
+    match attempt(dir, sql, guard, hot, sealed_through, &corrupt, deadline)? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
+    }
+}
+
+/// `Some(guard.timeout.as_secs())` when `deadline` has already passed, else `None`. Shared by the two
+/// places in [`run`] that must turn "we ran out of the shared deadline" into the same wording
+/// `attempt`'s own watchdog uses, rather than leaking `e`'s unrelated error text as the reason.
+fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        Some(guard.map(|g| g.timeout.as_secs()).unwrap_or(0))
+    } else {
+        None
     }
 }
 
@@ -162,6 +197,7 @@ fn attempt(
     hot: &HotRows,
     sealed_through: u64,
     excluded: &std::collections::BTreeSet<String>,
+    deadline: Option<Instant>,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -253,19 +289,25 @@ fn attempt(
     let referenced = referenced.map(|names| expand_through_views(&conn, &names));
 
     // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
-    // query once it outlives the guard's timeout (a cartesian blow-up can't be stopped by the memory
-    // cap alone). `interrupt()` makes the running query fail; we translate that into a clear timeout
-    // error below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
+    // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
+    // alone). `interrupt()` makes the running query fail; we translate that into a clear timeout error
+    // below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
     // queries skip all of this and run to completion.
+    //
+    // Waits on `deadline`, not a fresh `guard.timeout`, so a second `attempt` (the #433 reduced retry)
+    // only gets whatever's left of the *first* attempt's budget rather than a brand-new full timeout
+    // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
+    // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let watchdog = guard.map(|g| {
+    let watchdog = guard.zip(deadline).map(|(_, d)| {
         let handle = conn.interrupt_handle();
         let flag = interrupted.clone();
         let (tx, rx) = mpsc::channel::<()>();
         let join = std::thread::spawn(move || {
+            let remaining = d.saturating_duration_since(Instant::now());
             // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
             // (panic) leaves the query alone.
-            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(g.timeout) {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
                 flag.store(true, Ordering::SeqCst);
                 handle.interrupt();
             }
@@ -3108,9 +3150,78 @@ template="pool"
             .map(|names| expand_through_views(&conn, &names))
             .expect("the query names a table");
         assert_eq!(
-            crate::seal::segments_failing_verification(dir.path(), &referenced),
+            crate::seal::segments_failing_verification(dir.path(), &referenced, None),
             std::collections::BTreeSet::from([victim.hash.clone()]),
             "the same corrupt segment must be found when the query does name its table"
+        );
+    }
+
+    /// **Issue #476, end to end.** Before this fix, `run`'s watchdog covered only the query execution
+    /// either side of the sweep: the sweep itself ran with nothing watching it, and the #433 retry got
+    /// a brand-new `guard.timeout` rather than whatever was left of the first one. A genuinely degraded
+    /// nest could cost up to `2 x timeout` in execution alone, plus an unbounded sweep in between.
+    ///
+    /// Driven through the public surface (`query_guarded`, not `run` directly): three sealed segments,
+    /// the last corrupted, and `seal`'s test-only per-segment sweep delay (large relative to the query's
+    /// own timeout) so a sweep that actually obeys the shared deadline can only get through the first
+    /// segment before its budget is spent - it never reaches the corrupt one, so `corrupt` comes back
+    /// empty and the call must fail fast on the ORIGINAL error rather than pay for a second attempt.
+    /// An unbounded sweep would instead hash all three segments (3 x the injected delay) before ever
+    /// checking the clock, which the elapsed-time assertion below is wide enough to tell apart from the
+    /// bounded case but nowhere close to the unbounded one.
+    #[test]
+    fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
+        let _serial = crate::seal::test_sweep_serial().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        for block in [1u64, 2, 3] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"0xa","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .max_by_key(|s| s.from_block)
+            .expect("the block-3 segment");
+        let path = crate::seal::segment_path(dir.path(), &victim.file, &victim.hash);
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+
+        crate::seal::test_set_sweep_delay_ms(150);
+        let guard = QueryGuard {
+            timeout: Duration::from_millis(100),
+            max_rows: 10,
+        };
+        let start = Instant::now();
+        let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
+        let elapsed = start.elapsed();
+        crate::seal::test_set_sweep_delay_ms(0);
+
+        assert!(
+            result.is_err(),
+            "the sweep never reaches the corrupt (third) segment within budget, so there is nothing \
+             to exclude and this must fail the same way the un-reduced query does"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "an unbounded sweep hashes all 3 segments (>= 450ms at the injected 150ms/segment) before \
+             a fast retry; bound to the query's own 100ms budget it must return well under that - took \
+             {elapsed:?}"
         );
     }
 
