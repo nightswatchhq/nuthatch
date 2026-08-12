@@ -295,8 +295,8 @@ Serve a nest **read-only** from a shared hot store, without indexing it (RFC-002
 Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table
 
 - `<QUERY>` - The SQL query (SELECT/WITH). Tables are `{alias}__{event}`, e.g. `usdc__transfer`. Omit to open an interactive REPL (`.tables`, `.schema <t>`, history; `.exit` to quit)
-- `--dir <DIR>` - Nest directory (queried directly when no `nuthatch dev` holds the store)
-- `--url <URL>` - The running instance's API, used when the local store is locked by `nuthatch dev`
+- `--dir <DIR>` - Nest directory. Queried directly when it holds a store no `nuthatch dev` has open; never created by the query, so a directory without one falls back to --url
+- `--url <URL>` - The running instance's API, used when --dir holds no store or `nuthatch dev` has it open
 - `--json` - Emit newline-delimited JSON instead of a table (for piping to jq etc.)
 
 ## `nuthatch transform`

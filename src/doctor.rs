@@ -31,6 +31,24 @@ use serde_json::json;
 use crate::rpc::RpcClient;
 use crate::source::Source;
 
+/// Ceiling for a **range-only** recommendation (`max_window` measured with no `--address`).
+///
+/// The no-address probe filters on a topic0 no event can produce (see `probe()`), so its response
+/// is empty at every span and it can never meet a result-count cap - it only ever measures the
+/// provider's raw block-range ceiling, which on a provider with no hard range cap climbs to the
+/// probe loop's own limit rather than to anything the provider actually enforces. Halving that
+/// number is still an unfounded recommendation, since it says nothing about the result-count cap a
+/// nest's real, log-matching traffic will meet.
+///
+/// The one real measurement of that shape in this codebase is `arb1.arbitrum.io`, which refused
+/// the pre-#446 all-logs probe (no address filter, no topic0 filter - the densest traffic an
+/// address-less request can produce) at 640 blocks. That is also the traffic shape a factory nest
+/// legitimately sends on purpose (`LogFilter::new` allows a topic0-only, address-less filter for
+/// exactly that reason - `source.rs`), so it is the right proxy rather than an arbitrary margin.
+/// Halved again for the same headroom `recommended_window()` already applies to a direct
+/// measurement, since 640 is a cross-endpoint data point, not this endpoint's own ceiling.
+const RANGE_ONLY_WINDOW_CAP: u64 = 320;
+
 /// What one endpoint can actually do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
@@ -49,6 +67,10 @@ pub struct Probe {
     /// Notes worth printing - a 403, an auth demand, a partial batch. Each is a fact about the
     /// endpoint the operator would otherwise meet mid-backfill.
     pub notes: Vec<String>,
+    /// Whether `max_window` was measured **range-only**: no `--address` was given, so the probe
+    /// matched on a topic0 no event can produce and never met a result-count cap. `false` means the
+    /// probe matched real logs (an address was given) and `max_window` reflects both limits.
+    pub range_only: bool,
 }
 
 impl Probe {
@@ -59,8 +81,20 @@ impl Probe {
     /// maximum would hand the operator a value that works until it doesn't - and RFC-0028's adaptive
     /// controller can grow from a conservative start, whereas it can only recover from an aggressive
     /// one by failing first.
+    ///
+    /// For a **range-only** measurement the halved number is additionally capped at
+    /// [`RANGE_ONLY_WINDOW_CAP`], because halving only produces headroom against *this* number - and
+    /// a range-only `max_window` carries no result-count information at all, so there is no cap in
+    /// it to have headroom against.
     pub fn recommended_window(&self) -> Option<u64> {
-        self.max_window.map(|w| (w / 2).max(1))
+        self.max_window.map(|w| {
+            let halved = (w / 2).max(1);
+            if self.range_only {
+                halved.min(RANGE_ONLY_WINDOW_CAP)
+            } else {
+                halved
+            }
+        })
     }
 
     /// One line per finding, in the order an operator cares about.
@@ -117,6 +151,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
                 archive: false,
                 archive_unknown: true,
                 notes,
+                range_only: address.is_none(),
             });
         }
     };
@@ -235,13 +270,18 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
         }
     };
 
-    // An **unfiltered** getLogs hits result-size caps far sooner than a nest's filtered one, so this
-    // number understates what a real backfill can use. Measured: arb1.arbitrum.io probes at 640
-    // blocks unfiltered while comfortably serving far wider windows for a single contract.
+    // This probe filters on a topic0 no event can produce (see above), so its response is empty at
+    // every span and it can never meet a result-count cap - it only ever measures the provider's
+    // RANGE limit. A real nest filters by address and topic0 and gets back actual logs, so it
+    // additionally meets whatever result-count cap the provider enforces - which is the tighter
+    // limit in the one case measured in this file (arb1.arbitrum.io refused the pre-#446 all-logs
+    // probe at 640 blocks on result count, not range). So this number OVERSTATES what a real
+    // backfill can sustain, not understates it, and `recommended_window()` caps it accordingly.
     if address.is_none() && max_window.is_some() {
         notes.push(
-            "window measured UNFILTERED - a nest filters by address and topic0 and will sustain a \
-             wider window; re-probe with --address <contract> for a number you can actually use"
+            "window measured RANGE-ONLY - it never triggers a result-count cap, so a nest matching \
+             real logs will sustain a narrower window; re-probe with --address <contract> for a \
+             number that reflects both limits"
                 .to_string(),
         );
     }
@@ -252,6 +292,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
         archive,
         archive_unknown,
         notes,
+        range_only: address.is_none(),
     })
 }
 
@@ -315,6 +356,7 @@ mod tests {
             archive,
             archive_unknown: false,
             notes: Vec::new(),
+            range_only: false,
         }
     }
 
@@ -380,6 +422,7 @@ mod tests {
             archive: false,
             archive_unknown: true,
             notes: Vec::new(),
+            range_only: false,
         };
         let r = refused.report();
         assert!(r.contains("UNKNOWN"), "{r}");
@@ -393,5 +436,153 @@ mod tests {
             ..refused
         };
         assert!(genuinely_absent.report().contains("tip-following only"));
+    }
+
+    /// A **range-only** measurement (no `--address`) never triggers a result-count cap, so a huge
+    /// `max_window` only means no RANGE cap was found - not that no cap exists at all. Halving it is
+    /// still an unfounded recommendation, so it is capped at `RANGE_ONLY_WINDOW_CAP` instead. Below
+    /// the cap, a range-only probe behaves exactly like a filtered one (plain halving), and the same
+    /// `max_window` filtered (an address was given) is never capped, because it already carries a
+    /// real result-count answer.
+    #[test]
+    fn a_range_only_measurement_is_capped_not_just_halved() {
+        let unbounded = Probe {
+            range_only: true,
+            ..probe_of(Some(163_840), None, false)
+        };
+        assert_eq!(unbounded.recommended_window(), Some(RANGE_ONLY_WINDOW_CAP));
+
+        let small = Probe {
+            range_only: true,
+            ..probe_of(Some(400), None, false)
+        };
+        assert_eq!(small.recommended_window(), Some(200));
+
+        let filtered = Probe {
+            range_only: false,
+            ..probe_of(Some(163_840), None, false)
+        };
+        assert_eq!(filtered.recommended_window(), Some(81_920));
+    }
+
+    /// A one-endpoint fake JSON-RPC server that captures every `eth_getLogs` filter it is sent and
+    /// answers everything else just well enough for `probe()` to run to completion. `cap`, if set,
+    /// refuses `eth_getLogs` on result count once the requested span exceeds it - simulating a
+    /// provider whose range limit is known, rather than one that never refuses.
+    async fn filter_capturing_rpc(
+        seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        cap: Option<u64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::Value;
+
+        #[derive(Clone)]
+        struct St {
+            seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+            cap: Option<u64>,
+        }
+
+        fn hex_u64(v: Option<&Value>) -> Option<u64> {
+            u64::from_str_radix(v?.as_str()?.trim_start_matches("0x"), 16).ok()
+        }
+
+        async fn handler(State(st): State<St>, Json(req): Json<Value>) -> Json<Value> {
+            if let Some(batch) = req.as_array() {
+                let out: Vec<Value> = batch
+                    .iter()
+                    .map(|item| {
+                        json!({"jsonrpc":"2.0","id": item.get("id").cloned().unwrap_or(json!(0)), "result":"0x1"})
+                    })
+                    .collect();
+                return Json(Value::Array(out));
+            }
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "eth_blockNumber" => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x100000"})),
+                "eth_getLogs" => {
+                    let filter = req
+                        .get("params")
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first());
+                    if let Some(f) = filter {
+                        st.seen.lock().unwrap().push(f.clone());
+                    }
+                    let span = filter.and_then(|f| {
+                        Some(
+                            hex_u64(f.get("toBlock"))?.saturating_sub(hex_u64(f.get("fromBlock"))?)
+                                + 1,
+                        )
+                    });
+                    if let (Some(span), Some(cap)) = (span, st.cap) {
+                        if span > cap {
+                            return Json(json!({
+                                "jsonrpc":"2.0","id":1,
+                                "error":{"code":-32000,"message":"query returned more than 10000 results"}
+                            }));
+                        }
+                    }
+                    Json(json!({"jsonrpc":"2.0","id":1,"result": []}))
+                }
+                _ => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x0"})),
+            }
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(St { seen, cap });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #432: an empty address list AND an empty topic0 list is not a width probe - it is a request
+    /// for every log on the chain, which endpoints refuse on RESULT COUNT, and `doctor` misreported
+    /// that refusal as WIDTH. #446 fixed it with a topic0 no event can produce. This drives the real
+    /// probe loop (not a hand-built `Probe`) against a stub RPC and inspects the filter actually put
+    /// on the wire, so a regression that quietly drops the no-match topic0 fails here. Mutation check:
+    /// delete the `NO_MATCH_TOPIC0` fallback in `probe()` and this goes red.
+    #[tokio::test]
+    async fn the_no_address_probe_never_sends_the_match_everything_filter() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
+
+        probe(&url, None).await.unwrap();
+        handle.abort();
+
+        let filters = seen.lock().unwrap();
+        assert!(!filters.is_empty(), "no eth_getLogs call was captured");
+        assert!(
+            filters
+                .iter()
+                .all(|f| f.get("address").is_some() || f.get("topics").is_some()),
+            "a getLogs filter with neither address nor topics matches every log on the chain (#432): \
+             {filters:?}"
+        );
+    }
+
+    /// Drives `probe()` end to end against a fake provider whose range limit is controlled (50,000
+    /// blocks - large enough that the probe's own doubling climbs well past `RANGE_ONLY_WINDOW_CAP`
+    /// before the mock refuses), so a wrong headroom is visible as a wrong *recommendation*, not just
+    /// a wrong constant. Mutation check: change `recommended_window()` back to plain `(w / 2).max(1)`
+    /// (src/doctor.rs, `recommended_window`) and the final assertion goes red - it asserts 320, the
+    /// mutated code returns half of whatever range-only ceiling the mock's cap produced instead.
+    #[tokio::test]
+    async fn a_range_only_recommendation_against_a_controlled_provider_is_capped() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen, Some(50_000)).await;
+
+        let p = probe(&url, None).await.unwrap();
+        handle.abort();
+
+        assert!(
+            p.max_window.unwrap_or(0) > RANGE_ONLY_WINDOW_CAP * 2,
+            "test is meaningless unless the measured ceiling clears the cap: {:?}",
+            p.max_window
+        );
+        assert_eq!(p.recommended_window(), Some(RANGE_ONLY_WINDOW_CAP));
     }
 }

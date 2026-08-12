@@ -90,6 +90,19 @@ impl AdaptiveWindow {
     pub fn too_large(&mut self) {
         self.window = (self.window / 2).max(self.min);
     }
+
+    /// Re-bound the ceiling for one iteration (RFC-0036, #458). A caller whose ceiling changes
+    /// under it - the runtime tip loop's cursor gains and loses a header-costed nest as mounts
+    /// arrive and retire - must bound the controller itself, not just the span it lets it issue:
+    /// capping only the use still feeds `observed` results from the capped span into a `window`
+    /// that is free to keep climbing, so it drifts to `max` unseen and hands back the whole drift
+    /// in one step the moment the ceiling is lifted. Calling this every iteration keeps `window`
+    /// clamped down live, so growth back up after a ceiling is lifted goes through `observed`'s own
+    /// 4x-per-step damping instead of jumping straight to wherever it had silently drifted.
+    pub fn set_max(&mut self, max: u64) {
+        self.max = max.max(self.min);
+        self.window = self.window.min(self.max);
+    }
 }
 
 /// Whether an RPC error looks like a result-size / range cap (so the caller shrinks and retries the

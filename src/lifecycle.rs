@@ -302,8 +302,21 @@ pub fn reuse_segments(old_dir: &Path, new_dir: &Path) -> Result<ReuseOutcome> {
 
     // Set the new store's sealed watermark so its indexer resumes past the reused range. Opened and
     // dropped here, before the indexer opens it (redb is single-writer).
+    //
+    // Non-creating (#413, #469): this reads the *old* version's watermark, and a probe must not be
+    // able to answer itself. A directory can reach here with sealed segments but no store yet - the
+    // manifest check above only proves segments exist, not that a cursor ever opened this store - and
+    // a creating open would read `sealed_through = 0` back from the empty file it had just written,
+    // set the new store's watermark to 0, and litter the old directory with a store nobody indexed.
     let old_sealed = {
-        let s = crate::store::Store::open(&old_dir.join(crate::config::DB_FILE))?;
+        let s = crate::store::Store::open_existing(&old_dir.join(crate::config::DB_FILE))
+            .with_context(|| {
+                format!(
+                    "reusing segments from {} needs its sealed watermark, but there is no store \
+                     there to read it from",
+                    old_dir.display()
+                )
+            })?;
         s.sealed_through()
     };
     {
@@ -414,6 +427,48 @@ mod tests {
             ReuseOutcome::NotReusable(why) => assert!(why.contains("nothing sealed"), "{why}"),
             other => panic!("expected NotReusable (nothing sealed), got {other:?}"),
         }
+    }
+
+    /// #413/#469: the old version's store is opened to read its sealed watermark, and a creating
+    /// open answers that read with an empty file it just wrote instead of refusing. Reachable without
+    /// a live cursor: `holds_data` counts a non-empty `segments/` as data before it ever looks for a
+    /// store (`runtime.rs`), so a directory with sealed segments but no `nuthatch.redb` is not a
+    /// contradiction - it is what a source dataset looks like the moment segments are sealed but
+    /// before any indexer has opened the store here (or after a store was deleted out from under
+    /// segments that are still valid, since they are content-addressed and outlive it).
+    #[test]
+    fn reuse_refuses_an_old_dir_with_sealed_segments_but_no_store() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        std::fs::write(
+            old.path().join("schema.json"),
+            r#"{"registry_hash":"0xAAA","tables":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            new.path().join("schema.json"),
+            r#"{"registry_hash":"0xAAA","tables":[]}"#,
+        )
+        .unwrap();
+        // Sealed segments present, but no store - `holds_data` would already call this a dataset.
+        let old_seg = old.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&old_seg).unwrap();
+        std::fs::write(old_seg.join(crate::seal::MANIFEST_FILE), "{}").unwrap();
+        let old_db = old.path().join(crate::config::DB_FILE);
+        assert!(!old_db.exists(), "fixture must start with no store");
+
+        let err = reuse_segments(old.path(), new.path())
+            .expect_err("no store to read the watermark from must refuse, not invent one")
+            .to_string();
+        assert!(
+            err.contains(&old.path().display().to_string()),
+            "the error must name the directory that has no store: {err}"
+        );
+        assert!(
+            !old_db.exists(),
+            "a refused read must not leave a nuthatch.redb behind in the source directory - that \
+             litters it and, per issue #408/#415, can make it look unadoptable ever after"
+        );
     }
 
     #[test]
