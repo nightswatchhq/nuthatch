@@ -493,8 +493,17 @@ fn check_gate(
 pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     let config = Config::load(&dir)?;
-    let store = Store::open(&dir.join(crate::config::DB_FILE))
-        .context("open the nest store (stop `nuthatch dev` first - the bench needs the DB)")?;
+    // Non-creating (#413, #469): this reads an *already-indexed* nest, so a directory with no store
+    // has no baseline to measure. `Store::open` would create one, `sample_entity_keys` would find
+    // nothing in it, and the bench would report a baseline for the empty file it had just made -
+    // and leave that file behind for a later `holds_data` to misread.
+    let store = Store::open_existing(&dir.join(crate::config::DB_FILE)).with_context(|| {
+        format!(
+            "no indexed store at {} - either there is no nest here (check --dir), or `nuthatch \
+             dev` is running against it and needs to be stopped first",
+            dir.display()
+        )
+    })?;
 
     let keys = store.sample_entity_keys(args.reads)?;
     let hot = store.hot_rows_by_table()?;
@@ -1085,7 +1094,9 @@ mod tests {
     }
 
     /// An indexed nest on disk: config, ABI, and `rows` entities in the hot store.
-    fn indexed_nest(dir: &std::path::Path, rows: u64) {
+    /// A nest directory with a config but no store - the state `bench query` must refuse rather
+    /// than invent (#469).
+    fn nest_config(dir: &std::path::Path) {
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
             r#"[nest]
@@ -1108,6 +1119,10 @@ abi = "abis/c.json"
             r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
         )
         .unwrap();
+    }
+
+    fn indexed_nest(dir: &std::path::Path, rows: u64) {
+        nest_config(dir);
         let store = Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
         let batch: Vec<(String, String)> = (0..rows)
             .map(|i| {
@@ -1139,6 +1154,31 @@ abi = "abis/c.json"
             max_point_read_p99_us: None,
             min_reads,
         }
+    }
+
+    /// #413/#469: `Store::open` creates the file it is asked whether exists, so a probe against it
+    /// answers its own question. Against a directory with no store, `bench query` must refuse rather
+    /// than measure the empty store it just made - and must not leave that store behind either,
+    /// which is the half a message-only assertion cannot see.
+    #[test]
+    fn bench_query_refuses_a_directory_with_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let db = dir.path().join(crate::config::DB_FILE);
+        assert!(!db.exists(), "fixture must start with no store");
+
+        let err = query(gated_args(dir.path(), None, None))
+            .expect_err("a directory with no store must not produce a baseline")
+            .to_string();
+        assert!(
+            err.contains(&dir.path().display().to_string()),
+            "the error must name the directory that has no store: {err}"
+        );
+        assert!(
+            !db.exists(),
+            "a refused probe must not leave a nuthatch.redb behind - that is the litter #413 was \
+             about"
+        );
     }
 
     /// **The wiring, not the mechanism.** `check_gate` can be correct and complete while `query`
