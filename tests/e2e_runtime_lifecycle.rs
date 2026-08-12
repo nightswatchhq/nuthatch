@@ -285,6 +285,88 @@ nests = ["usdc", "arb"]
     assert_eq!(reloaded.runtime.chain_id, Some(42161));
 }
 
+/// RFC-0027 §2: when `admin_enabled` is false (the default for any non-localhost bind that does not
+/// supply `--admin-token`), `lifecycle_routes` must return an empty router - 404 on every path, not
+/// 401. The distinction matters: a 401 proves the route exists but rejected the caller; a 404 proves
+/// the route was never registered and no handler code ran.
+///
+/// This is Guard 1 of the two guards named in issue #400. Guard 2 (the credential check on an
+/// enabled surface) is covered by `the_lifecycle_routes_demand_the_admin_token_before_they_act`.
+///
+/// The test includes a premise block that confirms the routes DO exist when `admin_enabled: true`.
+/// Without that block the test passes trivially against a `lifecycle_routes` that always returns
+/// an empty router, which is exactly the false-green condition the sprint theme names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
+    const TOKEN: &str = "gate-test-token";
+
+    let roost_dir = tempfile::tempdir().unwrap();
+    let usdc_dir = roost_dir.path().join("nests/usdc");
+    let arb_dir = roost_dir.path().join("nests/arb");
+    std::fs::create_dir_all(&usdc_dir).unwrap();
+    std::fs::create_dir_all(&arb_dir).unwrap();
+    let (handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+
+    // Premise: with admin_enabled: true the routes exist - an unauthenticated call gets 401, not
+    // 404. This rules out a `lifecycle_routes` that always returns Router::new().
+    let enabled_routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let (premise_status, _) = call(
+        &enabled_routes,
+        "POST",
+        "/_admin/nests",
+        None,
+        Some(r#"{"name":"premise"}"#),
+    )
+    .await;
+    assert_ne!(
+        premise_status,
+        axum::http::StatusCode::NOT_FOUND,
+        "premise: POST /_admin/nests must exist (non-404) when admin is enabled - \
+         if this fails the gate test is testing nothing"
+    );
+    drop(enabled_routes);
+
+    // admin_enabled: false - this is the posture for any localhost bind without an explicit token
+    // or any remote bind that omits --admin-token.
+    let routes = runtime::lifecycle_routes(handles.clone(), false, None);
+
+    let (mount_status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/nests",
+        None,
+        Some(r#"{"name":"third"}"#),
+    )
+    .await;
+    assert_eq!(
+        mount_status,
+        axum::http::StatusCode::NOT_FOUND,
+        "POST /_admin/nests must be absent (404), not refused (401), when admin is disabled"
+    );
+
+    let (unmount_status, _) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
+    assert_eq!(
+        unmount_status,
+        axum::http::StatusCode::NOT_FOUND,
+        "DELETE /_admin/nests/{{name}} must be absent (404), not refused (401), when admin is disabled"
+    );
+
+    // The guard is structural, not positional - no code ran, so both nests must still be present.
+    let names: Vec<String> = handles
+        .lock()
+        .await
+        .states
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["usdc".to_string(), "arb".to_string()],
+        "neither nest must have been affected - the empty router must have returned before any handler ran"
+    );
+}
+
 /// Drive one request through the lifecycle routes as an HTTP caller would, and return
 /// (status, body). Built from `lifecycle_routes` itself rather than from the handlers, so route
 /// registration and extractor order are part of what is under test.
