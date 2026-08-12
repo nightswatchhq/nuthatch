@@ -6882,9 +6882,11 @@ template = "pool"
     #[tokio::test]
     async fn the_runtime_tip_loop_writes_block_rows_for_every_block_in_the_window() {
         let d_blocks = tempfile::tempdir().unwrap();
-        let blocks_nest =
-            build_blocks_nest_with_contract(d_blocks.path(), "0x1111111111111111111111111111111111111111")
-                .await;
+        let blocks_nest = build_blocks_nest_with_contract(
+            d_blocks.path(),
+            "0x1111111111111111111111111111111111111111",
+        )
+        .await;
         let blocks_store = blocks_nest.store.clone();
 
         let src = Arc::new(LogCountingSource::new());
