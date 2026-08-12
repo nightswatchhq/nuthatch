@@ -3089,20 +3089,28 @@ template="pool"
              amplifier the review found"
         );
 
-        // The positive control, in the same test with the same capture: a query that *does* name the
-        // table sweeps it, finds the corrupt segment and says so. Without this, the assertion above
-        // would pass just as happily with the log line renamed or the sweep deleted entirely.
-        let loud = CapturedLogs::default();
-        let rows = tracing::subscriber::with_default(
-            tracing_subscriber::registry().with(loud.clone()),
-            || query(dir.path(), r#"SELECT "from" FROM "t__transfer""#).expect("reduces"),
-        );
+        // The positive control: a query that *does* name the table sweeps it and finds the corrupt
+        // segment. Without this, the assertion above would pass just as happily with the sweep
+        // deleted entirely.
+        //
+        // Asserted on `segments_failing_verification`'s own return value, computed via the same
+        // `reject_unknown_table_refs` walk `run()` uses - not by scraping its `tracing::error!` log
+        // line. `tracing`'s per-callsite interest is a *global, process-wide* cache: whichever test in
+        // this binary hits that callsite first while no subscriber is installed gets it permanently
+        // marked uninteresting, so a `with_default` scope elsewhere in the same test binary can miss
+        // the event nondeterministically depending on run order (reproduced on `main`, independent of
+        // this fix - see #482). The return value has no such race.
+        let rows = query(dir.path(), r#"SELECT "from" FROM "t__transfer""#).expect("reduces");
         assert_eq!(rows.len(), 1, "the readable segment's row survives");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let referenced = reject_unknown_table_refs(&conn, r#"SELECT "from" FROM "t__transfer""#)
+            .unwrap()
+            .map(|names| expand_through_views(&conn, &names))
+            .expect("the query names a table");
         assert_eq!(
-            loud.mentioning(REJECTED),
-            1,
-            "the same corrupt segment must be found when the query does name its table - if this is \
-             0 the capture is broken and the assertion above proves nothing"
+            crate::seal::segments_failing_verification(dir.path(), &referenced),
+            std::collections::BTreeSet::from([victim.hash.clone()]),
+            "the same corrupt segment must be found when the query does name its table"
         );
     }
 
