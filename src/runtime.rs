@@ -627,7 +627,7 @@ pub fn adoptable(
     candidates.sort();
 
     candidates.into_iter().find(|(_, dir)| {
-        if !holds_data(dir) {
+        if !holds_data(dir, Adopting::From) {
             return false;
         }
         let Ok(m) = crate::blob::build_manifest(dir, None) else {
@@ -635,6 +635,25 @@ pub fn adoptable(
         };
         m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
     })
+}
+
+/// Which side of an adoption is asking [`holds_data`].
+///
+/// An unreadable store is the one input the two sides must answer **differently**, and the side is a
+/// parameter rather than a default folded into the function so that a third caller cannot inherit
+/// whichever answer happened to be hard-wired. It was hard-wired to the destination's answer, and
+/// `adoptable` - the one caller that wanted the other one - silently got it (issue #415).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adopting {
+    /// The dataset being written **into**. An unreadable store counts as data: being wrong here
+    /// overwrites history, and costing a re-index is the cheaper way to be wrong.
+    Into,
+    /// The dataset being copied **from**. An unreadable store disqualifies the candidate outright:
+    /// copying one in spends the destination's single adoption, and every later start then finds a
+    /// store that exists and errors - so the destination holds data, can never adopt again, and must
+    /// be emptied by hand. That is issue #408's permanently-stuck shape reached through the error
+    /// path, and unlike the destination's mistake it is not repaired by a re-index.
+    From,
 }
 
 /// Does this dataset hold indexed state of its own - a hot store with rows in it, or sealed segments?
@@ -650,20 +669,67 @@ pub fn adoptable(
 /// the decision: an empty candidate was adopted and consumed the one chance to adopt the sibling that
 /// held the real history, and a destination that had once been started could never adopt again.
 ///
-/// **An unreadable store counts as holding data.** The two directions want opposite defaults - the
-/// destination must never be written over on a maybe, the candidate is merely not worth adopting -
-/// and the destination's is the one where being wrong destroys something. Costing a re-index is the
-/// cheaper way to be wrong.
-pub fn holds_data(dir: &Path) -> bool {
+/// **An unreadable store is answered per [`Adopting`]**, and it is the only input that is. Note the
+/// order that follows from it: the store is consulted before `segments/`, because a candidate whose
+/// store cannot be read is not rescued by holding sealed segments beside it - copying the pair in
+/// lands the unreadable store on the destination just the same.
+pub fn holds_data(dir: &Path, side: Adopting) -> bool {
+    let db = dir.join(crate::config::DB_FILE);
+    if db.exists() {
+        match crate::store::store_holds_rows(&db) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "cannot read the store at {}, treating this dataset as {} for adoption: {err:#}",
+                    db.display(),
+                    match side {
+                        Adopting::Into => "holding data (it will not be written over)",
+                        Adopting::From => "unadoptable (it will not be copied from)",
+                    }
+                );
+                return matches!(side, Adopting::Into);
+            }
+        }
+    }
     // Sealed segments are data and need no lock to see. An *empty* `segments/` is not data.
-    if std::fs::read_dir(dir.join("segments"))
+    std::fs::read_dir(dir.join("segments"))
         .map(|mut e| e.next().is_some())
         .unwrap_or(false)
-    {
-        return true;
-    }
+}
+
+/// A dataset that genuinely holds indexed history: a real redb carrying `last_block = head`.
+///
+/// Shared by `runtime`'s and `migrate`'s tests, because the fixture it replaces was duplicated
+/// across both and both were wrong the same way. That was `fs::write(DB_FILE, "indexed history")` -
+/// a text file wearing a store's name. redb cannot open it, so it counted as history through
+/// [`crate::store::store_holds_rows`]' **error** path rather than because it held rows, and the
+/// suite therefore proved that adoption copies a store nothing can read (issue #415).
+///
+/// Scoped so the handle is dropped before it returns: redb holds a file lock for as long as it
+/// lives, and the caller is about to copy the file.
+#[cfg(test)]
+pub fn seed_history(dir: &Path, head: u64) {
+    let s = crate::store::Store::open(&dir.join(crate::config::DB_FILE))
+        .expect("a store fixture must be creatable");
+    s.set_meta("last_block", &head.to_string()).unwrap();
+}
+
+/// What [`seed_history`] wrote, read back through a real open - `None` if there is no store, or
+/// nothing can be read out of it. Every assertion that used to compare the fixture's bytes reads
+/// this instead, so a fixture that stopped holding rows fails rather than passing by another route.
+///
+/// The existence check is load-bearing, not defensive: `Store::open` is `Database::create`, so
+/// asking an absent dataset this question would answer it by creating an empty store, and an
+/// assertion that adoption copied nothing would then be reading a store the assertion itself put
+/// there. Same shape as issue #413.
+#[cfg(test)]
+pub fn history_head(dir: &Path) -> Option<u64> {
     let db = dir.join(crate::config::DB_FILE);
-    db.exists() && crate::store::store_holds_rows(&db).unwrap_or(true)
+    if !db.exists() {
+        return None;
+    }
+    crate::store::Store::open(&db).ok()?.indexed_head().ok()?
 }
 
 /// Early cutoff on the **mount path** (RFC-0033 §5, issue #364).
@@ -704,7 +770,7 @@ pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Ad
         std::fs::remove_dir_all(&staging)
             .with_context(|| format!("clearing stale adoption staging {}", staging.display()))?;
     }
-    if !dataset.is_dir() || holds_data(dataset) {
+    if !dataset.is_dir() || holds_data(dataset, Adopting::Into) {
         return Ok(None);
     }
     let Ok(want) = crate::blob::build_manifest(dataset, None) else {
@@ -2049,11 +2115,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         let old = migrated_nest(root, "usdc");
-        std::fs::write(
-            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
-            "indexed history",
-        )
-        .unwrap();
+        seed_history(&MountTable::data_dir(root, &old), 4242);
 
         let new = cosmetic_sibling(root, &old);
         let dest = MountTable::data_dir(root, &new);
@@ -2068,15 +2130,14 @@ mod tests {
             "a cosmetic edit must adopt the dataset it came from"
         );
         assert_eq!(
-            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
-            "indexed history",
+            history_head(&dest),
+            Some(4242),
             "the data must actually arrive - reporting an adoption that copied nothing is worse than \
              not adopting"
         );
-        assert!(
-            MountTable::data_dir(root, &old)
-                .join(crate::config::DB_FILE)
-                .is_file(),
+        assert_eq!(
+            history_head(&MountTable::data_dir(root, &old)),
+            Some(4242),
             "adoption must COPY - the source may still be mounted by another tenant"
         );
         // And it must not have moved the identity it adopted into, or the next start reports drift.
@@ -2096,27 +2157,20 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         let old = migrated_nest(root, "usdc");
-        std::fs::write(
-            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
-            "the other dataset's history",
-        )
-        .unwrap();
+        seed_history(&MountTable::data_dir(root, &old), 4242);
 
         let new = cosmetic_sibling(root, &old);
         let dest = MountTable::data_dir(root, &new);
         // This one has indexed on its own - a restart, or a partial backfill that was interrupted.
-        std::fs::write(dest.join(crate::config::DB_FILE), "my own history").unwrap();
+        // A different head from the source's, so "untouched" is checkable rather than assumed.
+        seed_history(&dest, 17);
 
         assert_eq!(
             adopt_dataset(root, &dest, &new).unwrap(),
             None,
             "a dataset holding data must not adopt"
         );
-        assert_eq!(
-            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
-            "my own history",
-            "its store must be untouched"
-        );
+        assert_eq!(history_head(&dest), Some(17), "its store must be untouched");
     }
 
     /// The dangerous direction, at the point the decision is made: different data identity, no
@@ -2126,11 +2180,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         let old = migrated_nest(root, "usdc");
-        std::fs::write(
-            MountTable::data_dir(root, &old).join(crate::config::DB_FILE),
-            "indexed history",
-        )
-        .unwrap();
+        seed_history(&MountTable::data_dir(root, &old), 4242);
 
         // A different contract: same shape, different bytes stored.
         let staging = root.join("staging");
@@ -2181,7 +2231,7 @@ mod tests {
         let root = d.path();
         let old = migrated_nest(root, "usdc");
         let src = MountTable::data_dir(root, &old);
-        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        seed_history(&src, 4242);
         std::fs::create_dir_all(src.join("segments")).unwrap();
         std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
 
@@ -2198,7 +2248,7 @@ mod tests {
             "the failure must name the adoption, got: {err:#}"
         );
         assert!(
-            !holds_data(&dest),
+            !holds_data(&dest, Adopting::Into),
             "a failed adoption must leave the dataset inputs-only, not half a dataset it can never \
              repair - found {:?}",
             crate::blob::DERIVED_STATE
@@ -2223,10 +2273,7 @@ mod tests {
             }),
             "the next start must adopt, or the failure was permanent after all"
         );
-        assert_eq!(
-            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
-            "indexed history"
-        );
+        assert_eq!(history_head(&dest), Some(4242));
         assert_eq!(
             std::fs::read_to_string(dest.join("segments").join("0000.parquet")).unwrap(),
             "sealed rows",
@@ -2284,6 +2331,86 @@ mod tests {
         );
     }
 
+    /// Issue #415, and the one input the two directions must answer differently.
+    ///
+    /// The candidate side is the half that was wrong: an unreadable store folded into "holds data",
+    /// so `adoptable` picked it, `stage_derived_state` copied it, and the destination came out of the
+    /// adoption holding a store nothing can read - which then reads as data forever, so it can never
+    /// adopt again and must be emptied by hand. A permanent stuck state reached from a transient
+    /// fault, and unlike the destination's mistake it is not repaired by a re-index.
+    ///
+    /// The segments arm is not decoration. `holds_data` used to answer from `segments/` before it
+    /// looked at the store at all, so a candidate with sealed segments beside an unreadable store was
+    /// adoptable however the error was folded - and the copy lands the unreadable store on the
+    /// destination just the same.
+    #[test]
+    fn an_unreadable_store_answers_the_two_adoption_directions_differently() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("dataset");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file with a store's name that redb cannot open. This is what a truncated write, a
+        // half-restored backup or a bad disk leaves, and it is what ten fixtures used to stand in
+        // for real history.
+        std::fs::write(dir.join(crate::config::DB_FILE), "not a redb").unwrap();
+
+        assert!(
+            holds_data(&dir, Adopting::Into),
+            "a destination whose store cannot be read must never be written over on a maybe"
+        );
+        assert!(
+            !holds_data(&dir, Adopting::From),
+            "and a store nothing can read is the last thing to copy out of"
+        );
+
+        std::fs::create_dir_all(dir.join("segments")).unwrap();
+        std::fs::write(dir.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+        assert!(
+            !holds_data(&dir, Adopting::From),
+            "sealed segments beside an unreadable store do not rescue the candidate - the copy takes \
+             the store too"
+        );
+        assert!(holds_data(&dir, Adopting::Into));
+    }
+
+    /// The same rule driven through `adopt_dataset` rather than asserted on the predicate: an
+    /// unreadable candidate must leave the destination inputs-only and **still adoptable**, not
+    /// carrying a store that will wedge it.
+    #[test]
+    fn an_unreadable_candidate_is_not_copied_into_the_destination() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        std::fs::write(src.join(crate::config::DB_FILE), "not a redb").unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "an unreadable store is not history worth spending the one adoption on"
+        );
+        assert!(
+            !dest.join(crate::config::DB_FILE).exists(),
+            "and nothing must have been copied in - a store that errors on open reads as data on \
+             every later start, so the destination could never adopt again"
+        );
+
+        // The claim that this is recoverable, checked rather than asserted in prose: repair the
+        // source and the destination adopts on the next start.
+        std::fs::remove_file(src.join(crate::config::DB_FILE)).unwrap();
+        seed_history(&src, 4242);
+        assert_eq!(
+            adopt_dataset(root, &dest, &new)
+                .unwrap()
+                .map(|a| a.from_nid),
+            Some(old),
+            "declining an unreadable candidate must cost nothing once it is readable"
+        );
+        assert_eq!(history_head(&dest), Some(4242));
+    }
+
     /// Issue #408, the destination side, and the lasting half of it. An interrupted start leaves the
     /// destination with an empty store of its own; under a presence check that dataset then read as
     /// holding data and could **never** adopt again, including from the sibling that holds the real
@@ -2294,7 +2421,7 @@ mod tests {
         let root = d.path();
         let old = migrated_nest(root, "usdc");
         let src = MountTable::data_dir(root, &old);
-        std::fs::write(src.join(crate::config::DB_FILE), "indexed history").unwrap();
+        seed_history(&src, 4242);
         std::fs::create_dir_all(src.join("segments")).unwrap();
         std::fs::write(src.join("segments").join("0000.parquet"), "sealed rows").unwrap();
 
@@ -2314,8 +2441,8 @@ mod tests {
             .expect("an empty store is not history, so it must not block the cutoff");
         assert_eq!(adoption.from_nid, old);
         assert_eq!(
-            std::fs::read_to_string(dest.join(crate::config::DB_FILE)).unwrap(),
-            "indexed history",
+            history_head(&dest),
+            Some(4242),
             "and the adopted store must replace the empty one"
         );
     }
