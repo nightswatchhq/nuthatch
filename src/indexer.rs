@@ -532,6 +532,20 @@ fn union_filter<'a>(
     let mut topics: Vec<String> = Vec::new();
     let mut any_factory = false;
     for (nest_addrs, nest_topics) in nests {
+        // A nest with neither addresses nor topics can issue no `getLogs` at all (#432) - and wants
+        // none. Since #445 that is a real supported shape rather than an unbuildable one: a
+        // contract-free `[extract] blocks = true` nest, whose rows come from block headers. It
+        // contributes nothing to the union, and it must not reach the factory signal below.
+        //
+        // If it did, it would clear a co-tenant's address filter on behalf of a nest that wanted no
+        // logs in the first place - and then `topic0_only_culprits`, which asks `factory.is_some()`,
+        // would find nobody to blame for the wide fetch it caused, so COR-5 would end the cursor and
+        // take every sibling with it. The two functions encode the same rule from opposite ends; this
+        // is what keeps them encoding the *same* rule now that empty-addresses no longer implies
+        // factory.
+        if nest_addrs.is_empty() && nest_topics.is_empty() {
+            continue;
+        }
         // An empty address list is the factory / topic0-only signal (see `build_nest`).
         if nest_addrs.is_empty() {
             any_factory = true;
@@ -1943,7 +1957,9 @@ async fn build_nest(
 
     let app_state = serve::AppState {
         store: shared_store.clone(),
-        address: config.primary()?.address.clone(),
+        // Not `primary()?`: that errors "nest has no contracts", which turned a field the summary
+        // renders into a hard refusal to build a contract-free blocks nest (#445).
+        address: config.contracts.first().map(|c| c.address.clone()),
         chain: config.nest.chain.clone(),
         dir: dir.clone(),
         balances,
@@ -5055,6 +5071,29 @@ template = "pool"
         nest
     }
 
+    /// A contract-free `[extract] blocks = true` nest - OBIB case 3 - through the real `build_nest`
+    /// path. Buildable only since #445; before that this helper could not have existed, which is why
+    /// the shape is absent from every fixture that predates it.
+    async fn build_contract_free_test_nest(dir: &std::path::Path) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"b\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .expect("a contract-free blocks nest must build (#445)");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
@@ -5080,6 +5119,56 @@ template = "pool"
             w.abort();
         }
         nest
+    }
+
+    /// #445: a contract-free `[extract] blocks = true` nest - OBIB case 3, RFC-0036 §4.2 - is a
+    /// supported shape, and `build_nest` is the only way any nest is built. It used to refuse this
+    /// one with `nest has no contracts`: a message about contracts the operator deliberately did not
+    /// declare, raised because `AppState.address` was a `String` and so had to come from somewhere.
+    ///
+    /// Nothing caught it because case 3 had only ever run through the bench harness, which builds a
+    /// `DecodeRegistry` directly and never calls `build_nest`. So the config key parsed, the bench
+    /// path produced rows, and every operator-facing path - solo `dev` and the runtime alike - refused
+    /// to start.
+    #[tokio::test]
+    async fn a_contract_free_blocks_nest_builds_and_names_no_address() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"b\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            config.contracts.is_empty(),
+            "fixture must declare no contracts"
+        );
+        assert!(config.extract.blocks, "fixture must be a blocks nest");
+        // `blocks` is deliberately outside `Extract::enabled()` - it is sourceable from ordinary RPC -
+        // so this must not hit the node-gated startup refusal either.
+        assert!(!config.extract.enabled(), "blocks must not be node-gated");
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (_nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a contract-free blocks nest must build");
+        assert_eq!(
+            state.address, None,
+            "a nest with no contracts names no address"
+        );
+        if let Some(w) = worker {
+            w.abort();
+        }
     }
 
     /// Seed a nest's hot store with one row per block and set `LAST_BLOCK` to the max.
@@ -5461,6 +5550,40 @@ template = "pool"
             topic0_only_culprits([(0usize, &stat), (1usize, &fact)].into_iter()),
             vec![1],
             "the factory nest is answerable; the static co-tenant is not"
+        );
+
+        // #445 made a third shape buildable, and it is the one that breaks the old reading of the
+        // rule: a contract-free `[extract] blocks = true` nest has an empty address list *and* an
+        // empty topic list. Empty-addresses therefore no longer implies factory-ness, and the two
+        // functions read that signal from opposite ends - `union_filter` off the addresses,
+        // `topic0_only_culprits` off `factory.is_some()`.
+        //
+        // Left alone, such a nest would clear a co-tenant's address filter (widening a fetch on
+        // behalf of a nest that wants no logs at all), and then no nest would be answerable for the
+        // width - so a single over-cap block would end the cursor and every nest riding it, which is
+        // the RFC-0026 violation this whole mechanism exists to prevent. It wants no logs, so it
+        // takes no part in the union.
+        let db = tempfile::tempdir().unwrap();
+        let blocks = build_contract_free_test_nest(db.path()).await;
+        assert!(
+            blocks.addresses.is_empty() && blocks.topic0s.is_empty(),
+            "the fixture must be the no-filter shape, or this proves nothing"
+        );
+        let (addrs, _) = union_filter(
+            [
+                (stat.addresses.as_slice(), stat.topic0s.as_slice()),
+                (blocks.addresses.as_slice(), blocks.topic0s.as_slice()),
+            ]
+            .into_iter(),
+        );
+        assert!(
+            !addrs.is_empty(),
+            "a contract-free blocks nest must not clear its co-tenant's address filter"
+        );
+        assert!(
+            topic0_only_culprits([(0usize, &stat), (1usize, &blocks)].into_iter()).is_empty(),
+            "and with the union still address-filtered, nobody is to blame - which is consistent \
+             only because the union stayed narrow. The two ends agree again."
         );
     }
 
@@ -6844,19 +6967,19 @@ template = "pool"
         );
     }
 
-    /// #432 assumes a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) reaches the
-    /// tip loops, and it does not: `build_nest` is the only way any nest is constructed - solo `dev`
-    /// and the runtime both go through it - and it refuses this config outright, because `AppState`
-    /// wants `config.primary()`. So OBIB case 3 runs today only through the bench harness, which
-    /// builds a registry directly and never calls `build_nest`.
+    /// The replacement `a_contract_free_nest_cannot_be_built_at_all_today` asked for by name: #445 is
+    /// fixed, so a contract-free nest (`[extract] blocks = true`, no `[[contracts]]`) now builds and
+    /// reaches the tip loop, and this drives the loop with a real one.
     ///
-    /// That is worth a test rather than a note, in both directions. It pins the reason the
-    /// empty-filter guard on the tip loops is currently unreachable defence rather than a live fix,
-    /// and it fails loudly the day someone makes case 3 startable - which is the day the guard starts
-    /// carrying weight, and the day this test should be replaced by one that drives the loops with a
-    /// real contract-free nest.
+    /// The distinction that matters is where the no-`getLogs` state comes from. Its sibling
+    /// (`the_tip_loop_writes_no_block_rows_for_a_window_yet`) has to *manufacture* it - emptying
+    /// `addresses` and `topic0s` on an already-built ERC20 nest - because until #445 no real config
+    /// could produce it. Here nothing is forced: the operator declares a blocks nest and no
+    /// contracts, `build_nest` accepts it, and the loop arrives at an unrepresentable filter on its
+    /// own. That is the day #432's empty-filter guard stops being unreachable defence and starts
+    /// carrying weight, which is exactly what the retired test said to check for.
     #[tokio::test]
-    async fn a_contract_free_nest_cannot_be_built_at_all_today() {
+    async fn a_contract_free_nest_reaches_the_tip_loop_and_asks_for_no_logs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(crate::config::CONFIG_FILE),
@@ -6864,19 +6987,15 @@ template = "pool"
              [extract]\nblocks = true\n",
         )
         .unwrap();
-
-        // The config itself is perfectly legal - it parses, and `blocks = true` is a supported key.
         let config = Config::load(dir.path()).unwrap();
         assert!(
             config.contracts.is_empty() && config.extract.blocks,
             "the fixture is the contract-free blocks nest, not a stand-in"
         );
 
-        // It is nest *construction* that refuses it, and the message names contracts rather than the
-        // thing the operator asked for.
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        // `match` rather than `expect_err`: neither `NestIngest` nor `AppState` is `Debug`.
-        let err = match build_nest(
+        // `match` rather than `unwrap`: neither `NestIngest` nor `AppState` is `Debug`.
+        let (nest, state, worker, _w) = match build_nest(
             &source,
             dir.path().to_path_buf(),
             &config,
@@ -6887,15 +7006,45 @@ template = "pool"
         )
         .await
         {
-            Ok(_) => panic!(
-                "a contract-free nest now builds - the tip-loop empty-filter guard has become \
-                 reachable, so replace this test with one that drives the loops (#432)"
-            ),
-            Err(e) => e.to_string(),
+            Ok(built) => built,
+            Err(e) => panic!("a contract-free nest must build (#445): {e:#}"),
         };
+        if let Some(w) = worker {
+            w.abort();
+        }
+        // The nest has no single contract to name, and the summary says so rather than inventing one.
+        assert_eq!(
+            state.address, None,
+            "a nest with no contracts names no address"
+        );
+        // Unforced, straight out of `build_nest`: no address filter and no topic filter, so there is
+        // no `getLogs` this nest could legally issue.
         assert!(
-            err.contains("no contracts"),
-            "expected the primary-contract refusal, got: {err}"
+            LogFilter::new(&nest.addresses, &nest.topic0s).is_none(),
+            "a contract-free nest must reach the loop with an unrepresentable filter, without a \
+             test having to empty it by hand"
+        );
+
+        let src = Arc::new(LogCountingSource::new());
+        let counter = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(10),
+            false,
+            1,
+            5,
+        ));
+        // Give the loop the same deadline the other loop tests use. There is nothing to wait *for* -
+        // the point is that a window passes without a log request - so wait for the cursor to move.
+        let _ = within_deadline(|| counter.calls() > 0).await;
+        task.abort();
+
+        assert_eq!(
+            counter.calls(),
+            0,
+            "whatever the loop does with the window, it must get there without asking for logs at \
+             all: an empty address AND topic filter is every log on the chain (#432)"
         );
     }
 
