@@ -1401,15 +1401,28 @@ async fn runtime_index_loop(
         // A blocks nest pays one header request per block, so a window that is cheap in logs can still
         // be ruinous in headers (RFC-0036). The backfill paths pick their controller once, from a
         // single registry; a cursor's nest set changes under it as mounts arrive and retire, so the
-        // ceiling is applied per window instead - a blocks nest mounted an hour in must not inherit a
-        // window that grew to `MAX_WINDOW` while only log-shaped nests were live. Bounding the *use*
-        // rather than the controller also means the ceiling lifts by itself when that nest retires.
+        // ceiling is re-derived every iteration instead - a blocks nest mounted an hour in must not
+        // inherit a window that grew to `MAX_WINDOW` while only log-shaped nests were live.
+        //
+        // `set_max` bounds the controller itself, not only the span this iteration is allowed to
+        // issue (#458). Capping only the use left `chunker` fed `observed` results from an
+        // `HEADER_WINDOW_CAP`-wide fetch while its own `window` kept climbing toward `MAX_WINDOW`
+        // unseen - so retiring the blocks nest handed back the whole drift in `window_cap`'s single
+        // next-iteration jump from 800 to `MAX_WINDOW`, instead of the controller's own gradual 4x
+        // growth. Calling `set_max` every iteration keeps `window` clamped down live while the blocks
+        // nest is live, so the mount-late direction is unaffected and the retire direction now climbs
+        // back up through `observed`'s own damping rather than in one step.
+        // `MAX_WINDOW` here, not `u64::MAX`: `set_max` overwrites the controller's own ceiling
+        // rather than layering an extra cap on top of it, so the "no blocks nest live" arm has to
+        // name the controller's ordinary ceiling explicitly - `u64::MAX` would erase it and let a
+        // plain nest's window balloon past `MAX_WINDOW` for as long as no blocks nest is mounted.
         let window_cap = if live.iter().any(|&i| live_ref(&nests, i).registry.blocks()) {
             crate::chunker::HEADER_WINDOW_CAP
         } else {
-            u64::MAX
+            crate::chunker::MAX_WINDOW
         };
-        let to = (global_next + chunker.window().min(window_cap) - 1).min(tip);
+        chunker.set_max(window_cap);
+        let to = (global_next + chunker.window() - 1).min(tip);
 
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
@@ -6599,7 +6612,11 @@ template = "pool"
     #[async_trait::async_trait]
     impl Source for WindowRecordingSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(1_000_000)
+            // Large enough that a controller growing unclamped toward `MAX_WINDOW` (100,000) across
+            // a couple of dozen 4x steps still has room before `global_next` catches it - the
+            // retirement test needs headroom past the point an uncapped controller would have
+            // saturated, not just past its own `--backfill` starting gap.
+            Ok(10_000_000)
         }
         async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
             Ok(None)
@@ -6771,6 +6788,78 @@ template = "pool"
             "control: the runtime cursor on a non-blocks nest must grow past {} - only got to \
              {rt_plain_widest}",
             crate::chunker::HEADER_WINDOW_CAP
+        );
+    }
+
+    /// #458: the previous test proves the *live* half of the header cap - it never retires a nest,
+    /// so a controller that is capped only at the use site (leaving its own `window` free to drift
+    /// toward `MAX_WINDOW` unseen) passes it too. This drives a runtime cursor with a blocks nest
+    /// co-mounted with a log-shaped nest well past the point an uncapped controller would have
+    /// saturated at `MAX_WINDOW`, retires the blocks nest mid-run, and asserts the windows issued
+    /// *after* that point climb back up gradually rather than jumping straight to the drifted value.
+    #[tokio::test]
+    async fn the_tip_loop_bounds_the_controller_through_a_blocks_nest_retirement() {
+        let addr = "0x1111111111111111111111111111111111111111";
+        let d_blocks = tempfile::tempdir().unwrap();
+        let mut blocks_nest = build_blocks_nest_with_contract(d_blocks.path(), addr).await;
+        blocks_nest.name = "blocks".to_string();
+
+        let d_plain = tempfile::tempdir().unwrap();
+        let mut plain_nest =
+            build_test_nest(d_plain.path(), "0x2222222222222222222222222222222222222222").await;
+        plain_nest.name = "plain".to_string();
+
+        let src = Arc::new(WindowRecordingSource::new());
+        let recorder = src.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // A generous `--backfill` gap (not the default-sized one the mount-late test uses): a
+        // controller that has silently drifted toward `MAX_WINDOW` while capped needs room past
+        // that drift to prove it does NOT resume from there in one step, and 20,000 blocks is only
+        // enough to observe the pre-retirement cap, not the recovery past it.
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![blocks_nest, plain_nest],
+            Some(2_000_000),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            Some(rx),
+        ));
+
+        // Growth from a seed of 5 under `observed(0)` is 5, 20, 80, 320, 1280, 5120, 20480, 81920,
+        // 100000(clamped)... - so an uncapped controller has already saturated at `MAX_WINDOW` well
+        // before twelve windows, while every span *issued* stays <= `HEADER_WINDOW_CAP` regardless,
+        // because the blocks nest is live throughout. The bug is invisible until retirement.
+        let drove = within_deadline(|| recorder.count() >= 12).await;
+        assert!(
+            drove,
+            "the cursor must have asked for at least twelve windows before retiring"
+        );
+        let before_retire = recorder.count();
+
+        tx.send(CursorCommand::unmount("blocks")).unwrap();
+
+        // One more window is enough to tell the two designs apart: bounding only the *use* leaves
+        // `window` free to have drifted toward `MAX_WINDOW` unseen while capped, so the very first
+        // post-retirement span jumps straight there. Bounding the controller keeps `window` clamped
+        // down live, so that same span is only the ordinary next 4x step up from the cap.
+        let advanced = within_deadline(|| recorder.count() > before_retire).await;
+        task.abort();
+        assert!(
+            advanced,
+            "the cursor must keep advancing after the blocks nest retires"
+        );
+
+        let first_post_retire = recorder.spans.lock().unwrap()[before_retire];
+        assert!(
+            first_post_retire <= 4 * crate::chunker::HEADER_WINDOW_CAP,
+            "the first window after the blocks nest retires must be the controller's ordinary next \
+             4x step up from {} (<= {}), not a jump to wherever it drifted to unseen while capped - \
+             got {first_post_retire}",
+            crate::chunker::HEADER_WINDOW_CAP,
+            4 * crate::chunker::HEADER_WINDOW_CAP
         );
     }
 
