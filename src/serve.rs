@@ -57,7 +57,15 @@ pub struct AppState {
     /// concrete `Store` because serving must not care which backend answers - that is the whole point
     /// of the seam, and an FE node under RFC-0022 §1 will be handed a Postgres-backed one.
     pub store: std::sync::Arc<dyn crate::store::HotStore>,
-    pub address: String,
+    /// The first declared contract's address - `None` for a nest that declares none.
+    ///
+    /// A contract-free `[extract] blocks = true` nest is a supported shape (RFC-0036 §4.2, OBIB
+    /// case 3), and this field being `String` is what refused to let one start: `build_nest` read
+    /// it through `Config::primary()?`, which errors "nest has no contracts", so the operator-facing
+    /// path rejected an entire configuration over a field only `GET /`'s summary reads. Optional
+    /// rather than an arbitrary pick, because a nest with no contracts has no address to name and
+    /// saying so is the honest answer; a nest with several has always shown only its first here.
+    pub address: Option<String>,
     pub chain: String,
     pub dir: PathBuf,
     pub balances: BalanceView,
@@ -1507,7 +1515,7 @@ mod tests {
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {
         AppState {
             store: std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap()),
-            address: "0x0".into(),
+            address: Some("0x0".into()),
             chain: "ethereum".into(),
             dir: dir.to_path_buf(),
             balances: BalanceView::start().unwrap(),
@@ -1803,6 +1811,26 @@ mod tests {
         );
     }
 
+    /// #445: a contract-free blocks nest has no address to name, and `GET /` says so with `null`
+    /// rather than inventing one. The key stays present either way - a client reading `.address`
+    /// gets a value it can test, not a missing field it has to guess about.
+    #[test]
+    fn the_summary_names_no_address_for_a_contract_free_nest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_state(dir.path(), 1);
+        s.address = None;
+        let v = summary_value(&s);
+        assert!(
+            v.get("address").is_some(),
+            "the address key stays present for a contract-free nest"
+        );
+        assert!(
+            v["address"].is_null(),
+            "and its value is null, not an invented address: {}",
+            v["address"]
+        );
+    }
+
     /// The RFC-0020 hot-swap mechanism: re-pointing a `SharedNest` atomically changes what serving
     /// resolves - both `current()` and the per-request `FromRef` a handler goes through - with no
     /// rebind. This is what lets a compatible upgrade flip an endpoint's backing underneath live
@@ -1812,18 +1840,18 @@ mod tests {
         use axum::extract::FromRef;
         let d1 = tempfile::tempdir().unwrap();
         let mut v1 = test_state(d1.path(), 1);
-        v1.address = "0xv1".into();
+        v1.address = Some("0xv1".into());
         let shared = SharedNest::new(v1);
-        assert_eq!(shared.current().address, "0xv1");
-        assert_eq!(AppState::from_ref(&shared).address, "0xv1");
+        assert_eq!(shared.current().address.as_deref(), Some("0xv1"));
+        assert_eq!(AppState::from_ref(&shared).address.as_deref(), Some("0xv1"));
 
         // Flip to a new backing version - same handle, next request sees v2.
         let d2 = tempfile::tempdir().unwrap();
         let mut v2 = test_state(d2.path(), 1);
-        v2.address = "0xv2".into();
+        v2.address = Some("0xv2".into());
         shared.swap(v2);
-        assert_eq!(shared.current().address, "0xv2");
-        assert_eq!(AppState::from_ref(&shared).address, "0xv2");
+        assert_eq!(shared.current().address.as_deref(), Some("0xv2"));
+        assert_eq!(AppState::from_ref(&shared).address.as_deref(), Some("0xv2"));
     }
 
     /// When the analytical gate is saturated, `/sql` fails fast with 503 rather than piling on.

@@ -653,6 +653,13 @@ pub enum Adopting {
     /// store that exists and errors - so the destination holds data, can never adopt again, and must
     /// be emptied by hand. That is issue #408's permanently-stuck shape reached through the error
     /// path, and unlike the destination's mistake it is not repaired by a re-index.
+    ///
+    /// Corruption is not the only way to reach it, and the other way is why this side matters more
+    /// once the cutoff runs on the mount path (#414): redb takes an **exclusive file lock**, so a
+    /// candidate held open by a live cursor answers `Err` too. A runtime that mounts a nest while
+    /// its sibling is indexing would otherwise nominate the one dataset that must never be copied,
+    /// and copying a redb mid-write does not yield a slightly-stale store, it yields a torn file
+    /// that is not a store at all.
     From,
 }
 
@@ -761,6 +768,82 @@ pub fn history_head(dir: &Path) -> Option<u64> {
 ///
 /// Returns what was adopted, for logging. A failed copy is an error, and the re-index it replaces is
 /// genuinely still available once the fault is fixed.
+/// A dataset directory that has been past the early cutoff, and the proof it has.
+///
+/// The cutoff used to be *a call you had to remember*. `load_mounted` remembered it; `mount`, added
+/// later for RFC-0027, did not - so an operator who edited a nest and mounted it into a running
+/// runtime re-indexed the whole chain, while stopping and starting the same runtime adopted the
+/// predecessor's data and re-indexed nothing (#414). That is the second time this sprint a guard
+/// applied per call site was missed by the next call site added.
+///
+/// So the guard stops being a call and becomes a type. [`indexer::build_and_prepare_nest`] takes one
+/// of these instead of a `PathBuf`, and the only way to make one is [`prepare_dataset`] (or the
+/// explicitly-named [`PreparedDataset::without_nid`], for a dataset that has no content address to
+/// adopt against). A future mount path cannot skip the cutoff by forgetting it; it would have to
+/// reach for a constructor whose name says what it is doing.
+#[derive(Debug, Clone)]
+pub struct PreparedDataset {
+    dir: PathBuf,
+    adoption: Option<Adoption>,
+}
+
+impl PreparedDataset {
+    /// A pre-2.0 `nests/<alias>` directory, which has no NID and therefore no sibling to adopt from.
+    /// Named rather than derived so the one legitimate bypass reads as a decision.
+    pub fn without_nid(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            adoption: None,
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn into_dir(self) -> PathBuf {
+        self.dir
+    }
+
+    /// What the cutoff adopted, if anything. `None` covers every ordinary case: no NID, no adoptable
+    /// sibling, or a destination that already holds its own data.
+    pub fn adoption(&self) -> Option<&Adoption> {
+        self.adoption.as_ref()
+    }
+}
+
+/// Run the early cutoff over `dir` and hand back the token that lets it be indexed.
+///
+/// **Infallible by design.** A dataset that could not adopt still indexes - slowly, and correctly,
+/// because [`adopt_dataset`] is all-or-nothing and leaves the destination inputs-only. Refusing to
+/// bring a nest up over a failed *optimisation* would turn a disk-full into an outage. That policy
+/// used to live inside `load_mounted`, which meant the mount path would have had to re-derive it;
+/// it lives here now so both paths get it without deciding again.
+pub fn prepare_dataset(
+    root: &Path,
+    dir: PathBuf,
+    nid: Option<&str>,
+    label: &str,
+) -> PreparedDataset {
+    let Some(nid) = nid else {
+        return PreparedDataset::without_nid(dir);
+    };
+    let adoption = match adopt_dataset(root, &dir, nid) {
+        Ok(Some(a)) => {
+            tracing::info!("early cutoff: {a}");
+            Some(a)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                "{label} could not adopt an existing dataset ({e:#}) - it will index from its start block"
+            );
+            None
+        }
+    };
+    PreparedDataset { dir, adoption }
+}
+
 pub fn adopt_dataset(root: &Path, dataset: &Path, nid: &str) -> Result<Option<Adoption>> {
     // A staging directory left behind means a previous adoption died mid-copy. It is scratch that
     // nothing outside this function reads, and clearing it before the `holds_data` check is what
@@ -877,19 +960,14 @@ pub fn load_mounted(
 ) -> Result<Vec<(String, PathBuf, Config)>> {
     let mut out = Vec::with_capacity(datasets.len());
     for ds in datasets {
-        if let Some(nid) = &ds.nid {
-            match adopt_dataset(dir, &ds.dir, nid) {
-                Ok(Some(a)) => tracing::info!("early cutoff: {a}"),
-                Ok(None) => {}
-                // A dataset that could not adopt still indexes - slowly, and correctly, because
-                // `adopt_dataset` is all-or-nothing and has left it inputs-only. Refusing to start
-                // over a failed optimisation would turn a disk-full into an outage.
-                Err(e) => tracing::warn!(
-                    "{} could not adopt an existing dataset ({e:#}) - it will index from its start block",
-                    ds.canonical()
-                ),
-            }
-        }
+        // The cutoff, and the warn-and-carry-on policy behind it, now live in `prepare_dataset` so
+        // the mount path gets the same treatment without re-deriving it (#414).
+        let _prepared = prepare_dataset(
+            dir,
+            ds.dir.clone(),
+            ds.nid.as_deref(),
+            &ds.canonical().to_string(),
+        );
         let config = Config::load(&ds.dir).with_context(|| {
             format!(
                 "loading mounted nest '{}' from {}",
@@ -1761,13 +1839,14 @@ impl RuntimeHandles {
             Some((t, a)) => (Some(t), a),
             None => (None, name),
         };
-        let record = self
+        let nid = self
             .mount_ctx
             .mounts
             .iter()
-            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
-        let dir = match record {
-            Some(m) => MountTable::data_dir(&self.mount_ctx.dir, &m.nid),
+            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+            .map(|m| m.nid.clone());
+        let dir = match &nid {
+            Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
         let config = Config::load(&dir)
@@ -1811,10 +1890,20 @@ impl RuntimeHandles {
             .into());
         }
 
+        // The early cutoff (RFC-0033 §5), which this path did not apply until #414: an operator who
+        // edits a nest cosmetically and mounts it into a running runtime re-indexed from the start
+        // block, where a restart would have adopted the predecessor's dataset and re-indexed
+        // nothing. The mount API exists precisely so operators need not restart, so the cheaper path
+        // was the one that paid.
+        //
+        // After the budget refusal deliberately: an over-budget mount is turned away without first
+        // copying a dataset for a nest that is not going to run.
+        let prepared = prepare_dataset(&self.mount_ctx.dir, dir, nid.as_deref(), name);
+
         // Phase 1: build and catch up, off to one side of the cursor.
         let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
             &source,
-            dir,
+            prepared,
             &config,
             self.mount_ctx.backfill,
             self.mount_ctx.seal_direct,

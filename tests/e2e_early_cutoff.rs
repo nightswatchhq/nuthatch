@@ -347,6 +347,215 @@ async fn a_cosmetic_edit_adopts_the_dataset_it_came_from_instead_of_re_indexing(
     );
 }
 
+/// Bring a runtime up over `only` and **leave it running**, handing back the live handles the admin
+/// surface drives. [`bring_up`] is the *restart* shape - it tears the cursor down before returning -
+/// and a restart is precisely the path that already adopted (#414). The gap was the other one.
+///
+/// `mount_ctx.mounts` is the real [`MountTable`] off disk, not an invented list, so the NID that
+/// `mount` resolves and the dataset it adopts into are the ones an operator's `mounts.toml` names.
+/// What this fixture does *not* reproduce is the HTTP layer above `RuntimeHandles::mount`; that is
+/// covered by `e2e_runtime_lifecycle`, and the cutoff is not a thing a route can add or remove.
+async fn bring_up_live(
+    root: &Path,
+    tape: Arc<TapeSource>,
+    only: &[&str],
+    tip: u64,
+) -> runtime::RuntimeHandles {
+    let mounts = MountTable::load(root).unwrap();
+    let multi_tenant = mounts.is_multi_tenant();
+    let datasets: Vec<_> = mounts
+        .datasets(root)
+        .into_iter()
+        .filter(|d| only.contains(&d.canonical().alias.as_str()))
+        .collect();
+    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load");
+
+    let health = Arc::new(RuntimeHealth::new());
+    for (name, _, _) in &mounted {
+        health.register(name, "arbitrum-one");
+    }
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        mounted,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let want = tip.to_string();
+    let landed = wait_until(POLL_TIMEOUT, || {
+        cursor.states.iter().all(|(_, s)| {
+            s.store.get_meta("last_block").ok().flatten().as_deref() == Some(want.as_str())
+        })
+    })
+    .await;
+    assert!(landed, "the live runtime did not reach block {tip} in time");
+
+    let roster = serde_json::json!({"runtime": "test", "nests": []});
+    let live = nuthatch::serve::LiveRuntime::new(nuthatch::serve::compose_runtime(
+        roster.clone(),
+        cursor.states.clone(),
+        health.clone(),
+    ));
+    let handles = runtime::RuntimeHandles {
+        live,
+        states: cursor.states,
+        alert_workers: cursor.alert_workers,
+        lifecycle: std::collections::HashMap::from([(
+            "arbitrum-one".to_string(),
+            cursor.lifecycle.clone(),
+        )]),
+        health,
+        roster,
+        estimates: std::collections::HashMap::new(),
+        mount_ctx: runtime::MountContext {
+            dir: root.to_path_buf(),
+            // The whole table, including the record for the nest not yet mounted - which is exactly
+            // the on-disk state after an operator installs an edited nest and calls the mount API.
+            mounts: mounts.mounts.clone(),
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape as Arc<dyn nuthatch::source::Source>,
+            )]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            window_override: Some(2),
+            admin_enabled: false,
+            admin_token: None,
+            max_rss_mb: 2048,
+        },
+    };
+    // The cursor has to keep running for the mount handshake to be answered at a window boundary.
+    std::mem::forget(cursor.ingest);
+    handles
+}
+
+/// **The #414 acceptance test.** The same cosmetic edit as
+/// `a_cosmetic_edit_adopts_the_dataset_it_came_from_instead_of_re_indexing`, delivered the way an
+/// operator actually delivers it: mounted into a runtime that is already up, rather than picked up
+/// by a restart. The mount API exists so that a restart is not needed, so it was the cheaper path
+/// that paid the full backfill.
+///
+/// The discriminator is the module doc's: the live runtime's provider serves blocks with the right
+/// hashes and **no logs**, so a re-index yields an empty table. Any transfer present under the new
+/// identity came from the predecessor's dataset and from nowhere else. **This fails on `main`**,
+/// where `mount` goes from `Config::load` straight to `build_and_prepare_nest`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nest_mounted_into_a_running_runtime_gets_the_early_cutoff_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (alpha_nid, _beta_nid) = two_nest_runtime(root);
+
+    // --- Run 1: index both nests over a chain the provider can still serve, and seal. ---
+    bring_up(root, full_history(), 6, 4).await;
+    let before = transfers(&MountTable::data_dir(root, &alpha_nid), "alpha");
+    assert_eq!(
+        before.len(),
+        4,
+        "the fixture must seal four transfers, or the comparison below is vacuous: {before:?}"
+    );
+
+    // --- The cosmetic edit, installed under the identity it now hashes to. ---
+    let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
+        let views = dir.join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(
+            views.join("10-note.sql"),
+            "-- a comment, and nothing else\n",
+        )
+        .unwrap();
+    });
+    let dest = MountTable::data_dir(root, &new_nid);
+    assert!(
+        !dest.join("nuthatch.redb").exists(),
+        "the fixture must start with no store, or it is not reproducing a re-index"
+    );
+
+    // --- Run 2: the runtime comes up with **beta only** and stays up. Alpha arrives by mount. ---
+    let mut handles = bring_up_live(root, pruned_history(), &["beta"], 8).await;
+    handles.mount("alpha").await.expect("mounting alpha");
+
+    // The load-bearing assertion, and a positive one: the provider served no logs at all, so every
+    // row here crossed over from the predecessor's dataset.
+    let after = transfers(&dest, "alpha");
+    assert!(
+        !after.is_empty(),
+        "the hot-mounted nest re-indexed from its start block against a provider with no history, \
+         so it holds nothing - the early cutoff did not reach the mount path (#414). \
+         dest={dest:?} store={} segments={:?} data_dirs={:?}",
+        dest.join("nuthatch.redb").exists(),
+        std::fs::read_dir(dest.join("segments"))
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>()),
+        data_dirs(root),
+    );
+    assert_eq!(
+        after[..before.len()],
+        before[..],
+        "the sealed rows must come across byte for byte, not be re-derived"
+    );
+    // Adoption copies - the predecessor may still be mounted by another tenant.
+    assert!(
+        MountTable::data_dir(root, &alpha_nid)
+            .join("nuthatch.redb")
+            .is_file(),
+        "adoption must not take data away from the dataset it came from"
+    );
+}
+
+/// The candidate-side rule #414 turns on: adoption on the **hot** path can meet a sibling dataset
+/// that a live cursor is writing, and `holds_data`'s deliberately pessimistic answer (an unreadable
+/// store *is* data) nominates exactly the dataset that must never be copied. A redb copied mid-write
+/// is not a stale store, it is a torn file - and the destination would then hold data permanently,
+/// never adoptable again and unable to backfill.
+///
+/// Here alpha's predecessor is still mounted and live when the edited alpha is mounted. The mount
+/// must succeed, and must not have staged a copy of a store held open by another cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_candidate_is_not_copied_out_from_under_its_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (alpha_nid, _beta_nid) = two_nest_runtime(root);
+
+    bring_up(root, full_history(), 6, 4).await;
+
+    // Edit alpha, but leave the *old* record in place as a second mount so the predecessor dataset
+    // is live on the cursor while the new one is mounted.
+    let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
+        let views = dir.join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(
+            views.join("10-note.sql"),
+            "-- a comment, and nothing else\n",
+        )
+        .unwrap();
+    });
+
+    // Beta stays up and keeps the cursor alive; the edited alpha is mounted into it.
+    let mut handles = bring_up_live(root, pruned_history(), &["beta"], 8).await;
+    handles.mount("alpha").await.expect("mounting alpha");
+
+    // Whatever adoption decided, the destination must never be left holding a half-copied store: a
+    // staging directory outliving the mount is the observable form of that fault.
+    let staging = root.join(DATA_DIR).join(format!("{new_nid}.adopting"));
+    assert!(
+        !staging.exists(),
+        "an adoption staging directory outlived the mount - a partial copy is worse than no cutoff"
+    );
+    let dest = MountTable::data_dir(root, &new_nid);
+    assert!(
+        dest.join("nuthatch.toml").is_file(),
+        "the mounted dataset must still hold its inputs"
+    );
+}
+
 /// The dangerous direction. A nest whose inputs genuinely change the data it will store must **not**
 /// adopt, however similar the rest of it looks - `migrate::a_substantive_edit_does_not_adopt` holds
 /// this line for the migration path, and the mount path needs its own.

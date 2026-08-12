@@ -817,27 +817,28 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
     );
 }
 
-/// **Issue #419, on the serving surface.** A sealed segment corrupted under a *running* node must
-/// reduce the table over HTTP `/sql`, not delete it.
+/// **Issues #419 and #433, on the serving surface.** A sealed segment corrupted under a *running*
+/// node must reduce the table over HTTP `/sql`, not delete it - whichever way the file went bad.
 ///
-/// The unit test in `analytics` pins `define_views`; this pins the path an operator actually hits.
-/// Startup quarantine (`seal::verify_and_quarantine`) catches a segment that is already bad when the
-/// node boots, so the case that reaches `define_views` is the one that goes bad *after* boot - a disk
-/// fault, or a file replaced under a live process. That is what this drives: two segments sealed and
-/// serving, one of them scribbled over, and the query re-run against the same running server.
+/// The unit tests in `analytics` pin `define_views` and `run`; this pins the path an operator
+/// actually hits. Startup quarantine (`seal::verify_and_quarantine`) catches a segment that is
+/// already bad when the node boots, so the case that reaches serving is the one that goes bad
+/// *after* boot - a disk fault, or a file replaced under a live process. That is what this drives:
+/// two segments sealed and serving, one of them destroyed by `corrupt`, and the query re-run against
+/// the same running server.
 ///
 /// The assertion is the exact surviving set, not merely "the table still exists": the reduction has
 /// to be confined to the blocks the dead segment carried, with the other segment and the hot tip
-/// untouched.
+/// untouched. Both callers below reach it by a different mechanism, and each asserts its own premise
+/// about whether the wrecked file still binds - which is the only thing that tells the two apart.
 ///
-/// **It also pins #435: the response has to *say* it was reduced.** The two responses this test
+/// **It also pins #435: the response has to *say* it was reduced.** The two responses this helper
 /// already produces are the whole of that question - one healthy, one short - and to a caller reading
 /// only `rows` they are indistinguishable, which is how `SELECT SUM(value)` comes back quietly wrong.
-/// Asserted here rather than in a fixture of its own because the flag is worth nothing unless it
+/// Asserted here, inside the shared helper, so both corruption mechanisms below prove the flag
 /// survives the real router, the real `spawn_nest` state and the real serialisation; a hand-built
 /// `AppState` would prove the handler and never the wiring.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() {
+async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&std::path::Path)) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     let tape = Arc::new(TapeSource::new());
@@ -964,14 +965,14 @@ async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() 
         "and name nothing: {healthy}"
     );
 
-    // Scribble over the segment carrying blocks [4,6], leaving the file present and the manifest
-    // untouched - exactly what a bad sector or a half-written restore looks like to `read_parquet`.
+    // Destroy the segment carrying blocks [4,6], leaving the file present and the manifest untouched
+    // - exactly what a bad sector or a half-written restore looks like.
     let bad = segs
         .iter()
         .find(|s| s.from_block == 4)
         .expect("a segment sealed from block 4");
     let bad_path = seal::segment_path(dir.path(), &bad.file, &bad.hash);
-    std::fs::write(&bad_path, b"this is not a parquet file").unwrap();
+    corrupt(&bad_path);
 
     let reduced = blocks_over_http(client.clone(), base.clone(), q.clone()).await;
     let got: BTreeSet<u64> = reduced["rows"]
@@ -1005,4 +1006,52 @@ async fn a_segment_corrupted_under_a_running_node_reduces_the_table_over_http() 
     );
 
     server.abort();
+}
+
+/// #419's half: the file stops being a Parquet file at all, so `read_parquet` refuses it while the
+/// view is created and the reduction happens at bind time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_segment_scribbled_over_under_a_running_node_reduces_the_table_over_http() {
+    a_corrupted_segment_reduces_the_table_over_http(|path| {
+        std::fs::write(path, b"this is not a parquet file").unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_err(),
+            "this is #419's case: the wrecked file must NOT bind, or it is #433's wearing this name"
+        );
+    })
+    .await;
+}
+
+/// #433's half, and the gap the review of PR #450 found: everything proving that fix went through
+/// `query()` or `collect()` directly, so nothing showed the reduction surviving the guarded surface
+/// - the watchdog, the hot union and the row cap. This drives the same wiring with a segment whose
+/// footer is intact and whose data region is gone, which **binds** and dies at execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_corrupt_segment_under_a_running_node_reduces_the_table_over_http() {
+    a_corrupted_segment_reduces_the_table_over_http(|path| {
+        // Destroy the data region, keep PAR1 + footer: this still binds, so #430's probe waves it
+        // through and the failure lands at execution. That is #433's case, not #419's.
+        let mut bytes = std::fs::read(path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let end = len - 8 - footer_len;
+        assert!(end > 4, "the fixture needs a data region to corrupt");
+        bytes[4..end].fill(0xFF);
+        std::fs::write(path, &bytes).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_ok(),
+            "the fixture must still BIND, or this is #419's case wearing #433's name"
+        );
+    })
+    .await;
 }

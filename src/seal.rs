@@ -278,10 +278,25 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 ///
 /// ## Cost, and the cache that is deliberately not here
 ///
-/// This reads and hashes every catalogued segment, every time it is called. That is not free, and the
-/// thing keeping it affordable is the *caller*: `run` only asks after a query has **bound and then
-/// died reading rows**. A bind failure - a typo, a missing column, the commonest error on this
-/// surface - never reaches here, so the cheap way to provoke a sweep does not exist.
+/// This reads and hashes segments, every time it is called, with no cache. Two things bound what it
+/// costs, and the first one alone was **not enough**:
+///
+/// - The *caller*: `run` only asks after a query has bound and then died reading rows. That rules
+///   out the commonest error on this surface (a typo, a missing column), and nothing more. It was
+///   claimed here that "the cheap way to provoke a sweep does not exist" - it did, and it was
+///   cheaper than the one this file named. `SELECT CAST('x' AS INTEGER)` is 27 bytes, references no
+///   table, sails past every gate on the way in, binds, and dies executing; measured, it hashed all
+///   3 segments of a healthy nest, on an unauthenticated surface whose concurrency permits are 2.
+/// - So, second and load-bearing: `tables`. Only the segments backing the tables the failed query
+///   actually **named** are read. A segment the query never touched cannot be what killed it, so
+///   sweeping it was never justified on correctness either. The table-free class above now hashes
+///   nothing at all, and `SELECT CAST(c AS INT) FROM t` pays for `t` and not for the other forty
+///   tables in the nest.
+///
+/// The bound that remains: a caller who names the nest's largest table can still make one request
+/// hash that table's segments. That is inherent to verifying-on-failure at all, and the remaining
+/// lever is coalescing concurrent sweeps or the gateway's rate limiting (#365) - not a cache keyed
+/// on anything that can go stale.
 ///
 /// **There was a memo here keyed on the file's `(mtime, len)`, and it was wrong.** The idea was that a
 /// segment already verified in this process is a `stat` rather than a read. Measured on this box
@@ -297,34 +312,58 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// If sweep cost ever does need bounding, bound it on something that cannot be stale - a coalescing
 /// flag so concurrent queries share one sweep, or the gateway, which is already where this project
 /// puts per-caller rate limiting (#365). Not on a filesystem timestamp.
-pub fn segments_failing_verification(dir: &Path) -> BTreeSet<String> {
-    let Ok(manifest) = load_manifest(dir) else {
-        return BTreeSet::new();
-    };
+///
+/// `tables` holds the table names the failed query referenced, lowercased (DuckDB identifiers are
+/// case-insensitive). An empty set hashes nothing.
+pub fn segments_failing_verification(dir: &Path, tables: &BTreeSet<String>) -> BTreeSet<String> {
     let mut bad = BTreeSet::new();
-    for (table, segs) in &manifest.tables {
-        for s in segs {
-            let path = segment_path(dir, &s.file, &s.hash);
-            // An absent file is not corruption, and `define_views` already skips it by existence.
-            if !path.exists() {
-                continue;
-            }
-            // An unreadable segment is not intact: it cannot serve rows either way, and saying
-            // "fine" about a file we could not read is the failure this whole issue is about.
-            let intact = std::fs::read(&path)
-                .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash);
-            if !intact {
-                tracing::error!(
-                    "segment {} for table {table} does not match its content address - dropping it \
-                     from this query (cold data reduced). Restart to quarantine it, or re-seal the \
-                     range to restore it.",
-                    s.file
-                );
-                bad.insert(s.hash.clone());
-            }
+    // Enumerate first, hash second: the hashing loop can only ever touch what `segments_to_verify`
+    // handed it, so the reachability bound holds by construction rather than by a filter someone
+    // could later move below the `fs::read`. `seal::tests::the_sweep_enumerates_only_the_tables_the
+    // _query_named` is what pins it.
+    for (table, seg) in segments_to_verify(dir, tables) {
+        let path = segment_path(dir, &seg.file, &seg.hash);
+        // An absent file is not corruption, and `define_views` already skips it by existence.
+        if !path.exists() {
+            continue;
+        }
+        // An unreadable segment is not intact: it cannot serve rows either way, and saying
+        // "fine" about a file we could not read is the failure this whole issue is about.
+        let intact =
+            std::fs::read(&path).is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == seg.hash);
+        if !intact {
+            tracing::error!(
+                "segment {} for table {table} does not match its content address - dropping it \
+                 from this query (cold data reduced). Restart to quarantine it, or re-seal the \
+                 range to restore it.",
+                seg.file
+            );
+            bad.insert(seg.hash.clone());
         }
     }
     bad
+}
+
+/// The segments [`segments_failing_verification`] is allowed to read: those belonging to a table in
+/// `tables` (matched case-insensitively, as DuckDB matches identifiers). Manifest-only, no file IO -
+/// which is what makes the sweep's cost bound testable without timing anything.
+fn segments_to_verify(dir: &Path, tables: &BTreeSet<String>) -> Vec<(String, Segment)> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    let Ok(manifest) = load_manifest(dir) else {
+        return Vec::new();
+    };
+    // Both sides are lowercased here rather than trusting the caller to have done it: a table name
+    // that arrives shouted would otherwise match nothing, and the failure mode of that is silent -
+    // the query loses its reduction and nobody sees a difference except in the answer.
+    let wanted: BTreeSet<String> = tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+    manifest
+        .tables
+        .iter()
+        .filter(|(table, _)| wanted.contains(&table.to_ascii_lowercase()))
+        .flat_map(|(table, segs)| segs.iter().map(move |s| (table.clone(), s.clone())))
+        .collect()
 }
 
 /// Startup integrity pass: verify every manifest segment's file exists and its bytes hash to the
@@ -438,6 +477,53 @@ mod tests {
         )
     }
 
+    /// The table these fixtures seal into, as the sweep's reachability bound would name it: what a
+    /// query over `usdc__transfer` is allowed to make the sweep read.
+    fn usdc() -> BTreeSet<String> {
+        ["usdc__transfer".to_string()].into_iter().collect()
+    }
+
+    /// **Issue #433, the cost bound the review sent back.** The sweep may read only the segments of
+    /// the tables the failed query named - so the enumeration is a separate, IO-free step and this
+    /// asserts it directly. The hashing loop can only touch what this hands it, which is why the
+    /// bound is structural rather than a filter that could later drift below the `fs::read`.
+    ///
+    /// A behavioural test cannot see this: sweeping a table the query never named changes no answer,
+    /// only cost. That is exactly how a cost bound rots quietly.
+    #[test]
+    fn the_sweep_enumerates_only_the_tables_the_query_named() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[approval(101, 0)], 101, 101).unwrap();
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.tables.len(), 2, "two tables, one segment each");
+
+        let named = |t: &str| -> Vec<String> {
+            segments_to_verify(dir.path(), &[t.to_string()].into_iter().collect())
+                .into_iter()
+                .map(|(table, _)| table)
+                .collect()
+        };
+        assert_eq!(
+            named("usdc__transfer"),
+            vec!["usdc__transfer".to_string()],
+            "a query over one table must not make the other one's segments readable"
+        );
+        assert_eq!(named("usdc__approval"), vec!["usdc__approval".to_string()]);
+        // DuckDB matches identifiers case-insensitively and the AST reports the name as written, so
+        // a shouted table name must still find its own segments and no others.
+        assert_eq!(named("USDC__TRANSFER"), vec!["usdc__transfer".to_string()]);
+        assert!(
+            named("no_such_table").is_empty(),
+            "a name the nest does not have reaches nothing"
+        );
+        assert!(
+            segments_to_verify(dir.path(), &BTreeSet::new()).is_empty(),
+            "a query that names no table at all - the 27-byte `SELECT CAST('x' AS INTEGER)` the \
+             review measured - must reach no segment whatsoever"
+        );
+    }
+
     /// **Issue #433.** The serving-path discriminator must catch page corruption that every cheap
     /// DuckDB probe waves through, and must not accuse a healthy segment.
     ///
@@ -457,7 +543,7 @@ mod tests {
         // Nothing is wrong yet, and saying so is half the test: a discriminator that always answered
         // "corrupt" would reduce every table on the first execution error in a healthy nest.
         assert!(
-            segments_failing_verification(dir.path()).is_empty(),
+            segments_failing_verification(dir.path(), &usdc()).is_empty(),
             "a healthy tree must accuse nothing"
         );
 
@@ -484,7 +570,7 @@ mod tests {
              test has stopped testing #433"
         );
 
-        let bad = segments_failing_verification(dir.path());
+        let bad = segments_failing_verification(dir.path(), &usdc());
         assert_eq!(
             bad.len(),
             1,
@@ -518,7 +604,7 @@ mod tests {
         let path = segment_path(dir.path(), &seg.file, &seg.hash);
 
         // Ask once while it is healthy: this is what would populate any cache.
-        assert!(segments_failing_verification(dir.path()).is_empty());
+        assert!(segments_failing_verification(dir.path(), &usdc()).is_empty());
 
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
@@ -549,7 +635,7 @@ mod tests {
         );
 
         assert_eq!(
-            segments_failing_verification(dir.path()).len(),
+            segments_failing_verification(dir.path(), &usdc()).len(),
             1,
             "corruption must be caught from the bytes - a verdict cached on (mtime, len) would call \
              this segment intact, which is the failure this whole issue is about"
