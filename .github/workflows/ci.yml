@@ -17,6 +17,7 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -82,6 +83,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U nuthatch -d nuthatch"
           --health-interval 3s --health-timeout 3s --health-retries 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -133,6 +135,7 @@ jobs:
     # stating so a fourth is avoided: **any job that builds a binary destined for the container image
     # must build on a base no newer than the Dockerfile's.**
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -246,6 +249,7 @@ jobs:
   deny:
     name: cargo-deny (vulns · licences · bans)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       # Dependency vulnerability scan (RUSTSEC) + permissive-only licence gate + banned-crate check.
@@ -267,6 +271,7 @@ jobs:
   build-release:
     name: build release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -284,6 +289,7 @@ jobs:
     name: footprint (RAM budget)
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: download binary
@@ -317,6 +323,7 @@ jobs:
     name: point-read latency
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: download binary
@@ -398,6 +405,10 @@ jobs:
     name: per-cursor RAM budget (dense multi-nest)
     needs: build-release
     runs-on: ubuntu-latest
+    # TIMEOUT_S (default 1800s = 30 min) bounds the harness's own wait loop; this is the backstop for
+    # everything around it (checkout, artifact download, RPC startup) plus headroom, so a harness bug
+    # can never hold a runner for GitHub's 6-hour job default (#449).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: download binary
