@@ -2461,6 +2461,58 @@ mod tests {
         assert!(holds_data(&dir, Adopting::Into));
     }
 
+    /// Issue #473: the `segments/` fallback at the bottom of [`holds_data`] answers when the store
+    /// is silent - absent, or opened and empty - and every other test reaches a store that already
+    /// says yes (real rows) or no-with-an-opinion (unreadable) before that line is ever run. Delete
+    /// the arm and this predicate can only ever see the store, yet 27 other tests kept passing.
+    ///
+    /// Both silences are covered: no store file at all (the pre-first-block dataset this function's
+    /// doc comment describes), and a store that exists and opens clean but was never written to
+    /// (`Store::open` creates on the way in, same as an interrupted start leaves behind).
+    #[test]
+    fn holds_data_falls_through_to_sealed_segments_when_the_store_is_silent() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("dataset");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            !holds_data(&dir, Adopting::Into),
+            "no store and no segments/ at all is not data"
+        );
+
+        std::fs::create_dir_all(dir.join("segments")).unwrap();
+        assert!(
+            !holds_data(&dir, Adopting::Into),
+            "segments/ that exists but is empty is not data either"
+        );
+
+        std::fs::write(dir.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+        assert!(
+            holds_data(&dir, Adopting::Into),
+            "a sealed segment with no store at all must still read as data"
+        );
+        assert!(
+            holds_data(&dir, Adopting::From),
+            "and be adoptable-from on that segment alone"
+        );
+
+        // A store that opens cleanly and was never written to - `store_holds_rows` answers `Ok(false)`
+        // rather than erroring, so this exercises the fall-through after the match, not the error arm
+        // `an_unreadable_store_answers_the_two_adoption_directions_differently` already covers.
+        std::fs::remove_file(dir.join("segments").join("0000.parquet")).unwrap();
+        crate::store::Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        assert!(
+            !holds_data(&dir, Adopting::Into),
+            "an empty, cleanly-opened store beside an empty segments/ is not data"
+        );
+
+        std::fs::write(dir.join("segments").join("0000.parquet"), "sealed rows").unwrap();
+        assert!(
+            holds_data(&dir, Adopting::Into),
+            "an empty store must not shadow sealed segments sitting beside it"
+        );
+    }
+
     /// The same rule driven through `adopt_dataset` rather than asserted on the predicate: an
     /// unreadable candidate must leave the destination inputs-only and **still adoptable**, not
     /// carrying a store that will wedge it.
