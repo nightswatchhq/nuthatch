@@ -35,11 +35,44 @@ pub struct QueryGuard {
     pub max_rows: usize,
 }
 
-/// The result of a query: the rows, plus whether a guard's row cap truncated them.
-#[derive(Debug)]
+/// The result of a query: the rows, plus the two ways they can fail to be the whole answer.
+///
+/// `truncated` is the caller's own row cap biting. `degraded_tables` is the other one and it is not
+/// the caller's doing: the tables whose **cold data was incomplete** when the views were built for
+/// this query - a sealed segment the manifest lists but that could not be read, so the view was
+/// rebuilt from what remained (#430, #433), or a table whose view could not be defined at all.
+///
+/// Reduction is the right policy - a bad segment must not delete a table, see [`define_views`] - but
+/// it makes the query **succeed** with quietly less data, and `SELECT SUM(value)` then returns a
+/// number that is wrong rather than absent (#435). Empty on the healthy path, which is every query
+/// on a nest whose segments all match their content addresses.
+///
+/// Scope note: the views cover every table in the nest, not just the ones this SQL touches, so this
+/// over-reports - a bad segment on an untouched table still flags the query. Narrowing it would mean
+/// parsing the SQL for table references, which is exactly the kind of guess that produces a
+/// confidently wrong answer. Over-reporting *with the names attached* lets the caller judge; silence
+/// does not.
+///
+/// **Which constrains how a surface may word it.** Because this is a property of the nest and not of
+/// the answer, a caveat must be a statement about the nest - "this nest could not serve complete cold
+/// data for X" - and never about these rows. A query over a healthy table on a nest with one bad
+/// segment is complete and correct, and `SELECT 1` and `.tables` have no rows drawn from these tables
+/// at all. Nor may it name a cause: the undefinable-view arm above lands here with every segment
+/// binding fine. Both mistakes shipped in the first rendering of this field and neither test nor
+/// mutation could see them, because every fixture had exactly one table.
+#[derive(Debug, Default)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
     pub truncated: bool,
+    pub degraded_tables: std::collections::BTreeSet<String>,
+}
+
+impl QueryOutput {
+    /// Whether any table's cold data was incomplete for this query. The one-bit form of
+    /// `degraded_tables`, for surfaces with room to say only yes or no.
+    pub fn degraded(&self) -> bool {
+        !self.degraded_tables.is_empty()
+    }
 }
 
 /// Hot (unsealed) rows grouped by logical table - from [`crate::store::Store::hot_rows_by_table`].
@@ -271,7 +304,7 @@ fn attempt(
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    define_views(&conn, dir, hot, sealed_through, excluded)?;
+    let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded)?;
     // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
     // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
     // this - they only touch the raw per-event tables.
@@ -351,7 +384,11 @@ fn attempt(
         }
         _ => false,
     };
-    Ok(Attempt::Ok(QueryOutput { rows, truncated }))
+    Ok(Attempt::Ok(QueryOutput {
+        rows,
+        truncated,
+        degraded_tables,
+    }))
 }
 
 /// Which phase of [`collect`] a failure came from. See [`Attempt`] for why the split is load-bearing.
@@ -1093,6 +1130,11 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
 /// SQL (RFC-0001 §2) each such column `c` gets two derived view columns: `c_dec` - the value as
 /// `DECIMAL(38,0)` when it fits, else NULL - and `c_overflow` - true when the exact value exceeds
 /// 38 digits (so `c_dec` is NULL but `c` isn't). Analytics can `SUM(c_dec)` without hand-casting.
+///
+/// Returns the tables whose cold data ended up **incomplete** - a manifest segment dropped from the
+/// view, or a view that could not be defined at all. Every reduction below is already logged, but a
+/// log is not reachable by the caller who is about to sum the reduced column, so the same decision is
+/// handed back as data and rides out on [`QueryOutput::degraded_tables`] (#435).
 fn define_views(
     conn: &Connection,
     dir: &Path,
@@ -1102,7 +1144,8 @@ fn define_views(
     // retry after an execution-phase failure it holds whatever `seal::segments_failing_verification`
     // found, so a page-corrupt segment *reduces* its table instead of failing the whole query (#433).
     excluded: &std::collections::BTreeSet<String>,
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
     let schema = schema_columns(dir);
     let cols_of = |table: &str| -> &[(String, String)] {
@@ -1140,6 +1183,14 @@ fn define_views(
                         // from the view rather than moved on disk - see
                         // `seal::segments_failing_verification` on why reduction, not quarantine.
                         if excluded.contains(&s.hash) {
+                            // Present on disk and corrupt in its pages - never reported before this
+                            // query, unlike the missing-file case below, so `error!` to match
+                            // `verify_and_quarantine`'s level for the identical decision (#435).
+                            tracing::error!(
+                                "segment {} for {table} fails verification - skipping (cold data reduced)",
+                                s.file
+                            );
+                            degraded.insert(table.clone());
                             return None;
                         }
                         let p = crate::seal::segment_path(dir, &s.file, &s.hash);
@@ -1150,10 +1201,14 @@ fn define_views(
                         if p.exists() {
                             Some(format!("'{}'", p.display()))
                         } else {
+                            // Stays at `warn!`: the usual cause is `verify_and_quarantine` having
+                            // already moved this file aside and logged it at `error!` at startup, and
+                            // re-raising the consequence on every query would double-count it.
                             tracing::warn!(
                                 "segment {} for {table} missing on disk - skipping (cold data reduced)",
                                 s.file
                             );
+                            degraded.insert(table.clone());
                             None
                         }
                     })
@@ -1262,9 +1317,12 @@ fn define_views(
                 match conn.prepare(&probe) {
                     Ok(_) => true,
                     Err(err) => {
-                        tracing::warn!(
+                        // Present and unreadable, same class as the excluded case above: `error!`,
+                        // and recorded so the caller learns the table came back short (#435).
+                        tracing::error!(
                             "segment {f} for {table} will not bind - skipping (cold data reduced): {err}"
                         );
+                        degraded.insert(table.clone());
                         false
                     }
                 }
@@ -1276,13 +1334,15 @@ fn define_views(
             // table undefined, as before. `warn!` rather than `debug!` - a table vanishing from `/sql`
             // is not a debugging detail.
             tracing::warn!("view {table} skipped: {e}");
+            degraded.insert(table.clone());
             continue;
         }
         if let Some(Err(e)) = view_ddl(&readable).map(|retry| conn.execute_batch(&retry)) {
             tracing::warn!("view {table} skipped after dropping bad segments: {e}");
+            degraded.insert(table.clone());
         }
     }
-    Ok(())
+    Ok(degraded)
 }
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
@@ -2959,6 +3019,150 @@ template="pool"
             rows[0]["from"],
             Value::from("0xa"),
             "and it is the block-1 row, not the corrupt one"
+        );
+    }
+
+    /// A nest with a schema and two one-block segments for `t__transfer`, blocks 1 and 2, rows `0xa`
+    /// and `0xb`. The shape both reduction tests above build by hand; shared by the #435 tests below
+    /// so the healthy control and the degraded cases are provably the *same* fixture apart from the
+    /// corruption - a control built separately could differ in some other way and stop controlling.
+    fn two_segment_nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","value":"{block}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// The block-2 segment's file, for a test that wants to damage it.
+    fn block_two_segment(dir: &std::path::Path) -> std::path::PathBuf {
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        let victim = manifest.tables["t__transfer"]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        crate::seal::segment_path(dir, &victim.file, &victim.hash)
+    }
+
+    fn cold(dir: &std::path::Path, sql: &str) -> QueryOutput {
+        query_guarded(
+            dir,
+            sql,
+            QueryGuard {
+                timeout: Duration::from_secs(30),
+                max_rows: 10_000,
+            },
+        )
+        .expect("a reduced table must still answer")
+    }
+
+    /// **Issue #435, the control.** A nest whose segments are all intact must report **no**
+    /// degradation.
+    ///
+    /// This is the load-bearing half of the pair. Every other #435 test asserts that a flag is *set*,
+    /// and all of them would pass just as well if the flag were hard-wired to "always degraded" -
+    /// which would be worse than no flag at all, because a warning that fires on every healthy query
+    /// is a warning an operator learns to scroll past. Nothing downstream (the `/sql` field, the CLI
+    /// line, the MCP notice) is worth anything unless silence on the healthy path is pinned here.
+    #[test]
+    fn an_intact_nest_reports_no_degradation() {
+        let dir = two_segment_nest();
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 2, "two intact segments, two rows");
+        assert!(
+            out.degraded_tables.is_empty(),
+            "an intact nest must report nothing degraded, got {:?}",
+            out.degraded_tables
+        );
+        assert!(!out.degraded(), "and the one-bit form must agree");
+    }
+
+    /// **Issue #435, the footer-corrupt half (#419/#430's path).** A segment dropped at DDL time
+    /// reduces the table *and says so in the result*.
+    ///
+    /// #430 chose reduction over deletion and was right to, but it left the decision visible only in
+    /// a `warn!` the caller cannot read: the query returns `200` with fewer rows and nothing to
+    /// distinguish that from a table which genuinely holds one row. `SELECT SUM(value)` over this
+    /// nest answers `1` where the truth is `3`, and both a human and an agent will take it.
+    #[test]
+    fn a_footer_corrupt_segment_names_its_table_in_the_result() {
+        let dir = two_segment_nest();
+        // Present, listed in the manifest, no longer a Parquet file - and not quarantined, because
+        // nothing has restarted.
+        std::fs::write(
+            block_two_segment(dir.path()),
+            b"not parquet, not even close",
+        )
+        .unwrap();
+
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 1, "reduced to the readable segment (#430)");
+        assert!(
+            out.degraded(),
+            "and the caller is told the answer is short, not left to infer it from one row"
+        );
+        assert_eq!(
+            out.degraded_tables,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the reduced table is named, so a caller can tell which of its numbers to distrust"
+        );
+    }
+
+    /// **Issue #435, the page-corrupt half (#433's path).** The reduction that happens on the *retry*
+    /// must be reported too.
+    ///
+    /// Worth its own test rather than folding into the one above, because it enters `define_views`
+    /// through an entirely different door: the footer-corrupt segment is dropped by the `conn.prepare`
+    /// probe on the first attempt, whereas this one binds cleanly, kills the query at execution, and
+    /// is only excluded on the second attempt via `segments_failing_verification`. A `degraded_tables`
+    /// wired into the first path alone would pass the test above and leave the #433 case - the one
+    /// that motivated #435 in the first place - silent.
+    #[test]
+    fn a_page_corrupt_segment_names_its_table_in_the_result() {
+        let dir = two_segment_nest();
+        let path = block_two_segment(dir.path());
+        assert!(
+            corrupt_pages_leaving_the_footer_intact(&path) > 0,
+            "the fixture must have corrupted something"
+        );
+        // The fixture is the condition it claims to be: #430's probe still passes this file, so the
+        // footer-corrupt path cannot be what sets the flag below.
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_ok(),
+            "if it no longer binds this is #430's case and the test has stopped testing #433's"
+        );
+
+        let out = cold(dir.path(), r#"SELECT "from" FROM "t__transfer""#);
+        assert_eq!(out.rows.len(), 1, "reduced on the retry (#433)");
+        assert_eq!(
+            out.degraded_tables,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the retry's exclusions are degradation too - the query succeeded with less data"
         );
     }
 
