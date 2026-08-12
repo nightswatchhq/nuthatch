@@ -227,9 +227,15 @@ DEV_PID=$!
 # Wait for every nest to reach FINAL_TIP, sampling RSS on the way. `at_tip` samples are taken only
 # once the backfill has drained (head >= INITIAL_TIP), so the steady-state figure describes the live
 # path rather than the burst that got there.
+#
+# Bounded on elapsed wall clock (`SECONDS`, bash's own since-shell-start counter), not on iteration
+# count: each iteration is `sleep 1` plus up to NESTS+1 curls at `-m 5`, so a `seq 1 "$TIMEOUT_S"`
+# loop bounds seconds-of-sleep, not seconds-of-wall-clock, and can run for hours under slow curls
+# while TIMEOUT_S=1800 and the failure text both say 30 minutes (#449).
 at_tip_samples=""
 done_at=""
-for t in $(seq 1 "$TIMEOUT_S"); do
+SECONDS=0
+while [ "$SECONDS" -lt "$TIMEOUT_S" ]; do
   sleep 1
   kill -0 "$DEV_PID" 2>/dev/null || { echo "FAIL: dev exited early"; tail -40 "$WORK/dev.log"; exit 1; }
   head1="$(nest_head n1)"
@@ -242,7 +248,7 @@ for t in $(seq 1 "$TIMEOUT_S"); do
     h="$(nest_head "n$i")"
     if [ -z "$h" ] || [ "$h" -lt "$FINAL_TIP" ] 2>/dev/null; then behind=1; break; fi
   done
-  if [ "$behind" -eq 0 ]; then done_at="$t"; break; fi
+  if [ "$behind" -eq 0 ]; then done_at="$SECONDS"; break; fi
 done
 
 PEAK_KB="$(peak_rss_kb "$DEV_PID")"
