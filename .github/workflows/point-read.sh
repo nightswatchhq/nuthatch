@@ -7,16 +7,20 @@
 # was a print statement rather than a gate and every perf change to the storage path could regress it
 # in silence.
 #
-# The shape is `footprint.sh`'s, for the same two reasons (issue #260): the chain is served locally by
-# footprint-rpc.py and the nest is written here rather than fetched, so there is **no secret and no
-# third party**. A fork PR can satisfy this check, and every run reads exactly the same 8,004 rows -
-# so a change in p99 is a change in nuthatch and not in somebody's rate limiter.
+# The chain is served locally by `multinest-rpc.py` and the nest is written here rather than fetched,
+# so there is **no secret and no third party** (issue #260). A fork PR can satisfy this check, and
+# every run reads exactly the same rows - so a change in p99 is a change in nuthatch and not in
+# somebody's rate limiter.
+#
+# **The scenario is the `per-cursor RAM budget` job's** (issue #424): the real ten-event Uniswap V4
+# `PoolManager` ABI at 200 logs a block, leaving 12,800 rows hot across ten tables once everything
+# past finality has sealed. It used to be `footprint.sh`'s single-event fixture, whose settled tip is
+# 256 rows - a hot store small enough that a 32-core dev box and a 4-core runner measured the same
+# number, which is a precise measurement of a case nobody runs. See the fixture block below.
 #
 # The ceilings were chosen by breaking the code on purpose and seeing what the numbers did, rather
-# than by leaving "plenty of headroom" - see the justification in ci.yml. Short version, all measured
-# on the `ubuntu-latest` runner that enforces this: a linear scan in place of the B-tree seek moves
-# p50 from 0.59-0.82µs to 18.15µs, so p50 gates at 8µs - 9.8x above the worst baseline and 2.3x below
-# a full scan.
+# than by leaving "plenty of headroom" - see the justification in ci.yml, which carries the measured
+# pair for the fixture in force.
 #
 # **p99 and p99.9 are recorded and gated on by nothing**, and that is a deliberate design call rather
 # than an omission. Gating p50 loosely and tracking the tail precisely are two different jobs: a p99
@@ -56,10 +60,18 @@
 # by hand: on your own box the check would fail correctly and uselessly every time. What CI enforces
 # is set in ci.yml.
 #
+# **Every scenario knob defaults to the enforced scenario** (#395's lesson, applied here by #424).
+# `bash .github/workflows/point-read.sh` with no environment measures the thing CI gates, so anyone
+# re-baselining from the tool's own default measures the right shape. The RSS harness once defaulted
+# to a fifth of its enforced scenario while its FAIL message pointed people at the harness, which
+# lands a re-derived ceiling *below* the healthy figure. CI therefore sets only what is genuinely the
+# job's own - enforcement policy and where to write the artifact - and must not restate the scenario.
+#
 # Env: BIN (default target/release/nuthatch), MAX_P50_US (see ci.yml for the value CI uses and why),
 #      MAX_P99_US (unset: recorded, not gated), PORT (default 8289), RPC_PORT (default 8546), OUT
 #      (default point-read-report.json), LABEL (default names the fixture),
-#      BASELINE (unset: not checked; CI sets docs/bench/point-read.json).
+#      BASELINE (unset: not checked; CI sets docs/bench/point-read.json),
+#      BACKFILL_BLOCKS (1000), LOGS_PER_BLOCK (200), TIP (20000), BACKFILL_TIMEOUT_S (900).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
@@ -71,7 +83,67 @@ RPC_PORT="${RPC_PORT:-8546}"
 OUT="${OUT:-point-read-report.json}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-python3 "$HERE/footprint-rpc.py" "$RPC_PORT" &
+# --- the fixture: a realistic nest, not a settled tip of 256 rows (issue #424) -------------------
+#
+# **The scenario is the gate.** #283's design call asked for the shape #286/#284 would actually
+# perturb - "the hot store under a realistic nest, the same scenario family the RAM work will load" -
+# and the first version of this script did not deliver it. It borrowed `footprint.sh`'s fixture: one
+# contract, one event, four logs a block. Everything past finality is sealed to Parquet and pruned
+# out of redb, and `get_entity` is a hot-store read, so what the gate actually measured was
+# 64 blocks x 4 logs = **256 rows** - a hot store that fits in L2 cache, which is why a 32-core dev
+# box and a 4-core runner produced the same number. Precise, cheap, and a measurement of a case
+# nobody runs.
+#
+# So the fixture is now the `per-cursor RAM budget` job's chain, served by the same
+# `multinest-rpc.py` off the same real Uniswap V4 `PoolManager` ABI: ten event types, ten tables, and
+# **200 logs per block**. That is the rate the RSS scenario puts on one cursor (20 nests x 10
+# logs/block/contract), carried here by a single high-rate contract so that it lands in one nest's
+# store - which is the store a point-read seeks in, since each nest gets its own redb. The hot store
+# is 64 x 200 = **12,800 rows across 10 tables**, 50x what it was and the same order as the cursor
+# the RAM work loads.
+#
+# Two gates, one chain shape, on purpose. `footprint.sh` stays on its small single-event fixture
+# because a 256 MB ceiling over 60 MB is a sensitive regression tripwire; this one wants the dense
+# case because a point-read gate's discriminating power is a function of how many rows a broken
+# read path would have to walk.
+#
+# `--contracts 1` rather than 20: one nest with 20 aliases would carry 200 tables, not 10, and the
+# table count is part of the shape being matched. The event *rate* is what sizes the hot store.
+ABI="$HERE/multinest-abi.json"
+BACKFILL_BLOCKS="${BACKFILL_BLOCKS:-1000}"
+LOGS_PER_BLOCK="${LOGS_PER_BLOCK:-200}"
+TIP="${TIP:-20000}"
+# `--backfill N` indexes N+1 blocks: it starts at `tip - N` inclusive of the tip. Measured, not
+# derived - `multinest-footprint.sh` carries the same off-by-one and got it wrong the first time too.
+EXPECT=$(( (BACKFILL_BLOCKS + 1) * LOGS_PER_BLOCK ))
+
+# **Point-reads see the unsealed tip, not the whole backfill.** Rows past finality are sealed to
+# Parquet and pruned out of redb, so of the rows indexed only the last finality window is still in
+# the hot store - and `get_entity` is a hot-store read. Measured on the old fixture: sealed_through
+# 19,936 against a 20,000 tip, so exactly `FINALITY_DEPTH` blocks stay hot.
+#
+# This is written down because the first version of this script asserted `--min-reads 8004` and
+# therefore failed *every* run: it was reasoned from the backfill size rather than run. If nuthatch's
+# finality or sealing changes, this goes red and wants a human, which is the correct outcome rather
+# than a silently shrinking sample.
+#
+# Named rather than left as a bare `64 * 200`, because both numbers are quotations from elsewhere and
+# a reader who cannot see the source cannot check them: mainnet is `Finality::Depth(64)`
+# (`src/chains.rs:77`) and the mock serves `--logs-per-block` per contract per block up to a fixed
+# `TIP`, so the settled hot tip is blocks 19937..=20000.
+#
+# It is a **floor, not an equality**. A run whose seal loop has not caught up holds *more* than this,
+# never fewer, so the check is satisfied at any point after the backfill completes rather than only in
+# the settled state. Asserting equality would turn the seal loop's timing into a flaky gate.
+FINALITY_DEPTH=64
+HOT_EXPECT=$(( FINALITY_DEPTH * LOGS_PER_BLOCK ))
+
+# The tip is **fixed**, unlike the RSS scenario's. That gate is about sustained operation at tip, so
+# its tip has to move; this one measures an offline store after `dev` has been stopped, so a moving
+# tip would buy nothing and cost the exact hot-row count that `--min-reads` is derived from.
+python3 "$HERE/multinest-rpc.py" --port "$RPC_PORT" --abi "$ABI" \
+  --contracts 1 --logs-per-block "$LOGS_PER_BLOCK" \
+  --initial-tip "$TIP" --final-tip "$TIP" --tip-step 0 &
 RPC_PID=$!
 trap 'kill "$RPC_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do
@@ -83,6 +155,8 @@ done
 
 DIR="$(mktemp -d)"
 mkdir -p "$DIR/abis"
+cp "$ABI" "$DIR/abis/pool_manager.json"
+# Contract 1 is address 0x…01, matching multinest-rpc.py's derivation.
 cat > "$DIR/nuthatch.toml" <<TOML
 [nest]
 name = "point-read"
@@ -92,62 +166,59 @@ rpc_urls = ["http://127.0.0.1:$RPC_PORT"]
 schema_version = 1
 
 [[contracts]]
-alias = "usdc"
-address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-abi = "abis/usdc.json"
+alias = "pool_manager"
+address = "$(printf '0x%040x' 1)"
+abi = "abis/pool_manager.json"
 TOML
-cat > "$DIR/abis/usdc.json" <<'JSON'
-[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
-  {"name":"from","type":"address","indexed":true},
-  {"name":"to","type":"address","indexed":true},
-  {"name":"value","type":"uint256","indexed":false}]}]
-JSON
 
-# The same fixed workload footprint.sh indexes: 2000 blocks x 4 logs + the tip's 4 = 8004 rows.
-BACKFILL_BLOCKS=2000
-EXPECT=$(( BACKFILL_BLOCKS * 4 + 4 ))
-TIP=20000
-
-# **Point-reads see the unsealed tip, not the whole backfill.** Rows past finality are sealed to
-# Parquet and pruned out of redb, so of the 8,004 rows indexed only the last finality window is still
-# in the hot store - and `get_entity` is a hot-store read. Measured: sealed_through 19,936 against a
-# 20,000 tip, so 64 blocks x 4 logs = 256 rows.
-#
-# This is written down because the first version of this script asserted `--min-reads 8004` and
-# therefore failed *every* run: it was reasoned from the backfill size rather than run. 256 is what
-# the fixture actually leaves hot. If nuthatch's finality or sealing changes, this goes red and wants
-# a human, which is the correct outcome rather than a silently shrinking sample.
-#
-# Named rather than left as a bare `64 * 4`, because both numbers are quotations from elsewhere and a
-# reader who cannot see the source cannot check them: mainnet is `Finality::Depth(64)`
-# (`src/chains.rs:77`) and the mock serves `LOGS_PER_BLOCK = 4` (`footprint-rpc.py:25`) up to a fixed
-# `TIP = 20_000`, so the settled hot tip is blocks 19937..=20000.
-#
-# It is a **floor, not an equality**. A run whose seal loop has not caught up holds *more* than this,
-# never fewer, so the check is satisfied at any point after the backfill completes rather than only in
-# the settled state. Asserting equality would turn the seal loop's timing into a flaky gate.
-FINALITY_DEPTH=64
-LOGS_PER_BLOCK=4
-HOT_EXPECT=$(( FINALITY_DEPTH * LOGS_PER_BLOCK ))
+echo "fixture: 1 nest, 10-event V4 ABI, ${LOGS_PER_BLOCK} logs/block, blocks $(( TIP - BACKFILL_BLOCKS ))..$TIP"
+echo "         expecting $EXPECT rows, of which $HOT_EXPECT stay hot past sealing"
 
 "$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$DIR/dev.log" 2>&1 &
 DEV_PID=$!
 trap 'kill "$DEV_PID" 2>/dev/null || true; kill "$RPC_PID" 2>/dev/null || true' EXIT
-for _ in $(seq 1 80); do
+# Generous, and generous for a stated reason: this fixture indexes 50x the rows the old one did, and
+# a 2-vCPU runner takes minutes over it. A timeout here is reported as a failure to complete (which
+# it is - an incomplete run's latencies are not a measurement), so tripping it on a slow runner would
+# make the job flaky, and a flaky required check gets disabled.
+BACKFILL_TIMEOUT_S="${BACKFILL_TIMEOUT_S:-900}"
+for _ in $(seq 1 "$BACKFILL_TIMEOUT_S"); do
   sleep 1
   kill -0 "$DEV_PID" 2>/dev/null || break
   last="$(curl -s "127.0.0.1:$PORT/" 2>/dev/null | grep -o '"last_block":"[0-9]*"' | grep -o '[0-9]*' || true)"
   if [ -n "$last" ] && [ "$last" -ge "$TIP" ]; then break; fi
 done
-rows="$(curl -s -G "127.0.0.1:$PORT/sql" --data-urlencode \
-  'q=SELECT count(*) n FROM usdc__transfer' 2>/dev/null \
-  | grep -o '"n":[0-9]*' | grep -o '[0-9]*' || true)"
-rows="${rows:-0}"
+
+# **Every one of the ten tables must hold rows**, not just the total. The mock cycles the event types
+# so all ten are populated, and an empty table means that event's topic0 never matched - which does
+# not error, it decodes to nothing. Summing a total alone would let this gate measure a fraction of
+# the ABI it claims to and call it a pass; `multinest-footprint.sh` guards its version of the same
+# fixture the same way.
+TABLES="pool_manager__approval pool_manager__donate pool_manager__initialize \
+pool_manager__modify_liquidity pool_manager__operator_set pool_manager__ownership_transferred \
+pool_manager__protocol_fee_controller_updated pool_manager__protocol_fee_updated \
+pool_manager__swap pool_manager__transfer"
+rows=0
+empty=""
+for tbl in $TABLES; do
+  r="$(curl -s -m 30 -G "127.0.0.1:$PORT/sql" --data-urlencode "q=SELECT count(*) n FROM $tbl" \
+    2>/dev/null | grep -o '"n":[0-9]*' | grep -o '[0-9]*' || true)"
+  r="${r:-0}"
+  [ "$r" -eq 0 ] && empty="$empty $tbl"
+  rows=$(( rows + r ))
+done
 
 # `bench query` opens the store directly, so `dev` has to be gone first - not merely asked to go.
 kill "$DEV_PID" 2>/dev/null || true
 wait "$DEV_PID" 2>/dev/null || true
 
+if [ -n "$empty" ]; then
+  tail -30 "$DIR/dev.log" || true
+  echo "FAIL: these tables are empty:$empty"
+  echo "      Each is one event type's topic0. An unmatched topic0 decodes to nothing rather than"
+  echo "      erroring, so this would otherwise be a green run over a fraction of the ABI."
+  exit 1
+fi
 if [ "$rows" -lt "$EXPECT" ]; then
   tail -30 "$DIR/dev.log" || true
   echo "FAIL: indexed $rows of $EXPECT rows - the run did not complete, so its latencies are not a"
@@ -177,7 +248,7 @@ fi
 
 set +e
 "$BIN" bench query --dir "$DIR" --reads "$EXPECT" --iters 5 --out "$OUT" \
-  --label "${LABEL:-point-read gate: $EXPECT rows indexed, $HOT_EXPECT hot, locally-served chain}" \
+  --label "${LABEL:-point-read gate: $EXPECT rows indexed, $HOT_EXPECT hot across 10 tables, 10-event V4 ABI at $LOGS_PER_BLOCK logs/block, locally-served chain}" \
   --min-reads "$HOT_EXPECT" \
   --max-point-read-p50-us "$MAX_P50_US" \
   ${p99_arg[@]+"${p99_arg[@]}"} | tee "$DIR/bench.log"
@@ -232,7 +303,29 @@ if [ -n "$BASELINE" ] && [ -f "$OUT" ]; then
     echo "      and say so in docs/benchmarks.md. Do not edit the hardware field."
     exit 1
   fi
-  echo "OK: baseline $BASELINE was measured on this machine ('$base_hw')"
+
+  # **And the same scenario, not just the same machine** (issue #424). The hardware check alone would
+  # have stayed green through this very change: swapping the fixture from a 256-row settled tip to a
+  # 12,800-row hot store leaves the runner spec untouched, so the committed baseline would go on
+  # describing a scenario nobody measures any more while still passing its own provenance check. The
+  # label is generated from the scenario parameters, so it drifts exactly when the scenario does.
+  label_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("label") or "")' "$1"; }
+  base_label="$(label_of "$BASELINE")"
+  this_label="$(label_of "$OUT")"
+  if [ "$base_label" != "$this_label" ]; then
+    echo "FAIL: $BASELINE was measured on a different scenario."
+    echo "      baseline: $base_label"
+    echo "      this run: $this_label"
+    echo "      A baseline for a scenario the gate no longer runs is not a baseline. The label is"
+    echo "      derived from the fixture, so this fires when the fixture moves and the committed"
+    echo "      artifact does not - which is how #424's 256-row hot store outlived the design call"
+    echo "      that asked for a realistic one."
+    echo "      Fix: refresh docs/bench/point-read.json from a green run of this job, and re-measure"
+    echo "      the ceiling - a different hot-store size moves the baseline and the regression by"
+    echo "      different factors."
+    exit 1
+  fi
+  echo "OK: baseline $BASELINE matches this machine ('$base_hw') and this scenario"
 fi
 
 if [ "$status" -ne 0 ]; then

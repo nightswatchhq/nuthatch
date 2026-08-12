@@ -250,6 +250,83 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
     }
 }
 
+/// The **serving-path** counterpart to [`verify_and_quarantine`]: which of `dir`'s manifest segments
+/// no longer hash to their content address. Returns their hashes, for `analytics::define_views` to
+/// drop from a rebuilt view (issue #433).
+///
+/// ## Why the hash and not a DuckDB probe
+///
+/// #430 drops a segment that will not **bind**, probing with `conn.prepare` over `read_parquet`. That
+/// catches footer corruption and nothing else. Measured in the DuckDB CLI (1.5.3) against a segment
+/// whose data region is overwritten but whose footer is intact:
+///
+/// - `SELECT 1 FROM read_parquet([f]) LIMIT 0` - the #430 probe - **succeeds**;
+/// - `count(*)` and `max(col)` **succeed**, answered from Parquet metadata without reading a page;
+/// - `SELECT * … LIMIT 1` fails on that file, and **succeeds** on one where only the late row groups
+///   are corrupt, because it never reads them.
+///
+/// So the only sound DuckDB-side discriminator is a full scan of every column of every segment, and
+/// it would be pinned to whatever the query planner prunes this release. The content address is not:
+/// sealed segments are immutable, so any changed byte is unambiguous corruption, and this is already
+/// the check `verify_and_quarantine` makes at startup. Using the same one here is what stops the
+/// serving path and the startup path disagreeing about the same file, which was half of #419.
+///
+/// **Reduce here, never quarantine.** Quarantine moves bytes, and the shared store's bytes belong to
+/// every dataset referencing them (RFC-0033 §11a). Dropping a segment from one query's view changes
+/// nothing on disk and so is safe for a shared segment, which is why this returns hashes rather than
+/// calling the startup pass.
+///
+/// ## Cost, and the cache that is deliberately not here
+///
+/// This reads and hashes every catalogued segment, every time it is called. That is not free, and the
+/// thing keeping it affordable is the *caller*: `run` only asks after a query has **bound and then
+/// died reading rows**. A bind failure - a typo, a missing column, the commonest error on this
+/// surface - never reaches here, so the cheap way to provoke a sweep does not exist.
+///
+/// **There was a memo here keyed on the file's `(mtime, len)`, and it was wrong.** The idea was that a
+/// segment already verified in this process is a `stat` rather than a read. Measured on this box
+/// (btrfs, Linux 6.12): rewriting a file in place with the same length inside one timer tick leaves
+/// `st_mtime_ns` **byte-identical**, because the kernel stamps writes from a per-tick cached clock. So
+/// the key cannot see an in-place same-length overwrite - which is precisely the corruption this
+/// function exists to catch. A cache that reports `intact` about a corrupt segment, inside the fix for
+/// reporting healthy about corrupt data, is the bug wearing the fix's clothes. It was removed rather
+/// than tuned, and `seal::tests::a_corrupt_segment_is_caught_even_when_its_mtime_is_unchanged` is
+/// what stops it coming back. That test exists because my first claim here - that the page-corruption
+/// test already covered it - was **false**: mutating the memo back in left the whole suite green.
+///
+/// If sweep cost ever does need bounding, bound it on something that cannot be stale - a coalescing
+/// flag so concurrent queries share one sweep, or the gateway, which is already where this project
+/// puts per-caller rate limiting (#365). Not on a filesystem timestamp.
+pub fn segments_failing_verification(dir: &Path) -> BTreeSet<String> {
+    let Ok(manifest) = load_manifest(dir) else {
+        return BTreeSet::new();
+    };
+    let mut bad = BTreeSet::new();
+    for (table, segs) in &manifest.tables {
+        for s in segs {
+            let path = segment_path(dir, &s.file, &s.hash);
+            // An absent file is not corruption, and `define_views` already skips it by existence.
+            if !path.exists() {
+                continue;
+            }
+            // An unreadable segment is not intact: it cannot serve rows either way, and saying
+            // "fine" about a file we could not read is the failure this whole issue is about.
+            let intact = std::fs::read(&path)
+                .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash);
+            if !intact {
+                tracing::error!(
+                    "segment {} for table {table} does not match its content address - dropping it \
+                     from this query (cold data reduced). Restart to quarantine it, or re-seal the \
+                     range to restore it.",
+                    s.file
+                );
+                bad.insert(s.hash.clone());
+            }
+        }
+    }
+    bad
+}
+
 /// Startup integrity pass: verify every manifest segment's file exists and its bytes hash to the
 /// recorded content address. A file that's missing, unreadable, or hash-mismatched is corrupt or
 /// tampered with - quarantine it (move to a sibling `quarantine/` dir so `define_views` skips it) and
@@ -359,6 +436,124 @@ mod tests {
         format!(
             r#"{{"table":"usdc__approval","owner":"0xaaaa","spender":"0xdddd","value":"1","block_number":{block},"tx_hash":"0xcc","log_index":{li}}}"#
         )
+    }
+
+    /// **Issue #433.** The serving-path discriminator must catch page corruption that every cheap
+    /// DuckDB probe waves through, and must not accuse a healthy segment.
+    ///
+    /// The fixture asserts its own premise. Corrupting the data region while leaving the footer and
+    /// magic bytes intact is the whole condition - if the file stopped binding it would be #430's
+    /// case, already covered, and this test would be proving something else under this name. So it
+    /// checks `read_parquet` still binds the corrupt file before asserting the hash catches it. That
+    /// gap between "binds" and "hashes wrong" is exactly the ground #433 sits on.
+    #[test]
+    fn segments_failing_verification_catches_page_corruption_that_still_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        assert_eq!(segs.len(), 2);
+
+        // Nothing is wrong yet, and saying so is half the test: a discriminator that always answered
+        // "corrupt" would reduce every table on the first execution error in a healthy nest.
+        assert!(
+            segments_failing_verification(dir.path()).is_empty(),
+            "a healthy tree must accuse nothing"
+        );
+
+        // Destroy the pages of the block-101 segment, keeping footer and magic bytes.
+        let victim = segs.iter().find(|s| s.from_block == 101).unwrap();
+        let path = segment_path(dir.path(), &victim.file, &victim.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let end = len - 8 - footer_len;
+        assert!(end > 4, "the fixture needs a data region to corrupt");
+        bytes[4..end].fill(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+
+        // **The fixture is the condition it names.** Still a Parquet file as far as binding goes.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(&format!(
+                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                path.display()
+            ))
+            .is_ok(),
+            "if this no longer binds, the fixture has become #430's footer-corrupt case and this \
+             test has stopped testing #433"
+        );
+
+        let bad = segments_failing_verification(dir.path());
+        assert_eq!(
+            bad.len(),
+            1,
+            "exactly the corrupt segment, and not its healthy sibling"
+        );
+        assert!(bad.contains(&victim.hash), "and it is the one we corrupted");
+    }
+
+    /// **Issue #433, and the reason there is no cache in `segments_failing_verification`.**
+    ///
+    /// A verdict about a segment's bytes must not be keyed on the segment's timestamp. Measured on
+    /// this box (btrfs, Linux 6.12): rewriting a file in place with the same length inside one kernel
+    /// timer tick leaves `st_mtime_ns` **byte-identical**, because writes are stamped from a per-tick
+    /// cached clock. So a `(mtime, len)` memo cannot see an in-place same-length overwrite - exactly
+    /// the corruption this is for.
+    ///
+    /// I know this because I wrote that memo, and then wrote in its doc comment that the test above
+    /// would catch it coming back. **It would not**: mutating the memo back in left the whole suite
+    /// green, because the two sweeps in that test happen to straddle a tick. A claim about a
+    /// mechanism, with nothing behind it, in the fix for claims with nothing behind them.
+    ///
+    /// So this constructs the condition deterministically instead of hoping for it: corrupt the bytes
+    /// and put the original timestamp back, which is what a same-tick overwrite does anyway. Linux
+    /// only - it needs GNU `touch -d @<epoch.nanos>` - and CI is Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_corrupt_segment_is_caught_even_when_its_mtime_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(200, 0, "9")], 200, 200).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+
+        // Ask once while it is healthy: this is what would populate any cache.
+        assert!(segments_failing_verification(dir.path()).is_empty());
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        bytes[4..len - 8 - footer_len].fill(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Put the clock back, so the file is byte-different and timestamp-identical.
+        let d = before.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ok = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{}.{:09}", d.as_secs(), d.subsec_nanos()))
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "the fixture needs GNU touch to restore the timestamp");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "the whole point of this test is that the timestamp did not move"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len as u64,
+            "and neither did the length"
+        );
+
+        assert_eq!(
+            segments_failing_verification(dir.path()).len(),
+            1,
+            "corruption must be caught from the bytes - a verdict cached on (mtime, len) would call \
+             this segment intact, which is the failure this whole issue is about"
+        );
     }
 
     #[test]
