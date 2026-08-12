@@ -60,11 +60,21 @@ pub struct QueryGuard {
 /// at all. Nor may it name a cause: the undefinable-view arm above lands here with every segment
 /// binding fine. Both mistakes shipped in the first rendering of this field and neither test nor
 /// mutation could see them, because every fixture had exactly one table.
+///
+/// `tip_unavailable` is the other kind of incomplete, and deliberately not folded into
+/// `degraded_tables` (#472). A hot-scan failure (`begin_read`, `open_table`, `t.iter()`, or a row
+/// partway through) is not per-table the way a bad segment is - it drops the *entire* unsealed tip,
+/// every table at once - and its cause and remedy differ: a damaged or unreadable hot store, not a
+/// corrupt segment. Shoehorning it into `degraded_tables` would either name every table for a failure
+/// that named none of them, or name none and repeat #472's silence. `QueryOutput` itself never sets
+/// this field - the hot scan happens in the caller, above `query_hot_cold` - so a caller that scans the
+/// tip assigns it after the query returns.
 #[derive(Debug, Default)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
+    pub tip_unavailable: bool,
 }
 
 impl QueryOutput {
@@ -388,6 +398,7 @@ fn attempt(
         rows,
         truncated,
         degraded_tables,
+        tip_unavailable: false,
     }))
 }
 

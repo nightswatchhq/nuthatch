@@ -1077,13 +1077,18 @@ async fn run_sql_query(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
-            Ok(hot) => hot,
+        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+            Ok(hot) => (hot, false),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
-            Err(_) => Default::default(),
+            // Same level as a segment read failure (#472): a hot store that will not scan is at least
+            // as serious, and the fallback below must not be the only trace of it.
+            Err(e) => {
+                tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
+                (Default::default(), true)
+            }
         };
         let sealed_through = store.sealed_through();
-        analytics::query_hot_cold(
+        let mut out = analytics::query_hot_cold(
             &dir,
             &sql,
             analytics::QueryGuard {
@@ -1092,7 +1097,9 @@ async fn run_sql_query(
             },
             &hot,
             sealed_through,
-        )
+        )?;
+        out.tip_unavailable = tip_unavailable;
+        Ok(out)
     })
     .await;
     match result {
@@ -1114,6 +1121,11 @@ async fn run_sql_query(
             // is the same reason errors go through `sanitize_sql_error`.
             "degraded": out.degraded(),
             "degraded_tables": out.degraded_tables,
+            // Tip failure, not per-table cold reduction (#472): the hot-tip scan itself errored, so
+            // this answer is sealed-history-only regardless of what `degraded_tables` says. Distinct
+            // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
+            // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
+            "tip_unavailable": out.tip_unavailable,
             "rows": out.rows,
             // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
             // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
@@ -2155,6 +2167,13 @@ mod tests {
         assert!(
             ADMIN_HTML.contains("degraded_tables"),
             "admin UI renders the reduced-cold-data caveat (#435)"
+        );
+        // Same reasoning, same pin, for the other kind of incomplete (#472): a lost tip is nest-wide
+        // and every-table, not per-table, so it needs its own substring or a deleted caveat here is
+        // just as silent as the arm that started this.
+        assert!(
+            ADMIN_HTML.contains("tip_unavailable"),
+            "admin UI renders the lost-tip caveat (#472)"
         );
     }
 

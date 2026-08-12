@@ -1055,3 +1055,246 @@ async fn a_page_corrupt_segment_under_a_running_node_reduces_the_table_over_http
     })
     .await;
 }
+
+/// A `HotStore` that answers every real call except the hot-tip scan, which always errors. redb's own
+/// scan has no controllable failure short of on-disk corruption a live, already-open handle would not
+/// even see - `begin_read`, `open_table` and `t.iter()` all succeed against a healthy, in-process
+/// database - so this is the deterministic way to reach the arm #472 found silent.
+struct HotScanFails(std::sync::Arc<dyn nuthatch::store::HotStore>);
+
+#[async_trait::async_trait]
+impl nuthatch::store::HotStore for HotScanFails {
+    fn put_entity(&self, key: &str, json: &str) -> anyhow::Result<()> {
+        self.0.put_entity(key, json)
+    }
+    fn get_entity(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.0.get_entity(key)
+    }
+    fn count(&self) -> anyhow::Result<u64> {
+        self.0.count()
+    }
+    fn recent(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.0.recent(limit)
+    }
+    fn recent_by_table(&self, table: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.0.recent_by_table(table, limit)
+    }
+    fn hot_rows_by_table(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
+        anyhow::bail!("simulated hot store failure (#472 fixture)")
+    }
+    fn hot_rows_by_table_bounded(
+        &self,
+        _max_rows: usize,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
+        anyhow::bail!("simulated hot store failure (#472 fixture)")
+    }
+    fn entities_in_range(&self, from: u64, to: u64) -> anyhow::Result<Vec<String>> {
+        self.0.entities_in_range(from, to)
+    }
+    fn sample_entity_keys(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.0.sample_entity_keys(limit)
+    }
+    fn get_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.0.get_meta(key)
+    }
+    fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.0.set_meta(key, value)
+    }
+    fn indexed_head(&self) -> anyhow::Result<Option<u64>> {
+        self.0.indexed_head()
+    }
+    fn sealed_through(&self) -> u64 {
+        self.0.sealed_through()
+    }
+    fn set_block_hash(&self, block: u64, hash: &str) -> anyhow::Result<()> {
+        self.0.set_block_hash(block, hash)
+    }
+    fn get_block_hash(&self, block: u64) -> anyhow::Result<Option<String>> {
+        self.0.get_block_hash(block)
+    }
+    fn checkpoints_desc(&self) -> anyhow::Result<Vec<(u64, String)>> {
+        self.0.checkpoints_desc()
+    }
+    fn commit_window(
+        &self,
+        entities: &[(String, String)],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> anyhow::Result<()> {
+        self.0.commit_window(entities, checkpoint, last_block)
+    }
+    async fn commit_window_blocking(
+        &self,
+        entities: Vec<(String, String)>,
+        checkpoint: Option<(u64, String)>,
+        last_block: u64,
+    ) -> anyhow::Result<()> {
+        self.0
+            .commit_window_blocking(entities, checkpoint, last_block)
+            .await
+    }
+    fn rollback_to(&self, block: u64) -> anyhow::Result<u64> {
+        self.0.rollback_to(block)
+    }
+    fn rollback_to_and_set_meta(
+        &self,
+        block: u64,
+        meta_key: &str,
+        meta_val: &str,
+    ) -> anyhow::Result<u64> {
+        self.0.rollback_to_and_set_meta(block, meta_key, meta_val)
+    }
+    fn prune_range(&self, from: u64, to: u64) -> anyhow::Result<u64> {
+        self.0.prune_range(from, to)
+    }
+    fn prune_and_set_meta(
+        &self,
+        from: u64,
+        to: u64,
+        meta_key: &str,
+        meta_val: &str,
+    ) -> anyhow::Result<u64> {
+        self.0.prune_and_set_meta(from, to, meta_key, meta_val)
+    }
+    fn claim(&self, owner: &str) -> anyhow::Result<u64> {
+        self.0.claim(owner)
+    }
+    fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> anyhow::Result<nuthatch::store::Lease> {
+        self.0.acquire_lease(owner, ttl_secs)
+    }
+    fn renew_lease(&self, ttl_secs: u64) -> anyhow::Result<nuthatch::store::Lease> {
+        self.0.renew_lease(ttl_secs)
+    }
+    fn release_lease(&self) -> anyhow::Result<()> {
+        self.0.release_lease()
+    }
+    fn current_lease(&self) -> anyhow::Result<Option<nuthatch::store::Lease>> {
+        self.0.current_lease()
+    }
+    fn current_fence(&self) -> anyhow::Result<u64> {
+        self.0.current_fence()
+    }
+    fn held_fence(&self) -> u64 {
+        self.0.held_fence()
+    }
+    fn outbox_push(&self, payload: &str) -> anyhow::Result<u64> {
+        self.0.outbox_push(payload)
+    }
+    fn outbox_pending(&self, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.0.outbox_pending(limit)
+    }
+    fn outbox_remove(&self, seq: u64) -> anyhow::Result<()> {
+        self.0.outbox_remove(seq)
+    }
+    async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> anyhow::Result<()> {
+        self.0.outbox_remove_batch_blocking(seqs).await
+    }
+    fn outbox_len(&self) -> u64 {
+        self.0.outbox_len()
+    }
+    fn outbox_trim(&self, max: u64) -> anyhow::Result<u64> {
+        self.0.outbox_trim(max)
+    }
+}
+
+/// #472: a hot-scan failure must not serve cold-only in silence and let the response read as complete.
+/// Real `spawn_nest` state throughout - the store is only swapped for [`HotScanFails`] after ingestion
+/// is frozen, the same point the corruption tests above swap in a damaged segment, so everything except
+/// the scan itself (seal state, meta, the real router) is the genuine wiring. A hand-built `AppState`
+/// would prove the handler and never that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hot_scan_failure_does_not_claim_completeness_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    let tape = Arc::new(TapeSource::new());
+
+    let a1 = account(1);
+    let a2 = account(2);
+    for b in 1..=5u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(5);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let store = rt.state.store.clone();
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            store.get_meta("last_block").ok().flatten().as_deref() == Some("5")
+        })
+        .await,
+        "nest did not index to the tip in time"
+    );
+
+    // Freeze ingestion, same as the corruption tests above, then swap the *serving* state onto a store
+    // whose hot scan always errors - nothing has sealed yet, so every row that exists lives only in the
+    // tip this is about to fail to read.
+    rt.ingest.abort();
+    if let Some(w) = rt.alert_worker {
+        w.abort();
+    }
+    let mut state = rt.state.clone();
+    state.store = Arc::new(HotScanFails(state.store.clone()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let table = transfer_table("usdc");
+    let q = format!("SELECT block_number FROM \"{table}\"");
+    let resp: serde_json::Value = client
+        .get(format!("{base}/sql"))
+        .query(&[("q", q)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        resp["error"].is_null(),
+        "a hot-scan failure must still answer (cold-only), not fault the query: {resp}"
+    );
+    // The whole point of #472: the response must not read as complete when the entire tip was dropped.
+    assert_eq!(
+        resp["tip_unavailable"],
+        serde_json::json!(true),
+        "a dropped tip must say so - a caller reading only `degraded`/`degraded_tables` would see \
+         nothing wrong at all: {resp}"
+    );
+    // Nothing is sealed yet, so the honest cold-only answer is empty - not a confident, wrong count
+    // invented from a tip the node never actually read.
+    assert_eq!(
+        resp["rows"].as_array().map(Vec::len),
+        Some(0),
+        "cold-only with nothing sealed must be empty: {resp}"
+    );
+
+    server.abort();
+}
