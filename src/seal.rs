@@ -35,9 +35,12 @@ use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 pub const SEGMENTS_DIR: &str = "segments";
 
@@ -294,9 +297,9 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 ///   tables in the nest.
 ///
 /// The bound that remains: a caller who names the nest's largest table can still make one request
-/// hash that table's segments. That is inherent to verifying-on-failure at all, and the remaining
-/// lever is coalescing concurrent sweeps or the gateway's rate limiting (#365) - not a cache keyed
-/// on anything that can go stale.
+/// hash that table's segments. That is inherent to verifying-on-failure at all - the levers are
+/// coalescing concurrent sweeps (below), a deadline shared with the query's own watchdog (`deadline`,
+/// #476), and the gateway's rate limiting (#365). Not a cache keyed on anything that can go stale.
 ///
 /// **There was a memo here keyed on the file's `(mtime, len)`, and it was wrong.** The idea was that a
 /// segment already verified in this process is a `stat` rather than a read. Measured on this box
@@ -309,19 +312,190 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// what stops it coming back. That test exists because my first claim here - that the page-corruption
 /// test already covered it - was **false**: mutating the memo back in left the whole suite green.
 ///
-/// If sweep cost ever does need bounding, bound it on something that cannot be stale - a coalescing
-/// flag so concurrent queries share one sweep, or the gateway, which is already where this project
-/// puts per-caller rate limiting (#365). Not on a filesystem timestamp.
+/// ## Coalescing (#476)
+///
+/// Concurrent callers naming the *same* tables (the shape of the amplifier: the same expensive query,
+/// repeated while the two `SQL_MAX_CONCURRENCY` permits are held) share one sweep rather than each
+/// paying for their own. This is not a cache: the in-flight entry lives only for the duration of the
+/// sweep it names and is removed the moment that sweep finishes, so there is nothing here that can go
+/// stale the way the `(mtime, len)` memo did - the next call, even for the identical key, always reads
+/// bytes fresh.
 ///
 /// `tables` holds the table names the failed query referenced, lowercased (DuckDB identifiers are
-/// case-insensitive). An empty set hashes nothing.
-pub fn segments_failing_verification(dir: &Path, tables: &BTreeSet<String>) -> BTreeSet<String> {
+/// case-insensitive). An empty set hashes nothing. `deadline`, when set, bounds the sweep by the same
+/// wall-clock budget as the query that triggered it (`analytics::run`'s `QueryGuard`), rather than
+/// running unbounded between the query's two attempts - a caller that has already spent its budget
+/// gets nothing further hashed on its behalf.
+pub fn segments_failing_verification(
+    dir: &Path,
+    tables: &BTreeSet<String>,
+    deadline: Option<Instant>,
+) -> BTreeSet<String> {
+    if tables.is_empty() {
+        return BTreeSet::new();
+    }
+    let key: SweepKey = (dir.to_path_buf(), tables.clone());
+    let (slot, is_leader) = {
+        let mut inflight = sweeps_in_flight().lock().unwrap();
+        match inflight.get(&key) {
+            Some(existing) => (Arc::clone(existing), false),
+            None => {
+                let slot = Arc::new(SweepSlot::default());
+                inflight.insert(key.clone(), Arc::clone(&slot));
+                (slot, true)
+            }
+        }
+    };
+
+    if is_leader {
+        // Removes this sweep's map entry and wakes any follower on every exit path, including a panic
+        // unwind out of `sweep_segments` - `fs::read`/`Sha256::digest` don't panic on the errors this
+        // code already handles, but leaving a slot that nothing will ever complete stuck in the map
+        // forever would hang a *trusted, unguarded* follower (query()/query_cold(), which have no
+        // deadline and must run to completion by design) indefinitely rather than just failing loudly.
+        struct Cleanup<'a> {
+            key: &'a SweepKey,
+            slot: &'a SweepSlot,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                sweeps_in_flight().lock().unwrap().remove(self.key);
+                self.slot.done.notify_all();
+            }
+        }
+        let _cleanup = Cleanup {
+            key: &key,
+            slot: &slot,
+        };
+        let result = sweep_segments(dir, tables, deadline);
+        *slot.result.lock().unwrap() = Some(result.clone());
+        return result;
+        // `_cleanup` drops here - map entry removed and followers notified only now that the result is
+        // published, so a follower checking the map first still finds the slot with a real answer.
+    }
+
+    // Follower: wait for the leader, but never past this call's own deadline - the query's time budget
+    // is a promise, and that must hold even when it is someone else's sweep in progress, not its own.
+    let mut guard = slot.result.lock().unwrap();
+    loop {
+        if let Some(result) = guard.as_ref() {
+            return result.clone();
+        }
+        // The leader is gone (removed itself, on success or on panic) without ever publishing - stop
+        // following a slot nobody will ever complete and retry from scratch, becoming the leader (or
+        // following a new one) rather than waiting out a deadline, or forever, for nothing.
+        if !sweeps_in_flight().lock().unwrap().contains_key(&key) {
+            drop(guard);
+            return segments_failing_verification(dir, tables, deadline);
+        }
+        guard = match deadline {
+            None => slot.done.wait(guard).unwrap(),
+            Some(d) => {
+                let remaining = d.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return BTreeSet::new();
+                }
+                slot.done.wait_timeout(guard, remaining).unwrap().0
+            }
+        };
+    }
+}
+
+/// A sweep in progress, keyed by exactly what it was asked to verify - see the "Coalescing" section
+/// above.
+type SweepKey = (PathBuf, BTreeSet<String>);
+
+#[derive(Default)]
+struct SweepSlot {
+    result: Mutex<Option<BTreeSet<String>>>,
+    done: Condvar,
+}
+
+fn sweeps_in_flight() -> &'static Mutex<HashMap<SweepKey, Arc<SweepSlot>>> {
+    static INFLIGHT: OnceLock<Mutex<HashMap<SweepKey, Arc<SweepSlot>>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Test-only knob: an artificial per-segment delay, so a test can force two sweeps to overlap (proving
+/// coalescing) or force one sweep to outlive a short deadline (proving the bound), deterministically
+/// rather than by racing the real filesystem.
+#[cfg(test)]
+static TEST_SWEEP_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_set_sweep_delay_ms(ms: u64) {
+    TEST_SWEEP_DELAY_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `TEST_SWEEP_DELAY_MS` is process-global, and `cargo test` runs tests concurrently by default - so
+/// any test using it must hold this lock for its whole body, or a second such test on another thread
+/// can overwrite the knob mid-measurement. Tests that don't touch the knob are unaffected: they never
+/// contend for it (`test_sweep_start_count` is keyed per-dir for the same reason - see its doc).
+#[cfg(test)]
+pub(crate) fn test_sweep_serial() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// How many times a real (leader) sweep has run, keyed by `dir` - a coalescing test's only window
+/// into whether N concurrent identical callers paid for N sweeps or one. Keyed rather than a bare
+/// counter because `cargo test` runs the whole suite concurrently: an unrelated test's own (fast,
+/// undelayed) sweep against its own tempdir would otherwise land inside this test's delay window and
+/// inflate the count for a dir it never touched. Each test's tempdir is unique, so counting per-dir
+/// isolates it from that contamination without requiring every other test to take `test_sweep_serial`.
+#[cfg(test)]
+fn test_sweep_starts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static STARTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    STARTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_sweep_start_count(dir: &Path) -> usize {
+    test_sweep_starts()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The actual read-and-hash pass, run by whichever caller is the sweep's leader. See
+/// [`segments_failing_verification`] for the coalescing and deadline behaviour around this.
+fn sweep_segments(
+    dir: &Path,
+    tables: &BTreeSet<String>,
+    deadline: Option<Instant>,
+) -> BTreeSet<String> {
+    #[cfg(test)]
+    {
+        *test_sweep_starts()
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
+
     let mut bad = BTreeSet::new();
     // Enumerate first, hash second: the hashing loop can only ever touch what `segments_to_verify`
     // handed it, so the reachability bound holds by construction rather than by a filter someone
     // could later move below the `fs::read`. `seal::tests::the_sweep_enumerates_only_the_tables_the
     // _query_named` is what pins it.
     for (table, seg) in segments_to_verify(dir, tables) {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            tracing::warn!(
+                "segment integrity sweep ran out of its query's time budget before checking every \
+                 segment named by {tables:?} - what it found so far still applies, the rest is \
+                 unverified for this request"
+            );
+            break;
+        }
+        #[cfg(test)]
+        {
+            let ms = TEST_SWEEP_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
         let path = segment_path(dir, &seg.file, &seg.hash);
         // An absent file is not corruption, and `define_views` already skips it by existence.
         if !path.exists() {
@@ -543,7 +717,7 @@ mod tests {
         // Nothing is wrong yet, and saying so is half the test: a discriminator that always answered
         // "corrupt" would reduce every table on the first execution error in a healthy nest.
         assert!(
-            segments_failing_verification(dir.path(), &usdc()).is_empty(),
+            segments_failing_verification(dir.path(), &usdc(), None).is_empty(),
             "a healthy tree must accuse nothing"
         );
 
@@ -570,7 +744,7 @@ mod tests {
              test has stopped testing #433"
         );
 
-        let bad = segments_failing_verification(dir.path(), &usdc());
+        let bad = segments_failing_verification(dir.path(), &usdc(), None);
         assert_eq!(
             bad.len(),
             1,
@@ -604,7 +778,7 @@ mod tests {
         let path = segment_path(dir.path(), &seg.file, &seg.hash);
 
         // Ask once while it is healthy: this is what would populate any cache.
-        assert!(segments_failing_verification(dir.path(), &usdc()).is_empty());
+        assert!(segments_failing_verification(dir.path(), &usdc(), None).is_empty());
 
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
@@ -635,10 +809,100 @@ mod tests {
         );
 
         assert_eq!(
-            segments_failing_verification(dir.path(), &usdc()).len(),
+            segments_failing_verification(dir.path(), &usdc(), None).len(),
             1,
             "corruption must be caught from the bytes - a verdict cached on (mtime, len) would call \
              this segment intact, which is the failure this whole issue is about"
+        );
+    }
+
+    /// **Issue #476.** Concurrent callers naming the same tables must share one sweep, not each pay to
+    /// hash the same segments - the amplifier the issue names: `SQL_MAX_CONCURRENCY` permits held by
+    /// identical repeated requests, each currently paying the full cost on its own.
+    ///
+    /// Made deterministic with the test-only delay knob rather than racing the real filesystem: a
+    /// `Barrier` lines up all callers before any of them asks, and the delay keeps the leader busy long
+    /// enough that latecomers are guaranteed to find its slot still in the map rather than a race that
+    /// depends on thread scheduling.
+    #[test]
+    fn concurrent_identical_sweeps_coalesce_into_one() {
+        let _serial = test_sweep_serial().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+
+        test_set_sweep_delay_ms(150);
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.path().to_path_buf();
+                let tables = usdc();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    segments_failing_verification(&dir, &tables, None)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        test_set_sweep_delay_ms(0);
+
+        for r in &results {
+            assert_eq!(
+                r, &results[0],
+                "coalesced callers must all see the same answer"
+            );
+        }
+        assert_eq!(
+            test_sweep_start_count(dir.path()),
+            1,
+            "4 concurrent callers naming the same tables must pay for one sweep, not 4"
+        );
+    }
+
+    /// **Issue #476, the other half.** A sweep must stop at its own deadline rather than hash every
+    /// named segment regardless of how long that takes - so a query's time budget bounds the sweep it
+    /// triggers, not just the query execution either side of it.
+    ///
+    /// Three segments, corrupted last: with a per-segment delay bigger than the deadline, the sweep can
+    /// only get through the first (healthy) segment before its budget is spent. If it stopped only in
+    /// spirit - checking the deadline but finishing the loop anyway - this would still find the corrupt
+    /// segment and still take the full three-segment cost; asserting both `bad.is_empty()` and the
+    /// elapsed time is what pins a real early exit rather than a check with nothing behind it.
+    #[test]
+    fn sweep_stops_at_its_deadline_instead_of_running_to_completion() {
+        let _serial = test_sweep_serial().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (block, value) in [(100u64, "1"), (101, "2"), (102, "3")] {
+            seal_range(dir.path(), &[transfer(block, 0, value)], block, block).unwrap();
+        }
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        assert_eq!(segs.len(), 3);
+        let victim = segs.iter().max_by_key(|s| s.from_block).unwrap();
+        let path = segment_path(dir.path(), &victim.file, &victim.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        let end = len - 8 - footer_len;
+        assert!(end > 4, "the fixture needs a data region to corrupt");
+        bytes[4..end].fill(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+
+        test_set_sweep_delay_ms(80);
+        let deadline = Some(Instant::now() + Duration::from_millis(100));
+        let start = Instant::now();
+        let bad = segments_failing_verification(dir.path(), &usdc(), deadline);
+        let elapsed = start.elapsed();
+        test_set_sweep_delay_ms(0);
+
+        assert!(
+            elapsed < Duration::from_millis(220),
+            "3 segments at 80ms each is 240ms if the deadline is ignored; took {elapsed:?}"
+        );
+        assert!(
+            bad.is_empty(),
+            "the deadline must land before the corrupt (last) segment is ever read, or this proves \
+             nothing about stopping early"
         );
     }
 
