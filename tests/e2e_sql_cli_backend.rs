@@ -166,3 +166,38 @@ async fn a_store_held_by_another_process_falls_back_to_the_instance() {
     );
     assert_eq!(instance.hits.load(Ordering::SeqCst), 1);
 }
+
+/// **Absent store, and no instance to fall back to → both halves named.** (#474)
+///
+/// `absent_store` exists so the connect failure can say more than "is `nuthatch dev` running?" -
+/// that alone is only half the truth when the real mistake is the directory. Nothing in the suite
+/// named the message itself; it could be reworded into nonsense, or the `Some(db)` arm dropped for
+/// the bare `None` message, with every other test here still green, because they all point `--url`
+/// at a real `serving_instance`.
+///
+/// Port 1 is privileged, so nothing in CI binds it - the connection is refused rather than merely
+/// slow, without needing to race a listener's shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_local_store_and_no_instance_names_both_in_the_error() {
+    let empty = tempfile::tempdir().unwrap();
+
+    let (status, output) = run_sql(empty.path(), "http://127.0.0.1:1", "SELECT 1 AS n").await;
+
+    assert!(
+        !status.success(),
+        "there is nothing to answer this query, got:\n{output}"
+    );
+    let expected_db = empty.path().join("nuthatch.redb");
+    assert!(
+        output.contains(&format!("no store at {}", expected_db.display())),
+        "the message must name the absent store, got:\n{output}"
+    );
+    assert!(
+        output.contains("Is `nuthatch dev` running, and is --dir the nest directory?"),
+        "and must ask about both the process and the directory, got:\n{output}"
+    );
+    assert!(
+        !expected_db.exists(),
+        "probing for a store must not create one - it left {expected_db:?} behind"
+    );
+}
