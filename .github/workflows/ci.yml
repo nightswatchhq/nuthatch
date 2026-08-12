@@ -7,8 +7,16 @@ on:
     # catches real breakage. It runs on GitHub's machines, so it costs no Claude allowance:
     # it is the one gate that is free, and therefore the one to keep.
     branches: [main, 'sprint/**']
+  # No `branches:` filter here, deliberately - it filters on the PR's *base*, and a stacked PR
+  # (head branch built on another feature branch, not `main`) matched neither the old
+  # `[main]` list nor `[main, 'sprint/**']`: zero checks run, and the PR reads as green because
+  # an empty check list renders the same as "nothing failed" (#454). Filtering by base can't
+  # enumerate every base a stack might use, so the fix is to stop trying - build every PR
+  # regardless of what it targets. Forward-ported here (#454/NIG-104) because GitHub evaluates
+  # `pull_request` triggers against the workflow file on the PR's *base* branch: `main` alone
+  # (#491) doesn't help a PR based on a `pete/*` branch forked from `sprint/diligent-dormouse`,
+  # since that branch still carried the filtered version.
   pull_request:
-    branches: [main, 'sprint/**']
 
 env:
   CARGO_TERM_COLOR: always
