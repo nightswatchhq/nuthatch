@@ -313,25 +313,46 @@ impl Store {
     /// a store they may read here. Callers that need to tell the two apart should check the path -
     /// [`store_holds_rows`] is the read-only variant for "does it hold anything".
     ///
-    /// **This still writes.** It goes through [`Store::from_db`], which commits a write txn, so
-    /// opening a store you only mean to read rewrites its bytes. The locking is *not* the reason: redb
-    /// takes the exclusive `flock` in `FileBackend::new`, i.e. inside `Database::open`, before any
-    /// transaction exists - so a store held by `dev` is refused here whether or not a write txn
-    /// follows, and the fallback to HTTP does not depend on this. The reason is table materialisation:
-    /// a store written by an older nuthatch that lacks one of the four tables would otherwise fail on
-    /// the first read rather than at open. The price is that every `nuthatch sql` against a free store
-    /// rewrites the file **at the same length with different bytes**, which anything caching on
-    /// `(mtime, len)` will read as unchanged. Making this read-only is a real question and a separate
-    /// one - see #471.
+    /// **Read-only** (issue #471). `Database::open` plus a read txn that checks the four tables are
+    /// present - no write txn, so a store opened here for reading is not rewritten by the reading.
+    /// The write txn this used to carry was never about locking: redb takes the exclusive `flock` in
+    /// `FileBackend::new`, i.e. inside `Database::open`, before any transaction exists - so a store
+    /// held by `dev` is refused here whether or not a write txn follows, and the fallback to HTTP does
+    /// not depend on it. Its actual job was materialising tables a store written by an older nuthatch
+    /// might lack, so a caller's first real read wouldn't hit redb's raw `TableDoesNotExist` instead
+    /// of an answer. A read txn proves the same thing without writing a byte - see the explicit check
+    /// below.
     pub fn open_existing(path: &Path) -> Result<Store> {
         let db = Database::open(path)
             .with_context(|| format!("failed to open an existing redb at {}", path.display()))?;
-        Store::from_db(db)
+        {
+            let rtx = db.begin_read().with_context(|| {
+                format!("failed to begin a read transaction at {}", path.display())
+            })?;
+            for (name, table) in [
+                ("entities", ENTITIES),
+                ("meta", META),
+                ("blocks", BLOCKS),
+                ("outbox", OUTBOX),
+            ] {
+                rtx.open_table(table).with_context(|| {
+                    format!(
+                        "{} is missing the '{name}' table - this store predates it; open it with the \
+                         nuthatch version that wrote it, or start a fresh store",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(Store {
+            db: Arc::new(db),
+            held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
     }
 
     fn from_db(db: Database) -> Result<Store> {
-        // Materialise all four tables up front so read txns never hit a missing one. This is the only
-        // reason the write txn is here - see [`Store::open_existing`] for what it costs a reader.
+        // Materialise all four tables up front so read txns never hit a missing one. Only `open`
+        // (the creating path) goes through this - `open_existing` is read-only, see #471.
         let wtx = db.begin_write()?;
         {
             wtx.open_table(ENTITIES)?;
@@ -1430,6 +1451,76 @@ mod tests {
         let store = Store::open_existing(&path).expect("an existing store opens");
         store.set_meta("last_block", "7").unwrap();
         assert_eq!(store.get_meta("last_block").unwrap().as_deref(), Some("7"));
+    }
+
+    /// Issue #471. `open_existing` used to go through [`Store::from_db`], which commits a write txn to
+    /// materialise the four tables - so every `nuthatch sql` against a free store rewrote the file at
+    /// the same length with different bytes. Hash the whole file before and after: length alone would
+    /// not have caught the original bug.
+    #[test]
+    fn open_existing_does_not_rewrite_the_bytes_of_the_store_it_reads() {
+        use std::hash::{Hash, Hasher};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = Store::open(&path).unwrap();
+            apply_block(&s, 1, 2, "h1");
+            s.set_meta("last_block", "1").unwrap();
+        }
+
+        let hash_of = |p: &std::path::Path| {
+            let bytes = std::fs::read(p).unwrap();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            (bytes.len(), h.finish())
+        };
+        let before = hash_of(&path);
+
+        {
+            let store = Store::open_existing(&path).expect("an existing store opens for reading");
+            // Actually read through it, not just open it.
+            assert_eq!(store.get_meta("last_block").unwrap().as_deref(), Some("1"));
+        }
+
+        let after = hash_of(&path);
+        assert_eq!(
+            before, after,
+            "reading an existing store through open_existing must not change its bytes"
+        );
+    }
+
+    /// Issue #471. The write txn `open_existing` used to commit was not pointless: it materialised
+    /// tables a store written by an older nuthatch might lack, so a caller's first real read failed
+    /// cleanly at open rather than confusingly later. The read-only replacement must keep that
+    /// property - so build a store missing one of the four tables and confirm the failure is early,
+    /// at `open_existing`, and names the table, not a raw redb error surfacing on first use.
+    #[test]
+    fn open_existing_fails_early_and_legibly_when_a_table_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = Store::open(&path).unwrap();
+            apply_block(&s, 1, 1, "h1");
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            assert!(
+                wtx.delete_table(OUTBOX).unwrap(),
+                "the table must have existed to prove this simulates an older store, not a fresh one"
+            );
+            wtx.commit().unwrap();
+        }
+
+        let err = Store::open_existing(&path)
+            .err()
+            .expect("a store missing a table must fail at open, not on first use");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outbox"),
+            "the error should name the missing table, got: {msg}"
+        );
     }
 
     #[test]
