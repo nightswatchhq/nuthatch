@@ -430,6 +430,13 @@ pub(crate) fn parse_retry_hint(raw: &str) -> Option<Duration> {
         ("h", 3600.0),
         ("s", 1.0),
     ];
+
+    // Try composite Go duration first: `1m30s`, `2h30m15s`, `1h500ms`, etc.
+    // A composite has at least two unit-terminated segments and no bare number tail.
+    if let Some(total) = parse_go_composite(raw, UNITS) {
+        return Some(total);
+    }
+
     let (value, secs_per_unit) = UNITS
         .iter()
         .find_map(|(suffix, mult)| raw.strip_suffix(suffix).map(|v| (v, *mult)))
@@ -441,6 +448,44 @@ pub(crate) fn parse_retry_hint(raw: &str) -> Option<Duration> {
         return None;
     }
     Duration::try_from_secs_f64(n * secs_per_unit).ok()
+}
+
+/// Parse a Go composite duration string such as `1m30s` or `2h30m15.5s`.
+///
+/// Go's `time.Duration.String()` emits one or more `<number><unit>` segments with no
+/// separator. A single-segment form like `30s` is handled by the caller's simpler path;
+/// this function only succeeds when it consumes **two or more** segments so the two code
+/// paths do not overlap on single-unit inputs.
+fn parse_go_composite(raw: &str, units: &[(&str, f64)]) -> Option<Duration> {
+    let mut rest = raw;
+    let mut total_secs: f64 = 0.0;
+    let mut segments: u32 = 0;
+
+    while !rest.is_empty() {
+        // Try each unit in order (longest first). For each candidate unit `suffix`, look
+        // for its first occurrence in `rest`; the slice before it must be a valid number.
+        let (consumed, secs) = units.iter().find_map(|(suffix, mult)| {
+            let sep = rest.find(suffix)?;
+            if sep == 0 {
+                return None; // need at least one digit before the unit
+            }
+            let n: f64 = rest[..sep].parse().ok()?;
+            if !n.is_finite() || n < 0.0 {
+                return None;
+            }
+            Some((sep + suffix.len(), n * mult))
+        })?;
+
+        total_secs += secs;
+        rest = &rest[consumed..];
+        segments += 1;
+    }
+
+    if segments >= 2 {
+        Duration::try_from_secs_f64(total_secs).ok()
+    } else {
+        None
+    }
 }
 
 /// The `try_again_in` hint out of a JSON-RPC error object, if the provider sent one.
@@ -2356,11 +2401,19 @@ mod rfc0036_tests {
             ("  3s  ", 3_000),
             // Bare number is seconds, matching `Retry-After`.
             ("5", 5_000),
+            // Go composite durations: the provider said `1m30s`, not `90s`.
+            ("1m30s", 90_000),
+            ("2m30s", 150_000),
+            ("1h30m", 5_400_000),
+            ("1h30m15s", 5_415_000),
+            ("2h0m0s", 7_200_000),
+            ("1h500ms", 3_600_500),
+            ("1m30.5s", 90_500),
         ] {
             let got = parse_retry_hint(raw).unwrap_or_else(|| panic!("{raw} must parse"));
             assert_eq!(got.as_millis() as u64, expected_ms, "{raw}");
         }
-        for raw in ["", "soon", "-1s", "NaN", "1 fortnight", "1e400s"] {
+        for raw in ["", "soon", "-1s", "NaN", "1 fortnight", "1e400s", "1m-5s", "ms30s"] {
             assert!(
                 parse_retry_hint(raw).is_none(),
                 "{raw:?} is not a duration we understand - it must fall back to our own pacing"
