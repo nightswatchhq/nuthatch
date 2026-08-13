@@ -8,6 +8,16 @@
 //!
 //! All three routings are asserted together, because "absent → HTTP" alone is satisfied by a backend
 //! that always chooses HTTP.
+//!
+//! The mount-prefix tests below (issue #546, closing the gap #509/#545 left) are a separate concern
+//! from the backend-choice tests above: given the HTTP fallback is chosen, does it ask for the right
+//! path? They cannot reuse `serving_instance()` - that stand-in answers `/sql` unconditionally, which
+//! would go green whether or not `resolve_mount_prefix` worked. They bring up the real
+//! `serve::compose_runtime` wiring `runtime::dev` uses instead, exactly to avoid the fixture this repo
+//! keeps getting wrong: an `AppState` built by hand and served without ever going through the router
+//! that actually nests a mount under `/<alias>`.
+
+mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,6 +26,10 @@ use std::sync::Arc;
 
 use axum::{extract::Query, routing::get, Json, Router};
 use serde_json::json;
+
+use common::tape::*;
+use nuthatch::runtime::{self, MountTable, MOUNTS_FILE};
+use nuthatch::{health::RuntimeHealth, indexer, migrate, serve};
 
 /// A stand-in for a running `nuthatch dev`: answers `/sql` with one unmistakable row, and counts the
 /// requests it was asked, so "the answer came from HTTP" is observed rather than inferred.
@@ -199,5 +213,185 @@ async fn no_local_store_and_no_instance_names_both_in_the_error() {
     assert!(
         !expected_db.exists(),
         "probing for a store must not create one - it left {expected_db:?} behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mount-prefix resolution (issue #546)
+// ---------------------------------------------------------------------------
+
+/// Bring up a real `mounts.toml` runtime with one nest mounted under `alias`, the same way
+/// `runtime::dev` does: a migrated mount table, a real `indexer::spawn_runtime` cursor over a
+/// scripted tape, and `serve::compose_runtime` bound to a real TCP listener - not a hand-built
+/// `AppState` handed straight to a handler. Returns the bound address and the dataset directory
+/// (`data/<nid>`) the CLI is pointed at, matching `--dir data/<nid>` on a real deployment.
+///
+/// The store stays open for the rest of the test (inside the `AppState` the spawned server holds),
+/// so the CLI subprocess's own local-store probe is refused and it is forced onto the HTTP path this
+/// issue is about - the same way a live `nuthatch dev` forces `nuthatch sql` there.
+async fn bring_up_mounted_runtime(
+    root: &Path,
+    alias: &str,
+) -> (std::net::SocketAddr, std::path::PathBuf) {
+    std::fs::write(
+        root.join(MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\nnests = [\"{alias}\"]\n"
+        ),
+    )
+    .unwrap();
+    let nest_dir = root.join("nests").join(alias);
+    std::fs::create_dir_all(&nest_dir).unwrap();
+    scaffold_nest(&nest_dir, alias, USDC);
+    migrate::run(root, false, false).expect("migrate to the 2.0 data/<nid> layout");
+
+    let mounts = MountTable::load(root).unwrap();
+    let datasets = mounts.datasets(root);
+    let multi_tenant = mounts.is_multi_tenant();
+    assert!(
+        !multi_tenant,
+        "a single mount must not become multi-tenant - route_key would gain a tenant segment"
+    );
+
+    let tape = Arc::new(TapeSource::new());
+    let a1 = account(1);
+    let a2 = account(2);
+    tape.insert_block(
+        1,
+        transfers_block(1, 0, 1_700_000_001, USDC, &[(a1.as_str(), a2.as_str(), 100)]),
+    );
+    tape.advance_tip_to(1);
+
+    let health = Arc::new(RuntimeHealth::new());
+    for ds in &datasets {
+        health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
+    }
+    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load_mounted");
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        mounted,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let landed = wait_until(POLL_TIMEOUT, || {
+        cursor
+            .states
+            .iter()
+            .all(|(_, s)| s.store.get_meta("last_block").ok().flatten().as_deref() == Some("1"))
+    })
+    .await;
+    assert!(landed, "the mounted nest did not index to the tip in time");
+
+    let mut estimates = HashMap::new();
+    let states = runtime::fan_out_aliases(&datasets, cursor.states, &health, &mut estimates, multi_tenant);
+
+    let nid = datasets[0]
+        .nid
+        .clone()
+        .expect("a migrated dataset must carry an identity");
+    // The fields `resolve_mount_prefix` actually reads (`nid`, `base_path`) - matching the shape
+    // `runtime::dev`'s roster builds (`runtime.rs`'s `roster_entries`), not every field it carries.
+    let roster = serde_json::json!({
+        "runtime": "test",
+        "nests": [{"name": alias, "nid": nid, "base_path": format!("/{alias}")}],
+    });
+    let live = serve::LiveRuntime::new(serve::compose_runtime(roster, states, health));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, live.service()).await;
+    });
+
+    (addr, datasets[0].dir.clone())
+}
+
+/// **The mutation this test exists for.** Against the pre-#509 behaviour (`resolve_mount_prefix`
+/// stubbed to `String::new()`), or with the `(Some(only), None)` arm degenerating to `String::new()`,
+/// or with `{prefix}` dropped from the request URL's `format!`, the CLI asks `compose_runtime` for
+/// `/sql` at the root - a path nothing here registers (only `/health`, `/nests`, `/ready` and each
+/// nest's routes under `/<alias>`) - so the request 404s and the command exits non-zero. A "prefix
+/// was returned" assertion cannot see any of that; only a query that must actually succeed can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mounted_runtime_resolves_the_alias_prefix_and_the_query_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let (addr, dataset_dir) = bring_up_mounted_runtime(root.path(), "usdc").await;
+
+    let (status, output) = run_sql(&dataset_dir, &format!("http://{addr}"), "SELECT 1 AS n").await;
+
+    assert!(
+        status.success(),
+        "the query must reach /usdc/sql through the resolved prefix, got:\n{output}"
+    );
+    assert!(
+        output.contains('n') && output.contains('1'),
+        "and the answer must be the query's, got:\n{output}"
+    );
+}
+
+/// **The other half of #546.** A solo (`nuthatch.toml`) runtime has no `/nests` route at all, so
+/// `resolve_mount_prefix` must leave the request unprefixed - the behaviour before #509, which #509
+/// must not have regressed for the case it wasn't fixing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_solo_runtime_stays_unprefixed() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(root.path(), "usdc", USDC);
+
+    let tape = Arc::new(TapeSource::new());
+    let a1 = account(1);
+    let a2 = account(2);
+    tape.insert_block(
+        1,
+        transfers_block(1, 0, 1_700_000_001, USDC, &[(a1.as_str(), a2.as_str(), 100)]),
+    );
+    tape.advance_tip_to(1);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        root.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let store = rt.state.store.clone();
+
+    let landed = wait_until(POLL_TIMEOUT, || {
+        store.get_meta("last_block").ok().flatten().as_deref() == Some("1")
+    })
+    .await;
+    assert!(landed, "the solo nest did not index to the tip in time");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(rt.state));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (status, output) = run_sql(root.path(), &format!("http://{addr}"), "SELECT 1 AS n").await;
+
+    assert!(
+        status.success(),
+        "a solo runtime serves /sql at the root and must stay unprefixed, got:\n{output}"
+    );
+    assert!(
+        output.contains('n') && output.contains('1'),
+        "and the answer must be the query's, got:\n{output}"
     );
 }
