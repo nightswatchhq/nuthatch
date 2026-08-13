@@ -98,8 +98,11 @@ async fn spawn_cursor(
         false,
         None,
         health,
-        // Production's default. `--fail-fast` deliberately couples cursor fate (`runtime.rs:1128`), so
-        // it is the one configuration under which this isolation property is not expected to hold.
+        // Production's default. This is `spawn_runtime`'s `fail_fast`, which the per-nest supervisor
+        // acts on at `indexer.rs:898-899`: a quarantined nest aborts the whole cursor instead of being
+        // isolated, so it is the one configuration under which this isolation property is not
+        // expected to hold. (The sibling-cursor coupling that `--fail-fast` also drives lives
+        // separately, in `runtime.rs:1539`'s `supervise_cursors`.)
         false,
     )
     .await

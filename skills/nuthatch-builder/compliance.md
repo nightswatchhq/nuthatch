@@ -9,7 +9,7 @@ throughout are i128 base units, returned as decimal strings. Flags are authorita
 | Feature | What it does | Drive it with |
 |---|---|---|
 | **Labels** | Content-addressed sets of tagged addresses (the annotation substrate). | `nuthatch labels import <file>` / `labels list` |
-| **Lists** | Sanctions/watch lists as content-addressed snapshots (fetched out-of-band). | `nuthatch lists fetch --list <name>` / `lists list` |
+| **Lists** | Sanctions/watch lists as content-addressed snapshots (fetched out-of-band). | `nuthatch lists fetch <name>` / `lists list` |
 | **Screen** | Screen sealed transfers against a list snapshot; records `sanction_hit` annotations. Replayable: same list hash + range → identical hits. | `nuthatch screen --list <hash> --from <b> --to <b>` |
 | **Flags** | `threshold` (single transfer ≥ N) and `velocity` (windowed volume) flags. Configured in `nuthatch.toml` `[flags]`. | query the `flags` MCP tool / `/flags` |
 | **Exposure** | An address's direct counterparty exposure to the labeled set. | the `exposure` MCP tool / `/exposure/{addr}` |
@@ -25,7 +25,7 @@ re-execution - nothing heavier (no TEE, no zk).
 
 ```sh
 # Screen a range against a fetched sanctions snapshot, then prove it reproduces.
-nuthatch lists fetch --list ofac-sdn
+nuthatch lists fetch ofac-sdn
 nuthatch screen --list <hash> --from 18000000 --to 18100000
 nuthatch audit replay --from 18000000 --to 18100000     # must reproduce byte-for-byte
 ```

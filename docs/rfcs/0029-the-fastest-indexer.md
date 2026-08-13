@@ -54,6 +54,12 @@ Then we ran it, and it died.
 
 `nuthatch bench backfill --from 0 --to 22200000 --window 50000 --concurrency 8 --seal-direct`:
 
+> Left as it was typed, because this section records a run rather than offering a recipe - but a
+> reader will copy it, so: **as of 2.2.0 that line does not run.** `bench backfill` takes no
+> `--window` and rejects it with `error: unexpected argument '--window' found`. Its flags are
+> `--dir --from --to --runs --rpc --out --label --seal-direct --concurrency --keep`. The getLogs
+> width is `nuthatch doctor`'s to measure and the nest's to configure.
+
 ```
 Error: seal-direct getLogs 20700000..=20749999 failed after 5 attempts
 Caused by:
