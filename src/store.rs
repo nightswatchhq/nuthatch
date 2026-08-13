@@ -265,8 +265,12 @@ pub struct Store {
 /// Adoption turns on the difference in both directions (issue #408): an empty store counted as data
 /// costs a dataset its one early cutoff, permanently.
 ///
-/// Opens **read-only and non-creating** - `Database::open` rather than `Database::create` - because a
-/// question about whether a store holds data must not be able to answer itself by creating one.
+/// **Non-creating, and no write txn** - `Database::open` rather than `Database::create` - because a
+/// question about whether a store holds data must not be able to answer itself by creating one. This
+/// is not the same as read-only: `Database::open` (`FileBackend::new`) takes the file `O_RDWR` and
+/// holds an exclusive `flock` for the lifetime of the handle, before any transaction exists, and may
+/// run crash recovery on it. A store held open elsewhere is refused here for that reason, not because
+/// this call writes to it.
 ///
 /// The three signals are the ones a cursor writes as it progresses: `last_block` once it has indexed
 /// anything, `sealed_through` once it has sealed past finality, and rows in `entities`/`blocks` for
@@ -277,7 +281,7 @@ pub struct Store {
 /// the caller is the only one who knows which way to be wrong about it.
 pub fn store_holds_rows(path: &Path) -> Result<bool> {
     let db = Database::open(path)
-        .with_context(|| format!("failed to open redb read-only at {}", path.display()))?;
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
     let rtx = db.begin_read()?;
     let meta = rtx.open_table(META)?;
     for key in ["last_block", "sealed_through"] {
@@ -311,17 +315,17 @@ impl Store {
     ///
     /// Absent and locked both come back as errors, which is what the routing callers want: neither is
     /// a store they may read here. Callers that need to tell the two apart should check the path -
-    /// [`store_holds_rows`] is the read-only variant for "does it hold anything".
+    /// [`store_holds_rows`] is the non-creating variant for "does it hold anything".
     ///
-    /// **Read-only** (issue #471). `Database::open` plus a read txn that checks the four tables are
-    /// present - no write txn, so a store opened here for reading is not rewritten by the reading.
-    /// The write txn this used to carry was never about locking: redb takes the exclusive `flock` in
-    /// `FileBackend::new`, i.e. inside `Database::open`, before any transaction exists - so a store
-    /// held by `dev` is refused here whether or not a write txn follows, and the fallback to HTTP does
-    /// not depend on it. Its actual job was materialising tables a store written by an older nuthatch
-    /// might lack, so a caller's first real read wouldn't hit redb's raw `TableDoesNotExist` instead
-    /// of an answer. A read txn proves the same thing without writing a byte - see the explicit check
-    /// below.
+    /// **No write txn** (issue #471) - `Database::open` plus a read txn that checks the four tables
+    /// are present, so nothing here commits a change. That is narrower than read-only: `Database::open`
+    /// (`FileBackend::new`) takes the file `O_RDWR` and holds an exclusive `flock` for the lifetime of
+    /// the handle, before any transaction exists, and may run crash recovery on it - so a store held
+    /// by `dev` is refused here whether or not a write txn follows, and the fallback to HTTP does not
+    /// depend on it. The write txn this used to carry was never about locking; its actual job was
+    /// materialising tables a store written by an older nuthatch might lack, so a caller's first real
+    /// read wouldn't hit redb's raw `TableDoesNotExist` instead of an answer. A read txn proves the
+    /// same thing without committing - see the explicit check below.
     pub fn open_existing(path: &Path) -> Result<Store> {
         let db = Database::open(path)
             .with_context(|| format!("failed to open an existing redb at {}", path.display()))?;
@@ -352,7 +356,7 @@ impl Store {
 
     fn from_db(db: Database) -> Result<Store> {
         // Materialise all four tables up front so read txns never hit a missing one. Only `open`
-        // (the creating path) goes through this - `open_existing` is read-only, see #471.
+        // (the creating path) goes through this - `open_existing` takes no write txn, see #471.
         let wtx = db.begin_write()?;
         {
             wtx.open_table(ENTITIES)?;
@@ -1492,7 +1496,7 @@ mod tests {
 
     /// Issue #471. The write txn `open_existing` used to commit was not pointless: it materialised
     /// tables a store written by an older nuthatch might lack, so a caller's first real read failed
-    /// cleanly at open rather than confusingly later. The read-only replacement must keep that
+    /// cleanly at open rather than confusingly later. The no-write-txn replacement must keep that
     /// property - so build a store missing one of the four tables and confirm the failure is early,
     /// at `open_existing`, and names the table, not a raw redb error surfacing on first use.
     #[test]
