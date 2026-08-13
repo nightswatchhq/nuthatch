@@ -2413,7 +2413,16 @@ mod rfc0036_tests {
             let got = parse_retry_hint(raw).unwrap_or_else(|| panic!("{raw} must parse"));
             assert_eq!(got.as_millis() as u64, expected_ms, "{raw}");
         }
-        for raw in ["", "soon", "-1s", "NaN", "1 fortnight", "1e400s", "1m-5s", "ms30s"] {
+        for raw in [
+            "",
+            "soon",
+            "-1s",
+            "NaN",
+            "1 fortnight",
+            "1e400s",
+            "1m-5s",
+            "ms30s",
+        ] {
             assert!(
                 parse_retry_hint(raw).is_none(),
                 "{raw:?} is not a duration we understand - it must fall back to our own pacing"
