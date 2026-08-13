@@ -798,6 +798,28 @@ fn is_terminal(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<TerminalFault>())
 }
 
+/// Tags a [`NestIngest::prepare`] failure as "the chain wasn't reachable yet", not a real fault (#510).
+/// `prepare`'s cold-start tip lookups used to be a bare `?`: a fully dead RPC pool killed the whole
+/// solo `dev` process moments after `serve` had already logged "API live", and with the process gone
+/// `/ready` never got a chance to report `stalled` either - the exact tolerance the steady-state tip
+/// loop already gives a dead pool never applied to the one-time lookup that runs before it. Recognised
+/// by downcast (same idiom as [`TerminalFault`]) so [`prepare_retrying`] can retry *only* this failure
+/// and still let any other `prepare` error (corrupt state, a dead IVM thread, …) fail loudly as before.
+#[derive(Debug)]
+struct ColdStartUnreachable(String);
+
+impl std::fmt::Display for ColdStartUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ColdStartUnreachable {}
+
+fn is_cold_start_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<ColdStartUnreachable>())
+}
+
 /// First backoff before a quarantined nest is re-admitted, doubling per attempt (RFC-0026 §4).
 const QUARANTINE_BACKOFF_START_SECS: u64 = 5;
 /// Ceiling on that backoff: an operator who restarts a wedged endpoint sees recovery within minutes.
@@ -1948,6 +1970,9 @@ async fn build_nest(
         topic0s,
         start_block,
     };
+    // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
+    // here, not permanent - see `serve::poll_stalled`.
+    nest.metrics.mark_started();
 
     let nest_info = serde_json::json!({
         "name": config.nest.name,
@@ -3002,7 +3027,9 @@ impl NestIngest {
         // below picks up from where this left off and handles the near-tip (un-finalized) window the
         // normal way. Nothing here can reorg - it is all strictly past finality.
         if seal_direct && self.store.get_meta(LAST_BLOCK_KEY)?.is_none() {
-            let tip = source.tip().await?;
+            let tip = source.tip().await.map_err(|e| {
+                anyhow::Error::new(ColdStartUnreachable(format!("cold-start tip lookup failed: {e:#}")))
+            })?;
             let origin = cold_start_block(self.start_block, backfill, tip);
             let finalized_tag = match self.finality {
                 Finality::FinalizedTag { .. } => source.finalized().await.ok().flatten(),
@@ -3131,7 +3158,11 @@ impl NestIngest {
         let next = match self.store.get_meta(LAST_BLOCK_KEY)? {
             Some(v) => v.parse::<u64>().context("corrupt last_block")? + 1,
             None => {
-                let tip = source.tip().await?;
+                let tip = source.tip().await.map_err(|e| {
+                    anyhow::Error::new(ColdStartUnreachable(format!(
+                        "cold-start tip lookup failed: {e:#}"
+                    )))
+                })?;
                 let start = cold_start_block(self.start_block, backfill, tip);
                 self.store.set_meta(START_BLOCK_KEY, &start.to_string())?;
                 let src = if backfill.is_none() && self.start_block.is_some() {
@@ -3528,6 +3559,34 @@ impl NestIngest {
     }
 }
 
+/// Drive [`NestIngest::prepare`] to completion, retrying a [`ColdStartUnreachable`] failure forever
+/// (mirroring `index_loop`'s own tolerance of a dead pool once past this point) and propagating any
+/// other failure immediately - a real bug (corrupt state, a dead IVM thread, …) must still fail the
+/// process loudly rather than spin quietly (#510).
+async fn prepare_retrying(
+    nest: &mut NestIngest,
+    source: &dyn Source,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window: u64,
+) -> Result<u64> {
+    let mut poll_failures = 0u32;
+    loop {
+        match nest
+            .prepare(source, backfill, seal_direct, concurrency, window)
+            .await
+        {
+            Ok(next) => return Ok(next),
+            Err(e) if is_cold_start_unreachable(&e) => {
+                poll_failures = escalate_stall(poll_failures, &e);
+                sleep_secs(3).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn index_loop(
     source: Arc<dyn Source>,
     mut nest: NestIngest,
@@ -3536,9 +3595,9 @@ async fn index_loop(
     concurrency: usize,
     window: u64,
 ) -> Result<()> {
-    let mut next = nest
-        .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
-        .await?;
+    let mut next =
+        prepare_retrying(&mut nest, source.as_ref(), backfill, seal_direct, concurrency, window)
+            .await?;
 
     // Adaptive getLogs sizing (RFC-0004 §2), seeded from the chain's default window.
     //
@@ -5151,6 +5210,54 @@ template = "pool"
             w.abort();
         }
         nest
+    }
+
+    /// #510: a fully dead RPC pool at cold start must not kill the process. Before this fix, `prepare`'s
+    /// cold-start tip lookup was a bare `?`: the very first connectivity error propagated straight out
+    /// of `index_loop` as a fatal `Result::Err`, and `run`'s `tokio::select!` treated that as the whole
+    /// process failing - moments after `serve` had already logged "API live". A pool that is merely
+    /// *briefly* unreachable (this fixture, one failure then recovery) must instead retry and proceed,
+    /// exactly as the steady-state tip loop already tolerates the same failure once past cold start.
+    #[tokio::test]
+    async fn prepare_retries_a_cold_start_tip_lookup_instead_of_dying() {
+        use crate::rpc::Log;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct FlakyTipSource {
+            fails_left: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl Source for FlakyTipSource {
+            async fn tip(&self) -> Result<u64> {
+                if self.fails_left.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    anyhow::bail!("connection refused (pool dead)");
+                }
+                Ok(1_000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<Log>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest = build_contract_free_test_nest(dir.path()).await;
+        let source = FlakyTipSource {
+            fails_left: AtomicU64::new(1),
+        };
+
+        let next = prepare_retrying(&mut nest, &source, None, false, 1, 5)
+            .await
+            .expect("a pool that eventually answers must not fail prepare - it should retry");
+        // DEFAULT_BACKFILL is 5_000; tip is 1_000, so cold_start_block saturates to 0.
+        assert_eq!(next, 0, "cold start begins at block 0 when tip < DEFAULT_BACKFILL");
     }
 
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {

@@ -619,10 +619,14 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
 /// when caught up, so a minute-plus of silence means every RPC endpoint is unreachable, not idleness.
 const READINESS_STALL_SECS: u64 = 90;
 
-/// Stalled = polled successfully at least once (`last_poll != 0`) but not within `threshold` seconds.
-/// A never-polled node (`last_poll == 0`) is *starting up*, not stalled - it gets grace.
-fn poll_stalled(last_poll: u64, now: u64, threshold: u64) -> bool {
-    last_poll != 0 && now.saturating_sub(last_poll) > threshold
+/// Stalled = polled successfully at least once (`last_poll != 0`) but not within `threshold` seconds. A
+/// never-polled node (`last_poll == 0`) is *starting up*, not stalled - it gets grace, but the grace is
+/// bounded by `started_at` (#510): a pool that has been dead since before the very first poll must
+/// eventually report stalled too, or `/ready` stays a false "ready:true" forever. `started_at == 0`
+/// (not yet stamped, e.g. an un-stamped test fixture) falls back to the old unconditional grace.
+fn poll_stalled(last_poll: u64, started_at: u64, now: u64, threshold: u64) -> bool {
+    let since = if last_poll != 0 { last_poll } else { started_at };
+    since != 0 && now.saturating_sub(since) > threshold
 }
 
 /// Readiness for a supervisor (k8s-style). `/health` is liveness - the process is up and serving, and
@@ -662,23 +666,25 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         .runtime_health
         .as_ref()
         .map(|(name, _)| METRICS.nest(name));
-    let (last_poll, tip, last, sealed) = match &nest {
+    let (last_poll, tip, last, sealed, started_at) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
             m.tip(),
             m.last_block(),
             m.sealed_through(),
+            m.started_at(),
         ),
         None => (
             METRICS.last_poll_ok(),
             METRICS.tip_height(),
             METRICS.last_block(),
             METRICS.sealed_through_val(),
+            METRICS.started_at(),
         ),
     };
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
-    let stalled = poll_stalled(last_poll, now, READINESS_STALL_SECS);
+    let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS);
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
@@ -1483,14 +1489,28 @@ mod tests {
     #[test]
     fn readiness_stall_logic() {
         let now = 1_000_000u64;
-        // Never polled → starting up, not stalled (grace).
-        assert!(!poll_stalled(0, now, 90));
+        // Never polled, just started → starting up, not stalled (grace).
+        assert!(!poll_stalled(0, now - 10, now, 90));
         // Polled recently → healthy.
-        assert!(!poll_stalled(now - 10, now, 90));
+        assert!(!poll_stalled(now - 10, now - 1_000, now, 90));
         // Polled long ago → stalled.
-        assert!(poll_stalled(now - 100, now, 90));
+        assert!(poll_stalled(now - 100, now - 1_000, now, 90));
         // Exactly at the threshold is not yet stalled (strictly greater).
-        assert!(!poll_stalled(now - 90, now, 90));
+        assert!(!poll_stalled(now - 90, now - 1_000, now, 90));
+        // Neither timestamp stamped (an un-stamped fixture) → old unconditional grace, not stalled.
+        assert!(!poll_stalled(0, 0, now, 90));
+    }
+
+    /// #510: a pool that has been unreachable since before the very first poll must eventually report
+    /// `stalled`, not stay a permanent "just starting up". Never-polled (`last_poll == 0`) alone used to
+    /// mean forever-fresh; the fix bounds that grace by how long ago the nest started trying.
+    #[test]
+    fn a_pool_dead_since_cold_start_eventually_stalls() {
+        let now = 2_000_000u64;
+        // Started 91s ago, never once polled successfully - past the 90s grace, so stalled.
+        assert!(poll_stalled(0, now - 91, now, 90));
+        // Started 10s ago, never polled - still within grace.
+        assert!(!poll_stalled(0, now - 10, now, 90));
     }
 
     #[test]
@@ -1683,6 +1703,37 @@ mod tests {
         );
         assert_eq!(live_json["stalled"], json!(false));
         assert_eq!(live_json["ready"], json!(true));
+    }
+
+    /// #510: a nest whose RPC pool has been dead since before its very first successful poll must
+    /// eventually answer `/ready` with `stalled`, not a permanent healthy-looking
+    /// `{"stalled":false,"last_poll_unixtime":0}` - the exact body a fully dead pool served forever
+    /// before this fix (the process used to crash before this endpoint even got a chance to answer).
+    #[tokio::test]
+    async fn a_never_polled_nest_stalls_once_its_start_grace_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "cold-start-dead";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        // Never successfully polled, and started well past the 90s grace window.
+        handle.set_started_at_for_test(now.saturating_sub(200));
+        assert_eq!(handle.last_poll_ok(), 0, "premise: this nest never polled");
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a pool dead since before the first poll must fail readiness: {json}"
+        );
+        assert_eq!(json["stalled"], json!(true));
+        assert_eq!(json["ready"], json!(false));
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
