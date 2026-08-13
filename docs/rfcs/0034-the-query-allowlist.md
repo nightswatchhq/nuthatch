@@ -40,8 +40,10 @@ public endpoint is:
 - with a cost profile an attacker can explore for free by trying queries,
 - and no way for an operator to say "this nest serves these five things".
 
-Note also that `/explain` does not carry the hot-row bound `/sql` does (issue #293). The allowlist
-applies to both, which incidentally closes that gap.
+Note also that `/explain` used to not carry the hot-row bound `/sql` does; #367 closed that gap
+unconditionally, so both endpoints are bounded whether or not a mount runs an allowlist. What the
+allowlist still closes is the *set* of queries `/explain` will plan at all, per the two paragraphs
+above.
 
 ## 2. Phase 1 - the allowlist is mount config
 

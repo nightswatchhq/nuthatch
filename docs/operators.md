@@ -1049,7 +1049,8 @@ Before pointing real traffic at a nuthatch deployment:
 
 - [ ] Running a release that includes the `/sql` statement-stacking fix (post-0.6.1).
 - [ ] Bound to localhost or an internal interface, with TLS and authentication in front.
-- [ ] `NUTHATCH_ADMIN_TOKEN` set, or `--no-admin` in use.
+- [ ] Admin surface accounted for: bound to localhost, or `--no-admin`, or a generated
+      `NUTHATCH_ADMIN_TOKEN` behind TLS.
 - [ ] Running as an unprivileged user; nest directory `0700`; `MemoryMax` set to the cursor budget.
 - [ ] Prometheus scraping `/metrics`; alerts wired for quarantine, cursor death, tip lag, ingest
       stall and memory.
