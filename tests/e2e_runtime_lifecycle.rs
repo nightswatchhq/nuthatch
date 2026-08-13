@@ -87,6 +87,7 @@ async fn two_nest_roost(
             ("usdc".to_string(), 90),
             ("arb".to_string(), 90),
         ]),
+        multi_tenant: false,
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
@@ -118,6 +119,20 @@ async fn status(live: &serve::LiveRuntime, path: &str) -> axum::http::StatusCode
         .body(axum::body::Body::empty())
         .unwrap();
     live.service().oneshot(req).await.unwrap().status()
+}
+
+/// Drive one GET through the served composition and return its parsed JSON body.
+async fn body_json(live: &serve::LiveRuntime, path: &str) -> serde_json::Value {
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = live.service().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// RFC-0027 §6: unmount is a **drain**, and the proof is that the store becomes reopenable.
@@ -347,6 +362,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         health,
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
+        multi_tenant: false,
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             // Only `usdc` is on record - `gamma` below is exactly the "runtime has never seen this
@@ -386,6 +402,25 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         .await
         .expect("mounting an unrecorded nest by nid must resolve data/<nid>, not nests/<name>");
     assert!(handles.states.iter().any(|(n, _)| n == "gamma"));
+
+    // #554: the roster is the surface an operator or tool actually reads to confirm a mount, and it
+    // must not still report the startup snapshot (`usdc` alone) once `gamma` is genuinely live. Not
+    // "the roster is non-empty" - that would pass unchanged - but that the mounted alias is *in* it.
+    let roster = body_json(&handles.live, "/nests").await;
+    let names: Vec<&str> = roster["nests"]
+        .as_array()
+        .expect("nests is an array")
+        .iter()
+        .map(|n| n["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        names.contains(&"gamma"),
+        "GET /nests must list a nest mounted live via POST /_admin/nests; got {names:?}"
+    );
+    assert!(
+        names.contains(&"usdc"),
+        "the pre-existing nest must stay listed too"
+    );
 
     // The record must be durable - `mounts.toml` is the record RFC-0027 §5 promises survives a
     // restart, and the whole point of fixing the mount half is that it now behaves like the unmount
@@ -481,6 +516,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         health,
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
+        multi_tenant: false,
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
