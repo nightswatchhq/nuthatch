@@ -1298,3 +1298,139 @@ async fn a_hot_scan_failure_does_not_claim_completeness_over_http() {
 
     server.abort();
 }
+
+/// **#472 + #477, as one piece.** Every #472 fixture above scaffolds a single table, so
+/// `tip_unavailable` (nest-wide by construction - one hot-store scan covers every table at once) was
+/// never exercised on a nest that also had a *per-table* `degraded_tables` opinion to disagree with.
+/// Two contracts, `usdc` cold-corrupted and `arb` left intact; the hot tip fails to scan on top of
+/// that. Querying the healthy table has to come back naming only `usdc` as degraded while still
+/// carrying `tip_unavailable: true` for the tip loss that touches both tables equally - the fixture
+/// #477 called for, doing #472's job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_two_contract_nest(dir.path(), "multi", "usdc", USDC, "arb", ARB);
+    let tape = Arc::new(TapeSource::new());
+
+    let a1 = account(1);
+    let a2 = account(2);
+    for b in 1..=6u64 {
+        let hash = block_hash(b, 0);
+        // Two logs in the same block, distinct log_index so tx_hash is unique.
+        let usdc_log =
+            transfer_log(USDC, b, 0, &hash, a1.as_str(), a2.as_str(), (100 * b) as u128);
+        let arb_log =
+            transfer_log(ARB, b, 1, &hash, a1.as_str(), a2.as_str(), (7 * b) as u128);
+        tape.insert_block(
+            b,
+            BlockFixture { hash, timestamp: 1_700_000_000 + b, logs: vec![usdc_log, arb_log] },
+        );
+    }
+    tape.advance_tip_to(6);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let store = rt.state.store.clone();
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            store.get_meta("last_block").ok().flatten().as_deref() == Some("6")
+        })
+        .await,
+        "nest did not index to the tip in time"
+    );
+
+    // Seal [1,3] on both tables, leaving [4,6] in the hot tip - same two-step shape as
+    // `a_corrupted_segment_reduces_the_table_over_http`, so each table has a sealed segment to corrupt
+    // (or not) independently of the other.
+    tape.advance_finalized_to(3);
+    tape.insert_block(7, empty_block(7, 0, 1_700_000_100));
+    tape.advance_tip_to(7);
+    assert!(
+        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 3).await,
+        "range [1,3] did not seal in time"
+    );
+
+    let usdc_table = transfer_table("usdc");
+    let arb_table = transfer_table("arb");
+    let manifest = seal::load_manifest(dir.path()).unwrap();
+    let usdc_segs = manifest
+        .tables
+        .get(&usdc_table)
+        .cloned()
+        .expect("usdc segment sealed");
+    assert_eq!(usdc_segs.len(), 1, "expected one sealed usdc segment, got {usdc_segs:?}");
+    let usdc_path = seal::segment_path(dir.path(), &usdc_segs[0].file, &usdc_segs[0].hash);
+
+    // Freeze ingestion, then inflict both faults at once - the combination #472 and #477 were each
+    // fixed in isolation from: `usdc`'s cold segment goes bad, and the *serving* store's hot scan is
+    // swapped for one that always errors.
+    rt.ingest.abort();
+    if let Some(w) = rt.alert_worker {
+        w.abort();
+    }
+    std::fs::write(&usdc_path, b"not parquet, not even close").unwrap();
+    let mut state = rt.state.clone();
+    state.store = Arc::new(HotScanFails(state.store.clone()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let q = format!("SELECT block_number FROM \"{arb_table}\"");
+    let resp: serde_json::Value = client
+        .get(format!("{base}/sql"))
+        .query(&[("q", q)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        resp["error"].is_null(),
+        "neither fault may turn into a query error: {resp}"
+    );
+    assert_eq!(
+        resp["tip_unavailable"],
+        serde_json::json!(true),
+        "the tip loss is nest-wide, so a query against the untouched table still sees it: {resp}"
+    );
+    assert_eq!(
+        resp["degraded_tables"],
+        serde_json::json!([usdc_table]),
+        "the flag names the table that is actually short - never the healthy one just queried: {resp}"
+    );
+    assert!(
+        resp["degraded"].as_bool().unwrap_or(false),
+        "degraded_tables is non-empty, so the nest-wide flag must agree: {resp}"
+    );
+    // Cold-only (the tip failed to scan), and the arb segment sealed [1,3] intact - the only rows this
+    // query can honestly return; nothing invented from the tip it never read.
+    assert_eq!(
+        resp["rows"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|r| r["block_number"].as_u64())
+            .collect::<BTreeSet<u64>>(),
+        (1..=3).collect::<BTreeSet<u64>>(),
+        "the healthy table's own sealed segment, and nothing from the lost tip: {resp}"
+    );
+
+    server.abort();
+}

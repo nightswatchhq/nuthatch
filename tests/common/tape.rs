@@ -397,6 +397,55 @@ events = ["Transfer"]
     Config::load(dir).expect("load scaffolded config")
 }
 
+/// [`scaffold_nest`], but with **two** independently-aliased ERC-20 `Transfer` contracts in one nest,
+/// so the fixture has two tables (`{alias1}__transfer`, `{alias2}__transfer`) sharing one cursor.
+/// Every hot-scan/cold-corruption fixture up to #472/#477 scaffolds exactly one contract, so "the
+/// nest is degraded" and "this query's table is degraded" are the same set in every assertion - a
+/// signal that names the wrong table, or every table, passes them all. This exists so a test can
+/// degrade one alias and query the other.
+pub fn scaffold_two_contract_nest(
+    dir: &Path,
+    name: &str,
+    alias1: &str,
+    address1: &str,
+    alias2: &str,
+    address2: &str,
+) -> Config {
+    let chain_id = nuthatch::chains::lookup("arbitrum-one")
+        .expect("arbitrum-one is in the registry")
+        .chain_id;
+    let abi_dir = dir.join("abis");
+    std::fs::create_dir_all(&abi_dir).expect("create abis dir");
+    let example_abi = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/erc20.json");
+    let abi = std::fs::read(example_abi).expect("read erc20 abi fixture");
+    std::fs::write(abi_dir.join("erc20.json"), abi).expect("write erc20 abi");
+
+    let toml = format!(
+        r#"[nest]
+name = "{name}"
+chain = "arbitrum-one"
+chain_id = {chain_id}
+rpc_urls = []
+
+[[contracts]]
+alias = "{alias1}"
+address = "{address1}"
+start_block = 1
+abi = "abis/erc20.json"
+events = ["Transfer"]
+
+[[contracts]]
+alias = "{alias2}"
+address = "{address2}"
+start_block = 1
+abi = "abis/erc20.json"
+events = ["Transfer"]
+"#
+    );
+    std::fs::write(dir.join("nuthatch.toml"), toml).expect("write nuthatch.toml");
+    Config::load(dir).expect("load scaffolded two-contract config")
+}
+
 /// Scaffold a nest whose contract emits Uniswap-V2 `Sync` (for the `reserves` recipe). One `Sync`-only
 /// pair contract at `address`, backfilling from block 1; the decoded table is `{alias}__sync`.
 pub fn scaffold_pair_nest(dir: &Path, name: &str, address: &str) -> Config {
