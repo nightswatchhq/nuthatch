@@ -2,6 +2,17 @@
 
 Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-order-vertical-slices-each-ends-runnable).
 
+**This is a dated record, not documentation.** Every entry is true of the day it carries, and it is
+left that way on purpose: rewriting a past entry so it matches today's CLI would make the log agree
+with the binary by making it disagree with what happened. The record stays; the caveat carries the
+correction.
+
+So: **an invocation in this file may not work today, and no entry below is kept in step with the
+binary.** There are 53 of them and the CLI moves every sprint. Check anything you intend to run with
+`nuthatch <command> --help` first, which is the only current answer there is. A worked example, so
+this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
+upgrade`, which was real that day and does not exist in 2.2.0.
+
 - **2026-07-28 - RFC-0027 and RFC-0028 complete; three live acceptance runs; relicensed to
   `MIT OR Apache-2.0`.** A long day; the parts worth remembering:
   - **[RFC-0027](rfcs/0027-the-live-roost.md) Implemented (all 7 slices).** A roost's nest set is no
@@ -184,6 +195,10 @@ Newest first. One entry per push, tracking the [build order](CLAUDE.md#build-ord
   and a breaking update is refused before any network touch; the compatible flip itself is the e2e-proven
   2b core. **RFC-0020 slices 1-2 complete.** 224 lib + 3 e2e green, clippy + fmt clean. README + roadmap
   updated.
+  **Not current, as of 2.2.0:** `nest upgrade` no longer exists; `nest` carries `bundle`, `load` and
+  `publish` only. Called out on this entry because it is the one a search for the command lands on,
+  and called out *because it was found* (#300, #505), not because the rest of the file was checked.
+  It was not - see the caveat at the top.
 - **2026-07-21 - RFC-0020 slice 2b (core): the concurrent re-index + atomic flip, proven end-to-end.**
   The compatible hot-upgrade Chief chose (full concurrent): `await_catchup_and_flip` runs the **old and
   new versions' indexers together**, serving the old backing, and **atomically flips** the endpoint to
