@@ -183,7 +183,7 @@ Fetch + cache immutable metadata for every contract in the nest (skips already-c
 
 Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`, and `roost.toml` becomes `mounts.toml` (RFC-0032)
 
-- `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a runtime.toml, or one already part-migrated
+- `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a `roost.toml`, or one already part-migrated
 - `--dry-run` - Print the plan - every nest, its identity, and where it would land - without changing anything
 - `--allow-breaking` - Proceed even when a nest's schema would break its consumers. The change is listed either way; this only decides whether the run stops. Data is safe regardless - this is about queries
 
@@ -245,7 +245,7 @@ Verify a pack: signature, artifact hashes, and grant conformance
 
 Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
 
-- `--dir <DIR>` - The directory to migrate: a pre-2.0 one with a runtime.toml, or one already part-migrated
+- `--dir <DIR>` - The directory to prune: a 2.0 one with a `mounts.toml`. A pre-2.0 directory is refused with a pointer to `nuthatch migrate` - nothing is reclaimable until its data is keyed by nid
 - `--yes` - Actually delete. Without this, prune only reports what it would remove
 
 ## `nuthatch recipe`
