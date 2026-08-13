@@ -352,6 +352,38 @@ mod tests {
         }
     }
 
+    /// A mount table with zero mounts is readable and valid: every dataset in `data/` is
+    /// collectable. The emptier the runtime, the more there is to reclaim.
+    #[test]
+    fn zero_mount_table_makes_every_dataset_collectable() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (nid("aa"), nid("bb"));
+        // Write an empty mount table and create two datasets.
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        for nid_ in [&a, &b] {
+            let dir = d.path().join(DATA_DIR).join(nid_);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("nuthatch.redb"), vec![0u8; 512]).unwrap();
+        }
+
+        let found = collectable(d.path()).expect("zero-mount table must not be refused");
+        assert_eq!(found.len(), 2, "both datasets are collectable: {found:?}");
+
+        run(d.path(), true).expect("prune --yes on a zero-mount runtime must succeed");
+        assert!(
+            !d.path().join(DATA_DIR).join(&a).exists(),
+            "dataset a was not removed"
+        );
+        assert!(
+            !d.path().join(DATA_DIR).join(&b).exists(),
+            "dataset b was not removed"
+        );
+    }
+
     /// An unreadable mount table means "we do not know what is mounted", never "nothing is". The
     /// difference is every dataset in the runtime.
     #[test]
