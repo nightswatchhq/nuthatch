@@ -700,7 +700,7 @@ pub fn holds_data(dir: &Path, side: Adopting) -> bool {
         }
     }
     // Sealed segments are data and need no lock to see. An *empty* `segments/` is not data.
-    std::fs::read_dir(dir.join("segments"))
+    std::fs::read_dir(dir.join(crate::seal::SEGMENTS_DIR))
         .map(|mut e| e.next().is_some())
         .unwrap_or(false)
 }

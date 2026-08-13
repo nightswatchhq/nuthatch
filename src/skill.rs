@@ -1,8 +1,10 @@
 //! The builder skill's generated references (RFC-0017 §S1). The one rule that keeps a skill from
 //! lying about nuthatch is: **generate what can be generated.** `cli-reference.md` is rendered from
 //! clap's own metadata here - the binary describing itself is the most drift-proof source we have -
-//! and a CI test (`tests/skill_refs.rs`) regenerates it and fails the build on any drift, plus fails
-//! if an authored skill file mentions a `--flag` this reference doesn't contain.
+//! and a CI test (`tests/skill_refs.rs`) regenerates it and fails the build on any drift, fails if
+//! an authored skill file mentions a `--flag` this reference doesn't contain, and (NIG-124 / #353)
+//! fails if a real flag exists that this reference never mentions - checked by walking clap's
+//! command tree independently of the render below, so a bug in the render can't hide from both.
 //!
 //! Nothing here runs in the data path; it's a dev/authoring tool exposed as a hidden subcommand so
 //! the reference is always in sync with the binary that ships.
@@ -39,6 +41,22 @@ pub fn generate_cli_reference() -> String {
          Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthatch skill-refs`.\n",
     );
     let cmd = Cli::command();
+
+    // The root command's own arguments - e.g. a `global = true` flag on `Cli` itself - are distinct
+    // from its subcommands' and were previously invisible here entirely (NIG-124 / #353): nothing
+    // ever called `render_command` on the root, only on each subcommand it returns.
+    let root_args: Vec<_> = cmd.get_arguments().filter(|a| !a.is_hide_set()).collect();
+    if !root_args.is_empty() {
+        out.push_str("\n## `nuthatch` (global - valid with any subcommand)\n\n");
+        for arg in root_args {
+            let help = arg
+                .get_help()
+                .map(|h| collapse(&h.to_string()))
+                .unwrap_or_default();
+            out.push_str(&format!("- `{}` - {help}\n", arg_signature(arg)));
+        }
+    }
+
     let mut subs: Vec<_> = cmd.get_subcommands().collect();
     subs.sort_by_key(|c| c.get_name());
     for sub in subs {

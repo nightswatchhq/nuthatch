@@ -60,11 +60,21 @@ pub struct QueryGuard {
 /// at all. Nor may it name a cause: the undefinable-view arm above lands here with every segment
 /// binding fine. Both mistakes shipped in the first rendering of this field and neither test nor
 /// mutation could see them, because every fixture had exactly one table.
+///
+/// `tip_unavailable` is the other kind of incomplete, and deliberately not folded into
+/// `degraded_tables` (#472). A hot-scan failure (`begin_read`, `open_table`, `t.iter()`, or a row
+/// partway through) is not per-table the way a bad segment is - it drops the *entire* unsealed tip,
+/// every table at once - and its cause and remedy differ: a damaged or unreadable hot store, not a
+/// corrupt segment. Shoehorning it into `degraded_tables` would either name every table for a failure
+/// that named none of them, or name none and repeat #472's silence. `QueryOutput` itself never sets
+/// this field - the hot scan happens in the caller, above `query_hot_cold` - so a caller that scans the
+/// tip assigns it after the query returns.
 #[derive(Debug, Default)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
+    pub tip_unavailable: bool,
 }
 
 impl QueryOutput {
@@ -409,6 +419,7 @@ fn attempt(
         rows,
         truncated,
         degraded_tables,
+        tip_unavailable: false,
     }))
 }
 
@@ -3185,6 +3196,192 @@ template="pool"
                 .collect::<std::collections::BTreeSet<_>>(),
             "the retry's exclusions are degradation too - the query succeeded with less data"
         );
+    }
+
+    /// A nest with **two** independently-populated tables, `t__transfer` (blocks 1-2) and
+    /// `t__approval` (blocks 1-2), both intact. Every fixture up to #477 - `two_segment_nest` above
+    /// included - has exactly one table, so "the nest is degraded" and "this query's table is
+    /// degraded" were the same set in every assertion in the tree: a `define_views` bug that flagged
+    /// the wrong table, or every table, would have passed all of them, because there was never a
+    /// second, untouched table to catch it naming the wrong one. Corruption is the caller's job, on
+    /// whichever table it wants degraded - this fixture ships both intact.
+    fn two_table_nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[
+                {"table":"t__transfer","columns":[
+                    {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                    {"name":"from","sol_type":"address","storage":"address","indexed":true},
+                    {"name":"value","sol_type":"uint256","storage":"word32","indexed":false}]},
+                {"table":"t__approval","columns":[
+                    {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                    {"name":"owner","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        for (block, from) in [(1u64, "0xa"), (2u64, "0xb")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__transfer","from":"{from}","value":"{block}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        for (block, owner) in [(1u64, "0xc"), (2u64, "0xd")] {
+            crate::seal::seal_range(
+                dir.path(),
+                &[format!(
+                    r#"{{"table":"t__approval","owner":"{owner}","block_number":{block},"tx_hash":"0xt","log_index":0}}"#
+                )],
+                block,
+                block,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// `table`'s block-2 segment file, in a [`two_table_nest`] - for a test that wants to damage one
+    /// table's data without touching the other's. Mirrors `block_two_segment` above, scoped to a
+    /// named table since this fixture has two.
+    fn block_two_segment_of(dir: &std::path::Path, table: &str) -> std::path::PathBuf {
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        let victim = manifest.tables[table]
+            .iter()
+            .find(|s| s.from_block == 2)
+            .expect("the block-2 segment");
+        crate::seal::segment_path(dir, &victim.file, &victim.hash)
+    }
+
+    /// **Issue #477, case 1.** A two-table nest with one table degraded: a query against the
+    /// *healthy* one must come back complete and correct, and the flag it carries must name the
+    /// *other* table - never itself. `degraded_tables` comes from `define_views`'s
+    /// schema ∪ manifest ∪ hot walk, never from the query's own `FROM` clause, so main.rs's and
+    /// mcp.rs's caveat renderers say nothing about *this result* - only about whichever tables the
+    /// set names. Excluding the healthy table here is what stops that caveat becoming a false
+    /// statement about a complete answer.
+    #[test]
+    fn a_healthy_table_names_the_other_ones_degradation() {
+        let dir = two_table_nest();
+        std::fs::write(
+            block_two_segment_of(dir.path(), "t__transfer"),
+            b"not parquet, not even close",
+        )
+        .unwrap();
+
+        let out = cold(
+            dir.path(),
+            r#"SELECT "owner" FROM "t__approval" ORDER BY "owner""#,
+        );
+        assert_eq!(
+            out.rows,
+            vec![
+                serde_json::json!({"owner": "0xc"}),
+                serde_json::json!({"owner": "0xd"}),
+            ],
+            "the healthy table's own segments are both intact - nothing about its answer is short"
+        );
+        assert_eq!(
+            out.degraded_tables,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the flag must name the table that is actually short, not the one just queried"
+        );
+        assert!(
+            !out.degraded_tables.contains("t__approval"),
+            "the queried table is healthy and must never appear in its own indictment"
+        );
+    }
+
+    /// **Issue #477, case 2.** `SELECT 1` and `.tables` (`information_schema.tables`, the query the
+    /// REPL's `.tables` dot-command runs) draw no row from any table at all, healthy or degraded - no
+    /// total to understate, nothing to call short. `define_views` runs before the caller's SQL and
+    /// without looking at it, so the flag comes back identical to a query that actually reads the
+    /// degraded table. That is the property that lets a caller trust the flag even on a query it
+    /// cannot line up against any particular row.
+    #[test]
+    fn select_one_and_dot_tables_carry_the_flag_with_no_rows_to_understate() {
+        let dir = two_table_nest();
+        std::fs::write(
+            block_two_segment_of(dir.path(), "t__transfer"),
+            b"not parquet, not even close",
+        )
+        .unwrap();
+        let degraded: std::collections::BTreeSet<String> =
+            ["t__transfer".to_string()].into_iter().collect();
+
+        let one = cold(dir.path(), "SELECT 1 AS one");
+        assert_eq!(one.rows, vec![serde_json::json!({"one": 1})]);
+        assert_eq!(
+            one.degraded_tables, degraded,
+            "SELECT 1 draws from no table and still learns the nest is short"
+        );
+
+        let tables = cold(
+            dir.path(),
+            "SELECT table_name FROM information_schema.tables \
+             WHERE NOT starts_with(table_name, '__hot_') ORDER BY table_name",
+        );
+        assert_eq!(
+            tables.degraded_tables, degraded,
+            ".tables draws no rows from any table either, and still carries the flag"
+        );
+    }
+
+    /// **Issue #477, case 3 (#434's shape).** A view that fails for a reason no segment probe would
+    /// ever catch still lands in `degraded_tables` - here, the view name is already taken in the
+    /// catalogue, which `define_views` cannot tell apart from any other whole-DDL failure once every
+    /// individual segment has already bound (`readable.len() == sealed_files.len()`, the branch #434
+    /// occupied before its fix). No file on either table is touched, so this proves the flag does not
+    /// depend on - and the caveat therefore must not name - a segment-level cause.
+    #[test]
+    fn an_undefinable_view_degrades_with_every_segment_intact() {
+        let dir = two_table_nest();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(r#"CREATE TABLE "t__transfer" (x INTEGER)"#)
+            .unwrap();
+
+        let degraded = define_views(
+            &conn,
+            dir.path(),
+            &HotRows::new(),
+            u64::MAX,
+            &std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            degraded,
+            ["t__transfer".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the pre-existing catalogue name, not any segment, is why the view failed"
+        );
+        assert!(
+            !degraded.contains("t__approval"),
+            "the other table's view was never touched by the collision"
+        );
+
+        // Prove the premise: every segment behind the table still binds on its own, so nothing here
+        // went through the corrupt/missing-file paths above - only the undefinable-view arm could
+        // have set the flag.
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        for seg in &manifest.tables["t__transfer"] {
+            let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
+            let probe = Connection::open_in_memory().unwrap();
+            assert!(
+                probe
+                    .prepare(&format!(
+                        "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
+                        path.display()
+                    ))
+                    .is_ok(),
+                "every segment must still bind on its own for this to be the undefinable-view arm"
+            );
+        }
     }
 
     /// **Issue #433, the half that bounds the cost.** `collect` must report *which phase* a query

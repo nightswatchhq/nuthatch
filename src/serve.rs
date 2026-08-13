@@ -47,7 +47,11 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// invisible until something is genuinely wrong. Under the CLAUDE.md division of labour resource
 /// safety is the node's job, not the gateway's - which is why this is a hard limit here rather than
 /// advice in the docs.
-const SQL_MAX_HOT_ROWS: usize = 2_000_000;
+///
+/// `pub(crate)` rather than private: it is the default [`AppState::sql_max_hot_rows`] is built
+/// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
+/// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
+pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
 /// Reject absurdly long query strings before they reach the planner.
 const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
@@ -92,6 +96,11 @@ pub struct AppState {
     /// `/table` queries run at once so a burst can't multiply DuckDB's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
     pub sql_gate: Arc<Semaphore>,
+    /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
+    /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
+    /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
+    /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
+    pub sql_max_hot_rows: usize,
     /// The SQL surface this mount exposes (RFC-0034). Default is [`Open`](crate::allowlist::SqlAccess::Open) -
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
@@ -293,7 +302,18 @@ pub fn compose_runtime(
                 async move { roost_ready(&h) }
             }),
         );
-    for (name, state) in nests {
+    for (name, mut state) in nests {
+        // A nest served through this composition answers `/ready` and `/metrics` from `health`'s
+        // per-nest counters, never the process-global aggregate - `spawn_runtime` and `mount()` stamp
+        // `runtime_health` before a real nest ever reaches here. Filled in here too, only if the caller
+        // left it unset, so a fixture (or any future caller) that forgets the stamp cannot silently fall
+        // back to the solo path - the fault that let three fixtures in a row (#292, #356, #388) prove
+        // the handler and never the wiring. `get_or_insert_with` rather than an unconditional
+        // assignment: an alias mount's state is deliberately pre-stamped with its *canonical* nest's
+        // name (`fan_out_aliases`), and that must survive composition unchanged.
+        state
+            .runtime_health
+            .get_or_insert_with(|| (name.clone(), health.clone()));
         // `Router::nest` re-roots the whole per-nest router under `/<name>`, so `/lodestar/tables`,
         // `/lodestar/sql`, `/lodestar/_admin/` … all resolve to that nest's isolated state.
         app = app.nest(&format!("/{name}"), router(SharedNest::new(state)));
@@ -1068,6 +1088,7 @@ async fn run_sql_query(
     let dir = s.dir.clone();
     let sql = q.q.clone();
     let store = s.store.clone();
+    let sql_max_hot_rows = s.sql_max_hot_rows;
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
@@ -1077,13 +1098,18 @@ async fn run_sql_query(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
-            Ok(hot) => hot,
+        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
+            Ok(hot) => (hot, false),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
-            Err(_) => Default::default(),
+            // Same level as a segment read failure (#472): a hot store that will not scan is at least
+            // as serious, and the fallback below must not be the only trace of it.
+            Err(e) => {
+                tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
+                (Default::default(), true)
+            }
         };
         let sealed_through = store.sealed_through();
-        analytics::query_hot_cold(
+        let mut out = analytics::query_hot_cold(
             &dir,
             &sql,
             analytics::QueryGuard {
@@ -1092,7 +1118,9 @@ async fn run_sql_query(
             },
             &hot,
             sealed_through,
-        )
+        )?;
+        out.tip_unavailable = tip_unavailable;
+        Ok(out)
     })
     .await;
     match result {
@@ -1114,6 +1142,11 @@ async fn run_sql_query(
             // is the same reason errors go through `sanitize_sql_error`.
             "degraded": out.degraded(),
             "degraded_tables": out.degraded_tables,
+            // Tip failure, not per-table cold reduction (#472): the hot-tip scan itself errored, so
+            // this answer is sealed-history-only regardless of what `degraded_tables` says. Distinct
+            // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
+            // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
+            "tip_unavailable": out.tip_unavailable,
             "rows": out.rows,
             // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
             // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
@@ -1196,6 +1229,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     // materialising rows. A CTE (`WITH …`) is legal inside the subquery, so this covers both shapes.
     let probe = format!("SELECT * FROM ({}) AS _explain LIMIT 0", q.q);
     let store = s.store.clone();
+    let sql_max_hot_rows = s.sql_max_hot_rows;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
@@ -1204,7 +1238,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+        let hot = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
             Ok(hot) => hot,
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
             Err(_) => Default::default(),
@@ -1525,6 +1559,7 @@ mod tests {
             velocity_threshold: None,
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
+            sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             surface: Arc::new(crate::allowlist::Surface::default()),
             nid: None,
             admin_enabled: true,
@@ -1587,6 +1622,14 @@ mod tests {
     /// Note the shape of the assertions: "chain B still answers 200" is the half that passes trivially
     /// when the mechanism is missing (a fresh global says ready to everyone). The load-bearing half is
     /// that chain **A** answers 503 *at the same time*, which only per-nest attribution can produce.
+    ///
+    /// Deliberately built from **un-stamped** [`test_state`] - `runtime_health` is left `None`, same as
+    /// every other test in this module - and composed via [`compose_runtime`] rather than stamped by
+    /// hand. That is the fix for #388: three fixtures in a row (#292, #356, this one) forgot to
+    /// replicate `spawn_runtime`'s stamp and silently proved the solo path instead, so the stamp now
+    /// lives once in `compose_runtime` itself and this test exists to pin that it actually fires - a
+    /// version of this test that reverted `compose_runtime`'s `get_or_insert_with` back to a no-op would
+    /// turn red here, both nests reporting via the process globals.
     #[tokio::test]
     async fn one_chains_dead_endpoints_leave_its_co_tenant_serving_and_report_only_itself_stalled()
     {
@@ -1598,15 +1641,10 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(live)).unwrap();
         let roster = json!({"runtime": "t", "nests": [{"name": dead}, {"name": live}]});
         let health = Arc::new(crate::health::RuntimeHealth::new());
-        // Stamp each state with its own name + the shared health surface, exactly as
-        // `indexer::spawn_runtime` does. That stamp is what makes `/ready` answer for THIS nest rather
-        // than from the process globals, so a mounts test that omits it is quietly testing the solo
-        // path under a mounts URL - which is why this gap survived.
         let nests: Vec<(String, AppState)> = [dead, live]
             .into_iter()
             .map(|name| {
-                let mut st = test_state(&dir.path().join(name), 4);
-                st.runtime_health = Some((name.to_string(), health.clone()));
+                let st = test_state(&dir.path().join(name), 4);
                 (name.to_string(), st)
             })
             .collect();
@@ -2022,6 +2060,72 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// #378: an over-budget tip is refused by both `/sql` and `/explain`, not just by the store layer
+    /// underneath them. Neither handler was ever driven directly by a test before this - the typed
+    /// error (`HotScanTooLarge`) and the call site (`no_request_path_uses_the_unbounded_hot_scan`)
+    /// were each covered, but the mapping between them - `503`, this exact body shape - was not, so
+    /// deleting either handler's refusal arm left the suite green.
+    ///
+    /// `SQL_MAX_HOT_ROWS` is `2_000_000`; reaching the refusal for real would mean putting two
+    /// million rows in the hot store. `AppState::sql_max_hot_rows` exists so this test can lower the
+    /// seam instead, exactly as production leaves it at the real constant (`test_state`, `indexer.rs`).
+    #[tokio::test]
+    async fn a_hot_tip_over_the_configured_cap_is_refused_by_sql_and_explain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_hot_rows = 2;
+        for b in 1..=3u64 {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b}).to_string(),
+                )
+                .unwrap();
+        }
+        let q = || {
+            Query(SqlQuery {
+                q: "SELECT 1 AS n".into(),
+                max_rows: None,
+            })
+        };
+
+        let resp = sql(State(state.clone()), q()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "/sql");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("will not materialise"),
+            "/sql body: {v}"
+        );
+        assert_eq!(v["sealed_through"], json!(0));
+
+        let resp = explain(State(state), q()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "/explain");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("will not materialise"),
+            "/explain body: {v}"
+        );
+        assert_eq!(v["sealed_through"], json!(0));
+        // `valid` is deliberately absent, not `false` - bindability is unknown, not disproved.
+        assert!(
+            v.get("valid").is_none(),
+            "/explain must omit `valid` on refusal: {v}"
+        );
+    }
+
     /// RFC-0010 Part A: the admin UI serves when enabled and 404s when disabled (`--no-admin` or a
     /// public bind without a token). `/nest` returns the static nest metadata either way.
     #[tokio::test]
@@ -2155,6 +2259,13 @@ mod tests {
         assert!(
             ADMIN_HTML.contains("degraded_tables"),
             "admin UI renders the reduced-cold-data caveat (#435)"
+        );
+        // Same reasoning, same pin, for the other kind of incomplete (#472): a lost tip is nest-wide
+        // and every-table, not per-table, so it needs its own substring or a deleted caveat here is
+        // just as silent as the arm that started this.
+        assert!(
+            ADMIN_HTML.contains("tip_unavailable"),
+            "admin UI renders the lost-tip caveat (#472)"
         );
     }
 

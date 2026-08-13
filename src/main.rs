@@ -289,6 +289,15 @@ fn caveats(out: &analytics::QueryOutput) -> Vec<String> {
     if out.truncated {
         lines.push("(result truncated at 50000 rows)".to_string());
     }
+    if out.tip_unavailable {
+        // Whole-answer, not per-table (#472): the live tip could not be scanned at all, so this result
+        // is sealed history only and misses everything since the last seal, on every table.
+        lines.push(
+            "warning: the hot tip could not be scanned. This result is sealed history only and \
+             misses everything indexed since the last seal. Check the node's logs for the cause."
+                .to_string(),
+        );
+    }
     if out.degraded() {
         // Phrased about the *nest*, not about this result, and it has to be. `define_views` builds
         // its table set from schema ∪ manifest ∪ hot and never sees the SQL, so `degraded_tables` is
@@ -378,7 +387,18 @@ impl SqlBackend {
         match self {
             SqlBackend::Local { dir, store } => {
                 // Live tip ∪ sealed history, disjoint by the sealed watermark (COR-1).
-                let hot = store.hot_rows_by_table().unwrap_or_default();
+                // Same silent-degradation shape as `serve.rs::run_sql_query` (#472): a hot-scan error
+                // here used to fall back to cold-only with nothing said, indistinguishable from a
+                // complete answer.
+                let (hot, tip_unavailable) = match store.hot_rows_by_table() {
+                    Ok(hot) => (hot, false),
+                    Err(e) => {
+                        tracing::error!(
+                            "hot-tip scan failed - serving cold-only for this query: {e:#}"
+                        );
+                        (Default::default(), true)
+                    }
+                };
                 let sealed_through = store.sealed_through();
                 match analytics::query_hot_cold(
                     dir,
@@ -390,7 +410,10 @@ impl SqlBackend {
                     &hot,
                     sealed_through,
                 ) {
-                    Ok(out) => Ok(out),
+                    Ok(mut out) => {
+                        out.tip_unavailable = tip_unavailable;
+                        Ok(out)
+                    }
                     Err(e) => {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
                         // nest's schema and append a fix hint. Schema is loaded only on the error path.
@@ -461,10 +484,17 @@ impl SqlBackend {
                             .collect()
                     })
                     .unwrap_or_default();
+                // Same absent-reads-healthy default as `degraded_tables` above, for the same reason: an
+                // older node that predates #472 simply never sends the field.
+                let tip_unavailable = body
+                    .get("tip_unavailable")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false);
                 Ok(analytics::QueryOutput {
                     rows,
                     truncated,
                     degraded_tables,
+                    tip_unavailable,
                 })
             }
         }
@@ -679,6 +709,7 @@ mod tests {
             rows: vec![],
             truncated,
             degraded_tables: degraded.iter().map(|s| s.to_string()).collect(),
+            tip_unavailable: false,
         }
     }
 
@@ -714,5 +745,24 @@ mod tests {
         assert_eq!(caveats(&out(true, &[])).len(), 1);
         assert_eq!(caveats(&out(true, &["a", "b"])).len(), 2);
         assert!(caveats(&out(true, &["a", "b"]))[1].contains("a, b"));
+    }
+
+    /// **Issue #472.** A tip failure is not per-table the way `degraded_tables` is, so it gets its own
+    /// caveat rather than being folded in - and, same as #435, a caller who ignores the field must
+    /// still be told on the terminal.
+    #[test]
+    fn a_lost_tip_warns_on_the_terminal_and_is_not_a_degraded_table() {
+        let mut result = out(false, &[]);
+        result.tip_unavailable = true;
+        let lines = caveats(&result);
+        assert_eq!(lines.len(), 1, "one caveat, the tip one: {lines:?}");
+        assert!(
+            lines[0].contains("hot tip"),
+            "the warning must say what went missing: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("INCOMPLETE"),
+            "must not read as the degraded_tables wording - different cause, different remedy: {lines:?}"
+        );
     }
 }

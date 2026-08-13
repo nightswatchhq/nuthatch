@@ -283,9 +283,11 @@ async fn nest_with_a_sealed_range(
 /// fixture's surviving checkpoints are `[14, 10, 2]`, so a fork at 11 or 13 leaves checkpoint 10
 /// canonical and `rollback_reorg` is handed 10, which is above `sealed_through = 8`.
 ///
-/// A fork at 9 is *also* strictly above the watermark and still halts, because the walk can only
-/// answer at a checkpoint it holds and the next one down is 2. That is issue #461, and it lives in
-/// the `#[ignore]`d test below rather than here, because it fails today.
+/// A fork at 9 is *also* strictly above the watermark, and used to halt for the same reason: the walk
+/// can only answer at a checkpoint it holds, and the next one down is 2. That was issue #461. #485
+/// fixed it by pinning a checkpoint at the watermark itself every time sealing advances, so the walk
+/// now lands above `sealed_through` instead of falling through to 2. It is covered by
+/// `a_reorg_above_the_sealed_watermark_should_not_halt` below, which runs (no `#[ignore]`), not here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reorg_above_the_seal_boundary_leaves_segments_byte_identical() {
     for fork in [11u64, 13] {
