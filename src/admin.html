@@ -205,7 +205,10 @@ async function runSql(){
     // Named tables, and no claim about *these* rows: the flag is nest-wide, so this result may well
     // be complete. Nor about the cause - an undefinable view is in the set with its segments intact.
     const deg = d.degraded_tables || [];
+    // Tip failure, not per-table (#472): the whole unsealed tip was dropped, so this answer is sealed
+    // history only regardless of what `degraded_tables` says. Separate clause, same reasoning as above.
     $('#sqlmeta').textContent = `${fmt(d.count)} row(s)` + (d.truncated?' (truncated)':'')
+      + (d.tip_unavailable?' - the hot tip could not be scanned, sealed history only':'')
       + (deg.length?` - INCOMPLETE cold data in this nest for ${deg.join(', ')}`:'');
     $('#sqlrows').innerHTML = rowsTable(d.rows);
   } catch(e){ $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent=''; }
