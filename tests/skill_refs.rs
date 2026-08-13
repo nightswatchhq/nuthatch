@@ -74,6 +74,79 @@ fn flags_in(text: &str) -> BTreeSet<String> {
     out
 }
 
+// ── The other direction for flags (NIG-124, continuing #353) ─────────────────────────────────
+//
+// `authored_files_only_mention_real_flags` catches a *hallucinated* flag. It cannot catch the
+// opposite: a real flag `cli-reference.md` never names - which sounds impossible, since the
+// reference is rendered from clap and should be complete by construction. It wasn't:
+// `generate_cli_reference` only walked `Cli::command()`'s *subcommands*. A `#[arg(global = true)]`
+// flag declared directly on `Cli` is real - accepted on every subcommand, shown in `--help` - and
+// was invisible to the renderer, because nothing ever visited the root command's own arguments.
+// Confirmed live: adding such a flag left every test in this file green, including
+// `committed_cli_reference_is_not_stale`, because the stale copy and the fresh copy omitted it
+// identically. `SKILL.md`'s golden rule #1 tells an agent "read cli-reference.md ... if a flag
+// isn't here, it doesn't exist" - so a flag the renderer drops breaks that promise exactly the way
+// `[[templates]].events` broke `config-reference.md`'s.
+//
+// The check below re-derives "real" independently of `generate_cli_reference`, the same way
+// `config_keys_in` re-parses `src/config.rs` instead of trusting `Config`'s own `Serialize` output:
+// it walks clap's command tree itself rather than reusing the generator's walk, so a bug shared
+// between the generator and this test can't make both agree on the wrong answer. `src/skill.rs`
+// now also renders the root's own arguments, closing the hole this test exists to keep closed.
+#[test]
+fn cli_reference_names_every_real_flag() {
+    let reference = nuthatch::skill::generate_cli_reference();
+    let documented = flags_in(&reference);
+
+    let mut missing = Vec::new();
+    collect_real_flags(
+        &<nuthatch::cli::Cli as clap::CommandFactory>::command(),
+        "nuthatch",
+        &documented,
+        &mut missing,
+    );
+
+    assert!(
+        missing.is_empty(),
+        "cli-reference.md never mentions these real flags:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Walk every non-hidden long flag on `cmd`, including `cmd`'s own arguments (the thing the
+/// generator skipped for the root command), recording any absent from `documented`. Recurses into
+/// non-hidden subcommands under `path`, matching the hide semantics `generate_cli_reference` uses -
+/// a hidden subcommand or flag is a deliberate exclusion (e.g. `skill-refs` itself), not drift.
+fn collect_real_flags(
+    cmd: &clap::Command,
+    path: &str,
+    documented: &BTreeSet<String>,
+    missing: &mut Vec<String>,
+) {
+    for arg in cmd.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        if let Some(long) = arg.get_long() {
+            let flag = format!("--{long}");
+            if !documented.contains(&flag) {
+                missing.push(format!("{flag} (on `{path}`)"));
+            }
+        }
+    }
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        collect_real_flags(
+            sub,
+            &format!("{path} {}", sub.get_name()),
+            documented,
+            missing,
+        );
+    }
+}
+
 /// RFC-0017 §S1, extended per issue #137 (C2): every `nuthatch_*` metric name an authored skill file
 /// mentions must be a real series the binary emits. A stale metric name (`nuthatch_tip` for
 /// `nuthatch_tip_height`) is the same failure class as a hallucinated flag - an agent greps a scrape
