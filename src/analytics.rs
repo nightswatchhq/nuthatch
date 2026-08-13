@@ -14,9 +14,13 @@ use anyhow::{bail, Context, Result};
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::Connection;
 use serde_json::{Map, Value};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
@@ -151,17 +155,32 @@ enum Attempt {
 }
 
 /// Test-only knob: an artificial delay standing in for a slow first attempt, so a test can drive the
-/// deadline shared across both attempts and the sweep down to a sliver by the time the sweep runs -
+/// deadline shared across both attempts and the sweep well past expiry by the time the sweep runs -
 /// distinct from a **fresh** `guard.timeout` recomputed at the sweep call site, which this delay does
-/// not touch. Analogous to `seal::TEST_SWEEP_DELAY_MS`; process-global for the same reason, so any test
-/// using it must hold `seal::test_sweep_serial()` for its whole body.
+/// not touch.
+///
+/// Keyed by `dir`, not a bare process-global (#529) - `run` is `query_guarded`'s entry point and dozens
+/// of unrelated tests call it, so a global read unconditionally in the retry path would delay *any*
+/// concurrently running test that also died on its first attempt, for as long as this knob happened to
+/// be armed - the same class of cross-test contamination `seal::test_set_sweep_expire_after_checks`
+/// was fixed to avoid, just reached through a different knob. Keying by `dir` means only a call
+/// against this test's own tempdir ever sees the delay.
 #[cfg(test)]
-static TEST_FIRST_ATTEMPT_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+fn test_first_attempt_delays() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static DELAYS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(test)]
-pub(crate) fn test_set_first_attempt_delay_ms(ms: u64) {
-    TEST_FIRST_ATTEMPT_DELAY_MS.store(ms, Ordering::SeqCst);
+pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
+    if ms == 0 {
+        test_first_attempt_delays().lock().unwrap().remove(dir);
+    } else {
+        test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), ms);
+    }
 }
 
 fn run(
@@ -193,7 +212,12 @@ fn run(
     };
     #[cfg(test)]
     {
-        let ms = TEST_FIRST_ATTEMPT_DELAY_MS.load(Ordering::SeqCst);
+        let ms = test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .get(dir)
+            .copied()
+            .unwrap_or(0);
         if ms > 0 {
             std::thread::sleep(Duration::from_millis(ms));
         }
@@ -391,7 +415,21 @@ fn attempt(
 
     let (mut rows, over_cap) = match outcome {
         Ok(v) => v,
-        Err(Died::Binding(e)) => return Err(e),
+        // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
+        // just an in-flight execute - a query that gets no further than `conn.prepare` before the
+        // deadline fires still dies to it, and did so leaking DuckDB's raw "Interrupted!" text here
+        // (`Died::Binding` never checked `interrupted`, only `Died::Executing` did). Invisible under
+        // light load, where `prepare()` finishes in microseconds long before any real deadline; a
+        // heavily contended box can stall `prepare()` itself past the budget, at which point the
+        // untrusted `/sql` surface was supposed to say "query exceeded budget" and instead surfaced an
+        // internal DuckDB error string - the same class of bug this guard exists to prevent.
+        Err(Died::Binding(e)) => {
+            if interrupted.load(Ordering::SeqCst) {
+                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
+                bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            }
+            return Err(e);
+        }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
@@ -3621,9 +3659,25 @@ template="pool"
     /// "exceeded budget" message the bounded sweep produces cooperatively, versus DuckDB's own
     /// "Interrupted!" from a retry that got cut off while running. That is the assertion below, not
     /// elapsed wall-clock time.
+    ///
+    /// #529: even that was still timing-coupled. The 200ms budget minus a 120ms first-attempt delay
+    /// left ~80ms for a 2x50ms sweep to land in - a margin of one segment's worth, and
+    /// `thread::sleep` only guarantees *at least* the requested duration. At load average 34 a
+    /// descheduled thread can wake arbitrarily later than 50ms, so which of the two branches the
+    /// (unmutated, correct) code actually took stopped being reliable: `cargo test --lib` saw the
+    /// *other* outcome's message on a busy box. Fixed by making the margin lopsided rather than
+    /// tight enough to race: the first-attempt delay (3s) is set to comfortably outlive the whole
+    /// 200ms budget by itself, so the shared deadline is unambiguously, already expired - by seconds,
+    /// not by a contended few milliseconds - before the sweep is ever called, on every run regardless
+    /// of scheduling. The sweep's own per-segment cost is no longer artificially delayed at all: the
+    /// fixture's three tiny segments cost microseconds to hash for real, so a *fresh* deadline
+    /// (mutation A) or no deadline (mutation B) still has essentially the whole 200ms of real
+    /// headroom to reach the corrupt segment in, which is orders of magnitude more slack than
+    /// scheduling jitter needs even under heavy contention. The two outcomes no longer share a
+    /// finish line to race across; one is already over before the sweep starts, the other has ample
+    /// room regardless of load.
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
-        let _serial = crate::seal::test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -3654,20 +3708,18 @@ template="pool"
             "the fixture must have corrupted something"
         );
 
-        // A 200ms budget, 120ms of it spent before the sweep ever runs, leaves 80ms under the shared
-        // deadline when the sweep starts - enough to start segments one and two (50ms each) but not to
-        // reach segment three, the corrupt one, before that shared deadline is spent. A fresh
-        // `guard.timeout` recomputed at the sweep call site instead opens a new 200ms window from that
-        // same 120ms mark, comfortably covering all three 50ms segments.
-        crate::seal::test_set_sweep_delay_ms(50);
-        test_set_first_attempt_delay_ms(120);
+        // A 200ms budget with a 3s first-attempt delay: by the time the sweep is ever called, the
+        // shared deadline is already several seconds in the past, unambiguously - not a close race
+        // against a comparably-sized per-segment cost (see the doc comment above for why that
+        // changed). The three fixture segments are real work but microseconds of it, so a fresh or
+        // absent deadline still has essentially the whole 200ms of headroom to reach the corrupt one.
+        test_set_first_attempt_delay_ms(dir.path(), 3_000);
         let guard = QueryGuard {
             timeout: Duration::from_millis(200),
             max_rows: 10,
         };
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
-        crate::seal::test_set_sweep_delay_ms(0);
-        test_set_first_attempt_delay_ms(0);
+        test_set_first_attempt_delay_ms(dir.path(), 0);
 
         let message = result.as_ref().err().map(ToString::to_string);
         assert_eq!(
