@@ -295,12 +295,6 @@ impl MountTable {
             .with_context(|| format!("no {MOUNTS_FILE} in {}", dir.display()))?;
         let mounts: MountTable =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-        if mounts.runtime.nests.is_empty() && mounts.mounts.is_empty() {
-            bail!(
-                "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
-                mounts.runtime.name
-            );
-        }
         mounts.validate_mounts()?;
         // Every mount, whichever form declared it, must be a safe path segment and must not collide
         // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
@@ -1161,6 +1155,12 @@ pub async fn dev(
     fail_fast: bool,
 ) -> Result<()> {
     let mounts = MountTable::load(&dir)?;
+    if mounts.mount_refs().is_empty() {
+        anyhow::bail!(
+            "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
+            mounts.runtime.name
+        );
+    }
     let meta = &mounts.runtime;
     let endpoints = mounts.chain_endpoints()?;
 
@@ -3007,17 +3007,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_roost_that_mounts_nothing() {
+    fn a_zero_mount_table_loads_for_prune_but_is_empty() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join(MOUNTS_FILE),
             "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = []\n",
         )
         .unwrap();
-        assert!(MountTable::load(d.path())
-            .unwrap_err()
-            .to_string()
-            .contains("mounts nothing"));
+        let t = MountTable::load(d.path()).expect("a readable zero-mount table must load");
+        assert!(t.mount_refs().is_empty());
     }
 
     #[test]

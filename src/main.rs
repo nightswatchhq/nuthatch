@@ -250,7 +250,7 @@ fn run_labels(args: cli::LabelsArgs) -> Result<()> {
 /// query, one-shot to a table (`--json` to pipe). Without, an interactive REPL. The terminal-native
 /// front door to querying, so a user never needs curl to poke at their own data (RFC-0015).
 async fn run_sql(args: cli::SqlArgs) -> Result<()> {
-    let backend = SqlBackend::open(&args.dir, &args.url)?;
+    let backend = SqlBackend::open(&args.dir, &args.url).await?;
     match args.query.clone() {
         Some(query) => {
             let out = backend.query(&query).await?;
@@ -341,6 +341,11 @@ enum SqlBackend {
     },
     Http {
         url: String,
+        /// The route prefix a `mounts.toml` runtime serves this nest under, e.g. `/lbtc` - empty for a
+        /// solo (`nuthatch.toml`) runtime, which serves `/sql` at the root (#509). Resolved once in
+        /// `open`, from the live instance's own roster rather than a local `mounts.toml` read, so it is
+        /// right even when `--dir` is a bare `data/<nid>` the CLI has no other context for.
+        prefix: String,
         client: reqwest::Client,
         /// Why we are not local. `None` when a store is there but held by `dev` - the ordinary case,
         /// and not worth mentioning. `Some(path)` when there is no store at all, which is the case
@@ -350,8 +355,57 @@ enum SqlBackend {
     },
 }
 
+/// Best-effort: map `--dir data/<nid>` to the alias a `mounts.toml` runtime serves it under, so the
+/// HTTP fallback asks for the route that actually exists (#509) rather than the bare `/sql` a
+/// multi-nest runtime never mounts (RFC-0032 §7 nests each mount under `/<alias>`).
+///
+/// Resolved against the *live instance's* own roster (`GET /nests`), not a local `mounts.toml` read -
+/// `--dir` is a `data/<nid>` the CLI has no runtime root for, and the roster is the one place that
+/// already knows the nid → route mapping (`runtime.rs`'s `route_key`), tenant segment included.
+///
+/// Anything short of an unambiguous match leaves the request unprefixed, exactly as before #509: no
+/// `/nests` route at all (a solo `nuthatch.toml` runtime), no entry for this nid, more than one (two
+/// mounts sharing a dataset - `--url .../<alias>` disambiguates by hand), or a `--url` that already
+/// carries a path of its own. The real connectivity error, if any, surfaces from the query itself, not
+/// from this probe.
+async fn resolve_mount_prefix(
+    client: &reqwest::Client,
+    url: &str,
+    dir: &std::path::Path,
+) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return String::new();
+    };
+    if !matches!(parsed.path(), "" | "/") {
+        return String::new();
+    }
+    let Some(nid) = dir.file_name().and_then(|n| n.to_str()) else {
+        return String::new();
+    };
+    let Ok(resp) = client.get(format!("{url}/nests")).send().await else {
+        return String::new();
+    };
+    if !resp.status().is_success() {
+        return String::new();
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return String::new();
+    };
+    let Some(nests) = body.get("nests").and_then(|n| n.as_array()) else {
+        return String::new();
+    };
+    let mut matches = nests
+        .iter()
+        .filter(|n| n.get("nid").and_then(|v| v.as_str()) == Some(nid))
+        .filter_map(|n| n.get("base_path").and_then(|v| v.as_str()));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => only.to_string(),
+        _ => String::new(),
+    }
+}
+
 impl SqlBackend {
-    fn open(dir: &str, url: &str) -> Result<Self> {
+    async fn open(dir: &str, url: &str) -> Result<Self> {
         let dir = std::path::PathBuf::from(dir);
         let db = dir.join(config::DB_FILE);
         // Prefer local files; redb is single-writer, so if `dev` holds the store the open fails and we
@@ -365,11 +419,17 @@ impl SqlBackend {
         // HTTP, locked by `dev` → HTTP, present and free → local.
         match store::Store::open_existing(&db) {
             Ok(store) => Ok(SqlBackend::Local { dir, store }),
-            Err(_) => Ok(SqlBackend::Http {
-                url: url.trim_end_matches('/').to_string(),
-                client: reqwest::Client::new(),
-                absent_store: (!db.exists()).then_some(db),
-            }),
+            Err(_) => {
+                let url = url.trim_end_matches('/').to_string();
+                let client = reqwest::Client::new();
+                let prefix = resolve_mount_prefix(&client, &url, &dir).await;
+                Ok(SqlBackend::Http {
+                    url,
+                    prefix,
+                    client,
+                    absent_store: (!db.exists()).then_some(db),
+                })
+            }
         }
     }
 
@@ -433,11 +493,12 @@ impl SqlBackend {
             }
             SqlBackend::Http {
                 url,
+                prefix,
                 client,
                 absent_store,
             } => {
                 let resp = client
-                    .get(format!("{url}/sql"))
+                    .get(format!("{url}{prefix}/sql"))
                     .query(&[("q", sql)])
                     .send()
                     .await
