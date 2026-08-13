@@ -625,7 +625,11 @@ const READINESS_STALL_SECS: u64 = 90;
 /// eventually report stalled too, or `/ready` stays a false "ready:true" forever. `started_at == 0`
 /// (not yet stamped, e.g. an un-stamped test fixture) falls back to the old unconditional grace.
 fn poll_stalled(last_poll: u64, started_at: u64, now: u64, threshold: u64) -> bool {
-    let since = if last_poll != 0 { last_poll } else { started_at };
+    let since = if last_poll != 0 {
+        last_poll
+    } else {
+        started_at
+    };
     since != 0 && now.saturating_sub(since) > threshold
 }
 

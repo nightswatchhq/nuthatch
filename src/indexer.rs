@@ -3028,7 +3028,9 @@ impl NestIngest {
         // normal way. Nothing here can reorg - it is all strictly past finality.
         if seal_direct && self.store.get_meta(LAST_BLOCK_KEY)?.is_none() {
             let tip = source.tip().await.map_err(|e| {
-                anyhow::Error::new(ColdStartUnreachable(format!("cold-start tip lookup failed: {e:#}")))
+                anyhow::Error::new(ColdStartUnreachable(format!(
+                    "cold-start tip lookup failed: {e:#}"
+                )))
             })?;
             let origin = cold_start_block(self.start_block, backfill, tip);
             let finalized_tag = match self.finality {
@@ -3595,9 +3597,15 @@ async fn index_loop(
     concurrency: usize,
     window: u64,
 ) -> Result<()> {
-    let mut next =
-        prepare_retrying(&mut nest, source.as_ref(), backfill, seal_direct, concurrency, window)
-            .await?;
+    let mut next = prepare_retrying(
+        &mut nest,
+        source.as_ref(),
+        backfill,
+        seal_direct,
+        concurrency,
+        window,
+    )
+    .await?;
 
     // Adaptive getLogs sizing (RFC-0004 §2), seeded from the chain's default window.
     //
@@ -5257,7 +5265,10 @@ template = "pool"
             .await
             .expect("a pool that eventually answers must not fail prepare - it should retry");
         // DEFAULT_BACKFILL is 5_000; tip is 1_000, so cold_start_block saturates to 0.
-        assert_eq!(next, 0, "cold start begins at block 0 when tip < DEFAULT_BACKFILL");
+        assert_eq!(
+            next, 0,
+            "cold start begins at block 0 when tip < DEFAULT_BACKFILL"
+        );
     }
 
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
