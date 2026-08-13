@@ -89,7 +89,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
         // never fatal - but loud when the answer is no, because the alternative is a nest that
         // indexes nothing and says nothing about it.
         report_abi_fit(
-            check_abi_fits(&rpc, address, &abi_json, tip, start_block).await,
+            check_abi_fits(&rpc, address, &abi_json, tip, start_block, chain.log_window).await,
             alias,
             address,
         );
@@ -236,7 +236,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
         };
 
         report_abi_fit(
-            check_abi_fits(&rpc, address, &abi_json, tip, start_block).await,
+            check_abi_fits(&rpc, address, &abi_json, tip, start_block, chain.log_window).await,
             alias,
             address,
         );
@@ -1067,10 +1067,8 @@ async fn check_abi_fits(
     abi: &serde_json::Value,
     tip: Option<u64>,
     start_block: Option<u64>,
+    log_window: u64,
 ) -> AbiFit {
-    // Deliberately narrow. A wide window on a busy contract trips provider result caps and returns an
-    // error, which would make this report `Unknown` for exactly the contracts it is meant to help.
-    const PROBE: u64 = 1_000;
     let Some(tip) = tip else {
         return AbiFit::Unknown;
     };
@@ -1082,12 +1080,7 @@ async fn check_abi_fits(
         return AbiFit::Mismatch { sampled: 0 };
     }
 
-    let mut windows = vec![(tip.saturating_sub(PROBE), tip)];
-    if let Some(start) = start_block {
-        if start.saturating_add(PROBE) < tip.saturating_sub(PROBE) {
-            windows.push((start, start + PROBE));
-        }
-    }
+    let windows = probe_windows(tip, start_block, log_window);
 
     let mut any_error = false;
     for (from, to) in windows {
@@ -1108,6 +1101,22 @@ async fn check_abi_fits(
     } else {
         AbiFit::NoSample
     }
+}
+
+/// Block ranges to probe, tip window first. `probe` is the chain's own measured, RPC-safe
+/// `eth_getLogs` span (`Chain::log_window`) - not a fixed guess. A wider guess trips a busy mainnet
+/// contract straight through every default provider's result-size cap (#512: a hardcoded 1,000-block
+/// probe of USDC errored on all three mainnet defaults - nodies, drpc, and onfinality), and the
+/// fallback below then reports a confident verdict from an ancient, unrepresentative sample instead
+/// of the `Unknown` an error is supposed to produce.
+fn probe_windows(tip: u64, start_block: Option<u64>, probe: u64) -> Vec<(u64, u64)> {
+    let mut windows = vec![(tip.saturating_sub(probe), tip)];
+    if let Some(start) = start_block {
+        if start.saturating_add(probe) < tip.saturating_sub(probe) {
+            windows.push((start, start + probe));
+        }
+    }
+    windows
 }
 
 /// The verdict itself, separated from fetching so it can be tested without a chain. `sample` is each
@@ -1657,6 +1666,36 @@ mod tests {
             fit_from_sample(&topic0s_of(IMPL_ABI), &[None]),
             AbiFit::Mismatch { sampled: 1 }
         );
+    }
+
+    /// #512: the tip probe must use the chain's own RPC-safe span, not a wider fixed guess. A
+    /// hardcoded 1,000-block window is exactly what sent USDC's real probe through every default
+    /// mainnet provider's result-size cap.
+    #[test]
+    fn tip_probe_window_matches_the_chains_log_window() {
+        let tip = 25_745_042u64;
+        let windows = probe_windows(tip, Some(6_082_465), 20);
+        assert_eq!(windows[0], (tip - 20, tip));
+    }
+
+    /// Deep gap between deploy and tip: both probes stay within `probe` blocks wide, and never widen
+    /// back out to some other constant regardless of how old the contract is.
+    #[test]
+    fn deploy_probe_window_is_also_bounded_by_log_window() {
+        let tip = 25_745_042u64;
+        let start = 6_082_465u64;
+        let windows = probe_windows(tip, Some(start), 20);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1], (start, start + 20));
+    }
+
+    /// A contract deployed within `2 * probe` of tip has overlapping windows - only the tip probe
+    /// runs, so a young contract isn't probed twice for the same blocks.
+    #[test]
+    fn recently_deployed_contract_gets_one_window() {
+        let tip = 25_745_042u64;
+        let windows = probe_windows(tip, Some(tip - 10), 20);
+        assert_eq!(windows.len(), 1);
     }
 
     // ---- --abi override -------------------------------------------------------------------------
