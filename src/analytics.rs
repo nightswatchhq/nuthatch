@@ -140,6 +140,20 @@ enum Attempt {
     },
 }
 
+/// Test-only knob: an artificial delay standing in for a slow first attempt, so a test can drive the
+/// deadline shared across both attempts and the sweep down to a sliver by the time the sweep runs -
+/// distinct from a **fresh** `guard.timeout` recomputed at the sweep call site, which this delay does
+/// not touch. Analogous to `seal::TEST_SWEEP_DELAY_MS`; process-global for the same reason, so any test
+/// using it must hold `seal::test_sweep_serial()` for its whole body.
+#[cfg(test)]
+static TEST_FIRST_ATTEMPT_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_set_first_attempt_delay_ms(ms: u64) {
+    TEST_FIRST_ATTEMPT_DELAY_MS.store(ms, Ordering::SeqCst);
+}
+
 fn run(
     dir: &Path,
     sql: &str,
@@ -167,6 +181,13 @@ fn run(
         Attempt::Ok(out) => return Ok(out),
         Attempt::DiedExecuting { error, tables } => (error, tables),
     };
+    #[cfg(test)]
+    {
+        let ms = TEST_FIRST_ATTEMPT_DELAY_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
     // **A segment that binds but will not read takes the whole query down** (#433). `read_parquet`
     // validates the footer while the view is being created, which is where #430's reduction hooks in;
     // corruption that leaves the footer intact and destroys the data region passes that probe and
@@ -3374,19 +3395,35 @@ template="pool"
         );
     }
 
-    /// **Issue #476, end to end.** Before this fix, `run`'s watchdog covered only the query execution
-    /// either side of the sweep: the sweep itself ran with nothing watching it, and the #433 retry got
-    /// a brand-new `guard.timeout` rather than whatever was left of the first one. A genuinely degraded
-    /// nest could cost up to `2 x timeout` in execution alone, plus an unbounded sweep in between.
+    /// **Issue #476, end to end - tightened for #500.** Before #476's fix, `run`'s watchdog covered
+    /// only the query execution either side of the sweep: the sweep itself ran with nothing watching
+    /// it, and the #433 retry got a brand-new `guard.timeout` rather than whatever was left of the
+    /// first one. A genuinely degraded nest could cost up to `2 x timeout` in execution alone, plus an
+    /// unbounded sweep in between.
     ///
-    /// Driven through the public surface (`query_guarded`, not `run` directly): three sealed segments,
-    /// the last corrupted, and `seal`'s test-only per-segment sweep delay (large relative to the query's
-    /// own timeout) so a sweep that actually obeys the shared deadline can only get through the first
-    /// segment before its budget is spent - it never reaches the corrupt one, so `corrupt` comes back
-    /// empty and the call must fail fast on the ORIGINAL error rather than pay for a second attempt.
-    /// An unbounded sweep would instead hash all three segments (3 x the injected delay) before ever
-    /// checking the clock, which the elapsed-time assertion below is wide enough to tell apart from the
-    /// bounded case but nowhere close to the unbounded one.
+    /// #500: the first version of this test could only tell a bounded sweep apart from an *unbounded*
+    /// one (`deadline: None`), not from one hand a **fresh** `guard.timeout` at the sweep call site,
+    /// which is the defect its name actually calls out - and that is the mutation that matters, since
+    /// it is what `deadline` accidentally recomputed at the wrong point would look like. The first
+    /// attempt (dying on a page-corrupt segment) is near-instant, so a fresh deadline taken a few
+    /// microseconds later was indistinguishable from the shared one, and the elapsed-time window this
+    /// test asserted was wide enough to swallow the gap.
+    ///
+    /// This version makes the first attempt itself consume most of the budget
+    /// (`test_set_first_attempt_delay_ms`), so a shared vs. a fresh deadline stop differing by degree
+    /// and start differing in kind. Bound to the shared deadline, only a sliver is left when the sweep
+    /// starts: it hashes segments one and two (unrelated, intact) but runs out before segment three,
+    /// the corrupt one, so `corrupt` comes back empty and `run` fails on its own plain "time budget"
+    /// check - a clean, cooperative bail, never touching a second `attempt`.
+    ///
+    /// Handed a fresh `guard.timeout` instead, the sweep gets the full budget again from that same
+    /// later point and reaches the corrupt segment - but the retry it then triggers is still bound by
+    /// the *original* shared `deadline` (only the sweep's own deadline was mutated), which by then has
+    /// already passed, so the retry's watchdog interrupts it mid-query instead. Both outcomes are
+    /// `Err`, so Ok vs Err cannot see this; the *error itself* differs in kind, though - a plain
+    /// "exceeded budget" message the bounded sweep produces cooperatively, versus DuckDB's own
+    /// "Interrupted!" from a retry that got cut off while running. That is the assertion below, not
+    /// elapsed wall-clock time.
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
         let _serial = crate::seal::test_sweep_serial().lock().unwrap();
@@ -3420,26 +3457,32 @@ template="pool"
             "the fixture must have corrupted something"
         );
 
-        crate::seal::test_set_sweep_delay_ms(150);
+        // A 200ms budget, 120ms of it spent before the sweep ever runs, leaves 80ms under the shared
+        // deadline when the sweep starts - enough to start segments one and two (50ms each) but not to
+        // reach segment three, the corrupt one, before that shared deadline is spent. A fresh
+        // `guard.timeout` recomputed at the sweep call site instead opens a new 200ms window from that
+        // same 120ms mark, comfortably covering all three 50ms segments.
+        crate::seal::test_set_sweep_delay_ms(50);
+        test_set_first_attempt_delay_ms(120);
         let guard = QueryGuard {
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_millis(200),
             max_rows: 10,
         };
-        let start = Instant::now();
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
-        let elapsed = start.elapsed();
         crate::seal::test_set_sweep_delay_ms(0);
+        test_set_first_attempt_delay_ms(0);
 
-        assert!(
-            result.is_err(),
-            "the sweep never reaches the corrupt (third) segment within budget, so there is nothing \
-             to exclude and this must fail the same way the un-reduced query does"
-        );
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "an unbounded sweep hashes all 3 segments (>= 450ms at the injected 150ms/segment) before \
-             a fast retry; bound to the query's own 100ms budget it must return well under that - took \
-             {elapsed:?}"
+        let message = result.as_ref().err().map(ToString::to_string);
+        assert_eq!(
+            message.as_deref(),
+            Some("query exceeded the 0s time budget on the read-only SQL surface"),
+            "bound to the shared deadline, the sweep has only a sliver of the 200ms budget left when \
+             it starts (120ms already spent on the first attempt) and cannot reach the corrupt third \
+             segment before that budget is spent, so `run` must bail on its own cooperative \"time \
+             budget\" check without ever starting a second attempt. A sweep handed a fresh 200ms \
+             instead reaches the corrupt segment too late for the *original* shared deadline that \
+             still bounds the retry, so it dies mid-query on DuckDB's own interrupt instead - a \
+             different error, not just a slower one: got {result:?}"
         );
     }
 
