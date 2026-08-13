@@ -259,7 +259,13 @@ async fn bring_up_mounted_runtime(
     let a2 = account(2);
     tape.insert_block(
         1,
-        transfers_block(1, 0, 1_700_000_001, USDC, &[(a1.as_str(), a2.as_str(), 100)]),
+        transfers_block(
+            1,
+            0,
+            1_700_000_001,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 100)],
+        ),
     );
     tape.advance_tip_to(1);
 
@@ -293,7 +299,13 @@ async fn bring_up_mounted_runtime(
     assert!(landed, "the mounted nest did not index to the tip in time");
 
     let mut estimates = HashMap::new();
-    let states = runtime::fan_out_aliases(&datasets, cursor.states, &health, &mut estimates, multi_tenant);
+    let states = runtime::fan_out_aliases(
+        &datasets,
+        cursor.states,
+        &health,
+        &mut estimates,
+        multi_tenant,
+    );
 
     let nid = datasets[0]
         .nid
@@ -352,7 +364,13 @@ async fn a_solo_runtime_stays_unprefixed() {
     let a2 = account(2);
     tape.insert_block(
         1,
-        transfers_block(1, 0, 1_700_000_001, USDC, &[(a1.as_str(), a2.as_str(), 100)]),
+        transfers_block(
+            1,
+            0,
+            1_700_000_001,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 100)],
+        ),
     );
     tape.advance_tip_to(1);
 
