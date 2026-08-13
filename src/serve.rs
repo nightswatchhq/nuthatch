@@ -1248,13 +1248,18 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let hot = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
-            Ok(hot) => hot,
+        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
+            Ok(hot) => (hot, false),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
-            Err(_) => Default::default(),
+            // Same level as a segment read failure (#472): a hot store that will not scan is at
+            // least as serious, and the fallback below must not be the only trace of it - #528.
+            Err(e) => {
+                tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
+                (Default::default(), true)
+            }
         };
         let sealed_through = store.sealed_through();
-        analytics::query_hot_cold(
+        let mut out = analytics::query_hot_cold(
             &dir,
             &probe,
             analytics::QueryGuard {
@@ -1263,14 +1268,20 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             },
             &hot,
             sealed_through,
-        )
+        )?;
+        out.tip_unavailable = tip_unavailable;
+        Ok(out)
     })
     .await;
     match result {
-        Ok(Ok(_)) => {
-            Json(json!({ "valid": true, "note": "query binds; run it with the sql tool" }))
-                .into_response()
-        }
+        Ok(Ok(out)) => Json(json!({
+            "valid": true,
+            "note": "query binds; run it with the sql tool",
+            // Same field, same meaning as `/sql` (#528): the hot-tip scan failed, so this bind
+            // answer is against sealed history alone and may miss a table/column the tip would add.
+            "tip_unavailable": out.tip_unavailable,
+        }))
+        .into_response(),
         // Same contract as `/sql`: a `503`, not a `400`. The query may well be valid - the node is
         // refusing to spend the memory to find out, so a caller should retry later, not rewrite
         // their SQL. `valid` is deliberately absent rather than `false`: bindability is unknown
