@@ -225,6 +225,19 @@ fn run(
 /// `Some(guard.timeout.as_secs())` when `deadline` has already passed, else `None`. Shared by the two
 /// places in [`run`] that must turn "we ran out of the shared deadline" into the same wording
 /// `attempt`'s own watchdog uses, rather than leaking `e`'s unrelated error text as the reason.
+/// Test-only knob: artificial delay in the `DiedExecuting` return path of `attempt`, after the
+/// watchdog is stopped. Lets a test make the first attempt consume most of the shared deadline
+/// before the sweep starts - so the difference between a shared deadline (nearly spent) and a
+/// fresh one (fully funded) is visible in how many segments the sweep can reach.
+/// See `tests::the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one`.
+#[cfg(test)]
+static TEST_ATTEMPT_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_set_attempt_delay_ms(ms: u64) {
+    TEST_ATTEMPT_DELAY_MS.store(ms, Ordering::SeqCst);
+}
+
 fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64> {
     if deadline.is_some_and(|d| Instant::now() >= d) {
         Some(guard.map(|g| g.timeout.as_secs()).unwrap_or(0))
@@ -380,6 +393,13 @@ fn attempt(
             // it and is worth one reduced retry (#433). The tables ride along because they come from
             // the security walk that already ran above - one parse, one answer about what this query
             // reaches, used by both controls.
+            #[cfg(test)]
+            {
+                let ms = TEST_ATTEMPT_DELAY_MS.load(Ordering::SeqCst);
+                if ms > 0 {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+            }
             return Ok(Attempt::DiedExecuting {
                 error: e,
                 tables: referenced,
@@ -3571,19 +3591,30 @@ template="pool"
         );
     }
 
-    /// **Issue #476, end to end.** Before this fix, `run`'s watchdog covered only the query execution
-    /// either side of the sweep: the sweep itself ran with nothing watching it, and the #433 retry got
-    /// a brand-new `guard.timeout` rather than whatever was left of the first one. A genuinely degraded
-    /// nest could cost up to `2 x timeout` in execution alone, plus an unbounded sweep in between.
+    /// **Issue #476, end to end - and #500, which pins the *fresh* half of the name.**
     ///
-    /// Driven through the public surface (`query_guarded`, not `run` directly): three sealed segments,
-    /// the last corrupted, and `seal`'s test-only per-segment sweep delay (large relative to the query's
-    /// own timeout) so a sweep that actually obeys the shared deadline can only get through the first
-    /// segment before its budget is spent - it never reaches the corrupt one, so `corrupt` comes back
-    /// empty and the call must fail fast on the ORIGINAL error rather than pay for a second attempt.
-    /// An unbounded sweep would instead hash all three segments (3 x the injected delay) before ever
-    /// checking the clock, which the elapsed-time assertion below is wide enough to tell apart from the
-    /// bounded case but nowhere close to the unbounded one.
+    /// Before #476, `run`'s watchdog covered only the query execution either side of the sweep:
+    /// the sweep itself ran with nothing watching it, and the #433 retry got a brand-new
+    /// `guard.timeout` rather than whatever was left of the first one.
+    ///
+    /// Driven through the public surface (`query_guarded`, not `run` directly): three sealed
+    /// segments, the last corrupted. `TEST_ATTEMPT_DELAY_MS` makes the first
+    /// (real, corruption-caused) attempt consume most of the 500ms `guard.timeout`, leaving the
+    /// sweep roughly 180ms of shared deadline. At `seal`'s injected 150ms per segment the sweep
+    /// checks two segments (T1 at 0ms, T2 at 150ms - both inside 180ms) before the T3 deadline
+    /// check fires at 300ms and breaks the loop. The sweep returns empty, the second attempt
+    /// retries with all segments, hits the corrupt third one again, and the call fails.
+    ///
+    /// The same fixture with a *fresh* deadline at the sweep call site (mutation A: `run` already
+    /// computed one `Instant` but the mutation re-derives `Instant::now() + guard.timeout`) or no
+    /// deadline at all (mutation B: `None`) gives the sweep a full or unbounded budget - T3 is
+    /// reached and found corrupt in both cases, and that extra segment costs an additional 150ms
+    /// of wall time. Both mutations are caught by `assert!(elapsed < ...)`: the window is wide
+    /// enough for the two-segment shared-deadline path but too narrow for three.
+    ///
+    /// Without `TEST_ATTEMPT_DELAY_MS` the first attempt is too fast: shared and fresh deadlines
+    /// start from nearly the same `Instant::now()`, each gets through the same one segment, and
+    /// the elapsed assertion cannot tell them apart. That is the gap #500 found in #494's test.
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
         let _serial = crate::seal::test_sweep_serial().lock().unwrap();
@@ -3617,26 +3648,32 @@ template="pool"
             "the fixture must have corrupted something"
         );
 
+        // 150ms per segment; the first attempt consumes ~300ms of the 500ms budget via
+        // TEST_ATTEMPT_DELAY_MS, leaving ~200ms. Sweep: T1 (0ms, ok), T2 (150ms, ok),
+        // T3 check (300ms > ~200ms remaining → break). A fresh or unbounded deadline reaches T3
+        // and costs an extra 150ms that puts elapsed past the window below.
         crate::seal::test_set_sweep_delay_ms(150);
+        test_set_attempt_delay_ms(300);
         let guard = QueryGuard {
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_millis(500),
             max_rows: 10,
         };
         let start = Instant::now();
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
         let elapsed = start.elapsed();
         crate::seal::test_set_sweep_delay_ms(0);
+        test_set_attempt_delay_ms(0);
 
         assert!(
             result.is_err(),
-            "the sweep never reaches the corrupt (third) segment within budget, so there is nothing \
-             to exclude and this must fail the same way the un-reduced query does"
+            "the sweep never reaches the corrupt (third) segment within the shared 500ms budget, \
+             so nothing is excluded and the second attempt re-hits the corruption"
         );
         assert!(
-            elapsed < Duration::from_millis(300),
-            "an unbounded sweep hashes all 3 segments (>= 450ms at the injected 150ms/segment) before \
-             a fast retry; bound to the query's own 100ms budget it must return well under that - took \
-             {elapsed:?}"
+            elapsed < Duration::from_millis(700),
+            "attempt (~300ms delay) + two-segment sweep (2 × 150ms = 300ms) ≈ 600ms total; a fresh \
+             or unbounded sweep that reaches the third segment costs one extra 150ms and lands past \
+             this window; took {elapsed:?}"
         );
     }
 
