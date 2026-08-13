@@ -8,7 +8,7 @@
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
-cargo install --git https://github.com/nightswatchhq/nuthatch nuthatch
+curl -fsSL https://nuthatch-indexer.com/install.sh | sh   # prebuilt binary, no compiler needed
 
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
 nuthatch dev            # backfills from deployment, follows the tip, serves an API
@@ -48,12 +48,27 @@ tiny*. That combination is the point - not any single feature.
 ## Install
 
 ```sh
-# from source (any platform with a Rust toolchain)
-cargo install --git https://github.com/nightswatchhq/nuthatch nuthatch
+curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 ```
 
-Prebuilt binaries (macOS Apple Silicon, Linux x86_64) ship with each release, or install in one line:
-`curl -fsSL https://nuthatch-indexer.com/install.sh | sh`.
+That downloads the prebuilt static binary for your platform from the latest release, verifies its
+SHA-256, and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
+involved**, so whichever rustc you happen to have is irrelevant. Prebuilt binaries cover macOS Apple
+Silicon and Linux x86_64 and are attached to every release with their checksums, if you would rather
+fetch one by hand.
+
+**From source**, which is the only route on a platform we do not publish a binary for:
+
+```sh
+rustup toolchain install 1.95.0
+cargo +1.95.0 install --git https://github.com/nightswatchhq/nuthatch nuthatch
+```
+
+The toolchain pin is load-bearing, not decoration. `rust-toolchain.toml` pins 1.95.0 because `dbsp`
+hits a next-trait-solver ICE on 1.97, and **that file does not apply to `cargo install --git`**,
+which builds in a temporary directory of its own. Without `+1.95.0`, a 1.97 default toolchain fails
+after a full dependency build with `error: could not compile dbsp` and installs nothing
+([#534](https://github.com/nightswatchhq/nuthatch/issues/534)).
 
 **Container images** are published per release to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
