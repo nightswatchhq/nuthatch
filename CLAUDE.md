@@ -73,7 +73,7 @@ RFC-0022) - but never a second chain behind one cursor. See RFC-0012, RFC-0021.
 > directory holds - a `nuthatch.toml` or a `mounts.toml` (RFC-0032). Data lives at `data/<nid>/`,
 > a mount record carries `tenant`, `alias` and `nid`, two mounts may share one nid, and `nuthatch
 > prune` is what reclaims a dataset nothing mounts any more - unmounting one of two mounts leaves
-> the data alone. `nuthatch migrate` moves a pre-2.0 directory and never re-indexes. Tenants may
+> the data alone. `nuthatch migrate` moves a pre-2.0 directory across. Tenants may
 > now be described as shipped, with the caveat the paragraph above already states: an opaque label
 > nuthatch refcounts and knows nothing else about. `docs/rfcs/0032` is the 2.0 shape; `0012` +
 > `0021` + `0027` are how it got here.
