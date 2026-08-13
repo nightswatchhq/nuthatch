@@ -1317,13 +1317,23 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
     for b in 1..=6u64 {
         let hash = block_hash(b, 0);
         // Two logs in the same block, distinct log_index so tx_hash is unique.
-        let usdc_log =
-            transfer_log(USDC, b, 0, &hash, a1.as_str(), a2.as_str(), (100 * b) as u128);
-        let arb_log =
-            transfer_log(ARB, b, 1, &hash, a1.as_str(), a2.as_str(), (7 * b) as u128);
+        let usdc_log = transfer_log(
+            USDC,
+            b,
+            0,
+            &hash,
+            a1.as_str(),
+            a2.as_str(),
+            (100 * b) as u128,
+        );
+        let arb_log = transfer_log(ARB, b, 1, &hash, a1.as_str(), a2.as_str(), (7 * b) as u128);
         tape.insert_block(
             b,
-            BlockFixture { hash, timestamp: 1_700_000_000 + b, logs: vec![usdc_log, arb_log] },
+            BlockFixture {
+                hash,
+                timestamp: 1_700_000_000 + b,
+                logs: vec![usdc_log, arb_log],
+            },
         );
     }
     tape.advance_tip_to(6);
@@ -1369,7 +1379,11 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
         .get(&usdc_table)
         .cloned()
         .expect("usdc segment sealed");
-    assert_eq!(usdc_segs.len(), 1, "expected one sealed usdc segment, got {usdc_segs:?}");
+    assert_eq!(
+        usdc_segs.len(),
+        1,
+        "expected one sealed usdc segment, got {usdc_segs:?}"
+    );
     let usdc_path = seal::segment_path(dir.path(), &usdc_segs[0].file, &usdc_segs[0].hash);
 
     // Freeze ingestion, then inflict both faults at once - the combination #472 and #477 were each

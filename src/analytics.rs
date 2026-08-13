@@ -3251,7 +3251,10 @@ template="pool"
         )
         .unwrap();
 
-        let out = cold(dir.path(), r#"SELECT "owner" FROM "t__approval" ORDER BY "owner""#);
+        let out = cold(
+            dir.path(),
+            r#"SELECT "owner" FROM "t__approval" ORDER BY "owner""#,
+        );
         assert_eq!(
             out.rows,
             vec![
