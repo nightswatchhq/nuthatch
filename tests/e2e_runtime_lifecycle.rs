@@ -382,7 +382,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
     scaffold_nest(&gamma_dir, "gamma", ARB);
 
     handles
-        .mount("gamma", Some(&gamma_nid))
+        .mount("gamma", Some(runtime::Nid::parse(&gamma_nid).unwrap()))
         .await
         .expect("mounting an unrecorded nest by nid must resolve data/<nid>, not nests/<name>");
     assert!(handles.states.iter().any(|(n, _)| n == "gamma"));
@@ -401,6 +401,144 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         reloaded.mounts.iter().any(|m| m.alias == "usdc"),
         "the pre-existing mount must survive untouched"
     );
+}
+
+/// NIG-185 / the #544 review finding: `nid` from the admin body reached `MountTable::data_dir` with
+/// nothing validating it in between, and `Path::join` discards the mount root outright when the
+/// argument is absolute or `..`-relative. The consequence that matters is not the 400 by itself - it
+/// is that an admitted bad `nid` gets to `persist_mounted_nests` (RFC-0027 §5's "converge on
+/// restart" write), and the very next `MountTable::load` calls `validate_mounts`, which has always
+/// refused a non-64-hex record. `load` is the single entry point for the whole table, so that is not
+/// "one nest fails" - it is every nest in the runtime failing to start, from a call that looked like
+/// it worked.
+///
+/// The traversal shape is what makes this reproducible without any coincidence: `../spare/legacy` is
+/// not a NID by any definition, but it is a real, valid, already-scaffolded nest directory once
+/// `data_dir` joins it onto the mount root and `..` walks back out - so *with the guard removed* this
+/// mount would fully succeed, right up through the cursor handshake, and the record would get
+/// written. That is what gives the final assertion teeth: delete the validation and this test does
+/// not merely fail to see a 400, it watches `MountTable::load` refuse the file the "successful" call
+/// just wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
+    const TOKEN: &str = "s3cret-admin-token";
+
+    let roost_dir = tempfile::tempdir().unwrap();
+    let usdc_nid = "bb22".repeat(16);
+    let usdc_dir = runtime::MountTable::data_dir(roost_dir.path(), &usdc_nid);
+    std::fs::create_dir_all(&usdc_dir).unwrap();
+
+    std::fs::write(
+        roost_dir.path().join(runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[mounts]]\nalias = \"usdc\"\nnid = \"{usdc_nid}\"\n"
+        ),
+    )
+    .unwrap();
+
+    // A real, valid nest a traversal-style `nid` can reach *without* being mounted itself - the
+    // danger here is not "no directory exists there", it is "one does".
+    let spare_dir = roost_dir.path().join("spare/legacy");
+    std::fs::create_dir_all(&spare_dir).unwrap();
+    scaffold_nest(&spare_dir, "legacy", ARB);
+    let traversal_nid = "../spare/legacy";
+
+    let tape = Arc::new(TapeSource::new());
+    let cfg_u = scaffold_nest(&usdc_dir, "usdc", USDC);
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("usdc", "arbitrum-one");
+
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        vec![("usdc".to_string(), usdc_dir.to_path_buf(), cfg_u)],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let roster = serde_json::json!({"runtime": "test", "nests": [{"name": "usdc"}]});
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
+        roster.clone(),
+        cursor.states.clone(),
+        health.clone(),
+    ));
+    let handles = runtime::RuntimeHandles {
+        live,
+        states: cursor.states,
+        alert_workers: cursor.alert_workers,
+        lifecycle: std::collections::HashMap::from([(
+            "arbitrum-one".to_string(),
+            cursor.lifecycle.clone(),
+        )]),
+        health,
+        roster,
+        estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
+        mount_ctx: runtime::MountContext {
+            dir: roost_dir.path().to_path_buf(),
+            mounts: vec![runtime::Mount {
+                tenant: "default".to_string(),
+                alias: "usdc".to_string(),
+                nid: usdc_nid.clone(),
+                sql: Default::default(),
+                queries: Vec::new(),
+            }],
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            window_override: Some(2),
+            admin_enabled: true,
+            admin_token: Some(TOKEN.to_string()),
+            max_rss_mb: 2048,
+        },
+    };
+    std::mem::forget(cursor.ingest);
+
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+
+    let (status, body) = call(
+        &routes,
+        "POST",
+        &format!("/_admin/nests?token={TOKEN}"),
+        None,
+        Some(&format!(r#"{{"name":"legacy","nid":"{traversal_nid}"}}"#)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "a nid that is not 64 hex characters must be refused, not resolved: {body}"
+    );
+
+    assert!(
+        !handles
+            .lock()
+            .await
+            .states
+            .iter()
+            .any(|(n, _)| n == "legacy"),
+        "the refused mount must not have taken effect"
+    );
+
+    // The assertion with teeth: `mounts.toml` was never touched, so the table the whole runtime
+    // depends on still parses and still holds exactly what it held before the call.
+    let reloaded =
+        runtime::MountTable::load(roost_dir.path()).expect("mounts.toml must still load");
+    assert_eq!(reloaded.mounts.len(), 1, "no record for the refused mount");
+    assert_eq!(reloaded.mounts[0].alias, "usdc");
+    assert_eq!(reloaded.mounts[0].nid, usdc_nid);
 }
 
 /// RFC-0027 §2: when `admin_enabled` is false (the default for any non-localhost bind that does not

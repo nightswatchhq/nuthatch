@@ -66,6 +66,48 @@ pub const NESTS_DIR: &str = "nests";
 /// that. That separation is the whole point: it is what lets two mounts name one dataset.
 pub const DATA_DIR: &str = "data";
 
+/// A nest identity, validated: 64 hex characters, exactly what [`crate::blob::Manifest::nid`]
+/// produces and what a `mounts.toml` record has always been required to hold (the SEC-10 rule
+/// `validate_mounts` applies below).
+///
+/// The only constructor is [`Nid::parse`], so a `Nid` in hand has already passed the same check a
+/// path segment gets. That matters at exactly one boundary: [`RuntimeHandles::mount`] takes an
+/// `Option<Nid>`, not `Option<&str>`, which is what closes the admin surface's `POST /_admin/nests`
+/// - the caller's `nid` used to reach [`MountTable::data_dir`] with nothing in between, and
+/// `Path::join` treats an absolute string as a full replacement, not a suffix. A raw string cannot
+/// reach that function without going through `parse` first; a guard at the handler alone would only
+/// have closed the one call site this fix was written against.
+///
+/// Internal `nid: String` fields (`Mount`, `PreparedDataset`, `migrate`'s records) stay untyped:
+/// they are populated either from `blob::nest_nid`'s own hash output, which is valid by
+/// construction, or from a `mounts.toml` that `validate_mounts` already gated at load. Retyping all
+/// of those is real follow-up work, not required to close the reachable path an admin caller has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nid(String);
+
+impl Nid {
+    pub fn parse(nid: &str) -> Result<Self> {
+        if nid.len() != 64 || !nid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("nid '{nid}' is invalid (expected 64 hex characters)");
+        }
+        Ok(Self(nid.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Nid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One mount record: an alias, and the identity of the nest whose dataset it serves (RFC-0032 §4).
 ///
 /// **Slice 1 carries `alias` and `nid` only.** The `tenant` column and refcount semantics land on
@@ -334,13 +376,8 @@ impl MountTable {
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
-            if m.nid.len() != 64 || !m.nid.bytes().all(|b| b.is_ascii_hexdigit()) {
-                bail!(
-                    "mount '{}' has an invalid nest identity '{}' (expected 64 hex characters)",
-                    m.alias,
-                    m.nid
-                );
-            }
+            Nid::parse(&m.nid)
+                .with_context(|| format!("mount '{}' has an invalid nest identity", m.alias))?;
             // SEC-10, again: a tenant is a path segment now, so it gets the same charset as an alias.
             // It is opaque to nuthatch, which is not the same as being allowed to contain `../`.
             safe_segment(&m.tenant, "tenant")?;
@@ -1592,6 +1629,11 @@ pub fn lifecycle_routes(
         /// it - see [`RuntimeHandles::mount`]. Required to mount a nest **not already recorded**, i.e.
         /// most 2.0 mounts: a fresh `mounts.toml` runtime has no record to fall back on, so omitting
         /// `nid` there reproduces #517 (silently trying the pre-2.0 `nests/<name>` path instead).
+        ///
+        /// Untrusted request-body input, so it stays a raw `String` here rather than `Nid` - Serde
+        /// has no way to turn a bad value into a clean 400, only a 422 the caller did not ask for.
+        /// `mount_nest` runs it through [`Nid::parse`] itself, before the credential-gated work
+        /// below even starts (NIG-185).
         nid: Option<String>,
     }
 
@@ -1625,8 +1667,20 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"error": "admin token required"})),
             );
         }
+        // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
+        // requires an `Nid` and cannot be called without one, but a bad value should read as a
+        // caller error (400) rather than the 500 an unwrapped `Result` would produce here.
+        let nid = match body.nid.as_deref().map(Nid::parse).transpose() {
+            Ok(nid) => nid,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
         let mut h = handles.lock().await;
-        match h.mount(&body.name, body.nid.as_deref()).await {
+        match h.mount(&body.name, nid).await {
             Ok(()) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"mounted": body.name})),
@@ -1853,7 +1907,12 @@ impl RuntimeHandles {
     /// which in a migrated (2.0) runtime is the common case: there is no `nests/<name>` to fall back
     /// on, so omitting it there used to resolve `data/<nid>/`'s nest against the pre-2.0 layout and
     /// fail (#517).
-    pub async fn mount(&mut self, name: &str, nid: Option<&str>) -> Result<()> {
+    ///
+    /// Takes `Option<Nid>`, not `Option<&str>` - an admin caller's `nid` used to reach
+    /// [`MountTable::data_dir`] unvalidated, and `Path::join` discards the mount root entirely when
+    /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
+    /// this function with a raw string.
+    pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
@@ -1867,7 +1926,7 @@ impl RuntimeHandles {
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
-        let nid = nid.map(str::to_string).or_else(|| {
+        let nid = nid.map(Nid::into_string).or_else(|| {
             self.mount_ctx
                 .mounts
                 .iter()
@@ -2872,6 +2931,29 @@ mod tests {
         let mounts = MountTable::load(root).expect("two tenants may share an alias");
         assert!(mounts.is_multi_tenant());
         assert_eq!(mounts.mount_refs().len(), 2);
+    }
+
+    /// `Nid::parse` is the only constructor - this is every caller `RuntimeHandles::mount` now has,
+    /// including the admin surface's `POST /_admin/nests`.
+    #[test]
+    fn nid_parse_rejects_anything_that_is_not_64_hex_characters() {
+        let good = "aa11".repeat(16);
+        assert_eq!(Nid::parse(&good).unwrap().as_str(), good);
+
+        let bad = [
+            "abc".to_string(), // the realistic typo: short, and not even all hex
+            "zz".repeat(32),   // right length, wrong alphabet
+            good[..good.len() - 1].to_string(), // one character short
+            "../../../../etc".to_string(), // traversal - not a NID at all
+            "/etc/passwd".to_string(), // absolute - Path::join would discard the mount root
+        ];
+        for bad in &bad {
+            let err = Nid::parse(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid") && err.contains("64 hex"),
+                "expected a 64-hex complaint for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
