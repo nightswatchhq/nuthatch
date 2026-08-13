@@ -27,9 +27,52 @@ use common::tape::{scaffold_nest, USDC};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `NUTHATCH_ADMIN_TOKEN` is process-wide and both tests below depend on its value, so they take turns
-/// rather than racing. Held across each test body - which spans awaits - hence the async mutex.
+/// `NUTHATCH_ADMIN_TOKEN` is process-wide and all four tests below depend on its value, so they take
+/// turns rather than racing. Held across each test body - which spans awaits - hence the async mutex.
 static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// RAII guard for `NUTHATCH_ADMIN_TOKEN`: clears it on drop, including when the drop is unwinding past
+/// a panicking assertion. `tokio::sync::Mutex` does not poison, so a test that left the variable set on
+/// panic used to hand it, live, to whichever test acquired [`ENV`] next (#436). Every test below builds
+/// one immediately after locking `ENV` and holds it for the rest of the body, so the value is correct by
+/// construction rather than by remembering to clear it before every `return`.
+struct EnvGuard;
+
+impl EnvGuard {
+    fn set(value: &str) -> Self {
+        std::env::set_var("NUTHATCH_ADMIN_TOKEN", value);
+        EnvGuard
+    }
+
+    fn unset() -> Self {
+        std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+        EnvGuard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+    }
+}
+
+/// #436, made concrete rather than left as a hypothetical "a fifth test would inherit s3cret": a panic
+/// while an `EnvGuard` is alive must still clear `NUTHATCH_ADMIN_TOKEN`, or the next test to acquire
+/// [`ENV`] starts with a stale credential already set. `std::panic::catch_unwind` is what makes the
+/// unwind checkable in-process without failing this test itself.
+#[tokio::test]
+async fn env_guard_clears_the_token_even_when_a_panic_unwinds_through_it() {
+    let _env = ENV.lock().await;
+    let result = std::panic::catch_unwind(|| {
+        let _token = EnvGuard::set("s3cret");
+        panic!("simulated assertion failure, to prove EnvGuard's drop still fires");
+    });
+    assert!(result.is_err(), "premise: the closure must actually have panicked");
+    assert!(
+        std::env::var("NUTHATCH_ADMIN_TOKEN").is_err(),
+        "EnvGuard must clear the token on an unwinding drop, not just a normal return"
+    );
+}
 
 /// A nest `serve_role` can load: `scaffold_nest` writes `rpc_urls = []`, and the FE constructs an
 /// `RpcClient` it never polls, which refuses an empty URL list.
@@ -89,7 +132,7 @@ async fn the_fe_admin_ui_is_not_open_on_an_off_localhost_bind() {
     let _env = ENV.lock().await;
     // Removing it makes the "no token configured" premise true regardless of the developer's shell,
     // rather than the test quietly asserting something else on a machine that exports one.
-    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
+    let _token = EnvGuard::unset();
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest(dir.path());
@@ -115,7 +158,7 @@ async fn the_fe_admin_ui_is_not_open_on_an_off_localhost_bind() {
 #[tokio::test]
 async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
     let _env = ENV.lock().await;
-    std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
+    let _token = EnvGuard::set("s3cret");
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest(dir.path());
@@ -135,7 +178,6 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
         .expect("admin request")
         .status();
     task.abort();
-    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
 
     assert_eq!(without.as_u16(), 401, "no credential must be refused");
     assert_eq!(with.as_u16(), 200, "the configured token must be accepted");
@@ -164,7 +206,7 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
 #[tokio::test]
 async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
     let _env = ENV.lock().await;
-    std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
+    let _token = EnvGuard::set("s3cret");
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest(dir.path());
@@ -191,9 +233,6 @@ async fn a_disabled_admin_surface_is_route_free_not_merely_404() {
     let admin_slash = probe("/_admin/").await;
     let admin_events = probe("/_admin/events").await;
     task.abort();
-    // Cleared before the assertions, like the sibling test: a panic must not leave the variable set
-    // for whatever runs next.
-    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
 
     assert_eq!(
         unrouted.0, 404,
@@ -325,7 +364,7 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 #[tokio::test]
 async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
     let _env = ENV.lock().await;
-    std::env::set_var("NUTHATCH_ADMIN_TOKEN", "s3cret");
+    let _token = EnvGuard::set("s3cret");
 
     let dir = tempfile::tempdir().unwrap();
     scaffold_fe_nest_with_secrets(dir.path());
@@ -448,6 +487,4 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
             );
         }
     }
-
-    std::env::remove_var("NUTHATCH_ADMIN_TOKEN");
 }
