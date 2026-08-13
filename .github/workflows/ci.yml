@@ -111,6 +111,16 @@ jobs:
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         run: |
+          # An unset start time is not a missing answer, it is one. Shell arithmetic reads an
+          # empty variable as 0, so the subtraction below would print the epoch itself as the
+          # elapsed time (measured on the probe run: 1786623050, i.e. 29,777,050m) and the
+          # sentence would then read as a confident expiry. The only way to reach this step
+          # without a start time is to be cut before the job's first step finished, which is
+          # seconds in, and therefore the one case that cannot be an expiry.
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 45m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
