@@ -1299,6 +1299,102 @@ async fn a_hot_scan_failure_does_not_claim_completeness_over_http() {
     server.abort();
 }
 
+/// #528: the third hot-scan call site #472 did not reach. `/explain` binds caller SQL against the
+/// hot tip too (RFC-0016 §3, over-budget case guarded since #293) but, unlike `/sql` and the CLI
+/// backend, used to swallow every *other* scan failure into `Default::default()` with nothing
+/// logged and nothing in the response - a caller got `valid: true` off sealed data alone, then hit
+/// a different schema on the very query `/sql` would actually run. Same [`HotScanFails`] fixture
+/// and real `spawn_nest` wiring as the `/sql` case above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hot_scan_failure_does_not_claim_bindable_completeness_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    let tape = Arc::new(TapeSource::new());
+
+    let a1 = account(1);
+    let a2 = account(2);
+    for b in 1..=5u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(5);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let store = rt.state.store.clone();
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            store.get_meta("last_block").ok().flatten().as_deref() == Some("5")
+        })
+        .await,
+        "nest did not index to the tip in time"
+    );
+
+    rt.ingest.abort();
+    if let Some(w) = rt.alert_worker {
+        w.abort();
+    }
+    let mut state = rt.state.clone();
+    state.store = Arc::new(HotScanFails(state.store.clone()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let table = transfer_table("usdc");
+    let q = format!("SELECT block_number FROM \"{table}\"");
+    let resp: serde_json::Value = client
+        .get(format!("{base}/explain"))
+        .query(&[("q", q)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        resp["error"].is_null(),
+        "a hot-scan failure must still answer (cold-only), not fault the bind: {resp}"
+    );
+    assert_eq!(
+        resp["valid"],
+        serde_json::json!(true),
+        "the query binds against sealed history alone even though the tip could not be read: {resp}"
+    );
+    // The whole point of #528: `/explain` must not say `valid: true` as though nothing happened
+    // when the entire tip - and whatever schema it might have added - was dropped.
+    assert_eq!(
+        resp["tip_unavailable"],
+        serde_json::json!(true),
+        "a dropped tip must say so on /explain too, not just /sql: {resp}"
+    );
+
+    server.abort();
+}
+
 /// **#472 + #477, as one piece.** Every #472 fixture above scaffolds a single table, so
 /// `tip_unavailable` (nest-wide by construction - one hot-store scan covers every table at once) was
 /// never exercised on a nest that also had a *per-table* `degraded_tables` opinion to disagree with.
