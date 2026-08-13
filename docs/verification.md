@@ -53,7 +53,7 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **verified across machines** | Every cross-machine invariant is now measured on published v0.9.3 artifacts: workers register, the scheduler assigns to a named remote worker, the lease carries a monotonic fence (incremented by a real handover), **clock skew** does not move a lease, a worker **indexes into a remote store**, and it **indexes straight through a control-plane partition**. |
+| 5 Scaled mode | **verified across machines on v0.9.3, not since** | Every cross-machine invariant was measured on published v0.9.3 artifacts (2026-08-02, #255): workers register, the scheduler assigns to a named remote worker, the lease carries a monotonic fence (incremented by a real handover), **clock skew** does not move a lease, a worker **indexes into a remote store**, and it **indexes straight through a control-plane partition**. **Not re-run on 1.x or 2.x** - the current release has the automated Postgres suites behind it and a cross-machine run two majors old. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
@@ -371,11 +371,15 @@ unauthenticated off-localhost.
 > the tests themselves: `partition` blocked the whole control-plane *host*, and since Postgres runs on
 > that box in the `multi` shape it cut the writer off from its **hot store** too - making its own
 > stated expectation ("the cursor STILL INDEXING") impossible to satisfy. Both now assert against the
-> shared Postgres and exit non-zero on failure. **Neither has been run yet**; this table moves only
-> when they have. Our 41 automated tests run against a live
-Postgres and cover every invariant below, but **the compose stack has never been brought up end to
-end**, and nothing has run across real machines. If you verify one level from this document, this is
-the one worth your time.
+> shared Postgres and exit non-zero on failure. **Neither had been run at the time of writing**;
+> both were run on 2026-08-02 (#255), which is when the table above moved.
+
+Our 41 automated tests run against a live Postgres and cover every invariant below, and the compose
+fleet has since been brought up end to end on real machines: `fleet-lab.sh up multi`, three Hetzner
+boxes on a private network, installing the **published v0.9.3** artifacts (#255). That run has not
+been repeated on 1.x or 2.x, so for the release you are holding this level rests on the automated
+tests plus a cross-machine run two majors old. If you verify one level from this document, this is
+still the one worth your time.
 
 Needs the **scaled** artifact — `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
 refuses these commands by name.
@@ -405,7 +409,8 @@ curl -s localhost:8290/workers    # expect: 2 workers with their budgets
 ```
 
 *Proves* the topology: control plane reachable, workers registering, FE nodes up. We have run this on a
-single host; **on separate machines it is still unverified**, and that is where a report helps most.
+single host and, on 2026-08-02, across three machines on published v0.9.3 artifacts (#255). **It has
+not been run on 1.x or 2.x**, so a report against the release you are holding still helps most.
 
 **5.2 Declaring a nest starts it, without a restart**
 

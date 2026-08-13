@@ -95,7 +95,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct MigrateArgs {
-    /// The directory to migrate: a pre-2.0 one with a runtime.toml, or one already part-migrated.
+    /// The directory to migrate: a pre-2.0 one with a `roost.toml`, or one already part-migrated.
     #[arg(long, default_value = ".")]
     pub dir: String,
     /// Print the plan - every nest, its identity, and where it would land - without changing
@@ -111,7 +111,8 @@ pub struct MigrateArgs {
 
 #[derive(Args)]
 pub struct PruneArgs {
-    /// The directory to migrate: a pre-2.0 one with a runtime.toml, or one already part-migrated.
+    /// The directory to prune: a 2.0 one with a `mounts.toml`. A pre-2.0 directory is refused with a
+    /// pointer to `nuthatch migrate` - nothing is reclaimable until its data is keyed by nid.
     #[arg(long, default_value = ".")]
     pub dir: String,
     /// Actually delete. Without this, prune only reports what it would remove.

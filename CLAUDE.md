@@ -68,11 +68,15 @@ boundary - never multiplex two chains behind one cursor. Multichain in one runti
 chain means a second cursor - in the same runtime or on another worker (the distributed pool,
 RFC-0022) - but never a second chain behind one cursor. See RFC-0012, RFC-0021.
 
-> **Status (2026-08-04): agreed, not yet built.** Today the runtime ships this as a *roost* -
-> `roost.toml`, `nuthatch roost dev`, a directory of nest directories, and storage keyed by nest
-> name. Tenants, NID-keyed storage and refcounted mounts are the agreed target and land in 2.0;
-> the roost is retired as a concept at that point. Read this paragraph as the destination and
-> `docs/rfcs/0012` + `0021` + `0027` as what exists. Do not describe tenants as shipped.
+> **Status (2026-08-13): shipped, verified against v2.2.0.** The roost is retired: there is no
+> `roost` subcommand, and `nuthatch dev --dir <dir>` runs one nest or many depending on what the
+> directory holds - a `nuthatch.toml` or a `mounts.toml` (RFC-0032). Data lives at `data/<nid>/`,
+> a mount record carries `tenant`, `alias` and `nid`, two mounts may share one nid, and `nuthatch
+> prune` is what reclaims a dataset nothing mounts any more - unmounting one of two mounts leaves
+> the data alone. `nuthatch migrate` moves a pre-2.0 directory across. Tenants may
+> now be described as shipped, with the caveat the paragraph above already states: an opaque label
+> nuthatch refcounts and knows nothing else about. `docs/rfcs/0032` is the 2.0 shape; `0012` +
+> `0021` + `0027` are how it got here.
 
 **Reorg strategy:** reorgs only ever touch the mutable hot store - and only that of the
 affected chain's cursor, isolated from other cursors in the same runtime. Segments are sealed to
