@@ -432,20 +432,37 @@ fn sweeps_in_flight() -> &'static Mutex<HashMap<SweepKey, Arc<SweepSlot>>> {
 }
 
 /// Test-only knob (#529): how many segment-budget checks the sweep loop gets to make before
-/// `sweep_out_of_budget` reports the deadline spent, **regardless of the wall clock** - `-1` (the
+/// `sweep_out_of_budget` reports the deadline spent, **regardless of the wall clock** - absent (the
 /// default) leaves the real `Instant`-based check in `sweep_out_of_budget` untouched. Replaces a
 /// per-segment `thread::sleep` raced against a real deadline: that raced two real clocks (how long
 /// the injected delay actually took to wake up vs. how long the deadline had left), and at load
 /// average 34 a descheduled thread can wake up arbitrarily later than its requested sleep, closing a
 /// margin that was only ever tens of milliseconds. Counting checks instead of milliseconds makes the
 /// early exit exact and load-independent: the loop stops after exactly the Nth check, on every run.
+///
+/// Keyed by `dir`, not a bare global - a first cut at this used a single process-global `AtomicI64`
+/// and read it unconditionally in `sweep_out_of_budget`, so for the whole window one test held it
+/// armed, *every* sweep in the test binary was truncated at the same check count, including sweeps
+/// belonging to tests that never touched the knob and held no lock over it. That is the exact class
+/// of bug this issue exists to remove, just relocated from a real clock to a shared atomic - keying
+/// by `dir` (same pattern as `test_sweep_starts` and the registration barrier above) removes it
+/// structurally: a sweep only ever consults the override for its own tempdir.
 #[cfg(test)]
-static TEST_SWEEP_EXPIRE_AFTER_CHECKS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+fn test_sweep_expiry_after_checks() -> &'static Mutex<HashMap<PathBuf, i64>> {
+    static EXPIRY: OnceLock<Mutex<HashMap<PathBuf, i64>>> = OnceLock::new();
+    EXPIRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(test)]
-pub(crate) fn test_set_sweep_expire_after_checks(n: i64) {
-    TEST_SWEEP_EXPIRE_AFTER_CHECKS.store(n, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn test_set_sweep_expire_after_checks(dir: &Path, n: i64) {
+    if n < 0 {
+        test_sweep_expiry_after_checks().lock().unwrap().remove(dir);
+    } else {
+        test_sweep_expiry_after_checks()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), n);
+    }
 }
 
 /// Test-only knob (#529): a rendezvous point inside `segments_failing_verification`, keyed by `dir`
@@ -480,23 +497,12 @@ pub(crate) fn test_clear_sweep_registration_barrier(dir: &Path) {
         .remove(dir);
 }
 
-/// `TEST_SWEEP_EXPIRE_AFTER_CHECKS` is process-global, and `cargo test` runs tests concurrently by
-/// default - so any test using it must hold this lock for its whole body, or a second such test on
-/// another thread can overwrite the knob mid-measurement. Tests that don't touch the knob are
-/// unaffected: they never contend for it (`test_sweep_start_count` is keyed per-dir for the same
-/// reason - see its doc).
-#[cfg(test)]
-pub(crate) fn test_sweep_serial() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 /// How many times a real (leader) sweep has run, keyed by `dir` - a coalescing test's only window
 /// into whether N concurrent identical callers paid for N sweeps or one. Keyed rather than a bare
 /// counter because `cargo test` runs the whole suite concurrently: an unrelated test's own (fast,
 /// undelayed) sweep against its own tempdir would otherwise land inside this test's delay window and
 /// inflate the count for a dir it never touched. Each test's tempdir is unique, so counting per-dir
-/// isolates it from that contamination without requiring every other test to take `test_sweep_serial`.
+/// isolates it from that contamination without requiring any process-wide serialisation.
 #[cfg(test)]
 fn test_sweep_starts() -> &'static Mutex<HashMap<PathBuf, usize>> {
     static STARTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -533,15 +539,18 @@ pub(crate) fn test_sweep_segments_processed_count(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// `deadline`'s check, factored out so a test can override it with an exact check-count cutoff
-/// (`TEST_SWEEP_EXPIRE_AFTER_CHECKS`) instead of racing a real `Instant` against a real
-/// `thread::sleep`. Production behaviour (the `#[cfg(not(test))]`-equivalent path, reached whenever
-/// no test has armed the override) is unchanged: `Instant::now() >= d`.
-fn sweep_out_of_budget(#[allow(unused_variables)] idx: usize, deadline: Option<Instant>) -> bool {
+/// `deadline`'s check, factored out so a test can override it with an exact, `dir`-keyed check-count
+/// cutoff (`test_set_sweep_expire_after_checks`) instead of racing a real `Instant` against a real
+/// `thread::sleep`. Production behaviour (the path reached whenever no test has armed an override for
+/// this `dir`) is unchanged: `Instant::now() >= d`.
+fn sweep_out_of_budget(
+    #[allow(unused_variables)] idx: usize,
+    deadline: Option<Instant>,
+    #[allow(unused_variables)] dir: &Path,
+) -> bool {
     #[cfg(test)]
     {
-        let n = TEST_SWEEP_EXPIRE_AFTER_CHECKS.load(std::sync::atomic::Ordering::SeqCst);
-        if n >= 0 {
+        if let Some(&n) = test_sweep_expiry_after_checks().lock().unwrap().get(dir) {
             return idx as i64 >= n;
         }
     }
@@ -570,7 +579,7 @@ fn sweep_segments(
     // could later move below the `fs::read`. `seal::tests::the_sweep_enumerates_only_the_tables_the
     // _query_named` is what pins it.
     for (idx, (table, seg)) in segments_to_verify(dir, tables).into_iter().enumerate() {
-        if sweep_out_of_budget(idx, deadline) {
+        if sweep_out_of_budget(idx, deadline, dir) {
             tracing::warn!(
                 "segment integrity sweep ran out of its query's time budget before checking every \
                  segment named by {tables:?} - what it found so far still applies, the rest is \
@@ -923,7 +932,6 @@ mod tests {
     /// matter how the threads are scheduled.
     #[test]
     fn concurrent_identical_sweeps_coalesce_into_one() {
-        let _serial = test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
 
@@ -973,7 +981,6 @@ mod tests {
     /// order, is never reached.
     #[test]
     fn sweep_stops_at_its_deadline_instead_of_running_to_completion() {
-        let _serial = test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         for (block, value) in [(100u64, "1"), (101, "2"), (102, "3")] {
             seal_range(dir.path(), &[transfer(block, 0, value)], block, block).unwrap();
@@ -990,13 +997,13 @@ mod tests {
         bytes[4..end].fill(0xFF);
         std::fs::write(&path, &bytes).unwrap();
 
-        test_set_sweep_expire_after_checks(1);
+        test_set_sweep_expire_after_checks(dir.path(), 1);
         // Still a real, non-expired deadline - a mutation that dropped the deadline argument
         // entirely (passed `None`) would let the sweep run unconstrained and reach the corrupt
         // segment regardless of the check-count override, which `bad.is_empty()` below would catch.
         let deadline = Some(Instant::now() + Duration::from_secs(3600));
         let bad = segments_failing_verification(dir.path(), &usdc(), deadline);
-        test_set_sweep_expire_after_checks(-1);
+        test_set_sweep_expire_after_checks(dir.path(), -1);
 
         assert_eq!(
             test_sweep_segments_processed_count(dir.path()),

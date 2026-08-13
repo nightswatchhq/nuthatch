@@ -14,9 +14,13 @@ use anyhow::{bail, Context, Result};
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::Connection;
 use serde_json::{Map, Value};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
@@ -153,15 +157,30 @@ enum Attempt {
 /// Test-only knob: an artificial delay standing in for a slow first attempt, so a test can drive the
 /// deadline shared across both attempts and the sweep well past expiry by the time the sweep runs -
 /// distinct from a **fresh** `guard.timeout` recomputed at the sweep call site, which this delay does
-/// not touch. Process-global, so any test using it must hold `seal::test_sweep_serial()` for its
-/// whole body.
+/// not touch.
+///
+/// Keyed by `dir`, not a bare process-global (#529) - `run` is `query_guarded`'s entry point and dozens
+/// of unrelated tests call it, so a global read unconditionally in the retry path would delay *any*
+/// concurrently running test that also died on its first attempt, for as long as this knob happened to
+/// be armed - the same class of cross-test contamination `seal::test_set_sweep_expire_after_checks`
+/// was fixed to avoid, just reached through a different knob. Keying by `dir` means only a call
+/// against this test's own tempdir ever sees the delay.
 #[cfg(test)]
-static TEST_FIRST_ATTEMPT_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+fn test_first_attempt_delays() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static DELAYS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(test)]
-pub(crate) fn test_set_first_attempt_delay_ms(ms: u64) {
-    TEST_FIRST_ATTEMPT_DELAY_MS.store(ms, Ordering::SeqCst);
+pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
+    if ms == 0 {
+        test_first_attempt_delays().lock().unwrap().remove(dir);
+    } else {
+        test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), ms);
+    }
 }
 
 fn run(
@@ -193,7 +212,12 @@ fn run(
     };
     #[cfg(test)]
     {
-        let ms = TEST_FIRST_ATTEMPT_DELAY_MS.load(Ordering::SeqCst);
+        let ms = test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .get(dir)
+            .copied()
+            .unwrap_or(0);
         if ms > 0 {
             std::thread::sleep(Duration::from_millis(ms));
         }
@@ -3654,7 +3678,6 @@ template="pool"
     /// room regardless of load.
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
-        let _serial = crate::seal::test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -3690,13 +3713,13 @@ template="pool"
         // against a comparably-sized per-segment cost (see the doc comment above for why that
         // changed). The three fixture segments are real work but microseconds of it, so a fresh or
         // absent deadline still has essentially the whole 200ms of headroom to reach the corrupt one.
-        test_set_first_attempt_delay_ms(3_000);
+        test_set_first_attempt_delay_ms(dir.path(), 3_000);
         let guard = QueryGuard {
             timeout: Duration::from_millis(200),
             max_rows: 10,
         };
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
-        test_set_first_attempt_delay_ms(0);
+        test_set_first_attempt_delay_ms(dir.path(), 0);
 
         let message = result.as_ref().err().map(ToString::to_string);
         assert_eq!(
