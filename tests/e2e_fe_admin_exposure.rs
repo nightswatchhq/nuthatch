@@ -67,7 +67,10 @@ async fn env_guard_clears_the_token_even_when_a_panic_unwinds_through_it() {
         let _token = EnvGuard::set("s3cret");
         panic!("simulated assertion failure, to prove EnvGuard's drop still fires");
     });
-    assert!(result.is_err(), "premise: the closure must actually have panicked");
+    assert!(
+        result.is_err(),
+        "premise: the closure must actually have panicked"
+    );
     assert!(
         std::env::var("NUTHATCH_ADMIN_TOKEN").is_err(),
         "EnvGuard must clear the token on an unwinding drop, not just a normal return"
