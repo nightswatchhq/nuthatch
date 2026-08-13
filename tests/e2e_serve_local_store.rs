@@ -34,6 +34,24 @@ async fn free_port() -> u16 {
     probe.local_addr().unwrap().port()
 }
 
+/// Drive `serve_role` expecting it to *refuse*, and return the error it refused with.
+///
+/// Bounded deliberately. A regression that opens the store instead does not return at all - it binds
+/// the port and serves forever - so an unbounded `.await` here would hang the whole test binary until
+/// the CI job's own timeout, which this repo has already learned reports as `cancelled` and reads
+/// like a supersede rather than a failure. Twenty seconds is far more than a refusal needs: both
+/// arms below fail before they touch the network.
+async fn refusal(args: ServeArgs) -> anyhow::Error {
+    match tokio::time::timeout(Duration::from_secs(20), nuthatch::indexer::serve_role(args)).await {
+        Ok(Ok(())) => panic!("serve must refuse this nest, but `serve_role` returned Ok"),
+        Ok(Err(err)) => err,
+        Err(_) => panic!(
+            "serve must refuse at startup, but was still running after 20s - it opened the store and \
+             started serving instead of refusing"
+        ),
+    }
+}
+
 /// `serve` against a nest directory with no store must refuse rather than create one - it must not be
 /// able to make itself true, the same principle #413 established for the `sql` probe.
 #[tokio::test]
@@ -52,9 +70,7 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
         hot_store: None,
         admin: false,
     };
-    let err = nuthatch::indexer::serve_role(args)
-        .await
-        .expect_err("serve must refuse a nest with no store, not bring an empty one into being");
+    let err = refusal(args).await;
 
     assert!(
         !db_path.exists(),
@@ -87,9 +103,7 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
         hot_store: None,
         admin: false,
     };
-    let err = nuthatch::indexer::serve_role(args)
-        .await
-        .expect_err("serve must refuse a store a live handle holds, not open it out from under it");
+    let err = refusal(args).await;
 
     let msg = format!("{err:#}");
     assert!(
