@@ -302,7 +302,18 @@ pub fn compose_runtime(
                 async move { roost_ready(&h) }
             }),
         );
-    for (name, state) in nests {
+    for (name, mut state) in nests {
+        // A nest served through this composition answers `/ready` and `/metrics` from `health`'s
+        // per-nest counters, never the process-global aggregate - `spawn_runtime` and `mount()` stamp
+        // `runtime_health` before a real nest ever reaches here. Filled in here too, only if the caller
+        // left it unset, so a fixture (or any future caller) that forgets the stamp cannot silently fall
+        // back to the solo path - the fault that let three fixtures in a row (#292, #356, #388) prove
+        // the handler and never the wiring. `get_or_insert_with` rather than an unconditional
+        // assignment: an alias mount's state is deliberately pre-stamped with its *canonical* nest's
+        // name (`fan_out_aliases`), and that must survive composition unchanged.
+        state
+            .runtime_health
+            .get_or_insert_with(|| (name.clone(), health.clone()));
         // `Router::nest` re-roots the whole per-nest router under `/<name>`, so `/lodestar/tables`,
         // `/lodestar/sql`, `/lodestar/_admin/` … all resolve to that nest's isolated state.
         app = app.nest(&format!("/{name}"), router(SharedNest::new(state)));
@@ -1611,6 +1622,14 @@ mod tests {
     /// Note the shape of the assertions: "chain B still answers 200" is the half that passes trivially
     /// when the mechanism is missing (a fresh global says ready to everyone). The load-bearing half is
     /// that chain **A** answers 503 *at the same time*, which only per-nest attribution can produce.
+    ///
+    /// Deliberately built from **un-stamped** [`test_state`] - `runtime_health` is left `None`, same as
+    /// every other test in this module - and composed via [`compose_runtime`] rather than stamped by
+    /// hand. That is the fix for #388: three fixtures in a row (#292, #356, this one) forgot to
+    /// replicate `spawn_runtime`'s stamp and silently proved the solo path instead, so the stamp now
+    /// lives once in `compose_runtime` itself and this test exists to pin that it actually fires - a
+    /// version of this test that reverted `compose_runtime`'s `get_or_insert_with` back to a no-op would
+    /// turn red here, both nests reporting via the process globals.
     #[tokio::test]
     async fn one_chains_dead_endpoints_leave_its_co_tenant_serving_and_report_only_itself_stalled()
     {
@@ -1622,15 +1641,10 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(live)).unwrap();
         let roster = json!({"runtime": "t", "nests": [{"name": dead}, {"name": live}]});
         let health = Arc::new(crate::health::RuntimeHealth::new());
-        // Stamp each state with its own name + the shared health surface, exactly as
-        // `indexer::spawn_runtime` does. That stamp is what makes `/ready` answer for THIS nest rather
-        // than from the process globals, so a mounts test that omits it is quietly testing the solo
-        // path under a mounts URL - which is why this gap survived.
         let nests: Vec<(String, AppState)> = [dead, live]
             .into_iter()
             .map(|name| {
-                let mut st = test_state(&dir.path().join(name), 4);
-                st.runtime_health = Some((name.to_string(), health.clone()));
+                let st = test_state(&dir.path().join(name), 4);
                 (name.to_string(), st)
             })
             .collect();
