@@ -24,9 +24,14 @@ concurrency:
   # for `pull_request`: a new push to a PR should kill that PR's own stale run.
   #
   # `push` to `main`/`sprint/**` must never have `cancel-in-progress` on. Those runs are what a
-  # merge queue or the next person's `git pull` waits on - killing one out from under it turns
-  # a real merge gate into a false pass. Grouping by ref still de-duplicates concurrent pushes
-  # to the same branch into a queue; it just refuses to cancel any of them.
+  # merge queue or the next person's `git pull` waits on - killing a *running* one out from under
+  # it turns a real merge gate into a false pass. `cancel-in-progress: false` buys exactly that:
+  # the running one survives. It does NOT guarantee every push gets a verdict. GitHub keeps only
+  # one *pending* run per concurrency group - a push that arrives while another is still queued
+  # (not yet started) cancels the queued one outright, with zero jobs run, regardless of this
+  # setting (#523). Under a burst of back-to-back pushes - a sprint close-out, say - intermediate
+  # commits can be dropped from the gate silently; only the running run and the latest arrival are
+  # ever safe.
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
