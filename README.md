@@ -51,11 +51,12 @@ tiny*. That combination is the point - not any single feature.
 curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 ```
 
-That downloads the prebuilt static binary for your platform from the latest release, verifies its
-SHA-256, and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
+That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
+and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
 involved**, so whichever rustc you happen to have is irrelevant. Prebuilt binaries cover macOS Apple
-Silicon and Linux x86_64 and are attached to every release with their checksums, if you would rather
-fetch one by hand.
+Silicon and Linux x86_64 (dynamically linked; needs glibc 2.35 or newer - Debian 12, Ubuntu 22.04,
+RHEL 9 and Amazon Linux 2023 all clear that floor) and are attached to every release with their
+checksums, if you would rather fetch one by hand.
 
 **From source**, which is the only route on a platform we do not publish a binary for:
 
