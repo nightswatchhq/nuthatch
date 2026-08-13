@@ -47,7 +47,11 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// invisible until something is genuinely wrong. Under the CLAUDE.md division of labour resource
 /// safety is the node's job, not the gateway's - which is why this is a hard limit here rather than
 /// advice in the docs.
-const SQL_MAX_HOT_ROWS: usize = 2_000_000;
+///
+/// `pub(crate)` rather than private: it is the default [`AppState::sql_max_hot_rows`] is built
+/// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
+/// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
+pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
 /// Reject absurdly long query strings before they reach the planner.
 const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
@@ -92,6 +96,11 @@ pub struct AppState {
     /// `/table` queries run at once so a burst can't multiply DuckDB's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
     pub sql_gate: Arc<Semaphore>,
+    /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
+    /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
+    /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
+    /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
+    pub sql_max_hot_rows: usize,
     /// The SQL surface this mount exposes (RFC-0034). Default is [`Open`](crate::allowlist::SqlAccess::Open) -
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
@@ -1068,6 +1077,7 @@ async fn run_sql_query(
     let dir = s.dir.clone();
     let sql = q.q.clone();
     let store = s.store.clone();
+    let sql_max_hot_rows = s.sql_max_hot_rows;
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
@@ -1077,7 +1087,7 @@ async fn run_sql_query(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
             Ok(hot) => (hot, false),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
             // Same level as a segment read failure (#472): a hot store that will not scan is at least
@@ -1208,6 +1218,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     // materialising rows. A CTE (`WITH …`) is legal inside the subquery, so this covers both shapes.
     let probe = format!("SELECT * FROM ({}) AS _explain LIMIT 0", q.q);
     let store = s.store.clone();
+    let sql_max_hot_rows = s.sql_max_hot_rows;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
@@ -1216,7 +1227,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let hot = match store.hot_rows_by_table_bounded(SQL_MAX_HOT_ROWS) {
+        let hot = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
             Ok(hot) => hot,
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
             Err(_) => Default::default(),
@@ -1537,6 +1548,7 @@ mod tests {
             velocity_threshold: None,
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
+            sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             surface: Arc::new(crate::allowlist::Surface::default()),
             nid: None,
             admin_enabled: true,
@@ -2032,6 +2044,72 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #378: an over-budget tip is refused by both `/sql` and `/explain`, not just by the store layer
+    /// underneath them. Neither handler was ever driven directly by a test before this - the typed
+    /// error (`HotScanTooLarge`) and the call site (`no_request_path_uses_the_unbounded_hot_scan`)
+    /// were each covered, but the mapping between them - `503`, this exact body shape - was not, so
+    /// deleting either handler's refusal arm left the suite green.
+    ///
+    /// `SQL_MAX_HOT_ROWS` is `2_000_000`; reaching the refusal for real would mean putting two
+    /// million rows in the hot store. `AppState::sql_max_hot_rows` exists so this test can lower the
+    /// seam instead, exactly as production leaves it at the real constant (`test_state`, `indexer.rs`).
+    #[tokio::test]
+    async fn a_hot_tip_over_the_configured_cap_is_refused_by_sql_and_explain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_hot_rows = 2;
+        for b in 1..=3u64 {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b}).to_string(),
+                )
+                .unwrap();
+        }
+        let q = || {
+            Query(SqlQuery {
+                q: "SELECT 1 AS n".into(),
+                max_rows: None,
+            })
+        };
+
+        let resp = sql(State(state.clone()), q()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "/sql");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("will not materialise"),
+            "/sql body: {v}"
+        );
+        assert_eq!(v["sealed_through"], json!(0));
+
+        let resp = explain(State(state), q()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "/explain");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("will not materialise"),
+            "/explain body: {v}"
+        );
+        assert_eq!(v["sealed_through"], json!(0));
+        // `valid` is deliberately absent, not `false` - bindability is unknown, not disproved.
+        assert!(
+            v.get("valid").is_none(),
+            "/explain must omit `valid` on refusal: {v}"
+        );
     }
 
     /// RFC-0010 Part A: the admin UI serves when enabled and 404s when disabled (`--no-admin` or a
