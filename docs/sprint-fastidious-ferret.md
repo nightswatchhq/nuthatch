@@ -1,7 +1,12 @@
 # Sprint: fastidious-ferret
 
 Filed by the board on 2026-08-13, immediately after auditing earnest-echidna.
-**Two days: 2026-08-14 to 2026-08-16.** Eleven issues.
+**Dispatched the evening of 2026-08-13; ends 2026-08-16.** Eleven issues.
+
+*Scoped and written as 14 to 16 August, then dispatched the evening before on the board's decision.
+Corrected here rather than left to read as though the plan had always said so - the last sprint's
+brief carried the opposite error, filed on the 12th and not dispatched until the 13th, and a brief
+that quietly agrees with whatever happened is worth nothing to the next person reading it.*
 
 Eleven rather than fifteen, deliberately. Earnest-echidna shifted fifteen in a shade over four hours,
 but eleven of its issues were corrections to prose and this sprint is almost entirely code with
