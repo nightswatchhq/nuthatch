@@ -112,7 +112,8 @@ indexing against the wrong chain corrupts state silently.
 ## Querying your data - the whole point
 
 Every declared event becomes a table named `{alias}__{event}` (e.g. `usdc__transfer`), carrying the
-event's fields plus `block_number`, `block_timestamp`, `tx_hash`, `log_index`, `address`.
+event's fields plus `block_number`, `block_hash`, `block_timestamp`, `tx_hash`, `log_index`,
+`address` and a `_seq` ordinal.
 
 > `block_timestamp` costs a block-header round trip per block - about 85% of backfill wall clock. A
 > nest that will never ask a time-series question can drop the column with `init --no-timestamps` and
