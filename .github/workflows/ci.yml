@@ -25,8 +25,20 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 45, not 25 (#525). Measured job durations: typical 17.8-19.8m, cold-cache tail 23.7m - a
+    # 25m ceiling left 1.3m of headroom over the observed worst case, and #521 landed exactly
+    # there: 25m32s, timed out, reported `cancelled`. A wider ceiling costs nothing on the happy
+    # path - a timeout only bills when it fires - and 45m matches the precedent already set on
+    # `multinest-footprint` below. The bound stays (#449 was right that an unbounded job is
+    # worse); only the number moves.
+    timeout-minutes: 45
     steps:
+      # Feeds "an expiry doesn't read as cancelled" below - GitHub gives `cancelled()` steps a
+      # grace window to run after a job is killed (proven on #521 itself: its own `if: always()`
+      # disk step ran and completed a second after the timed-out test step was cut off), so this
+      # survives to report elapsed time even when the job never reaches its last step normally.
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -75,6 +87,20 @@ jobs:
       - name: disk after the builds
         if: always()
         run: df -h /
+      # #525: `cancelled` is what GitHub reports for a human cancel, a `pull_request` supersede,
+      # AND an expired `timeout-minutes` - one word, three causes, and the checks list gives a
+      # reader nothing to tell them apart. There is no separate conclusion for an expired timeout,
+      # and no way to make the checks list itself say something else - only this job's own log
+      # can. So: do the subtraction here and print it, rather than leaving a reader to open the
+      # job and do it by hand. A run cancelled seconds after it started is plainly a real
+      # cancel/supersede; one that ran to (or past) the ceiling below is plainly an expiry. If it
+      # lands in between, that's the genuinely ambiguous case, and the numbers are what let a
+      # reader judge it instead of guessing from the icon.
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
