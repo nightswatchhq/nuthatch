@@ -72,11 +72,11 @@ pub const DATA_DIR: &str = "data";
 ///
 /// The only constructor is [`Nid::parse`], so a `Nid` in hand has already passed the same check a
 /// path segment gets. That matters at exactly one boundary: [`RuntimeHandles::mount`] takes an
-/// `Option<Nid>`, not `Option<&str>`, which is what closes the admin surface's `POST /_admin/nests`
-/// - the caller's `nid` used to reach [`MountTable::data_dir`] with nothing in between, and
-/// `Path::join` treats an absolute string as a full replacement, not a suffix. A raw string cannot
-/// reach that function without going through `parse` first; a guard at the handler alone would only
-/// have closed the one call site this fix was written against.
+/// `Option<Nid>`, not `Option<&str>`, closing the admin surface's `POST /_admin/nests`. The
+/// caller's `nid` used to reach [`MountTable::data_dir`] with nothing in between, and `Path::join`
+/// treats an absolute string as a full replacement, not a suffix. A raw string cannot reach that
+/// function without going through `parse` first; a guard at the handler alone would only have
+/// closed the one call site this fix was written against.
 ///
 /// Internal `nid: String` fields (`Mount`, `PreparedDataset`, `migrate`'s records) stay untyped:
 /// they are populated either from `blob::nest_nid`'s own hash output, which is valid by
