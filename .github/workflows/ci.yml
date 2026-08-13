@@ -18,6 +18,18 @@ on:
   # since that branch still carried the filtered version.
   pull_request:
 
+concurrency:
+  # A superseded run wastes a runner nobody will read the result of, and doubles the
+  # contention this box already feels from concurrent builds (#383). Cancel it - but only
+  # for `pull_request`: a new push to a PR should kill that PR's own stale run.
+  #
+  # `push` to `main`/`sprint/**` must never have `cancel-in-progress` on. Those runs are what a
+  # merge queue or the next person's `git pull` waits on - killing one out from under it turns
+  # a real merge gate into a false pass. Grouping by ref still de-duplicates concurrent pushes
+  # to the same branch into a queue; it just refuses to cancel any of them.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
