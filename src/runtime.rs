@@ -2075,6 +2075,13 @@ impl RuntimeHandles {
         .await
         .with_context(|| format!("preparing nest '{name}' for mount"))?;
         state.runtime_health = Some((name.to_string(), self.health.clone()));
+        // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
+        // this is the only place that knows it at mount time: `nid` above is already the resolved
+        // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
+        // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
+        // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
+        // it here or serve `nid: null` until the next restart (#557).
+        state.nid = nid.as_deref().map(Arc::from);
 
         // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
