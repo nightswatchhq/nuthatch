@@ -135,6 +135,16 @@ async fn body_json(live: &serve::LiveRuntime, path: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// The names `GET /nests` currently reports, in roster order.
+async fn roster_names(live: &serve::LiveRuntime) -> Vec<String> {
+    body_json(live, "/nests").await["nests"]
+        .as_array()
+        .expect("nests is an array")
+        .iter()
+        .map(|n| n["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// RFC-0027 §6: unmount is a **drain**, and the proof is that the store becomes reopenable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
@@ -162,6 +172,14 @@ async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
         "a mounted nest's store must be held open - otherwise this test cannot prove a release"
     );
 
+    // The control for the roster assertion below: `arb` really is listed while it is mounted, so a
+    // roster that never listed it cannot be mistaken for one that dropped it.
+    let before = roster_names(&handles.live).await;
+    assert!(
+        before.contains(&"arb".to_string()),
+        "premise: a mounted nest is listed in GET /nests; got {before:?}"
+    );
+
     handles.unmount("arb").await.expect("unmount");
 
     // The routes are gone, and the co-tenant is untouched - the whole point of unmounting one nest
@@ -175,6 +193,20 @@ async fn unmounting_a_nest_releases_its_store_and_removes_its_routes() {
         status(&handles.live, "/usdc/health").await,
         axum::http::StatusCode::OK,
         "the co-tenant must keep serving across another nest's unmount"
+    );
+
+    // #554's other half. `unmount` rebuilds `roster["nests"]` from the live states for the same
+    // reason `mount` does, and the two halves shipped together - but only the mount half was
+    // covered, so deleting the rebuild from `unmount` left the whole suite green. An operator who
+    // unmounts a nest and reads `/nests` to confirm it must not still be told it is there.
+    let after = roster_names(&handles.live).await;
+    assert!(
+        !after.contains(&"arb".to_string()),
+        "GET /nests must drop an unmounted nest, not keep reporting the startup set; got {after:?}"
+    );
+    assert!(
+        after.contains(&"usdc".to_string()),
+        "and the co-tenant must survive the rebuild; got {after:?}"
     );
 
     // The assertion this test exists for: every holder let go.
