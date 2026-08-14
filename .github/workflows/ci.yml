@@ -595,3 +595,48 @@ jobs:
           name: multinest-footprint-report
           path: multinest-footprint.json
           retention-days: 30
+
+  fuzz-smoke:
+    name: fuzz smoke (decode path)
+    runs-on: ubuntu-latest
+    # A short, bounded regression run, not a real fuzzing campaign - libFuzzer needs a fresh
+    # sanitizer-instrumented build (SanitizerCoverage), which only exists on nightly, so this
+    # deliberately does not share the pinned-1.95.0 toolchain the rest of CI uses. That pin is about
+    # keeping the *shipped binary* reproducible (Cargo.toml's rust-version comment); fuzz/ is dev-only
+    # tooling excluded from the published crate, same as components/ and scratchpad/.
+    #
+    # `-O` (no debug-assertions) and `--sanitizer none` (no ASan) are load-bearing, not
+    # convenience flags: nightly's trait solver ICEs (rustc bug, not our code - reproduced on both
+    # a June and an August 2026 nightly) computing a vtable slot for dbsp's
+    # `StarJoinFuncTrait`/`DynClone` whenever the build adds debug-assertions OR ASan on top of
+    # SanitizerCoverage. `overflow-checks = true` in fuzz/Cargo.toml survives that - it's the one
+    # of the pair this issue actually needs, to catch a `uint256[huge]`-style size computation
+    # overflowing rather than silently wrapping - and reproducibly does NOT trigger the ICE alone.
+    # Losing ASan costs memory-corruption detection in `unsafe` blocks; the decode path itself
+    # (registry.rs, rpc.rs) has none, so the exposure is only in dependencies, and libFuzzer's own
+    # OOM/RSS limits already cover the "unbounded allocation" half of this issue without it.
+    # Revisit once the upstream ICE is fixed (no tracking issue filed yet - reproduce with
+    # `cargo +nightly fuzz build` and no `--sanitizer none`/`-O` to check).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz decode path (nuthatch#290)
+        # Bounded by iteration count, not wall time, so runner speed doesn't change what this
+        # actually covers run to run. Seeds under fuzz/corpus/abi_json/ are checked in - see that
+        # directory's corpus/.gitignore carve-out - so this always starts from the shapes the issue
+        # named (duplicate topic0, absurd tuple depth, a huge fixed-array size) rather than from an
+        # empty corpus RNG luck would have to rediscover on every run. `abi_arbitrary` and
+        # `decode_log` build their own inputs structurally (see the file-level docs on each target)
+        # and don't need a checked-in seed corpus to reach the same shapes.
+        run: |
+          for target in abi_json abi_arbitrary decode_log; do
+            echo "::group::$target"
+            cargo fuzz run "$target" -O --sanitizer none -- -runs=300000 -max_total_time=180
+            echo "::endgroup::"
+          done
