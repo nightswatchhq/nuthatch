@@ -283,11 +283,11 @@ Screen sealed transfers against a list snapshot, recording `sanction_hit` annota
 
 ## `nuthatch serve`
 
-Serve a nest **read-only** from a shared hot store, without indexing it (RFC-0022 slice 3)
+Serve a nest without indexing it (RFC-0022 slice 3)
 
 - `--dir <DIR>` - Project directory (must contain a nuthatch.toml)
 - `--listen <LISTEN>` - Address to bind the HTTP API to
-- `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Omit to serve the nest's local redb, which read-scales a single box but shares a file rather than a service. Requires a build with `--features postgres-store`
+- `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with `--features postgres-store`. Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
 
 ## `nuthatch sql`
