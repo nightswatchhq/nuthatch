@@ -62,6 +62,20 @@ reaching the code it claims to fuzz - this project has been bitten by that shape
 five times (CLAUDE.md's docs-go-stale lesson generalises). Before trusting a green fuzz run, prove
 it reds on a known-bad build: reintroduce a fixed panic (e.g. revert `registry.rs`'s
 `u.saturating_to::<u64>()` guard, COR-11, to an unchecked `.to::<u64>()`) and confirm
-`cargo +nightly fuzz run decode_log` finds a crashing input within seconds against the seeded
-corpus, then revert. That check isn't automated here - a permanently red "this must find a bug"
-target isn't buildable - so re-run it by hand after any change to the fuzz harness itself.
+`cargo +nightly fuzz run decode_log -O --sanitizer none` finds a crashing input within seconds
+against the seeded corpus, then revert. That check isn't automated here - a permanently red "this
+must find a bug" target isn't buildable - so re-run it by hand after any change to the fuzz
+harness itself.
+
+**Status as of 2026-08-14: not completed live**, because the same rustc ICE described above (see
+"the compiler unexpectedly panicked" / `StarJoinFuncTrait`) blocked most build attempts that day,
+including plain rebuilds with no source change - it reproduced on roughly half of repeated,
+identical `cargo fuzz build -O --sanitizer none` invocations. Two builds against the *unmodified*
+(guard-in-place) code did succeed and confirmed `abi_json`/`abi_arbitrary`/`decode_log` link and
+run cleanly against the checked-in corpus with no crashes; the COR-11-reverted build to prove the
+opposite (a red) kept losing the same coin flip before landing one. The harness's construction is
+still sound by source inspection - `abi_json.rs`/`abi_arbitrary.rs` call
+`DecodeRegistry::build` directly, `decode_log.rs` calls `reg.decode(&log)` directly, exactly the
+entry points production ingestion calls - but that is not a substitute for the live proof this
+section asks for. Whoever picks this up next should re-run the COR-11 revert-and-build cycle
+(retrying past the flaky ICE as needed) before treating this target's coverage as trusted.

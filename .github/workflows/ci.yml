@@ -605,19 +605,27 @@ jobs:
     # keeping the *shipped binary* reproducible (Cargo.toml's rust-version comment); fuzz/ is dev-only
     # tooling excluded from the published crate, same as components/ and scratchpad/.
     #
-    # `-O` (no debug-assertions) and `--sanitizer none` (no ASan) are load-bearing, not
-    # convenience flags: nightly's trait solver ICEs (rustc bug, not our code - reproduced on both
-    # a June and an August 2026 nightly) computing a vtable slot for dbsp's
+    # `-O` (no debug-assertions) and `--sanitizer none` (no ASan) are the least-bad known
+    # workaround, not a fix: nightly's trait solver ICEs (rustc bug, not our code - reproduced on
+    # both a June and an August 2026 nightly) computing a vtable slot for dbsp's
     # `StarJoinFuncTrait`/`DynClone` whenever the build adds debug-assertions OR ASan on top of
-    # SanitizerCoverage. `overflow-checks = true` in fuzz/Cargo.toml survives that - it's the one
-    # of the pair this issue actually needs, to catch a `uint256[huge]`-style size computation
-    # overflowing rather than silently wrapping - and reproducibly does NOT trigger the ICE alone.
-    # Losing ASan costs memory-corruption detection in `unsafe` blocks; the decode path itself
-    # (registry.rs, rpc.rs) has none, so the exposure is only in dependencies, and libFuzzer's own
-    # OOM/RSS limits already cover the "unbounded allocation" half of this issue without it.
-    # Revisit once the upstream ICE is fixed (no tracking issue filed yet - reproduce with
-    # `cargo +nightly fuzz build` and no `--sanitizer none`/`-O` to check).
+    # SanitizerCoverage. `overflow-checks = true` in fuzz/Cargo.toml survives without either of
+    # those - it's the one of the pair this issue actually needs, to catch a `uint256[huge]`-style
+    # size computation overflowing rather than silently wrapping.
+    #
+    # IMPORTANT: this workaround is NOT reliable. Local testing (2026-08-14) saw the identical
+    # `-O --sanitizer none` command ICE on roughly half of repeated attempts with no source change
+    # in between - the trait-solver bug appears to be racy under rustc's parallel query engine, not
+    # a clean function of flags. `continue-on-error` below is load-bearing for that reason: this job
+    # is a best-effort regression tripwire, not a gate, until either upstream fixes the ICE or
+    # nuthatch stops linking dbsp into the fuzz build (the durable fix - see nuthatch#290's
+    # follow-up: extract registry.rs/rpc.rs, which have zero `unsafe` and no dbsp dependency at the
+    # source level, into their own crate so fuzzing the decode path never has to compile dbsp under
+    # instrumentation at all). Losing ASan costs memory-corruption detection in `unsafe` blocks; the
+    # decode path itself has none today, so the exposure is only in dependencies, and libFuzzer's
+    # own OOM/RSS limits already cover the "unbounded allocation" half of this issue without it.
     timeout-minutes: 45
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
