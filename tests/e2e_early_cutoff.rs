@@ -415,6 +415,7 @@ async fn bring_up_live(
         health,
         roster,
         estimates: std::collections::HashMap::new(),
+        multi_tenant,
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),
             // The whole table, including the record for the nest not yet mounted - which is exactly
@@ -481,7 +482,7 @@ async fn a_nest_mounted_into_a_running_runtime_gets_the_early_cutoff_too() {
 
     // --- Run 2: the runtime comes up with **beta only** and stays up. Alpha arrives by mount. ---
     let mut handles = bring_up_live(root, pruned_history(), &["beta"], 8).await;
-    handles.mount("alpha").await.expect("mounting alpha");
+    handles.mount("alpha", None).await.expect("mounting alpha");
 
     // The load-bearing assertion, and a positive one: the provider served no logs at all, so every
     // row here crossed over from the predecessor's dataset.
@@ -540,7 +541,7 @@ async fn a_live_candidate_is_not_copied_out_from_under_its_cursor() {
 
     // Beta stays up and keeps the cursor alive; the edited alpha is mounted into it.
     let mut handles = bring_up_live(root, pruned_history(), &["beta"], 8).await;
-    handles.mount("alpha").await.expect("mounting alpha");
+    handles.mount("alpha", None).await.expect("mounting alpha");
 
     // Whatever adoption decided, the destination must never be left holding a half-copied store: a
     // staging directory outliving the mount is the observable form of that fault.

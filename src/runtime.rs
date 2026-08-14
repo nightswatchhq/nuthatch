@@ -66,6 +66,48 @@ pub const NESTS_DIR: &str = "nests";
 /// that. That separation is the whole point: it is what lets two mounts name one dataset.
 pub const DATA_DIR: &str = "data";
 
+/// A nest identity, validated: 64 hex characters, exactly what [`crate::blob::Manifest::nid`]
+/// produces and what a `mounts.toml` record has always been required to hold (the SEC-10 rule
+/// `validate_mounts` applies below).
+///
+/// The only constructor is [`Nid::parse`], so a `Nid` in hand has already passed the same check a
+/// path segment gets. That matters at exactly one boundary: [`RuntimeHandles::mount`] takes an
+/// `Option<Nid>`, not `Option<&str>`, closing the admin surface's `POST /_admin/nests`. The
+/// caller's `nid` used to reach [`MountTable::data_dir`] with nothing in between, and `Path::join`
+/// treats an absolute string as a full replacement, not a suffix. A raw string cannot reach that
+/// function without going through `parse` first; a guard at the handler alone would only have
+/// closed the one call site this fix was written against.
+///
+/// Internal `nid: String` fields (`Mount`, `PreparedDataset`, `migrate`'s records) stay untyped:
+/// they are populated either from `blob::nest_nid`'s own hash output, which is valid by
+/// construction, or from a `mounts.toml` that `validate_mounts` already gated at load. Retyping all
+/// of those is real follow-up work, not required to close the reachable path an admin caller has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nid(String);
+
+impl Nid {
+    pub fn parse(nid: &str) -> Result<Self> {
+        if nid.len() != 64 || !nid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("nid '{nid}' is invalid (expected 64 hex characters)");
+        }
+        Ok(Self(nid.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Nid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One mount record: an alias, and the identity of the nest whose dataset it serves (RFC-0032 §4).
 ///
 /// **Slice 1 carries `alias` and `nid` only.** The `tenant` column and refcount semantics land on
@@ -295,12 +337,6 @@ impl MountTable {
             .with_context(|| format!("no {MOUNTS_FILE} in {}", dir.display()))?;
         let mounts: MountTable =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-        if mounts.runtime.nests.is_empty() && mounts.mounts.is_empty() {
-            bail!(
-                "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
-                mounts.runtime.name
-            );
-        }
         mounts.validate_mounts()?;
         // Every mount, whichever form declared it, must be a safe path segment and must not collide
         // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
@@ -340,13 +376,8 @@ impl MountTable {
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
-            if m.nid.len() != 64 || !m.nid.bytes().all(|b| b.is_ascii_hexdigit()) {
-                bail!(
-                    "mount '{}' has an invalid nest identity '{}' (expected 64 hex characters)",
-                    m.alias,
-                    m.nid
-                );
-            }
+            Nid::parse(&m.nid)
+                .with_context(|| format!("mount '{}' has an invalid nest identity", m.alias))?;
             // SEC-10, again: a tenant is a path segment now, so it gets the same charset as an alias.
             // It is opaque to nuthatch, which is not the same as being allowed to contain `../`.
             safe_segment(&m.tenant, "tenant")?;
@@ -1057,6 +1088,103 @@ impl Dataset {
     }
 }
 
+/// Group a runtime's *live* nests into datasets (RFC-0032 §4), for [`RuntimeHandles::mount`] /
+/// [`RuntimeHandles::unmount`] to feed [`build_roster_entries`].
+///
+/// Deliberately grouped from `states` - the nests actually being served right now - rather than
+/// [`MountTable::datasets`]'s source, the declared mount records. Those two agree at startup (every
+/// declared mount is live), but not after a live mount or unmount: an unmounted co-tenant of a shared
+/// dataset must drop out of `shared_with` immediately, and a nest mounted live from a bare directory
+/// with no mount record yet must still appear, grouped by directory like any other.
+fn live_datasets(
+    dir: &Path,
+    states: &[(String, crate::serve::AppState)],
+    mounts: &[Mount],
+) -> Vec<Dataset> {
+    let mut out: Vec<Dataset> = Vec::new();
+    for (name, _) in states {
+        let (tenant_seg, alias) = match name.split_once('/') {
+            Some((t, a)) => (Some(t), a),
+            None => (None, name.as_str()),
+        };
+        let record = mounts
+            .iter()
+            .find(|m| m.alias == alias && tenant_seg.is_none_or(|t| m.tenant == t));
+        let tenant = record
+            .map(|m| m.tenant.clone())
+            .unwrap_or_else(|| tenant_seg.unwrap_or(DEFAULT_TENANT).to_string());
+        let nid = record.map(|m| m.nid.clone());
+        let path = match &nid {
+            Some(nid) => MountTable::data_dir(dir, nid),
+            None => MountTable::nest_dir(dir, alias),
+        };
+        let mount_ref = MountRef {
+            tenant,
+            alias: alias.to_string(),
+        };
+        match out.iter_mut().find(|d| d.dir == path) {
+            Some(d) => d.mounts.push(mount_ref),
+            None => out.push(Dataset {
+                dir: path,
+                mounts: vec![mount_ref],
+                nid,
+            }),
+        }
+    }
+    out
+}
+
+/// Build the `GET /nests` roster entries for a nest set (RFC-0026 §5, RFC-0032 §4).
+///
+/// The one place this shape is assembled, called both at startup and by [`RuntimeHandles::mount`] /
+/// [`RuntimeHandles::unmount`]. Before #554 the live handlers rebuilt `self.states` but never touched
+/// `self.roster`, so a nest mounted into a running runtime served real traffic while `GET /nests` kept
+/// reporting the set as of boot - the roster is the one surface an operator reads to confirm a mount,
+/// and it lied by omission. Recomputing from the current state on every change, rather than patching the
+/// roster incrementally, is what makes that drift structurally impossible.
+fn build_roster_entries(
+    states: &[(String, crate::serve::AppState)],
+    datasets: &[Dataset],
+    multi_tenant: bool,
+    estimates: &std::collections::HashMap<String, u64>,
+) -> Vec<serde_json::Value> {
+    states
+        .iter()
+        .map(|(name, state)| {
+            // Which dataset backs this mount, and who else is on it (RFC-0032 §4). Without this an
+            // operator seeing two entries has no way to tell one shared dataset from two backfills.
+            // `None` when this mount has no dataset record - a nest mounted live from a bare directory
+            // with nothing yet in `mounts.toml` - and the fields below degrade gracefully to that.
+            let ds = datasets
+                .iter()
+                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
+            let this =
+                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
+            let tenant = this.map(|m| m.tenant.clone());
+            let shared_with: Vec<String> = ds
+                .map(|d| {
+                    d.mounts
+                        .iter()
+                        .map(|m| m.route_key(multi_tenant))
+                        .filter(|k| k != name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": name,
+                "chain": state.chain,
+                "tenant": tenant,
+                "nid": ds.and_then(|d| d.nid.clone()),
+                "shared_with": shared_with,
+                "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
+                "table_count": state.tables.len(),
+                "base_path": format!("/{name}"),
+                "estimated_rss_mb": estimates.get(name).copied().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 /// A mounted dataset whose inputs no longer hash to the identity its mount record claims.
 ///
 /// See [`MountTable::identity_drift`]. `actual` is `None` when the inputs could not be hashed at all,
@@ -1161,6 +1289,12 @@ pub async fn dev(
     fail_fast: bool,
 ) -> Result<()> {
     let mounts = MountTable::load(&dir)?;
+    if mounts.mount_refs().is_empty() {
+        anyhow::bail!(
+            "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
+            mounts.runtime.name
+        );
+    }
     let meta = &mounts.runtime;
     let endpoints = mounts.chain_endpoints()?;
 
@@ -1397,39 +1531,7 @@ pub async fn dev(
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
-    let roster_entries: Vec<_> = all_states
-        .iter()
-        .map(|(name, state)| {
-            // Which dataset backs this mount, and who else is on it (RFC-0032 §4). Without this an
-            // operator seeing two entries has no way to tell one shared dataset from two backfills.
-            let ds = datasets
-                .iter()
-                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
-            let this =
-                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
-            let tenant = this.map(|m| m.tenant.clone());
-            let shared_with: Vec<String> = ds
-                .map(|d| {
-                    d.mounts
-                        .iter()
-                        .map(|m| m.route_key(multi_tenant))
-                        .filter(|k| k != name)
-                        .collect()
-                })
-                .unwrap_or_default();
-            serde_json::json!({
-                "name": name,
-                "chain": state.chain,
-                "tenant": tenant,
-                "nid": ds.and_then(|d| d.nid.clone()),
-                "shared_with": shared_with,
-                "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
-                "table_count": state.tables.len(),
-                "base_path": format!("/{name}"),
-                "estimated_rss_mb": estimates.get(name).copied().unwrap_or(0),
-            })
-        })
-        .collect();
+    let roster_entries = build_roster_entries(&all_states, &datasets, multi_tenant, &estimates);
     let roster = serde_json::json!({
         // The runtime's own name. Called `roost` pre-2.0; the blanket rename briefly made this
         // `mounts`, which read as "the mount list" while holding a single name string.
@@ -1457,6 +1559,7 @@ pub async fn dev(
         health: health.clone(),
         roster,
         estimates: estimates.clone(),
+        multi_tenant,
         mount_ctx: MountContext {
             dir: dir.clone(),
             mounts: mounts.mounts.clone(),
@@ -1587,6 +1690,17 @@ pub fn lifecycle_routes(
     #[derive(serde::Deserialize)]
     struct MountBody {
         name: String,
+        /// The dataset identity to mount (RFC-0032 §4): `data/<nid>/`. Optional because a nest already
+        /// on record from a prior mount (or the pre-2.0 `nests/<name>` layout) still resolves without
+        /// it - see [`RuntimeHandles::mount`]. Required to mount a nest **not already recorded**, i.e.
+        /// most 2.0 mounts: a fresh `mounts.toml` runtime has no record to fall back on, so omitting
+        /// `nid` there reproduces #517 (silently trying the pre-2.0 `nests/<name>` path instead).
+        ///
+        /// Untrusted request-body input, so it stays a raw `String` here rather than `Nid` - Serde
+        /// has no way to turn a bad value into a clean 400, only a 422 the caller did not ask for.
+        /// `mount_nest` runs it through [`Nid::parse`] itself, before the credential-gated work
+        /// below even starts (NIG-185).
+        nid: Option<String>,
     }
 
     type Shared = (Arc<tokio::sync::Mutex<RuntimeHandles>>, Option<String>);
@@ -1619,8 +1733,20 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"error": "admin token required"})),
             );
         }
+        // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
+        // requires an `Nid` and cannot be called without one, but a bad value should read as a
+        // caller error (400) rather than the 500 an unwrapped `Result` would produce here.
+        let nid = match body.nid.as_deref().map(Nid::parse).transpose() {
+            Ok(nid) => nid,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
         let mut h = handles.lock().await;
-        match h.mount(&body.name).await {
+        match h.mount(&body.name, nid).await {
             Ok(()) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"mounted": body.name})),
@@ -1674,7 +1800,7 @@ pub fn lifecycle_routes(
 /// this list.** An operator who manages `mounts.toml` with configuration management should run
 /// `--no-admin` and restart to change the set, because fighting a config-management tool over a file
 /// is a losing game.
-fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
+fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Result<()> {
     let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
@@ -1684,6 +1810,13 @@ fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
     // that is what the serving layer and the admin API name a mount by. Matching them against
     // `alias` alone would drop every mount in a multi-tenant mounts on the first unmount.
     let multi_tenant = mounts.is_multi_tenant();
+    let key_of = |m: &Mount| {
+        MountRef {
+            tenant: m.tenant.clone(),
+            alias: m.alias.clone(),
+        }
+        .route_key(multi_tenant)
+    };
     if mounts.mounts.is_empty() {
         mounts.runtime.nests = nests.to_vec();
     } else {
@@ -1691,14 +1824,19 @@ fn persist_mounted_nests(dir: &Path, nests: &[String]) -> Result<()> {
         // wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5 makes
         // collection explicit, because re-backfilling is precisely the cost this design exists to
         // avoid and an accidental unmount must not trigger one.
-        mounts.mounts.retain(|m| {
-            let key = MountRef {
-                tenant: m.tenant.clone(),
-                alias: m.alias.clone(),
+        mounts.mounts.retain(|m| nests.contains(&key_of(m)));
+        // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
+        // /_admin/nests` rather than declared at boot (#517). Without this the mount works until the
+        // next restart, then silently vanishes: the exact "looks like it worked" failure this file
+        // exists to prevent (see the doc comment above).
+        for key in nests {
+            if mounts.mounts.iter().any(|m| &key_of(m) == key) {
+                continue;
             }
-            .route_key(multi_tenant);
-            nests.contains(&key)
-        });
+            if let Some(m) = known.iter().find(|m| &key_of(m) == key) {
+                mounts.mounts.push(m.clone());
+            }
+        }
         mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
     }
     let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
@@ -1726,11 +1864,16 @@ pub struct RuntimeHandles {
         tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
     >,
     pub health: Arc<crate::health::RuntimeHealth>,
-    /// The static half of the roster, re-merged with live health per request.
+    /// The static half of the roster, re-merged with live health per request. [`RuntimeHandles::mount`]
+    /// and [`RuntimeHandles::unmount`] rebuild `roster["nests"]` from `states` on every change (#554) -
+    /// this is not just the startup snapshot.
     pub roster: serde_json::Value,
     /// Per-nest projected RSS, so a mount can price the cursor it is joining without re-reading
     /// every co-tenant's config.
     pub estimates: std::collections::HashMap<String, u64>,
+    /// Whether the runtime serves more than one tenant, for [`build_roster_entries`]'s route keys.
+    /// Frozen at startup like `mount_ctx.mounts` - tenancy shape is not something a mount changes.
+    pub multi_tenant: bool,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
@@ -1828,7 +1971,19 @@ impl RuntimeHandles {
     ///
     /// Routes appear only after the cursor has acknowledged, so a nest is never reachable before it is
     /// actually indexing.
-    pub async fn mount(&mut self, name: &str) -> Result<()> {
+    ///
+    /// `nid` is the dataset identity to mount (RFC-0032 §4). It is optional because a nest already on
+    /// record - from a prior mount this session, or a pre-2.0 `mounts.toml` with no `[[mounts]]` at
+    /// all - still resolves without it. It is **required** to mount a nest with no existing record,
+    /// which in a migrated (2.0) runtime is the common case: there is no `nests/<name>` to fall back
+    /// on, so omitting it there used to resolve `data/<nid>/`'s nest against the pre-2.0 layout and
+    /// fail (#517).
+    ///
+    /// Takes `Option<Nid>`, not `Option<&str>` - an admin caller's `nid` used to reach
+    /// [`MountTable::data_dir`] unvalidated, and `Path::join` discards the mount root entirely when
+    /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
+    /// this function with a raw string.
+    pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
@@ -1839,12 +1994,16 @@ impl RuntimeHandles {
             Some((t, a)) => (Some(t), a),
             None => (None, name),
         };
-        let nid = self
-            .mount_ctx
-            .mounts
-            .iter()
-            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
-            .map(|m| m.nid.clone());
+        // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
+        // request to overwrite one. It falls back to a record from a prior mount/load only when the
+        // caller does not know it, e.g. remounting a nest this runtime has already seen.
+        let nid = nid.map(Nid::into_string).or_else(|| {
+            self.mount_ctx
+                .mounts
+                .iter()
+                .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                .map(|m| m.nid.clone())
+        });
         let dir = match &nid {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
@@ -1916,6 +2075,13 @@ impl RuntimeHandles {
         .await
         .with_context(|| format!("preparing nest '{name}' for mount"))?;
         state.runtime_health = Some((name.to_string(), self.health.clone()));
+        // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
+        // this is the only place that knows it at mount time: `nid` above is already the resolved
+        // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
+        // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
+        // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
+        // it here or serve `nid: null` until the next restart (#557).
+        state.nid = nid.as_deref().map(Arc::from);
 
         // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -1942,6 +2108,38 @@ impl RuntimeHandles {
         }
         self.estimates.insert(name.to_string(), incoming);
         self.states.push((name.to_string(), state));
+        // A 2.0 mount gets (or refreshes) its record here, so the persist just below can write it into
+        // `mounts.toml` even though it had none on disk - the durable half of the fix, matching what
+        // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
+        // already falls back to the flat `nests` list for that layout.
+        if let Some(nid) = &nid {
+            let record_tenant = tenant.map(str::to_string).unwrap_or_else(default_tenant);
+            match self
+                .mount_ctx
+                .mounts
+                .iter_mut()
+                .find(|m| m.alias == alias && m.tenant == record_tenant)
+            {
+                Some(m) => m.nid = nid.clone(),
+                None => self.mount_ctx.mounts.push(Mount {
+                    tenant: record_tenant,
+                    alias: alias.to_string(),
+                    nid: nid.clone(),
+                    sql: Default::default(),
+                    queries: Vec::new(),
+                }),
+            }
+        }
+        // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
+        // this step missing, which left the roster reporting its startup snapshot while the mount
+        // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
+        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        self.roster["nests"] = serde_json::json!(build_roster_entries(
+            &self.states,
+            &datasets,
+            self.multi_tenant,
+            &self.estimates,
+        ));
         self.live.swap(crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
@@ -1960,7 +2158,7 @@ impl RuntimeHandles {
     /// outcome, and the operator can fix the file.
     fn persist(&self) {
         let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
-        if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names) {
+        if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names, &self.mount_ctx.mounts) {
             tracing::warn!(
                 "the runtime's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
                  change is live now but will not survive a restart"
@@ -2037,6 +2235,15 @@ impl RuntimeHandles {
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
+        // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
+        // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
+        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        self.roster["nests"] = serde_json::json!(build_roster_entries(
+            &self.states,
+            &datasets,
+            self.multi_tenant,
+            &self.estimates,
+        ));
         self.live.swap(crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
@@ -2686,7 +2893,7 @@ mod tests {
         .unwrap();
 
         // acme unmounts; the runtime persists what is left, by route key.
-        persist_mounted_nests(root, &["globex/usdc".to_string()]).unwrap();
+        persist_mounted_nests(root, &["globex/usdc".to_string()], &[]).unwrap();
 
         let after = MountTable::load(root).expect("the rewritten file must still load");
         assert_eq!(after.mounts.len(), 1, "the co-tenant's mount was dropped");
@@ -2823,6 +3030,29 @@ mod tests {
         assert_eq!(mounts.mount_refs().len(), 2);
     }
 
+    /// `Nid::parse` is the only constructor - this is every caller `RuntimeHandles::mount` now has,
+    /// including the admin surface's `POST /_admin/nests`.
+    #[test]
+    fn nid_parse_rejects_anything_that_is_not_64_hex_characters() {
+        let good = "aa11".repeat(16);
+        assert_eq!(Nid::parse(&good).unwrap().as_str(), good);
+
+        let bad = [
+            "abc".to_string(), // the realistic typo: short, and not even all hex
+            "zz".repeat(32),   // right length, wrong alphabet
+            good[..good.len() - 1].to_string(), // one character short
+            "../../../../etc".to_string(), // traversal - not a NID at all
+            "/etc/passwd".to_string(), // absolute - Path::join would discard the mount root
+        ];
+        for bad in &bad {
+            let err = Nid::parse(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid") && err.contains("64 hex"),
+                "expected a 64-hex complaint for {bad:?}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn loads_a_valid_roost() {
         let d = tempfile::tempdir().unwrap();
@@ -2956,17 +3186,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_roost_that_mounts_nothing() {
+    fn a_zero_mount_table_loads_for_prune_but_is_empty() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join(MOUNTS_FILE),
             "[runtime]\nname = \"t\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = [\"u\"]\nnests = []\n",
         )
         .unwrap();
-        assert!(MountTable::load(d.path())
-            .unwrap_err()
-            .to_string()
-            .contains("mounts nothing"));
+        let t = MountTable::load(d.path()).expect("a readable zero-mount table must load");
+        assert!(t.mount_refs().is_empty());
     }
 
     #[test]

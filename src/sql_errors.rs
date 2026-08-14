@@ -99,6 +99,35 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         }
     }
 
+    // #539: a Solidity bool stored as exact text `'true'`/`'false'`, used somewhere that needs a real
+    // BOOLEAN. `enabled = true`/`AND`/`NOT` implicitly cast against a VARCHAR and just work, but a
+    // function requiring a uniform type across its arguments does not:
+    //   `Binder Error: Cannot mix values of type VARCHAR and BOOLEAN in COALESCE operator - an
+    //    explicit cast is required` (COALESCE, CASE, UNION - order of the two types in the message
+    //    varies by which side DuckDB names first, so check both), or
+    //   `Binder Error: No function matches the given name and argument types 'bool_and(VARCHAR)'`
+    //    (an aggregate that only accepts BOOLEAN, e.g. bool_and/bool_or).
+    let mixed_types = raw.contains("Cannot mix values of type")
+        && raw.contains("VARCHAR")
+        && raw.contains("BOOLEAN");
+    let bool_aggregate = raw.contains("No function matches")
+        && (raw.contains("bool_and(VARCHAR)") || raw.contains("bool_or(VARCHAR)"));
+    if mixed_types || bool_aggregate {
+        let lowered = query.to_ascii_lowercase();
+        for t in schema {
+            for bc in derive_footguns(t).bools {
+                if contains_word(&lowered, &bc.to_ascii_lowercase()) {
+                    return Some(format!(
+                        "`{bc}` is a Solidity bool stored as exact text `'true'`/`'false'`, not a SQL \
+                         boolean; direct comparisons (`{bc} = true`) and `AND`/`NOT` implicitly cast \
+                         and work, but COALESCE/CASE/bool_and/bool_or/UNION need matching types - write \
+                         `{bc} = 'true'` or `CAST({bc} AS BOOLEAN)`."
+                    ));
+                }
+            }
+        }
+    }
+
     // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
     // cleanly and then fails at execution, taking the whole query with it. The engine names nothing -
     // the observed message is `Invalid Error: don't know what type: ` - so an operator cannot tell a
@@ -299,6 +328,12 @@ mod tests {
                     indexed: false,
                 },
                 ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+                ColumnSchema {
                     name: "block_number".into(),
                     sol_type: "implicit".into(),
                     storage: "u64".into(),
@@ -443,6 +478,71 @@ mod tests {
             "Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'.";
         let hint = enrich(raw, "SELECT sum(value) FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("value_dec"), "points at value_dec");
+    }
+
+    /// #539: the issue's own repro, `COALESCE(enabled, false)`, against DuckDB's real message -
+    /// captured by actually running the query, not guessed.
+    #[test]
+    fn bool_column_in_coalesce_is_explained_not_left_as_a_raw_type_error() {
+        let raw = "Binder Error: Cannot mix values of type VARCHAR and BOOLEAN in COALESCE \
+                    operator - an explicit cast is required";
+        let hint = enrich(
+            raw,
+            "SELECT pool, COALESCE(enabled, false) AS override_enabled FROM usdc__transfer",
+            &schema(),
+        )
+        .unwrap();
+        assert!(hint.contains("`enabled`"), "names the bool column: {hint}");
+        assert!(
+            hint.contains("'true'") || hint.contains("CAST"),
+            "gives the working alternative: {hint}"
+        );
+    }
+
+    /// The message names the two types in the opposite order for `CASE` - the classifier must not be
+    /// order-sensitive.
+    #[test]
+    fn bool_column_in_case_is_explained_regardless_of_type_order_in_the_message() {
+        let raw = "Binder Error: Cannot mix values of type BOOLEAN and VARCHAR in CASE expression \
+                    - an explicit cast is required";
+        let hint = enrich(
+            raw,
+            "SELECT CASE WHEN true THEN enabled ELSE false END FROM usdc__transfer",
+            &schema(),
+        )
+        .unwrap();
+        assert!(hint.contains("`enabled`"), "{hint}");
+    }
+
+    /// The other real shape: an aggregate that only accepts BOOLEAN (`bool_and`/`bool_or`).
+    #[test]
+    fn bool_column_in_a_bool_aggregate_is_explained() {
+        let raw = "Binder Error: No function matches the given name and argument types \
+                    'bool_and(VARCHAR)'. You might need to add explicit type casts.";
+        let hint = enrich(
+            raw,
+            "SELECT bool_and(enabled) FROM usdc__transfer",
+            &schema(),
+        )
+        .unwrap();
+        assert!(hint.contains("`enabled`"), "{hint}");
+    }
+
+    /// A COALESCE type-mismatch between two columns that are *not* the bool footgun must not be
+    /// misattributed to `enabled` just because it mentions VARCHAR/BOOLEAN.
+    #[test]
+    fn a_mixed_type_error_naming_no_bool_column_gets_no_bool_hint() {
+        let raw = "Binder Error: Cannot mix values of type VARCHAR and BOOLEAN in COALESCE \
+                    operator - an explicit cast is required";
+        let hint = enrich(
+            raw,
+            "SELECT COALESCE(\"from\", false) FROM usdc__transfer",
+            &schema(),
+        );
+        assert!(
+            hint.is_none_or(|h| !h.contains("enabled")),
+            "must not name a column the query never mentioned"
+        );
     }
 
     #[test]

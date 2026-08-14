@@ -819,6 +819,14 @@ impl RpcClient {
         parse_hex_u64(result.as_str().unwrap_or_default())
     }
 
+    /// `eth_chainId`, once, with the same failover as any other call. Used to identify a chain
+    /// `init` has no registry entry for: the caller supplied `--rpc`, so this is the one round trip
+    /// standing between "unknown chain name" and a working nest (see `chains::resolve`).
+    pub async fn chain_id(&self) -> Result<u64> {
+        let result = self.call("eth_chainId", json!([])).await?;
+        parse_hex_u64(result.as_str().unwrap_or_default())
+    }
+
     /// Check **every** endpoint reports `expected` from `eth_chainId`, once, at startup (issue #150).
     ///
     /// A wrong-network endpoint in the pool is uniquely nasty: failover makes it *look* like a

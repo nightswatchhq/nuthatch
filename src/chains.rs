@@ -26,6 +26,8 @@
 //! Arbitrum - different finality semantics, denser blocks - is a data entry here, not a fork of the
 //! indexing loop.
 
+use anyhow::Context;
+
 /// How a chain decides a block is final enough to seal to the immutable cold layer. The sealing
 /// invariant is unchanged either way: the columnar layer never sees a reorg, so this only sets *how
 /// far behind the tip* we wait before a block is beyond reorg risk.
@@ -145,6 +147,91 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
     }
 }
 
+/// Policy for a chain with no registry entry: the same "assume L1, wait for real depth, and a
+/// narrow `eth_getLogs` window" default the indexer already falls back to for a nest whose
+/// `chain` field names nothing in this file. `init`/`add` hand a custom chain the identical
+/// policy, so a nest built here behaves exactly as `dev` already promised for one.
+pub const UNREGISTERED_FINALITY: Finality = Finality::Depth(64);
+pub const UNREGISTERED_WINDOW: u64 = 20;
+
+/// A resolved chain, ready for `init`/`add` to act on. `Chain` stays a purely `&'static` built-in
+/// registry entry; this is the owned shape a custom (non-built-in) chain needs, since its name and
+/// endpoints come from the command line rather than a `const`.
+///
+/// `Debug` is load-bearing rather than decorative: a test under the `scaled` feature unwraps a
+/// `Result` carrying this, which needs it, and the default build never compiles that test - so the
+/// omission was invisible until the scaled-mode CI job ran.
+#[derive(Debug)]
+pub struct ResolvedChain {
+    pub name: String,
+    pub chain_id: u64,
+    pub rpc_urls: Vec<String>,
+    pub finality: Finality,
+    pub log_window: u64,
+}
+
+impl From<&'static Chain> for ResolvedChain {
+    fn from(c: &'static Chain) -> Self {
+        ResolvedChain {
+            name: c.name.to_string(),
+            chain_id: c.chain_id,
+            rpc_urls: c.rpc_urls.iter().map(|s| s.to_string()).collect(),
+            finality: c.finality,
+            log_window: c.log_window,
+        }
+    }
+}
+
+/// Resolve `--chain` for `init`: a name in the built-in registry always wins, on its own vetted
+/// endpoints and policy. A name outside it is accepted too, but only when paired with `--rpc` -
+/// nothing else could tell nuthatch where to send traffic for a chain it doesn't ship. The custom
+/// chain's `chain_id` comes from the RPC itself (`eth_chainId`, one call) rather than a flag, since
+/// the endpoint already knows and a wrong hand-typed id would silently corrupt the nest.
+///
+/// This is the fix for issue #535: the nest format (`chain` + `chain_id` + `rpc_urls` in
+/// `nuthatch.toml`) and the runtime (`indexer::index` falls back to [`UNREGISTERED_FINALITY`] /
+/// [`UNREGISTERED_WINDOW`] for exactly this case) already support any chain - `init`'s allow-list
+/// was the only thing narrower than what it scaffolds.
+pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<ResolvedChain> {
+    if let Some(c) = lookup(name) {
+        return Ok(c.into());
+    }
+    if rpc_urls.is_empty() {
+        anyhow::bail!(
+            "unknown chain '{name}' (try: mainnet, arbitrum-one, base) - or pass --rpc <url> to \
+             point nuthatch at a chain it doesn't ship built-in"
+        );
+    }
+    let chain_id = crate::rpc::RpcClient::new(rpc_urls.to_vec())?
+        .chain_id()
+        .await
+        .with_context(|| format!("could not read the chain id for '{name}' from --rpc"))?;
+    Ok(ResolvedChain {
+        name: name.to_string(),
+        chain_id,
+        rpc_urls: rpc_urls.to_vec(),
+        finality: UNREGISTERED_FINALITY,
+        log_window: UNREGISTERED_WINDOW,
+    })
+}
+
+/// The chain of a nest already on disk: a known chain uses its own registry policy, and a nest
+/// scaffolded against a custom chain (see [`resolve`]) has its `chain_id` saved in `nuthatch.toml`
+/// already, so there is nothing left to ask an RPC for. Used by `add`, which grows an existing nest
+/// and must never re-detect or re-resolve the chain it already committed to at `init`.
+pub fn from_config(name: &str, chain_id: u64) -> ResolvedChain {
+    match lookup(name) {
+        Some(c) => c.into(),
+        None => ResolvedChain {
+            name: name.to_string(),
+            chain_id,
+            rpc_urls: Vec::new(),
+            finality: UNREGISTERED_FINALITY,
+            log_window: UNREGISTERED_WINDOW,
+        },
+    }
+}
+
 /// Every registered chain, in auto-detect probe order (L1 first, then the busiest L2s). `init`
 /// walks this when `--chain` is omitted: the chain a contract lives on is discoverable, not a
 /// thing the user should have to know and type.
@@ -248,5 +335,80 @@ mod tests {
                 assert!(seen.insert(*u), "{} lists {u} twice", c.name);
             }
         }
+    }
+
+    // ---- #535: `resolve`/`from_config` - a chain outside the built-in three ----------------------
+
+    /// A one-endpoint fake JSON-RPC server answering only `eth_chainId`. Mirrors `rpc::tests::fake_rpc`
+    /// (private to that module) - real HTTP, so `resolve`'s actual RPC round trip is exercised.
+    async fn fake_chain_id_rpc(chain_id: u64) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(State(chain_id): State<u64>, Json(_req): Json<Value>) -> Json<Value> {
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": format!("0x{chain_id:x}")}))
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(chain_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn resolve_of_a_known_name_ignores_rpc_and_never_dials_it() {
+        // A known chain never needs the network: `resolve` must not even try to dial `--rpc` for it -
+        // `127.0.0.1:1` is a port nothing listens on, so a dial here would hang or error.
+        let resolved = resolve("mainnet", &["http://127.0.0.1:1".into()])
+            .await
+            .unwrap();
+        assert_eq!(resolved.chain_id, 1);
+        assert_eq!(resolved.finality, Finality::Depth(64));
+        assert_eq!(resolved.log_window, 20);
+    }
+
+    #[tokio::test]
+    async fn resolve_of_an_unknown_name_without_rpc_names_the_remedy() {
+        let err = resolve("bsc", &[]).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown chain 'bsc'"), "{msg}");
+        assert!(msg.contains("--rpc"), "{msg}");
+    }
+
+    /// The fix for #535: an unregistered chain name is accepted once `--rpc` names where it lives,
+    /// and its `chain_id` comes from the endpoint itself rather than a hand-typed flag.
+    #[tokio::test]
+    async fn resolve_of_an_unknown_name_with_rpc_reads_the_chain_id_live() {
+        let (url, _rpc) = fake_chain_id_rpc(56).await;
+        let resolved = resolve("bsc", std::slice::from_ref(&url)).await.unwrap();
+        assert_eq!(resolved.name, "bsc");
+        assert_eq!(resolved.chain_id, 56);
+        assert_eq!(resolved.rpc_urls, vec![url]);
+        // Same fallback policy the indexer already applies to a nest on an unregistered chain
+        // (`indexer::DEFAULT_FINALITY`/`DEFAULT_WINDOW`) - a custom chain must not silently get a
+        // laxer or stricter default than the runtime it will actually run under.
+        assert_eq!(resolved.finality, UNREGISTERED_FINALITY);
+        assert_eq!(resolved.log_window, UNREGISTERED_WINDOW);
+    }
+
+    #[test]
+    fn from_config_of_a_known_chain_uses_the_registry_not_the_saved_id() {
+        // A hand-edited `chain_id` that disagrees with the registry is not this function's problem to
+        // catch (RPC startup's `verify_chain_ids` is) - it returns the registry's own policy either way.
+        let resolved = from_config("base", 999);
+        assert_eq!(resolved.chain_id, 8453);
+        assert!(matches!(resolved.finality, Finality::FinalizedTag { .. }));
+    }
+
+    #[test]
+    fn from_config_of_a_custom_chain_carries_the_saved_id_with_no_rpc_round_trip() {
+        let resolved = from_config("bsc", 56);
+        assert_eq!(resolved.name, "bsc");
+        assert_eq!(resolved.chain_id, 56);
+        assert_eq!(resolved.finality, UNREGISTERED_FINALITY);
+        assert_eq!(resolved.log_window, UNREGISTERED_WINDOW);
     }
 }

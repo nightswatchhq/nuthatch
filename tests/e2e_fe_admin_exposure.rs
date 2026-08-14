@@ -79,6 +79,11 @@ async fn env_guard_clears_the_token_even_when_a_panic_unwinds_through_it() {
 
 /// A nest `serve_role` can load: `scaffold_nest` writes `rpc_urls = []`, and the FE constructs an
 /// `RpcClient` it never polls, which refuses an empty URL list.
+///
+/// Also plants the local redb (#520): `serve` without `--hot-store` opens it non-creating now, so a
+/// nest with no store indexed yet - what `scaffold_nest` alone leaves behind - is refused at startup
+/// rather than served empty. A real deployment gets this from `dev` having run first; here it is a
+/// bare `Store::open` (create semantics), standing in for that indexing.
 fn scaffold_fe_nest(dir: &std::path::Path) -> nuthatch::config::Config {
     scaffold_nest(dir, "usdc", USDC);
     let toml_path = dir.join("nuthatch.toml");
@@ -89,6 +94,7 @@ fn scaffold_fe_nest(dir: &std::path::Path) -> nuthatch::config::Config {
         toml.replace("rpc_urls = []", r#"rpc_urls = ["http://127.0.0.1:1"]"#),
     )
     .unwrap();
+    nuthatch::store::Store::open(&dir.join(nuthatch::config::DB_FILE)).unwrap();
     nuthatch::config::Config::load(dir).unwrap()
 }
 
@@ -291,6 +297,8 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
         ),
     )
     .unwrap();
+    // #520: `serve` opens the local redb non-creating now - plant it, same as `scaffold_fe_nest`.
+    nuthatch::store::Store::open(&dir.join(nuthatch::config::DB_FILE)).unwrap();
     nuthatch::config::Config::load(dir).unwrap()
 }
 

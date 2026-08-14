@@ -90,6 +90,13 @@ big_ints = ["value"]              # use value_dec for SUM/AVG/compare
 overflows_dec = []                # the subset of big_ints too wide for DECIMAL(38,0) - their
                                   # _dec companion is NULL past 38 digits, so exact-decimal math
                                   # silently drops those rows. CAST(col AS DOUBLE) instead.
+bools = []                        # Solidity `bool` columns, stored as exact text 'true'/'false'
+                                  # rather than a SQL boolean. A direct comparison (col = true) or
+                                  # a boolean operator (AND/NOT) casts implicitly and works; a
+                                  # function needing one type across its arguments (COALESCE, CASE,
+                                  # bool_and/bool_or, UNION) does not, and fails to build with
+                                  # "an explicit cast is required". Write col = 'true', or
+                                  # CAST(col AS BOOLEAN).
 
 [view.top_recipients]             # optional (RFC-0018): what an authored view means
 description = "The 100 addresses receiving the most USDC, by total value."

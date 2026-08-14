@@ -156,9 +156,21 @@ Two consequences worth stating:
 
 | Route | Does |
 |---|---|
-| `POST /_admin/nests` | mount. Body: `{ "name": …, "source": <bundle path, URL, or registry ref>, "expect": <hash, optional> }`. `202` + the roster entry, or a §3 refusal |
+| `POST /_admin/nests` | mount. Body: `{ "name": …, "nid": <content address, optional> }`. `200` + the roster entry, or a §3 refusal |
 | `DELETE /_admin/nests/{name}` | unmount (§6). `?purge=true` to delete the data too. `202` |
 | `GET /nests` | the roster, gaining `health: "catching-up"` and `mounted_at` |
+
+> **Amendment (#550).** This row originally specified `{ "source", "expect" }` and `202`; the shipped
+> handler (`src/runtime.rs`) takes `nid` and returns `200`, and the board ruled the code right on both
+> counts rather than the document. `nid` is the content address a nest's data is already keyed by
+> (`CLAUDE.md`), so it is the field consistent with the data layer, not a shortcut that happened to
+> ship; `expect` is redundant once the identifier already *is* the hash it would assert. `nid` is
+> optional only because a nest already on record from a prior mount resolves without it - omitting it
+> against a fresh `mounts.toml` runtime, with no record to fall back on, is #517, not a supported
+> no-arg mount. `202` was wrong on its face: the handler awaits the mount and only builds a response
+> once it has returned and been persisted to `mounts.toml`, so the work is done before the caller is
+> answered, which `202 Accepted` denies by definition. `source` is not dropped, only moved - see the
+> open question below.
 
 Authentication is the existing admin token: `NUTHATCH_ADMIN_TOKEN`, presented as `?token=` or
 `Authorization: Bearer` (the header form lands with the audit-tail work). Off-localhost the token is
@@ -261,6 +273,11 @@ Each ends runnable, in dependency order:
   cursor's tip lag rises - i.e. whether the background job should yield to the foreground one
   dynamically rather than by static configuration.
 - Whether `POST /_admin/nests` should accept a registry `name@version` in slice 3 or only a local bundle,
-  deferring RFC-0019 resolution (and its credentials) to a later slice.
+  deferring RFC-0019 resolution (and its credentials) to a later slice. This is also where the `source`
+  field this RFC originally specified in §2 belongs (#550): a source-based mount - fetch-and-materialise
+  from a bundle path, URL, or registry ref - is a real feature with real questions attached, not least a
+  network fetch on an admin surface that needs bounding against non-negotiable 3. It is deliberately
+  deferred here rather than shipped as a field on the slice-2 mount, and should be designed alongside
+  this question rather than bolted on ahead of it.
 - Whether a catching-up nest should be exposed to webhooks and alerts, or hold delivery until it joins.
   Leaning hold: a nest replaying history would otherwise fire alerts for events that are years old.
