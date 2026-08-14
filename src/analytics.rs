@@ -14,9 +14,13 @@ use anyhow::{bail, Context, Result};
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::Connection;
 use serde_json::{Map, Value};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
@@ -151,17 +155,32 @@ enum Attempt {
 }
 
 /// Test-only knob: an artificial delay standing in for a slow first attempt, so a test can drive the
-/// deadline shared across both attempts and the sweep down to a sliver by the time the sweep runs -
+/// deadline shared across both attempts and the sweep well past expiry by the time the sweep runs -
 /// distinct from a **fresh** `guard.timeout` recomputed at the sweep call site, which this delay does
-/// not touch. Analogous to `seal::TEST_SWEEP_DELAY_MS`; process-global for the same reason, so any test
-/// using it must hold `seal::test_sweep_serial()` for its whole body.
+/// not touch.
+///
+/// Keyed by `dir`, not a bare process-global (#529) - `run` is `query_guarded`'s entry point and dozens
+/// of unrelated tests call it, so a global read unconditionally in the retry path would delay *any*
+/// concurrently running test that also died on its first attempt, for as long as this knob happened to
+/// be armed - the same class of cross-test contamination `seal::test_set_sweep_expire_after_checks`
+/// was fixed to avoid, just reached through a different knob. Keying by `dir` means only a call
+/// against this test's own tempdir ever sees the delay.
 #[cfg(test)]
-static TEST_FIRST_ATTEMPT_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+fn test_first_attempt_delays() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static DELAYS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(test)]
-pub(crate) fn test_set_first_attempt_delay_ms(ms: u64) {
-    TEST_FIRST_ATTEMPT_DELAY_MS.store(ms, Ordering::SeqCst);
+pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
+    if ms == 0 {
+        test_first_attempt_delays().lock().unwrap().remove(dir);
+    } else {
+        test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), ms);
+    }
 }
 
 fn run(
@@ -193,7 +212,12 @@ fn run(
     };
     #[cfg(test)]
     {
-        let ms = TEST_FIRST_ATTEMPT_DELAY_MS.load(Ordering::SeqCst);
+        let ms = test_first_attempt_delays()
+            .lock()
+            .unwrap()
+            .get(dir)
+            .copied()
+            .unwrap_or(0);
         if ms > 0 {
             std::thread::sleep(Duration::from_millis(ms));
         }
@@ -391,7 +415,21 @@ fn attempt(
 
     let (mut rows, over_cap) = match outcome {
         Ok(v) => v,
-        Err(Died::Binding(e)) => return Err(e),
+        // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
+        // just an in-flight execute - a query that gets no further than `conn.prepare` before the
+        // deadline fires still dies to it, and did so leaking DuckDB's raw "Interrupted!" text here
+        // (`Died::Binding` never checked `interrupted`, only `Died::Executing` did). Invisible under
+        // light load, where `prepare()` finishes in microseconds long before any real deadline; a
+        // heavily contended box can stall `prepare()` itself past the budget, at which point the
+        // untrusted `/sql` surface was supposed to say "query exceeded budget" and instead surfaced an
+        // internal DuckDB error string - the same class of bug this guard exists to prevent.
+        Err(Died::Binding(e)) => {
+            if interrupted.load(Ordering::SeqCst) {
+                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
+                bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            }
+            return Err(e);
+        }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
@@ -1545,6 +1583,135 @@ pub struct ViewIssue {
     pub hint: Option<String>,
 }
 
+/// If a query fails against a name DuckDB says doesn't exist, and that name is a nest-authored view
+/// that failed to build, replace the generic "does not exist" + fuzzy-match-on-an-unrelated-table
+/// message with the view's real build error (#539). A view that fails to build is reported as though
+/// it doesn't exist at all - `define_nest_views` loads views per-statement and swallows failures to
+/// `tracing::debug!` for fault isolation, so by the time a query dies at `/sql` there is no record of
+/// *why* the name is missing, and `sql_errors::enrich`'s fuzzy match then points at an unrelated real
+/// table. This is the one place that record is reconstructed: on the query's error path only (never
+/// on a successful query), rebuild the same base surface `validate_nest_views` uses and replay the
+/// view files in order, and report whichever `CREATE VIEW` statement targets `missing`.
+pub fn enrich_query_error(
+    dir: &Path,
+    raw: &str,
+    query: &str,
+    schema: &[crate::registry::TableSchema],
+) -> Option<String> {
+    if let Some(name) = missing_table_of(raw) {
+        if let Some(issue) = view_build_failure(dir, schema, &name) {
+            // The caller wraps whatever this returns as its own "hint: …" line, so this must read as
+            // that line's content, not carry a second nested "hint:" of its own.
+            let extra = issue.hint.map(|h| format!("\n{h}")).unwrap_or_default();
+            return Some(format!(
+                "view `{name}` failed to build (in `{}`): {}{extra}",
+                issue.file, issue.error
+            ));
+        }
+    }
+    crate::sql_errors::enrich(raw, query, schema)
+}
+
+/// If `missing` is the name of a nest-authored view (`views/*.sql`) that failed to build, the error
+/// from that specific `CREATE VIEW` statement - the real fault a query against it hit, rather than
+/// the "does not exist" DuckDB reports for a name that was simply never created. `None` if `missing`
+/// isn't an authored view name at all (an ordinary unknown-table typo), or names one that in fact
+/// built fine (so whatever failed, it wasn't this).
+fn view_build_failure(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    missing: &str,
+) -> Option<ViewIssue> {
+    // DuckDB validates `CREATE VIEW` eagerly (measured, not assumed - see the analytics.rs test
+    // suite), so "two later views joined pool_effective_fee" (#539) means those two views' *own*
+    // `CREATE VIEW` statements failed at load, each with the same "pool_effective_fee does not
+    // exist". Chase that chain to the view whose failure is not itself just a missing upstream view -
+    // the one line that actually explains anything - rather than reporting a hop that only repeats
+    // the same "does not exist" one level removed. Bounded to 8 hops, matching `expand_through_views`'
+    // cycle guard (DuckDB itself refuses a cyclic view, so this is a backstop, not the mechanism).
+    view_build_failure_at(dir, schema, missing, 8)
+}
+
+fn view_build_failure_at(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    missing: &str,
+    hops_left: u8,
+) -> Option<ViewIssue> {
+    let files = nest_view_files(dir);
+    if files.is_empty() {
+        return None;
+    }
+    let conn = Connection::open_in_memory().ok()?;
+    let empty_hot = HotRows::new();
+    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default());
+    define_labels_view(&conn, dir);
+    define_children_views(&conn, dir);
+
+    let target = missing.trim_matches('"').to_ascii_lowercase();
+    for v in &files {
+        for stmt in split_sql_statements(&v.sql) {
+            let result = conn.execute_batch(&stmt);
+            let Some(name) = view_target_name(&stmt) else {
+                continue;
+            };
+            if name.to_ascii_lowercase() != target {
+                continue;
+            }
+            return match result {
+                Ok(()) => None,
+                Err(e) => {
+                    let error = e.to_string();
+                    // If this statement's own failure is "some other name does not exist", and that
+                    // name is itself an authored view that also failed, that view's failure is the
+                    // actual cause - chase it rather than reporting a repeat of the same "does not
+                    // exist" the caller already has.
+                    if hops_left > 0 {
+                        if let Some(dep) = missing_table_of(&error) {
+                            if dep.to_ascii_lowercase() != target {
+                                if let Some(root) =
+                                    view_build_failure_at(dir, schema, &dep, hops_left - 1)
+                                {
+                                    return Some(ViewIssue {
+                                        file: v.file.clone(),
+                                        error: format!(
+                                            "depends on view `{dep}` (in `{}`), which failed to \
+                                             build: {}",
+                                            root.file, root.error
+                                        ),
+                                        hint: root.hint,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let hint = crate::sql_errors::enrich(&error, &stmt, schema);
+                    Some(ViewIssue {
+                        file: v.file.clone(),
+                        error,
+                        hint,
+                    })
+                }
+            };
+        }
+    }
+    None
+}
+
+/// The view name a `CREATE [OR REPLACE] VIEW <name> AS …` statement targets, unquoted. `None` for a
+/// statement that isn't that shape. Same lowercase-scan-for-offsets trick as `view_body`.
+fn view_target_name(stmt: &str) -> Option<String> {
+    let lower = stmt.to_ascii_lowercase();
+    let view_at = lower.find(" view ")?;
+    let as_at = lower[view_at..].find(" as ")? + view_at;
+    Some(
+        stmt[view_at + 6..as_at]
+            .trim()
+            .trim_matches('"')
+            .to_string(),
+    )
+}
+
 /// Validate a nest's authored views (RFC-0018 §1, the loud gate). Sets up the base surface - empty
 /// typed per-event views + labels + children, from the nest's own `schema.json`; no data needed, we're
 /// *binding*, not running - then defines each view in load order and records any that fail. A failure
@@ -2596,6 +2763,183 @@ template="pool"
         );
     }
 
+    /// #539's own repro: a Solidity `bool` column forces a `COALESCE` type mismatch, which fails the
+    /// view's `CREATE VIEW`. Querying it must name the build failure and the real DuckDB error, not
+    /// report it as though the view were never defined - and the old fuzzy match onto an unrelated
+    /// real table must be gone.
+    #[test]
+    fn a_view_broken_by_the_bool_footgun_is_named_as_a_build_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"pool_manager__toggle_custom_fee","pool":"0xp","enabled":true,"block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/20-custom-fees.sql"),
+            "CREATE VIEW pool_effective_fee AS \
+             SELECT pool, COALESCE(enabled, false) AS override_enabled \
+             FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+        // A real, unrelated table - present so the *old* fuzzy match had something to (wrongly) find.
+        std::fs::write(
+            dir.path().join("views/05-unrelated.sql"),
+            "CREATE VIEW pool_manager__set_default_fee_alias AS \
+             SELECT pool FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "pool_manager__toggle_custom_fee".into(),
+            alias: "pool_manager".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "ToggleCustomFee".into(),
+            topic0: "0x".into(),
+            columns: vec![
+                crate::registry::ColumnSchema {
+                    name: "pool".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: false,
+                },
+                crate::registry::ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+            ],
+        }];
+
+        // The exact DuckDB message a query against the broken view produces.
+        let raw = "Catalog Error: Table with name pool_effective_fee does not exist!\nDid you \
+                    mean \"pool_manager__set_default_fee_alias\"?";
+        let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM pool_effective_fee", &schema)
+            .unwrap();
+        assert!(
+            msg.contains("pool_effective_fee") && msg.contains("failed to build"),
+            "names the view and says it failed to build: {msg}"
+        );
+        assert!(
+            msg.contains("20-custom-fees.sql"),
+            "names the file the broken view lives in: {msg}"
+        );
+        assert!(
+            msg.contains("COALESCE") && msg.contains("explicit cast"),
+            "carries DuckDB's real error: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase()
+                .contains("pool_manager__set_default_fee_alias"),
+            "must not still suggest the unrelated real table now the real cause is known: {msg}"
+        );
+    }
+
+    /// The chained case: a view built *on top of* the broken one also fails to build (its own
+    /// `CREATE VIEW` cannot resolve `pool_effective_fee` either), and DuckDB's error for it names
+    /// `pool_effective_fee`, not the queried view. The message must still land on the root cause
+    /// rather than repeating "pool_effective_fee does not exist" one hop removed.
+    #[test]
+    fn a_view_built_on_a_broken_view_reports_the_root_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"pool_manager__toggle_custom_fee","pool":"0xp","enabled":true,"block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/20-custom-fees.sql"),
+            "CREATE VIEW pool_effective_fee AS \
+             SELECT pool, COALESCE(enabled, false) AS override_enabled \
+             FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/30-summary.sql"),
+            "CREATE VIEW pool_effective_fee_summary AS SELECT pool FROM pool_effective_fee;",
+        )
+        .unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "pool_manager__toggle_custom_fee".into(),
+            alias: "pool_manager".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "ToggleCustomFee".into(),
+            topic0: "0x".into(),
+            columns: vec![
+                crate::registry::ColumnSchema {
+                    name: "pool".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: false,
+                },
+                crate::registry::ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+            ],
+        }];
+
+        // DuckDB validates `CREATE VIEW` eagerly, so `pool_effective_fee_summary` was itself never
+        // created - a query against it names *itself* as missing, not `pool_effective_fee`.
+        let raw = "Catalog Error: Table with name pool_effective_fee_summary does not exist!";
+        let msg = enrich_query_error(
+            dir.path(),
+            raw,
+            "SELECT * FROM pool_effective_fee_summary",
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            msg.contains("pool_effective_fee_summary") && msg.contains("failed to build"),
+            "names the queried view: {msg}"
+        );
+        assert!(
+            msg.contains("pool_effective_fee") && msg.contains("30-summary.sql"),
+            "names the dependency and where the dependent view lives: {msg}"
+        );
+        assert!(
+            msg.contains("COALESCE") && msg.contains("explicit cast"),
+            "surfaces the *root* cause, not a repeat of \"does not exist\": {msg}"
+        );
+    }
+
+    /// An ordinary unknown-table typo - no authored view anywhere named after it - must fall through
+    /// to the normal fuzzy-match hint unchanged.
+    #[test]
+    fn an_unrelated_missing_table_is_unaffected_by_view_build_failure_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"5","block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "Transfer".into(),
+            topic0: "0xddf2".into(),
+            columns: vec![],
+        }];
+        let raw = "Catalog Error: Table with name transfers does not exist!";
+        let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM transfers", &schema).unwrap();
+        assert!(msg.contains("no table `transfers`"), "{msg}");
+        assert!(
+            msg.contains("usdc__transfer"),
+            "still suggests the real table: {msg}"
+        );
+    }
+
     /// RFC-0001 acceptance: `/sql` can JOIN across two per-event tables.
     #[test]
     fn sql_joins_across_two_tables() {
@@ -3621,9 +3965,25 @@ template="pool"
     /// "exceeded budget" message the bounded sweep produces cooperatively, versus DuckDB's own
     /// "Interrupted!" from a retry that got cut off while running. That is the assertion below, not
     /// elapsed wall-clock time.
+    ///
+    /// #529: even that was still timing-coupled. The 200ms budget minus a 120ms first-attempt delay
+    /// left ~80ms for a 2x50ms sweep to land in - a margin of one segment's worth, and
+    /// `thread::sleep` only guarantees *at least* the requested duration. At load average 34 a
+    /// descheduled thread can wake arbitrarily later than 50ms, so which of the two branches the
+    /// (unmutated, correct) code actually took stopped being reliable: `cargo test --lib` saw the
+    /// *other* outcome's message on a busy box. Fixed by making the margin lopsided rather than
+    /// tight enough to race: the first-attempt delay (3s) is set to comfortably outlive the whole
+    /// 200ms budget by itself, so the shared deadline is unambiguously, already expired - by seconds,
+    /// not by a contended few milliseconds - before the sweep is ever called, on every run regardless
+    /// of scheduling. The sweep's own per-segment cost is no longer artificially delayed at all: the
+    /// fixture's three tiny segments cost microseconds to hash for real, so a *fresh* deadline
+    /// (mutation A) or no deadline (mutation B) still has essentially the whole 200ms of real
+    /// headroom to reach the corrupt segment in, which is orders of magnitude more slack than
+    /// scheduling jitter needs even under heavy contention. The two outcomes no longer share a
+    /// finish line to race across; one is already over before the sweep starts, the other has ample
+    /// room regardless of load.
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
-        let _serial = crate::seal::test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -3654,20 +4014,18 @@ template="pool"
             "the fixture must have corrupted something"
         );
 
-        // A 200ms budget, 120ms of it spent before the sweep ever runs, leaves 80ms under the shared
-        // deadline when the sweep starts - enough to start segments one and two (50ms each) but not to
-        // reach segment three, the corrupt one, before that shared deadline is spent. A fresh
-        // `guard.timeout` recomputed at the sweep call site instead opens a new 200ms window from that
-        // same 120ms mark, comfortably covering all three 50ms segments.
-        crate::seal::test_set_sweep_delay_ms(50);
-        test_set_first_attempt_delay_ms(120);
+        // A 200ms budget with a 3s first-attempt delay: by the time the sweep is ever called, the
+        // shared deadline is already several seconds in the past, unambiguously - not a close race
+        // against a comparably-sized per-segment cost (see the doc comment above for why that
+        // changed). The three fixture segments are real work but microseconds of it, so a fresh or
+        // absent deadline still has essentially the whole 200ms of headroom to reach the corrupt one.
+        test_set_first_attempt_delay_ms(dir.path(), 3_000);
         let guard = QueryGuard {
             timeout: Duration::from_millis(200),
             max_rows: 10,
         };
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
-        crate::seal::test_set_sweep_delay_ms(0);
-        test_set_first_attempt_delay_ms(0);
+        test_set_first_attempt_delay_ms(dir.path(), 0);
 
         let message = result.as_ref().err().map(ToString::to_string);
         assert_eq!(

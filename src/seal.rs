@@ -347,6 +347,21 @@ pub fn segments_failing_verification(
         }
     };
 
+    // Test-only rendezvous (#529): when a test has armed a registration barrier for this `dir`, every
+    // caller - leader and followers alike - blocks here until all of them have made their
+    // leader-or-follower decision above. See `test_set_sweep_registration_barrier` for why.
+    #[cfg(test)]
+    {
+        let barrier = test_sweep_registration_barriers()
+            .lock()
+            .unwrap()
+            .get(dir)
+            .cloned();
+        if let Some(b) = barrier {
+            b.wait();
+        }
+    }
+
     if is_leader {
         // Removes this sweep's map entry and wakes any follower on every exit path, including a panic
         // unwind out of `sweep_segments` - `fs::read`/`Sha256::digest` don't panic on the errors this
@@ -416,25 +431,70 @@ fn sweeps_in_flight() -> &'static Mutex<HashMap<SweepKey, Arc<SweepSlot>>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Test-only knob: an artificial per-segment delay, so a test can force two sweeps to overlap (proving
-/// coalescing) or force one sweep to outlive a short deadline (proving the bound), deterministically
-/// rather than by racing the real filesystem.
+/// Test-only knob (#529): how many segment-budget checks the sweep loop gets to make before
+/// `sweep_out_of_budget` reports the deadline spent, **regardless of the wall clock** - absent (the
+/// default) leaves the real `Instant`-based check in `sweep_out_of_budget` untouched. Replaces a
+/// per-segment `thread::sleep` raced against a real deadline: that raced two real clocks (how long
+/// the injected delay actually took to wake up vs. how long the deadline had left), and at load
+/// average 34 a descheduled thread can wake up arbitrarily later than its requested sleep, closing a
+/// margin that was only ever tens of milliseconds. Counting checks instead of milliseconds makes the
+/// early exit exact and load-independent: the loop stops after exactly the Nth check, on every run.
+///
+/// Keyed by `dir`, not a bare global - a first cut at this used a single process-global `AtomicI64`
+/// and read it unconditionally in `sweep_out_of_budget`, so for the whole window one test held it
+/// armed, *every* sweep in the test binary was truncated at the same check count, including sweeps
+/// belonging to tests that never touched the knob and held no lock over it. That is the exact class
+/// of bug this issue exists to remove, just relocated from a real clock to a shared atomic - keying
+/// by `dir` (same pattern as `test_sweep_starts` and the registration barrier above) removes it
+/// structurally: a sweep only ever consults the override for its own tempdir.
 #[cfg(test)]
-static TEST_SWEEP_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn test_set_sweep_delay_ms(ms: u64) {
-    TEST_SWEEP_DELAY_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+fn test_sweep_expiry_after_checks() -> &'static Mutex<HashMap<PathBuf, i64>> {
+    static EXPIRY: OnceLock<Mutex<HashMap<PathBuf, i64>>> = OnceLock::new();
+    EXPIRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `TEST_SWEEP_DELAY_MS` is process-global, and `cargo test` runs tests concurrently by default - so
-/// any test using it must hold this lock for its whole body, or a second such test on another thread
-/// can overwrite the knob mid-measurement. Tests that don't touch the knob are unaffected: they never
-/// contend for it (`test_sweep_start_count` is keyed per-dir for the same reason - see its doc).
 #[cfg(test)]
-pub(crate) fn test_sweep_serial() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+pub(crate) fn test_set_sweep_expire_after_checks(dir: &Path, n: i64) {
+    if n < 0 {
+        test_sweep_expiry_after_checks().lock().unwrap().remove(dir);
+    } else {
+        test_sweep_expiry_after_checks()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), n);
+    }
+}
+
+/// Test-only knob (#529): a rendezvous point inside `segments_failing_verification`, keyed by `dir`
+/// so an unrelated test's concurrent sweep never joins it by accident (same reasoning as
+/// `test_sweep_starts` below). `concurrent_identical_sweeps_coalesce_into_one` used to keep the
+/// leader busy with a fixed 150ms per-segment delay, long enough - it hoped - for the three
+/// followers to be scheduled and find the leader's map entry before it published and removed
+/// itself. At load average 34 a follower can sit unscheduled for well over 150ms, arrive to find the
+/// entry already gone, and start its own uncoalesced sweep. A barrier removes the race instead of
+/// widening the margin: every caller (leader and followers) blocks here until all of them have made
+/// their leader-or-follower decision, so the leader cannot possibly finish and clean up before the
+/// last follower has registered, no matter how the four threads are scheduled.
+#[cfg(test)]
+fn test_sweep_registration_barriers() -> &'static Mutex<HashMap<PathBuf, Arc<std::sync::Barrier>>> {
+    static BARRIERS: OnceLock<Mutex<HashMap<PathBuf, Arc<std::sync::Barrier>>>> = OnceLock::new();
+    BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_sweep_registration_barrier(dir: &Path, n: usize) {
+    test_sweep_registration_barriers()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), Arc::new(std::sync::Barrier::new(n)));
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_sweep_registration_barrier(dir: &Path) {
+    test_sweep_registration_barriers()
+        .lock()
+        .unwrap()
+        .remove(dir);
 }
 
 /// How many times a real (leader) sweep has run, keyed by `dir` - a coalescing test's only window
@@ -442,7 +502,7 @@ pub(crate) fn test_sweep_serial() -> &'static Mutex<()> {
 /// counter because `cargo test` runs the whole suite concurrently: an unrelated test's own (fast,
 /// undelayed) sweep against its own tempdir would otherwise land inside this test's delay window and
 /// inflate the count for a dir it never touched. Each test's tempdir is unique, so counting per-dir
-/// isolates it from that contamination without requiring every other test to take `test_sweep_serial`.
+/// isolates it from that contamination without requiring any process-wide serialisation.
 #[cfg(test)]
 fn test_sweep_starts() -> &'static Mutex<HashMap<PathBuf, usize>> {
     static STARTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -457,6 +517,44 @@ pub(crate) fn test_sweep_start_count(dir: &Path) -> usize {
         .get(dir)
         .copied()
         .unwrap_or(0)
+}
+
+/// How many segments a sweep actually read and hashed, keyed by `dir` for the same reason as
+/// `test_sweep_starts`. What `sweep_stops_at_its_deadline_instead_of_running_to_completion` pins the
+/// early exit on: proof the loop stopped *before* the corrupt segment rather than merely that the
+/// corrupt segment happened not to be flagged.
+#[cfg(test)]
+fn test_sweep_segments_processed() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static PROCESSED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    PROCESSED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_sweep_segments_processed_count(dir: &Path) -> usize {
+    test_sweep_segments_processed()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `deadline`'s check, factored out so a test can override it with an exact, `dir`-keyed check-count
+/// cutoff (`test_set_sweep_expire_after_checks`) instead of racing a real `Instant` against a real
+/// `thread::sleep`. Production behaviour (the path reached whenever no test has armed an override for
+/// this `dir`) is unchanged: `Instant::now() >= d`.
+fn sweep_out_of_budget(
+    #[allow(unused_variables)] idx: usize,
+    deadline: Option<Instant>,
+    #[allow(unused_variables)] dir: &Path,
+) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(&n) = test_sweep_expiry_after_checks().lock().unwrap().get(dir) {
+            return idx as i64 >= n;
+        }
+    }
+    deadline.is_some_and(|d| Instant::now() >= d)
 }
 
 /// The actual read-and-hash pass, run by whichever caller is the sweep's leader. See
@@ -480,8 +578,8 @@ fn sweep_segments(
     // handed it, so the reachability bound holds by construction rather than by a filter someone
     // could later move below the `fs::read`. `seal::tests::the_sweep_enumerates_only_the_tables_the
     // _query_named` is what pins it.
-    for (table, seg) in segments_to_verify(dir, tables) {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+    for (idx, (table, seg)) in segments_to_verify(dir, tables).into_iter().enumerate() {
+        if sweep_out_of_budget(idx, deadline, dir) {
             tracing::warn!(
                 "segment integrity sweep ran out of its query's time budget before checking every \
                  segment named by {tables:?} - what it found so far still applies, the rest is \
@@ -491,10 +589,11 @@ fn sweep_segments(
         }
         #[cfg(test)]
         {
-            let ms = TEST_SWEEP_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
-            if ms > 0 {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
+            *test_sweep_segments_processed()
+                .lock()
+                .unwrap()
+                .entry(dir.to_path_buf())
+                .or_insert(0) += 1;
         }
         let path = segment_path(dir, &seg.file, &seg.hash);
         // An absent file is not corruption, and `define_views` already skips it by existence.
@@ -816,21 +915,27 @@ mod tests {
         );
     }
 
-    /// **Issue #476.** Concurrent callers naming the same tables must share one sweep, not each pay to
-    /// hash the same segments - the amplifier the issue names: `SQL_MAX_CONCURRENCY` permits held by
-    /// identical repeated requests, each currently paying the full cost on its own.
+    /// **Issue #476, tightened for #529.** Concurrent callers naming the same tables must share one
+    /// sweep, not each pay to hash the same segments - the amplifier the issue names:
+    /// `SQL_MAX_CONCURRENCY` permits held by identical repeated requests, each currently paying the
+    /// full cost on its own.
     ///
-    /// Made deterministic with the test-only delay knob rather than racing the real filesystem: a
-    /// `Barrier` lines up all callers before any of them asks, and the delay keeps the leader busy long
-    /// enough that latecomers are guaranteed to find its slot still in the map rather than a race that
-    /// depends on thread scheduling.
+    /// #529: the original made this deterministic with a fixed 150ms per-segment delay, keeping the
+    /// leader busy long enough - it hoped - for the three followers to be scheduled and find its slot
+    /// still in the map. That raced real thread scheduling rather than the filesystem, and at load
+    /// average 34 a follower can sit unscheduled well past 150ms, arrive to find the leader already
+    /// gone, and start an uncoalesced sweep of its own - `cargo test --lib` was red on a busy dev box
+    /// and green on a quiet one. A registration barrier (`test_set_sweep_registration_barrier`)
+    /// removes the race structurally instead of widening the margin: every one of the four callers
+    /// blocks inside `segments_failing_verification` until all four have made their leader-or-follower
+    /// decision, so there is no wall-clock window in which a follower can miss the leader's slot no
+    /// matter how the threads are scheduled.
     #[test]
     fn concurrent_identical_sweeps_coalesce_into_one() {
-        let _serial = test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
 
-        test_set_sweep_delay_ms(150);
+        test_set_sweep_registration_barrier(dir.path(), 4);
 
         let barrier = Arc::new(std::sync::Barrier::new(4));
         let handles: Vec<_> = (0..4)
@@ -845,7 +950,7 @@ mod tests {
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        test_set_sweep_delay_ms(0);
+        test_clear_sweep_registration_barrier(dir.path());
 
         for r in &results {
             assert_eq!(
@@ -860,18 +965,22 @@ mod tests {
         );
     }
 
-    /// **Issue #476, the other half.** A sweep must stop at its own deadline rather than hash every
-    /// named segment regardless of how long that takes - so a query's time budget bounds the sweep it
-    /// triggers, not just the query execution either side of it.
+    /// **Issue #476, the other half - tightened for #529.** A sweep must stop at its own deadline
+    /// rather than hash every named segment regardless of how long that takes - so a query's time
+    /// budget bounds the sweep it triggers, not just the query execution either side of it.
     ///
-    /// Three segments, corrupted last: with a per-segment delay bigger than the deadline, the sweep can
-    /// only get through the first (healthy) segment before its budget is spent. If it stopped only in
-    /// spirit - checking the deadline but finishing the loop anyway - this would still find the corrupt
-    /// segment and still take the full three-segment cost; asserting both `bad.is_empty()` and the
-    /// elapsed time is what pins a real early exit rather than a check with nothing behind it.
+    /// #529: the original raced an 80ms-per-segment `thread::sleep` against a 100ms deadline and then
+    /// asserted `elapsed < 220ms` to prove the loop actually stopped rather than merely returning an
+    /// empty set by chance. At load average 34 that margin (one segment's worth) evaporates: a
+    /// descheduled thread can wake up arbitrarily later than the 80ms it asked for, and the elapsed
+    /// wall-clock assertion above went red on its own even when the early exit itself was correct.
+    /// This pins the same property without a clock in it at all: `test_set_sweep_expire_after_checks`
+    /// tells the sweep loop directly that its budget is spent after the first check, and
+    /// `test_sweep_segments_processed_count` proves by construction (not by inference from elapsed
+    /// time) that only the first of the three segments was ever read - the corrupt one, last in block
+    /// order, is never reached.
     #[test]
     fn sweep_stops_at_its_deadline_instead_of_running_to_completion() {
-        let _serial = test_sweep_serial().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         for (block, value) in [(100u64, "1"), (101, "2"), (102, "3")] {
             seal_range(dir.path(), &[transfer(block, 0, value)], block, block).unwrap();
@@ -888,16 +997,19 @@ mod tests {
         bytes[4..end].fill(0xFF);
         std::fs::write(&path, &bytes).unwrap();
 
-        test_set_sweep_delay_ms(80);
-        let deadline = Some(Instant::now() + Duration::from_millis(100));
-        let start = Instant::now();
+        test_set_sweep_expire_after_checks(dir.path(), 1);
+        // Still a real, non-expired deadline - a mutation that dropped the deadline argument
+        // entirely (passed `None`) would let the sweep run unconstrained and reach the corrupt
+        // segment regardless of the check-count override, which `bad.is_empty()` below would catch.
+        let deadline = Some(Instant::now() + Duration::from_secs(3600));
         let bad = segments_failing_verification(dir.path(), &usdc(), deadline);
-        let elapsed = start.elapsed();
-        test_set_sweep_delay_ms(0);
+        test_set_sweep_expire_after_checks(dir.path(), -1);
 
-        assert!(
-            elapsed < Duration::from_millis(220),
-            "3 segments at 80ms each is 240ms if the deadline is ignored; took {elapsed:?}"
+        assert_eq!(
+            test_sweep_segments_processed_count(dir.path()),
+            1,
+            "the budget allows exactly one check to pass; a second segment being read means the \
+             early exit did not actually happen"
         );
         assert!(
             bad.is_empty(),

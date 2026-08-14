@@ -89,11 +89,21 @@ pub struct Footguns {
     /// Use `CAST({col} AS DOUBLE)` for arithmetic on such price/sqrt-scale values.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overflows_dec: Vec<String>,
+    /// Columns holding a Solidity `bool`, stored as exact text `'true'`/`'false'`, not a SQL boolean
+    /// (#539). A direct comparison (`{col} = true`) or boolean op (`AND`/`NOT`) implicitly casts and
+    /// works; a function requiring a uniform type across its arguments (`COALESCE`, `CASE`,
+    /// `bool_and`/`bool_or`, `UNION`) does not, and fails to build with "an explicit cast is
+    /// required". Write `{col} = 'true'` or `CAST({col} AS BOOLEAN)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bools: Vec<String>,
 }
 
 impl Footguns {
     pub fn is_empty(&self) -> bool {
-        self.reserved_words.is_empty() && self.big_ints.is_empty() && self.overflows_dec.is_empty()
+        self.reserved_words.is_empty()
+            && self.big_ints.is_empty()
+            && self.overflows_dec.is_empty()
+            && self.bools.is_empty()
     }
 }
 
@@ -143,11 +153,19 @@ fn is_bigint_storage(storage: &str) -> bool {
     storage == "word16" || storage == "word32"
 }
 
+/// A bool storage kind - a Solidity `bool` stored as exact text `'true'`/`'false'`, not a SQL
+/// boolean. Mirrors `analytics::hot_col_type`/`rows_to_batch`, which type it the same as every other
+/// non-numeric Solidity value: text.
+fn is_bool_storage(storage: &str) -> bool {
+    storage == "bool"
+}
+
 /// Derive the footguns for one table purely from its registry schema. Always correct by construction.
 pub fn derive_footguns(table: &TableSchema) -> Footguns {
     let mut reserved_words = Vec::new();
     let mut big_ints = Vec::new();
     let mut overflows_dec = Vec::new();
+    let mut bools = Vec::new();
     for col in &table.columns {
         if SQL_RESERVED.contains(&col.name.to_ascii_lowercase().as_str()) {
             reserved_words.push(col.name.clone());
@@ -162,11 +180,15 @@ pub fn derive_footguns(table: &TableSchema) -> Footguns {
                 overflows_dec.push(col.name.clone());
             }
         }
+        if is_bool_storage(&col.storage) {
+            bools.push(col.name.clone());
+        }
     }
     Footguns {
         reserved_words,
         big_ints,
         overflows_dec,
+        bools,
     }
 }
 
@@ -184,10 +206,22 @@ pub fn generate(schema: &[TableSchema], nest_name: &str, chain: &str) -> Semanti
             if col.sol_type == "implicit" {
                 continue; // implicit columns are documented once, in the composed doc, not per-nest.
             }
-            columns.insert(
-                col.name.clone(),
-                format!("The `{}` {} parameter. {SEEDED}", col.name, col.sol_type),
-            );
+            let desc = if col.storage == "bool" {
+                // #539: the old wording ("the `enabled` bool parameter") read as a promise that the
+                // column *is* a SQL boolean. It stores exact text `'true'`/`'false'` instead, so say so
+                // here - the one seeded description every column gets whether or not the author ever
+                // opens semantic.toml.
+                format!(
+                    "The `{0}` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL \
+                     boolean. `{0} = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, \
+                     `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `{0} = 'true'` or \
+                     `CAST({0} AS BOOLEAN)`. {SEEDED}",
+                    col.name
+                )
+            } else {
+                format!("The `{}` {} parameter. {SEEDED}", col.name, col.sol_type)
+            };
+            columns.insert(col.name.clone(), desc);
         }
         let footguns = derive_footguns(t);
         tables.insert(
@@ -482,6 +516,12 @@ mod tests {
                     indexed: false,
                 },
                 ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+                ColumnSchema {
                     name: "block_number".into(),
                     sol_type: "implicit".into(),
                     storage: "u64".into(),
@@ -498,6 +538,24 @@ mod tests {
         assert_eq!(fg.big_ints, vec!["value"]);
         // `value` is a word32 (uint256), so it also overflows DECIMAL(38,0) - flag it for CAST-to-DOUBLE.
         assert_eq!(fg.overflows_dec, vec!["value"]);
+        assert_eq!(fg.bools, vec!["enabled"]);
+    }
+
+    /// #539: the seeded description used to read "The `enabled` bool parameter" - a promise that it
+    /// *is* a SQL boolean. It is exact text `'true'`/`'false'`, so the seeded text (the one every
+    /// column gets, edited or not) must say so and give the working comparison.
+    #[test]
+    fn a_seeded_bool_description_warns_it_is_stored_as_text() {
+        let sem = generate(&[transfer_table()], "usdc", "ethereum");
+        let desc = sem.tables["usdc__transfer"].columns["enabled"].clone();
+        assert!(
+            desc.contains("exact text") && desc.contains("'true'"),
+            "must say it is text, not a boolean: {desc}"
+        );
+        assert!(
+            !desc.starts_with("The `enabled` bool parameter. ("),
+            "must not read as a bare, unqualified promise of a real boolean: {desc}"
+        );
     }
 
     #[test]
@@ -550,6 +608,7 @@ mod tests {
             reserved_words: vec!["from".into(), "to".into()],
             big_ints: vec!["value".into()],
             overflows_dec: vec!["value".into()],
+            bools: vec!["enabled".into()],
         };
         let ts = TableSemantic {
             footguns: fg.clone(),

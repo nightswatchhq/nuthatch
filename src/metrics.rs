@@ -30,6 +30,11 @@ pub struct NestMetrics {
     /// Every nest on the same cursor holds the same value, which is correct: they share a chain.
     tip: AtomicU64,
     last_poll_ok: AtomicU64,
+    /// Unix seconds this nest's ingest was built, i.e. when it first started trying to reach the chain.
+    /// `0` until [`NestMetrics::mark_started`] runs. Bounds `/ready`'s "never polled yet" grace period
+    /// (#510): without it, a pool that is dead from the very first poll never sets `last_poll_ok` and
+    /// looks permanently "just starting up" instead of eventually stalled.
+    started_at: AtomicU64,
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
@@ -64,6 +69,22 @@ impl NestMetrics {
     pub fn set_last_poll_ok_for_test(&self, t: u64) {
         self.last_poll_ok.store(t, Relaxed);
     }
+    /// Stamp this nest's readiness clock - called once, when its ingest is built. Also stamps the
+    /// process-global clock the first time any nest calls it, so a solo `dev` (which reads only the
+    /// global aggregate) gets the same bounded grace period.
+    pub fn mark_started(&self) {
+        let now = now_unix();
+        self.started_at.store(now, Relaxed);
+        METRICS.mark_started_once(now);
+    }
+    pub fn started_at(&self) -> u64 {
+        self.started_at.load(Relaxed)
+    }
+    /// Test seam, mirroring [`NestMetrics::set_last_poll_ok_for_test`].
+    #[cfg(test)]
+    pub fn set_started_at_for_test(&self, t: u64) {
+        self.started_at.store(t, Relaxed);
+    }
     pub fn last_block(&self) -> u64 {
         self.last_block.load(Relaxed)
     }
@@ -97,6 +118,9 @@ pub struct Metrics {
     /// readiness signal: if now − this exceeds the stall threshold, every RPC endpoint is unreachable
     /// and indexing has stalled (as opposed to "caught up and idle", which keeps this fresh).
     last_poll_ok: AtomicU64,
+    /// Unix seconds the first nest was built, i.e. process/runtime start. `0` until set. See
+    /// [`NestMetrics::started_at`] - a solo `dev` reads this one, since it has no per-nest health.
+    started_at: AtomicU64,
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
@@ -118,6 +142,7 @@ impl Metrics {
             last_block: AtomicU64::new(0),
             sealed_through: AtomicU64::new(0),
             last_poll_ok: AtomicU64::new(0),
+            started_at: AtomicU64::new(0),
             rows_decoded: AtomicU64::new(0),
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
@@ -159,6 +184,20 @@ impl Metrics {
     /// Unix seconds of the last successful poll (`0` = never). Read by the readiness endpoint.
     pub fn last_poll_ok(&self) -> u64 {
         self.last_poll_ok.load(Relaxed)
+    }
+    /// First-wins stamp of process/runtime start, called from [`NestMetrics::mark_started`]. Only the
+    /// first caller sets it - later nests built in the same startup burst must not push it forward.
+    fn mark_started_once(&self, t: u64) {
+        let _ = self.started_at.compare_exchange(0, t, Relaxed, Relaxed);
+    }
+    /// Unix seconds of process/runtime start (`0` = not yet stamped). Read by the readiness endpoint.
+    pub fn started_at(&self) -> u64 {
+        self.started_at.load(Relaxed)
+    }
+    /// Test seam, mirroring the per-nest one.
+    #[cfg(test)]
+    pub fn set_started_at_for_test(&self, t: u64) {
+        self.started_at.store(t, Relaxed);
     }
     // Getters for the readiness endpoint (the setters already exist for the ingest loop).
     pub fn tip_height(&self) -> u64 {
