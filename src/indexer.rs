@@ -3095,7 +3095,10 @@ impl NestIngest {
         // grown inline as the loop decodes new factory events.
         if let Some(fs) = self.factory.as_deref() {
             if self.store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-                self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs);
+                // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
+                // factory events must fault the nest into quarantine, not start it watching a
+                // silently-short set of children.
+                self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
                 if !self.children.is_empty() {
                     tracing::info!(
                         "rebuilt child registry: {} discovered child contract(s)",
@@ -4372,28 +4375,48 @@ fn decode_window(
 /// Rebuild the discovered-child registry on a warm restart by folding the stored factory events
 /// (RFC-0009). Cold (sealed) and hot factory-event rows are read as JSON and re-discovered - a pure
 /// fold, so the reconstructed registry is identical to the one grown live. Best-effort per table.
+/// Rebuild the discovered-child registry from stored factory events (#373).
+///
+/// **Every read here is load-bearing and none of them may be swallowed.** What this returns is the
+/// set of contracts the nest indexes; a rebuild that quietly yields *fewer* children than were
+/// discovered does not fail, it silently stops indexing them, and the nest goes on looking healthy
+/// with a hole in its data. That is the worst shape a fault can take in this codebase and it is the
+/// one this function used to have three times over: a DuckDB failure was `if let Ok(cold)`, a hot
+/// store failure was `.unwrap_or_default()`, and an unparseable stored row was `if let Ok(v)`.
+///
+/// The cold read is the only genuinely-expected absence, and it is now decided from the **segment
+/// catalogue** rather than inferred from an error. That distinction is the whole fix: "this table
+/// has never been sealed" and "DuckDB could not read this table" both arrived as `Err` and were
+/// discarded together, so the benign case was hiding the fatal one.
 fn rebuild_children(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     _registry: &DecodeRegistry,
     factory: &FactorySet,
-) -> ChildRegistry {
+) -> Result<ChildRegistry> {
     let mut children = ChildRegistry::new();
+    let manifest = crate::seal::load_manifest(dir)
+        .context("reading the segment catalogue to rebuild the child registry")?;
     // Fold in block order so the earliest discovery of each child wins (matches the live path).
     for table in factory.factory_tables() {
         let mut rows: Vec<serde_json::Value> = Vec::new();
-        // Cold (sealed) rows via DuckDB, then hot (un-sealed) rows from the store; a table with no
-        // sealed segment yet just yields nothing cold.
-        if let Ok(cold) = crate::analytics::query(dir, &format!("SELECT * FROM \"{table}\"")) {
-            rows.extend(cold);
+        // Cold (sealed) rows via DuckDB - but only where the catalogue says a segment exists, so an
+        // unsealed table is skipped rather than queried-and-forgiven.
+        if manifest.tables.get(&table).is_some_and(|s| !s.is_empty()) {
+            rows.extend(
+                crate::analytics::query(dir, &format!("SELECT * FROM \"{table}\""))
+                    .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?,
+            );
         }
         for raw in store
             .recent_by_table(&table, usize::MAX)
-            .unwrap_or_default()
+            .with_context(|| format!("reading hot factory rows for '{table}' (#373)"))?
         {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                rows.push(v);
-            }
+            rows.push(
+                serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
+                    format!("unparseable stored row in factory table '{table}' (#373)")
+                })?,
+            );
         }
         rows.sort_by(|a, b| {
             let key = |v: &serde_json::Value| {
@@ -4414,7 +4437,7 @@ fn rebuild_children(
             }
         }
     }
-    children
+    Ok(children)
 }
 
 async fn sleep_secs(s: u64) {
@@ -8391,6 +8414,97 @@ rpc_urls = ["https://rpc.example"]
             per_table, 0,
             "rebuild_views must not use recent_by_table: it re-walks and re-parses the whole entity \
              table per call, which is what issue #294 removed; found {per_table} call(s)"
+        );
+    }
+
+    /// A factory set with one rule, so `factory_tables()` yields exactly one announcing table.
+    fn one_rule_factory_set() -> (FactorySet, String) {
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+        let table = fs.factory_tables().first().cloned().expect("one rule");
+        (fs, table)
+    }
+
+    /// #373: an unsealed factory table is a legitimate absence and must still rebuild cleanly.
+    ///
+    /// This is the half that makes the fix safe rather than merely strict. Before it, the cold read
+    /// was attempted unconditionally and *any* error forgiven, so this case and the failing one below
+    /// were indistinguishable. The catalogue is what separates them: no segment entry, no query.
+    #[test]
+    fn rebuild_children_is_fine_when_a_factory_table_has_never_been_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, _table) = one_rule_factory_set();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+        let reg = DecodeRegistry::build(Vec::new()).unwrap();
+
+        let children = rebuild_children(dir.path(), &store, &reg, &fs)
+            .expect("an unsealed factory table must not be an error");
+        assert!(children.is_empty(), "nothing discovered, nothing sealed");
+    }
+
+    /// #373: a cold read that fails on a table the catalogue says IS sealed must surface, not be
+    /// silently forgiven into a short child registry.
+    ///
+    /// The mutation this kills is the original line, `if let Ok(cold) = analytics::query(...)`.
+    /// Restore it and this test goes green while the bug is back: `rebuild_children` returns a
+    /// registry missing every child that lived in the unreadable segment, the nest starts, and it
+    /// simply stops indexing those contracts. Nothing logs, nothing reports degraded, and the only
+    /// symptom is data that never arrives.
+    #[test]
+    fn rebuild_children_surfaces_a_cold_read_failure_instead_of_a_short_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, table) = one_rule_factory_set();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+        let reg = DecodeRegistry::build(Vec::new()).unwrap();
+
+        // A catalogue that promises a sealed segment whose parquet is not there. That is exactly the
+        // shape a half-written seal or a deleted segments dir leaves behind, and the read must fail.
+        let segments = dir.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&segments).unwrap();
+        let manifest = serde_json::json!({
+            "tables": {
+                table.clone(): [{
+                    "hash": "0".repeat(64),
+                    "from_block": 1,
+                    "to_block": 2,
+                    "rows": 1,
+                    "file": "definitely-not-here.parquet",
+                }]
+            }
+        });
+        std::fs::write(
+            segments.join(crate::seal::MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = rebuild_children(dir.path(), &store, &reg, &fs)
+            .expect_err("an unreadable sealed segment must fail the rebuild, not shorten it");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&table),
+            "the error must name the table that could not be read, got: {msg}"
         );
     }
 }
