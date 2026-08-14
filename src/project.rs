@@ -26,10 +26,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
     // most want to delete is making the user know (and correctly spell) which chain their contract
     // is on - so when they don't say, we go and find out.
     let chain = match &args.chain {
-        Some(name) => chains::lookup(name).with_context(|| {
-            format!("unknown chain '{name}' (try: mainnet, arbitrum-one, base)")
-        })?,
-        None => detect_chain(&args.addresses).await?,
+        Some(name) => chains::resolve(name, &args.rpc).await?,
+        None => detect_chain(&args.addresses).await?.into(),
     };
     let dir = PathBuf::from(&args.dir);
     std::fs::create_dir_all(dir.join("abis"))
@@ -106,7 +104,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
     let config = Config {
         nest: Nest {
             name: nest_name(&dir),
-            chain: chain.name.to_string(),
+            chain: chain.name.clone(),
             chain_id: chain.chain_id,
             rpc_urls,
             // Not `CURRENT_SCHEMA_VERSION`: a timestamped nest is a v1 file and stays readable by
@@ -131,7 +129,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
 
     // Build the registry from the vendored ABIs to generate the schema artifact + AI surface (one
     // source of truth: schema.json, llms.txt, the skill, and `/tables` all come from here).
-    let table_count = write_nest_artifacts(&dir, chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
 
     println!(
         "✓ scaffolded nest '{}' ({} contract(s), {} table(s)) in {}",
@@ -169,12 +167,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
     })?;
     // The chain is the nest's, already chosen at init - never re-detected. Adding a contract that
     // lives on a different chain is a different nest (one cursor, one chain - non-negotiable).
-    let chain = chains::lookup(&config.nest.chain).with_context(|| {
-        format!(
-            "nest declares unknown chain '{}' - cannot resolve ABIs",
-            config.nest.chain
-        )
-    })?;
+    let chain = chains::from_config(&config.nest.chain, config.nest.chain_id);
 
     let new_addresses: Vec<String> = args
         .addresses
@@ -251,7 +244,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
     }
 
     config.save(&dir)?;
-    let table_count = write_nest_artifacts(&dir, chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
 
     println!(
         "✓ added {} contract(s); nest '{}' now has {} contract(s), {} table(s)",
@@ -357,15 +350,15 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     // `--chain` wins if given: a manifest's network name and ours can disagree
     // (and a user porting to a fork needs the override).
     let chain = match &args.chain {
-        Some(name) => chains::lookup(name).with_context(|| {
-            format!("unknown chain '{name}' (try: mainnet, arbitrum-one, base)")
-        })?,
-        None => chains::lookup(&network).with_context(|| {
-            format!(
-                "the manifest indexes '{network}', which nuthatch has no built-in chain for - \
-                 re-run with --chain <name> --rpc <url> to point at it yourself"
-            )
-        })?,
+        Some(name) => chains::resolve(name, &args.rpc).await?,
+        None => chains::lookup(&network)
+            .with_context(|| {
+                format!(
+                    "the manifest indexes '{network}', which nuthatch has no built-in chain for - \
+                     re-run with --chain <name> --rpc <url> to point at it yourself"
+                )
+            })?
+            .into(),
     };
 
     let dir = PathBuf::from(&args.dir);
@@ -575,7 +568,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let config = Config {
         nest: Nest {
             name: nest_name(&dir),
-            chain: chain.name.to_string(),
+            chain: chain.name.clone(),
             chain_id: chain.chain_id,
             rpc_urls,
             schema_version: crate::config::required_schema_version(!args.no_timestamps),
@@ -592,7 +585,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         calls: Vec::new(),
     };
     config.save(&dir)?;
-    let table_count = write_nest_artifacts(&dir, chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
 
     // ── the honest report ────────────────────────────────────────────────
     println!(
@@ -1889,5 +1882,141 @@ abi = "abis/tok.json"
         // A plain local directory is not a git source and must still load as a directory.
         assert!(!is_git_source("./my-nest"));
         assert!(!is_git_source("/srv/nests/mine"));
+    }
+
+    // ---- #535: init rejects chains the nest format supports ---------------------------------------
+    //
+    // `--from-subgraph` on a manifest for a chain outside the built-in three named a remedy
+    // (`--chain <name> --rpc <url>`) that `chains::lookup` then refused. The round trip below is the
+    // one the user actually took: fetch the manifest, hit the error, follow its own advice exactly as
+    // printed, and expect it to work - not a test that pins whichever half of `init_from_subgraph` got
+    // edited.
+
+    /// A local HTTP server answering fixed paths with fixed bodies - stands in for the manifest URL
+    /// (`--from-subgraph`, `Origin::Operator`, fetched directly) and an IPFS gateway (`--ipfs`,
+    /// `Origin::Manifest`, `{gateway}{cid}`). Real HTTP, so `fetch_ipfs`'s actual request path runs.
+    async fn fake_gateway(
+        routes: Vec<(&'static str, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::get, Router};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let routes: Arc<BTreeMap<&'static str, &'static str>> =
+            Arc::new(routes.into_iter().collect());
+
+        async fn handler(
+            State(routes): State<Arc<BTreeMap<&'static str, &'static str>>>,
+            uri: axum::http::Uri,
+        ) -> Result<String, axum::http::StatusCode> {
+            routes
+                .get(uri.path())
+                .map(|s| s.to_string())
+                .ok_or(axum::http::StatusCode::NOT_FOUND)
+        }
+
+        let app = Router::new()
+            .route("/{*rest}", get(handler))
+            .with_state(routes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A one-endpoint fake JSON-RPC server answering `eth_chainId` - the round trip's `--rpc <url>`.
+    async fn fake_chain_id_rpc(chain_id: u64) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(State(chain_id): State<u64>, Json(_req): Json<Value>) -> Json<Value> {
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": format!("0x{chain_id:x}")}))
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(chain_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    const BSC_MANIFEST: &str = r#"
+specVersion: 0.0.5
+dataSources:
+  - kind: ethereum
+    name: Pool
+    network: bsc
+    source:
+      abi: Pool
+      address: "0x0000000000000000000000000000000000000001"
+    mapping:
+      abis:
+        - file:
+            /: /ipfs/Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s
+          name: Pool
+      eventHandlers:
+        - event: Transfer(indexed address,indexed address,uint256)
+          handler: handleTransfer
+"#;
+
+    const POOL_ABI: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+        {"name":"from","type":"address","indexed":true},
+        {"name":"to","type":"address","indexed":true},
+        {"name":"value","type":"uint256","indexed":false}]}]"#;
+
+    #[tokio::test]
+    async fn from_subgraph_recommendation_is_followable_end_to_end() {
+        let (gateway, _gw) = fake_gateway(vec![
+            ("/manifest.yaml", BSC_MANIFEST),
+            (
+                "/ipfslike/Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s",
+                POOL_ABI,
+            ),
+        ])
+        .await;
+        let (rpc_url, _rpc) = fake_chain_id_rpc(56).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("{gateway}/manifest.yaml");
+        let mut args = InitArgs {
+            addresses: vec![],
+            from: None,
+            from_subgraph: Some(source.clone()),
+            ipfs: vec![format!("{gateway}/ipfslike/")],
+            alias: vec![],
+            abi: vec![],
+            chain: None,
+            rpc: vec![],
+            dir: dir.path().to_string_lossy().into_owned(),
+            no_timestamps: false,
+        };
+
+        // Step 1: blind, this is the error the user actually hits - and the remedy it names.
+        let err = init_from_subgraph(&source, &args).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("the manifest indexes 'bsc', which nuthatch has no built-in chain for"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("re-run with --chain <name> --rpc <url> to point at it yourself"),
+            "{msg}"
+        );
+
+        // Step 2: follow that remedy exactly as printed - `--chain bsc --rpc <url>` - and it must work.
+        args.chain = Some("bsc".to_string());
+        args.rpc = vec![rpc_url.clone()];
+        init_from_subgraph(&source, &args)
+            .await
+            .expect("the recommended re-run must succeed - the nest format already supports it");
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.nest.chain, "bsc");
+        assert_eq!(config.nest.chain_id, 56);
+        assert_eq!(config.nest.rpc_urls, vec![rpc_url]);
     }
 }

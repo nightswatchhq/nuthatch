@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::alerts::{self, AlertRouter};
-use crate::chains::{self, Finality};
+use crate::chains::{
+    self, Finality, UNREGISTERED_FINALITY as DEFAULT_FINALITY,
+    UNREGISTERED_WINDOW as DEFAULT_WINDOW,
+};
 use crate::chunker::{self, AdaptiveWindow};
 use crate::cli::DevArgs;
 use crate::config::{Config, DB_FILE};
@@ -24,10 +27,6 @@ use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
 
-/// Defaults for a chain not in the registry (a custom `rpc_urls` nest): a small `eth_getLogs` window
-/// and a conservative Ethereum-style finality depth.
-const DEFAULT_WINDOW: u64 = 20;
-const DEFAULT_FINALITY: Finality = Finality::Depth(64);
 const LAST_BLOCK_KEY: &str = "last_block";
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
