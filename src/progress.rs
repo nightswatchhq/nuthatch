@@ -163,6 +163,58 @@ fn fmt_dur(secs: f64) -> String {
     }
 }
 
+/// A periodic, log-visible "are we behind or at tip" signal (issue #302). The one-time "✓ caught up
+/// to tip … now following" line above and the `nuthatch_tip_lag_blocks` metric both existed already,
+/// but neither serves an operator who is reading logs rather than scraping Prometheus: the log line
+/// fires once, ever, and after that the tip loop runs quiet by design (`index_loop`'s steady-state
+/// comment). This restates the same lag on a slow timer so it shows up in `journalctl`/stdout without
+/// pattern-matching a tick character - structured (`block`, `tip`, `blocks_behind` fields), so it
+/// reads the same under `--log-format json`.
+pub struct TipHeartbeat {
+    last_log: Instant,
+}
+
+/// Slow enough not to spam a quiet tip loop, frequent enough that "is it stuck?" never waits long
+/// for an answer.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+impl TipHeartbeat {
+    pub fn new() -> Self {
+        // Back-dated so the first call logs immediately rather than waiting a full interval.
+        Self {
+            last_log: Instant::now() - HEARTBEAT_INTERVAL,
+        }
+    }
+
+    /// `at` is the next block this cursor has yet to process; `tip` is the source's latest known
+    /// head. Throttled internally, so it's cheap to call on every loop iteration.
+    pub fn maybe_log(&mut self, at: u64, tip: u64) {
+        if self.last_log.elapsed() < HEARTBEAT_INTERVAL {
+            return;
+        }
+        self.last_log = Instant::now();
+        let (block, blocks_behind) = Self::lag(at, tip);
+        if blocks_behind == 0 {
+            tracing::info!(block, tip, blocks_behind, "at tip");
+        } else {
+            tracing::info!(block, tip, blocks_behind, "following, behind tip");
+        }
+    }
+
+    /// `(last block processed, how far behind tip that leaves us)`. Split out from `maybe_log` so the
+    /// arithmetic is unit-testable without standing up a `tracing` subscriber to capture the log line.
+    fn lag(at: u64, tip: u64) -> (u64, u64) {
+        let block = at.saturating_sub(1);
+        (block, tip.saturating_sub(block))
+    }
+}
+
+impl Default for TipHeartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +252,32 @@ mod tests {
         b.tick(100, 5);
         b.tick(200, 7);
         assert_eq!(b.events, 12);
+    }
+
+    #[test]
+    fn heartbeat_lag_reports_zero_at_tip() {
+        // `at` is the next block to process, so `at == tip + 1` means everything through `tip` is done.
+        assert_eq!(TipHeartbeat::lag(1001, 1000), (1000, 0));
+    }
+
+    #[test]
+    fn heartbeat_lag_reports_the_gap_while_behind() {
+        assert_eq!(TipHeartbeat::lag(940, 1000), (939, 61));
+    }
+
+    #[test]
+    fn heartbeat_lag_never_underflows_at_genesis() {
+        assert_eq!(TipHeartbeat::lag(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn heartbeat_throttles_to_the_interval() {
+        let mut hb = TipHeartbeat::new();
+        // Back-dated construction means the first call is never suppressed.
+        assert!(hb.last_log.elapsed() >= HEARTBEAT_INTERVAL);
+        hb.maybe_log(940, 1000);
+        // Immediately after logging, `last_log` is fresh - a second call in the same instant would
+        // be suppressed rather than re-logging every loop iteration.
+        assert!(hb.last_log.elapsed() < HEARTBEAT_INTERVAL);
     }
 }

@@ -4,6 +4,10 @@
 
 Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthatch skill-refs`.
 
+## `nuthatch` (global - valid with any subcommand)
+
+- `--log-format <LOG_FORMAT>` - Log output format. `text` (default) is the human-readable line format; `json` emits one structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an operator can point a log aggregator at stdout instead of scraping text. `global = true` so it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`)
+
 ## `nuthatch add`
 
 Add another contract to an existing nest - resolve its ABI and grow the config, no re-init

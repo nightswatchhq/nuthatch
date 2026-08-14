@@ -1324,6 +1324,9 @@ async fn runtime_index_loop(
 
     let mut chunker = AdaptiveWindow::for_window(window);
     let mut poll_failures = 0u32;
+    // Same periodic "at tip / N behind" restatement as the solo loop (issue #302), against the
+    // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
+    let mut heartbeat = crate::progress::TipHeartbeat::new();
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
@@ -1429,6 +1432,7 @@ async fn runtime_index_loop(
 
         // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
         let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
+        heartbeat.maybe_log(global_next, tip);
         if global_next > tip {
             sleep_secs(2).await;
             continue;
@@ -3715,6 +3719,10 @@ async fn index_loop(
     let mut caught_up = false;
     // Consecutive failed polls - drives the escalating stall log (a transient blip vs a real outage).
     let mut poll_failures = 0u32;
+    // A slow, log-visible "at tip / N behind" restated periodically (issue #302) - `progress` above
+    // only ever announces catch-up once, and after that this is the only text an operator watching
+    // logs (rather than Prometheus) gets.
+    let mut heartbeat = crate::progress::TipHeartbeat::new();
     loop {
         let tip = match source.tip().await {
             Ok(t) => {
@@ -3734,6 +3742,8 @@ async fn index_loop(
             next = new_next;
             continue;
         }
+
+        heartbeat.maybe_log(next, tip);
 
         if next > tip {
             // Reached the tip. If this was the initial backfill, announce it once and latch.

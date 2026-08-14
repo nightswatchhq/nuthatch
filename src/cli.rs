@@ -9,8 +9,22 @@ use clap::{Args, Parser, Subcommand};
     about = "Be your own indexer - one binary, one command."
 )]
 pub struct Cli {
+    /// Log output format. `text` (default) is the human-readable line format; `json` emits one
+    /// structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an
+    /// operator can point a log aggregator at stdout instead of scraping text. `global = true` so
+    /// it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch
+    /// dev --log-format json`).
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    pub log_format: LogFormat,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
