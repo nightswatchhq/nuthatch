@@ -44,16 +44,20 @@ assert. Open an issue with the level, the step, what you expected and what you g
 
 ### What we have verified ourselves
 
-Stated plainly so you know which steps are re-confirmation and which are genuinely new evidence:
+Stated plainly so you know which steps are re-confirmation and which are genuinely new evidence.
+
+**Each row says *which release* it was verified on, not just yes or no.** A bare "yes" ages silently:
+it reads as current however long ago it was earned, and this is the one page in the repo whose entire
+purpose is being checkable. Two rows had drifted that way by 2.4.0 and are now dated (#571).
 
 | Level | Verified by us | On what |
 |---|---|---|
-| 0 Artifact | yes | every release, from the *published* tarball: SHA-256 checked against the release's own checksum, then run |
-| 1 Single nest | yes | CI + the Lodestar production box, upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows) |
+| 0 Artifact | yes, **by hand, per release** | From the *published* tarball: SHA-256 checked against the release's own checksum, then run. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it |
+| 1 Single nest | CI every commit; **production through 2.0.0** | CI, plus the Lodestar production box upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows). **2.1.0, 2.2.0, 2.3.0 and 2.4.0 have not been verified on the production box** (#441) - the two-machine rule is ours, we wrote it down, and we have not kept it for four releases |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
-| 5 Scaled mode | **verified across machines on v0.9.3, not since** | Every cross-machine invariant was measured on published v0.9.3 artifacts (2026-08-02, #255): workers register, the scheduler assigns to a named remote worker, the lease carries a monotonic fence (incremented by a real handover), **clock skew** does not move a lease, a worker **indexes into a remote store**, and it **indexes straight through a control-plane partition**. **Not re-run on 1.x or 2.x** - the current release has the automated Postgres suites behind it and a cross-machine run two majors old. |
+| 5 Scaled mode | **across machines on v0.9.3 only, two majors ago** | Every cross-machine invariant was measured on published v0.9.3 artifacts (2026-08-02, #255): workers register, the scheduler assigns to a named remote worker, the lease carries a monotonic fence (incremented by a real handover), **clock skew** does not move a lease, a worker **indexes into a remote store**, and it **indexes straight through a control-plane partition** (377 blocks). **Not re-run on 1.x or 2.x** (#570), across a 2.0 that changed the unit of storage. CI's Postgres suites are not a substitute: a single runner cannot exercise a lease handover between two machines, and the cross-machine half is the unproven one. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
