@@ -1630,10 +1630,9 @@ mod tests {
             .put_entity(&Store::entity_key(10, 1), "not json")
             .unwrap();
 
-        let err = store
-            .recent_by_table("a__x", 10)
-            .err()
-            .expect("an unparseable stored row must fail the scan, not silently shrink the result");
+        let err = store.recent_by_table("a__x", 10).expect_err(
+            "an unparseable stored row must fail the scan, not silently shrink the result",
+        );
         let msg = format!("{err:#}");
         assert!(
             msg.contains("a__x"),
