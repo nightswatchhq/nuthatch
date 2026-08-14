@@ -4522,6 +4522,39 @@ mod tests {
         );
     }
 
+    /// With the ceiling gone (#538), the *pacing* is the only thing standing between a stalled endpoint
+    /// and a loop hammering it as fast as the network will answer. [`backfill_backoff`] is proved above
+    /// as a pure function and both retry loops are driven with `Duration::ZERO`, so nothing yet proved
+    /// the loops sleep for what it returns: replacing both `sleep(backoff)` calls with
+    /// `sleep(Duration::ZERO)` left all four tests in this group passing. Same shape as #361 - a
+    /// mechanism tested everywhere except where it is wired in - so assert the schedule itself, on
+    /// virtual time (`start_paused`, the `rpc.rs` idiom) so the assertion costs no wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_actually_sleeps_the_backoff_it_computes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        // The real base, not ZERO: this is about the pacing an operator's endpoint actually gets.
+        let r: Result<u32> = retry_transient("op", BACKFILL_RETRY_BASE, || async {
+            // Twelve failures - five past the attempt at which the doubling reaches its cap.
+            if calls.fetch_add(1, Ordering::SeqCst) < 12 {
+                Err(anyhow::anyhow!("all RPC endpoints failed"))
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        // 250ms doubling over attempts 1..=7 (250+500+1000+2000+4000+8000+16000 = 31.75s), then the
+        // 30s cap over attempts 8..=12 (5 x 30s). Written out rather than summed from
+        // `backfill_backoff`, so this stays an independent statement of the schedule.
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(31_750) + std::time::Duration::from_secs(150),
+            "the loop must sleep the computed backoff, not spin"
+        );
+    }
+
     /// `logs_with_retry` must keep retrying a plain transient failure past the old 5-attempt ceiling
     /// (#538) while still passing a result-cap error straight through on the first attempt, unretried,
     /// so the caller's window-shrink logic (not this function) handles it.
@@ -4585,9 +4618,24 @@ mod tests {
             fail_until: 0,
             then_cap: true,
         };
-        let err = logs_with_retry(&capped, &filter, 1, 10, std::time::Duration::ZERO)
-            .await
-            .unwrap_err();
+        // Bounded, and with a non-zero base, deliberately: without the pass-through arm this call never
+        // returns at all, so the assertions below could only ever be reached by a green run. A
+        // regression has to *fail*, not hang the job out to its timeout (the c0fb415 lesson on this
+        // branch). A non-zero base makes the doomed loop sleep, so the deadline can actually fire; on
+        // the correct path nothing sleeps and it costs nothing.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            logs_with_retry(
+                &capped,
+                &filter,
+                1,
+                10,
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a cap error must be handed back at once, not retried")
+        .unwrap_err();
         assert!(chunker::is_result_too_large(&err), "got: {err:#}");
         assert_eq!(
             capped.calls.load(Ordering::SeqCst),
