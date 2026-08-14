@@ -42,13 +42,15 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
-    # 45, not 25 (#525). Measured job durations: typical 17.8-19.8m, cold-cache tail 23.7m - a
-    # 25m ceiling left 1.3m of headroom over the observed worst case, and #521 landed exactly
-    # there: 25m32s, timed out, reported `cancelled`. A wider ceiling costs nothing on the happy
-    # path - a timeout only bills when it fires - and 45m matches the precedent already set on
-    # `multinest-footprint` below. The bound stays (#449 was right that an unbounded job is
-    # worse); only the number moves.
-    timeout-minutes: 45
+    # 90, not 45 (#584). A `Cargo.lock` change invalidates every `Swatinem/rust-cache` entry at
+    # once - the cache key is the lock hash - and this job runs `cargo fmt`/`clippy`/`test` cold
+    # from scratch when that happens. Measured on #579's lock change (run 31824503060): the job
+    # was still linking at 33 minutes in with a 45m ceiling, no headroom left. 45, not 25 (#525)
+    # already established the reasoning: size for the cold tail, not the warm median, because a
+    # wider ceiling costs nothing on the happy path and a timeout only bills when it fires. 90
+    # is headroom over the cold case, not the new steady state - a run that hits it every time
+    # means the cache stopped working, not that 90 was too tight.
+    timeout-minutes: 90
     steps:
       # Feeds "an expiry doesn't read as cancelled" below - GitHub gives `cancelled()` steps a
       # grace window to run after a job is killed (proven on #521 itself: its own `if: always()`
@@ -144,8 +146,15 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U nuthatch -d nuthatch"
           --health-interval 3s --health-timeout 3s --health-retries 20
-    timeout-minutes: 25
+    # 60, not 25 (#584). Same cold-cache exposure as `check` above: a `Cargo.lock` change
+    # invalidates this job's own `Swatinem/rust-cache` entry, and `clippy (postgres-store)` plus
+    # the parity suite then compile from scratch. Measured on #579's lock change (run
+    # 31824503060): killed at the 25m ceiling mid-`parity suite`, with `clippy (postgres-store)`
+    # alone having taken 12m30s cold.
+    timeout-minutes: 60
     steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
@@ -175,6 +184,19 @@ jobs:
           cargo test --locked --features postgres-store \
             --test pg_parity --test control_plane --test e2e_reconcile --test control_api \
             --test secret_isolation --test e2e_resolution -- --test-threads=1
+      # See the identical step in `check` above for why this exists: `cancelled` alone cannot
+      # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
+      # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
+      # subtraction by hand).
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 60m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
   fleet:
     name: the compose fleet comes up
@@ -196,7 +218,11 @@ jobs:
     # stating so a fourth is avoided: **any job that builds a binary destined for the container image
     # must build on a base no newer than the Dockerfile's.**
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # 60, not 30 (#584). This job survived #579's cold-cache run at 25m18s against a 30m
+    # ceiling - 4m42s of margin, which is luck (this job's `Swatinem/rust-cache` also keys on
+    # `Cargo.lock`), not headroom. 60 matches the same cold-cache reasoning applied to `check`,
+    # `build-release` and `pg-parity` above rather than banking on that margin holding again.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -332,8 +358,14 @@ jobs:
   build-release:
     name: build release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 45, not 20 (#584). Warm this job is 3m40s-5m12s; cold - triggered by any `Cargo.lock`
+    # change, since `Swatinem/rust-cache` keys on the lock hash - it is a full `--release` build
+    # from scratch. Measured on #579's lock change (run 31824503060): killed at the 20m ceiling
+    # still linking `nuthatch` itself.
+    timeout-minutes: 45
     steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
@@ -345,6 +377,19 @@ jobs:
           name: nuthatch-release
           path: target/release/nuthatch
           retention-days: 1
+      # See the identical step in `check` above for why this exists: `cancelled` alone cannot
+      # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
+      # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
+      # subtraction by hand).
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 45m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
   footprint:
     name: footprint (RAM budget)
