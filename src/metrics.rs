@@ -19,6 +19,9 @@ pub static METRICS: Metrics = Metrics::new();
 #[derive(Default)]
 pub struct NestMetrics {
     last_block: AtomicU64,
+    /// Unix seconds of the last time `last_block` changed. `0` until the first block is indexed.
+    /// Used by `/ready` to detect a cursor that polls successfully but makes no progress (#578).
+    last_block_advanced_at: AtomicU64,
     sealed_through: AtomicU64,
     /// The tip of **this nest's chain**, and when its cursor last polled successfully.
     ///
@@ -42,8 +45,18 @@ pub struct NestMetrics {
 
 impl NestMetrics {
     pub fn set_last_block(&self, v: u64) {
-        self.last_block.store(v, Relaxed);
+        let old = self.last_block.swap(v, Relaxed);
+        if old != v {
+            self.last_block_advanced_at.store(now_unix(), Relaxed);
+        }
         METRICS.set_last_block(v);
+    }
+    pub fn last_block_advanced_at(&self) -> u64 {
+        self.last_block_advanced_at.load(Relaxed)
+    }
+    #[cfg(test)]
+    pub fn set_last_block_advanced_at_for_test(&self, t: u64) {
+        self.last_block_advanced_at.store(t, Relaxed);
     }
     /// This nest's chain tip, and the global aggregate for a solo `dev`.
     pub fn set_tip(&self, v: u64) {
@@ -113,6 +126,8 @@ pub struct Metrics {
     // Ingestion - the "is it keeping up?" signals an operator alerts on.
     tip_height: AtomicU64,
     last_block: AtomicU64,
+    /// Unix seconds of the last time `last_block` changed (global aggregate). See [`NestMetrics::last_block_advanced_at`].
+    last_block_advanced_at: AtomicU64,
     sealed_through: AtomicU64,
     /// Unix seconds of the last *successful* source poll (tip fetch). `0` = never polled yet. The
     /// readiness signal: if now − this exceeds the stall threshold, every RPC endpoint is unreachable
@@ -140,6 +155,7 @@ impl Metrics {
         Self {
             tip_height: AtomicU64::new(0),
             last_block: AtomicU64::new(0),
+            last_block_advanced_at: AtomicU64::new(0),
             sealed_through: AtomicU64::new(0),
             last_poll_ok: AtomicU64::new(0),
             started_at: AtomicU64::new(0),
@@ -171,7 +187,13 @@ impl Metrics {
         self.tip_height.store(v, Relaxed);
     }
     pub fn set_last_block(&self, v: u64) {
-        self.last_block.store(v, Relaxed);
+        let old = self.last_block.swap(v, Relaxed);
+        if old != v {
+            self.last_block_advanced_at.store(now_unix(), Relaxed);
+        }
+    }
+    pub fn last_block_advanced_at(&self) -> u64 {
+        self.last_block_advanced_at.load(Relaxed)
     }
     pub fn set_sealed_through(&self, v: u64) {
         self.sealed_through.store(v, Relaxed);

@@ -619,6 +619,11 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
 /// when caught up, so a minute-plus of silence means every RPC endpoint is unreachable, not idleness.
 const READINESS_STALL_SECS: u64 = 90;
 
+/// Polls are fresh but `last_block` has not advanced in this many seconds while lag > 0 ⇒ pinned.
+/// Catches the case where an RPC can serve tip fetches (so `stalled` stays false) but refuses the
+/// window fetches that would actually advance the cursor (#578).
+const READINESS_ADVANCE_SECS: u64 = 90;
+
 /// Stalled = polled successfully at least once (`last_poll != 0`) but not within `threshold` seconds. A
 /// never-polled node (`last_poll == 0`) is *starting up*, not stalled - it gets grace, but the grace is
 /// bounded by `started_at` (#510): a pool that has been dead since before the very first poll must
@@ -670,13 +675,14 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         .runtime_health
         .as_ref()
         .map(|(name, _)| METRICS.nest(name));
-    let (last_poll, tip, last, sealed, started_at) = match &nest {
+    let (last_poll, tip, last, sealed, started_at, last_advanced) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
             m.tip(),
             m.last_block(),
             m.sealed_through(),
             m.started_at(),
+            m.last_block_advanced_at(),
         ),
         None => (
             METRICS.last_poll_ok(),
@@ -684,25 +690,40 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             METRICS.last_block(),
             METRICS.sealed_through_val(),
             METRICS.started_at(),
+            METRICS.last_block_advanced_at(),
         ),
     };
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
     let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS);
+    let lag = tip.saturating_sub(last);
+    // Cursor is pinned: polls are fresh (source is reachable) but the block cursor hasn't moved in
+    // READINESS_ADVANCE_SECS while lag remains. Catches 429-on-window-fetches and similar partial
+    // RPC failures that keep the tip loop alive while blocking indexing progress (#578).
+    // Grace: skip the check until we're past the advance threshold from start, and until at least
+    // one block has been indexed (last_advanced != 0), so a fresh nest during its first backfill
+    // window doesn't flap before it has had a chance to produce any blocks.
+    let cursor_pinned = !stalled
+        && lag > 0
+        && last_advanced != 0
+        && now.saturating_sub(last_advanced) > READINESS_ADVANCE_SECS
+        && now.saturating_sub(started_at) > READINESS_ADVANCE_SECS;
+    let ready = !stalled && !cursor_pinned;
     let body = json!({
-        "ready": !stalled,
+        "ready": ready,
         "stalled": stalled,
+        "pinned": cursor_pinned,
         "tip": tip,
         "last_block": last,
-        "lag_blocks": tip.saturating_sub(last),
+        "lag_blocks": lag,
         "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
     });
-    let code = if stalled {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+    let code = if ready {
         StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(body)).into_response()
 }
@@ -1749,6 +1770,71 @@ mod tests {
         );
         assert_eq!(json["stalled"], json!(true));
         assert_eq!(json["ready"], json!(false));
+    }
+
+    /// #578: a cursor whose polls succeed (source is reachable) but whose `last_block` hasn't moved in
+    /// `READINESS_ADVANCE_SECS` while lag > 0 must report `ready: false` with `pinned: true`.
+    ///
+    /// The mutation the current code (before this fix) fails: replace the `cursor_pinned` branch with
+    /// `false` and the test goes from 503 to 200, proving the check is load-bearing and not shadowed by
+    /// `stalled`.
+    #[tokio::test]
+    async fn a_polling_cursor_that_makes_no_block_progress_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "pinned-cursor";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        // Polls are fresh (source is answering), but the cursor hasn't advanced in 200s.
+        handle.set_last_poll_ok_for_test(now.saturating_sub(1));
+        handle.set_started_at_for_test(now.saturating_sub(200));
+        handle.set_last_block_advanced_at_for_test(now.saturating_sub(200));
+        // Tip is non-zero, last_block is 0: lag exists.
+        crate::metrics::METRICS.nest(name).set_tip(1_000_000);
+
+        let (code, body) = get(router.clone(), &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a pinned cursor must fail readiness even when polls succeed: {json}"
+        );
+        assert_eq!(json["ready"], json!(false), "ready must be false: {json}");
+        assert_eq!(
+            json["stalled"],
+            json!(false),
+            "stalled must stay false (polls are fresh): {json}"
+        );
+        assert_eq!(json["pinned"], json!(true), "pinned must be true: {json}");
+
+        // Grace: if the cursor just started, it should not be reported pinned even with stale progress.
+        handle.set_started_at_for_test(now.saturating_sub(10));
+        let (code_grace, body_grace) = get(router.clone(), &format!("/{name}/ready")).await;
+        let json_grace = serde_json::from_slice::<serde_json::Value>(&body_grace).unwrap();
+        assert_eq!(
+            code_grace,
+            StatusCode::OK,
+            "a freshly started cursor must not be pinned during startup: {json_grace}"
+        );
+        assert_eq!(json_grace["pinned"], json!(false));
+
+        // When the cursor is making progress (fresh advance), ready must be true.
+        handle.set_started_at_for_test(now.saturating_sub(200));
+        handle.set_last_block_advanced_at_for_test(now.saturating_sub(5));
+        let (code_ok, body_ok) = get(router, &format!("/{name}/ready")).await;
+        let json_ok = serde_json::from_slice::<serde_json::Value>(&body_ok).unwrap();
+        assert_eq!(
+            code_ok,
+            StatusCode::OK,
+            "an advancing cursor must be ready: {json_ok}"
+        );
+        assert_eq!(json_ok["pinned"], json!(false));
+        assert_eq!(json_ok["ready"], json!(true));
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
