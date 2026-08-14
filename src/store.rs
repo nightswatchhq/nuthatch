@@ -593,6 +593,12 @@ impl Store {
     }
 
     /// The `limit` most-recent hot rows belonging to `table` (highest keys first).
+    ///
+    /// A row that fails to parse as JSON is **not** the same thing as a row belonging to some other
+    /// table (issue #567): every row in here is one we wrote, so an unparseable one is corruption, and
+    /// this errors out rather than silently shortening the result the way `.ok().unwrap_or(false)`
+    /// used to. That silence is what made #373's parse-failure arm in `rebuild_children` unreachable
+    /// through this store - the corrupt row never survived to be rejected.
     pub fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
@@ -602,10 +608,13 @@ impl Store {
         for row in t.iter()?.rev() {
             let (_k, v) = row?;
             let s = v.value();
-            let matches = serde_json::from_str::<serde_json::Value>(s)
-                .ok()
-                .and_then(|j| j.get("table").and_then(|t| t.as_str()).map(|t| t == table))
-                .unwrap_or(false);
+            let parsed: serde_json::Value = serde_json::from_str(s).with_context(|| {
+                format!("unparseable hot row while scanning for table '{table}'")
+            })?;
+            let matches = parsed
+                .get("table")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == table);
             if matches {
                 out.push(s.to_string());
                 if out.len() >= limit {
@@ -1600,6 +1609,51 @@ mod tests {
         assert_eq!(store.get_block_hash(11).unwrap().as_deref(), Some("h11"));
         // The watermark moved in the same transaction.
         assert_eq!(store.get_meta("last_block").unwrap().as_deref(), Some("11"));
+    }
+
+    /// Issue #567. A row that fails to parse must not read the same as a row belonging to some other
+    /// table - both used to collapse to "excluded". Written through the real `Store::put_entity`
+    /// (which never validates its `json` argument), not poked into redb directly, so this is the
+    /// genuinely-corrupt row the issue asked for rather than a hand-built fixture.
+    ///
+    /// Mutation hazard named in the issue: a test that only asserts the corrupt row is *absent* from
+    /// the result would still pass if the guard were deleted and `.ok().unwrap_or(false)` came back,
+    /// since nothing else parses that row either. Asserting `Err` is what a reverted guard cannot
+    /// survive.
+    #[test]
+    fn recent_by_table_errors_on_an_unparseable_row_instead_of_dropping_it() {
+        let (store, _d) = temp_store();
+        store
+            .put_entity(&Store::entity_key(10, 0), r#"{"table":"a__x"}"#)
+            .unwrap();
+        store
+            .put_entity(&Store::entity_key(10, 1), "not json")
+            .unwrap();
+
+        let err = store.recent_by_table("a__x", 10).expect_err(
+            "an unparseable stored row must fail the scan, not silently shrink the result",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("a__x"),
+            "the error should name the table being scanned, got: {msg}"
+        );
+    }
+
+    /// The ordinary case the corrupt-row guard must not break: a well-formed row belonging to a
+    /// different table is a normal non-match, not an error.
+    #[test]
+    fn recent_by_table_skips_rows_from_other_tables_without_erroring() {
+        let (store, _d) = temp_store();
+        store
+            .put_entity(&Store::entity_key(10, 0), r#"{"table":"a__x"}"#)
+            .unwrap();
+        store
+            .put_entity(&Store::entity_key(10, 1), r#"{"table":"b__y"}"#)
+            .unwrap();
+
+        let rows = store.recent_by_table("a__x", 10).unwrap();
+        assert_eq!(rows, vec![r#"{"table":"a__x"}"#.to_string()]);
     }
 
     proptest! {
