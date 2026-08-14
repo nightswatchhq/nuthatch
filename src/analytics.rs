@@ -1583,6 +1583,135 @@ pub struct ViewIssue {
     pub hint: Option<String>,
 }
 
+/// If a query fails against a name DuckDB says doesn't exist, and that name is a nest-authored view
+/// that failed to build, replace the generic "does not exist" + fuzzy-match-on-an-unrelated-table
+/// message with the view's real build error (#539). A view that fails to build is reported as though
+/// it doesn't exist at all - `define_nest_views` loads views per-statement and swallows failures to
+/// `tracing::debug!` for fault isolation, so by the time a query dies at `/sql` there is no record of
+/// *why* the name is missing, and `sql_errors::enrich`'s fuzzy match then points at an unrelated real
+/// table. This is the one place that record is reconstructed: on the query's error path only (never
+/// on a successful query), rebuild the same base surface `validate_nest_views` uses and replay the
+/// view files in order, and report whichever `CREATE VIEW` statement targets `missing`.
+pub fn enrich_query_error(
+    dir: &Path,
+    raw: &str,
+    query: &str,
+    schema: &[crate::registry::TableSchema],
+) -> Option<String> {
+    if let Some(name) = missing_table_of(raw) {
+        if let Some(issue) = view_build_failure(dir, schema, &name) {
+            // The caller wraps whatever this returns as its own "hint: …" line, so this must read as
+            // that line's content, not carry a second nested "hint:" of its own.
+            let extra = issue.hint.map(|h| format!("\n{h}")).unwrap_or_default();
+            return Some(format!(
+                "view `{name}` failed to build (in `{}`): {}{extra}",
+                issue.file, issue.error
+            ));
+        }
+    }
+    crate::sql_errors::enrich(raw, query, schema)
+}
+
+/// If `missing` is the name of a nest-authored view (`views/*.sql`) that failed to build, the error
+/// from that specific `CREATE VIEW` statement - the real fault a query against it hit, rather than
+/// the "does not exist" DuckDB reports for a name that was simply never created. `None` if `missing`
+/// isn't an authored view name at all (an ordinary unknown-table typo), or names one that in fact
+/// built fine (so whatever failed, it wasn't this).
+fn view_build_failure(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    missing: &str,
+) -> Option<ViewIssue> {
+    // DuckDB validates `CREATE VIEW` eagerly (measured, not assumed - see the analytics.rs test
+    // suite), so "two later views joined pool_effective_fee" (#539) means those two views' *own*
+    // `CREATE VIEW` statements failed at load, each with the same "pool_effective_fee does not
+    // exist". Chase that chain to the view whose failure is not itself just a missing upstream view -
+    // the one line that actually explains anything - rather than reporting a hop that only repeats
+    // the same "does not exist" one level removed. Bounded to 8 hops, matching `expand_through_views`'
+    // cycle guard (DuckDB itself refuses a cyclic view, so this is a backstop, not the mechanism).
+    view_build_failure_at(dir, schema, missing, 8)
+}
+
+fn view_build_failure_at(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    missing: &str,
+    hops_left: u8,
+) -> Option<ViewIssue> {
+    let files = nest_view_files(dir);
+    if files.is_empty() {
+        return None;
+    }
+    let conn = Connection::open_in_memory().ok()?;
+    let empty_hot = HotRows::new();
+    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default());
+    define_labels_view(&conn, dir);
+    define_children_views(&conn, dir);
+
+    let target = missing.trim_matches('"').to_ascii_lowercase();
+    for v in &files {
+        for stmt in split_sql_statements(&v.sql) {
+            let result = conn.execute_batch(&stmt);
+            let Some(name) = view_target_name(&stmt) else {
+                continue;
+            };
+            if name.to_ascii_lowercase() != target {
+                continue;
+            }
+            return match result {
+                Ok(()) => None,
+                Err(e) => {
+                    let error = e.to_string();
+                    // If this statement's own failure is "some other name does not exist", and that
+                    // name is itself an authored view that also failed, that view's failure is the
+                    // actual cause - chase it rather than reporting a repeat of the same "does not
+                    // exist" the caller already has.
+                    if hops_left > 0 {
+                        if let Some(dep) = missing_table_of(&error) {
+                            if dep.to_ascii_lowercase() != target {
+                                if let Some(root) =
+                                    view_build_failure_at(dir, schema, &dep, hops_left - 1)
+                                {
+                                    return Some(ViewIssue {
+                                        file: v.file.clone(),
+                                        error: format!(
+                                            "depends on view `{dep}` (in `{}`), which failed to \
+                                             build: {}",
+                                            root.file, root.error
+                                        ),
+                                        hint: root.hint,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let hint = crate::sql_errors::enrich(&error, &stmt, schema);
+                    Some(ViewIssue {
+                        file: v.file.clone(),
+                        error,
+                        hint,
+                    })
+                }
+            };
+        }
+    }
+    None
+}
+
+/// The view name a `CREATE [OR REPLACE] VIEW <name> AS …` statement targets, unquoted. `None` for a
+/// statement that isn't that shape. Same lowercase-scan-for-offsets trick as `view_body`.
+fn view_target_name(stmt: &str) -> Option<String> {
+    let lower = stmt.to_ascii_lowercase();
+    let view_at = lower.find(" view ")?;
+    let as_at = lower[view_at..].find(" as ")? + view_at;
+    Some(
+        stmt[view_at + 6..as_at]
+            .trim()
+            .trim_matches('"')
+            .to_string(),
+    )
+}
+
 /// Validate a nest's authored views (RFC-0018 §1, the loud gate). Sets up the base surface - empty
 /// typed per-event views + labels + children, from the nest's own `schema.json`; no data needed, we're
 /// *binding*, not running - then defines each view in load order and records any that fail. A failure
@@ -2631,6 +2760,183 @@ template="pool"
         assert!(
             hint.contains("usdc__transfer"),
             "fuzzy-suggests the real table: {hint}"
+        );
+    }
+
+    /// #539's own repro: a Solidity `bool` column forces a `COALESCE` type mismatch, which fails the
+    /// view's `CREATE VIEW`. Querying it must name the build failure and the real DuckDB error, not
+    /// report it as though the view were never defined - and the old fuzzy match onto an unrelated
+    /// real table must be gone.
+    #[test]
+    fn a_view_broken_by_the_bool_footgun_is_named_as_a_build_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"pool_manager__toggle_custom_fee","pool":"0xp","enabled":true,"block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/20-custom-fees.sql"),
+            "CREATE VIEW pool_effective_fee AS \
+             SELECT pool, COALESCE(enabled, false) AS override_enabled \
+             FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+        // A real, unrelated table - present so the *old* fuzzy match had something to (wrongly) find.
+        std::fs::write(
+            dir.path().join("views/05-unrelated.sql"),
+            "CREATE VIEW pool_manager__set_default_fee_alias AS \
+             SELECT pool FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "pool_manager__toggle_custom_fee".into(),
+            alias: "pool_manager".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "ToggleCustomFee".into(),
+            topic0: "0x".into(),
+            columns: vec![
+                crate::registry::ColumnSchema {
+                    name: "pool".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: false,
+                },
+                crate::registry::ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+            ],
+        }];
+
+        // The exact DuckDB message a query against the broken view produces.
+        let raw = "Catalog Error: Table with name pool_effective_fee does not exist!\nDid you \
+                    mean \"pool_manager__set_default_fee_alias\"?";
+        let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM pool_effective_fee", &schema)
+            .unwrap();
+        assert!(
+            msg.contains("pool_effective_fee") && msg.contains("failed to build"),
+            "names the view and says it failed to build: {msg}"
+        );
+        assert!(
+            msg.contains("20-custom-fees.sql"),
+            "names the file the broken view lives in: {msg}"
+        );
+        assert!(
+            msg.contains("COALESCE") && msg.contains("explicit cast"),
+            "carries DuckDB's real error: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase()
+                .contains("pool_manager__set_default_fee_alias"),
+            "must not still suggest the unrelated real table now the real cause is known: {msg}"
+        );
+    }
+
+    /// The chained case: a view built *on top of* the broken one also fails to build (its own
+    /// `CREATE VIEW` cannot resolve `pool_effective_fee` either), and DuckDB's error for it names
+    /// `pool_effective_fee`, not the queried view. The message must still land on the root cause
+    /// rather than repeating "pool_effective_fee does not exist" one hop removed.
+    #[test]
+    fn a_view_built_on_a_broken_view_reports_the_root_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"pool_manager__toggle_custom_fee","pool":"0xp","enabled":true,"block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/20-custom-fees.sql"),
+            "CREATE VIEW pool_effective_fee AS \
+             SELECT pool, COALESCE(enabled, false) AS override_enabled \
+             FROM pool_manager__toggle_custom_fee;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/30-summary.sql"),
+            "CREATE VIEW pool_effective_fee_summary AS SELECT pool FROM pool_effective_fee;",
+        )
+        .unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "pool_manager__toggle_custom_fee".into(),
+            alias: "pool_manager".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "ToggleCustomFee".into(),
+            topic0: "0x".into(),
+            columns: vec![
+                crate::registry::ColumnSchema {
+                    name: "pool".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: false,
+                },
+                crate::registry::ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                },
+            ],
+        }];
+
+        // DuckDB validates `CREATE VIEW` eagerly, so `pool_effective_fee_summary` was itself never
+        // created - a query against it names *itself* as missing, not `pool_effective_fee`.
+        let raw = "Catalog Error: Table with name pool_effective_fee_summary does not exist!";
+        let msg = enrich_query_error(
+            dir.path(),
+            raw,
+            "SELECT * FROM pool_effective_fee_summary",
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            msg.contains("pool_effective_fee_summary") && msg.contains("failed to build"),
+            "names the queried view: {msg}"
+        );
+        assert!(
+            msg.contains("pool_effective_fee") && msg.contains("30-summary.sql"),
+            "names the dependency and where the dependent view lives: {msg}"
+        );
+        assert!(
+            msg.contains("COALESCE") && msg.contains("explicit cast"),
+            "surfaces the *root* cause, not a repeat of \"does not exist\": {msg}"
+        );
+    }
+
+    /// An ordinary unknown-table typo - no authored view anywhere named after it - must fall through
+    /// to the normal fuzzy-match hint unchanged.
+    #[test]
+    fn an_unrelated_missing_table_is_unaffected_by_view_build_failure_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"5","block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
+
+        let schema = vec![crate::registry::TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "Transfer".into(),
+            topic0: "0xddf2".into(),
+            columns: vec![],
+        }];
+        let raw = "Catalog Error: Table with name transfers does not exist!";
+        let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM transfers", &schema).unwrap();
+        assert!(msg.contains("no table `transfers`"), "{msg}");
+        assert!(
+            msg.contains("usdc__transfer"),
+            "still suggests the real table: {msg}"
         );
     }
 

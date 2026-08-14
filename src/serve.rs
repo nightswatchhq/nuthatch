@@ -1195,7 +1195,7 @@ async fn run_sql_query(
             // engine message is preserved but path-scrubbed (SEC review) - DuckDB embeds absolute
             // segment paths, which would leak the on-disk layout; the useful table/column detail stays.
             let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-            let msg = match crate::sql_errors::enrich(&raw, &q.q, &s.tables) {
+            let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, &q.q, &s.tables) {
                 Some(hint) => format!("{raw}\n\nhint: {hint}"),
                 None => raw,
             };
@@ -1300,7 +1300,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         Ok(Err(e)) => {
             METRICS.inc_sql_rejected();
             let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-            let msg = match crate::sql_errors::enrich(&raw, &q.q, &s.tables) {
+            let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, &q.q, &s.tables) {
                 Some(hint) => format!("{raw}\n\nhint: {hint}"),
                 None => raw,
             };

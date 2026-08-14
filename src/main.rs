@@ -483,7 +483,14 @@ impl SqlBackend {
                             .and_then(|cfg| {
                                 nuthatch::registry::DecodeRegistry::from_nest(dir, &cfg).ok()
                             })
-                            .and_then(|reg| nuthatch::sql_errors::enrich(&raw, sql, &reg.schema()));
+                            .and_then(|reg| {
+                                nuthatch::analytics::enrich_query_error(
+                                    dir,
+                                    &raw,
+                                    sql,
+                                    &reg.schema(),
+                                )
+                            });
                         match hint {
                             Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
                             None => anyhow::bail!("{raw}"),
