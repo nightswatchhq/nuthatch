@@ -2045,9 +2045,22 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     let config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
 
+    // Resolved here, not left to `build_nest`'s `None` branch (issue #520): that branch is
+    // `Store::open`, which *creates* the store and commits a write txn - correct for the writer
+    // roles that share it, wrong for a role that owns no cursor and has nothing to write. Omitting
+    // `--hot-store` still means "serve the local redb", but that store must already exist; this
+    // process opens it non-creating (`open_existing`) and refuses rather than bringing an empty one
+    // into being (#413's mistake at a site #413 did not cover) or silently taking the write path.
     let store_override: Option<Arc<dyn crate::store::HotStore>> = match &args.hot_store {
         Some(url) => Some(open_shared_hot_store(url, &config.nest.name)?),
-        None => None,
+        None => Some(Arc::new(Store::open_existing(&dir.join(DB_FILE)).with_context(|| {
+            format!(
+                "no hot store to serve from at '{}' - `serve` never creates or writes to the local \
+                 redb, only reads it. Index the nest first with `nuthatch dev`, or point at a shared \
+                 store with --hot-store",
+                dir.display()
+            )
+        })?)),
     };
 
     // No `Source` is ever polled on this role; the parameter exists for the ingest half we discard.
@@ -2080,13 +2093,26 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
         let _ = w.await;
     }
 
-    tracing::info!(
-        nest = %config.nest.name,
-        chain = %config.nest.chain,
-        listen = %args.listen,
-        store = %args.hot_store.as_deref().map(shorten_store).unwrap_or("local redb"),
-        "serving read-only (RFC-0022 query-FE role) - this process owns no cursor"
-    );
+    // Only the `--hot-store` path is actually shared - the local-redb path holds an exclusive flock
+    // on the file for the process's lifetime (#520), so it cannot run beside the `dev`/writer that
+    // fills it or beside a second `serve`, whatever "read-only" suggested.
+    if args.hot_store.is_some() {
+        tracing::info!(
+            nest = %config.nest.name,
+            chain = %config.nest.chain,
+            listen = %args.listen,
+            store = %args.hot_store.as_deref().map(shorten_store).unwrap_or("local redb"),
+            "serving read-only (RFC-0022 query-FE role) - this process owns no cursor"
+        );
+    } else {
+        tracing::info!(
+            nest = %config.nest.name,
+            chain = %config.nest.chain,
+            listen = %args.listen,
+            "serving the local redb (RFC-0022 query-FE role) - this process owns no cursor, but \
+             holds an exclusive lock on the store: it cannot run beside the writer or a second serve"
+        );
+    }
 
     serve::run(&args.listen, state).await
 }
