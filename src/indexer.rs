@@ -2482,22 +2482,68 @@ fn fetch_logs_splitting_inner<'a>(
     })
 }
 
-/// Attempts and base backoff for a transient RPC failure during a seal-direct backfill window.
-const BACKFILL_RETRY_ATTEMPTS: usize = 5;
+/// Base backoff for a transient RPC failure during a seal-direct backfill window, and the ceiling its
+/// doubling is capped at (#538).
+///
+/// A fixed attempt count used to give up after 5 tries spanning ~4s of backoff - shorter than even
+/// an endpoint's ordinary 30s cooldown (`ENDPOINT_COOLDOWN_MS` in `rpc.rs`), let alone a 300s terminal
+/// one, so it outlasted every retry and killed a multi-hour backfill over one bad window a bare
+/// restart resumed past for free. There is no failure class here worth giving up on:
+/// every caller of [`retry_transient`]/[`logs_with_retry`] is an RPC fetch on the sealed-history path,
+/// the same class of failure `index_loop`'s tip-following getLogs fetch already retries forever (see
+/// its `Err(e) => { warn!(...); sleep; }` arm) without anyone calling that a bug. So neither function
+/// gives up any more; retrying in place - loud, on the same window, cursor never advancing past it -
+/// is exactly what "no silent gap" requires, and it is exactly what a restart already proved safe.
+///
+/// #538 also reported a *second* apparent failure mode - a run dying right after the pool correctly
+/// identified one endpoint as permanently bad (a 403) and cooled it down, despite a second, healthy
+/// `--rpc` endpoint being configured. That is not a second bug: `RpcClient::call` already tries every
+/// endpoint, cooling ones included, within a *single* `logs()`/`call()` invocation before giving up
+/// (see `a_rejecting_endpoint_gets_the_long_cooldown_and_a_healthy_one_still_answers` in `rpc.rs`,
+/// which proves a lone terminal failure never blocks the healthy endpoint from answering the same
+/// call). For the whole call to fail, the "healthy" endpoint must *also* have failed on that
+/// attempt - plausible and unremarkable under concurrency (a momentary rate-limit), and exactly the
+/// same shape as the first failure mode: an outer ceiling shorter than the time an endpoint needs to
+/// come back. Removing the ceiling here fixes both from one cause, with no change needed in `rpc.rs`.
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Retry a transient RPC operation with capped exponential backoff. A single attempt already fails
-/// over across endpoints ([`RpcClient::call`]); this covers the case where *every* endpoint is briefly
-/// unavailable at once - a shared rate-limit or a provider blip (e.g. a 403 from one host while the
-/// others throttle under concurrency). Without it a single such window aborts the whole seal-direct
-/// backfill; with it the window waits and retries, matching the tip loop's resilience. `base` is
-/// parameterised so tests can pass `Duration::ZERO`.
-async fn retry_transient<T, F, Fut>(
+/// The backoff for a given attempt: `base` doubling per attempt, capped at
+/// [`BACKFILL_RETRY_BACKOFF_CAP`] so a long-stalled endpoint is polled steadily rather than at an
+/// ever-growing interval.
+fn backfill_backoff(base: std::time::Duration, attempt: usize) -> std::time::Duration {
+    base.saturating_mul(1u32 << (attempt - 1).min(16))
+        .min(BACKFILL_RETRY_BACKOFF_CAP)
+}
+
+/// Log a backfill retry with the same escalating severity as [`escalate_stall`]: `warn!` on every
+/// attempt (an operator watching the live progress line sees it moving again once this clears), and
+/// `error!` once every ten attempts *once the backoff has reached its cap* - by then the failure has
+/// outlasted a full ordinary endpoint cooldown, so it is worth a louder, less frequent signal that
+/// something is genuinely stuck rather than merely slow, without spamming a warn every 30s forever.
+fn log_backfill_retry(
     label: &str,
-    attempts: usize,
-    base: std::time::Duration,
-    mut op: F,
-) -> Result<T>
+    attempt: usize,
+    err: &anyhow::Error,
+    backoff: std::time::Duration,
+) {
+    if backoff >= BACKFILL_RETRY_BACKOFF_CAP && attempt % 10 == 0 {
+        tracing::error!(
+            "{label} still failing after {attempt} attempts: {err:#}; retrying in {backoff:?} - \
+             sealed history is safe and this resumes automatically once an endpoint recovers"
+        );
+    } else {
+        tracing::warn!("{label} failed (attempt {attempt}): {err:#}; retrying in {backoff:?}");
+    }
+}
+
+/// Retry a transient RPC operation forever, with capped exponential backoff (#538). A single attempt
+/// already fails over across endpoints ([`RpcClient::call`]); this covers the case where *every*
+/// endpoint is briefly unavailable at once - a shared rate-limit or a provider blip (e.g. a 403 from
+/// one host while the others throttle under concurrency). Without it a single such window could abort
+/// the whole seal-direct backfill; with it the window waits and retries, matching the tip loop's own
+/// resilience to the identical failure class. `base` is parameterised so tests can pass `Duration::ZERO`.
+async fn retry_transient<T, F, Fut>(label: &str, base: std::time::Duration, mut op: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -2507,13 +2553,8 @@ where
         match op().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if attempt >= attempts {
-                    return Err(e.context(format!("{label} failed after {attempts} attempts")));
-                }
-                let backoff = base.saturating_mul(1u32 << (attempt - 1).min(6));
-                tracing::warn!(
-                    "{label} failed (attempt {attempt}/{attempts}): {e:#}; retrying in {backoff:?}"
-                );
+                let backoff = backfill_backoff(base, attempt);
+                log_backfill_retry(label, attempt, &e, backoff);
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
@@ -2521,17 +2562,21 @@ where
     }
 }
 
-/// Fetch logs with the same bounded transient-retry as [`retry_transient`], but **pass a result-cap
-/// error straight through** so the caller's own window-shrink logic handles it. The factory backfill
-/// needs this because its cap strategy is an outer shrink (not the pipelined path's internal split):
-/// "too many results" ⇒ shrink the window, "endpoint down" ⇒ back off and retry. Without it a single
-/// transient RPC blip (a 521, an all-endpoints rate-limit) aborts a long factory backfill mid-run -
-/// exactly what building the Uniswap-v3 nest surfaced.
+/// Fetch logs with the same never-give-up transient-retry as [`retry_transient`], but **pass a
+/// result-cap error straight through** so the caller's own window-shrink logic handles it. The factory
+/// backfill needs this because its cap strategy is an outer shrink (not the pipelined path's internal
+/// split): "too many results" ⇒ shrink the window, "endpoint down" ⇒ back off and retry. Without it a
+/// single transient RPC blip (a 521, an all-endpoints rate-limit) could abort a long factory backfill
+/// mid-run - exactly what building the Uniswap-v3 nest surfaced, and exactly what #538 measured on a
+/// real multi-hour run.
+///
+/// `base` is parameterised like [`retry_transient`] so tests can pass `Duration::ZERO`.
 async fn logs_with_retry(
     source: &dyn Source,
     filter: &LogFilter,
     from: u64,
     to: u64,
+    base: std::time::Duration,
 ) -> Result<Vec<crate::rpc::Log>> {
     let mut attempt = 1usize;
     loop {
@@ -2539,15 +2584,13 @@ async fn logs_with_retry(
             Ok(l) => return Ok(l),
             // A result cap is not transient - hand it back so the caller shrinks the window.
             Err(e) if chunker::is_result_too_large(&e) => return Err(e),
-            Err(e) if attempt >= BACKFILL_RETRY_ATTEMPTS => {
-                return Err(e).with_context(|| {
-                    format!("getLogs {from}..={to} failed after {BACKFILL_RETRY_ATTEMPTS} attempts")
-                });
-            }
             Err(e) => {
-                let backoff = BACKFILL_RETRY_BASE.saturating_mul(1u32 << (attempt - 1).min(6));
-                tracing::warn!(
-                    "factory getLogs {from}..={to} failed (attempt {attempt}/{BACKFILL_RETRY_ATTEMPTS}): {e:#}; retrying in {backoff:?}"
+                let backoff = backfill_backoff(base, attempt);
+                log_backfill_retry(
+                    &format!("factory getLogs {from}..={to}"),
+                    attempt,
+                    &e,
+                    backoff,
                 );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
@@ -2642,7 +2685,6 @@ pub async fn backfill_direct_pipelined(
                 Some(f) => {
                     retry_transient(
                         &format!("seal-direct getLogs {w_from}..={w_to}"),
-                        BACKFILL_RETRY_ATTEMPTS,
                         BACKFILL_RETRY_BASE,
                         || fetch_logs_splitting(source, f, w_from, w_to),
                     )
@@ -2672,7 +2714,6 @@ pub async fn backfill_direct_pipelined(
             blocks.dedup();
             let ts = retry_transient(
                 &format!("seal-direct block_timestamps {w_from}..={w_to}"),
-                BACKFILL_RETRY_ATTEMPTS,
                 BACKFILL_RETRY_BASE,
                 || fetch_timestamps(source, registry, &blocks),
             )
@@ -2696,7 +2737,6 @@ pub async fn backfill_direct_pipelined(
                 let want: Vec<u64> = (w_from..=w_to).collect();
                 let headers = retry_transient(
                     &format!("seal-direct block_headers {w_from}..={w_to}"),
-                    BACKFILL_RETRY_ATTEMPTS,
                     BACKFILL_RETRY_BASE,
                     || source.block_headers(&want),
                 )
@@ -2821,22 +2861,25 @@ pub async fn backfill_direct_factory(
             // nothing from no logs, and the seal/progress bookkeeping still has to run.
             all_logs = match LogFilter::new(&[], topic0s) {
                 None => Vec::new(),
-                Some(wide) => match logs_with_retry(source, &wide, next, chunk_to).await {
-                    Ok(l) => {
-                        chunker.observed(l.len() as u64);
-                        l
-                    }
-                    Err(e) if chunker::is_result_too_large(&e) => {
-                        if next >= chunk_to {
-                            return Err(e).with_context(|| single_block_over_cap(next));
+                Some(wide) => {
+                    match logs_with_retry(source, &wide, next, chunk_to, BACKFILL_RETRY_BASE).await
+                    {
+                        Ok(l) => {
+                            chunker.observed(l.len() as u64);
+                            l
                         }
-                        chunker.too_large();
-                        continue;
+                        Err(e) if chunker::is_result_too_large(&e) => {
+                            if next >= chunk_to {
+                                return Err(e).with_context(|| single_block_over_cap(next));
+                            }
+                            chunker.too_large();
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
+                        }
                     }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
-                    }
-                },
+                }
             };
             let _ = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
         } else {
@@ -2854,22 +2897,25 @@ pub async fn backfill_direct_factory(
             // chain (#432). Empty window, same fall-through as above.
             let logs1 = match LogFilter::new(&current, topic0s) {
                 None => Vec::new(),
-                Some(pass1) => match logs_with_retry(source, &pass1, next, chunk_to).await {
-                    Ok(l) => {
-                        chunker.observed(l.len() as u64);
-                        l
-                    }
-                    Err(e) if chunker::is_result_too_large(&e) => {
-                        if next >= chunk_to {
-                            return Err(e).with_context(|| single_block_over_cap(next));
+                Some(pass1) => {
+                    match logs_with_retry(source, &pass1, next, chunk_to, BACKFILL_RETRY_BASE).await
+                    {
+                        Ok(l) => {
+                            chunker.observed(l.len() as u64);
+                            l
                         }
-                        chunker.too_large();
-                        continue; // retry the same range with a smaller window
+                        Err(e) if chunker::is_result_too_large(&e) => {
+                            if next >= chunk_to {
+                                return Err(e).with_context(|| single_block_over_cap(next));
+                            }
+                            chunker.too_large();
+                            continue; // retry the same range with a smaller window
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
+                        }
                     }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
-                    }
-                },
+                }
             };
             all_logs = logs1;
             // Decode to discover children (rows discarded here; the authoritative decode is below once
@@ -2894,9 +2940,10 @@ pub async fn backfill_direct_factory(
                 // the every-log-on-the-chain request that `LogFilter` refuses to build.
                 let child_filter = LogFilter::new(&new, topic0s)
                     .expect("child filter has a non-empty address list");
-                let more = logs_with_retry(source, &child_filter, next, chunk_to)
-                    .await
-                    .with_context(|| format!("getLogs (children) {next}..={chunk_to}"))?;
+                let more =
+                    logs_with_retry(source, &child_filter, next, chunk_to, BACKFILL_RETRY_BASE)
+                        .await
+                        .with_context(|| format!("getLogs (children) {next}..={chunk_to}"))?;
                 let _ = decode_window(registry, Some(factory), children, &more, &empty_ts);
                 all_logs.extend(more);
             }
@@ -2908,7 +2955,6 @@ pub async fn backfill_direct_factory(
         blocks.dedup();
         let ts = retry_transient(
             &format!("factory block_timestamps {next}..={chunk_to}"),
-            BACKFILL_RETRY_ATTEMPTS,
             BACKFILL_RETRY_BASE,
             || fetch_timestamps(source, registry, &blocks),
         )
@@ -4381,7 +4427,7 @@ mod tests {
     async fn retry_transient_recovers_after_transient_failures() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        let r: Result<u32> = retry_transient("op", 5, std::time::Duration::ZERO, || async {
+        let r: Result<u32> = retry_transient("op", std::time::Duration::ZERO, || async {
             // Fail the first two attempts (a rate-limit blip), succeed on the third.
             if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                 Err(anyhow::anyhow!("all RPC endpoints failed"))
@@ -4398,18 +4444,130 @@ mod tests {
         );
     }
 
+    /// #538: a 5-attempt ceiling killed a multi-hour backfill over one bad window a bare restart
+    /// resumed past for free, because it gave up faster than even an endpoint's ordinary 30s cooldown.
+    /// `retry_transient` no longer has a ceiling at all - prove it by outliving the old one many times
+    /// over and still recovering, exactly like `index_loop`'s tip-following getLogs fetch already does.
     #[tokio::test]
-    async fn retry_transient_gives_up_after_max_attempts() {
+    async fn retry_transient_never_gives_up_and_recovers_past_the_old_five_attempt_ceiling() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        let r: Result<u32> = retry_transient("op", 3, std::time::Duration::ZERO, || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow::anyhow!("persistent 403"))
+        let r: Result<u32> = retry_transient("op", std::time::Duration::ZERO, || async {
+            // Fail 25 times - five times the old `BACKFILL_RETRY_ATTEMPTS = 5` - then recover.
+            if calls.fetch_add(1, Ordering::SeqCst) < 25 {
+                Err(anyhow::anyhow!("persistent 403"))
+            } else {
+                Ok(7)
+            }
         })
         .await;
-        let err = r.unwrap_err().to_string();
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "exactly `attempts` tries");
-        assert!(err.contains("after 3 attempts"), "got: {err}");
+        assert_eq!(
+            r.unwrap(),
+            7,
+            "must still recover no matter how many attempts it took"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 26);
+    }
+
+    #[test]
+    fn backfill_backoff_doubles_then_caps() {
+        let base = std::time::Duration::from_millis(250);
+        assert_eq!(
+            backfill_backoff(base, 1),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            backfill_backoff(base, 2),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(backfill_backoff(base, 3), std::time::Duration::from_secs(1));
+        assert_eq!(backfill_backoff(base, 4), std::time::Duration::from_secs(2));
+        // Attempt 7 (past the old 5-attempt ceiling) is still growing, not yet at the cap.
+        assert_eq!(
+            backfill_backoff(base, 7),
+            std::time::Duration::from_secs(16)
+        );
+        // But it never exceeds the cap, however many attempts pile up - a stalled endpoint is polled
+        // steadily, not at an ever-widening interval that would delay recovery once it comes back.
+        assert_eq!(backfill_backoff(base, 100), BACKFILL_RETRY_BACKOFF_CAP);
+        assert_eq!(
+            backfill_backoff(base, usize::MAX),
+            BACKFILL_RETRY_BACKOFF_CAP
+        );
+    }
+
+    /// `logs_with_retry` must keep retrying a plain transient failure past the old 5-attempt ceiling
+    /// (#538) while still passing a result-cap error straight through on the first attempt, unretried,
+    /// so the caller's window-shrink logic (not this function) handles it.
+    #[tokio::test]
+    async fn logs_with_retry_never_gives_up_on_transient_failure_but_passes_a_cap_through_at_once()
+    {
+        use crate::rpc::Log;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FlakyThenCapped {
+            calls: AtomicUsize,
+            fail_until: usize,
+            then_cap: bool,
+        }
+        #[async_trait::async_trait]
+        impl Source for FlakyThenCapped {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(&self, _filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_until {
+                    anyhow::bail!("transport error: connection reset");
+                }
+                if self.then_cap {
+                    anyhow::bail!("query returned more than 10000 results");
+                }
+                Ok((from..=to)
+                    .map(|b| Log {
+                        address: "0xabc".into(),
+                        topics: vec![],
+                        data: "0x".into(),
+                        block_number: b,
+                        block_hash: "0x".into(),
+                        tx_hash: "0x".into(),
+                        log_index: 0,
+                    })
+                    .collect())
+            }
+        }
+        let filter = LogFilter::new(&["0xabc".to_string()], &[]).expect("non-empty filter");
+
+        // 20 transient failures - four times the old ceiling - then recovers.
+        let flaky = FlakyThenCapped {
+            calls: AtomicUsize::new(0),
+            fail_until: 20,
+            then_cap: false,
+        };
+        let logs = logs_with_retry(&flaky, &filter, 1, 10, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 10);
+        assert_eq!(flaky.calls.load(Ordering::SeqCst), 21);
+
+        // A result-cap error is handed back on the very first attempt, not retried.
+        let capped = FlakyThenCapped {
+            calls: AtomicUsize::new(0),
+            fail_until: 0,
+            then_cap: true,
+        };
+        let err = logs_with_retry(&capped, &filter, 1, 10, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(chunker::is_result_too_large(&err), "got: {err:#}");
+        assert_eq!(
+            capped.calls.load(Ordering::SeqCst),
+            1,
+            "a cap error must not be retried"
+        );
     }
 
     #[test]
