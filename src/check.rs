@@ -42,17 +42,6 @@ pub fn check(args: CheckArgs) -> Result<()> {
     }
 
     let checks = collect_checks(&dir, args.name.as_deref())?;
-    if checks.is_empty() {
-        bail!(
-            "no checks found in {} (expected checks/*.sql)",
-            dir.join("checks").display()
-        );
-    }
-    let expected_dir = dir.join("checks").join("expected");
-    if args.update {
-        std::fs::create_dir_all(&expected_dir)
-            .with_context(|| format!("cannot create {}", expected_dir.display()))?;
-    }
 
     let mut failures = 0usize;
 
@@ -60,8 +49,15 @@ pub fn check(args: CheckArgs) -> Result<()> {
     // references a table/column the registry no longer has (**drift**), fails loudly with a
     // fuzzy-matched fix hint instead of vanishing silently. This runs before the parity checks so a
     // drifted view is caught even if it's the reason a parity check would fail.
-    if let Some(schema) = nest_schema(&dir) {
-        for issue in analytics::validate_nest_views(&dir, &schema) {
+    //
+    // Deliberately **before** the no-checks bail below, and evaluated regardless of whether it finds
+    // anything (#539): a nest with views and no `checks/*.sql` yet is a normal intermediate state,
+    // and it's exactly when an author most wants this validator. The old order bailed on the empty
+    // `checks/` dir first, which made view drift invisible until a check happened to exist.
+    let views_validated = nest_schema(&dir).map(|schema| {
+        let issues = analytics::validate_nest_views(&dir, &schema);
+        let n = issues.len();
+        for issue in issues {
             let hint = issue
                 .hint
                 .map(|h| format!("\n    hint: {h}"))
@@ -70,6 +66,31 @@ pub fn check(args: CheckArgs) -> Result<()> {
             println!("✗ view {}: {first}{hint}", issue.file);
             failures += 1;
         }
+        n
+    });
+
+    if checks.is_empty() {
+        let has_views = !analytics::nest_view_files(&dir).is_empty();
+        // Only truly nothing to check - no checks, and either no views or no schema to validate them
+        // against - keeps the original bail. A nest with views that were actually validated above
+        // got a real answer instead, even with `checks/` empty.
+        if !has_views || views_validated.is_none() {
+            bail!(
+                "no checks found in {} (expected checks/*.sql)",
+                dir.join("checks").display()
+            );
+        }
+        if failures > 0 {
+            bail!("{failures} view issue(s) found");
+        }
+        println!("✓ no checks/*.sql, but all view(s) build cleanly");
+        return Ok(());
+    }
+
+    let expected_dir = dir.join("checks").join("expected");
+    if args.update {
+        std::fs::create_dir_all(&expected_dir)
+            .with_context(|| format!("cannot create {}", expected_dir.display()))?;
     }
 
     for (name, sql_path) in &checks {
@@ -182,6 +203,84 @@ mod tests {
         assert!(diff(&a, &a[..1]).unwrap().contains("row count"));
         let b = vec![json!({"x": 1}), json!({"x": 9})];
         assert!(diff(&a, &b).unwrap().contains("row 1 differs"));
+    }
+
+    /// A minimal nest with no `[[contracts]]` - `Config::load` and `DecodeRegistry::from_nest` both
+    /// succeed with an empty schema, so `nest_schema` returns `Some(vec![])` without needing any ABI
+    /// fixture. Enough to drive view validation on self-contained views that reference no real table.
+    fn write_minimal_nest(dir: &Path) {
+        std::fs::write(
+            dir.join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+    }
+
+    /// #539 fix 3: a nest with views and no `checks/*.sql` yet is a normal intermediate state, not an
+    /// error - `check` must still validate the views instead of bailing on the missing directory.
+    #[test]
+    fn no_checks_directory_still_validates_a_clean_view() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_nest(dir.path());
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-ok.sql"),
+            "CREATE VIEW ok AS SELECT 1 AS x;",
+        )
+        .unwrap();
+
+        let result = check(CheckArgs {
+            name: None,
+            dir: dir.path().display().to_string(),
+            update: false,
+        });
+        assert!(
+            result.is_ok(),
+            "a clean view with no checks/ must not bail on the missing directory: {result:?}"
+        );
+    }
+
+    /// The other half: a broken view with no `checks/*.sql` must fail *because of the view*, not
+    /// disappear behind (or be misreported as) the old "no checks found" bail.
+    #[test]
+    fn no_checks_directory_still_reports_a_broken_view() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_nest(dir.path());
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-broken.sql"),
+            "CREATE VIEW broken AS SELECT * FROM nonexistent_table;",
+        )
+        .unwrap();
+
+        let err = check(CheckArgs {
+            name: None,
+            dir: dir.path().display().to_string(),
+            update: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err.contains("no checks found"),
+            "must not be the generic empty-checks bail: {err}"
+        );
+        assert!(err.contains("view issue"), "{err}");
+    }
+
+    /// Unchanged: a nest with neither `checks/*.sql` nor any views has truly nothing to check.
+    #[test]
+    fn no_checks_and_no_views_still_bails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_nest(dir.path());
+
+        let err = check(CheckArgs {
+            name: None,
+            dir: dir.path().display().to_string(),
+            update: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no checks found"), "{err}");
     }
 
     #[test]

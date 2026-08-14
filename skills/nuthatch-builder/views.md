@@ -40,14 +40,19 @@ Query it by name - it's just another relation:
 nuthatch sql "SELECT * FROM top_recipients"
 ```
 
-## The footguns (the same three every agent trips on)
+## The footguns (the same four every agent trips on)
 
 1. **Reserved-word columns.** `from` and `to` are SQL keywords - double-quote them: `SELECT "from"`.
    Call the MCP `schema` tool; it lists exactly which columns are reserved for this nest.
 2. **Big-int columns are exact text.** A `uint256`/`int256` column (e.g. `value`) is stored as a text
    string. Never `SUM(value)` - use its derived `value_dec` companion: `SUM(value_dec)`. `schema`
    lists which columns have a `_dec`.
-3. **The hot/cold seam.** A view sees the whole hot ∪ cold surface, so results are current - but it's
+3. **Bool columns are exact text too.** A Solidity `bool` column (e.g. `enabled`) is stored as text
+   `'true'`/`'false'`, not a SQL boolean. `enabled = true` and `AND`/`NOT` implicitly cast and work;
+   `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not, and fail to build with "an explicit
+   cast is required". Write `enabled = 'true'` or `CAST(enabled AS BOOLEAN)`. `schema` lists which
+   columns are bools.
+4. **The hot/cold seam.** A view sees the whole hot ∪ cold surface, so results are current - but it's
    recomputed each query, not a maintained snapshot. `schema` shows `sealed_through` vs the tip.
 
 ## Validation is loud (RFC-0018 §1)
