@@ -67,15 +67,29 @@ against the seeded corpus, then revert. That check isn't automated here - a perm
 must find a bug" target isn't buildable - so re-run it by hand after any change to the fuzz
 harness itself.
 
-**Status as of 2026-08-14: not completed live**, because the same rustc ICE described above (see
-"the compiler unexpectedly panicked" / `StarJoinFuncTrait`) blocked most build attempts that day,
-including plain rebuilds with no source change - it reproduced on roughly half of repeated,
-identical `cargo fuzz build -O --sanitizer none` invocations. Two builds against the *unmodified*
-(guard-in-place) code did succeed and confirmed `abi_json`/`abi_arbitrary`/`decode_log` link and
-run cleanly against the checked-in corpus with no crashes; the COR-11-reverted build to prove the
-opposite (a red) kept losing the same coin flip before landing one. The harness's construction is
-still sound by source inspection - `abi_json.rs`/`abi_arbitrary.rs` call
-`DecodeRegistry::build` directly, `decode_log.rs` calls `reg.decode(&log)` directly, exactly the
-entry points production ingestion calls - but that is not a substitute for the live proof this
-section asks for. Whoever picks this up next should re-run the COR-11 revert-and-build cycle
-(retrying past the flaky ICE as needed) before treating this target's coverage as trusted.
+**Status as of 2026-08-14: the cargo-fuzz live proof is still not completed**, because the same
+rustc ICE described above (see "the compiler unexpectedly panicked" / `StarJoinFuncTrait`) blocked
+most build attempts that day, including plain rebuilds with no source change - it reproduced on
+roughly half of repeated, identical `cargo fuzz build -O --sanitizer none` invocations. Two builds
+against the *unmodified* (guard-in-place) code did succeed and confirmed
+`abi_json`/`abi_arbitrary`/`decode_log` link and run cleanly against the checked-in corpus with no
+crashes; the COR-11-reverted build to prove the opposite (a red) kept losing the same coin flip
+before landing one. The harness's construction is still sound by source inspection -
+`abi_json.rs`/`abi_arbitrary.rs` call `DecodeRegistry::build` directly, `decode_log.rs` calls
+`reg.decode(&log)` directly, exactly the entry points production ingestion calls - but that is not
+a substitute for the live proof this section asks for. Whoever picks this up next should re-run
+the COR-11 revert-and-build cycle (retrying past the flaky ICE as needed) before treating this
+target's coverage as trusted for libFuzzer discovery specifically.
+
+**The cheaper half is proven, though, and does not depend on the ICE at all.** The COR-11 *oracle*
+- that `value_from_dynsol` catches a dirty-high-bits uint and does not panic - is exercised by a
+plain `cargo test` in `src/registry.rs`
+(`registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking`), no nightly
+toolchain and no sanitizer required. It runs the same crafted log (a `uint64` field with a
+32-byte word of `0xff`) through the real `DecodeRegistry::decode` entry point. Verified live on
+2026-08-14: with the guard in place it passes; with `saturating_to::<u64>()` reverted to
+`.to::<u64>()` it panics at `src/registry.rs:926` with `Uint conversion error: Overflow(256,
+18446744073709551615, 18446744073709551615)`, restored immediately after. That proves the target
+body catches the crafted input once it reaches decode - it does not prove libFuzzer's mutation
+engine would find that input on its own, which is what the still-open cargo-fuzz proof above is
+for.

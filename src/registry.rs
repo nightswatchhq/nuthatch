@@ -1578,4 +1578,32 @@ mod tests {
       {"type":"event","name":"Sync","anonymous":false,"inputs":[{"name":"reserve0","type":"uint112","indexed":false}]},
       {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true}]}
     ]"#;
+
+    /// COR-11 oracle (nuthatch#290 fuzz follow-up, GH#581). `value_from_dynsol` guards a
+    /// declared-width-<=64 uint with `saturating_to::<u64>()` because alloy's dyn-abi decoder does
+    /// not require the padding above a sub-256-bit declared width to be zero: a log emitted (or
+    /// forged) with dirty high bits decodes to a `DynSolValue::Uint` whose `U256` does not fit in
+    /// `u64`. An unchecked `.to::<u64>()` there panics and would take the ingestion task down on
+    /// attacker-supplied log data. This is the "reds when the guard is removed" proof the cargo-fuzz
+    /// harness in fuzz/ could not complete in this environment (rustc ICE compiling dbsp under
+    /// sanitizer instrumentation, GH#581) - it needs no nightly toolchain and no sanitizer, so it
+    /// runs the same crafted input through the real decode path on stable `cargo test`.
+    #[test]
+    fn dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking() {
+        const ODD: &str = r#"[
+            {"type":"event","name":"Odd","anonymous":false,"inputs":[
+                {"name":"v","type":"uint64","indexed":false}]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("odd", USDC, ODD)]).unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        // A full 32-byte word of 0xff: every bit above the declared 64-bit width is dirty.
+        let l = log(USDC, &[&topic0], &format!("0x{}", "ff".repeat(32)), 1, 0);
+        let row = reg
+            .decode(&l)
+            .expect("a dirty-high-bits uint64 must not panic decoding")
+            .expect("topic0/address both match the fixture");
+        assert_eq!(row.params[0].0, "v");
+        // Saturated, not truncated/masked - the guard's documented behaviour.
+        assert_eq!(row.params[0].1, Value::U64(u64::MAX));
+    }
 }
