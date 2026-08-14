@@ -251,6 +251,26 @@ Break one nest deliberately — an invalid authored view is easiest. Expect that
 and reported, and **every other nest to keep serving**. *Proves* isolation. A runtime-wide failure here
 is the most serious finding in this document.
 
+**3.6 Cross-nest dataset adoption**
+
+```sh
+./scripts/cross-nest-adoption.sh   # NUTHATCH=/path/to/binary optional
+```
+
+*Scripted acceptance run.* Two independently-authored nests — different alias, description, and
+`views/` — share the same contract, ABI, and start block, so their `data_identity()` matches and
+their NIDs differ. Nest A indexes and seals a small fixture history; nest B is then migrated in
+against an endpoint switched to return **zero logs for the whole range**. Expect:
+
+- `migrate` prints `ADOPT` for B, not a fresh backfill.
+- B's NID differs from A's (two mounts of one nest would not prove this).
+- B's row count equals A's after mounting, even though its RPC endpoint cannot serve the history.
+- Zero `eth_getLogs` calls into the historic range after B was mounted.
+
+*Proves* that `runtime::adoptable` is general — it matches any nest whose decode inputs agree, not
+only edits of the same lineage. This is the case GraphOps described: "if two entity hashes across
+any nest are the same, you can reuse the data across."
+
 ---
 
 ## Level 4 — the guards
