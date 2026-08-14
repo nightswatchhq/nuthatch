@@ -434,6 +434,7 @@ impl Config {
             c.validate()?;
         }
         cfg.refuse_unwired_calls()?;
+        cfg.refuse_tip_finality_webhooks()?;
         Ok(cfg)
     }
 
@@ -464,6 +465,33 @@ impl Config {
             self.calls.len(),
             if self.calls.len() == 1 { "y" } else { "ies" },
             if self.calls.len() == 1 { "it" } else { "them" },
+        )
+    }
+
+    /// Refuse a `[[webhooks]]` entry declaring `finality = "tip"` while `deliver_sealed` is the only
+    /// delivery path that exists (issue #577).
+    ///
+    /// `finality` parses fine either way and `Webhook::finality` is a bare `Option<String>`, so a
+    /// typo'd or aspirational `"tip"` would otherwise be accepted, start clean, and never deliver a
+    /// single row - the exact "accepted, validated, and then ignored forever" shape
+    /// `refuse_unwired_calls` exists to prevent for `[[calls]]` (#262). A load error costs an
+    /// operator one clear message; silent non-delivery costs them finding out from a consumer.
+    fn refuse_tip_finality_webhooks(&self) -> Result<()> {
+        let tip_webhooks: Vec<&str> = self
+            .webhooks
+            .iter()
+            .filter(|w| w.finality.as_deref() == Some("tip"))
+            .map(|w| w.name.as_str())
+            .collect();
+        if tip_webhooks.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "webhook(s) {} declare `finality = \"tip\"`, and nuthatch cannot deliver on it yet - \
+             see issue #577. Only the sealed path (`finality = \"sealed\"`, the default) delivers \
+             today; a tip webhook would load cleanly and then never fire, silently, forever. Set \
+             `finality = \"sealed\"` (or omit it) until tip delivery ships.",
+            tip_webhooks.join(", "),
         )
     }
 
@@ -828,6 +856,79 @@ every = 100
              `Config::refuse_unwired_calls` and this test, and close issue #262",
             callers.join(", ")
         );
+    }
+
+    /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never
+    /// delivered (issue #577 - the same shape as #262's `[[calls]]` refusal above).
+    #[test]
+    fn a_tip_finality_webhook_is_refused_rather_than_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 1
+
+[[contracts]]
+alias = "c"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+
+[[webhooks]]
+name = "fast"
+table = "c__transfer"
+url = "http://127.0.0.1:8099/"
+finality = "tip"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(err.contains("#577"), "point at the issue: {err}");
+        assert!(err.contains("fast"), "name the offending webhook: {err}");
+        assert!(
+            err.contains("sealed"),
+            "a refusal should name the working alternative: {err}"
+        );
+    }
+
+    /// The default (`finality` omitted) and the explicit `"sealed"` both load clean - only `"tip"`
+    /// is refused.
+    #[test]
+    fn sealed_finality_webhooks_load_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 1
+
+[[contracts]]
+alias = "c"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+
+[[webhooks]]
+name = "default"
+table = "c__transfer"
+url = "http://127.0.0.1:8099/"
+
+[[webhooks]]
+name = "explicit"
+table = "c__transfer"
+url = "http://127.0.0.1:8099/"
+finality = "sealed"
+"#,
+        )
+        .unwrap();
+        Config::load(dir.path()).expect("sealed (default or explicit) must load");
     }
 
     #[test]

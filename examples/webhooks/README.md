@@ -5,9 +5,9 @@ Two delivery paths share one engine. This walks both, with a receiver you can ac
 | | `[[webhooks]]` (RFC-0010 Part B) | `[[alerts]]` (RFC-0008 C5) |
 |---|---|---|
 | Sends | rows of an event table | compliance annotations |
-| Triggered by | rows sealing (or hitting the tip) | a flag being raised or retracted |
+| Triggered by | rows sealing | a flag being raised or retracted |
 | Selected by | `table` + optional `where` | `kinds` |
-| Signed | when `secret` is set | when the named webhook carries a secret |
+| Signed | when `secret` is set | never - `[[alerts]]` has no `secret` field |
 
 Both go through the same durable outbox, so everything below about retries, ordering and
 the depth gauge applies to both.
@@ -29,7 +29,7 @@ table  = "token__transfer"
 where  = "value_dec > 1000000"      # optional; SQL over that table's columns
 url    = "http://127.0.0.1:8099/"
 secret = "hunter2"                  # enables X-Nuthatch-Signature
-finality = "sealed"                 # default; "tip" is faster and may retract
+finality = "sealed"                 # the only path that delivers today - see below
 since  = "registration"             # default; "genesis" or a block number
 batch_max = 50
 ```
@@ -45,16 +45,19 @@ kinds = ["sanction_hit", "threshold_flag"]
 url   = "http://127.0.0.1:8099/"
 ```
 
-## The four things that surprise people
+## The five things that surprise people
 
 **`since = "registration"` is the default, and it is the one you want.** A webhook added to a
 nest that is about to run `--seal-direct` over 40M blocks does *not* fire for all of history:
 the cursor starts where you registered it. Set `"genesis"` only if you mean it, and expect the
 receiver to be hit hard.
 
-**`finality = "sealed"` never lies; `"tip"` is faster and can retract.** Sealed rows are past
-finality, so a delivery is final. Tip deliveries arrive sooner and a reorg can retract one you
-already acted on. Pick per webhook, and if you are writing to a ledger, pick sealed.
+**`finality = "sealed"` never lies - and it is the only path that delivers.** Sealed rows are
+past finality, so a delivery is final. `"tip"` parses and is meant to be the faster,
+may-retract alternative eventually, but nothing delivers on it yet: a webhook configured with
+`finality = "tip"` is refused at `nuthatch.toml` load (not silently ignored) - see
+[#577](https://github.com/nightswatchhq/nuthatch/issues/577). Use `"sealed"` (the default) until
+that lands.
 
 **Delivery is at-least-once, so make your handler idempotent.** A non-2xx leaves the entry in
 the outbox and it retries. If your handler succeeds and *then* fails to reply 200, you will see
@@ -64,6 +67,13 @@ that payload again. Key on something stable from the row rather than counting de
 the JSON and re-encoding it to check the HMAC produces different bytes and fails for reasons
 that look like a nuthatch bug and are not. See `verify()` in `receiver.py` — twelve lines, and
 the only part of that file worth copying.
+
+**`[[alerts]]` deliveries are never signed - there is no `secret` field for them.** Signing is a
+`[[webhooks]]`-only feature; `Alert` (the `[[alerts]]` config struct) has just `kinds` and `url`.
+An alert receiver gets no `X-Nuthatch-Signature` header no matter what, so don't point compliance
+tooling at an `[[alerts]]` sink and expect the same provenance guarantee a signed `[[webhooks]]`
+delivery gives you - if you need that, route the same annotation table through a `[[webhooks]]`
+entry with a `secret` instead.
 
 ## Signature scheme
 

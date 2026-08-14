@@ -212,13 +212,28 @@ case.
   what is quarantined - with per-nest `/<name>/ready` answering for that nest alone. Route traffic on
   the per-nest one and page on the root; wiring a load balancer to the root means one sick nest evicts
   every healthy sibling.*
-- [ ] 🟡 Structured logs at a sane default level; a clear "we are behind / we are at tip" signal.  **[#302]**
+- [ ] ✅ Structured logs at a sane default level; a clear "we are behind / we are at tip" signal.  **[#302]**
+  *`--log-format json` emits one JSON object per line (level, target, message, timestamp, fields);
+  `--log-format text` (default) keeps the human-readable format unchanged. `TipHeartbeat` restates
+  the `block` / `tip` / `blocks_behind` signal every 60 s from both `index_loop` and
+  `runtime_index_loop`, so an operator watching logs (rather than Prometheus) gets a machine-readable
+  at-tip / behind-tip line on a slow clock rather than having to pattern-match `✓`. Verified
+  compilation, 4 unit tests (lag arithmetic, throttle) and fmt+clippy on 1.95 (2026-08-14, #302).*
 - [ ] ✅ Documented restart/recovery runbook and a backup/restore story for the redb hot store +
   sealed segments. - *[operators.md](operators.md) carries the failure model, the symptom→action
   runbook, backup/restore, and a go-live checklist (2026-07-28).*
 - [ ] ✅ SSE **push** for live status - `/_admin/events`. *(This entry outlived its fix; it was shipped
   and sat here marked ⛔ regardless, which is how a checklist stops being trusted.)*
-- [ ] 🟡 Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.  **[#302]**
+- [ ] ✅ Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.  **[#302]**
+  *`examples/webhooks/README.md` (110 lines, landed `dfed0f8` / #328): both `[[webhooks]]` and
+  `[[alerts]]` through one outbox, runnable `receiver.py --secret hunter2`, `nuthatch.toml` block,
+  and five "surprises" (at-least-once, `since`, finality, depth gauge, alert signing). Two README
+  false claims corrected in #302: the table said `[[webhooks]]` is "triggered by rows sealing (or
+  hitting the tip)" - tip delivery does not exist yet, and `nuthatch.toml` load now refuses
+  `finality = "tip"` with a clear error (#577); and `[[alerts]]` were described as "signed when the
+  named webhook carries a secret" - `Alert` has no `secret` field, signing is `[[webhooks]]`-only.
+  Two config tests for the tip-finality refusal (`a_tip_finality_webhook_is_refused_rather_than_silently_ignored`,
+  `sealed_finality_webhooks_load_clean`). Verified on Linux 1.95 (2026-08-14, #302).*
 
 ## 8. Release engineering
 

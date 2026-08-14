@@ -20,15 +20,29 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nuthatch=info".into()),
-        )
-        .with_target(false)
-        .init();
+    let cli = cli::Cli::parse();
 
-    match cli::Cli::parse().command {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "nuthatch=info".into())
+    };
+    match cli.log_format {
+        // Text stays exactly as it was: no target (the crate is the only binary running), env-filter
+        // default `nuthatch=info`.
+        cli::LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_target(false)
+            .init(),
+        // One JSON object per line for a log aggregator. Every `tracing::info!(block = .., tip = ..,
+        // "…")` field (the at-tip heartbeat, RFC #302) lands as its own JSON key instead of being
+        // interpolated into a message string, so it's queryable without a text parser.
+        cli::LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter())
+            .init(),
+    }
+
+    match cli.command {
         cli::Command::Init(args) => project::init(args).await,
         cli::Command::Add(args) => project::add(args).await,
         // **One command for 1..N nests** (RFC-0032). The runtime hosts a single nest or many; which
