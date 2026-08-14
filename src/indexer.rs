@@ -2542,6 +2542,17 @@ fn backfill_backoff(base: std::time::Duration, attempt: usize) -> std::time::Dur
         .min(BACKFILL_RETRY_BACKOFF_CAP)
 }
 
+/// Whether a backfill retry has earned the louder `error!` signal rather than the routine `warn!`:
+/// only once the backoff has reached [`BACKFILL_RETRY_BACKOFF_CAP`] (the failure has outlasted a full
+/// ordinary endpoint cooldown) *and* only once every ten attempts at that point (so it reads as a
+/// periodic "still stuck" signal rather than a warn spammed every 30s forever). Split out as a pure
+/// predicate - not just inlined in [`log_backfill_retry`] - so the escalation condition itself can be
+/// asserted directly, without a `tracing` capture harness (unsafe to share across this crate's
+/// parallel test run - see the comment on `with_default` in `analytics.rs`).
+fn should_escalate_backfill_retry(backoff: std::time::Duration, attempt: usize) -> bool {
+    backoff >= BACKFILL_RETRY_BACKOFF_CAP && attempt.is_multiple_of(10)
+}
+
 /// Log a backfill retry with the same escalating severity as [`escalate_stall`]: `warn!` on every
 /// attempt (an operator watching the live progress line sees it moving again once this clears), and
 /// `error!` once every ten attempts *once the backoff has reached its cap* - by then the failure has
@@ -2553,7 +2564,7 @@ fn log_backfill_retry(
     err: &anyhow::Error,
     backoff: std::time::Duration,
 ) {
-    if backoff >= BACKFILL_RETRY_BACKOFF_CAP && attempt.is_multiple_of(10) {
+    if should_escalate_backfill_retry(backoff, attempt) {
         tracing::error!(
             "{label} still failing after {attempt} attempts: {err:#}; retrying in {backoff:?} - \
              sealed history is safe and this resumes automatically once an endpoint recovers"
@@ -4520,6 +4531,34 @@ mod tests {
             backfill_backoff(base, usize::MAX),
             BACKFILL_RETRY_BACKOFF_CAP
         );
+    }
+
+    /// #559: the escalation condition in `log_backfill_retry` was only ever exercised through
+    /// `tracing` macros no test asserted on, so `if false { error!(...) }` left the suite green.
+    /// Asserting the extracted predicate directly kills that mutation (and an `attempt % 10`
+    /// swapped for `% 1` or similar) without needing a `tracing` capture harness.
+    #[test]
+    fn should_escalate_backfill_retry_needs_both_the_cap_and_a_tenth_attempt() {
+        let cap = BACKFILL_RETRY_BACKOFF_CAP;
+        let below_cap = cap - std::time::Duration::from_millis(1);
+
+        // Below the cap, never escalate - even on an attempt that is otherwise a multiple of ten.
+        assert!(!should_escalate_backfill_retry(below_cap, 10));
+        assert!(!should_escalate_backfill_retry(
+            std::time::Duration::ZERO,
+            10
+        ));
+
+        // At (or past) the cap, only every tenth attempt escalates.
+        assert!(!should_escalate_backfill_retry(cap, 1));
+        assert!(!should_escalate_backfill_retry(cap, 9));
+        assert!(should_escalate_backfill_retry(cap, 10));
+        assert!(!should_escalate_backfill_retry(cap, 11));
+        assert!(should_escalate_backfill_retry(cap, 20));
+        assert!(should_escalate_backfill_retry(
+            cap + std::time::Duration::from_secs(1),
+            30
+        ));
     }
 
     /// With the ceiling gone (#538), the *pacing* is the only thing standing between a stalled endpoint
