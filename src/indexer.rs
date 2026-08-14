@@ -25,11 +25,9 @@ use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
 
 /// Defaults for a chain not in the registry (a custom `rpc_urls` nest): a small `eth_getLogs` window
-/// and a conservative Ethereum-style finality depth. Mirrors `chains::UNREGISTERED_WINDOW` /
-/// `UNREGISTERED_FINALITY`, which `init`/`add` hand a custom chain at scaffold time - the same
-/// policy either way a nest ends up on a chain this registry doesn't know.
-const DEFAULT_WINDOW: u64 = chains::UNREGISTERED_WINDOW;
-const DEFAULT_FINALITY: Finality = chains::UNREGISTERED_FINALITY;
+/// and a conservative Ethereum-style finality depth.
+const DEFAULT_WINDOW: u64 = 20;
+const DEFAULT_FINALITY: Finality = Finality::Depth(64);
 const LAST_BLOCK_KEY: &str = "last_block";
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
@@ -4546,7 +4544,10 @@ mod tests {
 
         // Below the cap, never escalate - even on an attempt that is otherwise a multiple of ten.
         assert!(!should_escalate_backfill_retry(below_cap, 10));
-        assert!(!should_escalate_backfill_retry(std::time::Duration::ZERO, 10));
+        assert!(!should_escalate_backfill_retry(
+            std::time::Duration::ZERO,
+            10
+        ));
 
         // At (or past) the cap, only every tenth attempt escalates.
         assert!(!should_escalate_backfill_retry(cap, 1));
