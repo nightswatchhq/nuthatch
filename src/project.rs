@@ -1935,9 +1935,7 @@ abi = "abis/tok.json"
             Json(json!({"jsonrpc": "2.0", "id": 1, "result": format!("0x{chain_id:x}")}))
         }
 
-        let app = Router::new()
-            .route("/", post(handler))
-            .with_state(chain_id);
+        let app = Router::new().route("/", post(handler)).with_state(chain_id);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {

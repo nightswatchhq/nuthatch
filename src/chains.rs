@@ -157,6 +157,11 @@ pub const UNREGISTERED_WINDOW: u64 = 20;
 /// A resolved chain, ready for `init`/`add` to act on. `Chain` stays a purely `&'static` built-in
 /// registry entry; this is the owned shape a custom (non-built-in) chain needs, since its name and
 /// endpoints come from the command line rather than a `const`.
+///
+/// `Debug` is load-bearing rather than decorative: a test under the `scaled` feature unwraps a
+/// `Result` carrying this, which needs it, and the default build never compiles that test - so the
+/// omission was invisible until the scaled-mode CI job ran.
+#[derive(Debug)]
 pub struct ResolvedChain {
     pub name: String,
     pub chain_id: u64,
@@ -344,9 +349,7 @@ mod tests {
             Json(json!({"jsonrpc": "2.0", "id": 1, "result": format!("0x{chain_id:x}")}))
         }
 
-        let app = Router::new()
-            .route("/", post(handler))
-            .with_state(chain_id);
+        let app = Router::new().route("/", post(handler)).with_state(chain_id);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -380,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_of_an_unknown_name_with_rpc_reads_the_chain_id_live() {
         let (url, _rpc) = fake_chain_id_rpc(56).await;
-        let resolved = resolve("bsc", &[url.clone()]).await.unwrap();
+        let resolved = resolve("bsc", std::slice::from_ref(&url)).await.unwrap();
         assert_eq!(resolved.name, "bsc");
         assert_eq!(resolved.chain_id, 56);
         assert_eq!(resolved.rpc_urls, vec![url]);

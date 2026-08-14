@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::alerts::{self, AlertRouter};
-use crate::chains::{self, Finality, UNREGISTERED_FINALITY as DEFAULT_FINALITY, UNREGISTERED_WINDOW as DEFAULT_WINDOW};
+use crate::chains::{
+    self, Finality, UNREGISTERED_FINALITY as DEFAULT_FINALITY,
+    UNREGISTERED_WINDOW as DEFAULT_WINDOW,
+};
 use crate::chunker::{self, AdaptiveWindow};
 use crate::cli::DevArgs;
 use crate::config::{Config, DB_FILE};
