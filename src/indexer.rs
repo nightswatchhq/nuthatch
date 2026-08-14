@@ -2527,7 +2527,7 @@ fn log_backfill_retry(
     err: &anyhow::Error,
     backoff: std::time::Duration,
 ) {
-    if backoff >= BACKFILL_RETRY_BACKOFF_CAP && attempt % 10 == 0 {
+    if backoff >= BACKFILL_RETRY_BACKOFF_CAP && attempt.is_multiple_of(10) {
         tracing::error!(
             "{label} still failing after {attempt} attempts: {err:#}; retrying in {backoff:?} - \
              sealed history is safe and this resumes automatically once an endpoint recovers"
