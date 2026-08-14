@@ -633,10 +633,32 @@ fn poll_stalled(last_poll: u64, started_at: u64, now: u64, threshold: u64) -> bo
     since != 0 && now.saturating_sub(since) > threshold
 }
 
+/// No advance in `last_block` within this many seconds means the cursor is wedged (#578). Same value as
+/// `READINESS_STALL_SECS` - a cursor that is actually getting somewhere, backfilling or at tip, advances
+/// far more often than this on any chain with sub-minute blocks.
+const READINESS_PROGRESS_STALL_SECS: u64 = 90;
+
+/// Wedged = `last_block` moved at least once (`last_progress != 0`) but not within `threshold` seconds,
+/// even while [`poll_stalled`] says the source is still reachable. This is the case `poll_stalled` can't
+/// see: a source poll (tip fetch) can succeed on schedule while `process_window` (`indexer.rs:3437`)
+/// holds the cursor's position rather than seal a window it can't safely process - correct behaviour on
+/// its own, but not "ready" while it lasts. Same bounded-grace shape as `poll_stalled` (#510): a cursor
+/// that has never yet made progress is judged from `started_at`, so one wedged since block one
+/// eventually reports unready too, not "just starting up" forever.
+fn progress_stalled(last_progress: u64, started_at: u64, now: u64, threshold: u64) -> bool {
+    let since = if last_progress != 0 {
+        last_progress
+    } else {
+        started_at
+    };
+    since != 0 && now.saturating_sub(since) > threshold
+}
+
 /// Readiness for a supervisor (k8s-style). `/health` is liveness - the process is up and serving, and
-/// stays a plain `200 "ok"`. `/ready` answers "is it *healthy*" - still reaching the chain: **200** with
-/// a status body when fresh, **503** when stalled (no successful poll within [`READINESS_STALL_SECS`],
-/// i.e. every RPC endpoint is down). A just-started node that has never polled is *not* stalled (grace).
+/// stays a plain `200 "ok"`. `/ready` answers "is it *healthy*" - still reaching the chain **and making
+/// progress**: **200** with a status body when fresh, **503** when the source has stopped answering
+/// ([`poll_stalled`]) or the cursor has stopped advancing while the source answers fine
+/// ([`progress_stalled`], #578). A just-started node that has done neither yet is *not* stalled (grace).
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     use crate::metrics::{now_unix, METRICS};
     // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
@@ -670,13 +692,14 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         .runtime_health
         .as_ref()
         .map(|(name, _)| METRICS.nest(name));
-    let (last_poll, tip, last, sealed, started_at) = match &nest {
+    let (last_poll, tip, last, sealed, started_at, last_progress) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
             m.tip(),
             m.last_block(),
             m.sealed_through(),
             m.started_at(),
+            m.last_progress(),
         ),
         None => (
             METRICS.last_poll_ok(),
@@ -684,14 +707,22 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             METRICS.last_block(),
             METRICS.sealed_through_val(),
             METRICS.started_at(),
+            METRICS.last_progress(),
         ),
     };
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
-    let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS);
+    let wedged = progress_stalled(
+        last_progress,
+        started_at,
+        now,
+        READINESS_PROGRESS_STALL_SECS,
+    );
+    let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS) || wedged;
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
+        "wedged": wedged,
         "tip": tip,
         "last_block": last,
         "lag_blocks": tip.saturating_sub(last),
@@ -1528,6 +1559,30 @@ mod tests {
         assert!(!poll_stalled(0, now - 10, now, 90));
     }
 
+    /// #578: the same shape as `readiness_stall_logic`, but for the dimension `poll_stalled` cannot see -
+    /// whether the cursor is actually advancing, not just whether the source answered.
+    #[test]
+    fn progress_stall_logic() {
+        let now = 1_000_000u64;
+        // Never advanced, just started → starting up, not wedged (grace).
+        assert!(!progress_stalled(0, now - 10, now, 90));
+        // Advanced recently → healthy.
+        assert!(!progress_stalled(now - 10, now - 1_000, now, 90));
+        // Advanced long ago and nothing since → wedged.
+        assert!(progress_stalled(now - 100, now - 1_000, now, 90));
+        // Exactly at the threshold is not yet wedged (strictly greater).
+        assert!(!progress_stalled(now - 90, now - 1_000, now, 90));
+    }
+
+    /// #510's analogue for progress: a cursor wedged since before it ever advanced once must eventually
+    /// report unready too, not stay "just starting up" forever.
+    #[test]
+    fn a_cursor_wedged_since_cold_start_eventually_stalls() {
+        let now = 2_000_000u64;
+        assert!(progress_stalled(0, now - 91, now, 90));
+        assert!(!progress_stalled(0, now - 10, now, 90));
+    }
+
     #[test]
     fn ct_eq_matches_only_identical_strings() {
         assert!(ct_eq("s3cret", "s3cret"));
@@ -1749,6 +1804,74 @@ mod tests {
         );
         assert_eq!(json["stalled"], json!(true));
         assert_eq!(json["ready"], json!(false));
+    }
+
+    /// #578, reproduced from the GH issue verbatim: a cursor whose source keeps answering (so
+    /// `poll_stalled` alone sees nothing wrong) but whose `last_block` never leaves zero, holding
+    /// position on an unfetchable block timestamp rather than seal it (correct - `indexer.rs:3437`).
+    /// `poll_stalled` alone reported this `ready:true` with `lag_blocks` in the millions in the same
+    /// body; this is the mutation `progress_stalled` exists to catch: assert the status **code**, not
+    /// just `lag_blocks` in the body, from a fixture whose cursor is pinned while polls succeed.
+    #[tokio::test]
+    async fn a_cursor_pinned_at_zero_while_polling_succeeds_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "wedged-at-zero";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        // The source is healthy and answering right now - the exact trap: `poll_stalled` alone sees
+        // "fine". `last_block` has never moved, and the nest was built well past the progress grace.
+        handle.set_tip(25_754_377);
+        handle.mark_poll_ok();
+        handle.set_started_at_for_test(now.saturating_sub(200));
+        assert_eq!(handle.last_block(), 0, "premise: never indexed anything");
+        assert_eq!(handle.last_progress(), 0, "premise: never advanced");
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a cursor stuck at zero while polling succeeds must fail readiness: {json}"
+        );
+        assert_eq!(json["ready"], json!(false));
+        assert_eq!(json["stalled"], json!(true));
+        assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// The same trap, but the cursor had made real progress once before wedging - proving the check
+    /// catches a stall mid-backfill, not just one that never got off the ground.
+    #[tokio::test]
+    async fn a_cursor_that_advanced_once_then_froze_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "wedged-mid-backfill";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_last_block(12_000_000);
+        handle.set_tip(25_754_377);
+        handle.mark_poll_ok();
+        // Progress happened, but a long time ago - the source has kept polling fine since.
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a cursor frozen mid-backfill must fail readiness: {json}"
+        );
+        assert_eq!(json["wedged"], json!(true));
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
