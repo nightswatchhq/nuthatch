@@ -101,6 +101,35 @@ level0() {
   check 0.1 "the binary runs and reports a version" \
     bash -c "$NUTHATCH --version | grep -qE '^nuthatch [0-9]+\.[0-9]+\.[0-9]+'"
 
+  # 0.2 is in the document and was never emitted here, which is worse than skipping it: a check that
+  # is never printed cannot fail, is not counted, and `--strict` cannot see the hole - the one failure
+  # mode this harness exists to make impossible. It needs the published tarball, which is only lying
+  # around if that is how you got the binary, so the honest outcome without one is a SKIP that names
+  # what was missing. Both the checksum file *and* the tarball it covers have to be there: a `.sha256`
+  # whose tarball was tidied away after unpacking would otherwise read as transport corruption.
+  local bin_path bin_dir sums tarball
+  bin_path=$(command -v "$NUTHATCH" 2>/dev/null || printf '%s' "$NUTHATCH")
+  bin_dir=$(cd "$(dirname "$bin_path")" 2>/dev/null && pwd)
+  shopt -s nullglob; sums=("$bin_dir"/*.tar.gz.sha256); shopt -u nullglob
+  # `${sums[0]}` unsubscripted is an unbound variable under `set -u` when the glob matched nothing,
+  # which is the *common* case - a locally built binary - and it aborted level 0 outright.
+  tarball="${sums[0]:-}"; tarball="${tarball%.sha256}"
+  if [ ${#sums[@]} -eq 0 ]; then
+    skip 0.2 "the published tarball matches its checksum" \
+      "no *.tar.gz.sha256 beside $bin_path - this binary did not come from an unpacked release"
+  elif [ ! -f "$tarball" ]; then
+    skip 0.2 "the published tarball matches its checksum" \
+      "$(basename "${sums[0]}") is here but $(basename "$tarball") is not"
+  elif have sha256sum; then
+    check 0.2 "the published tarball matches its checksum" \
+      bash -c "cd '$bin_dir' && sha256sum -c '$(basename "${sums[0]}")'"
+  elif have shasum; then
+    check 0.2 "the published tarball matches its checksum" \
+      bash -c "cd '$bin_dir' && shasum -a 256 -c '$(basename "${sums[0]}")'"
+  else
+    skip 0.2 "the published tarball matches its checksum" "neither sha256sum nor shasum is on PATH"
+  fi
+
   # The glibc floor. A failure here is a distro older than 2.34, not a nuthatch bug.
   check 0.3 "it starts on this libc (no GLIBC_… not found)" \
     bash -c "$NUTHATCH --version 2>&1 | grep -qv 'GLIBC_'"
