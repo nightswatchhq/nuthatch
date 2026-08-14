@@ -21,11 +21,12 @@ pub enum Command {
     Add(AddArgs),
     /// Run the indexer: poll logs, store entities, and serve the API.
     Dev(DevArgs),
-    /// Serve a nest **read-only** from a shared hot store, without indexing it (RFC-0022 slice 3).
+    /// Serve a nest without indexing it (RFC-0022 slice 3).
     ///
     /// The query-FE half of scaled mode: it answers entity reads and SQL from state a *writer*
-    /// elsewhere is filling, owns no cursor, and never advances one. Scale it independently of
-    /// ingestion - that is the entire point of splitting the planes.
+    /// elsewhere is filling, owns no cursor, and never advances one. Read-only and genuinely shared
+    /// needs `--hot-store`; without it this still serves the nest's local redb, but exclusively -
+    /// see `--hot-store`'s own help.
     Serve(ServeArgs),
     /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
     /// take cursor leases, index what this worker is assigned.
@@ -794,9 +795,11 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
-    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Omit to serve the
-    /// nest's local redb, which read-scales a single box but shares a file rather than a service.
-    /// Requires a build with `--features postgres-store`.
+    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with
+    /// `--features postgres-store`. Omit to serve the nest's local redb instead - but that store
+    /// must already exist (`serve` never creates or writes to it), and redb's exclusive flock means
+    /// exactly one process may hold it: local redb does not read-scale a box or share with `dev`,
+    /// only `--hot-store` does.
     #[arg(long)]
     pub hot_store: Option<String>,
 
