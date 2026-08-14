@@ -1088,6 +1088,103 @@ impl Dataset {
     }
 }
 
+/// Group a runtime's *live* nests into datasets (RFC-0032 §4), for [`RuntimeHandles::mount`] /
+/// [`RuntimeHandles::unmount`] to feed [`build_roster_entries`].
+///
+/// Deliberately grouped from `states` - the nests actually being served right now - rather than
+/// [`MountTable::datasets`]'s source, the declared mount records. Those two agree at startup (every
+/// declared mount is live), but not after a live mount or unmount: an unmounted co-tenant of a shared
+/// dataset must drop out of `shared_with` immediately, and a nest mounted live from a bare directory
+/// with no mount record yet must still appear, grouped by directory like any other.
+fn live_datasets(
+    dir: &Path,
+    states: &[(String, crate::serve::AppState)],
+    mounts: &[Mount],
+) -> Vec<Dataset> {
+    let mut out: Vec<Dataset> = Vec::new();
+    for (name, _) in states {
+        let (tenant_seg, alias) = match name.split_once('/') {
+            Some((t, a)) => (Some(t), a),
+            None => (None, name.as_str()),
+        };
+        let record = mounts
+            .iter()
+            .find(|m| m.alias == alias && tenant_seg.is_none_or(|t| m.tenant == t));
+        let tenant = record
+            .map(|m| m.tenant.clone())
+            .unwrap_or_else(|| tenant_seg.unwrap_or(DEFAULT_TENANT).to_string());
+        let nid = record.map(|m| m.nid.clone());
+        let path = match &nid {
+            Some(nid) => MountTable::data_dir(dir, nid),
+            None => MountTable::nest_dir(dir, alias),
+        };
+        let mount_ref = MountRef {
+            tenant,
+            alias: alias.to_string(),
+        };
+        match out.iter_mut().find(|d| d.dir == path) {
+            Some(d) => d.mounts.push(mount_ref),
+            None => out.push(Dataset {
+                dir: path,
+                mounts: vec![mount_ref],
+                nid,
+            }),
+        }
+    }
+    out
+}
+
+/// Build the `GET /nests` roster entries for a nest set (RFC-0026 §5, RFC-0032 §4).
+///
+/// The one place this shape is assembled, called both at startup and by [`RuntimeHandles::mount`] /
+/// [`RuntimeHandles::unmount`]. Before #554 the live handlers rebuilt `self.states` but never touched
+/// `self.roster`, so a nest mounted into a running runtime served real traffic while `GET /nests` kept
+/// reporting the set as of boot - the roster is the one surface an operator reads to confirm a mount,
+/// and it lied by omission. Recomputing from the current state on every change, rather than patching the
+/// roster incrementally, is what makes that drift structurally impossible.
+fn build_roster_entries(
+    states: &[(String, crate::serve::AppState)],
+    datasets: &[Dataset],
+    multi_tenant: bool,
+    estimates: &std::collections::HashMap<String, u64>,
+) -> Vec<serde_json::Value> {
+    states
+        .iter()
+        .map(|(name, state)| {
+            // Which dataset backs this mount, and who else is on it (RFC-0032 §4). Without this an
+            // operator seeing two entries has no way to tell one shared dataset from two backfills.
+            // `None` when this mount has no dataset record - a nest mounted live from a bare directory
+            // with nothing yet in `mounts.toml` - and the fields below degrade gracefully to that.
+            let ds = datasets
+                .iter()
+                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
+            let this =
+                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
+            let tenant = this.map(|m| m.tenant.clone());
+            let shared_with: Vec<String> = ds
+                .map(|d| {
+                    d.mounts
+                        .iter()
+                        .map(|m| m.route_key(multi_tenant))
+                        .filter(|k| k != name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": name,
+                "chain": state.chain,
+                "tenant": tenant,
+                "nid": ds.and_then(|d| d.nid.clone()),
+                "shared_with": shared_with,
+                "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
+                "table_count": state.tables.len(),
+                "base_path": format!("/{name}"),
+                "estimated_rss_mb": estimates.get(name).copied().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 /// A mounted dataset whose inputs no longer hash to the identity its mount record claims.
 ///
 /// See [`MountTable::identity_drift`]. `actual` is `None` when the inputs could not be hashed at all,
@@ -1434,39 +1531,7 @@ pub async fn dev(
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
-    let roster_entries: Vec<_> = all_states
-        .iter()
-        .map(|(name, state)| {
-            // Which dataset backs this mount, and who else is on it (RFC-0032 §4). Without this an
-            // operator seeing two entries has no way to tell one shared dataset from two backfills.
-            let ds = datasets
-                .iter()
-                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
-            let this =
-                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
-            let tenant = this.map(|m| m.tenant.clone());
-            let shared_with: Vec<String> = ds
-                .map(|d| {
-                    d.mounts
-                        .iter()
-                        .map(|m| m.route_key(multi_tenant))
-                        .filter(|k| k != name)
-                        .collect()
-                })
-                .unwrap_or_default();
-            serde_json::json!({
-                "name": name,
-                "chain": state.chain,
-                "tenant": tenant,
-                "nid": ds.and_then(|d| d.nid.clone()),
-                "shared_with": shared_with,
-                "registry_hash": state.nest_info.get("registry_hash").cloned().unwrap_or_default(),
-                "table_count": state.tables.len(),
-                "base_path": format!("/{name}"),
-                "estimated_rss_mb": estimates.get(name).copied().unwrap_or(0),
-            })
-        })
-        .collect();
+    let roster_entries = build_roster_entries(&all_states, &datasets, multi_tenant, &estimates);
     let roster = serde_json::json!({
         // The runtime's own name. Called `roost` pre-2.0; the blanket rename briefly made this
         // `mounts`, which read as "the mount list" while holding a single name string.
@@ -1494,6 +1559,7 @@ pub async fn dev(
         health: health.clone(),
         roster,
         estimates: estimates.clone(),
+        multi_tenant,
         mount_ctx: MountContext {
             dir: dir.clone(),
             mounts: mounts.mounts.clone(),
@@ -1798,11 +1864,16 @@ pub struct RuntimeHandles {
         tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>,
     >,
     pub health: Arc<crate::health::RuntimeHealth>,
-    /// The static half of the roster, re-merged with live health per request.
+    /// The static half of the roster, re-merged with live health per request. [`RuntimeHandles::mount`]
+    /// and [`RuntimeHandles::unmount`] rebuild `roster["nests"]` from `states` on every change (#554) -
+    /// this is not just the startup snapshot.
     pub roster: serde_json::Value,
     /// Per-nest projected RSS, so a mount can price the cursor it is joining without re-reading
     /// every co-tenant's config.
     pub estimates: std::collections::HashMap<String, u64>,
+    /// Whether the runtime serves more than one tenant, for [`build_roster_entries`]'s route keys.
+    /// Frozen at startup like `mount_ctx.mounts` - tenancy shape is not something a mount changes.
+    pub multi_tenant: bool,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
@@ -2030,11 +2101,6 @@ impl RuntimeHandles {
         }
         self.estimates.insert(name.to_string(), incoming);
         self.states.push((name.to_string(), state));
-        self.live.swap(crate::serve::compose_runtime(
-            self.roster.clone(),
-            self.states.clone(),
-            self.health.clone(),
-        ));
         // A 2.0 mount gets (or refreshes) its record here, so the persist just below can write it into
         // `mounts.toml` even though it had none on disk - the durable half of the fix, matching what
         // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
@@ -2057,6 +2123,21 @@ impl RuntimeHandles {
                 }),
             }
         }
+        // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
+        // this step missing, which left the roster reporting its startup snapshot while the mount
+        // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
+        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        self.roster["nests"] = serde_json::json!(build_roster_entries(
+            &self.states,
+            &datasets,
+            self.multi_tenant,
+            &self.estimates,
+        ));
+        self.live.swap(crate::serve::compose_runtime(
+            self.roster.clone(),
+            self.states.clone(),
+            self.health.clone(),
+        ));
         self.persist();
         tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
         Ok(())
@@ -2147,6 +2228,15 @@ impl RuntimeHandles {
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
+        // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
+        // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
+        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        self.roster["nests"] = serde_json::json!(build_roster_entries(
+            &self.states,
+            &datasets,
+            self.multi_tenant,
+            &self.estimates,
+        ));
         self.live.swap(crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
