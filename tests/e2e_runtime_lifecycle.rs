@@ -454,6 +454,17 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         "the pre-existing nest must stay listed too"
     );
 
+    // #557: `GET /nests` naming `gamma` is not the whole surface - `/sql` stamps its own provenance
+    // per RFC-0035 §3, from `AppState::nid`, not the roster. Before this fix `mount()` rebuilt
+    // `states` and the roster but never set the state's own `nid`, so this answered `null` until a
+    // restart even though the roster already named the dataset correctly.
+    let sql = body_json(&handles.live, "/gamma/sql?q=SELECT%201").await;
+    assert_eq!(
+        sql["provenance"]["nid"].as_str(),
+        Some(gamma_nid.as_str()),
+        "a live-mounted nest's /sql provenance must name its nid, not null: {sql}"
+    );
+
     // The record must be durable - `mounts.toml` is the record RFC-0027 §5 promises survives a
     // restart, and the whole point of fixing the mount half is that it now behaves like the unmount
     // half already did.
