@@ -1606,4 +1606,82 @@ mod tests {
         // Saturated, not truncated/masked - the guard's documented behaviour.
         assert_eq!(row.params[0].1, Value::U64(u64::MAX));
     }
+
+    /// Prove the fuzz/fuzz_targets/decode_log.rs fixture ABI parses and that `decode` is actually
+    /// reached (nuthatch#231/#290). The ABI was previously invalid: `indexed` appeared on tuple
+    /// *components*, which alloy-json-abi rejects. The harness panicked at `unwrap()` in
+    /// `build_registry()` before libFuzzer ran a single iteration, so the decode path was never
+    /// exercised. This test uses the same six events and a well-formed Transfer log to confirm:
+    /// (1) `DecodeRegistry::build` succeeds, (2) `decode` returns `Ok(Some(..))` rather than
+    /// panicking.
+    #[test]
+    fn decode_log_fuzz_fixture_abi_parses_and_decode_is_reached() {
+        fn nested_tuple_param(depth: u16) -> serde_json::Value {
+            let mut param = serde_json::json!({"name": "leaf", "type": "uint256"});
+            for i in 0..depth {
+                param = serde_json::json!({
+                    "name": format!("t{i}"),
+                    "type": "tuple",
+                    "components": [param],
+                });
+            }
+            param
+        }
+        let mut top = nested_tuple_param(2);
+        top["indexed"] = serde_json::Value::Bool(false);
+        let events = serde_json::json!([
+            {"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false},
+            ]},
+            {"type":"event","name":"Hashed","anonymous":false,"inputs":[
+                {"name":"label","type":"string","indexed":true},
+                {"name":"amount","type":"uint256","indexed":false},
+            ]},
+            {"type":"event","name":"Collection","anonymous":false,"inputs":[
+                {"name":"amounts","type":"uint256[]","indexed":false},
+                {"name":"pair","type":"tuple","indexed":false,"components":[
+                    {"name":"a","type":"address"},
+                    {"name":"b","type":"uint256"},
+                ]},
+            ]},
+            {"type":"event","name":"HugeArray","anonymous":false,"inputs":[
+                {"name":"data","type":"uint256[4000000000]","indexed":false},
+            ]},
+            {"type":"event","name":"Deep","anonymous":false,"inputs":[top]},
+        ]);
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_value(events)
+            .expect("fuzz fixture ABI must parse without indexed on components");
+        let addr = "0x1111111111111111111111111111111111111111";
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "fuzz".into(),
+            address: parse_address(addr).unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .expect("build must succeed");
+        // Find the Transfer table and construct a valid log to confirm decode is reachable.
+        let transfer_dec = reg
+            .tables()
+            .into_iter()
+            .find(|d| d.table == "fuzz__transfer")
+            .expect("Transfer fixture must be registered");
+        let topic0 = format!("0x{}", hex::encode(transfer_dec.topic0));
+        let from = format!("0x{}", "aa".repeat(32));
+        let to = format!("0x{}", "bb".repeat(32));
+        let value = format!("0x{}", "00".repeat(31) + "2a");
+        let l = log(addr, &[&topic0, &from, &to], &value, 1, 0);
+        let row = reg
+            .decode(&l)
+            .expect("well-formed Transfer log must not error")
+            .expect("topic0 and address match - must return Some");
+        // uint256 decodes as Word32 (a 32-byte big-endian word), not U64.
+        let mut expected = [0u8; 32];
+        expected[31] = 42;
+        assert_eq!(
+            row.params.iter().find(|(n, _)| n == "value").unwrap().1,
+            Value::Word32(expected)
+        );
+    }
 }

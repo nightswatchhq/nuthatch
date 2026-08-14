@@ -10,3 +10,6 @@ corpus/*
 !corpus/abi_json/
 corpus/abi_json/*
 !corpus/abi_json/*.json
+!corpus/decode_log/
+corpus/decode_log/*
+!corpus/decode_log/seed_*

@@ -22,17 +22,26 @@ use nuthatch::registry::{ContractSpec, DecodeRegistry};
 use nuthatch::rpc::Log;
 use std::sync::OnceLock;
 
-fn nested_tuple_inputs(depth: u16) -> serde_json::Value {
-    let mut components = serde_json::json!([{"name": "leaf", "type": "uint256", "indexed": false}]);
+/// Builds a `tuple` parameter nested `depth` levels deep. `alloy-json-abi` only accepts the
+/// `indexed` key on a top-level event parameter (`EventParam`); every `components` entry
+/// deserializes as a plain `Param`, which rejects the key outright - nuthatch#290. So only the
+/// outermost object (returned to become an event's top-level input) carries `indexed`.
+fn nested_tuple_param(depth: u16) -> serde_json::Value {
+    let mut param = serde_json::json!({"name": "leaf", "type": "uint256"});
     for i in 0..depth {
-        components = serde_json::json!([{
+        param = serde_json::json!({
             "name": format!("t{i}"),
             "type": "tuple",
-            "components": components,
-            "indexed": false,
-        }]);
+            "components": [param],
+        });
     }
-    components
+    param
+}
+
+fn nested_tuple_inputs(depth: u16) -> serde_json::Value {
+    let mut top = nested_tuple_param(depth);
+    top["indexed"] = serde_json::Value::Bool(false);
+    serde_json::json!([top])
 }
 
 fn build_registry() -> DecodeRegistry {
@@ -67,8 +76,8 @@ fn build_registry() -> DecodeRegistry {
                     "type": "tuple",
                     "indexed": false,
                     "components": [
-                        {"name": "a", "type": "address", "indexed": false},
-                        {"name": "b", "type": "uint256", "indexed": false},
+                        {"name": "a", "type": "address"},
+                        {"name": "b", "type": "uint256"},
                     ],
                 },
             ],
