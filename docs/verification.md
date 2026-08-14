@@ -58,7 +58,7 @@ now names one.
 | Level | Verified by us | On what |
 |---|---|---|
 | 0 Artifact | yes, **by hand, on 2.4.0** | From the *published* `nuthatch-x86_64-unknown-linux-gnu.tar.gz` of **v2.4.0**, on **2026-08-14**: checksum `OK` against the release's own `.sha256`, `nuthatch --version` reports `2.4.0`, the worker role refuses by name, and the binary's highest required symbol is exactly `GLIBC_2.34`, read off `objdump -T` rather than inferred from the fact that it started. All four steps, `verify.sh 0` green. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it. The aarch64 tarball is *not* covered: nobody has run this on an arm64 machine |
-| 1 Single nest | CI every commit; **production through 2.0.0** | CI, plus the Lodestar production box upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows). **2.1.0, 2.2.0, 2.3.0 and 2.4.0 have not been verified on the production box** (#441) - the two-machine rule is ours, we wrote it down, and we have not kept it for four releases |
+| 1 Single nest | CI every commit; **production through 2.0.0** | CI, plus the Lodestar production box upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows). **2.1.0, 2.2.0, 2.3.0 and 2.4.0 have not been verified on the production box** (#441) - the two-machine rule is ours, we wrote it down, and we have not kept it for four releases. A **2.4.0** walk from the published tarball on a dev box (2026-08-14) passed 1.3a, 1.3b, 1.3c and 1.4 - API live 17 s after `dev`, tables served, `/sql` answering with `as_of` / `registry_hash` / `sealed_through`. Read that narrowly: it is one machine, so it does nothing for #441, and **1.3's non-zero count was not obtained** - the public endpoint 429'd and the nest indexed nothing (#578), so what is proven is that the surface answers, not that the data is right |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
 | 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
@@ -120,13 +120,26 @@ depending on build flags is harder to diagnose than one that explains itself.
 
 The under-two-minutes claim. Use any contract on any supported chain; a busy ERC-20 is easiest.
 
+**Bring an RPC endpoint.** `--rpc <url>` *adds* to the pool rather than replacing it, so pass one and
+the built-in public endpoint stops being the bottleneck. On 2.4.0 with the mainnet default alone, this
+exact walk 429s on `eth_getBlockByNumber` and indexes **nothing** - the cursor holds position by design
+rather than sealing zeroed timestamps, so you get a live, queryable, empty API. The two-minute claim is
+about *API live and answering with provenance*, which it comfortably makes (17 s, measured on the
+published 2.4.0 tarball); it is not a claim that a public endpoint will feed you 2000 blocks of USDC in
+that time. See #578 for the related defect: `/ready` says `ready:true` throughout.
+
 **1.1 Scaffold**
 
 ```sh
-nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet --dir /tmp/v-usdc
+nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet --alias usdc --dir /tmp/v-usdc
 ```
 
-Expect a scaffolded nest, and a printed table count > 0. *Proves* ABI resolution and code generation.
+Expect a scaffolded nest, and a printed table count > 0 (17, for this contract). *Proves* ABI
+resolution and code generation.
+
+**`--alias usdc` is doing real work here, not decoration.** Without it the tables are named `c0__*`
+after the positional default, and step 1.3 below - which asks for `usdc__transfer` - fails with a
+catalog error. It did, for anyone who ran this page verbatim before 2026-08-14.
 
 **If it warns that no logs match the resolved ABI**, that is the check working: you have hit a proxy
 whose implementation ABI the public resolvers did not return. Re-run with
