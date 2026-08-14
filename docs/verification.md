@@ -20,7 +20,9 @@ Most of this document is executable:
 Each check maps to a numbered step below, asserts a concrete result, and prints what failed with its
 output. **A skip is not a pass** - steps whose prerequisites are absent are counted separately, because
 a green run that silently skipped the interesting half is worse than a red one. `--strict` turns any
-skip into a failure, which is what CI uses.
+skip into a failure. **CI does not pass it** - `the compose fleet comes up` runs `verify.sh 5` plain,
+against `target/release/nuthatch` - so `--strict` is a thing you do by hand, and this line used to
+claim otherwise.
 
 The steps that genuinely need a human are marked as skips with the procedure attached rather than
 faked: a restart drill, a deliberate reorg, breaking a nest to watch its co-tenants survive, and
@@ -48,11 +50,14 @@ Stated plainly so you know which steps are re-confirmation and which are genuine
 
 **Each row says *which release* it was verified on, not just yes or no.** A bare "yes" ages silently:
 it reads as current however long ago it was earned, and this is the one page in the repo whose entire
-purpose is being checkable. Two rows had drifted that way by 2.4.0 and are now dated (#571).
+purpose is being checkable. Two rows had drifted that way by 2.4.0 and are now dated (#571). Level 0
+was a third and read differently: "by hand, **per release**" is a claim about a *practice*, which ages
+worse than a bare "yes" because it sounds like a standing guarantee while naming no release at all. It
+now names one.
 
 | Level | Verified by us | On what |
 |---|---|---|
-| 0 Artifact | yes, **by hand, per release** | From the *published* tarball: SHA-256 checked against the release's own checksum, then run. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it |
+| 0 Artifact | yes, **by hand, on 2.4.0** | From the *published* `nuthatch-x86_64-unknown-linux-gnu.tar.gz` of **v2.4.0**, on **2026-08-14**: checksum `OK` against the release's own `.sha256`, `nuthatch --version` reports `2.4.0`, the worker role refuses by name, and the binary's highest required symbol is exactly `GLIBC_2.34`, read off `objdump -T` rather than inferred from the fact that it started. All four steps, `verify.sh 0` green. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it. The aarch64 tarball is *not* covered: nobody has run this on an arm64 machine |
 | 1 Single nest | CI every commit; **production through 2.0.0** | CI, plus the Lodestar production box upgraded 1.0.2 → 2.0.0 in place with every table's row count identical either side (422 and 3,491 rows). **2.1.0, 2.2.0, 2.3.0 and 2.4.0 have not been verified on the production box** (#441) - the two-machine rule is ours, we wrote it down, and we have not kept it for four releases |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
 | 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
@@ -77,10 +82,17 @@ means a stale binary earlier in `PATH` — check `command -v nuthatch`.
 **0.2 Checksum**
 
 ```sh
-shasum -a 256 -c nuthatch-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c nuthatch-x86_64-unknown-linux-gnu.tar.gz.sha256   # Linux
+shasum -a 256 -c nuthatch-x86_64-unknown-linux-gnu.tar.gz.sha256   # macOS
 ```
 
-Expect `OK`. *Proves* transport integrity.
+Expect `nuthatch-…tar.gz: OK`. *Proves* transport integrity. Run it in the directory you unpacked
+into, next to the tarball the checksum file names — `-c` reads that name out of the file rather than
+taking it from you.
+
+`verify.sh` covers this step too, and only when it can: it wants the tarball and its `.sha256` sitting
+beside the binary, which is only true if that is how you got it. A binary you built yourself gets a
+**skip** naming what was absent, not a quiet pass.
 
 **0.3 It runs on your libc**
 
