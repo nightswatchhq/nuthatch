@@ -15,7 +15,10 @@ What is deferred and why lives in the [issue queue](https://github.com/nightswat
 (the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
 explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
-Written against **2.0.0** (2026-08-06). Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **2.0.0** (2026-08-06). The container tags below were refreshed for **2.5.0**
+(2026-08-15) after they were found still pinning `:2.0.0`, five releases on - the rest of this
+document has *not* been re-read against a newer release, and saying so is more use to you than a
+bumped number would be. Read [Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -81,7 +84,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:2.0.0
+  ghcr.io/nightswatchhq/nuthatch:2.5.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -118,7 +121,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:2.0.0-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:2.5.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
