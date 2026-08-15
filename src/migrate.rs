@@ -64,6 +64,11 @@ pub enum Plan {
         from_nid: String,
         from: PathBuf,
         to: PathBuf,
+        /// The incoming nest's own package directory. `from` supplies the data;
+        /// this supplies what the operator authored (views/, semantic.toml).
+        /// Without it an ADOPT copies the *source* package wholesale and the
+        /// adopting nest's own files are silently dropped (#587).
+        package: PathBuf,
     },
     /// Something is wrong with the nest and it will not be touched.
     Refuse { alias: String, why: String },
@@ -211,6 +216,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                         from_nid,
                         from,
                         to: dest,
+                        package: legacy.clone(),
                     }),
                     None => {
                         let breaking = breaking_against_current(dir, &mounts, alias, &legacy);
@@ -384,6 +390,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 nid,
                 from,
                 to,
+                package,
                 ..
             } => {
                 // A **copy**, not a move or a rename: the source dataset may still be mounted by
@@ -392,7 +399,30 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 crate::project::copy_dir(from, to).with_context(|| {
                     format!("adopting {} into {}", from.display(), to.display())
                 })?;
-                println!("  {alias}: adopted without re-indexing");
+                // The copy above brings the *source* dataset — its data, and its
+                // package files with it. That leaves the adopting nest wearing
+                // someone else's authored work: a `views/large-transfers.sql`
+                // this nest wrote is absent afterwards, and its semantic.toml is
+                // the source's (#587). Adoption is meant to save a backfill, not
+                // to replace what the operator wrote.
+                //
+                // So overlay the incoming nest's own package on top. Data is
+                // skipped by name: the redb store and segments/ belong to the
+                // source and are the whole reason this was an adopt.
+                let overlaid = overlay_package(package, to).with_context(|| {
+                    format!(
+                        "overlaying {}'s authored files onto {}",
+                        package.display(),
+                        to.display()
+                    )
+                })?;
+                if overlaid > 0 {
+                    println!(
+                        "  {alias}: adopted without re-indexing ({overlaid} authored file(s) kept)"
+                    );
+                } else {
+                    println!("  {alias}: adopted without re-indexing");
+                }
                 records.push(Mount {
                     tenant: tenant.clone(),
                     alias: alias.clone(),
@@ -448,6 +478,62 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
 
 /// Move a directory, preferring an atomic rename. See the module docs for why this is not the
 /// copy-then-swap RFC-0032 §12 described.
+/// Copy the adopting nest's authored files over an adopted dataset.
+///
+/// Returns how many files were overlaid, so the caller can say so rather than
+/// claiming work it did not do.
+///
+/// Data is excluded by name rather than by an allowlist of package files: a nest
+/// may carry anything its author put there — `views/`, `semantic.toml`, an
+/// `llms.txt`, a `.claude/skills/` tree — and an allowlist would quietly drop
+/// whatever it had not been taught about, which is the bug being fixed. Only the
+/// two things that are unambiguously the *source's* data are skipped.
+fn overlay_package(package: &Path, dest: &Path) -> Result<usize> {
+    if !package.is_dir() {
+        return Ok(0);
+    }
+    let skip = [crate::config::DB_FILE, crate::seal::SEGMENTS_DIR];
+    let mut copied = 0usize;
+    for entry in
+        std::fs::read_dir(package).with_context(|| format!("reading {}", package.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if skip.iter().any(|s| name == std::ffi::OsStr::new(s)) {
+            continue;
+        }
+        let (src, dst) = (entry.path(), dest.join(&name));
+        if src.is_dir() {
+            crate::project::copy_dir(&src, &dst)
+                .with_context(|| format!("copying {}", src.display()))?;
+            copied += walk_count(&dst);
+        } else {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+/// Files under a directory, for reporting only.
+fn walk_count(dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| {
+            if e.path().is_dir() {
+                walk_count(&e.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 fn relocate(from: &Path, to: &Path) -> Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
