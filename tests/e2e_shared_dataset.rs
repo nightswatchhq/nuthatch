@@ -113,7 +113,7 @@ async fn bring_up(
     for ds in &datasets {
         health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
     }
-    let cursor = indexer::spawn_runtime(
+    let mut cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
         None,
@@ -151,19 +151,15 @@ async fn bring_up(
     .await;
     assert!(sealed, "the dataset did not seal in time");
 
-    let mut estimates = std::collections::HashMap::new();
-    let states = runtime::fan_out_aliases(
-        &datasets,
-        cursor.states,
-        &health,
-        &mut estimates,
-        multi_tenant,
-    );
+    // Take the states the fan-out needs, then hand the rest of the cursor to
+    // `shutdown` so the ingest and alert tasks are actually stopped — and their
+    // `Store` clones dropped — rather than merely asked to stop.
+    let states_in = std::mem::take(&mut cursor.states);
+    cursor.shutdown().await;
 
-    cursor.ingest.abort();
-    for (_, w) in cursor.alert_workers {
-        w.abort();
-    }
+    let mut estimates = std::collections::HashMap::new();
+    let states =
+        runtime::fan_out_aliases(&datasets, states_in, &health, &mut estimates, multi_tenant);
     (states, tape, estimates)
 }
 

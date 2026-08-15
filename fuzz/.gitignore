@@ -1,0 +1,15 @@
+target
+artifacts
+coverage
+
+# libFuzzer grows `corpus/<target>/` with every interesting input it finds while running - that
+# accumulated state doesn't belong in git. The small hand-authored seeds under corpus/abi_json/
+# are the exception: they exist to bias the mutator toward the shapes nuthatch#290 names (duplicate
+# topic0, absurd tuple depth, a huge fixed-array size), so they're checked in deliberately.
+corpus/*
+!corpus/abi_json/
+corpus/abi_json/*
+!corpus/abi_json/*.json
+!corpus/decode_log/
+corpus/decode_log/*
+!corpus/decode_log/seed_*

@@ -301,13 +301,27 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     let urls = if args.rpc.is_empty() {
         // No `--rpc`: probe whatever the nest in `--dir` is configured to use, which is the case
         // where "my backfill is slow" usually starts.
-        let cfg =
-            crate::config::Config::load(std::path::Path::new(&args.dir)).with_context(|| {
+        // `load_for_diagnostics`, not `load`: doctor only wants `[nest].rpc_urls`,
+        // and the serving-path refusals (`[[calls]]`, tip-finality webhooks) are
+        // not reasons a diagnostic cannot read them. It used to inherit both and
+        // exit 1 on a nest that was present and parsed fine (#582).
+        let dir = std::path::Path::new(&args.dir);
+        let cfg = crate::config::Config::load_for_diagnostics(dir).with_context(|| {
+            // Only claim the nest is missing when it actually is. The old message
+            // said "no nest at '{dir}'" for every load failure, so an operator
+            // looking straight at their nuthatch.toml was told it was not there.
+            if dir.join(crate::config::CONFIG_FILE).exists() {
+                format!(
+                    "no --rpc given, and the nest at '{}' could not be read for its endpoints",
+                    args.dir
+                )
+            } else {
                 format!(
                     "no --rpc given and no nest at '{}' to read endpoints from",
                     args.dir
                 )
-            })?;
+            }
+        })?;
         cfg.nest.rpc_urls
     } else {
         args.rpc
