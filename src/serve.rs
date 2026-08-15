@@ -638,14 +638,31 @@ fn poll_stalled(last_poll: u64, started_at: u64, now: u64, threshold: u64) -> bo
 /// far more often than this on any chain with sub-minute blocks.
 const READINESS_PROGRESS_STALL_SECS: u64 = 90;
 
-/// Wedged = `last_block` moved at least once (`last_progress != 0`) but not within `threshold` seconds,
-/// even while [`poll_stalled`] says the source is still reachable. This is the case `poll_stalled` can't
-/// see: a source poll (tip fetch) can succeed on schedule while `process_window` (`indexer.rs:3437`)
-/// holds the cursor's position rather than seal a window it can't safely process - correct behaviour on
-/// its own, but not "ready" while it lasts. Same bounded-grace shape as `poll_stalled` (#510): a cursor
-/// that has never yet made progress is judged from `started_at`, so one wedged since block one
-/// eventually reports unready too, not "just starting up" forever.
-fn progress_stalled(last_progress: u64, started_at: u64, now: u64, threshold: u64) -> bool {
+/// Wedged = the cursor is behind tip (`lag > 0`) and `last_block` moved at least once
+/// (`last_progress != 0`) but not within `threshold` seconds, even while [`poll_stalled`] says the
+/// source is still reachable. This is the case `poll_stalled` can't see: a source poll (tip fetch)
+/// can succeed on schedule while `process_window` (`indexer.rs:3437`) holds the cursor's position
+/// rather than seal a window it can't safely process - correct behaviour on its own, but not "ready"
+/// while it lasts. Same bounded-grace shape as `poll_stalled` (#510): a cursor that has never yet
+/// made progress is judged from `started_at`, so one wedged since block one eventually reports
+/// unready too, not "just starting up" forever.
+///
+/// The `lag > 0` guard is load-bearing on its own: without it, a cursor that is caught up to tip -
+/// which stops stamping `last_progress` the moment it arrives, because `set_last_block` only stamps
+/// on an actual value change - reports wedged `threshold` seconds after catching up, even though it
+/// is behaving exactly as intended. Same failure mode for a fixed-range nest (`end_block:
+/// Option<u64>`, `src/subgraph_import.rs:68`) once its range completes: `last_block` is final by
+/// design, and without the guard `/ready` would report unready forever.
+fn progress_stalled(
+    last_progress: u64,
+    started_at: u64,
+    now: u64,
+    threshold: u64,
+    lag: u64,
+) -> bool {
+    if lag == 0 {
+        return false;
+    }
     let since = if last_progress != 0 {
         last_progress
     } else {
@@ -712,11 +729,13 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     };
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
+    let lag = tip.saturating_sub(last);
     let wedged = progress_stalled(
         last_progress,
         started_at,
         now,
         READINESS_PROGRESS_STALL_SECS,
+        lag,
     );
     let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS) || wedged;
     let body = json!({
@@ -725,7 +744,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "wedged": wedged,
         "tip": tip,
         "last_block": last,
-        "lag_blocks": tip.saturating_sub(last),
+        "lag_blocks": lag,
         "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
@@ -1565,13 +1584,24 @@ mod tests {
     fn progress_stall_logic() {
         let now = 1_000_000u64;
         // Never advanced, just started → starting up, not wedged (grace).
-        assert!(!progress_stalled(0, now - 10, now, 90));
+        assert!(!progress_stalled(0, now - 10, now, 90, 5));
         // Advanced recently → healthy.
-        assert!(!progress_stalled(now - 10, now - 1_000, now, 90));
-        // Advanced long ago and nothing since → wedged.
-        assert!(progress_stalled(now - 100, now - 1_000, now, 90));
+        assert!(!progress_stalled(now - 10, now - 1_000, now, 90, 5));
+        // Advanced long ago and nothing since, and still behind tip → wedged.
+        assert!(progress_stalled(now - 100, now - 1_000, now, 90, 5));
         // Exactly at the threshold is not yet wedged (strictly greater).
-        assert!(!progress_stalled(now - 90, now - 1_000, now, 90));
+        assert!(!progress_stalled(now - 90, now - 1_000, now, 90, 5));
+    }
+
+    /// #583/#589: a cursor level with tip must never be wedged, no matter how stale `last_progress` is -
+    /// it stops stamping the moment it catches up, by design (`set_last_block` only stamps on an actual
+    /// advance). Without the `lag > 0` guard this fires `threshold` seconds after every caught-up nest
+    /// arrives at tip, and forever on a completed fixed-range nest.
+    #[test]
+    fn a_caught_up_cursor_is_never_wedged() {
+        let now = 1_000_000u64;
+        assert!(!progress_stalled(now - 1_000, now - 1_000, now, 90, 0));
+        assert!(!progress_stalled(0, now - 1_000, now, 90, 0));
     }
 
     /// #510's analogue for progress: a cursor wedged since before it ever advanced once must eventually
@@ -1579,8 +1609,8 @@ mod tests {
     #[test]
     fn a_cursor_wedged_since_cold_start_eventually_stalls() {
         let now = 2_000_000u64;
-        assert!(progress_stalled(0, now - 91, now, 90));
-        assert!(!progress_stalled(0, now - 10, now, 90));
+        assert!(progress_stalled(0, now - 91, now, 90, 5));
+        assert!(!progress_stalled(0, now - 10, now, 90, 5));
     }
 
     #[test]
@@ -1872,6 +1902,47 @@ mod tests {
             "a cursor frozen mid-backfill must fail readiness: {json}"
         );
         assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #583/#589: a cursor level with tip - caught up, doing exactly what it should - must stay ready
+    /// even though `last_progress` is stale well past the threshold. `set_last_block` only stamps
+    /// `last_progress` on an actual advance, so a caught-up cursor stops stamping the moment it
+    /// arrives; without the `lag > 0` guard on `progress_stalled` this reports `wedged: true` and
+    /// 503 on a perfectly healthy nest. Same shape covers a completed fixed-range nest
+    /// (`end_block: Option<u64>`, `src/subgraph_import.rs:68`), whose `last_block` is final by design.
+    ///
+    /// Mutation check: remove the `lag > 0` guard (`progress_stalled` returning early on `lag == 0`)
+    /// and this test reds - the wedged path alone can't tell a caught-up cursor from a stuck one.
+    #[tokio::test]
+    async fn a_caught_up_cursor_is_ready_despite_stale_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "caught-up-cursor";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_tip(25_754_377);
+        handle.set_last_block(25_754_377); // level with tip: lag == 0
+        handle.mark_poll_ok();
+        handle.set_started_at_for_test(now.saturating_sub(1_000));
+        // Stale well past READINESS_PROGRESS_STALL_SECS - it stopped stamping the moment it caught up.
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "a cursor caught up to tip must stay ready despite stale last_progress: {json}"
+        );
+        assert_eq!(json["ready"], json!(true));
+        assert_eq!(json["stalled"], json!(false));
+        assert_eq!(json["wedged"], json!(false));
+        assert_eq!(json["lag_blocks"], json!(0));
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
