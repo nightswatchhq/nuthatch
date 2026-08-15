@@ -459,7 +459,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 |---|---|
 | `GET /` | summary: nest identity, heights, table count |
 | `GET /health` | liveness. `200 "ok"` while the process serves |
-| `GET /ready` | readiness. Per-nest: `503` if *that* nest is quarantined |
+| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, or the cursor stops advancing (`wedged`) |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold |
 | `GET /schema` | the full data model |
