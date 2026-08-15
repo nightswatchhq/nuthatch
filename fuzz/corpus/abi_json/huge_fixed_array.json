@@ -1,0 +1,4 @@
+[
+    {"type":"event","name":"HugeArray","anonymous":false,"inputs":[
+        {"name":"data","type":"uint256[4000000000]","indexed":false}]}
+]
