@@ -325,8 +325,10 @@ Primary sources behind the figures and rankings (all consulted 2026-07-19):
 **Tier 0 (Graph Protocol infrastructure)** - added 2026-07-19:
 
 - nuthatch [RFC-0002](rfcs/0002-horizon-nest.md) & [RFC-0011](rfcs/0011-graph-network-nest-lodestar-migration.md)
-  - the shipped `horizon-nest` and planned `graph-network-nest`; source of the vendored, live-verified
-  Arbitrum addresses used above
+  - the shipped `horizon-nest`; source of the vendored, live-verified Arbitrum addresses used above.
+  RFC-0011's remaining surface (Indexer Directory, Curation, Epochs) **extends `horizon-nest`** - it
+  said "planned `graph-network-nest`" until 2026-08-15, contradicting the status block above, which
+  has recorded since July that that nest was a byte-identical clone and was retired
 - `graphprotocol/contracts` - `packages/horizon/addresses.json`, `packages/subgraph-service/addresses.json`
   (pin the payments-layer + dispute addresses here)
 - `graphprotocol/graph-network-subgraph` (`master`) - the network subgraph manifest + Horizon event
