@@ -34,9 +34,13 @@ jobs:
       # Assert it is present before spending 30 minutes building.
       - name: the mutation is actually applied
         run: |
+          # Match the call site exactly. A bare `saturating_to::<u64>()` also occurs in the test
+          # module's doc comment describing the guard, so the absence check has to be narrower than
+          # the identifier or it fails on prose.
           grep -n 'Value::U64(u.to::<u64>())' src/registry.rs
-          if grep -q 'saturating_to::<u64>()' src/registry.rs; then
-            echo "::error::COR-11 guard still present - the mutation did not apply"; exit 1
+          if grep -q 'Value::U64(u.saturating_to::<u64>())' src/registry.rs; then
+            echo "::error::COR-11 guard still present at the call site - the mutation did not apply"
+            exit 1
           fi
           echo "applied: COR-11 guard reverted to the unchecked conversion"
 
