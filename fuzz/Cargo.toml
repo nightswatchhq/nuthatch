@@ -29,6 +29,7 @@ path = ".."
 # the full story and how to re-check whether upstream has fixed it.
 [profile.release]
 overflow-checks = true
+lto = false
 
 [[bin]]
 name = "abi_json"
