@@ -1624,6 +1624,44 @@ pub struct ChainCursor {
     pub lifecycle: tokio::sync::mpsc::UnboundedSender<CursorCommand>,
 }
 
+impl ChainCursor {
+    /// Stop this cursor and release everything it holds.
+    ///
+    /// Takes `self` on purpose. `abort()` only *requests* cancellation: until the
+    /// runtime polls the task again it still holds its `Store` clone, and `Store`
+    /// is an `Arc<Database>`, so redb's file lock outlives the call. A caller that
+    /// aborts and moves on has not stopped the cursor, it has asked politely.
+    ///
+    /// Seven e2e fixtures hand-rolled `ingest.abort()` plus a loop over the alert
+    /// workers. Six survived only because they never reopen a store in the same
+    /// process; `e2e_early_cutoff` does — twice, by design — and failed in CI with
+    /// "Database already open. Cannot acquire lock." Awaiting each aborted handle
+    /// fixed it, mutation-checked at 15/15 failures without the wait and 0/15 with
+    /// it (#407).
+    ///
+    /// Consuming `self` makes "stopped" a state the caller cannot forget to reach,
+    /// and drops the `AppState` clones as part of the contract rather than as
+    /// something each caller has to remember.
+    pub async fn shutdown(self) {
+        self.ingest.abort();
+        for (_, w) in &self.alert_workers {
+            w.abort();
+        }
+        // Await every handle, not just ingest. A cancelled task resolves to
+        // `Err(JoinError::Cancelled)`, which is the expected outcome here and not
+        // a failure — what matters is that the await proves the task is no longer
+        // running and its `Store` clone is dropped.
+        let _ = self.ingest.await;
+        for (_, w) in self.alert_workers {
+            let _ = w.await;
+        }
+        // Explicit rather than incidental: these are the remaining `Store` clones,
+        // and dropping them is the reason the file lock is actually free when this
+        // returns.
+        drop(self.states);
+    }
+}
+
 /// Build a nest and bring it up to date **off to one side of a running cursor** - phase 1 of the
 /// two-phase mount (RFC-0027 §4).
 ///

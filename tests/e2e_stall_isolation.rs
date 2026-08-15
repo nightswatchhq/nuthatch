@@ -104,11 +104,8 @@ fn last_block(store: &std::sync::Arc<dyn nuthatch::store::HotStore>) -> Option<S
     store.get_meta("last_block").ok().flatten()
 }
 
-fn shutdown(cursor: indexer::ChainCursor) {
-    cursor.ingest.abort();
-    for (_, w) in cursor.alert_workers {
-        w.abort();
-    }
+async fn shutdown(cursor: indexer::ChainCursor) {
+    cursor.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -192,6 +189,6 @@ async fn a_dead_chain_does_not_stall_its_co_tenant_cursor() {
         "chain B stays at its own tip throughout"
     );
 
-    shutdown(rt_a);
-    shutdown(rt_b);
+    shutdown(rt_a).await;
+    shutdown(rt_b).await;
 }

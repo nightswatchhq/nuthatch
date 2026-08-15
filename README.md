@@ -79,11 +79,24 @@ release*, so the two cannot drift.
 finality settings - **omit `--chain` and nuthatch probes each for your contract's bytecode and picks the
 one it lives on.** Point at your own node with `--rpc`.
 
-**Any other EVM chain works too** - World Chain, Base Sepolia, your own devnet - by supplying the chain
-id and an RPC endpoint yourself. See
-[running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain); the short version is
-that `dev`, `sql` and `bench` are chain-agnostic, while `init` currently only scaffolds the three
-built-in chains, so an unlisted chain means writing `nuthatch.toml` by hand (a dozen lines).
+**Any other EVM chain works too** - BSC, World Chain, Base Sepolia, your own devnet. Name the chain and
+say where it lives:
+
+```sh
+nuthatch init 0xADDR --chain bsc --rpc https://your-bsc-endpoint.example
+```
+
+The chain id is read **from the endpoint itself**, so there is no id to look up and nothing to type
+wrong. A built-in chain never dials: `--rpc` is ignored for `mainnet`, `arbitrum-one` and `base`.
+Omit `--rpc` on an unregistered name and the refusal tells you the remedy rather than just listing the
+three built-ins.
+
+Everything downstream was always chain-agnostic - `dev`, `sql` and `bench`, and the indexer's
+unregistered-chain finality and window defaults. `init`'s allow-list was the only thing narrower than
+what nuthatch actually scaffolds, and it went in 2.4.0. See
+[running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain) for the finality
+caveat, which is the part worth reading: a chain whose `finalized` tag runs close to the tip needs a
+depth-based policy instead, or you seal immutable Parquet that could never be corrected.
 
 ### A word on the free public RPCs
 
@@ -152,6 +165,13 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   and `degraded_tables` naming the affected tables, `nuthatch sql` prints a warning line, and the MCP
   server carries the same notice. The caveat is a fact about the *nest*, not about the row count you
   happened to get, so it appears whether or not this particular query touched the gap.
+- **A failed query tells you how to fix it.** A DuckDB error is classified against the nest's own
+  schema and an actionable line is appended - the engine's raw message is always kept, the hint is
+  added after it. An unknown table names the closest real one; a view that failed to *build* says so
+  rather than reporting "does not exist" and sending you hunting for a missing view; and a Solidity
+  `bool` column explains itself, because it is stored as exact text `'true'`/`'false'` and therefore
+  blows up inside `COALESCE`, `CASE`, `UNION` and `bool_and`/`bool_or` while comparing fine on its
+  own. Same treatment on `/sql`, the MCP `sql` tool and the `nuthatch sql` REPL.
 - **Hot + cold in one surface.** Queries span the live unsealed tip (redb) *and* sealed history
   (Parquet), transparently - you never think about the boundary.
 - **Big-int friendly.** `uint256` values are exact text; each also gets a `{col}_dec` DECIMAL view, so
