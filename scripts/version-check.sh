@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Find every place this repo states a nuthatch version, and flag any that is not the current one.
+#
+#   ./scripts/version-check.sh          # checks against Cargo.toml's version
+#   ./scripts/version-check.sh 2.5.0    # checks against a version you name
+#
+# The sibling of nuthatch-frontend/scripts/version-check.sh, and written for the same reason. The
+# website took three passes to get current on 2026-08-15; the same day, `docs/operators.md` was found
+# pinning its two copy-paste `docker run` commands at `:2.0.0` - five releases stale, in the document
+# an operator is most likely to follow verbatim. Nothing was broken by it, which is exactly why it
+# survived five releases: a five-release-old image starts up perfectly well.
+#
+# A version is a claim, and claims want a checker rather than a good memory.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+WANT=${1:-}
+[ -z "$WANT" ] && WANT=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+[ -z "$WANT" ] && { echo "could not read a version from Cargo.toml; pass one as an argument"; exit 2; }
+echo "current version: $WANT"
+echo
+
+fail=0
+
+# 1. The copy-paste commands. These are what someone actually runs, so a stale tag here is not a
+#    documentation nit - it hands them an old binary that works, which is the hardest kind to notice.
+echo "container tags in docs (copy-paste commands):"
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in
+    # Globbed on both sides: these lines are whole shell commands, so the tag is rarely the last
+    # thing on them (`... :2.5.0-scaled worker --help`). Anchoring at the end reported a correct tag
+    # as stale, which is the failure mode that gets a checker switched off.
+    *":$WANT"*|*':<version>'*|*':{version}'*) printf "  OK   %s\n" "$line" ;;
+    *) printf "  STALE %s\n" "$line"; fail=$((fail + 1)) ;;
+  esac
+done < <(grep -rn "ghcr.io/nightswatchhq/nuthatch:" --include="*.md" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
+
+# 2. Cargo.toml is the source of truth and must agree with itself.
+have=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+echo
+if [ "$have" = "$WANT" ]; then
+  echo "Cargo.toml: OK ($have)"
+else
+  echo "Cargo.toml: STALE ($have, expected $WANT)"; fail=$((fail + 1))
+fi
+
+# 3. Everything else, reported but never judged. `docs/rfcs/` and the progress log are dated writing
+#    and *should* keep the version they were written about; so should a security note naming the
+#    release that fixed something. Listing them without a verdict is deliberate - a checker that
+#    cried wolf over history would be ignored within two releases.
+echo
+echo "other version mentions - review by eye, most are legitimate history:"
+grep -rnoE "\b[0-9]+\.[0-9]+\.[0-9]+\b" --include="*.md" --include="*.toml" . 2>/dev/null \
+  | grep -v "^./target" | grep -v "/rfcs/" | grep -v "progress-log" | grep -v "^./docs/sprint-" \
+  | grep -vE ":${WANT//./\\.}$" \
+  | grep -viE "1\.95\.0|1\.85\.0|0\.0\.0|127\.0\.0|glibc|2\.3[0-9]\.[0-9]" \
+  | sed 's/^/  /' | head -25
+
+echo
+if [ "$fail" -gt 0 ]; then
+  echo "$fail stale reference(s) that a reader would act on - fix before tagging"
+  exit 1
+fi
+echo "no stale references in anything a reader would copy-paste"

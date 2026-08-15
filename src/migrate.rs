@@ -487,12 +487,21 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
 /// may carry anything its author put there — `views/`, `semantic.toml`, an
 /// `llms.txt`, a `.claude/skills/` tree — and an allowlist would quietly drop
 /// whatever it had not been taught about, which is the bug being fixed. Only the
-/// two things that are unambiguously the *source's* data are skipped.
+/// things that are unambiguously the *source's* data are skipped.
+///
+/// That set is [`crate::blob::DERIVED_STATE`] rather than a literal here, and the
+/// reuse is load-bearing rather than tidiness. `DERIVED_STATE` is defined as "what
+/// *is* the data - the set early cutoff copies when one identity adopts another's
+/// dataset", which is exactly the question this function asks, and it is held to
+/// `blob::EXCLUDE` by a test. A second copy of the same two names would be correct
+/// today and silently wrong the day the derived set grows: a new data file would
+/// be copied here as though the operator had authored it - the very class of bug
+/// #587 is about.
 fn overlay_package(package: &Path, dest: &Path) -> Result<usize> {
     if !package.is_dir() {
         return Ok(0);
     }
-    let skip = [crate::config::DB_FILE, crate::seal::SEGMENTS_DIR];
+    let skip = crate::blob::DERIVED_STATE;
     let mut copied = 0usize;
     for entry in
         std::fs::read_dir(package).with_context(|| format!("reading {}", package.display()))?
