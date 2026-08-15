@@ -168,15 +168,11 @@ async fn bring_up(
 
     // Run 2 reopens these very stores in this same process, so aborting is not enough: `abort` only
     // *requests* cancellation, and until the task is actually polled again it still holds its `Store`
-    // clone - and with it redb's file lock. Await each handle so the tasks are gone, then drop our own
-    // clones, before any of this returns to a caller that is about to open the same databases.
-    cursor.ingest.abort();
-    let _ = cursor.ingest.await;
-    for (_, w) in cursor.alert_workers {
-        w.abort();
-        let _ = w.await;
-    }
-    drop(cursor.states);
+    // clone - and with it redb's file lock. `shutdown` awaits each handle and drops the states, which
+    // is what makes the lock actually free before this returns to a caller about to open the same
+    // databases. It used to be written out here; it now lives on `ChainCursor` so the next fixture
+    // that reopens a store cannot step in the same hole (#407).
+    cursor.shutdown().await;
     heights
 }
 

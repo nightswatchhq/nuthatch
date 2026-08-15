@@ -35,15 +35,34 @@ pub struct NestMetrics {
     /// (#510): without it, a pool that is dead from the very first poll never sets `last_poll_ok` and
     /// looks permanently "just starting up" instead of eventually stalled.
     started_at: AtomicU64,
+    /// Unix seconds `last_block` last actually *changed* value. `0` until it has ever moved. Distinct
+    /// from `last_poll_ok` (#578): a source poll can succeed on schedule - keeping `last_poll_ok` fresh
+    /// and `/ready` looking healthy - while the cursor itself is wedged refusing to seal the window in
+    /// front of it (e.g. `process_window` holding position on an unfetchable block timestamp,
+    /// `indexer.rs:3437`). `last_poll_ok` alone cannot see that; this can.
+    last_progress: AtomicU64,
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
 }
 
 impl NestMetrics {
+    /// Also stamps `last_progress` when `v` actually advances the watermark, so `/ready` can tell "the
+    /// source answered" apart from "the cursor is getting somewhere" (#578).
     pub fn set_last_block(&self, v: u64) {
-        self.last_block.store(v, Relaxed);
+        if self.last_block.swap(v, Relaxed) != v {
+            self.last_progress.store(now_unix(), Relaxed);
+        }
         METRICS.set_last_block(v);
+    }
+    pub fn last_progress(&self) -> u64 {
+        self.last_progress.load(Relaxed)
+    }
+    /// Test seam, mirroring [`NestMetrics::set_last_poll_ok_for_test`]: pin the progress clock directly,
+    /// so a test can simulate "advanced once, then froze" without waiting out real time between calls.
+    #[cfg(test)]
+    pub fn set_last_progress_for_test(&self, t: u64) {
+        self.last_progress.store(t, Relaxed);
     }
     /// This nest's chain tip, and the global aggregate for a solo `dev`.
     pub fn set_tip(&self, v: u64) {
@@ -121,6 +140,8 @@ pub struct Metrics {
     /// Unix seconds the first nest was built, i.e. process/runtime start. `0` until set. See
     /// [`NestMetrics::started_at`] - a solo `dev` reads this one, since it has no per-nest health.
     started_at: AtomicU64,
+    /// Global counterpart of [`NestMetrics::last_progress`], read by a solo `dev` (no per-nest health).
+    last_progress: AtomicU64,
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
@@ -143,6 +164,7 @@ impl Metrics {
             sealed_through: AtomicU64::new(0),
             last_poll_ok: AtomicU64::new(0),
             started_at: AtomicU64::new(0),
+            last_progress: AtomicU64::new(0),
             rows_decoded: AtomicU64::new(0),
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
@@ -171,7 +193,17 @@ impl Metrics {
         self.tip_height.store(v, Relaxed);
     }
     pub fn set_last_block(&self, v: u64) {
-        self.last_block.store(v, Relaxed);
+        if self.last_block.swap(v, Relaxed) != v {
+            self.last_progress.store(now_unix(), Relaxed);
+        }
+    }
+    pub fn last_progress(&self) -> u64 {
+        self.last_progress.load(Relaxed)
+    }
+    /// Test seam, mirroring the per-nest one.
+    #[cfg(test)]
+    pub fn set_last_progress_for_test(&self, t: u64) {
+        self.last_progress.store(t, Relaxed);
     }
     pub fn set_sealed_through(&self, v: u64) {
         self.sealed_through.store(v, Relaxed);
@@ -466,5 +498,25 @@ mod tests {
         m.set_tip(100);
         m.set_last_block(120); // last ahead of a stale tip read
         assert!(m.render().contains("nuthatch_tip_lag_blocks 0"));
+    }
+
+    /// #578: `last_progress` stamps only when `last_block` actually moves, not on every call - a cursor
+    /// re-reporting the same watermark (holding position while it waits out an unfetchable block
+    /// timestamp) must not look like it's making progress.
+    #[test]
+    fn last_progress_stamps_only_on_an_actual_advance() {
+        let m = Metrics::new();
+        assert_eq!(m.last_progress(), 0, "never advanced yet");
+        m.set_last_block(100);
+        let first = m.last_progress();
+        assert!(first > 0, "first advance stamps progress");
+        m.set_last_block(100); // same value again - held, not advanced
+        assert_eq!(
+            m.last_progress(),
+            first,
+            "re-reporting the same block must not restamp progress"
+        );
+        m.set_last_block(101); // a genuine advance restamps
+        assert!(m.last_progress() >= first);
     }
 }

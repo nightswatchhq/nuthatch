@@ -1578,4 +1578,110 @@ mod tests {
       {"type":"event","name":"Sync","anonymous":false,"inputs":[{"name":"reserve0","type":"uint112","indexed":false}]},
       {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true}]}
     ]"#;
+
+    /// COR-11 oracle (nuthatch#290 fuzz follow-up, GH#581). `value_from_dynsol` guards a
+    /// declared-width-<=64 uint with `saturating_to::<u64>()` because alloy's dyn-abi decoder does
+    /// not require the padding above a sub-256-bit declared width to be zero: a log emitted (or
+    /// forged) with dirty high bits decodes to a `DynSolValue::Uint` whose `U256` does not fit in
+    /// `u64`. An unchecked `.to::<u64>()` there panics and would take the ingestion task down on
+    /// attacker-supplied log data. This is the "reds when the guard is removed" proof the cargo-fuzz
+    /// harness in fuzz/ could not complete in this environment (rustc ICE compiling dbsp under
+    /// sanitizer instrumentation, GH#581) - it needs no nightly toolchain and no sanitizer, so it
+    /// runs the same crafted input through the real decode path on stable `cargo test`.
+    #[test]
+    fn dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking() {
+        const ODD: &str = r#"[
+            {"type":"event","name":"Odd","anonymous":false,"inputs":[
+                {"name":"v","type":"uint64","indexed":false}]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("odd", USDC, ODD)]).unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        // A full 32-byte word of 0xff: every bit above the declared 64-bit width is dirty.
+        let l = log(USDC, &[&topic0], &format!("0x{}", "ff".repeat(32)), 1, 0);
+        let row = reg
+            .decode(&l)
+            .expect("a dirty-high-bits uint64 must not panic decoding")
+            .expect("topic0/address both match the fixture");
+        assert_eq!(row.params[0].0, "v");
+        // Saturated, not truncated/masked - the guard's documented behaviour.
+        assert_eq!(row.params[0].1, Value::U64(u64::MAX));
+    }
+
+    /// Prove the fuzz/fuzz_targets/decode_log.rs fixture ABI parses and that `decode` is actually
+    /// reached (nuthatch#231/#290). The ABI was previously invalid: `indexed` appeared on tuple
+    /// *components*, which alloy-json-abi rejects. The harness panicked at `unwrap()` in
+    /// `build_registry()` before libFuzzer ran a single iteration, so the decode path was never
+    /// exercised. This test uses the same six events and a well-formed Transfer log to confirm:
+    /// (1) `DecodeRegistry::build` succeeds, (2) `decode` returns `Ok(Some(..))` rather than
+    /// panicking.
+    #[test]
+    fn decode_log_fuzz_fixture_abi_parses_and_decode_is_reached() {
+        fn nested_tuple_param(depth: u16) -> serde_json::Value {
+            let mut param = serde_json::json!({"name": "leaf", "type": "uint256"});
+            for i in 0..depth {
+                param = serde_json::json!({
+                    "name": format!("t{i}"),
+                    "type": "tuple",
+                    "components": [param],
+                });
+            }
+            param
+        }
+        let mut top = nested_tuple_param(2);
+        top["indexed"] = serde_json::Value::Bool(false);
+        let events = serde_json::json!([
+            {"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false},
+            ]},
+            {"type":"event","name":"Hashed","anonymous":false,"inputs":[
+                {"name":"label","type":"string","indexed":true},
+                {"name":"amount","type":"uint256","indexed":false},
+            ]},
+            {"type":"event","name":"Collection","anonymous":false,"inputs":[
+                {"name":"amounts","type":"uint256[]","indexed":false},
+                {"name":"pair","type":"tuple","indexed":false,"components":[
+                    {"name":"a","type":"address"},
+                    {"name":"b","type":"uint256"},
+                ]},
+            ]},
+            {"type":"event","name":"HugeArray","anonymous":false,"inputs":[
+                {"name":"data","type":"uint256[4000000000]","indexed":false},
+            ]},
+            {"type":"event","name":"Deep","anonymous":false,"inputs":[top]},
+        ]);
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_value(events)
+            .expect("fuzz fixture ABI must parse without indexed on components");
+        let addr = "0x1111111111111111111111111111111111111111";
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "fuzz".into(),
+            address: parse_address(addr).unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .expect("build must succeed");
+        // Find the Transfer table and construct a valid log to confirm decode is reachable.
+        let transfer_dec = reg
+            .tables()
+            .into_iter()
+            .find(|d| d.table == "fuzz__transfer")
+            .expect("Transfer fixture must be registered");
+        let topic0 = format!("0x{}", hex::encode(transfer_dec.topic0));
+        let from = format!("0x{}", "aa".repeat(32));
+        let to = format!("0x{}", "bb".repeat(32));
+        let value = format!("0x{}", "00".repeat(31) + "2a");
+        let l = log(addr, &[&topic0, &from, &to], &value, 1, 0);
+        let row = reg
+            .decode(&l)
+            .expect("well-formed Transfer log must not error")
+            .expect("topic0 and address match - must return Some");
+        // uint256 decodes as Word32 (a 32-byte big-endian word), not U64.
+        let mut expected = [0u8; 32];
+        expected[31] = 42;
+        assert_eq!(
+            row.params.iter().find(|(n, _)| n == "value").unwrap().1,
+            Value::Word32(expected)
+        );
+    }
 }
