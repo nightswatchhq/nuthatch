@@ -1,0 +1,6 @@
+[
+    {"type":"event","name":"Dup","anonymous":false,"inputs":[
+        {"name":"a","type":"uint256","indexed":true}]},
+    {"type":"event","name":"Dup","anonymous":false,"inputs":[
+        {"name":"a","type":"uint256","indexed":true}]}
+]
