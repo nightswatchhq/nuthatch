@@ -438,6 +438,69 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Parse and validate a nest **without** the serving-path policy refusals.
+    ///
+    /// `load` ends with `refuse_unwired_calls` (#262) and
+    /// `refuse_tip_finality_webhooks` (#577). Both are right for anything that
+    /// is about to *serve*: a declaration that parses and then silently does
+    /// nothing is the failure this project can least afford.
+    ///
+    /// They are wrong for a diagnostic. `nuthatch doctor` is what an operator
+    /// reaches for when a nest misbehaves, and it refused to run on any nest
+    /// carrying a forward-looking declaration — reporting, on a nest that was
+    /// present and parsed cleanly, that there was no nest there (#582). The
+    /// tool that tells you what is wrong should be the last thing to refuse.
+    ///
+    /// Everything that makes the file *readable* still applies: the nest.star
+    /// removal, the v1/v2 fallback, the schema version, and per-call validation.
+    /// Only the "we will not run this" policy is skipped.
+    pub fn load_for_diagnostics(dir: &Path) -> Result<Config> {
+        let cfg = Self::load(dir);
+        match cfg {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                // A policy refusal is not a reason a diagnostic cannot run, so
+                // re-read past it. Anything else is a real load failure and is
+                // returned unchanged.
+                let reparsed = Self::parse_only(dir);
+                match reparsed {
+                    Ok(c) => Ok(c),
+                    Err(_) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The readable-file half of `load`: everything except the policy refusals.
+    fn parse_only(dir: &Path) -> Result<Config> {
+        if dir.join("nest.star").exists() {
+            bail!(
+                "{} has a nest.star, and the Starlark front-end was removed in 2.0 (RFC-0018 §2, \
+                 retired 2026-07-21). Port it to nuthatch.toml - `nuthatch init` emits that shape, \
+                 and it is what every other nest already uses.",
+                dir.display()
+            );
+        }
+        let path = dir.join(CONFIG_FILE);
+        let raw = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "no {CONFIG_FILE} in {} - run `nuthatch init` first",
+                dir.display()
+            )
+        })?;
+        let cfg = match toml::from_str::<Config>(&raw) {
+            Ok(cfg) => cfg,
+            Err(v2_err) => Self::from_v1(&raw).map_err(|v1_err| {
+                anyhow!("nuthatch.toml is neither v2 ({v2_err}) nor v1 ({v1_err})")
+            })?,
+        };
+        cfg.check_schema_version()?;
+        for c in &cfg.calls {
+            c.validate()?;
+        }
+        Ok(cfg)
+    }
+
     /// Refuse a `[[calls]]` block while RFC-0023 tier 3 has no executor (issue #262).
     ///
     /// Everything around this is built - `CallKey`, `CallDecl::validate`, `resolve_at`, and the
