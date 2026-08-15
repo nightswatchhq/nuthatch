@@ -656,9 +656,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      # #586 applies here more sharply than anywhere else in this file. This job carries
+      # `timeout-minutes: 45` and observed 40m26s on PR #592 - four and a half minutes of headroom,
+      # nearly all of it `cargo install cargo-fuzz --locked` plus three nightly targets built from
+      # cold. It is by some distance the likeliest job in the repo to be killed by its own ceiling,
+      # and without `cache-on-failure` it would be the one job that seeds nothing when killed, so
+      # the next run starts cold too and is killed again. `continue-on-error` hides that entirely: a
+      # job killed by its timeout still reports **success** to the checks API, so the deadlock would
+      # tighten with nothing on screen to say so.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
+          cache-on-failure: true
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: fuzz decode path (nuthatch#290)
