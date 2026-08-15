@@ -1,0 +1,135 @@
+# Did anyone actually review this?
+#
+# Eight required contexts on `main` and `sprint/**`, strict, admin-enforced - and until this file
+# existed, not one of them asked whether a human or agent had ever read the change. The
+# `Reviewed-by:` rule was honour-system, checked only by a post-hoc audit grep that runs long after
+# the merge. `gh pr merge --auto` arms on an unsigned PR quite happily and lands it the instant the
+# eighth context goes green.
+#
+# **Three near-misses, one measured.** 2026-08-14 ~19:40 UTC: #583, #588 and #589 all had auto-merge
+# armed with no signature in the body. #583 was one check away and carried a real defect (`/ready`
+# returning 503 on a healthy cursor at tip). It was caught by a CEO heartbeat happening to land in
+# the right ten-minute window, which is luck, not a control. This job is the control (NIG-235).
+#
+# ## Why a separate workflow and not a job in `ci.yml`
+#
+# The `edited` trigger below is load-bearing - without it, adding the signature to the body never
+# re-runs anything and the PR stays red forever, with no way out. But `types:` is set per-`on:`
+# block, not per-job: putting this in `ci.yml` would mean every body edit, every typo fix in a PR
+# description, re-runs the full matrix - a 90-minute `fmt · clippy · test` cold build included. So it
+# lives alone, costs one ubuntu runner for a couple of seconds, and `ci.yml`'s triggers are untouched.
+name: review signature
+
+on:
+  # No `branches:` filter, deliberately, for the reason `ci.yml` documents at length (#454): the
+  # filter matches the PR's *base*, so a stacked PR onto a `pete/*` branch matches nothing, no run
+  # is created, and the context reads `pending` rather than `skipped` - indistinguishable from
+  # "still building" and permanently unsatisfiable. For a *gate* that failure mode is worse than
+  # useless: it is the exact bypass this job exists to close. Build every PR whatever it targets.
+  pull_request:
+    # `opened`/`synchronize`/`reopened` are the defaults; `edited` is not, and is the one that
+    # matters. The signature lives in the PR body, so the act of satisfying this check is a body
+    # edit - which fires `edited` and nothing else. Omit it and the check is a trap with no exit.
+    types: [opened, edited, synchronize, reopened]
+
+  # There is deliberately no `push:` arm, and this is not an oversight.
+  #
+  # A push arm would have to pass trivially (a push has no PR body to read), and `main`/`sprint/**`
+  # branches *are* PR heads - the sprint branch is merged to `main` by PR. A push to `sprint/foo`
+  # with an open PR would fire both arms against the same head SHA: the real check and a trivially
+  # green one, same context name. Branch protection honours whichever check-run reports last, so the
+  # trivial pass could overwrite a genuine red. That is a bypass, so the arm is absent.
+  #
+  # Nothing is lost by omitting it: direct pushes to these branches are already refused, because
+  # required status checks cannot be green on a commit that does not exist yet.
+
+concurrency:
+  # A burst of body edits while someone fixes a typo shouldn't queue five runs of the same check.
+  group: review-signature-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  signature:
+    name: reviewed-by signature
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: the PR body carries a Reviewed-by line
+        env:
+          # Via the environment, never interpolated into the script. `${{ ... }}` is substituted
+          # into the shell source text before bash sees it, so a PR body containing a backtick or
+          # `$(...)` would execute on the runner. A PR body is attacker-controlled by definition.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          # A line starting at column 1, `Reviewed-by:`, and at least one non-blank character after
+          # the colon. Everything past that is free text - what the reviewer actually checked.
+          #
+          # The `tr -d '\r'` is *not* load-bearing for the match and this comment used to claim it
+          # was: GitHub stores bodies CRLF, but `\r` is `[[:space:]]`, so `Reviewed-by:\r` already
+          # fails the non-blank test and a real signature matches with the `\r` still on the end.
+          # Mutation-checked - removing the `tr` failed none of the cases below. It stays because it
+          # keeps a stray `\r` out of the echoed log line, and because the match would otherwise be
+          # quietly locale-dependent, not because it is doing work today.
+          signed() {  # signed <body> -> 0 if that body carries a signature
+            printf '%s' "$1" | tr -d '\r' | grep -qE '^Reviewed-by:[[:space:]]*[^[:space:]]'
+          }
+
+          # The matcher proves itself in BOTH directions before it is allowed to judge anything.
+          # A gate asserted only in the passing direction is the mistake this repo has shipped five
+          # times: every one of those tests was green with the mechanism removed. These cases are
+          # the ones that died under mutation of the pattern above - drop the `^` anchor and the
+          # last three go green; drop the non-blank test and `colon only` goes green.
+          selftest=0
+          case_is() {  # case_is <want-exit> <label> <body>
+            if signed "$3"; then got=0; else got=1; fi
+            if [ "$got" != "$1" ]; then
+              echo "::error::signature matcher self-test failed: '$2' returned $got, wanted $1"
+              selftest=1
+            fi
+          }
+          case_is 0 'plain signature'      'Reviewed-by: Iris (NIG-235)'
+          case_is 0 'signature after prose' "$(printf 'Fixes a thing.\n\nReviewed-by: Iris (NIG-235)')"
+          case_is 0 'CRLF body'            "$(printf 'Fixes a thing.\r\nReviewed-by: Iris\r\n')"
+          case_is 0 'trailing detail'      'Reviewed-by: Iris (CEO) - read against MountTable'
+          case_is 1 'empty body'           ''
+          case_is 1 'no signature at all'  "$(printf 'Fixes a thing.\n\nCloses #123.')"
+          case_is 1 'colon, nothing after' 'Reviewed-by:'
+          case_is 1 'colon, blanks after'  'Reviewed-by:   '
+          case_is 1 'not at column 1'      '  Reviewed-by: Iris'
+          case_is 1 'mid-line mention'     'I think Reviewed-by: Iris would be good'
+          case_is 1 'prose mention only'   'This was reviewed by Iris, honest.'
+          if [ "$selftest" != 0 ]; then
+            echo "::error::The signature matcher is broken, so this run is judging nothing. Fix .github/workflows/review-signature.yml - do not merge past this by disabling the check."
+            exit 1
+          fi
+
+          if signed "$PR_BODY"; then
+            echo "Signed:"
+            printf '%s' "$PR_BODY" | tr -d '\r' | grep -E '^Reviewed-by:' | sed 's/^/  /'
+            exit 0
+          fi
+
+          # A required check that can red a branch needs a recovery path stated *in the failing
+          # state* - not "see the docs", which is unreachable advice at the moment it is needed.
+          cat <<'MSG'
+          ::error::No `Reviewed-by:` line in the PR body. This PR has not been signed off.
+
+          To satisfy this check:
+
+            1. Get the change reviewed by someone who is not its author.
+            2. The reviewer adds a line to the PR *body* (not a comment - the audit and this
+               check both read the body only), at the start of its own line:
+
+                 Reviewed-by: <name> (<issue>)
+
+               for example:  Reviewed-by: Iris (NIG-235)
+
+            3. Saving the body fires the `edited` event, which re-runs this check automatically.
+               There is nothing to re-trigger by hand and no need to push an empty commit.
+
+          Everything after the colon is free text - what was actually checked belongs there. The
+          only requirement is that the line starts at column 1 and is not empty after the colon.
+          MSG
+          exit 1
