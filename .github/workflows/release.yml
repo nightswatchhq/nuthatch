@@ -45,6 +45,12 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
+          # on success() by default, so a job killed by an expired timeout seeds nothing and the next
+          # run starts cold too - the deadlock half of #584, which raising ceilings does not fix.
+          # Proven step-level on run 31824503060: rust-cache's post step was *skipped* while
+          # checkout's succeeded in the same grace window.
+          cache-on-failure: true
           key: release-${{ matrix.target }}
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}

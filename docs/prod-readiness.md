@@ -327,10 +327,14 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
   which is the case DuckDB cannot serve and the real point of §2.*
 - [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike  **[#279]**
   already showed parity on the fold that matters.*
-- [ ] ⛔ A multi-machine run. - *Everything above is verified on one host: several processes and  **[#281]**
-  connections against one database, which is what two machines are from the data's point of view for
-  every invariant tested. It is **not** a substitute for real network partitions or clock skew, and
-  the RFC always said scale validation happens on operator infra.*
+- [x] ✅ A multi-machine run. - *Done **2026-08-15 on published 2.4.0 artifacts** (#281, #597).  **[#281]**
+  Control plane + Postgres + FE on a box in Nuremberg, a second writer on a machine in another
+  country, over a real network. Both registered; killing the holding writer moved the lease to the
+  remote worker and incremented `owner_fence` by a **real handover**; the remote worker indexed
+  **2.2 M blocks** into the other machine's store; and with the control plane stopped and Postgres
+  deliberately left up it indexed **3,000,000 blocks straight through the outage** and resumed on
+  healing. **Clock skew is NOT covered** and remains 0.9.3-only - pushing a worker's clock needs root
+  on a machine running other work; `verification.md` says so too.*
 
 ## 12. Infra-gated capabilities (the shared blocker)
 
