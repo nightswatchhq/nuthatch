@@ -1,0 +1,71 @@
+# THROWAWAY. Delete this file and the `pete/290-fuzz-redproof` branch once #290 is settled.
+#
+# The one acceptance criterion PR #580 could not tick: proving `decode_log` *reds* on a known-bad
+# build, i.e. that libFuzzer's mutation engine discovers COR-11's panic on its own rather than the
+# harness merely compiling and exiting clean. That attempt was made locally, where a flaky rustc
+# ICE (GH#581) and a loaded box beat it. The same build succeeds on a GitHub runner - the
+# `fuzz-smoke` job on PR #580 built and ran all three targets in 33 minutes on 2026-08-14 - so run
+# the proof here instead.
+#
+# The expectation is INVERTED: this job is green only when the fuzz run crashes. `src/registry.rs`
+# on this branch carries the COR-11 mutation (`saturating_to::<u64>()` -> `to::<u64>()`), so a
+# clean fuzz run means the harness cannot see a panic it is pointed straight at, which is the
+# finding. Deliberately NO `continue-on-error` here: on #580 that flag makes the job report success
+# even when the fuzz step fails, so it cannot be used to prove anything reds.
+name: fuzz red-proof (throwaway)
+
+on:
+  push:
+    branches: [pete/290-fuzz-redproof]
+
+jobs:
+  redproof:
+    name: decode_log reds on a COR-11-reverted build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      # A mutation that never applied tests unmutated code and reports whatever the baseline did.
+      # Assert it is present before spending 30 minutes building.
+      - name: the mutation is actually applied
+        run: |
+          grep -n 'Value::U64(u.to::<u64>())' src/registry.rs
+          if grep -q 'saturating_to::<u64>()' src/registry.rs; then
+            echo "::error::COR-11 guard still present - the mutation did not apply"; exit 1
+          fi
+          echo "applied: COR-11 guard reverted to the unchecked conversion"
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Separate from the run step on purpose: the run step below treats a non-zero exit as
+      # SUCCESS, so a build failure (the ICE) must be caught here or it would masquerade as the
+      # crash we are trying to prove.
+      - name: build the fuzz targets
+        run: cargo fuzz build decode_log -O --sanitizer none
+
+      - name: decode_log must find the panic
+        run: |
+          set +e
+          cargo fuzz run decode_log -O --sanitizer none -- -runs=2000000 -max_total_time=300
+          status=$?
+          set -e
+          echo "fuzz exit status: $status"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::decode_log ran clean against a build with a live COR-11 panic in it."
+            echo "::error::The harness does not red when the code is broken - #290 is not proven."
+            exit 1
+          fi
+          # A non-zero exit is necessary but not sufficient: it must be a crash, with an artifact,
+          # not libFuzzer failing to start or the binary being missing.
+          if [ -z "$(ls -A fuzz/artifacts/decode_log 2>/dev/null)" ]; then
+            echo "::error::non-zero exit but no crash artifact - that is a harness failure, not a find"
+            exit 1
+          fi
+          echo "proven: decode_log discovered the panic and wrote an artifact"
+          ls -la fuzz/artifacts/decode_log

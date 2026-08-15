@@ -920,10 +920,10 @@ pub(crate) fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
         DynSolValue::Bool(b) => Value::Bool(*b),
         DynSolValue::Uint(u, bits) => {
             if *bits <= 64 {
-                // A conformant uint≤64 fits u64; a maliciously-crafted log with dirty high bits above
-                // the declared width would panic `to::<u64>()` and take down the ingestion task (COR-11).
-                // Saturate instead - no panic, and a well-formed value is unaffected.
-                Value::U64(u.saturating_to::<u64>())
+                // MUTATION (nuthatch#290 red-proof, throwaway branch - NEVER merge). COR-11's guard
+                // reverted to the unchecked conversion on purpose, so `decode_log` has a real panic
+                // to discover. The proof is that libFuzzer finds it; see fuzz-redproof.yml.
+                Value::U64(u.to::<u64>())
             } else if *bits <= 128 {
                 Value::Word16(u.to_be_bytes::<32>()[16..].try_into().unwrap())
             } else {
