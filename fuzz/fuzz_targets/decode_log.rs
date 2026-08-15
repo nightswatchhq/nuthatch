@@ -83,6 +83,20 @@ fn build_registry() -> DecodeRegistry {
             ],
         },
         {
+            // The only fixture with a declared width <= 64, and the reason it exists: that is the
+            // branch `value_from_dynsol` guards with `saturating_to::<u64>()` (COR-11), and alloy's
+            // decoder does not require the padding above a sub-256-bit width to be zero. Without a
+            // sub-64 uint in the curated set, `decode_log` never reaches that branch at all, and a
+            // clean run says nothing about whether it would catch a panic there.
+            "type": "event",
+            "name": "Narrow",
+            "anonymous": false,
+            "inputs": [
+                {"name": "small", "type": "uint64", "indexed": false},
+                {"name": "tiny", "type": "uint8", "indexed": false},
+            ],
+        },
+        {
             "type": "event",
             "name": "HugeArray",
             "anonymous": false,
@@ -130,6 +144,7 @@ enum Fixture {
     Transfer,
     Hashed,
     Collection,
+    Narrow,
     HugeArray,
     Deep,
 }
@@ -140,6 +155,7 @@ impl Fixture {
             Self::Transfer => "fuzz__transfer",
             Self::Hashed => "fuzz__hashed",
             Self::Collection => "fuzz__collection",
+            Self::Narrow => "fuzz__narrow",
             Self::HugeArray => "fuzz__huge_array",
             Self::Deep => "fuzz__deep",
         }
