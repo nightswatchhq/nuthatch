@@ -18,23 +18,57 @@ one better written than the entry it came from. A second list is a list that dri
 
 ## Reading the queue
 
-Labels carry the meaning that this file's "tracks" used to:
+Labels carry the meaning that this file's "tracks" used to. Every open issue carries **exactly one of
+a priority or `parked`** - that is the invariant this queue is kept to, and a bare issue with neither
+is a bug in the backlog rather than a style choice.
+
+**How urgent is it?**
 
 | Label | What it means |
 |---|---|
-| `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker.** |
-| `rfc` | Tracks a named RFC slice; the RFC holds the design, the issue holds the state |
-| `verification` | An unproven claim that needs a real run - not code, evidence |
-| `performance` | Throughput, latency or footprint |
-| `security` | Hardening or audit follow-up |
-| `tech-debt` | Deferred cleanup with a recorded reason |
+| `p0` | Do now: a gate that cannot fail, a live defect, or a **published claim that is false** |
+| `p1` | Next: a real correctness or coverage gap, with no immediate exposure |
+| `p2` | Later: tidy-up, ergonomics, or a gap with a known workaround |
+| `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker.** Carries no priority, on purpose - re-raising it as one is how a settled decision gets relitigated |
 
-The one query that matters most:
+**What kind of thing is it?** More than one may apply.
+
+| Label | What it means |
+|---|---|
+| `bug` | Something is wrong in shipped behaviour |
+| `security` | Hardening or audit follow-up |
+| `verification` | An unproven claim that needs a real run - **evidence, not code**. Closing one means a measurement exists, not that something was written |
+| `performance` | Throughput, latency or footprint |
+| `tech-debt` | Deferred cleanup with a recorded reason |
+| `rfc` | Tracks a named RFC slice; the RFC holds the design, the issue holds the state |
+| `documentation`, `enhancement`, `question` | As they read |
+
+**Who can pick it up, and can it start?**
+
+| Label | What it means |
+|---|---|
+| `board-only` | Needs credentials or machine access the firm must never hold. **Agents must not attempt these**, including "just the safe part" |
+| `blocked` | Cannot proceed until another issue lands. The blocker is named in a comment - if it is not, the label is wrong |
+| `help wanted` | Genuinely open to an outside contributor. Two of gallant-gecko's merged PRs came in this way |
+| `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
+
+**Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
+are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
+closed one it means nothing but provenance.** None is currently set on an open issue, which is the
+state to expect between sprints.
+
+The queries that matter:
 
 ```sh
-gh issue list --limit 100 | grep -v parked     # everything actually actionable
-gh issue list --label parked                   # everything deliberately not
+gh issue list --limit 100 --json number,title,labels          # everything open
+gh issue list --label p0                                      # drop what you are doing
+gh issue list --label p1                                      # the real queue
+gh issue list --label parked                                  # deliberately not now
+gh issue list --label verification                            # claims owing a measurement
 ```
+
+Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label, and
+`grep -v parked` used to be the recommendation here only because priorities did not exist yet.
 
 ## Standing decisions - do not re-raise these as blockers
 
