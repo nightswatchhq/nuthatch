@@ -25,9 +25,9 @@ finding.
 ## Running
 
 ```sh
-cargo +nightly fuzz run abi_json -O --sanitizer none
-cargo +nightly fuzz run abi_arbitrary -O --sanitizer none
-cargo +nightly fuzz run decode_log -O --sanitizer none
+cargo +nightly fuzz run abi_json
+cargo +nightly fuzz run abi_arbitrary
+cargo +nightly fuzz run decode_log
 ```
 
 Requires `cargo install cargo-fuzz` and a nightly toolchain (libFuzzer's sanitizer coverage
@@ -35,25 +35,22 @@ instrumentation isn't available on the pinned stable 1.95.0 - see the toolchain 
 `../Cargo.toml`). This is dev-only tooling: `fuzz/` is excluded from the published crate and never
 sits in the runtime data path.
 
-**`-O --sanitizer none` is required, not optional**, until an upstream rustc bug is fixed. Without
-it, `cargo fuzz build` fails outright: nightly's trait solver ICEs while compiling `dbsp` (checked
-against both a 2026-06-22 and a 2026-08-13 nightly, so this isn't a one-off regression) whenever
-the build carries debug-assertions *or* ASan on top of SanitizerCoverage instrumentation - it
-crashes resolving a vtable slot for `StarJoinFuncTrait`'s `DynClone` impl, deep in dbsp's
-type-erased operator graph, nothing to do with nuthatch's own code. `overflow-checks = true`
-(set in this crate's `[profile.release]`) survives on its own and is the property this issue
-actually needs - a `uint256[huge]`-shaped size computation must panic, not silently wrap - so `-O`
-only drops the *separate* debug-assertions flag cargo-fuzz otherwise adds by default. Losing ASan
-gives up memory-corruption detection inside dependencies' `unsafe` blocks; `registry.rs`/`rpc.rs`
-(the decode path itself) contain none, and libFuzzer's own `-rss_limit_mb`/`-malloc_limit_mb`
-already catch unbounded allocation without it. To check whether upstream has fixed the ICE, drop
-both flags and see if `cargo +nightly fuzz build` still panics with "the compiler unexpectedly
-panicked" mentioning `StarJoinFuncTrait`.
+**No sanitizer/debug-assertions workaround needed as of nuthatch#581.** These targets used to
+require `-O --sanitizer none`: nightly's trait solver ICEs computing a vtable slot for dbsp's
+`StarJoinFuncTrait`/`DynClone` impl whenever the build carried debug-assertions *or* ASan on top of
+SanitizerCoverage instrumentation - a real rustc bug, reproduced on both a 2026-06-22 and a
+2026-08-13 nightly, nothing to do with nuthatch's own code. #581 extracted the decode path
+(`registry.rs`/`rpc.rs`) into the standalone `nuthatch-decode` crate this crate now depends on;
+`dbsp` is not in `nuthatch-decode`'s or `nuthatch-fuzz`'s dependency graph at all
+(`cargo +nightly tree -p nuthatch-fuzz | grep -c dbsp` is `0`), so the ICE cannot be reached
+regardless of flags. ASan and debug-assertions run by default again. `overflow-checks = true` (set
+in this crate's `[profile.release]`) is unaffected either way and remains the property this target
+actually needs - a `uint256[huge]`-shaped size computation must panic, not silently wrap.
 
 CI runs all three under a bounded `-runs=300000 -max_total_time=180` smoke pass on every push/PR
 (`fuzz-smoke` in `.github/workflows/ci.yml`) - not a real fuzzing campaign, a regression tripwire.
 For an actual campaign, run locally or in a dedicated job with a much larger time budget and let
-the corpus grow (`cargo +nightly fuzz run <target> -O --sanitizer none -- -max_total_time=3600`).
+the corpus grow (`cargo +nightly fuzz run <target> -- -max_total_time=3600`).
 
 ## Verifying the harness actually reaches decode
 
@@ -62,34 +59,30 @@ reaching the code it claims to fuzz - this project has been bitten by that shape
 five times (CLAUDE.md's docs-go-stale lesson generalises). Before trusting a green fuzz run, prove
 it reds on a known-bad build: reintroduce a fixed panic (e.g. revert `registry.rs`'s
 `u.saturating_to::<u64>()` guard, COR-11, to an unchecked `.to::<u64>()`) and confirm
-`cargo +nightly fuzz run decode_log -O --sanitizer none` finds a crashing input within seconds
-against the seeded corpus, then revert. That check isn't automated here - a permanently red "this
-must find a bug" target isn't buildable - so re-run it by hand after any change to the fuzz
-harness itself.
+`cargo +nightly fuzz run decode_log` finds a crashing input against the seeded corpus, then revert.
+That check isn't automated here - a permanently red "this must find a bug" target isn't buildable -
+so re-run it by hand after any change to the fuzz harness itself.
 
-**Status as of 2026-08-14: the cargo-fuzz live proof is still not completed**, because the same
-rustc ICE described above (see "the compiler unexpectedly panicked" / `StarJoinFuncTrait`) blocked
-most build attempts that day, including plain rebuilds with no source change - it reproduced on
-roughly half of repeated, identical `cargo fuzz build -O --sanitizer none` invocations. Two builds
-against the *unmodified* (guard-in-place) code did succeed and confirmed
-`abi_json`/`abi_arbitrary`/`decode_log` link and run cleanly against the checked-in corpus with no
-crashes; the COR-11-reverted build to prove the opposite (a red) kept losing the same coin flip
-before landing one. The harness's construction is still sound by source inspection -
-`abi_json.rs`/`abi_arbitrary.rs` call `DecodeRegistry::build` directly, `decode_log.rs` calls
-`reg.decode(&log)` directly, exactly the entry points production ingestion calls - but that is not
-a substitute for the live proof this section asks for. Whoever picks this up next should re-run
-the COR-11 revert-and-build cycle (retrying past the flaky ICE as needed) before treating this
-target's coverage as trusted for libFuzzer discovery specifically.
+**Status as of 2026-08-18, re-run post-nuthatch#581: the live proof still doesn't find a crash, and
+now the reason is diagnosed rather than blocked on the ICE.** With dbsp out of the dependency graph
+the build itself is no longer the obstacle - `cargo fuzz build decode_log` with ASan and
+debug-assertions on (the defaults, no flags) finished in 26s, no ICE. But 300,000 runs
+(`-runs=300000`, 21s wall clock) of `decode_log` against the COR-11-reverted code found nothing.
+The cause isn't fuzzer luck: none of this target's five fixture ABIs (`Transfer.value`,
+`Collection.pair.b`, `HugeArray.data`'s element type, `Deep`'s nested leaf) declare a uint narrower
+than `uint256`, so `value_from_dynsol`'s `*bits <= 64` branch - the one line the COR-11 guard
+lives on - is structurally unreachable from this harness no matter how long it runs. This is a
+coverage gap in the fixture set, not a mutation-budget problem; fixing it means adding a fixture
+event with a `uint8`/`uint32`/`uint64`-typed field, not fuzzing longer. Filed as a follow-up rather
+than fixed here, since this PR's job was getting dbsp out of the graph, not auditing fixture
+coverage.
 
-**The cheaper half is proven, though, and does not depend on the ICE at all.** The COR-11 *oracle*
+**The cheaper half is still proven, and doesn't depend on the fuzzer at all.** The COR-11 *oracle*
 - that `value_from_dynsol` catches a dirty-high-bits uint and does not panic - is exercised by a
-plain `cargo test` in `src/registry.rs`
+plain `cargo test` in `decode/src/registry.rs`
 (`registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking`), no nightly
-toolchain and no sanitizer required. It runs the same crafted log (a `uint64` field with a
-32-byte word of `0xff`) through the real `DecodeRegistry::decode` entry point. Verified live on
-2026-08-14: with the guard in place it passes; with `saturating_to::<u64>()` reverted to
-`.to::<u64>()` it panics at `src/registry.rs:926` with `Uint conversion error: Overflow(256,
-18446744073709551615, 18446744073709551615)`, restored immediately after. That proves the target
-body catches the crafted input once it reaches decode - it does not prove libFuzzer's mutation
-engine would find that input on its own, which is what the still-open cargo-fuzz proof above is
-for.
+toolchain and no sanitizer required. It runs a crafted log (a `uint64` field with a 32-byte word of
+`0xff`) through the real `DecodeRegistry::decode` entry point. Verified live on 2026-08-18: with
+the guard in place it passes; with `saturating_to::<u64>()` reverted to `.to::<u64>()` it panics.
+That proves the guard itself is correct - it does not prove libFuzzer's mutation engine would ever
+find that input on its own, which the fixture-coverage gap above explains it can't, structurally.
