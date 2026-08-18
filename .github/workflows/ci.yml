@@ -632,27 +632,14 @@ jobs:
     # keeping the *shipped binary* reproducible (Cargo.toml's rust-version comment); fuzz/ is dev-only
     # tooling excluded from the published crate, same as components/ and scratchpad/.
     #
-    # `-O` (no debug-assertions) and `--sanitizer none` (no ASan) are the least-bad known
-    # workaround, not a fix: nightly's trait solver ICEs (rustc bug, not our code - reproduced on
-    # both a June and an August 2026 nightly) computing a vtable slot for dbsp's
-    # `StarJoinFuncTrait`/`DynClone` whenever the build adds debug-assertions OR ASan on top of
-    # SanitizerCoverage. `overflow-checks = true` in fuzz/Cargo.toml survives without either of
-    # those - it's the one of the pair this issue actually needs, to catch a `uint256[huge]`-style
-    # size computation overflowing rather than silently wrapping.
+    # The decode path (nuthatch-decode crate, PR #607) no longer links dbsp, so the rustc ICE
+    # computing a vtable slot for dbsp's `StarJoinFuncTrait`/`DynClone` under sanitizer
+    # instrumentation cannot recur. ASan and debug-assertions are now restored: `-O` and
+    # `--sanitizer none` workarounds have been removed (see the run step below).
     #
-    # IMPORTANT: this workaround is NOT reliable. Local testing (2026-08-14) saw the identical
-    # `-O --sanitizer none` command ICE on roughly half of repeated attempts with no source change
-    # in between - the trait-solver bug appears to be racy under rustc's parallel query engine, not
-    # a clean function of flags. `continue-on-error` below is load-bearing for that reason: this job
-    # is a best-effort regression tripwire, not a gate, until either upstream fixes the ICE or
-    # nuthatch stops linking dbsp into the fuzz build (the durable fix - see nuthatch#290's
-    # follow-up: extract registry.rs/rpc.rs, which have zero `unsafe` and no dbsp dependency at the
-    # source level, into their own crate so fuzzing the decode path never has to compile dbsp under
-    # instrumentation at all). Losing ASan costs memory-corruption detection in `unsafe` blocks; the
-    # decode path itself has none today, so the exposure is only in dependencies, and libFuzzer's
-    # own OOM/RSS limits already cover the "unbounded allocation" half of this issue without it.
+    # `continue-on-error` is gone: this job is now a real gate. A failure here means a regression
+    # in the decode path - it must be fixed before merging.
     timeout-minutes: 45
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -681,6 +668,6 @@ jobs:
         run: |
           for target in abi_json abi_arbitrary decode_log; do
             echo "::group::$target"
-            cargo fuzz run "$target" -O --sanitizer none -- -runs=300000 -max_total_time=180 -print_final_stats=1
+            cargo fuzz run "$target" -- -runs=300000 -max_total_time=180 -print_final_stats=1
             echo "::endgroup::"
           done
