@@ -70,9 +70,11 @@ fn nested_tuple_inputs(depth: u16) -> serde_json::Value {
 }
 
 fuzz_target!(|input: FuzzInput| {
-    // Still absurd (up to 4095 levels), but capped so corpus entries don't balloon the JSON text
-    // itself into gigabytes before nuthatch's parser even runs.
-    let depth = input.tuple_depth % 4096;
+    // CI measured 2 exec/s and lim:8 with the 4096 cap: nested_tuple_inputs(4095) builds 4095
+    // serde_json objects per call, burning almost all of the budget on JSON construction rather than
+    // the decode path. 64 levels is still unreachable via real ABIs and covers the stack-overflow
+    // scenario the test documents; the 4096 cap cost the fuzzer ~99.9% of its iterations.
+    let depth = input.tuple_depth % 64;
     let huge = input.huge_array_size;
 
     let mut events = vec![serde_json::json!({
