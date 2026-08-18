@@ -15,8 +15,8 @@ alloy-primitives = "1.6"
 serde_json = "1"
 hex = "0.4"
 
-[dependencies.nuthatch]
-path = ".."
+[dependencies.nuthatch-decode]
+path = "../decode"
 
 # Decode must stay a deterministic, panic-free boundary against attacker-supplied ABIs and logs
 # (CLAUDE.md §4, nuthatch#290) - overflow checks on so an integer-overflow panic in a size

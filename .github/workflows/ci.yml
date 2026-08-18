@@ -681,6 +681,6 @@ jobs:
         run: |
           for target in abi_json abi_arbitrary decode_log; do
             echo "::group::$target"
-            cargo fuzz run "$target" -O --sanitizer none -- -runs=300000 -max_total_time=180
+            cargo fuzz run "$target" -O --sanitizer none -- -runs=300000 -max_total_time=180 -print_final_stats=1
             echo "::endgroup::"
           done
