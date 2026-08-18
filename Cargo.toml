@@ -24,6 +24,7 @@ name = "nuthatch"
 path = "src/main.rs"
 
 [dependencies]
+nuthatch-decode = { path = "nuthatch-decode" }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 futures = "0.3"

@@ -12,7 +12,6 @@
 //! order, files sorted by path, compact encoding), reusing the seal-manifest discipline, not new crypto.
 
 use crate::config::{Config, DB_FILE};
-use crate::registry::DecodeRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -154,7 +153,7 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
     let config = Config::load(dir).context("loading nest config for pack")?;
     // Regenerate the decode registry from the *inputs* (toml + ABIs) so the manifest pins what a mount
     // must reproduce - never a stored artifact.
-    let registry = DecodeRegistry::from_nest(dir, &config).context("building decode registry")?;
+    let registry = crate::registry::from_nest(dir, &config).context("building decode registry")?;
     let registry_hash = hex::encode(registry.hash());
 
     let files = collect_files(dir, skip_out)?
@@ -696,7 +695,7 @@ pub fn install_verified(
 /// runs. Kept here so `bundle` and load share one definition of "does this blob decode as promised".
 pub fn verify_registry_reproduces(dir: &Path, manifest: &Manifest) -> Result<()> {
     let config = Config::load(dir)?;
-    let regen = hex::encode(DecodeRegistry::from_nest(dir, &config)?.hash());
+    let regen = hex::encode(crate::registry::from_nest(dir, &config)?.hash());
     if regen != manifest.registry_hash {
         bail!(
             "registry hash mismatch: manifest claims {}, inputs regenerate {} - the blob was authored \
@@ -821,7 +820,7 @@ abi = "abis/c.json"
         assert_eq!(m1.canonical_bytes(), m2.canonical_bytes());
         // The manifest pins the regenerated decode registry, and it verifies against the inputs.
         let config = Config::load(a.path()).unwrap();
-        let expected = hex::encode(DecodeRegistry::from_nest(a.path(), &config).unwrap().hash());
+        let expected = hex::encode(crate::registry::from_nest(a.path(), &config).unwrap().hash());
         assert_eq!(m1.registry_hash, expected);
         verify_registry_reproduces(a.path(), &m1).unwrap();
         // Files are sorted and exclude nothing authored (config + abi + llms.txt = 3).

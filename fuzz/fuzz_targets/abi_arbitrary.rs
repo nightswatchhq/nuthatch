@@ -13,7 +13,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
 
 #[derive(Arbitrary, Debug)]
 struct FuzzInput {
@@ -70,9 +70,9 @@ fn nested_tuple_inputs(depth: u16) -> serde_json::Value {
 }
 
 fuzz_target!(|input: FuzzInput| {
-    // Still absurd (up to 4095 levels), but capped so corpus entries don't balloon the JSON text
-    // itself into gigabytes before nuthatch's parser even runs.
-    let depth = input.tuple_depth % 4096;
+    // Capped to match the deepest fixture in decode_log (512 levels). Higher values cause
+    // serde_json's recursive JSON parser to overflow the stack under ASan's enlarged frames.
+    let depth = input.tuple_depth % 512;
     let huge = input.huge_array_size;
 
     let mut events = vec![serde_json::json!({
