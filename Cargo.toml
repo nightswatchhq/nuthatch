@@ -19,6 +19,18 @@ categories = ["command-line-utilities", "database", "cryptography::cryptocurrenc
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
 exclude = ["/components", "/scratchpad", "/fuzz", "/decode"]
 
+# `decode/` is production code in the binary's data path, so it must sit inside the workspace: a
+# non-member path dependency is compiled but never reached by `cargo fmt`, `cargo clippy` or
+# `cargo test`, which is how nuthatch#581's extraction quietly took the COR-11 guard and its 18
+# tests out of the `fmt · clippy · test` gate. `fuzz/` stays OUT deliberately - nightly-only, its
+# own lock, driven by an explicit `cargo fuzz` invocation.
+[workspace]
+members = [".", "decode"]
+# So a bare `cargo test` / `cargo clippy` covers both, matching what CI already runs rather
+# than requiring every invocation to remember `--workspace`.
+default-members = [".", "decode"]
+exclude = ["fuzz", "components", "scratchpad"]
+
 [[bin]]
 name = "nuthatch"
 path = "src/main.rs"
