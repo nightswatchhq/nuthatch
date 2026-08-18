@@ -38,6 +38,15 @@ ignore = [
   # **dbsp still requires `rkyv ^0.7.45` as of 0.327.0** (checked 2026-08-04), so even the newest dbsp
   # does not clear it. Tracked upstream; re-check on the next dbsp bump, same as the quick-xml pair.
   "RUSTSEC-2026-0235", # rkyv: shared-pointer validation ignored pointer metadata
+  # h2 0.3.x (transitive: reqwest → hyper 0.14 → h2 0.3). The 0.4.x entry was updated to
+  # 0.4.16 (the patched release). The 0.3.x series has no patched version and is held in the
+  # tree by reqwest's dependency on hyper 0.14, which in turn is required by several other deps;
+  # updating to hyper 1.x is a larger cross-crate migration. The flaw (unbounded empty DATA
+  # frames if the stream is not actively drained) requires a peer that deliberately spams empty
+  # frames; nuthatch only opens outbound RPC connections to trusted endpoints the operator
+  # configured, so the attack surface is controlled. Low severity per the advisory; re-check on
+  # the next reqwest/hyper bump.
+  "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
 ]
 
 [licenses]
