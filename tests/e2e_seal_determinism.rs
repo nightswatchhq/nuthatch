@@ -13,7 +13,7 @@ mod common;
 
 use std::sync::Arc;
 
-use nuthatch::{indexer, registry::DecodeRegistry, seal};
+use nuthatch::{indexer, seal};
 
 use common::tape::*;
 
@@ -40,7 +40,7 @@ async fn seal_with_window(dir: &std::path::Path, window: u64) -> Vec<String> {
     tape.advance_tip_to(60);
     tape.advance_finalized_to(60);
 
-    let registry = DecodeRegistry::from_nest(dir, &cfg).expect("registry");
+    let registry = nuthatch::registry::from_nest(dir, &cfg).expect("registry");
     let addresses: Vec<String> = cfg.contracts.iter().map(|c| c.address.clone()).collect();
     let topic0s: Vec<String> = registry
         .topic0s()

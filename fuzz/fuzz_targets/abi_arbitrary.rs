@@ -13,7 +13,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
 
 #[derive(Arbitrary, Debug)]
 struct FuzzInput {

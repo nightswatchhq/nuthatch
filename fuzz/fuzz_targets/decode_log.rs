@@ -18,8 +18,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
-use nuthatch::rpc::Log;
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::rpc::Log;
 use std::sync::OnceLock;
 
 /// Builds a `tuple` parameter nested `depth` levels deep. `alloy-json-abi` only accepts the

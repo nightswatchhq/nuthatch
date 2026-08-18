@@ -494,9 +494,7 @@ impl SqlBackend {
                         let raw = format!("{e:#}");
                         let hint = config::Config::load(dir)
                             .ok()
-                            .and_then(|cfg| {
-                                nuthatch::registry::DecodeRegistry::from_nest(dir, &cfg).ok()
-                            })
+                            .and_then(|cfg| nuthatch::registry::from_nest(dir, &cfg).ok())
                             .and_then(|reg| {
                                 nuthatch::analytics::enrich_query_error(
                                     dir,
