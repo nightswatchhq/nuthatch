@@ -15,21 +15,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Create the release with auto-generated notes before the matrix runs. Without this, every
-  # matrix leg (macOS + Linux) calls action-gh-release concurrently and they race on the body:
-  # whichever leg wins sets the notes, and the other silently overwrites them or sets nothing.
-  # A dedicated pre-matrix step owns the body; the build matrix only attaches files.
-  create-release:
-    name: create release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-
   build:
-    needs: create-release
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
