@@ -181,8 +181,8 @@ fuzz_target!(|input: FuzzInput| {
         log_index: 0,
     };
 
-    // Hunting panics and unbounded allocation (nuthatch#290) - a malformed log producing `Err` (or
-    // `Ok(None)` on a topic0/address mismatch, or `Ok(Some(..))` on a well-formed decode) is all
-    // correct; only a panic or an OOM abort is a finding.
+    // RED-PROOF: deliberate panic to prove the gate can go red. Reverted in the next commit.
+    panic!("deliberate break: red-capable proof for NIG-252 / nuthatch#593");
+    #[allow(unreachable_code)]
     let _ = reg.decode(&log);
 });
