@@ -13,7 +13,7 @@ mod common;
 
 use std::sync::Arc;
 
-use nuthatch::{indexer, registry::DecodeRegistry, seal};
+use nuthatch::{indexer, seal};
 
 use common::tape::*;
 
