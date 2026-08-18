@@ -79,7 +79,7 @@ coverage.
 
 **The cheaper half is still proven, and doesn't depend on the fuzzer at all.** The COR-11 *oracle*
 - that `value_from_dynsol` catches a dirty-high-bits uint and does not panic - is exercised by a
-plain `cargo test` in `registry.rs`
+plain `cargo test` in `decode/src/registry.rs`
 (`registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking`), no nightly
 toolchain and no sanitizer required. It runs a crafted log (a `uint64` field with a 32-byte word of
 `0xff`) through the real `DecodeRegistry::decode` entry point. Verified live on 2026-08-18: with
