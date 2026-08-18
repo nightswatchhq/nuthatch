@@ -1,0 +1,6 @@
+# fuzz/ is dev-only tooling (not published) and requires nightly for SanitizerCoverage /
+# -Zsanitizer=address. This file overrides the workspace root's stable pin so that `cargo fuzz`
+# (and cargo-fuzz's internal `cargo build` invocation) resolve to nightly rather than 1.95.0.
+[toolchain]
+channel = "nightly"
+profile = "minimal"
