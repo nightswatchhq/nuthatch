@@ -17,7 +17,8 @@ finding.
   `uint256[huge]` fixed-array param.
 - **`decode_log`** - a fixed, curated set of ABIs (ordinary indexed/non-indexed params, an indexed
   `string` that arrives as a topic hash, a dynamic array + tuple, a `uint256[4000000000]` fixed
-  array, and a tuple nested 512 levels deep) decoded against a fuzzed `Log`: arbitrary topic count
+  array, a tuple nested 512 levels deep, and a non-indexed `uint64` for the COR-11 narrow-uint
+  branch) decoded against a fuzzed `Log`: arbitrary topic count
   and length, truncated/garbage `data`, and corrupted hex. `topic0` is left fixed per fixture -
   it's resolved ahead of time by whoever built the registry, not something a byzantine RPC response
   or a malicious log actually controls.
@@ -63,26 +64,39 @@ it reds on a known-bad build: reintroduce a fixed panic (e.g. revert `registry.r
 That check isn't automated here - a permanently red "this must find a bug" target isn't buildable -
 so re-run it by hand after any change to the fuzz harness itself.
 
-**Status as of 2026-08-18, re-run post-nuthatch#581: the live proof still doesn't find a crash, and
-now the reason is diagnosed rather than blocked on the ICE.** With dbsp out of the dependency graph
-the build itself is no longer the obstacle - `cargo fuzz build decode_log` with ASan and
-debug-assertions on (the defaults, no flags) finished in 26s, no ICE. But 300,000 runs
-(`-runs=300000`, 21s wall clock) of `decode_log` against the COR-11-reverted code found nothing.
-The cause isn't fuzzer luck: none of this target's five fixture ABIs (`Transfer.value`,
-`Collection.pair.b`, `HugeArray.data`'s element type, `Deep`'s nested leaf) declare a uint narrower
-than `uint256`, so `value_from_dynsol`'s `*bits <= 64` branch - the one line the COR-11 guard
-lives on - is structurally unreachable from this harness no matter how long it runs. This is a
-coverage gap in the fixture set, not a mutation-budget problem; fixing it means adding a fixture
-event with a `uint8`/`uint32`/`uint64`-typed field, not fuzzing longer. Filed as a follow-up rather
-than fixed here, since this PR's job was getting dbsp out of the graph, not auditing fixture
-coverage.
+**Status as of 2026-08-18: the live proof reds, and the harness is trusted for COR-11.** Two
+things were in the way, and only one of them was the ICE.
 
-**The cheaper half is still proven, and doesn't depend on the fuzzer at all.** The COR-11 *oracle*
+1. The ICE is gone. #581/#607 extracted `nuthatch-decode`; `dbsp` is not in `nuthatch-fuzz`'s
+   dependency graph at all, so the build carries ASan and debug-assertions again by default.
+
+2. The fixture set could not reach the guard. None of this target's five ABIs declared a uint
+   narrower than `uint256`, so `value_from_dynsol`'s `*bits <= 64` branch - the one line COR-11
+   lives on - was structurally unreachable no matter how long libFuzzer ran. That is a coverage
+   gap, not a mutation-budget problem, and it is what nuthatch#612 asked for: `fuzz__narrow`
+   (`Narrow(uint64 id)`, non-indexed) is the fixture that closes it.
+
+Proven live on 2026-08-18, both directions, on the post-#618 sprint branch with the fixture
+applied:
+
+- **Reverted guard reds.** With `u.saturating_to::<u64>()` at `decode/src/registry.rs:886` put
+  back to an unchecked `u.to::<u64>()`, `decode_log` panicked after **16,484 executions** - about
+  a second - with `Uint conversion error: Overflow(256, 17289301308300282624, ...)` at that exact
+  line, and wrote the crashing input to `fuzz/artifacts/decode_log/`. Before this fixture the same
+  reverted build survived 300,000 runs untouched, so the fixture is what made the branch findable
+  rather than the fuzzer getting luckier.
+- **Restored guard runs clean.** With the guard back, 300,000 runs finished in 14s at ~21k
+  exec/s, 347 new corpus units, no crash.
+
+Re-run that pair by hand after any change to this harness. It is the only thing standing between
+"the fuzz job is green" and "the fuzz job would notice", and this project has been bitten by that
+distinction five times.
+
+**The unit-test half is proven too, and needs no nightly at all.** The COR-11 *oracle*
 - that `value_from_dynsol` catches a dirty-high-bits uint and does not panic - is exercised by a
 plain `cargo test` in `decode/src/registry.rs`
-(`registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking`), no nightly
-toolchain and no sanitizer required. It runs a crafted log (a `uint64` field with a 32-byte word of
-`0xff`) through the real `DecodeRegistry::decode` entry point. Verified live on 2026-08-18: with
-the guard in place it passes; with `saturating_to::<u64>()` reverted to `.to::<u64>()` it panics.
-That proves the guard itself is correct - it does not prove libFuzzer's mutation engine would ever
-find that input on its own, which the fixture-coverage gap above explains it can't, structurally.
+(`registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking`). It runs a
+crafted log (a `uint64` field with a 32-byte word of `0xff`) through the real
+`DecodeRegistry::decode` entry point: with the guard in place it passes, with it reverted it
+panics. That proves the guard is correct; the fuzz proof above is what proves libFuzzer can find
+its way there unaided.
