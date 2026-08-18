@@ -653,6 +653,8 @@ jobs:
           workspaces: fuzz -> target
           cache-on-failure: true
       - name: install cargo-fuzz
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: cargo install cargo-fuzz --locked
       - name: fuzz decode path (nuthatch#290)
         # Bounded by iteration count, not wall time, so runner speed doesn't change what this
@@ -662,6 +664,14 @@ jobs:
         # empty corpus RNG luck would have to rediscover on every run. `abi_arbitrary` and
         # `decode_log` build their own inputs structurally (see the file-level docs on each target)
         # and don't need a checked-in seed corpus to reach the same shapes.
+        #
+        # RUSTUP_TOOLCHAIN=nightly overrides the workspace rust-toolchain.toml (which pins 1.95.0
+        # for the shipped binary). Without it, cargo-fuzz's internal `cargo build` invocation runs
+        # from the workspace root and picks up the workspace toolchain pin rather than the nightly
+        # installed by dtolnay/rust-toolchain above. fuzz/rust-toolchain.toml only takes effect
+        # when the CWD is inside fuzz/, which it is not here.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           for target in abi_json abi_arbitrary decode_log; do
             echo "::group::$target"
