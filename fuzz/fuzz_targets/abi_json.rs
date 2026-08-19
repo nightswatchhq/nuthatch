@@ -8,7 +8,7 @@
 //! duplicate topic0) this one is unlikely to stumble into by random byte flips alone.
 
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {

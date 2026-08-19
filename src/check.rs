@@ -145,7 +145,7 @@ pub fn check(args: CheckArgs) -> Result<()> {
 /// nest (no config) - view validation is then skipped, not fatal.
 fn nest_schema(dir: &Path) -> Option<Vec<crate::registry::TableSchema>> {
     let cfg = crate::config::Config::load(dir).ok()?;
-    let reg = crate::registry::DecodeRegistry::from_nest(dir, &cfg).ok()?;
+    let reg = crate::registry::from_nest(dir, &cfg).ok()?;
     Some(reg.schema())
 }
 

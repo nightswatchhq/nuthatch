@@ -12,14 +12,18 @@
 //!                           against truncated `data` must error, not try to allocate 4B elements
 //!   - `fuzz__deep`          a tuple nested 512 levels - decode-time recursion depth, not just the
 //!                           registry-build-time signature computation `abi_arbitrary` covers
+//!   - `fuzz__narrow`        non-indexed `uint64` - exercises the `bits <= 64` branch in
+//!                           `value_from_dynsol` (COR-11 guard, nuthatch#290); no uint narrower than
+//!                           256 appears in any other fixture so that branch was structurally
+//!                           unreachable before this fixture was added (nuthatch#612)
 //!
 //! `topic0` is left fixed per fixture (the registry has already resolved it; it is not the part of
 //! a log an attacker or a byzantine RPC provider controls) - everything else is fuzzed.
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
-use nuthatch::rpc::Log;
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::rpc::Log;
 use std::sync::OnceLock;
 
 /// Builds a `tuple` parameter nested `depth` levels deep. `alloy-json-abi` only accepts the
@@ -94,6 +98,14 @@ fn build_registry() -> DecodeRegistry {
             "anonymous": false,
             "inputs": nested_tuple_inputs(512),
         },
+        {
+            "type": "event",
+            "name": "Narrow",
+            "anonymous": false,
+            "inputs": [
+                {"name": "id", "type": "uint64", "indexed": false},
+            ],
+        },
     ]);
     let abi: alloy_json_abi::JsonAbi = serde_json::from_value(events).unwrap();
     let spec = ContractSpec {
@@ -132,6 +144,7 @@ enum Fixture {
     Collection,
     HugeArray,
     Deep,
+    Narrow,
 }
 
 impl Fixture {
@@ -142,6 +155,7 @@ impl Fixture {
             Self::Collection => "fuzz__collection",
             Self::HugeArray => "fuzz__huge_array",
             Self::Deep => "fuzz__deep",
+            Self::Narrow => "fuzz__narrow",
         }
     }
 }
