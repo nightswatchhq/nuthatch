@@ -42,6 +42,45 @@ The one thing to check before starting each slice is the **pending Horizon upgra
 (`port-queue-nest.md` §5a): `SubgraphService`'s event signatures move, and `HorizonStaking`'s pending
 implementation is still unverified on Sourcify, so its diff cannot be taken.
 
+## Slices two and three: `epochs` and `disputes` (2026-08-19)
+
+Both built into `graph-allocations-nest` rather than into new nests, because a nuthatch query is
+per-nest scoped (RFC-0012) and epochs must join against the rewards and fees already indexed there.
+Two contracts added, both narrowed to what Lodestar actually reads.
+
+**`lodestar_disputes`** is unremarkable, which is the point: three creation events for three dispute
+kinds, four resolutions, and `Undecided` falls out of a `LEFT JOIN` rather than needing a status on
+chain. Eight disputes exist on the Horizon `DisputeManager` so far and all eight were drawn; the
+pre-Horizon history is on the legacy contract and would need it added.
+
+### `epochs`, and the trap in it
+
+The obvious implementation is wrong, and wrong by a factor of about 48.
+
+`EpochManager.epochLength` is 7,200, so `start_block = anchor + (epoch - anchor_epoch) * 7200` looks
+right. It produced **60,142 epochs where the network has 1,356**. The cause: **inside an Arbitrum
+contract `block.number` returns the L1 block number**, so EpochManager counts epochs in *L1* blocks,
+while the `block_number` on an indexed log is *L2*. Measured against our own data, an epoch spans
+~342,000 L2 blocks against a nominal length of 7,200 - a ratio of 47.5, which is exactly Arbitrum's
+blocks per L1 block.
+
+`EpochRun` cannot rescue it either. It has fired **once** in the entire history, because running an
+epoch is optional and nobody bothers. A view built on it would have reported three epochs.
+
+**The fix needs no L1/L2 mapping at all.** `AllocationCreated` and `IndexingRewardsCollected` both
+carry `currentEpoch` beside their own L2 block, which is a direct observation of the boundary. Deriving
+from those gives **253 epochs, 1104 to 1356**, and **1,356 is exactly the network subgraph's
+`currentEpoch`**. It starts at 1104 rather than 1 because `SubgraphService` only deployed in November
+2025; earlier epochs belong to the legacy contract.
+
+The view says `boundary_source = 'observed'` on every row, so nobody downstream mistakes it for a
+figure read off a contract. An epoch in which nothing happened leaves no row, and a consumer has to
+expect that.
+
+**Worth generalising:** any protocol contract on an L2 that does block arithmetic is doing it in L1
+blocks, and any nest that mixes that with indexed log block numbers will be quietly wrong rather than
+loudly broken. This one was caught only because the network subgraph disagreed.
+
 ## Field map: `ingest-allocations`, the first route (2026-08-19)
 
 The status update below says the six `cron/ingest-*` routes are the highest-leverage slice, because
