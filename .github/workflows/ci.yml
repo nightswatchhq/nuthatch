@@ -108,6 +108,22 @@ jobs:
         run: cargo test --locked
       - name: test (exex)
         run: cargo test --features exex --locked
+      # `nuthatch-decode` is a path dependency, and the root manifest has no `[workspace]` table -
+      # deliberately, so `fuzz/` stays its own workspace (see nuthatch#581). A consequence nobody
+      # intended: cargo builds a path dependency but never runs its unit tests, so the 18 tests
+      # #607 moved out of `src/registry.rs` stopped being executed by CI the moment they landed in
+      # `decode/src/registry.rs`. Among them is
+      # `registry::tests::dirty_high_bits_on_a_sub64_uint_saturate_instead_of_panicking` - the
+      # COR-11 oracle, the nightly-free half of the proof that the decode guard works.
+      #
+      # An extraction that silently drops the tests it moved is this sprint's own theme, so these
+      # steps are explicit rather than clever: same three checks, aimed at the other manifest.
+      - name: fmt (decode)
+        run: cargo fmt --check --manifest-path decode/Cargo.toml
+      - name: clippy (decode)
+        run: cargo clippy --all-targets --manifest-path decode/Cargo.toml -- -D warnings
+      - name: test (decode)
+        run: cargo test --locked --manifest-path decode/Cargo.toml
       # What was left when the longest step finished, or when it died. A job that can fail of
       # exhaustion has to report what it had, or the next failure is guessed at like the last two.
       - name: disk after the builds
