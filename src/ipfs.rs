@@ -29,6 +29,7 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// A nest's declaration that a column holds CIDs worth resolving.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +119,35 @@ pub fn cid_from_any(s: &str) -> Option<&str> {
     }
     let bare = s.strip_prefix("ipfs://").unwrap_or(s).trim_matches('/');
     looks_like_cid(bare).then_some(bare)
+}
+
+/// The CID a decoded event parameter names, whatever shape the contract chose to store it in.
+///
+/// Two shapes reach here and they are genuinely different things:
+///
+/// - `Value::Str` - a bare CID, an `ipfs://` URI, or a whole gateway URL. Handed to
+///   [`cid_from_any`], which keeps only the content address and throws the host away.
+/// - `Value::Bytes` of exactly 32 - the raw sha2-256 digest, which is what a `bytes32` column holds.
+///   Re-framed as a CIDv0 by [`crate::cid::cid_v0_from_digest`]. Without this a nest reading such a
+///   column resolves nothing and says nothing about it, which is the worst of the available
+///   behaviours.
+///
+/// `Value::Hash32` is deliberately **not** accepted, and this is the same refusal the tier-3 call
+/// path makes for the same reason: that variant is an *indexed dynamic* parameter, where the topic
+/// holds `keccak(value)` rather than the value. Those 32 bytes look exactly like a digest and are
+/// not one, so accepting them would mint a well-formed CID for a document that has never existed.
+/// A `bytes32` is a fixed type and stays `Value::Bytes` whether indexed or not, so nothing real is
+/// lost by refusing.
+pub fn cid_from_value(v: &crate::registry::Value) -> Option<Cow<'_, str>> {
+    match v {
+        crate::registry::Value::Str(s) => cid_from_any(s).map(Cow::Borrowed),
+        crate::registry::Value::Bytes(b) if b.len() == 32 => {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(b);
+            Some(Cow::Owned(crate::cid::cid_v0_from_digest(&d)))
+        }
+        _ => None,
+    }
 }
 
 /// Cheap shape check. [`crate::cid::Cid::parse`] is the real one; this only decides whether a string
@@ -280,5 +310,71 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("needs `on`"));
+    }
+
+    /// The `bytes32` form, end to end through the same entry point the indexer uses. The vector is
+    /// a real `SubgraphMetadataUpdated` payload from Arbitrum GNS whose document The Graph's gateway
+    /// actually serves - see the matching test in `crate::cid`.
+    #[test]
+    fn a_bytes32_column_resolves_to_the_cid_it_names() {
+        use crate::registry::Value;
+        let d = hex::decode("6283b77fbdf020ce43a55149457f8ca1a3bec1ca60cd177163a7402e1a3945e4")
+            .unwrap();
+        assert_eq!(
+            cid_from_value(&Value::Bytes(d.clone())).as_deref(),
+            Some("QmUyD9wPyVCkDotF9oUoQHcMrhCMLU9Sqi6HY7BrttLPsq")
+        );
+        // Anything that is not exactly 32 bytes is not a sha2-256 digest, whatever else it may be.
+        for n in [0usize, 20, 31, 33, 64] {
+            assert_eq!(
+                cid_from_value(&Value::Bytes(vec![0xab; n])),
+                None,
+                "{n} bytes must not be read as a digest"
+            );
+        }
+    }
+
+    /// The refusal that matters. `Value::Hash32` holds `keccak(value)` for an *indexed dynamic*
+    /// parameter, not the value - so those 32 bytes have exactly the shape of a digest and are not
+    /// one. Accepting them would mint a perfectly well-formed CID for a document that has never
+    /// existed anywhere, and the fetch would simply time out against every gateway in turn with
+    /// nothing to say about why.
+    ///
+    /// Written against the *same bytes* as the test above, so it cannot pass by accident: the only
+    /// thing separating them is the variant, which is precisely the thing under test.
+    #[test]
+    fn an_indexed_dynamic_topic_is_refused_even_though_it_is_32_bytes() {
+        use crate::registry::Value;
+        let mut d = [0u8; 32];
+        d.copy_from_slice(
+            &hex::decode("6283b77fbdf020ce43a55149457f8ca1a3bec1ca60cd177163a7402e1a3945e4")
+                .unwrap(),
+        );
+        assert!(cid_from_value(&Value::Bytes(d.to_vec())).is_some());
+        assert_eq!(
+            cid_from_value(&Value::Hash32(d)),
+            None,
+            "keccak(value) is not a content address and must never be fetched as one"
+        );
+    }
+
+    /// The string forms still route through `cid_from_any` unchanged - the new variant must not have
+    /// cost the old one anything.
+    #[test]
+    fn the_string_forms_still_resolve_through_the_value_entry_point() {
+        use crate::registry::Value;
+        for s in [
+            "QmR7XFmkBnAsRwZTUt4kx4Fp5FEHwWKgSJvcGnnHNcvNAB",
+            "ipfs://QmR7XFmkBnAsRwZTUt4kx4Fp5FEHwWKgSJvcGnnHNcvNAB",
+            "https://gateway.pinata.cloud/ipfs/QmR7XFmkBnAsRwZTUt4kx4Fp5FEHwWKgSJvcGnnHNcvNAB",
+        ] {
+            assert_eq!(
+                cid_from_value(&Value::Str(s.to_string())).as_deref(),
+                Some("QmR7XFmkBnAsRwZTUt4kx4Fp5FEHwWKgSJvcGnnHNcvNAB"),
+                "failed on {s}"
+            );
+        }
+        assert_eq!(cid_from_value(&Value::Str("not a cid".into())), None);
+        assert_eq!(cid_from_value(&Value::U64(42)), None);
     }
 }
