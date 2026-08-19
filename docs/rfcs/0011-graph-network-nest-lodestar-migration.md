@@ -3,6 +3,55 @@
 - Status: **Parked after pilot (2026-07-18)** - the wedge is proven in production; the full migration is not done. See "Implementation status" below.
 - Update (2026-07-20): the separate `graph-network-nest` repo - a byte-identical clone of `horizon-nest` that never diverged - has been **retired**. The remaining network-subgraph surface (Indexer Directory, Curation, Epochs) is now planned as an **extension of `horizon-nest`**, not a second nest. This RFC stands as the migration record; "the graph-network nest" throughout means that intended-superset work, now folded into `horizon-nest`.
 
+## Status update (2026-08-19) - measured, not recalled
+
+Counted in `~/Projects/lodestar`, not remembered:
+
+- **120 route files** under `src/app/api`. **39 import the gateway client. 2 import nuthatch.**
+- The two are `delegation-events` and `developer-activity` - **exactly the two this RFC recorded as
+  migrated when it parked.** Nothing has moved in a month; recent Lodestar commits went into x402
+  pay-per-query and the playground.
+- **Goal 4 is untouched.** `src/lib/ingest/` still holds eight modules (allocations, delegations,
+  disputes, epochs, indexers, network-snapshot, qos, rav) and imports `../subgraph` in seven places.
+
+**The dependency is load-bearing twice**, which the original goals imply but do not state: directly for
+39 routes, and *indirectly* through the cron pipeline that feeds `@/lib/db`, which **53 routes read**.
+Killing the six `cron/ingest-*` routes therefore releases 53 more, and is the highest-leverage single
+slice available.
+
+### Can Lodestar reach zero `GRAPH_API_KEY`? No, and the split is three ways
+
+**1. Some features *are* gateway access.** `bounty-query`, `subgraph-playground`, `studio`, `x402`,
+`gateway`. Their purpose is running user-supplied queries against arbitrary third-party subgraphs.
+Removing the key removes the feature, not a dependency. Not a migration target.
+
+**2. Some data is structurally off-chain.** `indexer-qos`, `indexer-status`, `indexing-status`,
+`cron/check-subgraph-health`, `indexer-node-health`, `chain-lag`, `gateway-probe`. Gateway QoS and
+indexing progress are emitted by no contract, so **no indexer can derive them, nuthatch included**.
+The same boundary [port-queue-nest.md](../launch/port-queue-nest.md) §6 records: on-chain data answers
+*unserved*, never *unhealthy*. A non-gateway source may exist (indexer status endpoints are directly
+queryable; `gib/`'s QoS work looks adjacent) but it is not nest-shaped.
+
+**3. Some is other chains and other APIs.** `price`, `token-metrics`, `ens`.
+
+### What can reach zero, which is most of it
+
+Roughly **27 of the 39** are plain on-chain event data: `curators`, `delegation-flows`, `epochs`,
+`grt-flow`, `indexers`, `indexer-stake-history`, `indexer-trends`, `network-stats`, `payments`,
+`portfolio`, `provisions`, `rewards-history`, `poi`, `subgraph-curation`, `subgraph-deployments`,
+`subgraph-history`, `subgraph-versions`, `apr-provenance`, and the six `cron/ingest-*` jobs.
+
+**So the goal is not "no key". It is "the key is no longer load-bearing for Lodestar's own
+dashboard"** - it stays for the features that exist to query The Graph, and disappears from everything
+that merely reads the network's own state. That claim is demonstrable; "no key" is not, and chasing it
+would mean deleting product.
+
+### The blocked pair
+
+`subgraph-names` and `subgraph-search` cannot leave the gateway until nuthatch resolves IPFS content:
+subgraph display names and metadata live in IPFS-pinned JSON behind the GNS, not on chain. They are
+**RFC-0037's first named customer**, recorded in that RFC's §7.
+
 ## Implementation status (parked 2026-07-18)
 
 **The pilot shipped and the wedge is proven.** Two Lodestar panels serve live from nuthatch in

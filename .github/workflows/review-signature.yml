@@ -60,6 +60,9 @@ jobs:
           # into the shell source text before bash sees it, so a PR body containing a backtick or
           # `$(...)` would execute on the runner. A PR body is attacker-controlled by definition.
           PR_BODY: ${{ github.event.pull_request.body }}
+          # Same rule, same reason. A login cannot contain shell metacharacters, but the habit is
+          # the control - not the judgement about which values happen to be safe today.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -uo pipefail
 
@@ -74,6 +77,31 @@ jobs:
           # quietly locale-dependent, not because it is doing work today.
           signed() {  # signed <body> -> 0 if that body carries a signature
             printf '%s' "$1" | tr -d '\r' | grep -qE '^Reviewed-by:[[:space:]]*[^[:space:]]'
+          }
+
+          # The one forgery this mechanism can actually detect (nuthatch#619).
+          #
+          # Reviewers here sign as firm agents - `Iris`, `Rowan` - which are not GitHub accounts, so
+          # no API call can confirm that the named party exists, let alone that they read anything.
+          # This check is an **attestation**, not a verification, and #619 is right that no predicate
+          # over the body alone can make it otherwise: the body is written by the party the rule
+          # constrains.
+          #
+          # What *is* decidable is whether the signature names the author. `Reviewed-by: cargopete`
+          # on a PR cargopete opened asserts, in writing, that nobody else read it. That is a claim
+          # the check can refuse without guessing, and refusing it costs nothing: it has no false
+          # positives, because a genuine reviewer is by definition not the author.
+          #
+          # Deliberately NOT a denylist of `pending`/`tbd`/`todo`. #619 rejects that shape and is
+          # correct to - it is a finite list against an infinite set, and the next placeholder is
+          # `Reviewed-by: -`. This closes the one case that is decidable and claims nothing about
+          # the rest.
+          self_signed() {  # self_signed <body> <author> -> 0 if the signature names the author
+            [ -n "$2" ] || return 1
+            printf '%s' "$1" | tr -d '\r' \
+              | grep -E '^Reviewed-by:' \
+              | sed 's/^Reviewed-by:[[:space:]]*//' \
+              | grep -qiE "^${2}([[:space:]]|\\(|$)"
           }
 
           # The matcher proves itself in BOTH directions before it is allowed to judge anything.
@@ -100,14 +128,50 @@ jobs:
           case_is 1 'not at column 1'      '  Reviewed-by: Iris'
           case_is 1 'mid-line mention'     'I think Reviewed-by: Iris would be good'
           case_is 1 'prose mention only'   'This was reviewed by Iris, honest.'
+
+          # The self-review predicate proves itself in both directions too, for the same reason: a
+          # rule asserted only where it should fire is a rule that can stop firing unnoticed. These
+          # are the cases that die under mutation - drop the `-i` and 'CargoPete' goes green; drop
+          # the trailing `([[:space:]]|\(|$)` group and 'different login, same prefix' reds wrongly.
+          self_is() {  # self_is <want-exit> <label> <body> <author>
+            if self_signed "$3" "$4"; then got=0; else got=1; fi
+            if [ "$got" != "$1" ]; then
+              echo "::error::self-review self-test failed: '$2' returned $got, wanted $1"
+              selftest=1
+            fi
+          }
+          self_is 0 'author signs plainly'      'Reviewed-by: cargopete'                 'cargopete'
+          self_is 0 'author signs with detail'  'Reviewed-by: cargopete (NIG-235)'       'cargopete'
+          self_is 0 'author, different case'    'Reviewed-by: CargoPete'                 'cargopete'
+          self_is 1 'someone else signs'        'Reviewed-by: Iris (NIG-235)'            'cargopete'
+          self_is 1 'different login, prefix'   'Reviewed-by: cargopete-bot'             'cargopete'
+          self_is 1 'author named in prose'     'Thanks cargopete. Reviewed-by: Iris'    'cargopete'
+          self_is 1 'no signature at all'       'Fixes a thing.'                         'cargopete'
+          self_is 1 'author unknown'            'Reviewed-by: cargopete'                 ''
+
           if [ "$selftest" != 0 ]; then
             echo "::error::The signature matcher is broken, so this run is judging nothing. Fix .github/workflows/review-signature.yml - do not merge past this by disabling the check."
             exit 1
           fi
 
           if signed "$PR_BODY"; then
+            if self_signed "$PR_BODY" "$PR_AUTHOR"; then
+              printf '%s' "$PR_BODY" | tr -d '\r' | grep -E '^Reviewed-by:' | sed 's/^/  /'
+              cat <<MSG
+          ::error::The \`Reviewed-by:\` line names \`${PR_AUTHOR}\`, who opened this PR. A signature
+          that names its own author asserts in writing that nobody else read the change.
+
+          Get it reviewed by someone who is not you, and put their name on the line.
+          MSG
+              exit 1
+            fi
             echo "Signed:"
             printf '%s' "$PR_BODY" | tr -d '\r' | grep -E '^Reviewed-by:' | sed 's/^/  /'
+            echo
+            echo "Note: this check confirms a signature is present and is not the author's own."
+            echo "It cannot confirm that the named reviewer exists or read anything - reviewers here"
+            echo "sign as firm agents rather than GitHub accounts. This is an attestation, not a"
+            echo "verification. See nuthatch#619."
             exit 0
           fi
 
