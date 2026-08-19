@@ -84,10 +84,10 @@ impl IpfsDecl {
 
 /// The CID inside whatever a column happens to hold.
 ///
-/// **Found by porting a real subgraph.** DOUDOCHAIN_V2's `seriesMetaDataURI` does not hold a bare CID
-/// - it holds `https://gateway.pinata.cloud/ipfs/QmR7XF…` and
-/// `https://lime-basic-thrush-351.mypinata.cloud/ipfs/QmWyCg…`. A resolver that only understood bare
-/// CIDs resolved nothing at all, which is what the first run of that port showed.
+/// **Found by porting a real subgraph.** DOUDOCHAIN_V2's `seriesMetaDataURI` holds no bare CID at
+/// all: its values are `https://gateway.pinata.cloud/ipfs/QmR7XF…` and
+/// `https://lime-basic-thrush-351.mypinata.cloud/ipfs/QmWyCg…`. A resolver that understood only bare
+/// CIDs resolved nothing whatever, which is what the first run of that port showed.
 ///
 /// **The location is discarded and only the content address is kept**, and that is a security
 /// property rather than tidiness. The string comes from a log, so anybody who can emit an event can
