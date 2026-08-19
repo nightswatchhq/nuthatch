@@ -50,6 +50,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // RFC-0023 tier 3's archive endpoints. Carried on `Config` because every layer below already
     // takes `&Config`, and `#[serde(skip)]` keeps them out of `nuthatch.toml` and so out of the NID.
     config.state_rpc_urls = args.state_rpc.clone();
+    config.ipfs_gateways = args.ipfs.clone();
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. `--rpc` overrides are tried ahead of the configured
     // endpoints without touching the nest's config on disk.
@@ -2048,6 +2049,15 @@ async fn build_nest(
         addresses,
         topic0s,
         start_block,
+        ipfs: config.ipfs.clone(),
+        ipfs_gateways: if config.ipfs_gateways.is_empty() {
+            crate::subgraph_import::DEFAULT_IPFS_GATEWAYS
+                .iter()
+                .map(|g| g.to_string())
+                .collect()
+        } else {
+            config.ipfs_gateways.clone()
+        },
         top_level_calls: config.extract.top_level_calls,
         call_registry: call_registry.clone(),
         chain_id: config.nest.chain_id,
@@ -3147,6 +3157,13 @@ pub struct NestIngest {
     /// The nest's earliest vendored deployment block (the min of the contracts' `start_block`s), or
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
+    /// RFC-0037: declared IPFS resolutions, in config order - which fixes each row's slot in the
+    /// reserved band and therefore its key.
+    ipfs: Vec<crate::ipfs::IpfsDecl>,
+    /// The gateways (or local node) declared resolutions are fetched through. Never part of the
+    /// nest's identity: a gateway is an access path, and content addressing is what makes two
+    /// operators' answers comparable regardless of which one they used.
+    ipfs_gateways: Vec<String>,
     /// RFC-0038 §5: whether this nest decodes **top-level calls** - transactions sent directly to its
     /// contracts, which is what a subgraph's `callHandlers` fire on.
     top_level_calls: bool,
@@ -3722,6 +3739,103 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
+        // RFC-0037: resolve the IPFS documents this window's rows point at.
+        //
+        // Deduped by CID before any fetch, because a CID *is* a content address: a thousand rows
+        // naming the same document are one fetch and one row. Every body is verified against its CID
+        // before it is stored (`crate::cid`), so a gateway answering HTTP 200 with prose - which they
+        // really do - cannot become a nest's data.
+        //
+        // Bounded, and failure is absence rather than error: an unresolved document simply has no
+        // row, which is what the `LEFT JOIN` shape expects. Tip-following must never wait on a
+        // gateway indefinitely.
+        if !self.ipfs.is_empty() {
+            const MAX_FETCHES_PER_WINDOW: usize = 64;
+            let mut budget = MAX_FETCHES_PER_WINDOW;
+            let mut per_block: std::collections::BTreeMap<u64, Vec<(usize, String)>> =
+                std::collections::BTreeMap::new();
+            for (i, d) in self.ipfs.iter().enumerate() {
+                let col = d.column();
+                let mut seen = std::collections::HashSet::new();
+                let mut src: Vec<&crate::registry::DecodedRow> =
+                    rows.iter().filter(|r| r.table == d.on).collect();
+                src.sort_by_key(|r| (r.block_number, r.log_index));
+                for r in src {
+                    let Some(cid) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v) else {
+                        continue;
+                    };
+                    let crate::registry::Value::Str(cid) = cid else {
+                        continue;
+                    };
+                    // The column may hold a bare CID, an `ipfs://` URI, or a full gateway URL - a
+                    // real subgraph port turned up all three. Only the content address is kept: the
+                    // string comes from a log, so fetching the host it names would let whoever
+                    // emitted the event choose what this process connects to.
+                    let Some(cid) = crate::ipfs::cid_from_any(cid) else {
+                        continue;
+                    };
+                    if !seen.insert(cid.to_string()) {
+                        continue;
+                    }
+                    per_block
+                        .entry(r.block_number)
+                        .or_default()
+                        .push((i, cid.to_string()));
+                }
+            }
+            for (block, items) in per_block {
+                let hash = source.block_hash(block).await?.unwrap_or_default();
+                let ctx = crate::ipfs::BlockCtx {
+                    number: block,
+                    hash: &hash,
+                    timestamp: timestamps.get(&block).copied().unwrap_or(0),
+                    timestamps: self.registry.timestamps(),
+                };
+                for (slot, (i, cid)) in items.into_iter().enumerate() {
+                    if budget == 0 {
+                        tracing::warn!(
+                            "ipfs: window {next}..={to} hit the {MAX_FETCHES_PER_WINDOW}-fetch \
+                             budget; the remaining documents stay unresolved and will be retried \
+                             when a resolver runs out of band (RFC-0037)"
+                        );
+                        break;
+                    }
+                    budget -= 1;
+                    match crate::subgraph_import::fetch_ipfs(
+                        &cid,
+                        &self.ipfs_gateways,
+                        crate::subgraph_import::Origin::Manifest,
+                    )
+                    .await
+                    {
+                        Ok(content) => {
+                            // `fetch_ipfs` only returns a body that verified, or one it warned about
+                            // as too large for single-block re-encoding. Record which, so a consumer
+                            // can tell a proven document from an accepted-unverified one.
+                            let verified = content.len() <= 256 * 1024;
+                            let row = crate::ipfs::to_row(
+                                &self.ipfs[i].name,
+                                &cid,
+                                &content,
+                                verified,
+                                slot,
+                                &ctx,
+                            );
+                            to_store.push((
+                                Store::entity_key(row.block_number, row.log_index),
+                                row.to_json().to_string(),
+                            ));
+                            stored += 1;
+                        }
+                        Err(e) => tracing::warn!(
+                            "ipfs: {cid} unresolved ({e:#}) - no row written, which is what a \
+                             LEFT JOIN reads as 'not yet'"
+                        ),
+                    }
+                }
+            }
+        }
+
         // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
         // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
         // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
@@ -7605,6 +7719,175 @@ template = "pool"
         );
         drop(ok_nest);
         drop(ok_state);
+        handle.abort();
+    }
+
+    /// A stub IPFS gateway serving one fixed body for any path.
+    async fn stub_gateway(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Router};
+        let app = Router::new().route("/{*rest}", get(move || async move { body.to_string() }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/ipfs/"), handle)
+    }
+
+    /// ABI-encode a single non-indexed `string` into a log's data field.
+    fn abi_string(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = format!("0x{:064x}{:064x}", 32, b.len());
+        let mut padded = b.to_vec();
+        padded.resize(b.len().div_ceil(32) * 32, 0);
+        out.push_str(&hex::encode(padded));
+        out
+    }
+
+    async fn run_ipfs_nest(
+        dir: &std::path::Path,
+        gateway: String,
+        uri: &str,
+    ) -> Vec<(String, serde_json::Value)> {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ip\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"nft\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/nft.json\"\n\n\
+             [[ipfs]]\nname = \"token_metadata\"\non = \"nft__uri_set\"\ncid_column = \"uri\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/nft.json"),
+            r#"[{"type":"event","name":"UriSet","inputs":[{"name":"uri","type":"string","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir).unwrap();
+        config.ipfs_gateways = vec![gateway];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .expect("an ipfs nest must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "nft__uri_set")
+                    .expect("fixture must expose nft__uri_set")
+                    .topic0
+            )
+        );
+        // Two events naming the *same* document, so dedupe is exercised rather than assumed.
+        let logs: Vec<crate::rpc::Log> = (0..2)
+            .map(|i| crate::rpc::Log {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                topics: vec![topic0.clone()],
+                data: abi_string(uri),
+                block_number: 9,
+                block_hash: format!("0x{:064x}", 9),
+                tx_hash: format!("0xt{i}"),
+                log_index: i,
+            })
+            .collect();
+        nest.process_window(source.as_ref(), &logs, 9, 9, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let store = Store::open(&dir.join(DB_FILE)).unwrap();
+        store
+            .entity_keys()
+            .unwrap()
+            .into_iter()
+            .map(|k| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&store.get_entity(&k).unwrap().unwrap()).unwrap();
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// **RFC-0037, end to end: a document a row points at is fetched, verified and stored.**
+    ///
+    /// The last thing a subgraph could do that a nest could not. `file/ipfs` data sources index the
+    /// content behind a CID; `subgraph_import` said nuthatch "indexes the metadata hash as a column
+    /// value and stops there".
+    #[tokio::test]
+    async fn a_declared_ipfs_document_is_resolved_verified_and_stored() {
+        const DOC: &str = r#"{"name":"Nuthatch #1","image":"ipfs://Qm..."}"#;
+        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
+        let (gateway, handle) = stub_gateway(DOC).await;
+        let dir = tempfile::tempdir().unwrap();
+        let rows = run_ipfs_nest(dir.path(), gateway, &cid).await;
+
+        let resolved: Vec<_> = rows
+            .iter()
+            .filter(|(_, v)| v["table"] == "token_metadata")
+            .collect();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "two events naming one document owe ONE fetch and ONE row - a CID is a content address: \
+             {rows:?}"
+        );
+        let (key, row) = resolved[0];
+        assert_eq!(row["content"], DOC, "the document itself must be stored");
+        assert_eq!(row["cid"], cid);
+        assert_eq!(row["verified"], true, "a small document is provable");
+        let ordinal: u64 = key.rsplit('-').next().unwrap().parse().unwrap();
+        assert!(
+            (crate::registry::IPFS_ROW_LOG_INDEX_BASE..crate::registry::TX_CALL_ROW_LOG_INDEX_BASE)
+                .contains(&ordinal),
+            "resolutions belong in their own slice of the reserved band, clear of logs, reads and \
+             calls: {ordinal}"
+        );
+        handle.abort();
+    }
+
+    /// **A gateway that answers with something else must produce no row at all.**
+    ///
+    /// This is the whole argument for letting IPFS feed canonical state. An HTTP enricher can hand
+    /// two operators different answers with neither able to tell; a CID cannot, because the bytes are
+    /// checkable. Absence is the honest outcome and a `LEFT JOIN` reads it as "not yet" - a *wrong*
+    /// document stored as if it were right would be the silent-wrong-answer failure this project
+    /// cares most about.
+    ///
+    /// The body is one a real gateway really returned while this was being written.
+    #[tokio::test]
+    async fn a_gateway_serving_the_wrong_document_yields_no_row() {
+        const DOC: &str = r#"{"name":"Nuthatch #1","image":"ipfs://Qm..."}"#;
+        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
+        let (gateway, handle) = stub_gateway(
+            "Unable to retrieve content within timeout period: timeout occurred after finding 3 \
+             provider(s) and connecting to 3 (phase: connecting to providers)",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let rows = run_ipfs_nest(dir.path(), gateway, &cid).await;
+
+        assert!(
+            !rows.iter().any(|(_, v)| v["table"] == "token_metadata"),
+            "a body that does not hash to the CID must not be stored as the document: {rows:?}"
+        );
+        // The events themselves are still indexed - only the resolution is absent, which is exactly
+        // the shape the side-table design exists to express.
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, v)| v["table"] == "nft__uri_set")
+                .count(),
+            2,
+            "the source rows are unaffected: {rows:?}"
+        );
         handle.abort();
     }
 

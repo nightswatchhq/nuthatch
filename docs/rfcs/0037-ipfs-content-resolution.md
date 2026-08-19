@@ -1,6 +1,6 @@
 # RFC-0037: IPFS content resolution - a verified, content-addressed side table
 
-**Status:** Draft (2026-08-19). Nothing is built. Depends on 0001 (decode registry and vendored ABIs),
+**Status:** Draft (2026-08-19). **Slices 1-3 built**; slice 4 (local node) is a `--ipfs` flag away and is done in spirit. Depends on 0001 (decode registry and vendored ABIs),
 0023 §3 (the pinned-call cache whose machinery this reuses rather than duplicates), 0013 §3 (sealed
 segments the resolved documents spill into). Adjacent: 0024 (the sibling "irreducible residue" engine).
 Corrects an implication in `src/subgraph_import.rs`. Blocks: subgraph ports whose entities are

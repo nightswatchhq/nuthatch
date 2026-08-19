@@ -103,6 +103,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
 
     let config = Config {
         state_rpc_urls: Vec::new(),
+        ipfs_gateways: Vec::new(),
+        ipfs: Vec::new(),
         nest: Nest {
             name: nest_name(&dir),
             chain: chain.name.clone(),
@@ -488,12 +490,22 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
 
     // ── templates → [[templates]] ────────────────────────────────────────
     let mut templates: Vec<crate::config::Template> = Vec::new();
+    // `file/ipfs` templates, reported separately because their remedy is `[[ipfs]]`, not `[[factories]]`.
+    let mut ipfs_templates: Vec<String> = Vec::new();
     // Manifest name → the alias it actually settled on, so factory rules can be emitted
     // against the same name the `[[templates]]` entry carries.
     let mut template_alias: BTreeMap<String, String> = BTreeMap::new();
     for t in &manifest.templates {
         if !t.is_evm() {
-            notes.push(format!("skipped template `{}` (kind `{}`)", t.name, t.kind));
+            // A `file/ipfs` template is not an unportable thing any more (RFC-0037): it is a
+            // resolution nuthatch can express, once somebody says which column carries the CID.
+            // Which column that is lives in the mapping WASM - same reason a factory's rule does -
+            // so the manifest cannot tell us, but "we cannot do this" is now the wrong answer.
+            if t.kind.starts_with("file/ipfs") {
+                ipfs_templates.push(t.name.clone());
+            } else {
+                notes.push(format!("skipped template `{}` (kind `{}`)", t.name, t.kind));
+            }
             continue;
         }
         let Some(abi_ref) = t.own_abi().cloned() else {
@@ -568,6 +580,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
     let config = Config {
         state_rpc_urls: Vec::new(),
+        ipfs_gateways: Vec::new(),
+        ipfs: Vec::new(),
         nest: Nest {
             name: nest_name(&dir),
             chain: chain.name.clone(),
@@ -630,6 +644,24 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             "\n  The warnings above are work the manifest cannot do for us: which template a \
              factory creates lives in the mapping WASM, not in the manifest. Resolve them by \
              adding [[factories]] rules to nuthatch.toml."
+        );
+    }
+    if !ipfs_templates.is_empty() {
+        // Deliberately *not* filed with the warnings above, and deliberately not called "skipped":
+        // the remedy is a different config block, and telling someone to write `[[factories]]` for a
+        // file template sends them to a rule that cannot express it.
+        println!(
+            "\n  {} `file/ipfs` template(s) - {} - index the *content* behind a CID. nuthatch \
+             resolves those (RFC-0037), but which column carries the CID lives in the mapping WASM \
+             rather than the manifest, so it needs one line each:\n\n    \
+             [[ipfs]]\n    name = \"token_metadata\"     # the table to put documents in\n    \
+             on = \"<table>\"                # the table whose rows carry the CID\n    \
+             cid_column = \"<column>\"       # which column that is\n\n  \
+             Then run with --ipfs <gateway-or-your-own-node>. Every document is verified against its \
+             CID before it is stored, and one that will not resolve leaves no row rather than a wrong \
+             one.",
+            ipfs_templates.len(),
+            ipfs_templates.join(", ")
         );
     }
     println!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
@@ -701,6 +733,13 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     // RFC-0023 tier 3: a declared `[[calls]]` read is a table too, and it moves the decode identity
     // for the same reason `[extract]` does - two nests differing only in what they read must not be
     // mistaken for the same decode version by segment reuse.
+    if !config.ipfs.is_empty() {
+        schema.extend(crate::ipfs::schema(&config.ipfs, registry.timestamps()));
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, hash);
+        sha2::Digest::update(&mut h, crate::ipfs::decl_hash(&config.ipfs));
+        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
+    }
     if !config.calls.is_empty() {
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
         let mut h = <sha2::Sha256 as sha2::Digest>::new();
@@ -1982,14 +2021,20 @@ dataSources:
 
     #[tokio::test]
     async fn from_subgraph_recommendation_is_followable_end_to_end() {
-        let (gateway, _gw) = fake_gateway(vec![
-            ("/manifest.yaml", BSC_MANIFEST),
-            (
-                "/ipfslike/Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s",
-                POOL_ABI,
-            ),
-        ])
-        .await;
+        // The CID is *derived from the content*, not invented. Before RFC-0037 slice 1 nothing
+        // checked the two matched, so this fixture named a CID its body did not hash to - and the
+        // test passed. It does not any more, which is the verification working.
+        let pool_cid = crate::cid::cid_v0_for(POOL_ABI.as_bytes());
+        // Leaked deliberately: `fake_gateway` wants `'static` paths and this is a test that ends.
+        let pool_path: &'static str = Box::leak(format!("/ipfslike/{pool_cid}").into_boxed_str());
+        // The manifest names the ABI by CID, so it has to name the *real* one too.
+        let manifest: &'static str = Box::leak(
+            BSC_MANIFEST
+                .replace("Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s", &pool_cid)
+                .into_boxed_str(),
+        );
+        let (gateway, _gw) =
+            fake_gateway(vec![("/manifest.yaml", manifest), (pool_path, POOL_ABI)]).await;
         let (rpc_url, _rpc) = fake_chain_id_rpc(56).await;
 
         let dir = tempfile::tempdir().unwrap();

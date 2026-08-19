@@ -1,6 +1,6 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). **Slices 0, 1, 2 and 4 built** (see §6); slice 3 (IPFS) outstanding. Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** Draft (2026-08-19). **All five slices built** (see §6). The claim in the title is met, with one stated limit (§6 slice 3). Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
@@ -188,11 +188,29 @@ thousands - a narrow band would have recreated the very bug slice 0 fixed. And a
 parameter is refused as an argument**: the log holds `keccak(value)`, so the original is unrecoverable,
 and encoding the hash would produce a well-formed call asking a question nobody meant.
 
-**Slice 3 - IPFS. Outstanding, and larger than RFC-0037 assumed.** A v0 CID hashes the **dag-pb
-node**, not the bytes a gateway returns, so honest verification means fetching raw blocks
-(`?format=raw`) and unwrapping UnixFS. There is also no base58, base32 or multihash crate in the tree,
-so it is hand-rolled or a dependency decision under `deny.toml`. Worth its own pass rather than being
-squeezed in beside these.
+**Slice 3 - IPFS. DONE**, and it was larger than RFC-0037 assumed. A v0 CID hashes the **dag-pb
+node**, not the bytes a gateway returns, so `sha256(what came back)` never matches. Fetching raw
+blocks would have meant three code paths for three gateway shapes; instead `crate::cid` **re-encodes**
+the returned bytes into UnixFS/dag-pb framing and compares, which needs no gateway cooperation. base58,
+base32, varint and two protobuf messages are hand-rolled, because no such crate is in the tree and
+`deny.toml` makes every dependency a decision.
+
+`[[ipfs]]` declares `on` + `cid_column`; documents are deduped by CID before any fetch, verified
+before storage, and stored in their own slice of the reserved band. **Failure is absence, not error:**
+an unresolved document has no row, which is exactly what the `LEFT JOIN` design expects, so a gateway
+that will not answer leaves a hole rather than failing the nest.
+
+**Stated limit.** Resolution runs inline in the window under a 64-fetch budget, not out of band behind
+the cursor as §3 of RFC-0037 asks. That wants a queue and a worker and is the follow-up; the budget is
+what keeps tip-following from waiting on a gateway indefinitely meanwhile. Documents over 256 KiB are
+multi-block and cannot be verified by re-encoding: they are accepted with `verified = false` and a
+loud warning, never silently and never as if proven.
+
+**The bug found while building it.** Fetching one real manifest CID, ipfs.io answered `Unable to
+retrieve content within timeout period…` and Pinata answered `The request timed out searching for a
+file on the non-pinata IPFS network`, both HTTP 200; only The Graph's gateway served the document.
+Two of three would have been vendored as a nest's ABI, because the only check was non-empty. Both
+strings are now test fixtures.
 
 **Slice 4 - top-level calls from ordinary RPC. DONE.** `[extract] top_level_calls`, sourced from
 `eth_getBlockByNumber(b, true)` via a new `Source::block_bodies` that shares `block_headers`' pacing

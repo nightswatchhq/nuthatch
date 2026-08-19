@@ -61,6 +61,21 @@ pub struct Config {
     /// string.
     #[serde(skip)]
     pub state_rpc_urls: Vec<String>,
+    /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
+    /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
+    ///
+    /// `#[serde(skip)]` for a different reason than `state_rpc_urls`, and the reason matters: a
+    /// gateway is an *access path*, not data identity. Two operators resolving the same CID through
+    /// different gateways must get the same bytes - that is what content addressing means - so baking
+    /// the gateway into the nest's content address would make the same data two different nests.
+    ///
+    /// Empty falls back to the public defaults. An operator who wants no third party points this at
+    /// their own node, which is what non-negotiable 3 requires of every optional integration.
+    #[serde(skip)]
+    pub ipfs_gateways: Vec<String>,
+    /// RFC-0037: declared IPFS resolutions. Absent → this nest never touches a gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipfs: Vec<crate::ipfs::IpfsDecl>,
     #[serde(default)]
     pub contracts: Vec<Contract>,
     /// Optional sanctions-screening stage (RFC-0008 C2). When present with a non-empty `lists`, the
@@ -472,6 +487,9 @@ impl Config {
         for c in &cfg.calls {
             c.validate()?;
         }
+        for i in &cfg.ipfs {
+            i.validate()?;
+        }
         cfg.refuse_tip_finality_webhooks()?;
         Ok(cfg)
     }
@@ -607,6 +625,8 @@ impl Config {
         let v1: V1 = toml::from_str(raw)?;
         Ok(Config {
             state_rpc_urls: Vec::new(),
+            ipfs_gateways: Vec::new(),
+            ipfs: Vec::new(),
             nest: Nest {
                 name: "nest".to_string(),
                 chain: v1.chain,
@@ -676,6 +696,8 @@ mod tests {
     fn roundtrips_a_v2_file() {
         let cfg = Config {
             state_rpc_urls: Vec::new(),
+            ipfs_gateways: Vec::new(),
+            ipfs: Vec::new(),
             nest: Nest {
                 name: "my-nest".into(),
                 chain: "mainnet".into(),

@@ -17,6 +17,7 @@ pub mod calls;
 pub mod chains;
 pub mod check;
 pub mod chunker;
+pub mod cid;
 pub mod cli;
 pub mod config;
 /// The control-plane HTTP API (RFC-0022 §3): declare what the fleet should run.
@@ -34,6 +35,7 @@ pub mod flags;
 pub mod graft;
 pub mod health;
 pub mod indexer;
+pub mod ipfs;
 pub mod labels;
 pub mod lifecycle;
 pub mod lists;

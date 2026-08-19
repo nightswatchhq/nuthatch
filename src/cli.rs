@@ -840,6 +840,16 @@ pub struct DevArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
+    /// IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable).
+    ///
+    /// Empty falls back to public gateways. Point it at your own node if you want no third party in
+    /// the path - non-negotiable 3 requires that to be possible for every optional integration.
+    /// Not a `nuthatch.toml` field: a gateway is an access path, and two operators resolving the same
+    /// CID through different gateways must get the same bytes, so it must not enter the nest's
+    /// content address.
+    #[arg(long = "ipfs", value_name = "URL")]
+    pub ipfs: Vec<String>,
+
     /// Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable).
     ///
     /// A pinned `eth_call` needs historical state, which the ingestion endpoints usually cannot
