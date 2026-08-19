@@ -305,3 +305,56 @@ signal *shares* and the network's is `signalledTokens` in GRT. Different units, 
 
 `HorizonStaking`'s pending implementation is still unverified on Sourcify, so its upgrade remains
 undiffable (§5a). That is the one gate item left, and it is waiting on somebody else's verification.
+
+---
+
+## 10. The queue, triaged (2026-08-19)
+
+The five verified subjects from §9, with their manifests fetched and read. This is what the loop
+actually has to work with, and one of them is a finding rather than a job.
+
+| Subject | Signalled | Chain | Shape | Portable |
+|---|---:|---|---|---|
+| **Substreams Uniswap v3 Ethereum** | 54,724 GRT | mainnet | **0 event sources, 2 `kind: substreams`** | **No** |
+| estfor | 26,774 GRT | fantom | 46 event sources | Yes |
+| Spookyswap | 21,491 GRT | fantom | 4 sources + 1 template | **Ported** |
+| Peeranha | 10,673 GRT | matic | 10 event sources | Yes |
+| Graph Network Activity - Arb | 9,954 GRT | arbitrum-one | 12 event sources | Yes |
+
+### The largest one is structurally out of reach, and it is worth saying why
+
+`Substreams Uniswap v3 Ethereum` declares **no `eventHandlers` at all**. Its entire data source is a
+Substreams package pinned by CID:
+
+```yaml
+- kind: substreams
+  mapping: { kind: substreams/graph-entities }
+  source: { package: { file: { /: /ipfs/QmfZgQxwtsejAuf8rr1CFj6nuJ2C79oMQGQAPFm5uhEz6z } } }
+```
+
+There is nothing for `init --from-subgraph` to read: no ABIs, no events, no contracts. This is **not**
+one of RFC-0038's three named gaps - it is a different kind of gap entirely. Those are features a nest
+lacks; this is a subgraph that is not event-shaped, so the porting *premise* does not apply.
+
+**And it is the highest-signal unserved deployment on the queue.** The single biggest opportunity the
+port loop can see needs Substreams ingestion, which nuthatch does not have and
+[RFC-0014 deliberately defers](../rfcs/0014-firehose-class-extraction-traces-and-state.md) - the same
+RFC whose *name* was mistaken for Substreams support in the strategy review this morning
+([strategy-review-2026-08-19.md](strategy-review-2026-08-19.md) §2).
+
+That is worth stating plainly rather than filing as "skipped": if Substreams-powered subgraphs are a
+growing share of what goes unserved, the port loop's ceiling is lower than the queue's raw signal
+suggests, and the case for Substreams ingestion changes from "reach" to "reachable demand".
+
+### What the chain work bought
+
+Every portable subject is on a chain nuthatch can now index, and **two of the three only became
+reachable today**: Polygon shipped in #646, and Fantom's endpoints were measured for Spookyswap. Before
+this morning, three of the four portable subjects would have needed a chain entry first.
+
+### Next subjects, in signal order
+
+1. **estfor** (fantom) - the endpoints are already proven by Spookyswap; 46 sources is the largest port
+   attempted so far.
+2. **Peeranha** (matic) - first real use of the Polygon entry.
+3. **Graph Network Activity - Arb** - Arbitrum, and adjacent to work already done.
