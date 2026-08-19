@@ -254,6 +254,7 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     // `Config.calls` was excused here as "parses but is never executed (#268)". It executes now, so
     // the excuse expired and `[[calls]]` is documented in the reference instead.
     ("Config.state_rpc_urls", "`#[serde(skip)]` - the tier-3 archive endpoint comes from `--state-rpc` and is deliberately never a config key, because it carries an API key and this file is pinned into the nest's content address"),
+    ("Config.ipfs_gateways", "`#[serde(skip)]` - IPFS gateways come from `--ipfs`. A gateway is an *access path*: two operators resolving one CID through different gateways must get the same bytes, so it must not enter the nest's content address"),
 ];
 
 #[test]
