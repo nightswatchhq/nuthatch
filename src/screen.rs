@@ -439,7 +439,7 @@ pub fn transfer_tables(
 pub fn backfill(args: crate::cli::ScreenArgs) -> Result<()> {
     let dir = std::path::PathBuf::from(&args.dir);
     let config = crate::config::Config::load(&dir)?;
-    let registry = crate::registry::DecodeRegistry::from_nest(&dir, &config)?;
+    let registry = crate::registry::from_nest(&dir, &config)?;
     let tables = transfer_tables(&registry);
     if tables.is_empty() {
         anyhow::bail!("this nest has no transfer-shaped tables to screen");

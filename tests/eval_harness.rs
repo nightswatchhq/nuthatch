@@ -182,7 +182,7 @@ async fn every_question_oracle_is_correct_against_the_fixture() {
 /// Write `schema.json` the way `init`/`add` do, so the fixture's analytics views are typed (derived
 /// `*_dec` columns, honest reserved-word columns) rather than the schema-less skeleton.
 fn write_fixture_schema(dir: &std::path::Path, cfg: &nuthatch::config::Config) {
-    let registry = nuthatch::registry::DecodeRegistry::from_nest(dir, cfg).expect("build registry");
+    let registry = nuthatch::registry::from_nest(dir, cfg).expect("build registry");
     let schema = registry.schema();
     std::fs::write(
         dir.join("schema.json"),

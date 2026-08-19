@@ -1807,7 +1807,7 @@ async fn build_nest(
             Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
         }
     }
-    let registry = Arc::new(DecodeRegistry::from_nest(&dir, config)?);
+    let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer

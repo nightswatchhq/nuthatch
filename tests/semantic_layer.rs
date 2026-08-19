@@ -15,8 +15,7 @@ fn fixture() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
-    let registry =
-        nuthatch::registry::DecodeRegistry::from_nest(dir.path(), &cfg).expect("build registry");
+    let registry = nuthatch::registry::from_nest(dir.path(), &cfg).expect("build registry");
     let schema = registry.schema();
     let sem = nuthatch::semantic::generate(&schema, "usdc", "arbitrum-one");
     (schema, sem)
