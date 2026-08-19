@@ -3,6 +3,45 @@
 - Status: **Parked after pilot (2026-07-18)** - the wedge is proven in production; the full migration is not done. See "Implementation status" below.
 - Update (2026-07-20): the separate `graph-network-nest` repo - a byte-identical clone of `horizon-nest` that never diverged - has been **retired**. The remaining network-subgraph surface (Indexer Directory, Curation, Epochs) is now planned as an **extension of `horizon-nest`**, not a second nest. This RFC stands as the migration record; "the graph-network nest" throughout means that intended-superset work, now folded into `horizon-nest`.
 
+## The migration worklist: what "everything we can" actually means (2026-08-19)
+
+"Port everything we can" needs a list or it stays a feeling. This is every ingest module in
+`lodestar/src/lib/ingest/`, what it reads today, and the contract that would replace the gateway for
+it. Addresses are from `graphprotocol/contracts` `addresses.json` for chain 42161 and are **verified**;
+which events each contract emits is **inferred from its role** and needs the ABI pulled before anyone
+commits to a slice.
+
+| Module | Reads today | Replacement | Contract (Arbitrum) | State |
+|---|---|---|---|---|
+| `allocations` | `allocations` | `SubgraphService` + `L2Curation` | `0xb2Bb92d0…` / `0x22d78fb4…` | **Done.** `lodestar_allocations`, 13,301 active, exact vs the network subgraph |
+| `delegations` | `delegationEventsQuery` | `HorizonStaking` | `0x00669A4C…` | **Half done.** `graph-staking-nest` already indexes the four delegation events and Lodestar's `delegation-events` route already serves from it |
+| `epochs` | `epoches` | `EpochManager` | `0x5A843145c43d328B9bB7a4401d94918f131bB281` | One contract away |
+| `disputes` | `disputes` | `DisputeManager` (+ legacy) | `0x2FE023a5…` / `0x0Ab2B043…` | One contract away |
+| `rav` | `paymentsEscrowTransactions` | `PaymentsEscrow` | `0xf6Fcc27aAf1fcD8B254498c9794451d82afC673E` | One contract away |
+| `network-snapshot` | `graphNetwork` | `RewardsManager` + `HorizonStaking` + `L2GraphToken` | `0x971B9d3d…` / `0x00669A4C…` / `0x96230633…` | Derivable, but it is an aggregate rather than a table - the fiddliest of the set |
+| `qos` | `qosOracleQuery` | **none** | - | **Cannot move.** Gateway QoS is off-chain; no contract emits it |
+| `indexers` | composed | the above, plus indexer status endpoints | - | Follows the others |
+
+### So "everything we can" is five modules, one aggregate, and one that never moves
+
+That is the honest shape. Five of the seven are a contract and a view each, on a chain already
+indexed. `network-snapshot` is real work because it is protocol-wide aggregate state rather than an
+event table. `qos` stays on the gateway permanently, and no amount of indexing changes that - which is
+why the goal in the status update below is **"the key is no longer load-bearing for the dashboard"**
+rather than "no key".
+
+### Why this is cheaper than it looks
+
+Every replacement contract is on **Arbitrum**, which nuthatch has indexed since the beginning, and four
+of the six named here (`SubgraphService`, `L2Curation`, `HorizonStaking`, `EpochManager`) are either
+already in a nest or adjacent to one. There is no new capability required for any of it: no
+`eth_call`, no IPFS, no traces. It is event decode and SQL views, which is the part of nuthatch that
+has been solid longest.
+
+The one thing to check before starting each slice is the **pending Horizon upgrade** staged 2026-07-23
+(`port-queue-nest.md` §5a): `SubgraphService`'s event signatures move, and `HorizonStaking`'s pending
+implementation is still unverified on Sourcify, so its diff cannot be taken.
+
 ## Field map: `ingest-allocations`, the first route (2026-08-19)
 
 The status update below says the six `cron/ingest-*` routes are the highest-leverage slice, because
