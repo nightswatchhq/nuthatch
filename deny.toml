@@ -38,15 +38,27 @@ ignore = [
   # **dbsp still requires `rkyv ^0.7.45` as of 0.327.0** (checked 2026-08-04), so even the newest dbsp
   # does not clear it. Tracked upstream; re-check on the next dbsp bump, same as the quick-xml pair.
   "RUSTSEC-2026-0235", # rkyv: shared-pointer validation ignored pointer metadata
-  # h2 0.3.x (transitive: reqwest → hyper 0.14 → h2 0.3). The 0.4.x entry was updated to
-  # 0.4.16 (the patched release). The 0.3.x series has no patched version and is held in the
-  # tree by reqwest's dependency on hyper 0.14, which in turn is required by several other deps;
-  # updating to hyper 1.x is a larger cross-crate migration. The flaw (unbounded empty DATA
-  # frames if the stream is not actively drained) requires a peer that deliberately spams empty
-  # frames; nuthatch only opens outbound RPC connections to trusted endpoints the operator
-  # configured, so the attack surface is controlled. Low severity per the advisory; re-check on
-  # the next reqwest/hyper bump.
-  "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
+  #
+  # h2 0.3.27 (transitive: dbsp → feldera-types → actix-web → actix-http). The 0.4 line is **fixed,
+  # not ignored**: h2 0.4.15 → 0.4.16 in the same commit. That is the right action regardless of
+  # exposure and needs no justification here; this entry covers only the 0.3 copy, which cannot be
+  # upgraded. Reachability, stated no more strongly than it can be checked:
+  #   - **Neither line is reachable as a server in this binary**, because nuthatch does not speak
+  #     HTTP/2 at all. We serve over axum 0.8, whose `http2` feature is opt-in and is not enabled -
+  #     `cargo tree -e features -i axum` lists `http1`, `form`, `json`, `query`, `tokio`, `tracing`
+  #     and no `http2` (checked 2026-08-19). h2 0.4 is in the graph as a *client*, via reqwest and
+  #     object_store; h2 0.3 via actix-http, which we never construct.
+  #   - nuthatch never uses actix directly either (`grep -rn actix src/ decode/src/` is empty).
+  #     actix-web arrives solely because `feldera-types` depends on it.
+  #   - The advisory is unbounded empty DATA frames against an HTTP/2 **server**. No actix listener is
+  #     ever constructed in this binary, so no such server accepts a connection. Note what that last
+  #     claim rests on: the grep above is a checked fact about our own source, but "no listener
+  #     anywhere in the process" is a reachability argument over dbsp's internals too, not something
+  #     grep proves. It is the assumption to re-test on a dbsp bump, ahead of the version numbers.
+  # Not fixable by upgrading: 0.3.27 is the head of the 0.3 line and no patched 0.3 release exists
+  # (checked 2026-08-19); the fix shipped in 0.4.16 only. Clearing it needs actix-web to move to h2 0.4
+  # or dbsp to drop actix-web. Re-check on the next dbsp bump, same as the quick-xml and rkyv entries.
+  "RUSTSEC-2026-0258", # h2 (0.3 line only): unbounded empty DATA frames against an HTTP/2 server
 ]
 
 [licenses]
