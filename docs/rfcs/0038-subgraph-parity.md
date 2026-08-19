@@ -287,6 +287,38 @@ So the claim this RFC can support is narrower than its title, and should be stat
 a busy pool, potentially much longer for a rarely-touched token. Measuring it needs the gateway diff
 §7 calls for, which is still outstanding.
 
+## 6b. The gateway diff, run (2026-08-19)
+
+§7 sets the acceptance criterion: *a real port, diffed against the gateway. Anything less is us marking
+our own homework.* Run against **Uniswap V3 on Arbitrum**, deliberately - eleven of the network's top
+25 subgraphs by query fee are Uniswap, so it is the family that decides the question.
+
+- **Subject:** the WETH/USDC 0.05% pool, `0xc6962004f452be9203591991d15f6b388e09e8d0`, the
+  highest-volume V3 pool on Arbitrum by the subgraph's own ranking.
+- **Range:** blocks 496,000,000 to 496,010,000, long final.
+- **Both sides queried independently:** the subgraph through the decentralised gateway, the nest
+  through `nuthatch sql` over its own store.
+
+```
+subgraph: 343 swaps    nuthatch: 343 swaps
+ROW-FOR-ROW IDENTICAL across all 343 swaps
+(block_number, sqrtPriceX96, tick) matched exactly, with multiplicity
+```
+
+Compared as a multiset rather than a sorted list, so a duplicated or dropped row cannot hide behind a
+matching count. `sqrtPriceX96` and `tick` are raw integers on both sides; `amount0`/`amount1` are
+deliberately excluded because the subgraph decimal-adjusts them, which is a formatting difference and
+not a data one.
+
+**What this settles.** The *input* layer is exactly reproducible against the most-queried subgraph on
+the network, which is §6a's "Exactly" column measured rather than asserted - including
+`sqrtPriceX96`, the field every Uniswap price derives from. The nest was scaffolded by
+`nuthatch init <address> --chain arbitrum-one` and caught up in **8 seconds, 4,781 events, 600 ev/s**.
+
+**What it does not settle.** §6a's other column. `derivedETH` and `ethPriceUSD` are order-dependent in
+the subgraph's own implementation, so a fixed-point view will differ by an amount nobody has measured
+yet. That diff needs the entity layer built first and remains the outstanding work.
+
 ## 7. Testing, because this warrants its own release
 
 The correctness rules in [CLAUDE.md](../../CLAUDE.md) apply in full, and this repo has specific scars
