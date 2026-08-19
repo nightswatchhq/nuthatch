@@ -411,6 +411,27 @@ That is a much better position than §6a assumed. The remaining measurement - ho
 `derivedETH` drifts from an order-dependent one - needs the full factory history rather than a
 674k-block window, and is the outstanding work.
 
+## 6e. The seal-direct refusal, met in practice (2026-08-19)
+
+Slice 1 refuses `--seal-direct` alongside declared `[[calls]]`, because tier 3 is wired into
+`process_window` only and a seal-direct run would sail past every sampled block and seal the range with
+the table silently absent. That guard is right and it fired on the first real nest to need it.
+
+The cost is now measured rather than assumed. `graph-allocations-nest` grew a one-line `[[calls]]`
+entry for GRT `totalSupply` - a single pinned read, sampled every 100,000 blocks - and the same
+454M-block backfill went from **~12 minutes on seal-direct to ~66 minutes on the hot path**. Five and a
+half times slower, for one number.
+
+That is a bad trade and the guard is not the thing to change: silently missing rows would be far worse.
+What it argues for is **teaching the seal-direct paths to resolve calls**, which is the follow-up the
+slice already names. Until then the honest advice is that a nest wanting both a from-deployment
+backfill and a pinned read pays for it in wall-clock, and should know that before starting rather than
+after.
+
+Worth noting the alternative was worse: deriving `totalSupply` from events means indexing every
+`L2GraphToken` Transfer to sum mints minus burns - millions of rows for one scalar. The pinned read is
+the right shape; only the backfill path is wrong.
+
 ## 7. Testing, because this warrants its own release
 
 The correctness rules in [CLAUDE.md](../../CLAUDE.md) apply in full, and this repo has specific scars
