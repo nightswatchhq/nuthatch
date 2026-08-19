@@ -15,8 +15,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Creates (or updates) the release with its body, before the matrix starts. Must be a separate
+  # job, not a step tacked onto `build`: the first `attach to release` step in that job carries no
+  # `if:`, so it runs once per matrix leg, concurrently - give *that* step a body_path and every leg
+  # races to set it. Doing it here instead means the matrix's two action-gh-release calls only ever
+  # pass `files:`, and softprops/action-gh-release preserves the existing body on an update when the
+  # call doesn't set body/body_path (`body = workflowBody || existingReleaseBody`, src/github.ts) -
+  # so attaching files afterward can't blank out what this job wrote.
+  release-notes:
+    name: release notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: resolve release notes
+        id: notes
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes" ]; then
+            echo "::error::$notes not found. Every tagged release needs its notes written at that path before tagging - see docs/releases/README.md."
+            exit 1
+          fi
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+      - name: create release with notes
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.notes.outputs.path }}
+
   build:
     name: ${{ matrix.target }}
+    needs: release-notes
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

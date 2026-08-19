@@ -126,7 +126,7 @@ fn signing_bytes(body: &Body) -> Result<Vec<u8>> {
 /// hashes, sign it if a key is given, and write `compliance-pack.toml`.
 pub fn build(dir: &Path, key: Option<&Path>, created: &str) -> Result<()> {
     let config = crate::config::Config::load(dir)?;
-    let registry = crate::registry::DecodeRegistry::from_nest(dir, &config)?;
+    let registry = crate::registry::from_nest(dir, &config)?;
 
     // Screening list snapshots (hash + address count) actually present in the nest.
     let mut screening = Vec::new();

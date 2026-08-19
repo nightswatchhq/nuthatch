@@ -17,7 +17,7 @@ type HitKey = (u64, u64, String, String, String);
 /// stored `sanction_hit` annotations are exactly reproduced. Returns the verdict + any differences.
 pub fn replay(dir: &Path, from: u64, to: u64) -> Result<ReplayReport> {
     let config = crate::config::Config::load(dir)?;
-    let registry = crate::registry::DecodeRegistry::from_nest(dir, &config)?;
+    let registry = crate::registry::from_nest(dir, &config)?;
     let tables = crate::screen::transfer_tables(&registry);
 
     // Re-compute the hits: for each configured list, screen the sealed transfers over the range.
