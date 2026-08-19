@@ -372,6 +372,45 @@ been proved against stubs I wrote myself.
 full factory history is 495 million blocks, not 674 thousand. And nothing here computes `derivedETH`,
 so §6a's divergence remains unmeasured.
 
+## 6d. §6a measured, part one: the root of the pricing tree is exact
+
+§6a said Uniswap's entity model is order-dependent and a declarative fixed point would differ *by an
+unmeasured amount*. Measuring it splits cleanly in two, because the pricing tree has a base case and a
+recursion, and only one of them is order-dependent.
+
+**The base case.** `getEthPriceInUSD()` loads exactly one pool - Arbitrum's
+`STABLE_TOKEN_POOL = 0x17c14d2c…` (WETH/USDC) - and returns `token1Price`, since `token0` is the
+reference token. `token1Price` comes from `sqrtPriceX96ToTokenPrices`, a pure function of the pool's
+last `sqrtPriceX96`. Nothing stored, nothing recursive, no write order.
+
+**Verified in three steps, 2026-08-19:**
+
+1. The formula was checked *against the subgraph's own stored value* before being trusted:
+   `(sqrtPrice² / 2¹⁹²) · 10^dec0 / 10^dec1` reproduced their `token0Price` and `token1Price` to a
+   relative difference of **1.3 × 10⁻³⁵** - their `BigDecimal` precision, not an error.
+2. The pool was indexed by a plain `nuthatch init 0x17c14d2c… --chain arbitrum-one` (164 events, 3s).
+3. Both sides read **at the same block**, using the subgraph's own time-travel query to pin it:
+
+| | value |
+|---|---|
+| nuthatch, latest `Swap` at or before block 496,213,467 | `sqrtPriceX96 = 3611630104467636802226442` |
+| subgraph, `pool(block:{number:496213467}).sqrtPrice` | `3611630104467636802226442` |
+| nuthatch `ethPriceUSD` | `2078.008699136272184458689456222861027…` |
+| subgraph `bundle.ethPriceUSD` | `2078.008699136272184458689456222861` |
+
+**Identical.** The difference is 10⁻³² absolute, which is where their decimal type stops and ours
+does not.
+
+### What this narrows
+
+`ethPriceUSD` is the **root** every Uniswap USD figure hangs from, and it is exactly reproducible. So
+§6a's divergence is not "somewhere in the pricing" - it is confined entirely to the **recursive**
+`findEthPerToken` layer, which reads back other tokens' stored `derivedETH`.
+
+That is a much better position than §6a assumed. The remaining measurement - how far a fixed-point
+`derivedETH` drifts from an order-dependent one - needs the full factory history rather than a
+674k-block window, and is the outstanding work.
+
 ## 7. Testing, because this warrants its own release
 
 The correctness rules in [CLAUDE.md](../../CLAUDE.md) apply in full, and this repo has specific scars
