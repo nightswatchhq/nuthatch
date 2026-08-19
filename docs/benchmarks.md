@@ -41,8 +41,13 @@ Throughput is not the only number an operator cares about. "Be your own indexer"
 about bills, so this is what a day of real backfills actually consumed - measured against one Alchemy
 key, across Arbitrum, BSC, Polygon, Optimism and Gnosis.
 
-**~11.5M compute units for six backfills**, the largest being 454M blocks of Arbitrum history for a
-two-contract nest and 200,000 blocks of BSC for a single busy ERC-20.
+**~11.5M compute units for six backfills** - about **$5** at the rate an Alchemy PAYG invoice actually
+charges, **$0.00000045/CU** ($0.45 per million; taken from a real July invoice, not from a pricing
+page). The largest runs were 454M blocks of Arbitrum history for a two-contract nest and 200,000
+blocks of BSC for a single busy ERC-20.
+
+For scale: a whole month of this project's development traffic came to **67.5M CU = $30.39**. Indexing
+is cheap; the interesting question is what fraction of it is *necessary*, which is the next section.
 
 | Run | Estimated CU | Shape |
 |---|---:|---|
@@ -64,6 +69,10 @@ response`, and each one is a re-ask of the same range.
 So against a metered endpoint, **nuthatch's default costs several times more than its actual indexing
 work**. That is a fact about our defaults rather than about any provider, and it is the sort of thing
 this project should publish about itself rather than have an operator discover on an invoice.
+
+At today's volumes that is $5 against $1, which nobody would optimise for. At a hundred nests it is
+the difference between a rounding error and a line item, and it is a claim nuthatch makes about
+itself - so it is worth stating the number rather than the adjective.
 
 `block_timestamps = false` (RFC-0029 §6b) removes it entirely, at the cost of the column. A nest that
 never asks "when" should not be paying for it.
