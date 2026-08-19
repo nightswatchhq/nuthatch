@@ -138,11 +138,106 @@ const BASE: Chain = Chain {
     log_window: 1000,
 };
 
+/// BNB Smart Chain. **Tip-following works out of the box; a from-deployment backfill does not.**
+///
+/// Measured 2026-08-19 against the RFC-0030 §4 bar. `bsc-rpc.publicnode.com` is the only keyless
+/// endpoint that passes at all - getLogs 5/5, batch-of-5 OK, `finalized` OK - and even it reports
+/// **archive depth no**. Six others were probed and every one returned getLogs **0/5** on a 10-block
+/// address-filtered request 5,000 behind tip (`bsc-dataseed*.bnbchain.org`, `.defibit.io`,
+/// `.ninicoin.io`, `bsc-mainnet.public.blastapi.io`); `1rpc.io/bnb` managed 4/5 with a 40-block
+/// ceiling and refused the archive probe on quota; `binance.llamarpc.com`, `bsc.drpc.org`,
+/// `bsc-pokt.nodies.app` and `rpc.therpc.io/bsc` were unreachable.
+///
+/// So this is shipped honestly rather than not shipped: a nest that tip-follows is fine, and one that
+/// wants history needs `--rpc <your archive endpoint>`. Saying that here beats a default that dies a
+/// thousand blocks into a backfill.
+const BSC: Chain = Chain {
+    name: "bsc",
+    chain_id: 56,
+    rpc_urls: &["https://bsc-rpc.publicnode.com"],
+    // Fast finality is ~2 blocks, and the endpoint serves the tag; the fallback is deliberately far
+    // more conservative than that because a single-endpoint chain has nothing to cross-check against.
+    finality: Finality::FinalizedTag {
+        fallback_depth: 1000,
+    },
+    // Measured max 320 address-filtered. Set at the measurement rather than optimistically above it:
+    // with one endpoint there is no sibling to absorb a retry storm.
+    log_window: 320,
+};
+
+/// Polygon PoS. Archive is available but narrow; the wide endpoint is not archive.
+///
+/// Measured 2026-08-19: `polygon-bor-rpc.publicnode.com` gives a 5,120-block window and batch 200+
+/// but **archive depth no**; `polygon.drpc.org` **is** archive but caps getLogs at 80 blocks and
+/// batches at 10. `polygon-rpc.com` was unreachable.
+///
+/// The wide one is listed first because it serves the tip, which is most of the work; failover reaches
+/// the archive endpoint for historical windows and the adaptive chunker (RFC-0004 §2) finds its much
+/// narrower ceiling on its own.
+const POLYGON: Chain = Chain {
+    name: "polygon",
+    chain_id: 137,
+    rpc_urls: &[
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.drpc.org",
+    ],
+    // Heimdall checkpoints are the real finality signal and the tag reflects them; the fallback is
+    // sized for a checkpoint interval rather than a block time.
+    finality: Finality::FinalizedTag {
+        fallback_depth: 1000,
+    },
+    log_window: 2000,
+};
+
+/// Gnosis. The best-served of the four chains added here: two keyless **archive** endpoints, both
+/// with a 163,840-block getLogs ceiling and batch 200+.
+///
+/// Measured 2026-08-19. `gnosis-rpc.publicnode.com` also passes the bar but reports archive depth no,
+/// so it is deliberately not listed - a third endpoint that cannot serve history is a trap during a
+/// backfill, not redundancy.
+const GNOSIS: Chain = Chain {
+    name: "gnosis",
+    chain_id: 100,
+    rpc_urls: &[
+        "https://rpc.gnosischain.com",
+        "https://rpc.gnosis.gateway.fm",
+    ],
+    finality: Finality::FinalizedTag {
+        fallback_depth: 200,
+    },
+    // Both endpoints measured at 163,840; 20,000 leaves headroom for the adaptive chunker to climb
+    // without opening on a window neither can serve.
+    log_window: 20_000,
+};
+
+/// Optimism. OP-stack L2, so the same finality reasoning as Base: the `finalized` tag is L1-aware.
+///
+/// Measured 2026-08-19: `mainnet.optimism.io` (window 640) and `optimism-rpc.publicnode.com`
+/// (window 1,280), both **archive**, both batch-of-5 OK. `optimism.drpc.org` is excluded for failing
+/// batch-of-5 - the identical failure that removed `arbitrum.drpc.org` and `base.drpc.org` under
+/// issue #267, which is now three chains in a row.
+const OPTIMISM: Chain = Chain {
+    name: "optimism",
+    chain_id: 10,
+    rpc_urls: &[
+        "https://mainnet.optimism.io",
+        "https://optimism-rpc.publicnode.com",
+    ],
+    finality: Finality::FinalizedTag {
+        fallback_depth: 900,
+    },
+    log_window: 600,
+};
+
 pub fn lookup(name: &str) -> Option<&'static Chain> {
     match name {
         "mainnet" | "ethereum" | "eth" => Some(&MAINNET),
         "arbitrum-one" | "arbitrum" | "arb" | "arb1" => Some(&ARBITRUM_ONE),
         "base" | "base-mainnet" | "base-one" => Some(&BASE),
+        "bsc" | "bnb" | "binance" | "bnb-smart-chain" | "bsc-mainnet" => Some(&BSC),
+        "polygon" | "matic" | "polygon-pos" | "polygon-mainnet" => Some(&POLYGON),
+        "gnosis" | "xdai" | "gnosis-chain" => Some(&GNOSIS),
+        "optimism" | "op" | "op-mainnet" | "optimism-mainnet" => Some(&OPTIMISM),
         _ => None,
     }
 }
@@ -198,8 +293,8 @@ pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<Resolved
     }
     if rpc_urls.is_empty() {
         anyhow::bail!(
-            "unknown chain '{name}' (try: mainnet, arbitrum-one, base) - or pass --rpc <url> to \
-             point nuthatch at a chain it doesn't ship built-in"
+            "unknown chain '{name}' (try: mainnet, arbitrum-one, base, optimism, polygon, gnosis, \
+             bsc) - or pass --rpc <url> to point nuthatch at a chain it doesn't ship built-in"
         );
     }
     let chain_id = crate::rpc::RpcClient::new(rpc_urls.to_vec())?
@@ -370,11 +465,65 @@ mod tests {
         assert_eq!(resolved.log_window, 20);
     }
 
+    /// Every shipped chain resolves under each of its aliases, with the right id.
+    ///
+    /// Added with the four chains in the top-25 list (BNB, Polygon, Gnosis, Optimism). A typo in an
+    /// alias arm is invisible until somebody types that alias, and then it reads as "nuthatch does
+    /// not support this chain" rather than "we spelled it wrong".
+    #[test]
+    fn every_shipped_chain_resolves_under_all_of_its_aliases() {
+        for (aliases, id) in [
+            (&["mainnet", "ethereum", "eth"][..], 1u64),
+            (&["arbitrum-one", "arbitrum", "arb", "arb1"][..], 42161),
+            (&["base", "base-mainnet", "base-one"][..], 8453),
+            (
+                &["bsc", "bnb", "binance", "bnb-smart-chain", "bsc-mainnet"][..],
+                56,
+            ),
+            (
+                &["polygon", "matic", "polygon-pos", "polygon-mainnet"][..],
+                137,
+            ),
+            (&["gnosis", "xdai", "gnosis-chain"][..], 100),
+            (
+                &["optimism", "op", "op-mainnet", "optimism-mainnet"][..],
+                10,
+            ),
+        ] {
+            for a in aliases {
+                let c = lookup(a).unwrap_or_else(|| panic!("alias {a:?} resolves to nothing"));
+                assert_eq!(c.chain_id, id, "alias {a:?} points at the wrong chain");
+            }
+        }
+    }
+
+    /// A shipped chain with no endpoint would be worse than an unshipped one: `init` would look
+    /// supported and then have nowhere to ask.
+    #[test]
+    fn no_shipped_chain_has_an_empty_endpoint_list() {
+        for name in [
+            "mainnet",
+            "arbitrum-one",
+            "base",
+            "bsc",
+            "polygon",
+            "gnosis",
+            "optimism",
+        ] {
+            let c = lookup(name).unwrap();
+            assert!(!c.rpc_urls.is_empty(), "{name} ships with no endpoints");
+            assert!(
+                c.log_window > 0,
+                "{name} has a zero log window, which schedules nothing"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolve_of_an_unknown_name_without_rpc_names_the_remedy() {
-        let err = resolve("bsc", &[]).await.unwrap_err();
+        let err = resolve("avalanche", &[]).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("unknown chain 'bsc'"), "{msg}");
+        assert!(msg.contains("unknown chain 'avalanche'"), "{msg}");
         assert!(msg.contains("--rpc"), "{msg}");
     }
 
@@ -382,10 +531,12 @@ mod tests {
     /// and its `chain_id` comes from the endpoint itself rather than a hand-typed flag.
     #[tokio::test]
     async fn resolve_of_an_unknown_name_with_rpc_reads_the_chain_id_live() {
-        let (url, _rpc) = fake_chain_id_rpc(56).await;
-        let resolved = resolve("bsc", std::slice::from_ref(&url)).await.unwrap();
-        assert_eq!(resolved.name, "bsc");
-        assert_eq!(resolved.chain_id, 56);
+        let (url, _rpc) = fake_chain_id_rpc(43114).await;
+        let resolved = resolve("avalanche", std::slice::from_ref(&url))
+            .await
+            .unwrap();
+        assert_eq!(resolved.name, "avalanche");
+        assert_eq!(resolved.chain_id, 43114);
         assert_eq!(resolved.rpc_urls, vec![url]);
         // Same fallback policy the indexer already applies to a nest on an unregistered chain
         // (`indexer::DEFAULT_FINALITY`/`DEFAULT_WINDOW`) - a custom chain must not silently get a
@@ -405,9 +556,9 @@ mod tests {
 
     #[test]
     fn from_config_of_a_custom_chain_carries_the_saved_id_with_no_rpc_round_trip() {
-        let resolved = from_config("bsc", 56);
-        assert_eq!(resolved.name, "bsc");
-        assert_eq!(resolved.chain_id, 56);
+        let resolved = from_config("avalanche", 43114);
+        assert_eq!(resolved.name, "avalanche");
+        assert_eq!(resolved.chain_id, 43114);
         assert_eq!(resolved.finality, UNREGISTERED_FINALITY);
         assert_eq!(resolved.log_window, UNREGISTERED_WINDOW);
     }
