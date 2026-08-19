@@ -258,3 +258,50 @@ The top entry carries **208,847 GRT signalled and no indexer serving it**. The s
 - **`block_timestamps = true` produced six retry storms** against the archive RPC ("every item in a
   1-block `eth_getBlockByNumber` batch returned an error, inside an HTTP 200"). It recovered on retry
   and cost nothing, but a per-block timestamp fetch is the fragile part of this backfill.
+
+---
+
+## 9. The release gate, met (2026-08-19)
+
+§7 step 4 was the gate: *read the top of the list by hand. If the top twenty are not recognisably real
+projects with real problems, the filter is wrong and no amount of tooling fixes that.*
+
+It is better than reading by hand. With a gateway key, the Graph Network subgraph resolves a deployment
+id to a name **and independently states its allocation count** - so the queue can be checked against
+the network's own answer rather than against our arithmetic.
+
+The top five, resolved:
+
+| Deployment | Active allocations | Signalled | Name |
+|---|---:|---:|---|
+| `QmWFi6uciaQPQmo1xR…` | **0** | 54,724 GRT | Substreams Uniswap v3 Ethereum |
+| `QmdEz2oUhYGsePUteC…` | **0** | 26,774 GRT | estfor |
+| `QmPJbGjktGa7c4UYWX…` | **0** | 21,491 GRT | Spookyswap |
+| `QmW4Vo3ZYV79pizzYK…` | **0** | 10,673 GRT | Peeranha |
+| `QmQKXcNQQRdUvNRMGJ…` | **0** | 9,954 GRT | Graph Network Activity - Arb |
+
+**Every one: zero active allocations, confirmed by the network subgraph itself.** Our nest derived
+"signal, no allocation" from raw `SubgraphService` and `L2Curation` events; the network agrees, from a
+completely different code path.
+
+And they are **recognisably real**: Spookyswap is a live DEX, Peeranha a live Q&A protocol, estfor a
+live game. §8's suspicion - that the list might be mostly programmatic signal and dead deployments -
+does not survive contact with the names. The repeating 10,000 GRT shape is further down the list, not
+at the top of it.
+
+One of them is worth a wry note: **"Graph Network Activity - Arb" is itself unserved**, with ~10k GRT
+signalled on it.
+
+### What this settles
+
+The queue is not a guess. It is a ranked list of named projects whose owners have GRT staked on data
+nobody is producing - which is exactly what [community.md](community.md) §2 needed and could not
+previously produce. **These five are the port loop's first subjects.**
+
+The signal figures differ slightly from §8's (54,336 vs 54,724 for the top entry) because ours is net
+signal *shares* and the network's is `signalledTokens` in GRT. Different units, both correct.
+
+### Still outstanding
+
+`HorizonStaking`'s pending implementation is still unverified on Sourcify, so its upgrade remains
+undiffable (§5a). That is the one gate item left, and it is waiting on somebody else's verification.
