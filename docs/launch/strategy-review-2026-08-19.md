@@ -6,8 +6,9 @@
 - Reviews: an external research report on launch strategy and chain expansion, checked against the
   repo at `6196b08` (`v2.5.0`)
 - Related: [RFC-0007](../rfcs/0007-launch-and-validation.md) (launch and validation),
-  [show-hn.md](show-hn.md), [home-turf.md](home-turf.md), [docs/grants](../grants),
-  [benchmarks.md](../benchmarks.md)
+  [show-hn.md](show-hn.md), [home-turf.md](home-turf.md), [community.md](community.md),
+  [docs/grants](../grants), [benchmarks.md](../benchmarks.md)
+- Revised: 2026-08-19 - port loop to P0, NLnet to the back burner (§1)
 
 ## Why this document exists
 
@@ -24,15 +25,26 @@ deadline.
 
 ## 1. The priority stack
 
+Revised 2026-08-19 after the community pass ([community.md](community.md)): the port loop moves to the
+front, and NLnet moves to the back burner by decision.
+
 | # | Item | When | Why it sits here |
 |---|------|------|------------------|
-| **P0** | NLnet application, ready to submit | draft by **3 Sept**, submit before **3 Nov 2026 12:00 CEST** | The only item on the list with a *verified, external, closing* date. [nlnet.md](../grants/nlnet.md) already exists at €38,400. |
-| **P1** | Show HN copy: version-number honesty pass | before posting | `show-hn.md` says "It's v0.1.0". `Cargo.toml` says `2.5.0`. One line, and it currently undercuts the entire post. |
-| **P2** | Show HN, posted | Tue-Thu, ~08:00-10:00 ET, once P1 is done | Phase 2 of RFC-0007. Everything below is easier after it and none of it is blocked on it. |
-| **P3** | EF ESP inquiry against a named wishlist item | after the post, with the HN thread as evidence | [ef-esp.md](../grants/ef-esp.md) exists. The permissive relicence removed the friction that made this awkward. |
+| **P0** | Post [home-turf.md](home-turf.md) on the Graph forum, then the subgraph-fallback piece, then ask for an unserved deployment | now | RFC-0007 Phase 1, and it is what generates every item below it. No tooling required to start. |
+| **P1** | Run the port loop three times ([community.md](community.md) §2) | before Show HN | Three ports converts "is anyone running this" from an awkward question into three names, and converts the honest-limits list from reasoning into measurement. |
+| **P2** | Show HN copy: version-number honesty pass, then post | Tue-Thu, ~08:00-10:00 ET, after P1 | `show-hn.md` says "It's v0.1.0". `Cargo.toml` says `2.5.0`. One line, and it currently undercuts the entire post. Phase 2 of RFC-0007. |
+| **P3** | EF ESP inquiry against a named wishlist item | after the post, with the thread and the ports as evidence | [ef-esp.md](../grants/ef-esp.md) exists. The permissive relicence removed the friction that made this awkward. |
 | **P4** | HyperEVM as the chain expansion | ~1 week of work, opportunistic | EVM, so it is a `chains.rs` entry plus endpoint measurement. Same "underserved, one dominant provider" story as Solana at ~5% of the cost. |
 | **P5** | Compliance / data-residency positioning note | a page, whenever | Attaches to the product that already exists. Costs nothing to write and nothing to maintain. |
+| **-** | **NLnet** | **back burner** (decision, 2026-08-19) | The window is real and verified (3 Sept to 3 Nov 2026, 12:00 CEST) and [nlnet.md](../grants/nlnet.md) is drafted at €38,400. Recorded, not scheduled, so that if it comes forward the date is known rather than rediscovered. Missing this window means waiting for the next cycle. |
 | **-** | **Solana** | **not now** | See §2. The case for it rests on a pipeline that does not exist, and the honest build violates non-negotiables 1 and 3. |
+
+**What changed and why.** The first version of this table put NLnet at P0 on the grounds that it was
+the only item with a verified external deadline. That was true and is still true, and it was the wrong
+reason to rank it first: a deadline makes something *urgent*, not *load-bearing*. The port loop is
+load-bearing, because it feeds the Show HN, the validation roster, the honest-limits list and any
+future grant application at the same time. NLnet was subsequently put on the back burner by decision,
+which settles the question either way.
 
 ---
 
@@ -165,14 +177,16 @@ carry that paragraph instead. That is the sentence engineers actually stop on.
 
 | Fund | Status | Action |
 |------|--------|--------|
-| **NLnet / NGI** | **Verified 2026-08-19** at nlnet.nl/propose: "There are currently no calls open." Next window **opens 3 Sept 2026, closes 3 Nov 2026 12:00 CEST**. | **P0.** [nlnet.md](../grants/nlnet.md) exists at €38,400. Refresh the budget-versus-evidence split against the progress log the week of submission, per that document's own rule. Confirm which fund name the September call actually carries before writing it into the form - the NGI Zero lineage is mid-transition. |
-| **EF ESP** | Permissive relicence removed the licensing friction. Reported to have restructured into a wishlist/RFP model. *(Restructure and figures unverified.)* | **P3.** Apply against a specific named wishlist item, not a general inquiry. [ef-esp.md](../grants/ef-esp.md) is drafted at $50-90K. |
+| **NLnet / NGI** | **Verified 2026-08-19** at nlnet.nl/propose: "There are currently no calls open." Next window **opens 3 Sept 2026, closes 3 Nov 2026 12:00 CEST**. | **Back burner** by decision, 2026-08-19. [nlnet.md](../grants/nlnet.md) is drafted at €38,400 and loses nothing by waiting; the port loop only improves the evidence half of it. If it comes forward: refresh the budget-versus-evidence split against the progress log first, per that document's own rule, and confirm which fund name the September call actually carries - the NGI Zero lineage is mid-transition. |
+| **EF ESP** | Permissive relicence removed the licensing friction. Reported to have restructured into a wishlist/RFP model. *(Restructure and figures unverified.)* | **P3**, and now the lead grant. Apply against a specific named wishlist item, not a general inquiry. [ef-esp.md](../grants/ef-esp.md) is drafted at $50-90K. |
 | **Sovereign Tech Fellowship** | Reported closed for the 2026 cohort. *(Unverified.)* | Park until the 2027 cycle. Not worth verifying now. |
 | **Gitcoin** | GG24 reported concluded, GG25 unannounced. *(Unverified.)* | Watch. Meanwhile the useful work is growing the unique-contributor base, which quadratic funding rewards and which the Show HN produces anyway. |
 | **Solana Foundation / Superteam** | Contingent on shipping Solana. | Not applicable per §2. |
 | **Optimism RetroPGF / Base / Arbitrum** | Retroactive, impact-gated. | Revisit once there is measurable usage. Not a launch-week lever. |
 
-Two funders, two documents, one deadline. Do not let the length of that table suggest otherwise.
+Two funders and two documents. Neither is currently on the critical path: NLnet is parked by decision
+and ESP is gated on having something to point at, which is what P0 and P1 produce. Do not let the
+length of that table suggest a workload it does not carry.
 
 ---
 
