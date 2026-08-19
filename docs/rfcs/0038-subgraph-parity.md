@@ -319,6 +319,49 @@ the network, which is §6a's "Exactly" column measured rather than asserted - in
 the subgraph's own implementation, so a fixed-point view will differ by an amount nobody has measured
 yet. That diff needs the entity layer built first and remains the outstanding work.
 
+## 6c. Uniswap V3, ported and run (2026-08-19)
+
+The nest §6b diffed was one pool, scaffolded by hand. This is the **whole subgraph**, ported by
+`nuthatch init --from-subgraph QmZ5uwhnws…` from the live Arbitrum deployment - the top-25 entry, and
+the family that decides the question.
+
+**The importer needed no help.** It read the manifest, vendored the factory and pool ABIs, and
+**inferred the factory rule by itself**: `factory.PoolCreated → Pool via 'pool' (param 'pool' names the
+template exactly)`. Five tables, matching exactly the four events the subgraph's manifest handles plus
+`PoolCreated`. It also reported honestly that the pool template handles 4 of the 9 events its ABI
+defines, which is the subgraph's choice, not a gap.
+
+**Parameterised `eth_call`, proved on a real mapping's real need.** The subgraph's `fetchTokenSymbol`
+and `fetchTokenDecimals` call `symbol()` and `decimals()` on each new pool's tokens. Declared as
+RFC-0038 §3 intends - `contract_column` naming the address the row itself carries:
+
+```toml
+[[calls]]
+name = "token0_symbol"
+on = "factory__pool_created"
+contract_column = "{token0}"
+signature = "symbol()"
+```
+
+Run over blocks 495,500,000 to tip: **195,515 events in 3m37s (901 ev/s)**.
+
+| Table | Rows |
+|---|---:|
+| `factory__pool_created` | **219** |
+| `token0_symbol` | **219** |
+| `token0_decimals` | **219** |
+| `token1_symbol` | **219** |
+| `pool__swap` | 6,210 |
+
+**Exactly one call per pool, per declaration. No misses, no duplicates.** Factory discovery fed the
+call scheduler, each call resolved at its own row's block against the address that row carried, and
+the counts line up to the unit. That is the capability §3 was written for, and until now it had only
+been proved against stubs I wrote myself.
+
+**Still unproved:** the entity layer. 219 pools is discovery working, not discovery *at scale* - the
+full factory history is 495 million blocks, not 674 thousand. And nothing here computes `derivedETH`,
+so §6a's divergence remains unmeasured.
+
 ## 7. Testing, because this warrants its own release
 
 The correctness rules in [CLAUDE.md](../../CLAUDE.md) apply in full, and this repo has specific scars

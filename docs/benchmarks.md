@@ -34,6 +34,46 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 | W2 | [horizon-nest](https://github.com/cargopete/horizon-nest) (Arbitrum) | full history from deployment | sparse multi-contract, L2 cadence |
 | W3 | USDC + WETH + Uniswap V3 factory (mainnet) | 50,000 blocks | mixed density, multi-table fan-out |
 
+
+## What a backfill costs against a metered endpoint (2026-08-19)
+
+Throughput is not the only number an operator cares about. "Be your own indexer" is partly an argument
+about bills, so this is what a day of real backfills actually consumed - measured against one Alchemy
+key, across Arbitrum, BSC, Polygon, Optimism and Gnosis.
+
+**~11.5M compute units for six backfills**, the largest being 454M blocks of Arbitrum history for a
+two-contract nest and 200,000 blocks of BSC for a single busy ERC-20.
+
+| Run | Estimated CU | Shape |
+|---|---:|---|
+| `graph-allocations`, 454M blocks | ~4.4M | ~5,500 `getLogs` + a header per event-bearing block |
+| BSC, 200k blocks, 1.67M events | ~3.0M | dense contract, ~180k event-bearing blocks |
+| Uniswap V3, 674k blocks, 196k events | ~3.6M | plus retries |
+| Chain sweep + diffs + DOUDOCHAIN | ~0.4M | all bounded |
+
+### The finding: our own default is the cost, not the indexing
+
+**Roughly 80% of that is `eth_getBlockByNumber`, not `eth_getLogs`.** The provider's method breakdown
+put the header call *above* the log call. The cause is `block_timestamps = true`, which nuthatch
+defaults on: one header fetch for every block that carries an event.
+
+It is worse than the raw count suggests. A busy range provokes partial responses - the Uniswap run
+logged two dozen warnings of the form `block_timestamps: 882/1548 block(s) missing from the RPC
+response`, and each one is a re-ask of the same range.
+
+So against a metered endpoint, **nuthatch's default costs several times more than its actual indexing
+work**. That is a fact about our defaults rather than about any provider, and it is the sort of thing
+this project should publish about itself rather than have an operator discover on an invoice.
+
+`block_timestamps = false` (RFC-0029 §6b) removes it entirely, at the cost of the column. A nest that
+never asks "when" should not be paying for it.
+
+### The other lever: concurrency, not volume
+
+The only limit actually hit that day was **throughput, not spend**: 11,717 CU/s against a 10,000 cap,
+caused by two backfills running at once rather than by either one being large. A provider-side
+throughput cap turns that into throttling instead of billing, and costs nothing to set.
+
 ## Sourcing tiers
 
 - **T1** - public RPC defaults (round-robin), as a new user experiences it.
