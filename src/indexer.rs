@@ -3764,14 +3764,15 @@ impl NestIngest {
                     let Some(cid) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v) else {
                         continue;
                     };
-                    let crate::registry::Value::Str(cid) = cid else {
-                        continue;
-                    };
-                    // The column may hold a bare CID, an `ipfs://` URI, or a full gateway URL - a
-                    // real subgraph port turned up all three. Only the content address is kept: the
-                    // string comes from a log, so fetching the host it names would let whoever
-                    // emitted the event choose what this process connects to.
-                    let Some(cid) = crate::ipfs::cid_from_any(cid) else {
+                    // The column may hold a bare CID, an `ipfs://` URI, a full gateway URL, or a
+                    // raw 32-byte digest - a real subgraph port turned up all four. Only the content
+                    // address is kept: the string comes from a log, so fetching the host it names
+                    // would let whoever emitted the event choose what this process connects to.
+                    //
+                    // Matching on `Value::Str` here is what used to drop the `bytes32` form on the
+                    // floor before the resolver ever saw it, so the match now lives in
+                    // `cid_from_value` where the refusals can be stated once.
+                    let Some(cid) = crate::ipfs::cid_from_value(cid) else {
                         continue;
                     };
                     if !seen.insert(cid.to_string()) {

@@ -206,6 +206,27 @@ pub fn cid_v0_for(content: &[u8]) -> String {
     base58_encode(&mh)
 }
 
+/// The CIDv0 for a bare 32-byte sha2-256 digest, as carried by a `bytes32` event parameter.
+///
+/// Distinct from [`cid_v0_for`], and the distinction is the whole point: `cid_v0_for` *hashes
+/// content* to find its address, whereas this takes an address somebody already computed and only
+/// re-frames it. A CIDv0 is `base58btc(<multihash>)` and a sha2-256 multihash is
+/// `0x12 0x20 || digest`, so there is nothing here but a two-byte prefix and an encoding - no
+/// content, no UnixFS framing, and no way to check it until the document is fetched. [`verify`]
+/// does that afterwards, exactly as it does for a CID that arrived as a string.
+///
+/// The reason this exists at all: a great many subgraphs, The Graph's own GNS among them, store an
+/// IPFS address on chain as a raw `bytes32` rather than as a string, because 32 bytes is what the
+/// digest actually is and the `Qm…` text is merely one encoding of it. Without this a nest reading
+/// such a column resolves nothing at all, silently.
+pub fn cid_v0_from_digest(digest: &[u8; 32]) -> String {
+    let mut mh = Vec::with_capacity(34);
+    mh.push(MH_SHA2_256 as u8);
+    mh.push(32);
+    mh.extend_from_slice(digest);
+    base58_encode(&mh)
+}
+
 /// The dag-pb bytes a single-block UnixFS file with this content would have.
 ///
 /// `PBNode { Data: UnixFS { Type: File, Data: content, filesize: len } }`, with no links. Canonical
@@ -414,5 +435,49 @@ mod tests {
         eprintln!("fetched {} bytes", body.len());
         eprintln!("content sha256 = {}", hex::encode(Sha256::digest(&body)));
         verify(&cid, &body).expect("re-encoding must reproduce the CID");
+    }
+
+    /// Three real `SubgraphMetadataUpdated` payloads, taken off Arbitrum GNS
+    /// (`0xec9a7fb6cbc2e41926127929c2dce6e9c5d33bec`) at blocks 495,864,081, 496,045,896 and
+    /// 496,124,693, with the CIDs on the right confirmed by fetching them from The Graph's gateway -
+    /// the first returns 293 bytes of subgraph metadata carrying a `displayName`.
+    ///
+    /// Fixed vectors rather than a round-trip through [`base58_decode`], deliberately: a round-trip
+    /// test passes just as happily when both directions share a mistake, and the thing actually
+    /// being asserted here is agreement with the rest of the world, not with ourselves.
+    #[test]
+    fn a_bytes32_digest_becomes_the_cid_the_network_serves() {
+        for (digest, want) in [
+            (
+                "6283b77fbdf020ce43a55149457f8ca1a3bec1ca60cd177163a7402e1a3945e4",
+                "QmUyD9wPyVCkDotF9oUoQHcMrhCMLU9Sqi6HY7BrttLPsq",
+            ),
+            (
+                "03b323306942bf347c602031319293fd6eaad9c891c0261232610132c7c7f943",
+                "QmNb6MzQ4E9bS8tffxMeQbGsPvcn8Hwor67MG8fHTS66up",
+            ),
+            (
+                "ecd9754f54112f72ed6cf787d64e2449729ac9b64a192d6cd5ba1887860104b9",
+                "QmeHDFJScdzx8Rz9sVuZZePytFvJbXcNAo4AT3t58KwysN",
+            ),
+        ] {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&hex::decode(digest).unwrap());
+            let got = cid_v0_from_digest(&d);
+            assert_eq!(got, want, "digest 0x{digest}");
+            // And it must survive our own parser, or the resolver would reject what we just built.
+            let parsed = Cid::parse(&got).expect("a CID we produced must parse");
+            assert_eq!(parsed.digest, d.to_vec(), "the digest must round-trip");
+        }
+    }
+
+    /// The framing is the difference between this and [`cid_v0_for`], and it is easy to lose: both
+    /// end in `base58(0x12 0x20 || sha256(..))`, but one hashes the UnixFS node and the other hashes
+    /// nothing at all. Assert they disagree on the same 32 bytes, so a refactor that quietly routed
+    /// one through the other would be caught here rather than by a nest that resolves nothing.
+    #[test]
+    fn a_digest_is_not_the_address_of_those_same_32_bytes() {
+        let d = [7u8; 32];
+        assert_ne!(cid_v0_from_digest(&d), cid_v0_for(&d));
     }
 }
