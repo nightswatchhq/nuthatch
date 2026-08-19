@@ -90,6 +90,12 @@ jobs:
       # ~69G against the 70G the runner offered before the reclaim - which is the whole of #464, and
       # why it read as a flake: at that margin a couple of GB of cache variance decides it. There is
       # now room for the builds to grow by about a quarter before this is back at the cliff.
+      #
+      # **Stale as of 2026-08-19: that headroom is gone and this paragraph overstates it by half.**
+      # 18G free was measured when it was written; job 95791757824 on 18 August finished on **9.2G**,
+      # and job 96013820700 on 19 August hit **775M and `No space left on device`** linking the
+      # `exex` test binary - on a documentation-only PR. The figures above are kept as the historical
+      # record they are; do not read them as the current margin. Tracked in the issue linked below.
       - name: reclaim runner disk
         run: |
           df -h /
@@ -118,11 +124,32 @@ jobs:
       #
       # An extraction that silently drops the tests it moved is this sprint's own theme, so these
       # steps are explicit rather than clever: same three checks, aimed at the other manifest.
+      #
+      # `CARGO_TARGET_DIR` here is a disk measure, not tidiness: `decode/` is its own workspace, so
+      # without it these steps build a *second* artifact set under `decode/target`. Pointing them at
+      # the root `target/` costs almost nothing, because `cargo test` above already compiles
+      # `nuthatch-decode` as a path dependency into that directory - the only new artifact is
+      # decode's own test harness.
+      #
+      # **It buys ~0.4 GB, and that is not what the ENOSPC above was about.** Measured, because the
+      # first guess was wrong and worth recording so nobody re-guesses it:
+      #
+      #   job 95791757824 (1526cb2, 18 Aug, *before* these steps)  136G used,  9.2G free
+      #   job 95990278738 (#623, the PR that added them)           136G used,  8.8G free
+      #   job 96013820700 (#630, docs-only, 19 Aug)                144G used,  775M -> ENOSPC
+      #
+      # So the job was already finishing at 94% before the decode steps existed, and a docs-only PR
+      # is what tipped it. The variable is cache-restore size between runs, exactly as the paragraph
+      # above says. Reclaiming 0.4 GB is worth doing and does not fix it.
       - name: fmt (decode)
         run: cargo fmt --check --manifest-path decode/Cargo.toml
       - name: clippy (decode)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo clippy --all-targets --manifest-path decode/Cargo.toml -- -D warnings
       - name: test (decode)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo test --locked --manifest-path decode/Cargo.toml
       # What was left when the longest step finished, or when it died. A job that can fail of
       # exhaustion has to report what it had, or the next failure is guessed at like the last two.

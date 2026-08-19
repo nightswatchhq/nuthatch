@@ -58,8 +58,9 @@ the corpus grow (`cargo +nightly fuzz run <target> -- -max_total_time=3600`).
 An acceptance criterion phrased as "no crash found" passes trivially if the harness silently isn't
 reaching the code it claims to fuzz - this project has been bitten by that shape of false-green
 five times (CLAUDE.md's docs-go-stale lesson generalises). Before trusting a green fuzz run, prove
-it reds on a known-bad build: reintroduce a fixed panic (e.g. revert `registry.rs`'s
-`u.saturating_to::<u64>()` guard, COR-11, to an unchecked `.to::<u64>()`) and confirm
+it reds on a known-bad build: reintroduce a fixed panic (e.g. revert
+`decode/src/registry.rs:886`'s `u.saturating_to::<u64>()` guard, COR-11, to an unchecked
+`.to::<u64>()`) and confirm
 `cargo +nightly fuzz run decode_log` finds a crashing input against the seeded corpus, then revert.
 That check isn't automated here - a permanently red "this must find a bug" target isn't buildable -
 so re-run it by hand after any change to the fuzz harness itself.

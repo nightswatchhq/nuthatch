@@ -26,6 +26,12 @@ guide. Both are green as of 2026-08-06. A checklist nobody re-reads decides what
 | 🟡 | Partial - exists but incomplete, unverified, or narrow |
 | ⛔ | Not started, deferred, or blocked (see "Blocked on") |
 
+**The flag is the status; the `[ ]` box beside it means nothing.** 63 rows here read `- [ ] ✅` -
+done and verified, in an unchecked box - because the boxes were never maintained. GitHub renders
+them as a page of empty checkboxes regardless, so a reader skimming the ticks rather than the flags
+reads this document as far worse than it is. Two rows carry `[x]`, which makes the boxes look
+meaningful; they are not. Read the emoji.
+
 **Two production targets, graded separately** - don't conflate them:
 
 - **Embedded / single-chain runtime** (the primary deliverable): one binary, one chain, tip-follow +
@@ -171,6 +177,15 @@ case.
   by how many share a cursor - so read this as "co-tenancy is cheap", never as "a cursor uses 84 MB".
 - [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
   churn).
+  **Still unproven, and #286 being briefly closed is not evidence that it was.** It was closed as
+  completed on 2026-08-10 with no commit referencing it, no PR closing it and no comment recording a
+  measurement; reopened 2026-08-19 on those grounds. Read the row as written, not as the issue's
+  state implies. **The `per-cursor RAM budget (dense multi-nest)` CI job does not cover this** - it is
+  #284's density fixture, and the qualifier four lines above is the reason: density is not workload.
+  The fixture this needs is Uniswap V4 (~17 events/block on mainnet), which lives in
+  `nightswatchhq/uniswap-v4-ethereum` rather than here, and whatever measures it needs a floor
+  proving it indexed anything, since "RSS stayed under 2 GB" passes most confidently when the
+  workload failed to start.
 - [ ] ✅ Long-running soak (23h) with no RSS creep (leak check).
   **Two nests on the Lodestar prod box, 0.7.2, 2026-07-29 → 30.** Final RSS **459 MB** and **427 MB**
   against the 2048 MB per-cursor budget - 22% and 21% - and **flat across repeated samples** at the
