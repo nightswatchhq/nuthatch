@@ -244,13 +244,16 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 /// documenting it is the decision. It is checked for staleness below, so an entry that becomes
 /// documented fails rather than lingering.
 const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
-    ("Config.extract", "RFC-0014 traces/state: parses, then refused at startup - no extraction source exists yet (#277)"),
-    ("Extract.blocks", "field of `[extract]`, same reason"),
+    // `Config.extract` is documented now (RFC-0038 §5 added `top_level_calls`, which works on
+    // ordinary RPC), so its excuse is gone. The node-gated fields below keep theirs.
+    ("Extract.blocks", "field of `[extract]`; sourceable from ordinary RPC (RFC-0036) but not yet written up"),
     ("Extract.state", "field of `[extract]`, same reason"),
     ("Extract.traces", "field of `[extract]`, same reason"),
     ("Extract.selectors", "field of `[extract]`, same reason"),
     ("Extract.unbounded", "field of `[extract]`, same reason"),
-    ("Config.calls", "RFC-0023 tier 3: parses but is never executed (#268)"),
+    // `Config.calls` was excused here as "parses but is never executed (#268)". It executes now, so
+    // the excuse expired and `[[calls]]` is documented in the reference instead.
+    ("Config.state_rpc_urls", "`#[serde(skip)]` - the tier-3 archive endpoint comes from `--state-rpc` and is deliberately never a config key, because it carries an API key and this file is pinned into the nest's content address"),
 ];
 
 #[test]
