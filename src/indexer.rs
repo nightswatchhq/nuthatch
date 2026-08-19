@@ -7133,21 +7133,22 @@ template = "pool"
         nest
     }
 
-    /// RFC-0038 slice 0: **does a block row collide with a log at index 0 in the same block?**
+    /// **#642: a block row must not destroy the log at index 0 in its block.**
     ///
     /// `Store::entity_key` is `(block, log_index)` and assumes every row descends from a log. Block
-    /// rows (RFC-0036) do not: they are written with `log_index: 0`. Nothing refuses a nest that sets
-    /// `[extract] blocks` *and* indexes a contract, and `to_store` is a plain `Vec<(String, String)>`
-    /// committed as written into redb, where a repeated key is an overwrite.
+    /// rows (RFC-0036) descend from none, and were written with `log_index: 0` - indistinguishable
+    /// from the first log in the block. In `process_window` the log rows are pushed to `to_store`
+    /// first and the block rows second, and a repeated key in redb is an overwrite, so the block row
+    /// won and the log was gone. Silently: no warning, no error, no gap in the cursor.
     ///
-    /// This settles it before RFC-0038 adds a **third** kind of row that descends from no log at all
-    /// (call results). Driven through the real `process_window` - the hot-store path - because the
-    /// seal-direct path buffers by block into append-only Parquet and cannot collide, so testing that
-    /// one proves nothing about this one.
+    /// Fixed by [`crate::registry::BLOCK_ROW_LOG_INDEX`], which reserves the top of the index range
+    /// for rows that descend from no log. This is the test that found it.
     ///
-    /// Blocks 1-3, one Ping at block 2 log_index 0: **four rows are owed**.
+    /// Driven through the real `process_window` because the seal-direct path buffers `(block, json)`
+    /// into append-only Parquet and cannot collide - testing that path proves nothing about this one,
+    /// and it passed while this bug was live.
     #[tokio::test]
-    async fn a_block_row_and_a_log_at_index_zero_both_survive() {
+    async fn a_block_row_does_not_overwrite_the_log_at_index_zero() {
         struct HeadersAndOneLog;
         #[async_trait::async_trait]
         impl Source for HeadersAndOneLog {
@@ -7228,10 +7229,8 @@ template = "pool"
         assert_eq!(
             keys.len(),
             4,
-            "blocks 1-3 owe three block rows plus one Ping at block 2 log_index 0, but the store \
-             holds {}: {keys:?}. A block row and a log row shared the `(block, log_index)` key and \
-             one overwrote the other.",
-            keys.len()
+            "blocks 1-3 plus one Ping at block 2 log_index 0 owe four rows; three means the block \
+             row overwrote the log again (#642). Keys: {keys:?}"
         );
     }
 

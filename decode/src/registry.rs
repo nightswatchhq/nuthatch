@@ -204,6 +204,19 @@ pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
 /// rather than to any one contract in the nest.
 pub const BLOCKS_TABLE: &str = "blocks";
 
+/// The `log_index` a **block row** is stored under (#642).
+///
+/// Rows are keyed `(block, log_index)` by `Store::entity_key`, which assumes every row descends from
+/// a log. A block row descends from none, and using `0` made it indistinguishable from the *first log
+/// in the block* - so the block row, written second, silently overwrote it. That is the first event of
+/// every block, gone, with no warning and no gap in the cursor.
+///
+/// `999_000..=999_999` is therefore **reserved for rows that descend from no log**. Real logs cannot
+/// reach it: `entity_key` already asserts `log_index < 1_000_000`, and a block's gas limit caps logs
+/// around 80k, three orders of magnitude below the reserve. Block rows take the top of the band so
+/// they sort after the logs they summarise; RFC-0023 tier-3 call results will take the rest.
+pub const BLOCK_ROW_LOG_INDEX: u64 = 999_999;
+
 /// A serializable table schema (per-event table + its columns).
 ///
 /// `event`/`topic0` and `function`/`selector` are the same idea for different [`TableKind`]s, and
@@ -421,7 +434,7 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
         block_hash: hash.clone(),
         block_timestamp: hex("timestamp"),
         timestamps,
-        log_index: 0,
+        log_index: BLOCK_ROW_LOG_INDEX,
         tx_hash: hash,
         address: String::new(),
     })
