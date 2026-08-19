@@ -96,6 +96,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--dir <DIR>` - The directory to run. A `nuthatch.toml` runs that one nest; a `mounts.toml` runs every nest it mounts, one isolated cursor per chain (RFC-0032). One command either way
 - `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving
 - `--listen <LISTEN>` - Address to bind the HTTP API to
+- `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable)
 - `--rpc <RPC>` - Override the nest's `rpc_urls` at runtime without editing the config (repeatable). These are tried first; the nest's configured endpoints remain as fallback. Point at your own node
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
 - `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following - much faster for a from-deployment backfill (RFC-0004). The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments

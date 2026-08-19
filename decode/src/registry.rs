@@ -204,6 +204,46 @@ pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
 /// rather than to any one contract in the nest.
 pub const BLOCKS_TABLE: &str = "blocks";
 
+/// The `log_index` a **block row** is stored under (#642).
+///
+/// Rows are keyed `(block, log_index)` by `Store::entity_key`, which assumes every row descends from
+/// a log. A block row descends from none, and using `0` made it indistinguishable from the *first log
+/// in the block* - so the block row, written second, silently overwrote it. That is the first event of
+/// every block, gone, with no warning and no gap in the cursor.
+///
+/// `500_000..=999_999` is therefore **reserved for rows that descend from no log**. Real logs cannot
+/// reach it: `entity_key` already asserts `log_index < 1_000_000`, and a block's gas limit caps logs
+/// around 80k, well below the reserve. Block rows take the very top so they sort after the logs they
+/// summarise; RFC-0023 tier-3 call results take the rest.
+///
+/// The band is half the range rather than a thousand slots because a **row-driven** call fires once
+/// per source row (RFC-0038 §3), so one block can want thousands of results. A narrow band would have
+/// turned that into a silent key collision - the very bug (#642) this constant exists to fix.
+pub const BLOCK_ROW_LOG_INDEX: u64 = 999_999;
+
+/// The base `log_index` for **pinned call results** (RFC-0023 tier 3), inside the same reserved band
+/// as [`BLOCK_ROW_LOG_INDEX`].
+///
+/// A call result descends from no log either, and there may be many in one block: a sampled
+/// declaration contributes one, a row-driven one contributes a call per source row. They are laid out
+/// from this base in a deterministic order - declarations in config order, and within a row-driven
+/// declaration its source rows in `log_index` order - so two operators running the same nest produce
+/// the same keys, not merely the same content addresses.
+pub const CALL_ROW_LOG_INDEX_BASE: u64 = 500_000;
+
+/// The base `log_index` for **decoded top-level calls** (RFC-0038 §5), the upper half of the reserved
+/// band.
+///
+/// A top-level call is a transaction, so its ordinal is the transaction index - which lives in the
+/// same numeric space as `log_index` and would otherwise collide with both a log and a tier-3 result.
+/// `CallContext::call_index` recorded this as a known gap "deliberately left for the extraction
+/// slice"; this is that slice, and the band is the answer.
+///
+/// A block's gas limit caps transactions near 1,500, so the quarter-million slots here are enormous
+/// headroom. The split is 500,000..749,999 for pinned reads and 750,000..999,998 for calls, with the
+/// block row alone at the top.
+pub const TX_CALL_ROW_LOG_INDEX_BASE: u64 = 750_000;
+
 /// A serializable table schema (per-event table + its columns).
 ///
 /// `event`/`topic0` and `function`/`selector` are the same idea for different [`TableKind`]s, and
@@ -421,7 +461,7 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
         block_hash: hash.clone(),
         block_timestamp: hex("timestamp"),
         timestamps,
-        log_index: 0,
+        log_index: BLOCK_ROW_LOG_INDEX,
         tx_hash: hash,
         address: String::new(),
     })

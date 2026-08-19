@@ -46,7 +46,10 @@ const DEFAULT_BACKFILL: u64 = 5_000;
 /// `Source` instead and calls [`run`] directly - same core, different tip source.
 pub async fn dev(args: DevArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
-    let config = Config::load(&dir)?;
+    let mut config = Config::load(&dir)?;
+    // RFC-0023 tier 3's archive endpoints. Carried on `Config` because every layer below already
+    // takes `&Config`, and `#[serde(skip)]` keeps them out of `nuthatch.toml` and so out of the NID.
+    config.state_rpc_urls = args.state_rpc.clone();
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. `--rpc` overrides are tried ahead of the configured
     // endpoints without touching the nest's config on disk.
@@ -1988,6 +1991,41 @@ async fn build_nest(
     // nests from one cursor (RFC-0012). `source` stays shared and borrowed, not owned; `children`
     // starts empty (it is rebuilt/grown by `prepare`). The view handles are cloned here and shared
     // with the `AppState` below - the API must see the same views the loop feeds.
+    // RFC-0023 tier 3: the archive endpoint a declared call is resolved against. Built here so a
+    // nest declaring `[[calls]]` without one is refused at startup rather than discovered thousands
+    // of blocks into a backfill as a wall of identical failures.
+    // RFC-0038 §5: built whenever the nest decodes calldata at all. Distinct from `enabled()`, which
+    // is the node-gated set - a top-level-calls nest needs this surface and needs no node.
+    let call_registry = if config.extract.decodes_calls() {
+        Some(Arc::new(crate::calldata::CallRegistry::from_nest(
+            &dir, config,
+        )?))
+    } else {
+        None
+    };
+
+    let state_rpc = if config.state_rpc_urls.is_empty() {
+        if !config.calls.is_empty() {
+            anyhow::bail!(
+                "this nest declares {} `[[calls]]` entr{}, which need historical `eth_call` and \
+                 therefore an archive endpoint.\n\n\
+                 Pass `--state-rpc <url>`. It is deliberately not a `nuthatch.toml` field: an \
+                 archive endpoint usually carries an API key, and the config is pinned into the \
+                 nest's content address.\n\n\
+                 Most contract state does not need this at all - try `nuthatch recipe add \
+                 total_supply` (also `balances`, `holder_count`, `reserves`), or `nuthatch metadata \
+                 fetch` for immutable `decimals`/`symbol`/`name`.",
+                config.calls.len(),
+                if config.calls.len() == 1 { "y" } else { "ies" },
+            );
+        }
+        None
+    } else {
+        Some(Arc::new(crate::rpc::RpcClient::new(
+            config.state_rpc_urls.clone(),
+        )?))
+    };
+
     let shared_store = store.clone();
     let nest = NestIngest {
         name: config.nest.name.clone(),
@@ -2010,6 +2048,11 @@ async fn build_nest(
         addresses,
         topic0s,
         start_block,
+        top_level_calls: config.extract.top_level_calls,
+        call_registry: call_registry.clone(),
+        chain_id: config.nest.chain_id,
+        calls: config.calls.clone(),
+        state_rpc,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -3104,6 +3147,26 @@ pub struct NestIngest {
     /// The nest's earliest vendored deployment block (the min of the contracts' `start_block`s), or
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
+    /// RFC-0038 §5: whether this nest decodes **top-level calls** - transactions sent directly to its
+    /// contracts, which is what a subgraph's `callHandlers` fire on.
+    top_level_calls: bool,
+    /// RFC-0038 §5: the call-decode surface, present when the nest sets `[extract] top_level_calls`
+    /// or `traces`. `None` when it decodes events only, which is the default and the common case.
+    call_registry: Option<Arc<crate::calldata::CallRegistry>>,
+    /// The nest's chain id, needed to key a tier-3 call result: a `CallKey` is
+    /// `(chain, block, contract, calldata)`, and omitting the chain would make two chains' answers
+    /// to the same question share one content address.
+    chain_id: u64,
+    /// RFC-0023 tier 3: the nest's declared pinned reads, in config order. That order fixes each
+    /// row's `log_index` inside the reserved band, so it is identity, not presentation.
+    calls: Vec<crate::calls::CallDecl>,
+    /// The **operator-supplied archive endpoint** a declared call is resolved against (`--state-rpc`).
+    ///
+    /// Deliberately not the ingestion `Source`: a source may be an ExEx, a mock, or a pool of
+    /// pruned endpoints that serve logs perfectly well and cannot answer a historical `eth_call`.
+    /// Tier 3 needs archive state and RFC-0024 is explicit that it comes from the operator, so it is
+    /// its own client and its absence is refused at startup rather than discovered mid-backfill.
+    state_rpc: Option<Arc<crate::rpc::RpcClient>>,
 }
 
 impl NestIngest {
@@ -3121,6 +3184,26 @@ impl NestIngest {
         concurrency: usize,
         window: u64,
     ) -> Result<u64> {
+        // RFC-0023 tier 3 is resolved in `process_window`, which is the hot path. The seal-direct
+        // backfill does not go through it, so a `--seal-direct` run would sail past every sampled
+        // block and seal the range with the declared table simply absent - accepted, validated, and
+        // silently producing nothing over exactly the range the operator asked to be fast.
+        //
+        // That is issue #262's shape, which this slice exists to remove, so it is refused rather than
+        // warned about. Delete this when the seal-direct paths learn to resolve calls; the test named
+        // after it will fail and say so.
+        if seal_direct && !self.calls.is_empty() {
+            anyhow::bail!(
+                "this nest declares {} `[[calls]]` entr{} and `--seal-direct` was requested, but the \
+                 seal-direct backfill does not resolve pinned reads yet - the sealed range would be \
+                 missing them entirely, without saying so.\n\n\
+                 Drop `--seal-direct` for this nest, or remove the `[[calls]]` block. Tier 3 works on \
+                 the ordinary path.",
+                self.calls.len(),
+                if self.calls.len() == 1 { "y" } else { "ies" },
+            );
+        }
+
         // User webhooks (RFC-0010 Part B): initialise each subscription's cursor before any sealing, so a
         // `since = "registration"` webhook starts at the tip and a `--seal-direct` backfill doesn't fire
         // its history. Best-effort - a tip lookup failure just defers registration to the first live tip.
@@ -3474,6 +3557,12 @@ impl NestIngest {
         // factory discovery is inline: a child created at log i is in the registry before its
         // own activity at log j>i in the same window decodes (RFC-0009 same-block handling).
         let mut blocks: Vec<u64> = logs.iter().map(|l| l.block_number).collect();
+        // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row with
+        // `block_timestamp = 0` seals that zero permanently once it finalizes (the H4 finding below).
+        // So the sampled blocks join the timestamp fetch rather than being handled after it.
+        for d in &self.calls {
+            blocks.extend(d.blocks_in(next, to));
+        }
         blocks.sort_unstable();
         blocks.dedup();
         let timestamps = match fetch_timestamps(source, &self.registry, &blocks).await {
@@ -3633,6 +3722,173 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
+        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
+        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
+        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
+        //
+        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
+        // it did not ask for.
+        if self.top_level_calls {
+            if let Some(creg) = self.call_registry.clone() {
+                let want: Vec<u64> = (next..=to).collect();
+                let bodies = source.block_bodies(&want).await?;
+                for b in &want {
+                    let Some(body) = bodies.get(b) else { continue };
+                    let bhash = body
+                        .get("hash")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    // The body already carries the header, so the timestamp comes from it rather
+                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
+                    // that emitted no matching log at all, which is most of them.
+                    let ts = body
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(0);
+                    let txs = body.get("transactions").and_then(|t| t.as_array());
+                    for tx in txs.into_iter().flatten() {
+                        // `to` is absent for a contract creation, which is not a call to anything we
+                        // index.
+                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
+                            continue;
+                        };
+                        let lower = to_addr.to_ascii_lowercase();
+                        if !self
+                            .addresses
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&lower))
+                        {
+                            continue;
+                        }
+                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
+                            continue;
+                        };
+                        let input = hex::decode(
+                            tx.get("input")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("0x")
+                                .trim_start_matches("0x"),
+                        )
+                        .unwrap_or_default();
+                        let idx = tx
+                            .get("transactionIndex")
+                            .and_then(|i| i.as_str())
+                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0);
+                        let ctx = crate::calldata::CallContext {
+                            block_number: *b,
+                            block_hash: bhash.clone(),
+                            block_timestamp: ts,
+                            tx_hash: tx
+                                .get("hash")
+                                .and_then(|h| h.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            // The reserved band is applied here rather than at storage, so the row's
+                            // own `log_index` is the key it lands under - one number, one meaning.
+                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
+                            timestamps: self.registry.timestamps(),
+                        };
+                        if let Some(row) = creg.decode_call(addr, &input, &ctx) {
+                            to_store.push((
+                                Store::entity_key(row.block_number, row.log_index),
+                                row.to_json().to_string(),
+                            ));
+                            stored += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // RFC-0023 tier 3 + RFC-0038 §3: resolve the declared reads this window asks for.
+        //
+        // Two forms. A **sampled** declaration fires at the blocks `blocks_in` yields. A **row-driven**
+        // one fires once per row of the table it names, which is what a subgraph mapping does - the
+        // call happens as the row is produced, the same moment a handler would have made it.
+        //
+        // Ordering is identity, not presentation: declarations in config order, and within a
+        // row-driven declaration its source rows in `log_index` order. Two operators running the same
+        // nest must produce the same keys, not merely the same content addresses.
+        if !self.calls.is_empty() {
+            let rpc = self
+                .state_rpc
+                .clone()
+                .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
+            let mut wanted: std::collections::BTreeMap<u64, Vec<(usize, String, String)>> =
+                std::collections::BTreeMap::new();
+            for (i, d) in self.calls.iter().enumerate() {
+                if d.is_row_driven() {
+                    let table = d.on.as_deref().unwrap_or_default();
+                    let mut src: Vec<&crate::registry::DecodedRow> =
+                        rows.iter().filter(|r| r.table == table).collect();
+                    src.sort_by_key(|r| (r.block_number, r.log_index));
+                    for r in src {
+                        let (contract, calldata) = d.resolve_for_row(r)?;
+                        wanted
+                            .entry(r.block_number)
+                            .or_default()
+                            .push((i, contract, calldata));
+                    }
+                } else {
+                    for b in d.blocks_in(next, to) {
+                        wanted.entry(b).or_default().push((
+                            i,
+                            d.contract.to_ascii_lowercase(),
+                            d.calldata.to_ascii_lowercase(),
+                        ));
+                    }
+                }
+            }
+
+            let capacity =
+                crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+            for (block, mut items) in wanted {
+                // `CallKey` is a content address, so N rows asking the same question of the same
+                // contract at the same block are one call and one row. Dedupe before the RPC, not
+                // after: the saving is the request, not the storage.
+                let mut seen = std::collections::HashSet::new();
+                items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
+
+                if items.len() as u64 >= capacity {
+                    anyhow::bail!(
+                        "block {block} wants {} distinct pinned reads, and only {capacity} fit in the \
+                         reserved row-index band.\n\n\
+                         A row-driven `[[calls]]` declaration fires once per source row, so a dense \
+                         table can ask for more reads than a block can hold. Narrow the source table \
+                         (index fewer events), or make the declaration sampled instead.",
+                        items.len()
+                    );
+                }
+
+                let pairs: Vec<(String, String)> = items
+                    .iter()
+                    .map(|(_, c, d)| (c.clone(), d.clone()))
+                    .collect();
+                let results =
+                    crate::calls::resolve_pairs_at(rpc.as_ref(), self.chain_id, &pairs, block)
+                        .await?;
+                let hash = source.block_hash(block).await?.unwrap_or_default();
+                let ts = timestamps.get(&block).copied().unwrap_or(0);
+                for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
+                    let row = r.to_row(
+                        &self.calls[*i].name,
+                        slot,
+                        &hash,
+                        ts,
+                        self.registry.timestamps(),
+                    );
+                    to_store.push((
+                        Store::entity_key(row.block_number, row.log_index),
+                        row.to_json().to_string(),
+                    ));
+                    stored += 1;
+                }
+            }
+        }
+
         // requests. `to_store` is moved rather than borrowed - the work outlives this borrow.
         self.store
             .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
@@ -7102,6 +7358,666 @@ template = "pool"
                 })
                 .collect())
         }
+    }
+
+    /// A nest with **both** a contract and `[extract] blocks = true`, through the real `build_nest`.
+    /// Nothing in `config.rs` refuses this combination, so it is a shape an operator can write.
+    async fn build_blocks_and_contract_nest(dir: &std::path::Path) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"bc\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .expect("a nest with a contract and [extract] blocks must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
+    /// A stub JSON-RPC that answers every `eth_call` in a batch with the same fixed word, and
+    /// records the blocks it was asked about so a test can assert the *pin* rather than just the
+    /// answer.
+    async fn stub_state_rpc(
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Router};
+        async fn handler(
+            axum::extract::State(seen): axum::extract::State<
+                std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            >,
+            body: String,
+        ) -> axum::Json<serde_json::Value> {
+            let req: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
+            let one = |r: &serde_json::Value| {
+                // `eth_call` params are `[{to,data}, block]`. Record `block|to|data` so a test can
+                // assert the *pin* and the *argument*, not merely that something was called.
+                let p = r.get("params");
+                let at = |k: &str| {
+                    p.and_then(|p| p.get(0))
+                        .and_then(|o| o.get(k))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                let blk = p
+                    .and_then(|p| p.get(1))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("?");
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{blk}|{}|{}", at("to"), at("data")));
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": r.get("id").cloned().unwrap_or(serde_json::json!(1)),
+                    "result": format!("0x{:064x}", 42),
+                })
+            };
+            axum::Json(match req.as_array() {
+                Some(rs) => serde_json::Value::Array(rs.iter().map(one).collect()),
+                None => one(&req),
+            })
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    fn write_calls_nest(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"c\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"oracle_answer\"\n\
+             contract = \"0x2222222222222222222222222222222222222222\"\n\
+             calldata = \"0x18160ddd\"\nevery = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+    }
+
+    /// RFC-0023 tier 3, end to end: a declared `[[calls]]` read is resolved at the blocks it samples
+    /// and stored as rows.
+    ///
+    /// Before this, `resolve_at` had no caller at all - the machinery was built, tested and reachable
+    /// from config, and a declaration was accepted, validated and then ignored forever (#262). This
+    /// is the test that the wire exists, driven through the real `build_nest` and the real
+    /// `process_window` against a stub archive endpoint.
+    #[tokio::test]
+    async fn a_declared_call_is_resolved_at_every_sampled_block_and_stored() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a calls nest with a state RPC must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        // Both handles hold the store: redb takes its exclusive flock at `Database::open`, so a
+        // second handle is refused while either is alive.
+        drop(nest);
+        drop(state);
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+        assert_eq!(
+            keys.len(),
+            3,
+            "`every = 1` over blocks 1-3 owes three resolved rows, got {}: {keys:?}",
+            keys.len()
+        );
+
+        // The pin is the point: each sample must be asked at *its own* block, not at `latest`.
+        let asked: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.split('|').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            asked,
+            vec!["0x1", "0x2", "0x3"],
+            "each sample must be pinned to its own block - `latest` would break determinism"
+        );
+
+        let row: serde_json::Value =
+            serde_json::from_str(&store.get_entity(&keys[0]).unwrap().unwrap()).unwrap();
+        assert_eq!(row["table"], "oracle_answer", "row: {row}");
+        assert_eq!(
+            row["reverted"], false,
+            "a stub that answers is not a revert"
+        );
+        handle.abort();
+    }
+
+    /// `--seal-direct` with declared calls is refused, because the seal-direct backfill does not
+    /// resolve them and would seal the range with the table silently absent.
+    ///
+    /// This is #262's shape guarded against in advance: the slice that wired tier 3 wired it into
+    /// `process_window` only, and a partial wire that looks whole is the failure this project can
+    /// least afford. **Delete this guard, and this test, when the seal-direct paths resolve calls.**
+    #[tokio::test]
+    async fn seal_direct_with_declared_calls_is_refused_rather_than_silently_skipping_them() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let err = match nest.prepare(source.as_ref(), None, true, 1, 100).await {
+            Ok(_) => panic!("seal-direct plus declared calls must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("seal-direct"), "name the flag: {err}");
+        assert!(
+            err.contains("without saying so"),
+            "the refusal must say *why* it is not merely a warning: {err}"
+        );
+
+        // Control: the same nest without `--seal-direct` prepares fine, or this test would pass
+        // just as well against a nest that refuses everything.
+        drop(nest);
+        drop(state);
+        let (mut ok_nest, ok_state, w2, _) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(w) = w2 {
+            w.abort();
+        }
+        assert!(
+            ok_nest
+                .prepare(source.as_ref(), None, false, 1, 100)
+                .await
+                .is_ok(),
+            "the ordinary path must still accept a calls nest"
+        );
+        drop(ok_nest);
+        drop(ok_state);
+        handle.abort();
+    }
+
+    /// **RFC-0038 §5, end to end: a top-level call is decoded from ordinary RPC.**
+    ///
+    /// This is what a subgraph's `callHandlers` fire on. `[extract] traces` bundled it with the
+    /// *internal* call tree behind the node gate, which was RFC-0036's bundling-by-shape error a
+    /// second time: internal calls genuinely need `debug_*`, but a top-level call is a transaction and
+    /// `eth_getBlockByNumber(b, true)` returns it.
+    ///
+    /// Asserts three things a weaker test would miss: the call row exists, a transaction to an
+    /// address this nest does **not** index is ignored, and the row's key sits in the reserved band so
+    /// it cannot collide with a log at the same ordinal - the gap `CallContext::call_index` recorded
+    /// and #642 proved was live for block rows.
+    ///
+    /// **No `[extract] contracts` scope, deliberately.** With one set, `CallRegistry::in_scope` does
+    /// the filtering and this test passes with the indexer's own address filter deleted - it would be
+    /// asserting somebody else's guard. Unscoped, the nest's own addresses are the only bound, which
+    /// is the one that matters: `scope_check` guards `traces`/`state` and returns early for a
+    /// top-level-calls nest, so without that filter an unscoped nest would decode every transaction
+    /// on the chain.
+    #[tokio::test]
+    async fn a_top_level_call_is_decoded_without_a_node() {
+        struct BodySource;
+        #[async_trait::async_trait]
+        impl Source for BodySource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                Ok(blocks
+                    .iter()
+                    .map(|&b| {
+                        (
+                            b,
+                            serde_json::json!({
+                                "hash": format!("0x{b:064x}"),
+                                "timestamp": "0x65000000",
+                                "transactions": [
+                                    // A call to the contract this nest indexes: `ping()`.
+                                    {
+                                        "hash": "0xaa",
+                                        "to": "0x1111111111111111111111111111111111111111",
+                                        "input": "0x5c36b186",
+                                        "transactionIndex": "0x0"
+                                    },
+                                    // A call to some other contract entirely. Decoding this would
+                                    // mean the nest pays for chain traffic it never asked for.
+                                    {
+                                        "hash": "0xbb",
+                                        "to": "0x9999999999999999999999999999999999999999",
+                                        "input": "0x5c36b186",
+                                        "transactionIndex": "0x1"
+                                    },
+                                    // A contract creation has no `to` at all.
+                                    {
+                                        "hash": "0xcc",
+                                        "input": "0x6080",
+                                        "transactionIndex": "0x2"
+                                    },
+                                ],
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"tc\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [extract]\ntop_level_calls = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"function","name":"ping","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
+                {"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            !config.extract.enabled(),
+            "top_level_calls must NOT be node-gated, or this nest is refused at startup"
+        );
+
+        let source: Arc<dyn Source> = Arc::new(BodySource);
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a top-level-calls nest must build with no node");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        nest.process_window(source.as_ref(), &[], 4, 4, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "only the call to *our* contract is decoded - the foreign call and the creation are not: \
+             {keys:?}"
+        );
+        let ordinal: u64 = keys[0].rsplit('-').next().unwrap().parse().unwrap();
+        assert_eq!(
+            ordinal,
+            crate::registry::TX_CALL_ROW_LOG_INDEX_BASE,
+            "transaction 0 must land in the reserved band, not at log_index 0 where a log lives"
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(&store.get_entity(&keys[0]).unwrap().unwrap()).unwrap();
+        // `call_` prefixed, so a function and an event of the same name cannot collide in one nest -
+        // this ABI has both a `ping()` function and a `Ping` event, which is why the fixture carries
+        // both.
+        assert_eq!(row["table"], "tok__call_ping", "row: {row}");
+        assert_eq!(
+            row["tx_hash"], "0xaa",
+            "the row must carry the transaction it came from"
+        );
+        assert_eq!(
+            row["block_timestamp"], 1_694_498_816u64,
+            "the timestamp comes from the body we already fetched, not a second round trip"
+        );
+    }
+
+    /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**
+    ///
+    /// This is the claim the whole parity argument rests on. A subgraph mapping reads
+    /// `c.balanceOf(event.params.to)`; before this, a nest could only declare a fixed calldata
+    /// sampled every N blocks, which expresses an oracle read and not a mapping.
+    ///
+    /// Two transfers in one block to two different recipients must produce **two** calls with
+    /// **different arguments** and **distinct keys** - not one, and not two rows overwriting each
+    /// other, which is exactly how #642 went wrong for block rows.
+    #[tokio::test]
+    async fn a_row_driven_call_fires_once_per_event_with_the_events_own_argument() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"recipient_balance\"\n\
+             contract = \"0x1111111111111111111111111111111111111111\"\n\
+             on = \"tok__transfer\"\nsignature = \"balanceOf(address)\"\nargs = [\"{to}\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a row-driven calls nest must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "tok__transfer")
+                    .expect("fixture must expose tok__transfer")
+                    .topic0
+            )
+        );
+        let pad = |b: u8| format!("0x{:064x}", b);
+        let logs: Vec<crate::rpc::Log> = (1u8..=2)
+            .map(|i| crate::rpc::Log {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                topics: vec![topic0.clone(), pad(0xaa), pad(0xb0 + i)],
+                data: format!("0x{:064x}", 1000 * i as u64),
+                block_number: 5,
+                block_hash: format!("0x{:064x}", 5),
+                tx_hash: format!("0xt{i}"),
+                log_index: u64::from(i),
+            })
+            .collect();
+
+        nest.process_window(source.as_ref(), &logs, 5, 5, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let asked = seen.lock().unwrap().clone();
+        assert_eq!(
+            asked.len(),
+            2,
+            "two transfers to two recipients owe two calls, got {asked:?}"
+        );
+        for (i, a) in asked.iter().enumerate() {
+            assert!(
+                a.starts_with("0x5|"),
+                "pinned to the event's own block: {a}"
+            );
+            // `balanceOf(address)` is selector 0x70a08231 - a published value, not ours.
+            assert!(a.contains("|0x70a08231"), "calldata must be balanceOf: {a}");
+            assert!(
+                a.ends_with(&format!("{:0>64x}", 0xb1 + i as u32)),
+                "the argument must be *this* event's recipient: {a}"
+            );
+        }
+        assert_ne!(asked[0], asked[1], "two recipients, two distinct questions");
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let mut call_keys: Vec<String> = store
+            .entity_keys()
+            .unwrap()
+            .into_iter()
+            .filter(|k| {
+                k.rsplit('-')
+                    .next()
+                    .and_then(|i| i.parse::<u64>().ok())
+                    .is_some_and(|i| i >= crate::registry::CALL_ROW_LOG_INDEX_BASE)
+            })
+            .collect();
+        call_keys.sort();
+        assert_eq!(
+            call_keys.len(),
+            2,
+            "two results must land under two keys, not overwrite each other (#642's lesson): \
+             {call_keys:?}"
+        );
+        handle.abort();
+    }
+
+    /// A declared call with no archive endpoint is refused at startup, not discovered thousands of
+    /// blocks into a backfill as a wall of identical failures.
+    #[tokio::test]
+    async fn calls_without_a_state_rpc_are_refused_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            config.state_rpc_urls.is_empty(),
+            "the endpoint must never come from nuthatch.toml - it would enter the content address"
+        );
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let err = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await;
+        // `unwrap_err` would need `Debug` on the Ok type, and `NestIngest`/`AppState` do not carry it.
+        let err = match err {
+            Ok(_) => panic!("a calls nest with no --state-rpc must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("--state-rpc"), "name the flag: {err}");
+        assert!(
+            err.contains("recipe add") || err.contains("metadata fetch"),
+            "a refusal should name the cheaper thing to do instead: {err}"
+        );
+    }
+
+    /// **#642: a block row must not destroy the log at index 0 in its block.**
+    ///
+    /// `Store::entity_key` is `(block, log_index)` and assumes every row descends from a log. Block
+    /// rows (RFC-0036) descend from none, and were written with `log_index: 0` - indistinguishable
+    /// from the first log in the block. In `process_window` the log rows are pushed to `to_store`
+    /// first and the block rows second, and a repeated key in redb is an overwrite, so the block row
+    /// won and the log was gone. Silently: no warning, no error, no gap in the cursor.
+    ///
+    /// Fixed by [`crate::registry::BLOCK_ROW_LOG_INDEX`], which reserves the top of the index range
+    /// for rows that descend from no log. This is the test that found it.
+    ///
+    /// Driven through the real `process_window` because the seal-direct path buffers `(block, json)`
+    /// into append-only Parquet and cannot collide - testing that path proves nothing about this one,
+    /// and it passed while this bug was live.
+    #[tokio::test]
+    async fn a_block_row_does_not_overwrite_the_log_at_index_zero() {
+        struct HeadersAndOneLog;
+        #[async_trait::async_trait]
+        impl Source for HeadersAndOneLog {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_headers(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                Ok(blocks
+                    .iter()
+                    .map(|&b| {
+                        (
+                            b,
+                            serde_json::json!({
+                                "hash": format!("0x{b:064x}"),
+                                "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                                "miner": "0x0000000000000000000000000000000000000000",
+                                "gasUsed": "0x0",
+                                "gasLimit": "0x1388",
+                                "size": "0x220",
+                                "timestamp": format!("0x{:x}", 1_700_000_000 + b),
+                                "transactions": [],
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest = build_blocks_and_contract_nest(dir.path()).await;
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "tok__ping")
+                    .expect("fixture must expose tok__ping")
+                    .topic0
+            )
+        );
+        let src = HeadersAndOneLog;
+        let logs = vec![crate::rpc::Log {
+            address: "0x1111111111111111111111111111111111111111".into(),
+            topics: vec![topic0],
+            data: "0x".into(),
+            block_number: 2,
+            block_hash: format!("0x{:064x}", 2),
+            tx_hash: "0xdeadbeef".into(),
+            log_index: 0,
+        }];
+
+        nest.process_window(&src, &logs, 1, 3, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+
+        // Drop the nest first: redb takes its exclusive flock at `Database::open`, so a second
+        // handle is refused while this one is alive.
+        drop(nest);
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "blocks 1-3 plus one Ping at block 2 log_index 0 owe four rows; three means the block \
+             row overwrote the log again (#642). Keys: {keys:?}"
+        );
     }
 
     /// #429: a nest with **no contract at all** must not issue a single `getLogs`, on **any** backfill

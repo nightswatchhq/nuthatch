@@ -287,7 +287,10 @@ impl CallRegistry {
                 }
             })
             .collect();
-        if extract.traces {
+        // The raw-calls catch-all belongs to either call surface: an unrecognised selector on a
+        // contract we index is information (a proxy whose implementation moved, an ABI fetched before
+        // an upgrade), and that is as true of a top-level call as of an internal one.
+        if extract.traces || extract.top_level_calls {
             out.push(raw_calls_schema(self.timestamps));
         }
         if extract.state {
@@ -307,11 +310,12 @@ pub struct CallContext {
     /// part `log_index` plays for events: a stable per-block ordinal that makes the row addressable
     /// and re-executable.
     ///
-    /// **Known gap, deliberately left for the extraction slice:** the hot store keys every row by
-    /// `(block, log_index)` in one namespace (`store::entity_key`), so call ordinal 5 and log index 5
-    /// in the same block would collide. Wiring extraction requires giving calls their own key
-    /// namespace first. Recorded in RFC-0014 rather than half-solved here, because the right answer
-    /// depends on the ordering the ExEx notification actually supplies.
+    /// **The gap this once recorded is closed.** The hot store keys every row by `(block, log_index)`
+    /// in one namespace, so call ordinal 5 and log index 5 in the same block used to collide - the
+    /// same defect that turned out to be *live* for block rows (#642). Rows that descend from no log
+    /// now live in a reserved band: [`crate::registry::TX_CALL_ROW_LOG_INDEX_BASE`] for calls,
+    /// [`crate::registry::CALL_ROW_LOG_INDEX_BASE`] for pinned reads, and
+    /// [`crate::registry::BLOCK_ROW_LOG_INDEX`] for the block row.
     pub call_index: u64,
     /// See [`crate::registry::DecodedRow::timestamps`] - carried on the context because every row
     /// built from one block shares it.

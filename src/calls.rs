@@ -92,12 +92,42 @@ pub struct CallResult {
 pub struct CallDecl {
     /// Table name for the results, e.g. `oracle__latest_answer`.
     pub name: String,
-    /// The contract to call, `0x…`.
+    /// The contract to call, `0x…`. Empty when [`Self::contract_column`] names it instead.
+    #[serde(default)]
     pub contract: String,
-    /// Hex calldata including the 4-byte selector. Fixed arguments only: an argument that varied per
-    /// block would make the declaration non-reproducible from the config alone, and reproducibility
-    /// from the declaration is the whole point.
+    /// Hex calldata including the 4-byte selector, for a **sampled** declaration. Fixed arguments
+    /// only: with nothing to draw an argument from, a varying one could not be reproduced from the
+    /// config alone.
+    ///
+    /// Empty when the declaration is **row-driven** (`on` + `signature`), where the calldata is built
+    /// per source row instead. Exactly one of the two forms is required, checked in [`Self::validate`].
+    #[serde(default)]
     pub calldata: String,
+    /// RFC-0038 §3: the table whose rows drive this call, e.g. `factory__pool_created`.
+    ///
+    /// A subgraph mapping reads `c.balanceOf(event.params.to)` - the argument comes from the event.
+    /// A declaration naming a source table can say the same thing while staying deterministic: the
+    /// source rows are decoded events, the block is the row's own block, and `CallKey` does not care
+    /// where the calldata came from. The config declares the *rule*; reproducible data supplies the
+    /// arguments.
+    ///
+    /// Rows are taken from the window being processed, so the call fires as the row is produced -
+    /// the same moment a subgraph handler would have made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// The ABI signature to call, e.g. `balanceOf(address)`. Row-driven declarations only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Arguments, positionally. `{column}` takes the value from the source row; anything else is a
+    /// literal coerced to the signature's parameter type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The contract to call, when it is a `{column}` of the source row rather than a fixed address -
+    /// a factory's newly created child, say. Row-driven declarations only.
+    ///
+    /// `contract` stays the fixed-address form; this is the alternative, and exactly one applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_column: Option<String>,
     /// Sample every `every` blocks. State reads are not free and most of them change slowly, so a
     /// declaration says how often it actually needs an answer rather than implying "every block".
     #[serde(default = "default_every")]
@@ -112,6 +142,11 @@ fn default_every() -> u64 {
 }
 
 impl CallDecl {
+    /// True when this declaration is driven by the rows of a table rather than a block schedule.
+    pub fn is_row_driven(&self) -> bool {
+        self.on.is_some()
+    }
+
     /// Validate a declaration at load time rather than at the first RPC round trip.
     ///
     /// Every one of these is a config error that would otherwise surface thousands of blocks into a
@@ -130,14 +165,65 @@ impl CallDecl {
                 self.name
             );
         }
-        let c = self.contract.strip_prefix("0x").unwrap_or(&self.contract);
+
+        // The two forms are exclusive. Accepting both would leave it ambiguous whether the call is
+        // sampled or row-driven, and a config whose meaning depends on which field the reader
+        // noticed first is worse than one that refuses.
+        let sampled = !self.calldata.is_empty();
+        match (sampled, self.is_row_driven()) {
+            (false, false) => bail!(
+                "call `{}`: needs either `calldata` (sampled every N blocks) or `on` + `signature` \
+                 (one call per row of a table)",
+                self.name
+            ),
+            (true, true) => bail!(
+                "call `{}`: has both `calldata` and `on` - a declaration is either sampled or \
+                 row-driven, never both. Drop whichever you did not mean.",
+                self.name
+            ),
+            _ => {}
+        }
+
+        if self.is_row_driven() {
+            self.validate_row_driven()?;
+        } else {
+            self.validate_sampled()?;
+        }
+
+        // `every = 0` would divide by zero when scheduling; it is also meaningless.
+        if self.every == 0 {
+            bail!("call `{}`: `every` must be at least 1", self.name);
+        }
+        Ok(())
+    }
+
+    fn validate_address(&self, what: &str, addr: &str) -> Result<()> {
+        let c = addr.strip_prefix("0x").unwrap_or(addr);
         if c.len() != 40 || !c.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!(
-                "call `{}`: `contract` must be a 20-byte 0x address, got {:?}",
-                self.name,
-                self.contract
+                "call `{}`: `{what}` must be a 20-byte 0x address, got {addr:?}",
+                self.name
             );
         }
+        Ok(())
+    }
+
+    fn validate_sampled(&self) -> Result<()> {
+        if self.contract_column.is_some() {
+            bail!(
+                "call `{}`: `contract_column` names a column of a source table, so it needs `on` - a \
+                 sampled call has no row to read it from",
+                self.name
+            );
+        }
+        if self.signature.is_some() || !self.args.is_empty() {
+            bail!(
+                "call `{}`: `signature`/`args` build calldata from a source row, so they need `on`. A \
+                 sampled call carries its calldata whole.",
+                self.name
+            );
+        }
+        self.validate_address("contract", &self.contract)?;
         let d = self.calldata.strip_prefix("0x").unwrap_or(&self.calldata);
         if d.len() < 8 || !d.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!(
@@ -153,9 +239,56 @@ impl CallDecl {
                 d.len()
             );
         }
-        // `every = 0` would divide by zero when scheduling; it is also meaningless.
-        if self.every == 0 {
-            bail!("call `{}`: `every` must be at least 1", self.name);
+        Ok(())
+    }
+
+    fn validate_row_driven(&self) -> Result<()> {
+        let Some(sig) = self.signature.as_deref() else {
+            bail!(
+                "call `{}`: `on` names a source table, so `signature` must say what to call, e.g. \
+                 `balanceOf(address)`",
+                self.name
+            );
+        };
+        // Parsed at load, so a malformed signature is one clear error rather than one per row.
+        let f = alloy_json_abi::Function::parse(sig).map_err(|e| {
+            anyhow::anyhow!(
+                "call `{}`: `signature` {sig:?} is not a valid ABI signature: {e}",
+                self.name
+            )
+        })?;
+        if f.inputs.len() != self.args.len() {
+            bail!(
+                "call `{}`: `{sig}` takes {} argument(s) but `args` has {}",
+                self.name,
+                f.inputs.len(),
+                self.args.len()
+            );
+        }
+        match (self.contract.is_empty(), self.contract_column.is_some()) {
+            (true, false) => bail!(
+                "call `{}`: needs either `contract` (a fixed address) or `contract_column` (a column \
+                 of `{}` holding one)",
+                self.name,
+                self.on.as_deref().unwrap_or("?")
+            ),
+            (false, true) => bail!(
+                "call `{}`: has both `contract` and `contract_column` - the address comes from one \
+                 place or the other",
+                self.name
+            ),
+            (false, false) => self.validate_address("contract", &self.contract)?,
+            _ => {}
+        }
+        // `every` is a block schedule and means nothing for a row-driven call; silently ignoring it
+        // would let an operator believe they had throttled something they had not.
+        if self.every != default_every() {
+            bail!(
+                "call `{}`: `every` schedules a sampled call by block and does nothing for a \
+                 row-driven one - it fires once per row of `{}`. Remove it.",
+                self.name,
+                self.on.as_deref().unwrap_or("?")
+            );
         }
         Ok(())
     }
@@ -187,7 +320,7 @@ pub async fn resolve_at(
     decls: &[CallDecl],
     block: u64,
 ) -> Result<Vec<CallResult>> {
-    let calls: Vec<(String, String)> = decls
+    let pairs: Vec<(String, String)> = decls
         .iter()
         .map(|d| {
             (
@@ -196,15 +329,29 @@ pub async fn resolve_at(
             )
         })
         .collect();
+    resolve_pairs_at(rpc, chain_id, &pairs, block).await
+}
+
+/// Resolve a batch of `(contract, calldata)` pairs at one pinned block.
+///
+/// The form a **row-driven** declaration needs (RFC-0038 §3): its calldata is built per source row,
+/// so there is no `CallDecl` to hand over - only the question. [`resolve_at`] is this with the pairs
+/// read off a sampled declaration instead.
+pub async fn resolve_pairs_at(
+    rpc: &crate::rpc::RpcClient,
+    chain_id: u64,
+    pairs: &[(String, String)],
+    block: u64,
+) -> Result<Vec<CallResult>> {
     let raw = rpc
-        .eth_call_batch_at(&calls, block)
+        .eth_call_batch_at(pairs, block)
         .await
         .with_context(|| format!("pinned eth_call batch at block {block}"))?;
-    Ok(decls
+    Ok(pairs
         .iter()
         .zip(raw)
-        .map(|(d, r)| {
-            let key = CallKey::new(chain_id, block, &d.contract, &d.calldata);
+        .map(|((contract, calldata), r)| {
+            let key = CallKey::new(chain_id, block, contract, calldata);
             CallResult {
                 block,
                 contract: key.contract.clone(),
@@ -216,6 +363,267 @@ pub async fn resolve_at(
         .collect())
 }
 
+/// The table shape a `[[calls]]` declaration produces, in the same form `/tables`, MCP, `llms.txt`
+/// and `schema.json` already consume.
+///
+/// One table per declaration, named by `CallDecl::name`. The implicit `address` column carries the
+/// **contract called**, so the content address needs its own name (`content_address`) rather than
+/// colliding with it.
+pub fn schema(decls: &[CallDecl], timestamps: bool) -> Vec<crate::registry::TableSchema> {
+    use crate::registry::{ColumnSchema, TableKind, TableSchema};
+    decls
+        .iter()
+        .map(|d| {
+            let mut columns = crate::registry::implicit_columns(timestamps);
+            let own = |name: &str, sol: &str, storage: &str| ColumnSchema {
+                name: name.to_string(),
+                sol_type: sol.to_string(),
+                storage: storage.to_string(),
+                indexed: false,
+            };
+            columns.push(own("calldata", "bytes", "bytes"));
+            columns.push(own("result", "bytes", "bytes"));
+            // `Value` has no null, so an empty `result` would be indistinguishable from a call that
+            // genuinely returned no bytes. A revert is a fact about chain state - a getter often does
+            // not exist before the contract is initialised - and it deserves a column rather than an
+            // ambiguity.
+            columns.push(own("reverted", "bool", "bool"));
+            // `hash32`, not `fixed_bytes`: `Value::Word32` renders a 32-byte value as a *decimal
+            // integer*, which turned a content address into a 78-digit number. It is a hash and has
+            // to read as one.
+            columns.push(own("content_address", "bytes32", "hash32"));
+            TableSchema {
+                table: d.name.clone(),
+                alias: d.name.clone(),
+                kind: TableKind::Call,
+                event: String::new(),
+                topic0: String::new(),
+                function: String::new(),
+                selector: format!(
+                    "0x{}",
+                    &d.calldata.trim_start_matches("0x")
+                        [..8.min(d.calldata.trim_start_matches("0x").len())]
+                ),
+                columns,
+            }
+        })
+        .collect()
+}
+
+/// Turn a stored [`Value`] into the ABI value a signature's parameter expects.
+///
+/// The interesting case is [`Value::Hash32`], which is refused. An *indexed* dynamic parameter
+/// (`string`, `bytes`, an array) is stored in the log topic as `keccak(value)`, not the value - so
+/// the original is not recoverable and cannot be passed on to a call. Encoding the hash instead would
+/// produce a well-formed call asking a question nobody meant, and the answer would look like data.
+fn dynsol_from_value(
+    v: &crate::registry::Value,
+    want: &alloy_dyn_abi::DynSolType,
+    call: &str,
+    col: &str,
+) -> Result<alloy_dyn_abi::DynSolValue> {
+    use crate::registry::Value as V;
+    use alloy_dyn_abi::{DynSolType, DynSolValue};
+    use alloy_primitives::{Address, I256, U256};
+
+    let uint = |bytes: &[u8], bits: usize| DynSolValue::Uint(U256::from_be_slice(bytes), bits);
+    Ok(match (v, want) {
+        (V::Address(a), DynSolType::Address) => DynSolValue::Address(Address::from(*a)),
+        (V::Bool(b), DynSolType::Bool) => DynSolValue::Bool(*b),
+        (V::U64(n), DynSolType::Uint(bits)) => DynSolValue::Uint(U256::from(*n), *bits),
+        (V::Word16(w), DynSolType::Uint(bits)) => uint(w, *bits),
+        (V::Word32(w), DynSolType::Uint(bits)) => uint(w, *bits),
+        (V::I64(n), DynSolType::Int(bits)) => DynSolValue::Int(I256::try_from(*n)?, *bits),
+        (V::IWord16(w), DynSolType::Int(bits)) => {
+            DynSolValue::Int(I256::from_be_bytes::<32>(sign_extend(w)), *bits)
+        }
+        (V::IWord32(w), DynSolType::Int(bits)) => {
+            DynSolValue::Int(I256::from_be_bytes::<32>(*w), *bits)
+        }
+        (V::Bytes(b), DynSolType::FixedBytes(n)) => {
+            let mut w = [0u8; 32];
+            let take = (*n).min(b.len());
+            w[..take].copy_from_slice(&b[..take]);
+            DynSolValue::FixedBytes(w.into(), *n)
+        }
+        (V::Bytes(b), DynSolType::Bytes) => DynSolValue::Bytes(b.clone()),
+        (V::Str(t), DynSolType::String) => DynSolValue::String(t.clone()),
+        (V::Hash32(_), _) => bail!(
+            "call `{call}`: column `{col}` is an *indexed* dynamic parameter, so the log holds \
+             `keccak(value)` rather than the value. The original cannot be recovered, so it cannot be \
+             passed to `{want:?}`. Use a non-indexed column, or index the contract that emits the \
+             value unhashed."
+        ),
+        (other, _) => bail!(
+            "call `{call}`: column `{col}` holds {other:?}, which does not fit the parameter type \
+             `{want:?}`"
+        ),
+    })
+}
+
+/// Sign-extend a 16-byte two's-complement integer into 32 bytes.
+fn sign_extend(w: &[u8; 16]) -> [u8; 32] {
+    let fill = if w[0] & 0x80 != 0 { 0xff } else { 0x00 };
+    let mut out = [fill; 32];
+    out[16..].copy_from_slice(w);
+    out
+}
+
+impl CallDecl {
+    /// The `(contract, calldata)` this row-driven declaration asks for, given one source row.
+    ///
+    /// Deterministic by construction: the row is decoded output, the signature and argument
+    /// references are config, and nothing here reads a clock or the chain.
+    pub fn resolve_for_row(&self, row: &crate::registry::DecodedRow) -> Result<(String, String)> {
+        use alloy_dyn_abi::{DynSolType, DynSolValue};
+
+        let col = |name: &str| -> Result<&crate::registry::Value> {
+            row.params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .with_context(|| {
+                    format!(
+                        "call `{}`: `{}` has no column `{name}` - columns are {:?}",
+                        self.name,
+                        self.on.as_deref().unwrap_or("?"),
+                        row.params
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        let contract = match self.contract_column.as_deref() {
+            None => self.contract.to_ascii_lowercase(),
+            Some(c) => match col(column_ref(c).unwrap_or(c))? {
+                crate::registry::Value::Address(a) => format!("0x{}", hex::encode(a)),
+                other => bail!(
+                    "call `{}`: `contract_column` points at `{c}`, which holds {other:?} rather than \
+                     an address",
+                    self.name
+                ),
+            },
+        };
+
+        let sig = self.signature.as_deref().unwrap_or_default();
+        let f = alloy_json_abi::Function::parse(sig)
+            .map_err(|e| anyhow::anyhow!("call `{}`: bad signature {sig:?}: {e}", self.name))?;
+        let mut values = Vec::with_capacity(self.args.len());
+        for (arg, input) in self.args.iter().zip(f.inputs.iter()) {
+            let ty = DynSolType::parse(&input.ty).map_err(|e| {
+                anyhow::anyhow!(
+                    "call `{}`: unsupported parameter type {:?}: {e}",
+                    self.name,
+                    input.ty
+                )
+            })?;
+            values.push(match column_ref(arg) {
+                Some(name) => dynsol_from_value(col(name)?, &ty, &self.name, name)?,
+                // A literal: `getPool(tokenA, tokenB, 3000)` has a constant fee tier.
+                None => ty.coerce_str(arg).map_err(|e| {
+                    anyhow::anyhow!(
+                        "call `{}`: argument {arg:?} is neither a `{{column}}` reference nor a valid \
+                         `{}` literal: {e}",
+                        self.name,
+                        input.ty
+                    )
+                })?,
+            });
+        }
+        let mut data = f.selector().to_vec();
+        data.extend(DynSolValue::Tuple(values).abi_encode_params());
+        Ok((contract, format!("0x{}", hex::encode(data))))
+    }
+}
+
+/// `"{pool}"` → `Some("pool")`; anything else is a literal.
+fn column_ref(s: &str) -> Option<&str> {
+    s.strip_prefix('{')?.strip_suffix('}')
+}
+
+/// A stable hash over the declared calls, folded into a nest's decode identity.
+///
+/// Two nests that differ only in what they *read* are different decode versions, exactly as two that
+/// differ only in what they extract are (RFC-0014). Without this they would share a decode hash, and
+/// segment reuse would happily serve one nest's rows to the other.
+pub fn decl_hash(decls: &[CallDecl]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for d in decls {
+        // Field-separated for the same reason `CallKey::address` separates: concatenating raw would
+        // let two different declarations hash identically.
+        h.update(d.name.as_bytes());
+        h.update(b"\x1f");
+        h.update(d.contract.to_ascii_lowercase().as_bytes());
+        h.update(b"\x1f");
+        h.update(d.calldata.to_ascii_lowercase().as_bytes());
+        h.update(b"\x1f");
+        h.update(d.every.to_be_bytes());
+        h.update(b"\x1f");
+        h.update(d.start.unwrap_or(0).to_be_bytes());
+        h.update(b"\x1e");
+    }
+    h.finalize().into()
+}
+
+impl CallResult {
+    /// Turn a resolved call into a stored row, so it flows through the same store, seal and query
+    /// path every other table uses.
+    ///
+    /// `slot` is this result's position within its block, assigned in a deterministic order
+    /// (declarations in config order; within a row-driven declaration, its source rows by
+    /// `log_index`). It fixes the row's `log_index` inside the reserved band and therefore its key,
+    /// so two operators running the same nest produce the same keys, not merely the same content
+    /// addresses.
+    ///
+    /// There is no transaction behind a pinned read, so `tx_hash` is empty rather than borrowing the
+    /// block hash - a block hash sitting in a `tx_hash` column is a lie that reads like data.
+    pub fn to_row(
+        &self,
+        table: &str,
+        slot: usize,
+        block_hash: &str,
+        block_timestamp: u64,
+        timestamps: bool,
+    ) -> crate::registry::DecodedRow {
+        use crate::registry::Value;
+        let bytes =
+            |h: &str| Value::Bytes(hex::decode(h.trim_start_matches("0x")).unwrap_or_default());
+        let mut addr = [0u8; 20];
+        if let Ok(b) = hex::decode(self.contract.trim_start_matches("0x")) {
+            if b.len() == 20 {
+                addr.copy_from_slice(&b);
+            }
+        }
+        let mut content = [0u8; 32];
+        if let Ok(b) = hex::decode(&self.address) {
+            if b.len() == 32 {
+                content.copy_from_slice(&b);
+            }
+        }
+        crate::registry::DecodedRow {
+            table: table.to_string(),
+            params: vec![
+                ("calldata".to_string(), bytes(&self.calldata)),
+                (
+                    "result".to_string(),
+                    bytes(self.result.as_deref().unwrap_or("0x")),
+                ),
+                ("reverted".to_string(), Value::Bool(self.result.is_none())),
+                ("content_address".to_string(), Value::Hash32(content)),
+            ],
+            block_number: self.block,
+            block_hash: block_hash.to_string(),
+            block_timestamp,
+            timestamps,
+            log_index: crate::registry::CALL_ROW_LOG_INDEX_BASE + slot as u64,
+            tx_hash: String::new(),
+            address: format!("0x{}", hex::encode(addr)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,9 +632,13 @@ mod tests {
         CallDecl {
             name: name.into(),
             contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+            contract_column: None,
             calldata: "0x18160ddd".into(),
             every,
             start: None,
+            on: None,
+            signature: None,
+            args: Vec::new(),
         }
     }
 
@@ -356,6 +768,291 @@ mod tests {
         );
     }
 
+    fn result_for(name: &str, block: u64, result: Option<&str>) -> CallResult {
+        let d = decl(name, 100);
+        let key = CallKey::new(1, block, &d.contract, &d.calldata);
+        CallResult {
+            block,
+            contract: key.contract.clone(),
+            calldata: key.calldata.clone(),
+            result: result.map(str::to_string),
+            address: key.address(),
+        }
+    }
+
+    fn row_with(params: Vec<(&str, crate::registry::Value)>) -> crate::registry::DecodedRow {
+        crate::registry::DecodedRow {
+            table: "tok__transfer".into(),
+            params: params
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            block_number: 42,
+            block_hash: "0xbh".into(),
+            block_timestamp: 7,
+            timestamps: true,
+            log_index: 3,
+            tx_hash: "0xtx".into(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+        }
+    }
+
+    fn row_driven(name: &str, sig: &str, args: &[&str]) -> CallDecl {
+        CallDecl {
+            name: name.into(),
+            contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+            contract_column: None,
+            calldata: String::new(),
+            every: default_every(),
+            start: None,
+            on: Some("tok__transfer".into()),
+            signature: Some(sig.into()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// The claim RFC-0038 exists for: a declaration can name an event's parameters, which is what a
+    /// subgraph mapping does (`c.balanceOf(event.params.to)`).
+    ///
+    /// The selector is asserted against the **published** `balanceOf(address)` selector rather than
+    /// against our own encoder, so this is evidence about ABI encoding and not a tautology.
+    #[test]
+    fn a_row_driven_call_encodes_the_event_parameter_as_its_argument() {
+        let mut to = [0u8; 20];
+        to[19] = 0xbe;
+        let row = row_with(vec![("to", crate::registry::Value::Address(to))]);
+        let (contract, calldata) = row_driven("bal", "balanceOf(address)", &["{to}"])
+            .resolve_for_row(&row)
+            .unwrap();
+
+        assert_eq!(contract, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        assert!(
+            calldata.starts_with("0x70a08231"),
+            "balanceOf(address) is selector 0x70a08231, got {calldata}"
+        );
+        assert!(
+            calldata.ends_with(&format!("{:0>64}", "be")),
+            "the address argument must be left-padded to 32 bytes: {calldata}"
+        );
+        assert_eq!(
+            calldata.len(),
+            2 + 8 + 64,
+            "selector + one word: {calldata}"
+        );
+    }
+
+    /// An indexed dynamic parameter holds `keccak(value)`, not the value, so it cannot be passed on.
+    ///
+    /// Encoding the hash would produce a well-formed call asking a question nobody meant, and the
+    /// answer would look like data. Refusing is the only honest option.
+    #[test]
+    fn an_indexed_dynamic_parameter_cannot_be_used_as_a_call_argument() {
+        let row = row_with(vec![("name", crate::registry::Value::Hash32([9u8; 32]))]);
+        let err = row_driven("x", "resolve(string)", &["{name}"])
+            .resolve_for_row(&row)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("keccak"), "say why it cannot work: {err}");
+        assert!(
+            err.contains("non-indexed"),
+            "and say what to do instead: {err}"
+        );
+    }
+
+    /// Mixed arguments: a column reference beside a constant, which is what a pool lookup needs.
+    #[test]
+    fn a_literal_argument_sits_beside_a_column_reference() {
+        let mut a = [0u8; 20];
+        a[19] = 1;
+        let row = row_with(vec![("token", crate::registry::Value::Address(a))]);
+        let (_, calldata) = row_driven(
+            "pool",
+            "getPool(address,address,uint24)",
+            &[
+                "{token}",
+                "0x0000000000000000000000000000000000000002",
+                "3000",
+            ],
+        )
+        .resolve_for_row(&row)
+        .unwrap();
+        assert_eq!(
+            calldata.len(),
+            2 + 8 + 64 * 3,
+            "three words of arguments: {calldata}"
+        );
+        assert!(
+            calldata.ends_with(&format!("{:0>64x}", 3000u32)),
+            "the literal fee tier must encode as the last word: {calldata}"
+        );
+    }
+
+    /// A factory's child address comes from the row, not the config - RFC-0009's shape, read back.
+    #[test]
+    fn the_contract_itself_can_come_from_the_row() {
+        let mut child = [0u8; 20];
+        child[0] = 0xab;
+        let row = row_with(vec![("pool", crate::registry::Value::Address(child))]);
+        let mut d = row_driven("t0", "token0()", &[]);
+        d.contract = String::new();
+        d.contract_column = Some("{pool}".into());
+        let (contract, calldata) = d.resolve_for_row(&row).unwrap();
+        assert_eq!(contract, format!("0x{}", hex::encode(child)));
+        assert_eq!(
+            calldata.len(),
+            2 + 8,
+            "token0() takes no arguments: {calldata}"
+        );
+    }
+
+    /// The two declaration forms are exclusive, and each half-declared shape names what is missing.
+    #[test]
+    fn a_declaration_is_either_sampled_or_row_driven_never_both() {
+        let mut both = row_driven("b", "token0()", &[]);
+        both.calldata = "0x18160ddd".into();
+        assert!(
+            both.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("never both"),
+            "both forms must be refused"
+        );
+
+        let mut no_sig = row_driven("n", "token0()", &[]);
+        no_sig.signature = None;
+        assert!(no_sig
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("signature"));
+
+        let wrong_arity = row_driven("a", "balanceOf(address)", &[]);
+        assert!(
+            wrong_arity
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("takes 1 argument"),
+            "an arity mismatch is a config error, not a per-row surprise"
+        );
+
+        // `every` is a block schedule; silently ignoring it would let an operator believe they had
+        // throttled something they had not.
+        let mut throttled = row_driven("e", "token0()", &[]);
+        throttled.every = 500;
+        assert!(throttled
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("Remove it"));
+
+        // And the valid shape still validates, or every assertion above would pass against a
+        // declaration that refuses everything.
+        assert!(row_driven("ok", "balanceOf(address)", &["{to}"])
+            .validate()
+            .is_ok());
+    }
+
+    /// A revert must stay distinguishable from a call that genuinely returned no bytes.
+    ///
+    /// `Value` has no null, so both would serialise as empty `result` bytes. Losing that distinction
+    /// would report "this getter does not exist yet" and "this function returns nothing" as the same
+    /// fact, which is exactly the silent-wrong-answer shape this project cares most about.
+    #[test]
+    fn a_revert_is_not_an_empty_return() {
+        let reverted = result_for("t", 100, None).to_row("t", 0, "0xbh", 7, true);
+        let empty = result_for("t", 100, Some("0x")).to_row("t", 0, "0xbh", 7, true);
+
+        let flag = |r: &crate::registry::DecodedRow| {
+            r.params
+                .iter()
+                .find(|(k, _)| k == "reverted")
+                .map(|(_, v)| v.to_json().to_string())
+                .unwrap()
+        };
+        assert_ne!(
+            flag(&reverted),
+            flag(&empty),
+            "a revert and an empty return must not read identically"
+        );
+        assert_eq!(flag(&reverted), "true");
+        assert_eq!(flag(&empty), "false");
+    }
+
+    /// Two declarations resolved at one block must not land on the same key.
+    ///
+    /// This is #642's lesson applied before the fact: rows that descend from no log share a key space
+    /// with those that do, and several call results can occur in a single block.
+    #[test]
+    fn two_declarations_at_one_block_get_distinct_keys() {
+        let a = result_for("a", 500, Some("0x01")).to_row("a", 0, "0xbh", 7, true);
+        let b = result_for("b", 500, Some("0x02")).to_row("b", 1, "0xbh", 7, true);
+        assert_ne!(
+            crate::store::Store::entity_key(a.block_number, a.log_index),
+            crate::store::Store::entity_key(b.block_number, b.log_index),
+            "one declaration must not overwrite another at the same block"
+        );
+        // And both sit inside the reserved band, clear of any real log.
+        for r in [&a, &b] {
+            assert!(
+                r.log_index >= crate::registry::CALL_ROW_LOG_INDEX_BASE
+                    && r.log_index < crate::registry::BLOCK_ROW_LOG_INDEX,
+                "call rows belong in the reserved band, below the block row: {}",
+                r.log_index
+            );
+        }
+    }
+
+    /// The stored row carries the content address, so a row can be re-verified without recomputing
+    /// the key from context that may no longer exist.
+    #[test]
+    fn the_row_carries_its_content_address_and_the_contract_it_called() {
+        let res = result_for("t", 900, Some("0xdeadbeef"));
+        let row = res.to_row("t", 0, "0xbh", 7, true);
+        let col = |n: &str| {
+            row.params
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.to_json().to_string())
+                .unwrap()
+        };
+        assert!(
+            col("content_address").contains(&res.address),
+            "content_address must be CallKey::address(): {}",
+            col("content_address")
+        );
+        assert_eq!(
+            row.address, res.contract,
+            "the implicit `address` column is the contract that was called"
+        );
+        assert!(
+            row.tx_hash.is_empty(),
+            "a pinned read has no transaction - borrowing the block hash would be a lie"
+        );
+    }
+
+    /// The declared table is advertised in the same shape everything else consumes.
+    #[test]
+    fn a_declaration_produces_a_queryable_table_schema() {
+        let s = schema(&[decl("oracle__answer", 100)], true);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].table, "oracle__answer");
+        let names: Vec<&str> = s[0].columns.iter().map(|c| c.name.as_str()).collect();
+        for want in [
+            "block_number",
+            "calldata",
+            "result",
+            "reverted",
+            "content_address",
+        ] {
+            assert!(names.contains(&want), "missing column {want}: {names:?}");
+        }
+        assert!(
+            !names.contains(&"contract"),
+            "the contract is the implicit `address` column; a second one would be redundant"
+        );
+    }
+
     /// The determinism claim, **against the real chain** rather than a mock.
     ///
     /// A mock proving my own encoder agrees with itself would not be evidence for "re-executes
@@ -378,9 +1075,13 @@ mod tests {
         let decls = vec![CallDecl {
             name: "usdc_total_supply".into(),
             contract: usdc.into(),
+            contract_column: None,
             calldata: "0x18160ddd".into(),
             every: 1_000_000,
             start: None,
+            on: None,
+            signature: None,
+            args: Vec::new(),
         }];
 
         let first = resolve_at(&rpc, 1, &decls, 15_000_000).await.unwrap();

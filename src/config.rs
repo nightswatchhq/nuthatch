@@ -48,6 +48,19 @@ pub fn required_schema_version(block_timestamps: bool) -> u32 {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub nest: Nest,
+    /// RFC-0023 tier 3: archive endpoints for resolving declared `[[calls]]`, supplied by the
+    /// operator at run time (`--state-rpc`), **never** written to `nuthatch.toml`.
+    ///
+    /// `#[serde(skip)]` is load-bearing, not tidiness. An archive endpoint almost always carries an
+    /// API key, and `nuthatch.toml` is pinned into the nest blob and the content address - so a
+    /// serialisable field here would bake a credential into the nest's identity and ship it to
+    /// anyone the nest is shared with. Skipping it makes that impossible rather than discouraged.
+    ///
+    /// It rides on `Config` rather than a `build_nest` parameter because every layer already takes
+    /// `&Config`; threading a parameter would have touched 37 call sites to carry one optional
+    /// string.
+    #[serde(skip)]
+    pub state_rpc_urls: Vec<String>,
     #[serde(default)]
     pub contracts: Vec<Contract>,
     /// Optional sanctions-screening stage (RFC-0008 C2). When present with a non-empty `lists`, the
@@ -227,8 +240,25 @@ pub struct Extract {
     #[serde(default)]
     pub blocks: bool,
     /// Emit a row per **call** (top-level and internal), calldata decoded by 4-byte selector.
+    ///
+    /// Node-gated: the *internal* call tree only exists as an execution artifact, so it needs
+    /// `debug_*` or a colocated node. See [`Extract::top_level_calls`] for the half that does not.
     #[serde(default)]
     pub traces: bool,
+    /// Emit a row per **top-level call** to this nest's contracts - a transaction sent directly to
+    /// one of them, calldata decoded by 4-byte selector. This is what a subgraph's `callHandlers`
+    /// fire on (RFC-0038 §5).
+    ///
+    /// Unlike `traces` this is **sourceable from ordinary RPC**: a top-level call is a transaction,
+    /// and `eth_getBlockByNumber(b, true)` returns them. Filing it with `traces` behind the node gate
+    /// was the same bundling-by-shape error RFC-0036 corrected for blocks and transactions - grouping
+    /// by "non-event data" when the thing that matters is the *source*. So it deliberately does not
+    /// count towards [`Extract::enabled`], which is the node-gated set and the startup refusal.
+    ///
+    /// Bounded by the nest's own contracts: a transaction to an address this nest does not index is
+    /// not decoded and not stored.
+    #[serde(default)]
+    pub top_level_calls: bool,
     /// Emit a row per **storage write**: `(address, slot, prev, new)`, raw slots, no ABI needed.
     #[serde(default)]
     pub state: bool,
@@ -267,7 +297,16 @@ impl Extract {
     /// Is any surface at all switched on, node-gated or not? For "does this nest want extraction work
     /// scheduled", as distinct from "must this nest be refused".
     pub fn any(&self) -> bool {
-        self.blocks || self.traces || self.state
+        self.blocks || self.traces || self.state || self.top_level_calls
+    }
+
+    /// Does this nest decode calldata at all - internal calls, top-level calls, or both?
+    ///
+    /// The gate for building a [`crate::calldata::CallRegistry`] and advertising its tables. Distinct
+    /// from [`Self::enabled`], which is the *node-gated* set: a top-level-calls nest needs the call
+    /// decode surface and needs no node.
+    pub fn decodes_calls(&self) -> bool {
+        self.traces || self.top_level_calls
     }
 
     /// Scoped means "bounded by something the operator named". A selector allowlist bounds traces
@@ -433,7 +472,6 @@ impl Config {
         for c in &cfg.calls {
             c.validate()?;
         }
-        cfg.refuse_unwired_calls()?;
         cfg.refuse_tip_finality_webhooks()?;
         Ok(cfg)
     }
@@ -499,36 +537,6 @@ impl Config {
             c.validate()?;
         }
         Ok(cfg)
-    }
-
-    /// Refuse a `[[calls]]` block while RFC-0023 tier 3 has no executor (issue #262).
-    ///
-    /// Everything around this is built - `CallKey`, `CallDecl::validate`, `resolve_at`, and the
-    /// content addressing - and nothing calls it. So a declared call was **accepted, validated, and
-    /// then ignored forever**: no rows, no warning, no error. That is the same shape as the writer
-    /// pool that took leases and never indexed (#250), and it is the failure mode this project can
-    /// least afford, because the config looks like it worked.
-    ///
-    /// Refusing costs an operator one clear message. Accepting costs them a silent wrong answer, and
-    /// they find out from a consumer. Delete this the moment an executor exists - the test named
-    /// after it will fail loudly and tell you to.
-    fn refuse_unwired_calls(&self) -> Result<()> {
-        if self.calls.is_empty() {
-            return Ok(());
-        }
-        bail!(
-            "this nest declares {} `[[calls]]` entr{}, and nuthatch cannot run {} yet.\n\n\
-             RFC-0023 tier 3 (pinned-block `eth_call`) has the decoding, validation and content \
-             addressing in place but no executor, so a declared call would be accepted and then \
-             silently produce nothing - see issue #262.\n\n\
-             Remove the `[[calls]]` block. Most contract state is *derivable* from events you already \
-             index, which is faster, free, and needs no archive node: try `nuthatch recipe add \
-             total_supply` (also `balances`, `holder_count`, `reserves`), or `nuthatch metadata fetch` \
-             for immutable `decimals`/`symbol`/`name`.",
-            self.calls.len(),
-            if self.calls.len() == 1 { "y" } else { "ies" },
-            if self.calls.len() == 1 { "it" } else { "them" },
-        )
     }
 
     /// Refuse a `[[webhooks]]` entry declaring `finality = "tip"` while `deliver_sealed` is the only
@@ -598,6 +606,7 @@ impl Config {
         }
         let v1: V1 = toml::from_str(raw)?;
         Ok(Config {
+            state_rpc_urls: Vec::new(),
             nest: Nest {
                 name: "nest".to_string(),
                 chain: v1.chain,
@@ -666,6 +675,7 @@ mod tests {
     #[test]
     fn roundtrips_a_v2_file() {
         let cfg = Config {
+            state_rpc_urls: Vec::new(),
             nest: Nest {
                 name: "my-nest".into(),
                 chain: "mainnet".into(),
@@ -853,74 +863,6 @@ rpc_urls = ["https://rpc.example"]
 
     /// A file claiming v1 while declaring a v2-only feature is refused - it is precisely the file an
     /// older binary would accept and get wrong.
-    /// A declared call must be **refused**, not accepted and ignored (issue #262).
-    #[test]
-    fn a_declared_call_is_refused_rather_than_silently_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(CONFIG_FILE),
-            r#"
-[nest]
-name = "n"
-chain = "mainnet"
-chain_id = 1
-rpc_urls = ["https://rpc.example"]
-schema_version = 1
-
-[[contracts]]
-alias = "c"
-address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-abi = "abis/c.json"
-
-[[calls]]
-name = "price"
-contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-calldata = "0x1234abcd"
-every = 100
-"#,
-        )
-        .unwrap();
-        let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
-        assert!(err.contains("#262"), "point at the issue: {err}");
-        assert!(
-            err.contains("recipe add") || err.contains("metadata fetch"),
-            "a refusal should name the thing to do instead: {err}"
-        );
-    }
-
-    /// **Delete `refuse_unwired_calls` when this fails.**
-    ///
-    /// The refusal above exists only because nothing executes a declared call. The day someone wires
-    /// `resolve_at` into the indexer, that refusal silently becomes a bug of its own - a working
-    /// feature rejected at config load - and nothing else would catch it, because every test of the
-    /// refusal would still pass. So this watches for the executor rather than the refusal.
-    #[test]
-    fn the_calls_refusal_must_go_when_an_executor_appears() {
-        let mut callers = Vec::new();
-        for entry in std::fs::read_dir("src").expect("src/ is readable") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().is_some_and(|e| e == "rs")
-                && path.file_name().is_some_and(|f| f != "calls.rs")
-            {
-                // Built at runtime so this file never contains the string it searches for. Written
-                // as a literal, the test matched *itself* and reported `config.rs` as the executor -
-                // twice, once per spelling. A scanner that scans its own source has to say the thing
-                // it is looking for without ever spelling it.
-                let needle = format!("{}::{}(", "calls", "resolve_at");
-                let src = std::fs::read_to_string(&path).unwrap_or_default();
-                if src.contains(&needle) {
-                    callers.push(path.display().to_string());
-                }
-            }
-        }
-        assert!(
-            callers.is_empty(),
-            "the tier-3 executor now has a caller ({}), so tier 3 is wired - delete \
-             `Config::refuse_unwired_calls` and this test, and close issue #262",
-            callers.join(", ")
-        );
-    }
-
     /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never
     /// delivered (issue #577 - the same shape as #262's `[[calls]]` refusal above).
     #[test]
