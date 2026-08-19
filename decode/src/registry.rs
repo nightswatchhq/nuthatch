@@ -211,20 +211,25 @@ pub const BLOCKS_TABLE: &str = "blocks";
 /// in the block* - so the block row, written second, silently overwrote it. That is the first event of
 /// every block, gone, with no warning and no gap in the cursor.
 ///
-/// `999_000..=999_999` is therefore **reserved for rows that descend from no log**. Real logs cannot
+/// `500_000..=999_999` is therefore **reserved for rows that descend from no log**. Real logs cannot
 /// reach it: `entity_key` already asserts `log_index < 1_000_000`, and a block's gas limit caps logs
-/// around 80k, three orders of magnitude below the reserve. Block rows take the top of the band so
-/// they sort after the logs they summarise; RFC-0023 tier-3 call results will take the rest.
+/// around 80k, well below the reserve. Block rows take the very top so they sort after the logs they
+/// summarise; RFC-0023 tier-3 call results take the rest.
+///
+/// The band is half the range rather than a thousand slots because a **row-driven** call fires once
+/// per source row (RFC-0038 §3), so one block can want thousands of results. A narrow band would have
+/// turned that into a silent key collision - the very bug (#642) this constant exists to fix.
 pub const BLOCK_ROW_LOG_INDEX: u64 = 999_999;
 
 /// The base `log_index` for **pinned call results** (RFC-0023 tier 3), inside the same reserved band
 /// as [`BLOCK_ROW_LOG_INDEX`].
 ///
-/// A call result descends from no log either, and unlike a block row there may be several in one
-/// block - one per declaration. They are laid out from this base in declaration order, which is fixed
-/// by the config, so two operators running the same nest produce the same keys as well as the same
-/// content addresses.
-pub const CALL_ROW_LOG_INDEX_BASE: u64 = 999_000;
+/// A call result descends from no log either, and there may be many in one block: a sampled
+/// declaration contributes one, a row-driven one contributes a call per source row. They are laid out
+/// from this base in a deterministic order - declarations in config order, and within a row-driven
+/// declaration its source rows in `log_index` order - so two operators running the same nest produce
+/// the same keys, not merely the same content addresses.
+pub const CALL_ROW_LOG_INDEX_BASE: u64 = 500_000;
 
 /// A serializable table schema (per-event table + its columns).
 ///

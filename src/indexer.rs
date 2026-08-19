@@ -3704,35 +3704,79 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
-        // RFC-0023 tier 3: resolve the declared pinned reads that sample inside this window.
+        // RFC-0023 tier 3 + RFC-0038 §3: resolve the declared reads this window asks for.
         //
-        // Batched per block, because that is what `resolve_at` is for and what the boundary
-        // discipline everywhere else in this file requires. Ordered by block, then by the
-        // declaration's position in the config, so two operators produce identical keys and not
-        // merely identical content addresses.
+        // Two forms. A **sampled** declaration fires at the blocks `blocks_in` yields. A **row-driven**
+        // one fires once per row of the table it names, which is what a subgraph mapping does - the
+        // call happens as the row is produced, the same moment a handler would have made it.
+        //
+        // Ordering is identity, not presentation: declarations in config order, and within a
+        // row-driven declaration its source rows in `log_index` order. Two operators running the same
+        // nest must produce the same keys, not merely the same content addresses.
         if !self.calls.is_empty() {
             let rpc = self
                 .state_rpc
                 .clone()
                 .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
-            let mut by_block: std::collections::BTreeMap<u64, Vec<usize>> =
+            let mut wanted: std::collections::BTreeMap<u64, Vec<(usize, String, String)>> =
                 std::collections::BTreeMap::new();
             for (i, d) in self.calls.iter().enumerate() {
-                for b in d.blocks_in(next, to) {
-                    by_block.entry(b).or_default().push(i);
+                if d.is_row_driven() {
+                    let table = d.on.as_deref().unwrap_or_default();
+                    let mut src: Vec<&crate::registry::DecodedRow> =
+                        rows.iter().filter(|r| r.table == table).collect();
+                    src.sort_by_key(|r| (r.block_number, r.log_index));
+                    for r in src {
+                        let (contract, calldata) = d.resolve_for_row(r)?;
+                        wanted
+                            .entry(r.block_number)
+                            .or_default()
+                            .push((i, contract, calldata));
+                    }
+                } else {
+                    for b in d.blocks_in(next, to) {
+                        wanted.entry(b).or_default().push((
+                            i,
+                            d.contract.to_ascii_lowercase(),
+                            d.calldata.to_ascii_lowercase(),
+                        ));
+                    }
                 }
             }
-            for (block, idxs) in by_block {
-                let decls: Vec<crate::calls::CallDecl> =
-                    idxs.iter().map(|&i| self.calls[i].clone()).collect();
+
+            let capacity =
+                crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+            for (block, mut items) in wanted {
+                // `CallKey` is a content address, so N rows asking the same question of the same
+                // contract at the same block are one call and one row. Dedupe before the RPC, not
+                // after: the saving is the request, not the storage.
+                let mut seen = std::collections::HashSet::new();
+                items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
+
+                if items.len() as u64 >= capacity {
+                    anyhow::bail!(
+                        "block {block} wants {} distinct pinned reads, and only {capacity} fit in the \
+                         reserved row-index band.\n\n\
+                         A row-driven `[[calls]]` declaration fires once per source row, so a dense \
+                         table can ask for more reads than a block can hold. Narrow the source table \
+                         (index fewer events), or make the declaration sampled instead.",
+                        items.len()
+                    );
+                }
+
+                let pairs: Vec<(String, String)> = items
+                    .iter()
+                    .map(|(_, c, d)| (c.clone(), d.clone()))
+                    .collect();
                 let results =
-                    crate::calls::resolve_at(rpc.as_ref(), self.chain_id, &decls, block).await?;
+                    crate::calls::resolve_pairs_at(rpc.as_ref(), self.chain_id, &pairs, block)
+                        .await?;
                 let hash = source.block_hash(block).await?.unwrap_or_default();
                 let ts = timestamps.get(&block).copied().unwrap_or(0);
-                for (&i, r) in idxs.iter().zip(results) {
+                for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
                     let row = r.to_row(
-                        &self.calls[i].name,
-                        i,
+                        &self.calls[*i].name,
+                        slot,
                         &hash,
                         ts,
                         self.registry.timestamps(),
@@ -7262,14 +7306,23 @@ template = "pool"
             let req: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
             let one = |r: &serde_json::Value| {
-                // `eth_call` params are `[{to,data}, block]`; record the pinned block.
-                if let Some(b) = r
-                    .get("params")
+                // `eth_call` params are `[{to,data}, block]`. Record `block|to|data` so a test can
+                // assert the *pin* and the *argument*, not merely that something was called.
+                let p = r.get("params");
+                let at = |k: &str| {
+                    p.and_then(|p| p.get(0))
+                        .and_then(|o| o.get(k))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                let blk = p
                     .and_then(|p| p.get(1))
                     .and_then(|b| b.as_str())
-                {
-                    seen.lock().unwrap().push(b.to_string());
-                }
+                    .unwrap_or("?");
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{blk}|{}|{}", at("to"), at("data")));
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": r.get("id").cloned().unwrap_or(serde_json::json!(1)),
@@ -7363,7 +7416,12 @@ template = "pool"
         );
 
         // The pin is the point: each sample must be asked at *its own* block, not at `latest`.
-        let asked = seen.lock().unwrap().clone();
+        let asked: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.split('|').next().unwrap_or_default().to_string())
+            .collect();
         assert_eq!(
             asked,
             vec!["0x1", "0x2", "0x3"],
@@ -7448,6 +7506,128 @@ template = "pool"
         );
         drop(ok_nest);
         drop(ok_state);
+        handle.abort();
+    }
+
+    /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**
+    ///
+    /// This is the claim the whole parity argument rests on. A subgraph mapping reads
+    /// `c.balanceOf(event.params.to)`; before this, a nest could only declare a fixed calldata
+    /// sampled every N blocks, which expresses an oracle read and not a mapping.
+    ///
+    /// Two transfers in one block to two different recipients must produce **two** calls with
+    /// **different arguments** and **distinct keys** - not one, and not two rows overwriting each
+    /// other, which is exactly how #642 went wrong for block rows.
+    #[tokio::test]
+    async fn a_row_driven_call_fires_once_per_event_with_the_events_own_argument() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"recipient_balance\"\n\
+             contract = \"0x1111111111111111111111111111111111111111\"\n\
+             on = \"tok__transfer\"\nsignature = \"balanceOf(address)\"\nargs = [\"{to}\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a row-driven calls nest must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "tok__transfer")
+                    .expect("fixture must expose tok__transfer")
+                    .topic0
+            )
+        );
+        let pad = |b: u8| format!("0x{:064x}", b);
+        let logs: Vec<crate::rpc::Log> = (1u8..=2)
+            .map(|i| crate::rpc::Log {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                topics: vec![topic0.clone(), pad(0xaa), pad(0xb0 + i)],
+                data: format!("0x{:064x}", 1000 * i as u64),
+                block_number: 5,
+                block_hash: format!("0x{:064x}", 5),
+                tx_hash: format!("0xt{i}"),
+                log_index: u64::from(i),
+            })
+            .collect();
+
+        nest.process_window(source.as_ref(), &logs, 5, 5, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let asked = seen.lock().unwrap().clone();
+        assert_eq!(
+            asked.len(),
+            2,
+            "two transfers to two recipients owe two calls, got {asked:?}"
+        );
+        for (i, a) in asked.iter().enumerate() {
+            assert!(
+                a.starts_with("0x5|"),
+                "pinned to the event's own block: {a}"
+            );
+            // `balanceOf(address)` is selector 0x70a08231 - a published value, not ours.
+            assert!(a.contains("|0x70a08231"), "calldata must be balanceOf: {a}");
+            assert!(
+                a.ends_with(&format!("{:0>64x}", 0xb1 + i as u32)),
+                "the argument must be *this* event's recipient: {a}"
+            );
+        }
+        assert_ne!(asked[0], asked[1], "two recipients, two distinct questions");
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let mut call_keys: Vec<String> = store
+            .entity_keys()
+            .unwrap()
+            .into_iter()
+            .filter(|k| {
+                k.rsplit('-')
+                    .next()
+                    .and_then(|i| i.parse::<u64>().ok())
+                    .is_some_and(|i| i >= crate::registry::CALL_ROW_LOG_INDEX_BASE)
+            })
+            .collect();
+        call_keys.sort();
+        assert_eq!(
+            call_keys.len(),
+            2,
+            "two results must land under two keys, not overwrite each other (#642's lesson): \
+             {call_keys:?}"
+        );
         handle.abort();
     }
 
