@@ -358,3 +358,39 @@ this morning, three of the four portable subjects would have needed a chain entr
    attempted so far.
 2. **Peeranha** (matic) - first real use of the Polygon entry.
 3. **Graph Network Activity - Arb** - Arbitrum, and adjacent to work already done.
+
+---
+
+## 11. The loop closed: the gateway cannot answer, the nest can (2026-08-19)
+
+Two subjects from §10 ported and backfilled. Then the same question put to The Graph's gateway that a
+consumer of those subgraphs would ask:
+
+```
+Peeranha    -> {"errors":[{"message":"subgraph not found: no allocations"}]}
+Spookyswap  -> {"errors":[{"message":"subgraph not found: no allocations"}]}
+```
+
+**The gateway cannot serve either one.** Not slow, not stale - it refuses, because nobody is indexing
+them. Meanwhile the nests answer: Peeranha's returns 26 communities created, 3 frozen, 3 unfrozen and
+148 updated; Spookyswap's is discovering pairs from the factory as it backfills.
+
+That is [the forum post](../nuthatch-subgraph-fallback-forum-post.md)'s thesis - *when a subgraph is
+down, the data does not have to disappear* - demonstrated rather than argued, on subgraphs nobody
+picked to flatter us. The queue picked them.
+
+### Three independent confirmations of the same fact
+
+The port queue's claim was "these deployments have signal and no indexer". It has now been confirmed
+by three sources that share no code:
+
+1. **Our own nest**, joining `SubgraphService` allocations against `L2Curation` signal from raw events.
+2. **The Graph Network subgraph**, reporting `indexerAllocations(status: Active)` = 0 for each.
+3. **The gateway itself**, refusing the query with `no allocations`.
+
+A filter that three unrelated systems agree on is not a heuristic any more.
+
+### What it cost
+
+Peeranha: 62.7M blocks of Polygon, **~$1** of metered RPC. Spookyswap: 119M blocks of Fantom on free
+public endpoints, **$0**. The chain entries that made both reachable landed the same day.
