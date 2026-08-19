@@ -77,6 +77,33 @@ itself - so it is worth stating the number rather than the adjective.
 `block_timestamps = false` (RFC-0029 §6b) removes it entirely, at the cost of the column. A nest that
 never asks "when" should not be paying for it.
 
+### Price a backfill before you start it
+
+A from-deployment backfill on a mature chain is not the same order of expense as a bounded one, and the
+difference is three figures rather than a rounding error. The arithmetic is simple enough that there is
+no excuse for skipping it:
+
+```
+cost ≈ (blocks / measured_blocks) × measured_CU × $0.00000045
+```
+
+Worked, from a run that was actually measured: Uniswap V3 on Arbitrum over 674,425 blocks cost ~3.6M CU
+(~$1.62). Its factory was deployed at block **175**, so the full history is **736 times** that range:
+
+| Range | Events | CU | Cost |
+|---|---:|---:|---:|
+| 674k blocks (measured) | 195,515 | 3.6M | **$1.62** |
+| Full factory history (extrapolated) | ~144M | ~2,650M | **~$1,192** |
+
+Early chain history is far sparser than the tip, so that is an upper bound - but a tenth of it is still
+three figures. **A full-history backfill on a busy factory gets priced and agreed before it is
+started, not after.** A day of bounded proof runs across six chains came to **$5.15**; one unpriced
+backfill would have been two hundred times that.
+
+Two guards worth having on the provider side rather than in a habit: a **spend limit** (the "Set limit"
+control beside each usage chart) turns an accident into a refusal, and a **custom throughput override**
+turns a concurrency spike into throttling rather than billing.
+
 ### The other lever: concurrency, not volume
 
 The only limit actually hit that day was **throughput, not spend**: 11,717 CU/s against a 10,000 cap,
