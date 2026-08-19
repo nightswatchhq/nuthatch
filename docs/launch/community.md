@@ -18,9 +18,8 @@ nuthatch.
 
 ## 1. The asset that already proves it
 
-There is a draft in the working tree, `docs/nuthatch-subgraph-fallback-forum-post.md`, titled *"When a
-subgraph is down, the data does not have to disappear."* It is the strongest community artifact this
-project has, and at time of writing it is **untracked**. First action in §5 is to commit it.
+`docs/nuthatch-subgraph-fallback-forum-post.md`, *"When a subgraph is down, the data does not have to
+disappear."* It is the strongest community artifact this project has.
 
 Why it works, and what to copy from it into everything else:
 
@@ -57,18 +56,52 @@ One turn of that loop produces four things simultaneously:
 
 Nothing else on the launch plan does four jobs at once.
 
-### The lead generation is queryable, not social
+### The stopping rule, because the loop has no natural end
 
-Tier 0.1 of the nest catalogue calls the network subgraph "the crown jewel" on demand grounds. It is
-also, and more usefully, **the customer-discovery tool**: the network knows which deployments have no
-indexer allocation and which are falling behind. That is a ranked list of teams who currently have a
-data problem, available without hanging about in a Discord waiting for somebody to complain.
+"Port subgraphs for whoever asks" is unbounded, bespoke, and indistinguishable from freelancing. It is
+possible to disappear into it for a quarter and ship nothing to the core. So the loop is time-boxed by
+count, not by calendar:
 
-**Sequencing consequence:** build the Tier-0 network-subgraph nest *before* the bigger Tier-1 names
-(Aave, ENS). They are larger protocols; this one is the one that finds you the others. This is a
-recommendation against the current catalogue ordering and is deliberate.
+> **Three ports, then Show HN.**
 
----
+Three is enough to have real users and a hardened limits list; few enough that this stays a launch
+activity rather than a business model. A fourth request arriving mid-loop goes in a queue, not in the
+loop.
+
+**Pick the three for what they teach the product, not by who asks loudest:**
+
+1. One **factory or template** protocol, which tests the catalogue's central thesis that a good nest is
+   a family rather than a singleton.
+2. One already suspected to **hit the `eth_call` or IPFS boundary**, so the parity limit becomes a
+   precise empirical statement instead of a caveat written from first principles.
+3. One **boring, high-demand and straightforward**, which proves the process is not all artisanal
+   effort.
+
+### Why this goes before Show HN
+
+- **There is roughly one Show HN per project.** Posted from the current state, the thread's hardest
+  question - some form of "is anyone actually running this" - is answered with one operator
+  conversation. Three ports in, it is answered with three names and three working repos. Same post,
+  different reception, and the delay costs nothing that cannot be recovered.
+- **It hardens the honest-limits list empirically.** "Events only, no `eth_call`, no IPFS" is currently
+  reasoned from first principles. The DOUDOCHAIN_V2 port already converted part of it into fact
+  (IPFS-derived entities deliberately not claimed as parity). Two more do the same for the rest, and
+  that is better copy as well as better engineering.
+- **RFC-0007 already sequences it this way.** Home turf is Phase 1 and Show HN is Phase 2. This is a
+  sharper Phase 1, not a departure from the plan.
+
+### Find the first ports by asking, not by building
+
+An earlier draft of this document said to build the Tier-0 network-subgraph nest first and use its
+output as the port queue. **That was the wrong order** and is corrected here: it is the standard trap
+of building lead-generation tooling for a pipeline nobody has yet demonstrated exists.
+
+The network subgraph does know which deployments have no indexer allocation and which are falling
+behind, and that is a genuinely good queue. But the first one or two ports can be found by posting the
+fallback piece on the Graph forum and asking, or by reading Explorer, with no code written at all.
+**Build the network-subgraph nest at port three**, once the manual version has proved there is a queue
+worth automating. It is an excellent nest on its own merits either way, and by then it is a tool for
+observed demand rather than a bet on it.
 
 ## 3. Channels, ranked, for one person
 
@@ -116,17 +149,24 @@ what it is, and it burns rooms that a nest would have opened properly later.
 
 ## 5. Next actions
 
-1. **Commit `docs/nuthatch-subgraph-fallback-forum-post.md`.** It is currently untracked and one
-   `git clean` from oblivion.
-2. **Decide the hosted-fallback paragraph.** That post's closing offer of "a bounded, rate-limited
+In order. Nothing here blocks on anything below it.
+
+1. **Settle the hosted-fallback paragraph** in the forum post. Its offer of "a bounded, rate-limited
    temporary endpoint" edges toward the hosted-service line that [CLAUDE.md](../../CLAUDE.md) puts out
    of scope. It reads as an operator courtesy rather than a product, but a forum will read it as a
-   product. Pete's call, made deliberately rather than discovered in a reply.
-3. **Open the awesome-selfhosted PR.** Independent of launch timing.
-4. **Build the Tier-0 network-subgraph nest**, and use its output as the port queue (§2).
-5. **Post home-turf, then the fallback post**, in that order, on the Graph forum.
+   product. Decide it deliberately rather than discovering it in a reply.
+2. **Post [home-turf.md](home-turf.md) on the Graph forum**, then the fallback piece. In that order.
+3. **Ask for the first unserved deployment** in the same thread and in `#indexers`. No tooling.
+4. **Run the loop three times**, chosen against the criteria in §2.
+5. **Build the Tier-0 network-subgraph nest at port three**, and let it take over the queue.
+6. **Then Show HN**, per [strategy-review-2026-08-19.md](strategy-review-2026-08-19.md) and RFC-0007
+   Phase 2.
+7. **Open the awesome-selfhosted PR** whenever. It is independent of all of the above and costs an
+   hour.
 
----
+**Not on this list:** NLnet. Its window (3 Sept - 3 Nov 2026) is real and verified, but it is on the
+back burner by decision as of 2026-08-19. Recorded so that if it comes forward again, the date is
+already known rather than rediscovered.
 
 ## 6. What is unverified
 
