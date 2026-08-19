@@ -103,6 +103,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
 
     let config = Config {
         state_rpc_urls: Vec::new(),
+        ipfs_gateways: Vec::new(),
+        ipfs: Vec::new(),
         nest: Nest {
             name: nest_name(&dir),
             chain: chain.name.clone(),
@@ -568,6 +570,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
     let config = Config {
         state_rpc_urls: Vec::new(),
+        ipfs_gateways: Vec::new(),
+        ipfs: Vec::new(),
         nest: Nest {
             name: nest_name(&dir),
             chain: chain.name.clone(),
@@ -701,6 +705,13 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     // RFC-0023 tier 3: a declared `[[calls]]` read is a table too, and it moves the decode identity
     // for the same reason `[extract]` does - two nests differing only in what they read must not be
     // mistaken for the same decode version by segment reuse.
+    if !config.ipfs.is_empty() {
+        schema.extend(crate::ipfs::schema(&config.ipfs, registry.timestamps()));
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, hash);
+        sha2::Digest::update(&mut h, crate::ipfs::decl_hash(&config.ipfs));
+        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
+    }
     if !config.calls.is_empty() {
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
         let mut h = <sha2::Sha256 as sha2::Digest>::new();

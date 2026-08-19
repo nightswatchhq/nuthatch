@@ -240,9 +240,24 @@ pub const CALL_ROW_LOG_INDEX_BASE: u64 = 500_000;
 /// slice"; this is that slice, and the band is the answer.
 ///
 /// A block's gas limit caps transactions near 1,500, so the quarter-million slots here are enormous
-/// headroom. The split is 500,000..749,999 for pinned reads and 750,000..999,998 for calls, with the
-/// block row alone at the top.
+/// headroom. The band is partitioned:
+///
+/// | Range | Rows |
+/// |---|---|
+/// | `500_000..=624_999` | pinned `eth_call` results ([`CALL_ROW_LOG_INDEX_BASE`]) |
+/// | `625_000..=749_999` | resolved IPFS documents ([`IPFS_ROW_LOG_INDEX_BASE`]) |
+/// | `750_000..=999_998` | decoded top-level calls (here) |
+/// | `999_999` | the block row ([`BLOCK_ROW_LOG_INDEX`]) |
+///
+/// Every one of these is bounded by something smaller than its quarter: reads and resolutions by the
+/// source rows in a block (itself bounded by the ~80k log ceiling), calls by the transaction count.
 pub const TX_CALL_ROW_LOG_INDEX_BASE: u64 = 750_000;
+
+/// The base `log_index` for **resolved IPFS documents** (RFC-0037), between pinned reads and calls.
+///
+/// A resolved document descends from no log: it is the content behind a CID some row referenced. Same
+/// reasoning as its neighbours, and the same band.
+pub const IPFS_ROW_LOG_INDEX_BASE: u64 = 625_000;
 
 /// A serializable table schema (per-event table + its columns).
 ///
