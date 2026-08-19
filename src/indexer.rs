@@ -1725,6 +1725,29 @@ pub async fn build_and_prepare_nest(
 /// the caller's job ([`spawn_nest`] today; a runtime driver tomorrow, RFC-0012). Per-nest isolation
 /// (own store, own segments, own views) is the CLAUDE.md non-negotiable a runtime preserves by calling
 /// this once per nest.
+
+
+/// Every table this nest actually serves, not merely the ones a decoder produces.
+///
+/// `registry.schema()` describes the event tables and nothing else, and for a long while that was
+/// the whole truth. It stopped being so when tier-3 `[[calls]]` and `[[ipfs]]` documents started
+/// landing rows in tables of their own: those rows were queryable through `/sql` and completely
+/// invisible everywhere the registry's list is treated as the catalogue, which is most places.
+/// Measured on two real nests before this existed - `grt_total_supply` held 3,509 rows and appeared
+/// in neither `/tables` nor `/schema`, and `/table/grt_total_supply` answered 404.
+///
+/// Three consequences, all from the one omission, which is why this is a single list rather than
+/// three patches: the point-read endpoint refused a table that exists, the AI-native schema surface
+/// told an agent it did not exist at all, and the `semantic.toml` drift check warned that a
+/// correctly-described table "has no decoder" - a warning that fires on a correct config, which
+/// teaches operators to ignore warnings.
+fn full_schema(registry: &DecodeRegistry, config: &Config) -> Vec<crate::registry::TableSchema> {
+    let ts = registry.timestamps();
+    let mut tables = registry.schema();
+    tables.extend(crate::calls::schema(&config.calls, ts));
+    tables.extend(crate::ipfs::schema(&config.ipfs, ts));
+    tables
+}
 async fn build_nest(
     // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
     // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
@@ -1928,15 +1951,16 @@ async fn build_nest(
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
     // doesn't have, the semantics are stale - worse than none. Warn loudly at startup.
+    let served = full_schema(&registry, &config);
     if let Ok(Some(sem)) = crate::semantic::load(&dir) {
-        for w in crate::semantic::drift(&registry.schema(), &sem) {
+        for w in crate::semantic::drift(&served, &sem) {
             tracing::warn!("semantic.toml drift: {w}");
         }
     }
     // Authored views (RFC-0018 §1): a broken/drifted view no longer vanishes silently - it's a loud
     // startup warning (with a fuzzy-matched fix hint), and a `nuthatch check` failure. The view still
     // loads fault-isolated (a bad one never disables its siblings or the query surface).
-    for issue in crate::analytics::validate_nest_views(&dir, &registry.schema()) {
+    for issue in crate::analytics::validate_nest_views(&dir, &served) {
         match &issue.hint {
             Some(h) => tracing::warn!("view {} failed to load: {} - {h}", issue.file, issue.error),
             None => tracing::warn!("view {} failed to load: {}", issue.file, issue.error),
@@ -2099,7 +2123,7 @@ async fn build_nest(
         velocity,
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
-        tables: Arc::new(registry.schema()),
+        tables: Arc::new(full_schema(&registry, &config)),
         sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::SQL_MAX_CONCURRENCY)),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
@@ -8485,6 +8509,62 @@ template = "pool"
 
     /// A nest with a contract *and* `[extract] blocks = true`: one header request per block, so its
     /// window ceiling is header cost rather than log density (RFC-0036).
+    /// The catalogue must list every table the nest serves, not only the ones a decoder produces.
+    ///
+    /// This is the regression guard for a defect measured on two live nests: `[[calls]]` and
+    /// `[[ipfs]]` rows were queryable through `/sql` and absent from `/tables`, `/schema` and
+    /// `/table/{name}` - so the point-read endpoint answered 404 for a table holding 3,509 rows, and
+    /// the AI-native schema surface told an agent it did not exist. The `semantic.toml` drift check
+    /// read from the same short list and warned that a correctly-described table "has no decoder".
+    ///
+    /// Asserted on the *composed* list rather than through the HTTP surface deliberately: all three
+    /// symptoms had one cause, and a test per endpoint would pass again the moment a fourth consumer
+    /// of the catalogue is added without being told about it.
+    #[test]
+    fn the_catalogue_lists_call_and_ipfs_tables_not_just_decoder_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"uri","type":"string","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"total_supply\"\n\
+             contract = \"0x0000000000000000000000000000000000000002\"\ncalldata = \"0x18160ddd\"\nevery = 1000\n\n\
+             [[ipfs]]\nname = \"token_metadata\"\non = \"tok__transfer\"\ncid_column = \"uri\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.calls.len(), 1, "fixture must declare a call");
+        assert_eq!(config.ipfs.len(), 1, "fixture must declare an ipfs document");
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+
+        let decoder_only: Vec<String> = registry.schema().iter().map(|t| t.table.clone()).collect();
+        let served: Vec<String> = full_schema(&registry, &config)
+            .iter()
+            .map(|t| t.table.clone())
+            .collect();
+
+        // The premise: these two lists must actually differ, or the assertions below prove nothing.
+        assert!(
+            !decoder_only.contains(&"total_supply".to_string())
+                && !decoder_only.contains(&"token_metadata".to_string()),
+            "the registry alone should not know these tables: {decoder_only:?}"
+        );
+        for want in ["tok__transfer", "total_supply", "token_metadata"] {
+            assert!(
+                served.contains(&want.to_string()),
+                "`{want}` must be in the served catalogue, got {served:?}"
+            );
+        }
+    }
+
     async fn build_blocks_nest_with_contract(dir: &std::path::Path, addr: &str) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
