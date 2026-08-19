@@ -263,6 +263,30 @@ pub fn schema(decls: &[CallDecl], timestamps: bool) -> Vec<crate::registry::Tabl
         .collect()
 }
 
+/// A stable hash over the declared calls, folded into a nest's decode identity.
+///
+/// Two nests that differ only in what they *read* are different decode versions, exactly as two that
+/// differ only in what they extract are (RFC-0014). Without this they would share a decode hash, and
+/// segment reuse would happily serve one nest's rows to the other.
+pub fn decl_hash(decls: &[CallDecl]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for d in decls {
+        // Field-separated for the same reason `CallKey::address` separates: concatenating raw would
+        // let two different declarations hash identically.
+        h.update(d.name.as_bytes());
+        h.update(b"\x1f");
+        h.update(d.contract.to_ascii_lowercase().as_bytes());
+        h.update(b"\x1f");
+        h.update(d.calldata.to_ascii_lowercase().as_bytes());
+        h.update(b"\x1f");
+        h.update(d.every.to_be_bytes());
+        h.update(b"\x1f");
+        h.update(d.start.unwrap_or(0).to_be_bytes());
+        h.update(b"\x1e");
+    }
+    h.finalize().into()
+}
+
 impl CallResult {
     /// Turn a resolved call into a stored row, so it flows through the same store, seal and query
     /// path every other table uses.

@@ -840,6 +840,14 @@ pub struct DevArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
+    /// Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable).
+    ///
+    /// A pinned `eth_call` needs historical state, which the ingestion endpoints usually cannot
+    /// serve. Deliberately a flag rather than a `nuthatch.toml` field: an archive endpoint almost
+    /// always carries an API key, and the config is pinned into the nest's content address.
+    #[arg(long = "state-rpc", value_name = "URL")]
+    pub state_rpc: Vec<String>,
+
     /// Override the nest's `rpc_urls` at runtime without editing the config (repeatable). These are
     /// tried first; the nest's configured endpoints remain as fallback. Point at your own node.
     #[arg(long)]
