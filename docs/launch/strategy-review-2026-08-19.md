@@ -25,26 +25,58 @@ deadline.
 
 ## 1. The priority stack
 
-Revised 2026-08-19 after the community pass ([community.md](community.md)): the port loop moves to the
-front, and NLnet moves to the back burner by decision.
+Revised twice on 2026-08-19. The second revision is the important one: **three of the candidate items
+turned out to be the same job**, which is why this table is now short.
+
+### The collapse
+
+The port-queue nest ([port-queue-nest.md](port-queue-nest.md)) needs `SubgraphService` (allocations)
+and `L2Curation` (signal). Lodestar's `cron/ingest-allocations` and `curators` routes need
+`SubgraphService` and `L2Curation`. **Same two contracts, same chain, two consumers.**
+
+And the port loop already has its first subject. Lodestar is a real user with a real problem, running
+nuthatch in production, with 39 gateway-dependent routes and a documented list of what is missing
+(RFC-0011 status update, 2026-08-19). There is no need to find a stranger's subgraph to prove the loop
+when the best design partner available is already here and the port is half-specified.
+
+### Therefore, one next thing
+
+> **Confirm `SubgraphService`, then add it and `L2Curation` to the nests already running.**
+
+It pays out four ways simultaneously:
+
+1. **Lodestar loses its heaviest gateway dependency.** The six `cron/ingest-*` routes hold 53 more
+   hostage through `@/lib/db`; killing that group releases all of them.
+2. **The port queue exists as a by-product**, not as a separate project.
+3. **It is a genuine port**, so it is validation-conversation evidence and a forum post.
+4. **It measures which capability is actually missing**, instead of us guessing.
+
+Point 4 dissolves the IPFS-versus-`eth_call` question rather than answering it. Current evidence: IPFS
+blocks **two routes out of 39** (`subgraph-names`, `subgraph-search`), which is real but small. If the
+RFC-0023 tier-3 executor turns out to block eight, it wins on a count rather than on anybody's
+intuition. RFC-0037 and RFC-0023 both exist and neither expires; they can wait a fortnight for a
+number.
 
 | # | Item | When | Why it sits here |
 |---|------|------|------------------|
-| **P0** | Post [home-turf.md](home-turf.md) on the Graph forum, then the subgraph-fallback piece, then ask for an unserved deployment | now | RFC-0007 Phase 1, and it is what generates every item below it. No tooling required to start. |
-| **P1** | Run the port loop three times ([community.md](community.md) §2) | before Show HN | Three ports converts "is anyone running this" from an awkward question into three names, and converts the honest-limits list from reasoning into measurement. |
-| **P2** | Show HN copy: version-number honesty pass, then post | Tue-Thu, ~08:00-10:00 ET, after P1 | `show-hn.md` says "It's v0.1.0". `Cargo.toml` says `2.5.0`. One line, and it currently undercuts the entire post. Phase 2 of RFC-0007. |
-| **P3** | EF ESP inquiry against a named wishlist item | after the post, with the thread and the ports as evidence | [ef-esp.md](../grants/ef-esp.md) exists. The permissive relicence removed the friction that made this awkward. |
-| **P4** | HyperEVM as the chain expansion | ~1 week of work, opportunistic | EVM, so it is a `chains.rs` entry plus endpoint measurement. Same "underserved, one dominant provider" story as Solana at ~5% of the cost. |
-| **P5** | Compliance / data-residency positioning note | a page, whenever | Attaches to the product that already exists. Costs nothing to write and nothing to maintain. |
-| **-** | **NLnet** | **back burner** (decision, 2026-08-19) | The window is real and verified (3 Sept to 3 Nov 2026, 12:00 CEST) and [nlnet.md](../grants/nlnet.md) is drafted at €38,400. Recorded, not scheduled, so that if it comes forward the date is known rather than rediscovered. Missing this window means waiting for the next cycle. |
-| **-** | **Solana** | **not now** | See §2. The case for it rests on a pipeline that does not exist, and the honest build violates non-negotiables 1 and 3. |
+| **P0** | Confirm `SubgraphService`, add it + `L2Curation`, migrate the `cron/ingest-*` group | now | The collapse above. One build, four payoffs. |
+| **P1** | The remaining on-chain Lodestar routes | after P0 | ~27 of 39 are plain event data and fall individually behind the per-panel flags that already exist. |
+| **P2** | Show HN copy pass, then post | after P1 | The version line is fixed; the honest-limits paragraph is fixed. The headline it earns after P1 - a production dashboard serving its on-chain panels with no gateway dependency - is far better than anything currently drafted. |
+| **P3** | IPFS (RFC-0037) or tier-3 executor (RFC-0023) | whichever P0/P1 proves blocking | Deliberately unresolved. See point 4. |
+| **P4** | EF ESP against a named wishlist item | after the post | Now the lead grant, and gated on having something to point at - which P0 and P1 produce. |
+| **P5** | HyperEVM, compliance positioning note | opportunistic | Neither has a user asking. |
+| **-** | **NLnet** | **back burner** (decision, 2026-08-19) | Window verified (3 Sept - 3 Nov 2026, 12:00 CEST), [nlnet.md](../grants/nlnet.md) drafted at €38,400. Recorded, not scheduled. The P0/P1 work is exactly the evidence it would want if it comes forward. |
+| **-** | **Solana** | **not now** | See §2. |
 
-**What changed and why.** The first version of this table put NLnet at P0 on the grounds that it was
-the only item with a verified external deadline. That was true and is still true, and it was the wrong
-reason to rank it first: a deadline makes something *urgent*, not *load-bearing*. The port loop is
-load-bearing, because it feeds the Show HN, the validation roster, the honest-limits list and any
-future grant application at the same time. NLnet was subsequently put on the back burner by decision,
-which settles the question either way.
+**Done since this document was first written:** the subgraph-fallback forum post is live on The Graph
+forum (2026-08-17), so RFC-0007 Phase 1 has started.
+
+**What changed and why.** Revision 1 put NLnet at P0 because it was the only item with a verified
+external deadline. That was the wrong reason: a deadline makes a thing *urgent*, not *load-bearing*.
+Revision 2 collapsed the port loop, the port-queue nest and the Lodestar migration into one job, once
+counting Lodestar showed that its heaviest dependency and the port queue want the same two contracts.
+Both revisions moved the same direction: toward the work that produces evidence, and away from the
+work that consumes it.
 
 ---
 
@@ -228,3 +260,28 @@ allowed to move a date or a decision.
 The report's own caveat applies with force: many of the sharpest claims about Solana indexing pain and
 about competitors' maturity originate with vendors selling the fix. Direction is probably right;
 magnitudes are marketing.
+
+---
+
+## 9. The position this all implies
+
+Recorded because it was the reasoning behind §1 and existed nowhere in the repo.
+
+Everything that has actually worked points somewhere narrower than the README. An infrastructure
+operator proposed a partnership unprompted (validation conversation #1). A production dashboard runs
+two panels on nuthatch and wants 39. The forum post that landed was about subgraphs going unserved.
+The differentiator that keeps proving out is not throughput - it is **you do not have to rent this
+from anyone**, plus the derive-first state work (RFC-0023 tiers 1-2) meaning you do not need a
+~1.77 TB archive node either.
+
+That is not a general-purpose indexer competing with Ponder and Envio. It is **the self-hosted data
+layer for The Graph ecosystem**, a position already half-held, with two users and a partner in it.
+Being the Nth EVM indexer is a fight. Being the only self-hosted answer to "my subgraph is unserved
+and I am paying a gateway" is not, because nobody else wants that job.
+
+**The standing temptation is to broaden** - another chain, another ecosystem, a bigger claim. Resist
+it until Lodestar is off the gateway for everything on-chain. That single fact is worth more than any
+amount of breadth, and it is roughly a month of focused work rather than a year.
+
+This is a position, not a non-negotiable. It should be argued with when the evidence changes, and
+[CLAUDE.md](../../CLAUDE.md) remains the authority on scope.
