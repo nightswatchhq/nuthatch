@@ -240,8 +240,25 @@ pub struct Extract {
     #[serde(default)]
     pub blocks: bool,
     /// Emit a row per **call** (top-level and internal), calldata decoded by 4-byte selector.
+    ///
+    /// Node-gated: the *internal* call tree only exists as an execution artifact, so it needs
+    /// `debug_*` or a colocated node. See [`Extract::top_level_calls`] for the half that does not.
     #[serde(default)]
     pub traces: bool,
+    /// Emit a row per **top-level call** to this nest's contracts - a transaction sent directly to
+    /// one of them, calldata decoded by 4-byte selector. This is what a subgraph's `callHandlers`
+    /// fire on (RFC-0038 §5).
+    ///
+    /// Unlike `traces` this is **sourceable from ordinary RPC**: a top-level call is a transaction,
+    /// and `eth_getBlockByNumber(b, true)` returns them. Filing it with `traces` behind the node gate
+    /// was the same bundling-by-shape error RFC-0036 corrected for blocks and transactions - grouping
+    /// by "non-event data" when the thing that matters is the *source*. So it deliberately does not
+    /// count towards [`Extract::enabled`], which is the node-gated set and the startup refusal.
+    ///
+    /// Bounded by the nest's own contracts: a transaction to an address this nest does not index is
+    /// not decoded and not stored.
+    #[serde(default)]
+    pub top_level_calls: bool,
     /// Emit a row per **storage write**: `(address, slot, prev, new)`, raw slots, no ABI needed.
     #[serde(default)]
     pub state: bool,
@@ -280,7 +297,16 @@ impl Extract {
     /// Is any surface at all switched on, node-gated or not? For "does this nest want extraction work
     /// scheduled", as distinct from "must this nest be refused".
     pub fn any(&self) -> bool {
-        self.blocks || self.traces || self.state
+        self.blocks || self.traces || self.state || self.top_level_calls
+    }
+
+    /// Does this nest decode calldata at all - internal calls, top-level calls, or both?
+    ///
+    /// The gate for building a [`crate::calldata::CallRegistry`] and advertising its tables. Distinct
+    /// from [`Self::enabled`], which is the *node-gated* set: a top-level-calls nest needs the call
+    /// decode surface and needs no node.
+    pub fn decodes_calls(&self) -> bool {
+        self.traces || self.top_level_calls
     }
 
     /// Scoped means "bounded by something the operator named". A selector allowlist bounds traces

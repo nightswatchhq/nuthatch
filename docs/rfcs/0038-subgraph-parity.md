@@ -1,6 +1,6 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). **Slices 0, 1 and 2 built** (see §6); 3 and 4 outstanding. Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** Draft (2026-08-19). **Slices 0, 1, 2 and 4 built** (see §6); slice 3 (IPFS) outstanding. Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
@@ -188,10 +188,29 @@ thousands - a narrow band would have recreated the very bug slice 0 fixed. And a
 parameter is refused as an argument**: the log holds `keccak(value)`, so the original is unrecoverable,
 and encoding the hash would produce a well-formed call asking a question nobody meant.
 
-**Slice 3 - IPFS.** RFC-0037's own slices, verification first.
+**Slice 3 - IPFS. Outstanding, and larger than RFC-0037 assumed.** A v0 CID hashes the **dag-pb
+node**, not the bytes a gateway returns, so honest verification means fetching raw blocks
+(`?format=raw`) and unwrapping UnixFS. There is also no base58, base32 or multihash crate in the tree,
+so it is hand-rolled or a dependency decision under `deny.toml`. Worth its own pass rather than being
+squeezed in beside these.
 
-**Slice 4 - top-level calls from ordinary RPC.** Split `[extract] traces` into the node-gated and
-node-independent halves.
+**Slice 4 - top-level calls from ordinary RPC. DONE.** `[extract] top_level_calls`, sourced from
+`eth_getBlockByNumber(b, true)` via a new `Source::block_bodies` that shares `block_headers`' pacing
+and partial-response handling rather than copying it. `Extract::decodes_calls()` splits the
+call-decode gate from `enabled()`, which stays the node-gated set - so a top-level-calls nest builds
+and runs with no node at all.
+
+This also **closed a gap `CallContext::call_index` had recorded** as "deliberately left for the
+extraction slice": call ordinals and log indexes shared one key namespace. #642 proved that defect was
+live for block rows; the reserved band now carries all three kinds, split
+`500_000..=749_999` for pinned reads, `750_000..=999_998` for calls, and `999_999` for the block row.
+
+**A mutation that did not bite changed the test.** The first fixture set `[extract] contracts`, so
+`CallRegistry::in_scope` did the filtering and the test passed with the indexer's own address filter
+deleted - it was asserting somebody else's guard. Unscoped, the nest's own addresses are the only
+bound, and that is the one that matters: `scope_check` guards `traces`/`state` and returns early for a
+top-level-calls nest, so without the filter an unscoped nest would decode every transaction on the
+chain.
 
 ## 7. Testing, because this warrants its own release
 

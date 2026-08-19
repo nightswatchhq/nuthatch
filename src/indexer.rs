@@ -1994,6 +1994,16 @@ async fn build_nest(
     // RFC-0023 tier 3: the archive endpoint a declared call is resolved against. Built here so a
     // nest declaring `[[calls]]` without one is refused at startup rather than discovered thousands
     // of blocks into a backfill as a wall of identical failures.
+    // RFC-0038 §5: built whenever the nest decodes calldata at all. Distinct from `enabled()`, which
+    // is the node-gated set - a top-level-calls nest needs this surface and needs no node.
+    let call_registry = if config.extract.decodes_calls() {
+        Some(Arc::new(crate::calldata::CallRegistry::from_nest(
+            &dir, config,
+        )?))
+    } else {
+        None
+    };
+
     let state_rpc = if config.state_rpc_urls.is_empty() {
         if !config.calls.is_empty() {
             anyhow::bail!(
@@ -2038,6 +2048,8 @@ async fn build_nest(
         addresses,
         topic0s,
         start_block,
+        top_level_calls: config.extract.top_level_calls,
+        call_registry: call_registry.clone(),
         chain_id: config.nest.chain_id,
         calls: config.calls.clone(),
         state_rpc,
@@ -3135,6 +3147,12 @@ pub struct NestIngest {
     /// The nest's earliest vendored deployment block (the min of the contracts' `start_block`s), or
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
+    /// RFC-0038 §5: whether this nest decodes **top-level calls** - transactions sent directly to its
+    /// contracts, which is what a subgraph's `callHandlers` fire on.
+    top_level_calls: bool,
+    /// RFC-0038 §5: the call-decode surface, present when the nest sets `[extract] top_level_calls`
+    /// or `traces`. `None` when it decodes events only, which is the default and the common case.
+    call_registry: Option<Arc<crate::calldata::CallRegistry>>,
     /// The nest's chain id, needed to key a tier-3 call result: a `CallKey` is
     /// `(chain, block, contract, calldata)`, and omitting the chain would make two chains' answers
     /// to the same question share one content address.
@@ -3704,6 +3722,87 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
+        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
+        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
+        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
+        //
+        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
+        // it did not ask for.
+        if self.top_level_calls {
+            if let Some(creg) = self.call_registry.clone() {
+                let want: Vec<u64> = (next..=to).collect();
+                let bodies = source.block_bodies(&want).await?;
+                for b in &want {
+                    let Some(body) = bodies.get(b) else { continue };
+                    let bhash = body
+                        .get("hash")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    // The body already carries the header, so the timestamp comes from it rather
+                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
+                    // that emitted no matching log at all, which is most of them.
+                    let ts = body
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(0);
+                    let txs = body.get("transactions").and_then(|t| t.as_array());
+                    for tx in txs.into_iter().flatten() {
+                        // `to` is absent for a contract creation, which is not a call to anything we
+                        // index.
+                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
+                            continue;
+                        };
+                        let lower = to_addr.to_ascii_lowercase();
+                        if !self
+                            .addresses
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&lower))
+                        {
+                            continue;
+                        }
+                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
+                            continue;
+                        };
+                        let input = hex::decode(
+                            tx.get("input")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("0x")
+                                .trim_start_matches("0x"),
+                        )
+                        .unwrap_or_default();
+                        let idx = tx
+                            .get("transactionIndex")
+                            .and_then(|i| i.as_str())
+                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0);
+                        let ctx = crate::calldata::CallContext {
+                            block_number: *b,
+                            block_hash: bhash.clone(),
+                            block_timestamp: ts,
+                            tx_hash: tx
+                                .get("hash")
+                                .and_then(|h| h.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            // The reserved band is applied here rather than at storage, so the row's
+                            // own `log_index` is the key it lands under - one number, one meaning.
+                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
+                            timestamps: self.registry.timestamps(),
+                        };
+                        if let Some(row) = creg.decode_call(addr, &input, &ctx) {
+                            to_store.push((
+                                Store::entity_key(row.block_number, row.log_index),
+                                row.to_json().to_string(),
+                            ));
+                            stored += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // RFC-0023 tier 3 + RFC-0038 §3: resolve the declared reads this window asks for.
         //
         // Two forms. A **sampled** declaration fires at the blocks `blocks_in` yields. A **row-driven**
@@ -7507,6 +7606,161 @@ template = "pool"
         drop(ok_nest);
         drop(ok_state);
         handle.abort();
+    }
+
+    /// **RFC-0038 §5, end to end: a top-level call is decoded from ordinary RPC.**
+    ///
+    /// This is what a subgraph's `callHandlers` fire on. `[extract] traces` bundled it with the
+    /// *internal* call tree behind the node gate, which was RFC-0036's bundling-by-shape error a
+    /// second time: internal calls genuinely need `debug_*`, but a top-level call is a transaction and
+    /// `eth_getBlockByNumber(b, true)` returns it.
+    ///
+    /// Asserts three things a weaker test would miss: the call row exists, a transaction to an
+    /// address this nest does **not** index is ignored, and the row's key sits in the reserved band so
+    /// it cannot collide with a log at the same ordinal - the gap `CallContext::call_index` recorded
+    /// and #642 proved was live for block rows.
+    ///
+    /// **No `[extract] contracts` scope, deliberately.** With one set, `CallRegistry::in_scope` does
+    /// the filtering and this test passes with the indexer's own address filter deleted - it would be
+    /// asserting somebody else's guard. Unscoped, the nest's own addresses are the only bound, which
+    /// is the one that matters: `scope_check` guards `traces`/`state` and returns early for a
+    /// top-level-calls nest, so without that filter an unscoped nest would decode every transaction
+    /// on the chain.
+    #[tokio::test]
+    async fn a_top_level_call_is_decoded_without_a_node() {
+        struct BodySource;
+        #[async_trait::async_trait]
+        impl Source for BodySource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                Ok(blocks
+                    .iter()
+                    .map(|&b| {
+                        (
+                            b,
+                            serde_json::json!({
+                                "hash": format!("0x{b:064x}"),
+                                "timestamp": "0x65000000",
+                                "transactions": [
+                                    // A call to the contract this nest indexes: `ping()`.
+                                    {
+                                        "hash": "0xaa",
+                                        "to": "0x1111111111111111111111111111111111111111",
+                                        "input": "0x5c36b186",
+                                        "transactionIndex": "0x0"
+                                    },
+                                    // A call to some other contract entirely. Decoding this would
+                                    // mean the nest pays for chain traffic it never asked for.
+                                    {
+                                        "hash": "0xbb",
+                                        "to": "0x9999999999999999999999999999999999999999",
+                                        "input": "0x5c36b186",
+                                        "transactionIndex": "0x1"
+                                    },
+                                    // A contract creation has no `to` at all.
+                                    {
+                                        "hash": "0xcc",
+                                        "input": "0x6080",
+                                        "transactionIndex": "0x2"
+                                    },
+                                ],
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"tc\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [extract]\ntop_level_calls = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"function","name":"ping","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
+                {"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            !config.extract.enabled(),
+            "top_level_calls must NOT be node-gated, or this nest is refused at startup"
+        );
+
+        let source: Arc<dyn Source> = Arc::new(BodySource);
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a top-level-calls nest must build with no node");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        nest.process_window(source.as_ref(), &[], 4, 4, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "only the call to *our* contract is decoded - the foreign call and the creation are not: \
+             {keys:?}"
+        );
+        let ordinal: u64 = keys[0].rsplit('-').next().unwrap().parse().unwrap();
+        assert_eq!(
+            ordinal,
+            crate::registry::TX_CALL_ROW_LOG_INDEX_BASE,
+            "transaction 0 must land in the reserved band, not at log_index 0 where a log lives"
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(&store.get_entity(&keys[0]).unwrap().unwrap()).unwrap();
+        // `call_` prefixed, so a function and an event of the same name cannot collide in one nest -
+        // this ABI has both a `ping()` function and a `Ping` event, which is why the fixture carries
+        // both.
+        assert_eq!(row["table"], "tok__call_ping", "row: {row}");
+        assert_eq!(
+            row["tx_hash"], "0xaa",
+            "the row must carry the transaction it came from"
+        );
+        assert_eq!(
+            row["block_timestamp"], 1_694_498_816u64,
+            "the timestamp comes from the body we already fetched, not a second round trip"
+        );
     }
 
     /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**

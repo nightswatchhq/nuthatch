@@ -98,6 +98,16 @@ pub trait Source: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Full blocks **with transaction bodies**, for a nest with `[extract] top_level_calls`
+    /// (RFC-0038 §5).
+    ///
+    /// Same default and same reasoning as `block_headers`: a source that cannot answer produces no
+    /// call rows rather than empty ones, because an empty table is indistinguishable from "this
+    /// contract was never called".
+    async fn block_bodies(&self, _blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        Ok(HashMap::new())
+    }
+
     /// Forget any cached per-block data above `block`, because the chain reorganised there.
     ///
     /// Default: nothing to forget. A source that caches anything keyed by **block number** must
@@ -143,6 +153,10 @@ impl Source for RpcClient {
 
     async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
         RpcClient::block_headers(self, blocks).await
+    }
+
+    async fn block_bodies(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        RpcClient::block_bodies(self, blocks).await
     }
 
     async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {

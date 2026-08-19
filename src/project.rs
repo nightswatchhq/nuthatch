@@ -690,7 +690,7 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     // folds in the call surface, so two nests differing only in what they extract are not mistaken for
     // the same decode version - the hash is what segment reuse and `check` compare.
     let mut hash = registry.hash();
-    if config.extract.enabled() {
+    if config.extract.decodes_calls() {
         let calls = crate::calldata::CallRegistry::from_nest(dir, config)?;
         schema.extend(calls.schema(&config.extract));
         let mut h = <sha2::Sha256 as sha2::Digest>::new();

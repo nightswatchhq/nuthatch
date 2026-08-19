@@ -1075,7 +1075,7 @@ impl RpcClient {
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
             .chunks(MAX_TIMESTAMP_BATCH)
-            .map(|c| self.fetch_timestamp_batch(c))
+            .map(|c| self.fetch_timestamp_batch(c, false))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
             .buffered(TIMESTAMP_FANOUT)
@@ -1136,6 +1136,23 @@ impl RpcClient {
     /// consumed once, as rows, and caching them would hold `TIMESTAMP_CACHE_MAX` full headers against
     /// a 2 GB per-cursor budget to serve a read that never repeats.
     pub async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, Value>> {
+        self.blocks_with(blocks, false).await
+    }
+
+    /// Full blocks **including transaction bodies** (`eth_getBlockByNumber(b, true)`).
+    ///
+    /// The source for top-level call decoding (RFC-0038 §5). It is ordinary RPC - the same method
+    /// `block_headers` already calls, with the one flag flipped - which is why top-level calls are
+    /// *not* node-gated the way internal calls are: only the internal call tree needs `debug_*`.
+    ///
+    /// Shares `blocks_with`'s pacing and partial-response handling rather than copying it: a
+    /// rate-limited provider answers HTTP 200 with some items filled and the rest carrying a per-item
+    /// 429, and that logic took several findings to get right.
+    pub async fn block_bodies(&self, blocks: &[u64]) -> Result<HashMap<u64, Value>> {
+        self.blocks_with(blocks, true).await
+    }
+
+    async fn blocks_with(&self, blocks: &[u64], full: bool) -> Result<HashMap<u64, Value>> {
         if blocks.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1164,7 +1181,7 @@ impl RpcClient {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
                 .chunks(MAX_TIMESTAMP_BATCH)
-                .map(|c| self.fetch_timestamp_batch(c))
+                .map(|c| self.fetch_timestamp_batch(c, full))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
                 .buffered(HEADER_FANOUT)
@@ -1240,9 +1257,13 @@ impl RpcClient {
     /// *multiplicatively* and nothing bounds the product, and §6f made it sharper by growing windows to
     /// 100,000 blocks, so each window now covers far more distinct blocks than when the batch size was
     /// chosen. Halving on failure is what adapts to that without having to predict it.
-    fn fetch_timestamp_batch<'a>(&'a self, blocks: &'a [u64]) -> TimestampBatchFuture<'a> {
+    fn fetch_timestamp_batch<'a>(
+        &'a self,
+        blocks: &'a [u64],
+        full: bool,
+    ) -> TimestampBatchFuture<'a> {
         Box::pin(async move {
-            match self.fetch_timestamp_batch_once(blocks).await {
+            match self.fetch_timestamp_batch_once(blocks, full).await {
                 Ok(v) => Ok(v),
                 // A single block that still fails is a real failure - there is nothing left to halve,
                 // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
@@ -1253,8 +1274,8 @@ impl RpcClient {
                         blocks.len()
                     );
                     let (a, b) = blocks.split_at(mid);
-                    let mut out = self.fetch_timestamp_batch(a).await?;
-                    out.extend(self.fetch_timestamp_batch(b).await?);
+                    let mut out = self.fetch_timestamp_batch(a, full).await?;
+                    out.extend(self.fetch_timestamp_batch(b, full).await?);
                     Ok(out)
                 }
                 Err(e) => Err(e),
@@ -1262,13 +1283,17 @@ impl RpcClient {
         })
     }
 
-    async fn fetch_timestamp_batch_once(&self, blocks: &[u64]) -> Result<HashMap<u64, Value>> {
+    async fn fetch_timestamp_batch_once(
+        &self,
+        blocks: &[u64],
+        full: bool,
+    ) -> Result<HashMap<u64, Value>> {
         let batch: Vec<Value> = blocks
             .iter()
             .enumerate()
             .map(|(i, b)| {
                 json!({ "jsonrpc": "2.0", "id": i, "method": "eth_getBlockByNumber",
-                        "params": [format!("0x{b:x}"), false] })
+                        "params": [format!("0x{b:x}"), full] })
             })
             .collect();
         let body = Value::Array(batch);

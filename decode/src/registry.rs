@@ -231,6 +231,19 @@ pub const BLOCK_ROW_LOG_INDEX: u64 = 999_999;
 /// the same keys, not merely the same content addresses.
 pub const CALL_ROW_LOG_INDEX_BASE: u64 = 500_000;
 
+/// The base `log_index` for **decoded top-level calls** (RFC-0038 §5), the upper half of the reserved
+/// band.
+///
+/// A top-level call is a transaction, so its ordinal is the transaction index - which lives in the
+/// same numeric space as `log_index` and would otherwise collide with both a log and a tier-3 result.
+/// `CallContext::call_index` recorded this as a known gap "deliberately left for the extraction
+/// slice"; this is that slice, and the band is the answer.
+///
+/// A block's gas limit caps transactions near 1,500, so the quarter-million slots here are enormous
+/// headroom. The split is 500,000..749,999 for pinned reads and 750,000..999,998 for calls, with the
+/// block row alone at the top.
+pub const TX_CALL_ROW_LOG_INDEX_BASE: u64 = 750_000;
+
 /// A serializable table schema (per-event table + its columns).
 ///
 /// `event`/`topic0` and `function`/`selector` are the same idea for different [`TableKind`]s, and
