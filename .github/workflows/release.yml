@@ -36,10 +36,21 @@ jobs:
             exit 1
           fi
           echo "path=$notes" >> "$GITHUB_OUTPUT"
-      - name: create release with notes
+      # Created as a **draft** (#626). This job runs before a single binary has been built, so a
+      # published release here means a failing matrix leaves a live, fully-annotated release with no
+      # assets attached, visible to anyone watching the repo and to `gh release download`. A draft is
+      # visible only to people with write access, so the failure stays private until it is fixed.
+      # The `publish` job at the bottom flips it once everything has actually built.
+      #
+      # The draft flag is repeated on every action-gh-release call in this workflow rather than set
+      # once here, because the attach steps below issue *updates* against this release and the
+      # action's handling of an unset draft input on update is not something to bet a public release
+      # on. Stating it each time costs a line and removes the question.
+      - name: create draft release with notes
         uses: softprops/action-gh-release@v2
         with:
           body_path: ${{ steps.notes.outputs.path }}
+          draft: true
 
   build:
     name: ${{ matrix.target }}
@@ -90,6 +101,7 @@ jobs:
       - name: attach to release
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             nuthatch-${{ matrix.target }}.tar.gz
             nuthatch-${{ matrix.target }}.tar.gz.sha256
@@ -115,6 +127,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             nuthatch-scaled-${{ matrix.target }}.tar.gz
             nuthatch-scaled-${{ matrix.target }}.tar.gz.sha256
@@ -199,3 +212,32 @@ jobs:
           docker run --rm nuthatch:scaled control --help > /dev/null
           docker tag nuthatch:scaled "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
           docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
+
+  # The release goes public here and nowhere else (#626). Everything above builds against a draft:
+  # two binary targets, the scaled binary, and two container images that are smoke-tested before they
+  # are pushed. Only when all of that has succeeded does the release stop being a draft.
+  #
+  # `needs: container` rather than `needs: build`, and that is a deliberate choice rather than an
+  # oversight: an image is part of what a release promises (RFC-0005), so a green matrix with a failed
+  # container job is an incomplete release and a human should decide what to do about it. Which they
+  # can, cheaply - the draft is sitting there with its notes and its binaries already attached, and
+  # the recovery is one command, stated here because a failure message that names an unreachable
+  # recovery path is worse than none:
+  #
+  #     gh release edit v<x.y.z> --draft=false
+  #
+  # There is no `if: always()`. A failure upstream must leave this job unrun, because "publish it
+  # anyway" is the exact behaviour the issue was filed about.
+  publish:
+    name: publish the release
+    needs: container
+    runs-on: ubuntu-latest
+    steps:
+      - name: undraft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+          echo "published $GITHUB_REF_NAME"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
+            --jq '"draft=\(.isDraft) assets=\(.assets | length)"'

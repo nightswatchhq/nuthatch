@@ -59,6 +59,31 @@ jobs:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      # #634. `release.yml` hard-fails when `docs/releases/<tag>.md` is missing, which is right, but
+      # it discovers that *after the tag is pushed* - the most expensive moment to find out, and the
+      # one where the fix means deleting a tag. The version bump is the moment the notes are owed, so
+      # check it here, on the PR that does the bumping, where the cost of being wrong is a red tick.
+      #
+      # Deliberately a step in this job rather than a job of its own: only the names in
+      # `required_status_checks` actually block a merge, and a new job would not be one of them
+      # (see the cost of learning that the other way round). First step after checkout so it answers
+      # in seconds rather than behind an hour of builds.
+      - name: a version bump brings its release notes (#634)
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          git fetch --depth=1 origin main
+          base=$(git show origin/main:Cargo.toml | grep -m1 '^version = ' | cut -d'"' -f2)
+          if [ "$version" = "$base" ]; then
+            echo "version unchanged at $version - nothing owed"
+            exit 0
+          fi
+          notes="docs/releases/v$version.md"
+          echo "version $base -> $version, so $notes must exist"
+          if [ ! -s "$notes" ]; then
+            echo "::error::This PR bumps the version to $version, so tagging v$version will need $notes and it is missing or empty. Write it in this PR - see docs/releases/README.md. Without it the tag fails in release.yml *after* it is pushed, and recovering from that means deleting a pushed tag."
+            exit 1
+          fi
+          echo "$notes present, $(wc -c < "$notes") bytes"
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
