@@ -1717,16 +1717,6 @@ pub async fn build_and_prepare_nest(
     Ok((nest, state, worker, next))
 }
 
-/// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode
-/// registry + IVM views, run the warm-restart rebuilds, and assemble both the [`NestIngest`] the
-/// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
-/// handles (the API must see the same views the loop feeds). Also spawns the optional alert/webhook
-/// delivery worker, and returns the effective `eth_getLogs` window. Spawning the ingestion loop is
-/// the caller's job ([`spawn_nest`] today; a runtime driver tomorrow, RFC-0012). Per-nest isolation
-/// (own store, own segments, own views) is the CLAUDE.md non-negotiable a runtime preserves by calling
-/// this once per nest.
-
-
 /// Every table this nest actually serves, not merely the ones a decoder produces.
 ///
 /// `registry.schema()` describes the event tables and nothing else, and for a long while that was
@@ -1748,6 +1738,15 @@ fn full_schema(registry: &DecodeRegistry, config: &Config) -> Vec<crate::registr
     tables.extend(crate::ipfs::schema(&config.ipfs, ts));
     tables
 }
+
+/// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode
+/// registry + IVM views, run the warm-restart rebuilds, and assemble both the [`NestIngest`] the
+/// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
+/// handles (the API must see the same views the loop feeds). Also spawns the optional alert/webhook
+/// delivery worker, and returns the effective `eth_getLogs` window. Spawning the ingestion loop is
+/// the caller's job ([`spawn_nest`] today; a runtime driver tomorrow, RFC-0012). Per-nest isolation
+/// (own store, own segments, own views) is the CLAUDE.md non-negotiable a runtime preserves by calling
+/// this once per nest.
 async fn build_nest(
     // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
     // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
@@ -1951,7 +1950,7 @@ async fn build_nest(
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
     // doesn't have, the semantics are stale - worse than none. Warn loudly at startup.
-    let served = full_schema(&registry, &config);
+    let served = full_schema(&registry, config);
     if let Ok(Some(sem)) = crate::semantic::load(&dir) {
         for w in crate::semantic::drift(&served, &sem) {
             tracing::warn!("semantic.toml drift: {w}");
@@ -2123,7 +2122,7 @@ async fn build_nest(
         velocity,
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
-        tables: Arc::new(full_schema(&registry, &config)),
+        tables: Arc::new(full_schema(&registry, config)),
         sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::SQL_MAX_CONCURRENCY)),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
@@ -8542,7 +8541,11 @@ template = "pool"
 
         let config = Config::load(dir.path()).unwrap();
         assert_eq!(config.calls.len(), 1, "fixture must declare a call");
-        assert_eq!(config.ipfs.len(), 1, "fixture must declare an ipfs document");
+        assert_eq!(
+            config.ipfs.len(),
+            1,
+            "fixture must declare an ipfs document"
+        );
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
 
         let decoder_only: Vec<String> = registry.schema().iter().map(|t| t.table.clone()).collect();
