@@ -7,11 +7,16 @@
 //! the events the contract actually emits. The manifest is the only good
 //! source, and it is already content-addressed.
 //!
-//! Content-addressed, but **not verified here**: nothing recomputes the multihash over the bytes
-//! a gateway returns, so a hostile or compromised gateway can serve any document for any CID and
-//! this module will vendor it. The CID buys a stable name to ask for, not proof of what came
-//! back. Verifying it is worth doing and is not done yet — say so rather than let the phrase
-//! "pinned by CID" imply a guarantee the code does not provide.
+//! Content-addressed **and now verified** (RFC-0037 slice 1, #642's sibling): every body is hashed
+//! back to its CID by [`crate::cid`] before it is believed. This was written after a real gateway
+//! answered HTTP 200 with the prose "Unable to retrieve content within timeout period" - and a
+//! second answered with a different error string - for a CID that a third served correctly. Both
+//! would have been vendored as the nest's manifest, because the only check was that the body was
+//! non-empty.
+//!
+//! The one gap left is stated where it happens rather than hidden: a file over the 256 KiB default
+//! chunk size is multi-block, its root holds links rather than data, and re-encoding cannot
+//! reproduce it. Those are accepted with a loud UNVERIFIED warning, never silently.
 //!
 //! What the manifest **cannot** tell us is which template a factory creates:
 //! that lives in the mapping WASM, as a `Template.create(address)` call. So
@@ -226,6 +231,9 @@ pub fn candidate_urls(source: &str, gateways: &[String], origin: Origin) -> Resu
 /// out of them is, and then we say which ones we tried.
 pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Result<String> {
     let urls = candidate_urls(source, gateways, origin)?;
+    // The CID the document must hash to. `None` only for an operator-supplied URL, which addresses a
+    // location rather than a content, and therefore commits to nothing we can check.
+    let expect = cid_of(source).and_then(|c| crate::cid::Cid::parse(&c).ok());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -233,13 +241,47 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Re
 
     let mut failures = Vec::new();
     for url in &urls {
-        match client.get(url).send().await {
+        let body = match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match read_capped(resp).await {
-                Ok(body) if !body.trim().is_empty() => return Ok(body),
-                Ok(_) => failures.push(format!("{url}: empty body")),
-                Err(e) => failures.push(format!("{url}: {e}")),
+                Ok(body) if !body.trim().is_empty() => body,
+                Ok(_) => {
+                    failures.push(format!("{url}: empty body"));
+                    continue;
+                }
+                Err(e) => {
+                    failures.push(format!("{url}: {e}"));
+                    continue;
+                }
             },
-            Ok(resp) => failures.push(format!("{url}: HTTP {}", resp.status())),
+            Ok(resp) => {
+                failures.push(format!("{url}: HTTP {}", resp.status()));
+                continue;
+            }
+            Err(e) => {
+                failures.push(format!("{url}: {e}"));
+                continue;
+            }
+        };
+
+        // RFC-0037 slice 1. Until this existed, a gateway answering HTTP 200 with *anything* was
+        // believed - and gateways really do answer 200 with prose like "Unable to retrieve content
+        // within timeout period", which would have been vendored into the nest as its manifest.
+        let Some(cid) = expect.as_ref() else {
+            return Ok(body);
+        };
+        match crate::cid::verify(cid, body.as_bytes()) {
+            Ok(()) => return Ok(body),
+            Err(e) if body.len() > 256 * 1024 => {
+                // Over the default chunk size, so re-encoding cannot reproduce a multi-block root.
+                // Unverifiable is not tampered, and refusing a legitimately large ABI would be worse
+                // than saying so - but it is said loudly, once, naming the document.
+                tracing::warn!(
+                    "{source}: {} bytes could not be verified against its CID ({e}). Accepting \
+                     UNVERIFIED - the content is too large for single-block re-encoding.",
+                    body.len()
+                );
+                return Ok(body);
+            }
             Err(e) => failures.push(format!("{url}: {e}")),
         }
     }
@@ -247,6 +289,20 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Re
         "could not fetch '{source}' from any gateway:\n  {}",
         failures.join("\n  ")
     ))
+}
+
+/// The CID a source names, if it names one. An `http(s)` URL does not.
+fn cid_of(source: &str) -> Option<String> {
+    let s = source.trim();
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return None;
+    }
+    let cid = s
+        .strip_prefix("ipfs://")
+        .or_else(|| s.strip_prefix("/ipfs/"))
+        .unwrap_or(s)
+        .trim_matches('/');
+    is_cid_shaped(cid).then(|| cid.to_string())
 }
 
 /// The most we will hold in memory for one manifest or ABI.

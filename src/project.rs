@@ -1982,14 +1982,20 @@ dataSources:
 
     #[tokio::test]
     async fn from_subgraph_recommendation_is_followable_end_to_end() {
-        let (gateway, _gw) = fake_gateway(vec![
-            ("/manifest.yaml", BSC_MANIFEST),
-            (
-                "/ipfslike/Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s",
-                POOL_ABI,
-            ),
-        ])
-        .await;
+        // The CID is *derived from the content*, not invented. Before RFC-0037 slice 1 nothing
+        // checked the two matched, so this fixture named a CID its body did not hash to - and the
+        // test passed. It does not any more, which is the verification working.
+        let pool_cid = crate::cid::cid_v0_for(POOL_ABI.as_bytes());
+        // Leaked deliberately: `fake_gateway` wants `'static` paths and this is a test that ends.
+        let pool_path: &'static str = Box::leak(format!("/ipfslike/{pool_cid}").into_boxed_str());
+        // The manifest names the ABI by CID, so it has to name the *real* one too.
+        let manifest: &'static str = Box::leak(
+            BSC_MANIFEST
+                .replace("Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s", &pool_cid)
+                .into_boxed_str(),
+        );
+        let (gateway, _gw) =
+            fake_gateway(vec![("/manifest.yaml", manifest), (pool_path, POOL_ABI)]).await;
         let (rpc_url, _rpc) = fake_chain_id_rpc(56).await;
 
         let dir = tempfile::tempdir().unwrap();
