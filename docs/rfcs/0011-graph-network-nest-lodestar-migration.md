@@ -81,6 +81,36 @@ expect that.
 blocks, and any nest that mixes that with indexed log block numbers will be quietly wrong rather than
 loudly broken. This one was caught only because the network subgraph disagreed.
 
+## Slice four: `rav` (2026-08-19)
+
+`PaymentsEscrow` at `0xf6Fcc27a...`, narrowed to the five money movements. Every field of Lodestar's
+`PaymentsTx` maps across; `allocationId` is NULL throughout and that is correct rather than missing,
+because escrow moves are payer/receiver level, no escrow event carries an allocation, and Lodestar's
+own interface already types it nullable.
+
+`id` is `tx_hash-log_index` rather than a counter, so it is reproducible by anyone re-indexing the
+same range. The subgraph uses the same idea: its ids are the tx hash with the log index appended.
+
+### The comparison, including the part that does not match
+
+| Type | nuthatch | network subgraph |
+|---|---:|---:|
+| Deposit | 6,645 | 6,645 |
+| EscrowCollected / `redeem` | **66,281** | **66,272** |
+| Thaw | 1 | not modelled |
+| CancelThaw | 1 | not modelled |
+
+**Deposits are exact. Collections differ by 9 out of 66,281 - 0.014% - and the cause is not
+established.** Ruled out: indexing lag (the subgraph's head was *ahead* of our last indexed block, and
+bounding ours to their head changed nothing); a `paymentType` filter (all 66,281 are type 0); and an
+id collision in the subgraph (its ids carry the log index, so they are unique per event).
+
+Recorded rather than explained, because the remaining hypotheses - the subgraph dropping events it
+cannot attribute, or the comparison's own pagination crossing a page boundary badly - are guesses, and
+0.014% did not justify more chasing today. **It should be settled before this view backs a money
+figure anyone acts on.** A nine-row gap in a table of escrow collections is exactly the sort of thing
+that turns out to matter later.
+
 ## Field map: `ingest-allocations`, the first route (2026-08-19)
 
 The status update below says the six `cron/ingest-*` routes are the highest-leverage slice, because
