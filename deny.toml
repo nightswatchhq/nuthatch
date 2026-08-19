@@ -38,6 +38,20 @@ ignore = [
   # **dbsp still requires `rkyv ^0.7.45` as of 0.327.0** (checked 2026-08-04), so even the newest dbsp
   # does not clear it. Tracked upstream; re-check on the next dbsp bump, same as the quick-xml pair.
   "RUSTSEC-2026-0235", # rkyv: shared-pointer validation ignored pointer metadata
+  #
+  # h2 0.3.27 (transitive: dbsp → feldera-types → actix-web → actix-http). The 0.4 line was the real
+  # exposure and is **fixed, not ignored**: h2 0.4.15 → 0.4.16 in the same commit clears every path
+  # under axum/hyper/reqwest, which is what nuthatch actually serves and calls over. This entry covers
+  # only the 0.3 copy, and reachability is the question:
+  #   - nuthatch never uses actix (`grep -rn actix src/ decode/` is empty); we serve over **axum 0.8**
+  #     on hyper 1.x. actix-web arrives solely because `feldera-types` depends on it, and its h2 0.3
+  #     *server* is the vulnerable path.
+  #   - The advisory is unbounded empty DATA frames against an HTTP/2 **server**. No actix listener is
+  #     ever constructed in this binary, so no such server accepts a connection.
+  # Not fixable by upgrading: 0.3.27 is the head of the 0.3 line and no patched 0.3 release exists
+  # (checked 2026-08-19); the fix shipped in 0.4.16 only. Clearing it needs actix-web to move to h2 0.4
+  # or dbsp to drop actix-web. Re-check on the next dbsp bump, same as the quick-xml and rkyv entries.
+  "RUSTSEC-2026-0258", # h2 (0.3 line only): unbounded empty DATA frames against an HTTP/2 server
 ]
 
 [licenses]
