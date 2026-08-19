@@ -62,7 +62,7 @@ invalidate.
 
 ## Implementation
 
-- `src/registry.rs`: `TableSchema::is_transfer_shaped()` - the schema-level mirror of
+- `decode/src/registry.rs`: `TableSchema::is_transfer_shaped()` - the schema-level mirror of
   `EventDecoder::transfer_columns()`.
 - `src/serve.rs`: `GET /shape`, derived from `AppState` (`tables`, `threshold`, `velocity_threshold`,
   and the `labels/`/`lists/` dirs under the nest dir).

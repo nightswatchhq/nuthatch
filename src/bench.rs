@@ -200,7 +200,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     }
     let dir = PathBuf::from(&args.dir);
     let config = Config::load(&dir)?;
-    let registry = Arc::new(DecodeRegistry::from_nest(&dir, &config)?);
+    let registry = Arc::new(crate::registry::from_nest(&dir, &config)?);
 
     // **A factory nest must be measured through the factory path** (RFC-0009 §3). The static
     // `addresses` filter below is fixed at start-up, so a factory nest measured through the plain
@@ -576,7 +576,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
                 .map(|(t, _)| t.clone())
             {
                 Some(t) => t,
-                None => DecodeRegistry::from_nest(&dir, &config)?
+                None => crate::registry::from_nest(&dir, &config)?
                     .tables()
                     .first()
                     .map(|d| d.table.clone())
