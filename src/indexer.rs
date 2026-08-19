@@ -3767,8 +3767,14 @@ impl NestIngest {
                     let crate::registry::Value::Str(cid) = cid else {
                         continue;
                     };
-                    let cid = cid.trim().trim_start_matches("ipfs://").trim_matches('/');
-                    if cid.is_empty() || !seen.insert(cid.to_string()) {
+                    // The column may hold a bare CID, an `ipfs://` URI, or a full gateway URL - a
+                    // real subgraph port turned up all three. Only the content address is kept: the
+                    // string comes from a log, so fetching the host it names would let whoever
+                    // emitted the event choose what this process connects to.
+                    let Some(cid) = crate::ipfs::cid_from_any(cid) else {
+                        continue;
+                    };
+                    if !seen.insert(cid.to_string()) {
                         continue;
                     }
                     per_block

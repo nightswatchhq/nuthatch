@@ -82,6 +82,51 @@ impl IpfsDecl {
     }
 }
 
+/// The CID inside whatever a column happens to hold.
+///
+/// **Found by porting a real subgraph.** DOUDOCHAIN_V2's `seriesMetaDataURI` does not hold a bare CID
+/// - it holds `https://gateway.pinata.cloud/ipfs/QmR7XF…` and
+/// `https://lime-basic-thrush-351.mypinata.cloud/ipfs/QmWyCg…`. A resolver that only understood bare
+/// CIDs resolved nothing at all, which is what the first run of that port showed.
+///
+/// **The location is discarded and only the content address is kept**, and that is a security
+/// property rather than tidiness. The string comes from a log, so anybody who can emit an event can
+/// choose it - fetching the URL it names would let a stranger point this process at any host they
+/// like. Instead the CID is pulled out and asked for through *our* configured gateways, which is also
+/// the honest reading of content addressing: the CID says what the document is, the host merely says
+/// where somebody once kept a copy.
+pub fn cid_from_any(s: &str) -> Option<&str> {
+    let s = s.trim();
+    // `https://<cid>.ipfs.<host>/…` - the subdomain gateway form.
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        if let Some((sub, _)) = rest.split_once(".ipfs.") {
+            return looks_like_cid(sub).then_some(sub);
+        }
+    }
+    // Any `…/ipfs/<cid>…` - the path gateway form, and also a bare `/ipfs/<cid>`.
+    if let Some((_, after)) = s.rsplit_once("/ipfs/") {
+        let cid = after.split(['/', '?', '#']).next().unwrap_or_default();
+        return looks_like_cid(cid).then_some(cid);
+    }
+    // Kubo's API form, `…/api/v0/cat?arg=<cid>`.
+    if let Some((_, after)) = s.rsplit_once("arg=") {
+        let cid = after.split(['&', '#']).next().unwrap_or_default();
+        return looks_like_cid(cid).then_some(cid);
+    }
+    let bare = s.strip_prefix("ipfs://").unwrap_or(s).trim_matches('/');
+    looks_like_cid(bare).then_some(bare)
+}
+
+/// Cheap shape check. [`crate::cid::Cid::parse`] is the real one; this only decides whether a string
+/// is worth handing to it.
+fn looks_like_cid(s: &str) -> bool {
+    (s.starts_with("Qm") && s.len() == 46 && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        || (s.starts_with('b') && s.len() >= 50 && s.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 /// The table shape a declaration produces, in the form `/tables`, MCP and `schema.json` consume.
 pub fn schema(decls: &[IpfsDecl], timestamps: bool) -> Vec<crate::registry::TableSchema> {
     use crate::registry::{ColumnSchema, TableKind, TableSchema};
@@ -172,4 +217,68 @@ pub fn decl_hash(decls: &[IpfsDecl]) -> [u8; 32] {
         h.update(b"\x1e");
     }
     h.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The URL shapes a real subgraph actually put on chain, plus the ones a gateway list uses.
+    ///
+    /// The first two are verbatim from DOUDOCHAIN_V2's `seriesMetaDataURI` column - the values that
+    /// made the first run of that port resolve nothing.
+    #[test]
+    fn a_cid_is_found_inside_every_shape_a_uri_column_holds() {
+        const CID: &str = "QmR7XFYe7q9XLCFG3tzWFTHSc9iAnfS1Ra1pgSvJDhDERu";
+        for s in [
+            CID,
+            &format!("ipfs://{CID}"),
+            &format!("/ipfs/{CID}"),
+            &format!("https://gateway.pinata.cloud/ipfs/{CID}"),
+            &format!("https://lime-basic-thrush-351.mypinata.cloud/ipfs/{CID}"),
+            &format!("https://ipfs.io/ipfs/{CID}?filename=x.json"),
+            &format!("https://ipfs.thegraph.com/api/v0/cat?arg={CID}"),
+            &format!("https://{CID}.ipfs.dweb.link/"),
+        ] {
+            assert_eq!(cid_from_any(s), Some(CID), "failed on {s}");
+        }
+    }
+
+    /// A string that names no CID must yield none - the resolver then writes no row, rather than
+    /// fetching whatever host a log author chose.
+    #[test]
+    fn a_uri_with_no_cid_in_it_resolves_to_nothing() {
+        for s in [
+            "",
+            "not a uri",
+            "https://example.com/metadata.json",
+            "https://example.com/ipfs/not-a-cid",
+            "ipfs://",
+        ] {
+            assert_eq!(cid_from_any(s), None, "must not accept {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_names_its_table_its_source_and_its_column() {
+        let d = IpfsDecl {
+            name: "meta".into(),
+            on: "nft__uri_set".into(),
+            cid_column: "{uri}".into(),
+        };
+        assert!(d.validate().is_ok());
+        assert_eq!(
+            d.column(),
+            "uri",
+            "braces are optional on a column reference"
+        );
+
+        let mut bad = d.clone();
+        bad.on = String::new();
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs `on`"));
+    }
 }
