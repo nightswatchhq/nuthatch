@@ -32,16 +32,42 @@ dead and a list of the underserved.
 
 Everything else here is plumbing in service of that one predicate.
 
-## 3. Three sources, one join
+## 3. Two contracts, one new nest
 
-| Source | Gives | Status |
+| Source | Gives | Deployed at (Arbitrum One) |
 |---|---|---|
-| `L2GNS` `SubgraphPublished` | the deployment universe | **already indexed** - `graph-gns-nest`, live in production |
-| `SubgraphService` allocation events | who is serving what, now | **new contract, verified** - `0xb2Bb92d0DE618878E438b55D5846cfecD9301105` |
-| `L2Curation` `Signalled` / `Burned` | who paid to have it served | **new contract, verified** - `0x22d78fb4bc72e191C765807f8891B5e1785C8014` |
+| `SubgraphService` `AllocationCreated` / `AllocationClosed` / `AllocationResized` | who is serving what, now | **397,492,865** - 2025-11-06 19:00 UTC |
+| `L2Curation` `Signalled` / `Burned` / `Collected` | who paid to have it served | **42,449,403** - 2022-11-30 13:39 UTC |
 
-One SQL join across those three answers the question. No UI, no scoring service, no automation, no
-scheduled report. The deliverable is a query and a ranked list.
+`SubgraphService` is `0xb2Bb92d0DE618878E438b55D5846cfecD9301105`; `L2Curation` is
+`0x22d78fb4bc72e191C765807f8891B5e1785C8014`. Both blocks found by binary search on `eth_getCode`
+against an archive RPC (the public endpoint refuses historical state and fails identically for both
+addresses, which is the endpoint declining rather than the contract being absent). `L2Curation`'s block
+lands 182 blocks from `graph-staking-nest`'s pinned `42449585`, same day, which corroborates that
+number as the L2 deployment era rather than someone's guess.
+
+**`L2Curation` is the expensive half.** Signal is cumulative, so current signal on a deployment needs
+every `Signalled` and `Burned` since 2022. `SubgraphService` is ten months old by comparison.
+
+### Correction: `L2GNS` is not needed
+
+An earlier version of this section listed three sources including `L2GNS`. It buys nothing here.
+Allocations and signal both key on `subgraphDeploymentID`, so **"signal with no open allocation" is
+answerable from two contracts**. `L2GNS` adds only human-readable identity, and the display names
+actually live in IPFS-pinned JSON (RFC-0037), which nuthatch cannot resolve yet - so it would deliver a
+deployment ID we already hold.
+
+### Why a *new* nest, rather than extending one that exists
+
+1. **Queries are per-nest scoped.** RFC-0012: a query sees one nest's segments, and cross-nest
+   federated queries are scaled-mode. Lodestar's `nuthatch.ts` already shows the consequence - a
+   `basePath` argument picking between `/sql` and `/gns/sql`, because those are two surfaces. **The
+   join must live inside one nest** or it is not a join, it is client-side stitching.
+2. **Editing a nest changes its NID.** A nest's data is keyed by its content address, so any edit
+   yields a different nest and a full re-index. `graph-staking-nest` is serving Lodestar's delegation
+   feed in production; re-indexing it to bolt on an unrelated query is a poor trade.
+3. **It is nearly free.** Same chain, so it rides the `arbitrum-one` cursor already running rather than
+   opening a second one.
 
 ### Why this is not "port the network subgraph"
 
@@ -105,6 +131,36 @@ Deployment blocks must be pinned before backfilling. `graph-staking-nest` pins `
 42449585`, which is the Horizon deployment and is the obvious candidate to verify against, since these
 contracts went live in the same event (GIP-0066, Arbitrum mainnet, 2 December 2025).
 
+## 5a. The staged upgrade, and what it does to decoding
+
+`graphprotocol/contracts` shows a `pendingImplementation` on every Horizon contract, all deployed
+within a minute of each other on **2026-07-23**: `SubgraphService`, `DisputeManager`, `HorizonStaking`,
+`L2Curation`, `PaymentsEscrow`, `RewardsManager`, plus a new `RecurringCollector`. A coordinated
+upgrade, staged and awaiting execution. Diffed the event signatures rather than assuming:
+
+**`L2Curation`: no change at all.** 7 events before, 7 after, every signature identical. Signal history
+is safe across the upgrade.
+
+**`SubgraphService`: signatures do change** - but **not the three this nest depends on**.
+`AllocationCreated`, `AllocationClosed` and `AllocationResized` all survive untouched. What moves:
+
+| Change | Event |
+|---|---|
+| **Removed** | `LegacyAllocationMigrated(address,address,bytes32)` |
+| **Removed** | `StakeClaimLocked(...)`, `StakeClaimReleased(...)` |
+| **Arity changed** (so topic0 changes) | `GraphDirectoryInitialized` 10 → 9 args; `SubgraphServiceDirectoryInitialized` 4 → 5 |
+| **Added** | `POIPresented`, `IndexingFeesCutSet`, `BlockClosingAllocationWithActiveAgreementSet` |
+
+The consequence is an ABI-versioning one, and CLAUDE.md already has the rule: *never retroactively
+re-decode stored history when ABIs improve; version decodings.* **Vendor the current ABI**, because it
+is what decodes the history; a nest built on the pending ABI would silently fail to match historical
+`LegacyAllocationMigrated` logs. `POIPresented` is worth wanting *after* the upgrade lands.
+
+**Open risk: `HorizonStaking`'s pending implementation is not verified on Sourcify**
+(`0xd3ba4a3b…`), so its ABI cannot be fetched and its events cannot be diffed. That is the contract
+`graph-staking-nest` indexes for Lodestar's live delegation feed, so it is the one place where an
+undiffable upgrade meets a production panel. Re-check before the upgrade executes.
+
 ## 6. What this cannot do
 
 An earlier claim in [community.md](community.md) said the network subgraph shows which deployments have
@@ -120,8 +176,9 @@ answerable this way either. Signal is the available proxy for demand, and it is 
 
 ## 7. Build order
 
-1. ~~**Confirm `SubgraphService`**~~ - **done 2026-08-19** (§5). Remaining prerequisite: **pin the
-   deployment blocks**, since a tip offset cannot answer "did this allocation ever close".
+1. ~~**Confirm `SubgraphService`**~~ and ~~**pin the deployment blocks**~~ - **both done 2026-08-19**
+   (§3, §5). Remaining prerequisite: **re-check `HorizonStaking`'s pending ABI** when it verifies
+   (§5a), because that one touches production.
 2. **Add the two contracts.** `SubgraphService` allocations and `L2Curation` signal, on `arbitrum-one`,
    alongside the nests already running.
 3. **Write the join.** Signal, no open allocation, ranked by signalled tokens.
