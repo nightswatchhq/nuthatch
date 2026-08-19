@@ -216,6 +216,108 @@ pub async fn resolve_at(
         .collect())
 }
 
+/// The table shape a `[[calls]]` declaration produces, in the same form `/tables`, MCP, `llms.txt`
+/// and `schema.json` already consume.
+///
+/// One table per declaration, named by `CallDecl::name`. The implicit `address` column carries the
+/// **contract called**, so the content address needs its own name (`content_address`) rather than
+/// colliding with it.
+pub fn schema(decls: &[CallDecl], timestamps: bool) -> Vec<crate::registry::TableSchema> {
+    use crate::registry::{ColumnSchema, TableKind, TableSchema};
+    decls
+        .iter()
+        .map(|d| {
+            let mut columns = crate::registry::implicit_columns(timestamps);
+            let own = |name: &str, sol: &str, storage: &str| ColumnSchema {
+                name: name.to_string(),
+                sol_type: sol.to_string(),
+                storage: storage.to_string(),
+                indexed: false,
+            };
+            columns.push(own("calldata", "bytes", "bytes"));
+            columns.push(own("result", "bytes", "bytes"));
+            // `Value` has no null, so an empty `result` would be indistinguishable from a call that
+            // genuinely returned no bytes. A revert is a fact about chain state - a getter often does
+            // not exist before the contract is initialised - and it deserves a column rather than an
+            // ambiguity.
+            columns.push(own("reverted", "bool", "bool"));
+            // `hash32`, not `fixed_bytes`: `Value::Word32` renders a 32-byte value as a *decimal
+            // integer*, which turned a content address into a 78-digit number. It is a hash and has
+            // to read as one.
+            columns.push(own("content_address", "bytes32", "hash32"));
+            TableSchema {
+                table: d.name.clone(),
+                alias: d.name.clone(),
+                kind: TableKind::Call,
+                event: String::new(),
+                topic0: String::new(),
+                function: String::new(),
+                selector: format!(
+                    "0x{}",
+                    &d.calldata.trim_start_matches("0x")
+                        [..8.min(d.calldata.trim_start_matches("0x").len())]
+                ),
+                columns,
+            }
+        })
+        .collect()
+}
+
+impl CallResult {
+    /// Turn a resolved call into a stored row, so it flows through the same store, seal and query
+    /// path every other table uses.
+    ///
+    /// `decl_index` is the declaration's position in the config, which fixes the row's `log_index`
+    /// inside the reserved band and therefore its key. Two operators running the same nest produce
+    /// the same keys, not merely the same content addresses.
+    ///
+    /// There is no transaction behind a pinned read, so `tx_hash` is empty rather than borrowing the
+    /// block hash - a block hash sitting in a `tx_hash` column is a lie that reads like data.
+    pub fn to_row(
+        &self,
+        table: &str,
+        decl_index: usize,
+        block_hash: &str,
+        block_timestamp: u64,
+        timestamps: bool,
+    ) -> crate::registry::DecodedRow {
+        use crate::registry::Value;
+        let bytes =
+            |h: &str| Value::Bytes(hex::decode(h.trim_start_matches("0x")).unwrap_or_default());
+        let mut addr = [0u8; 20];
+        if let Ok(b) = hex::decode(self.contract.trim_start_matches("0x")) {
+            if b.len() == 20 {
+                addr.copy_from_slice(&b);
+            }
+        }
+        let mut content = [0u8; 32];
+        if let Ok(b) = hex::decode(&self.address) {
+            if b.len() == 32 {
+                content.copy_from_slice(&b);
+            }
+        }
+        crate::registry::DecodedRow {
+            table: table.to_string(),
+            params: vec![
+                ("calldata".to_string(), bytes(&self.calldata)),
+                (
+                    "result".to_string(),
+                    bytes(self.result.as_deref().unwrap_or("0x")),
+                ),
+                ("reverted".to_string(), Value::Bool(self.result.is_none())),
+                ("content_address".to_string(), Value::Hash32(content)),
+            ],
+            block_number: self.block,
+            block_hash: block_hash.to_string(),
+            block_timestamp,
+            timestamps,
+            log_index: crate::registry::CALL_ROW_LOG_INDEX_BASE + decl_index as u64,
+            tx_hash: String::new(),
+            address: format!("0x{}", hex::encode(addr)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +455,118 @@ mod tests {
         assert!(
             j.contains("\"result\":null"),
             "a revert must serialise as null: {j}"
+        );
+    }
+
+    fn result_for(name: &str, block: u64, result: Option<&str>) -> CallResult {
+        let d = decl(name, 100);
+        let key = CallKey::new(1, block, &d.contract, &d.calldata);
+        CallResult {
+            block,
+            contract: key.contract.clone(),
+            calldata: key.calldata.clone(),
+            result: result.map(str::to_string),
+            address: key.address(),
+        }
+    }
+
+    /// A revert must stay distinguishable from a call that genuinely returned no bytes.
+    ///
+    /// `Value` has no null, so both would serialise as empty `result` bytes. Losing that distinction
+    /// would report "this getter does not exist yet" and "this function returns nothing" as the same
+    /// fact, which is exactly the silent-wrong-answer shape this project cares most about.
+    #[test]
+    fn a_revert_is_not_an_empty_return() {
+        let reverted = result_for("t", 100, None).to_row("t", 0, "0xbh", 7, true);
+        let empty = result_for("t", 100, Some("0x")).to_row("t", 0, "0xbh", 7, true);
+
+        let flag = |r: &crate::registry::DecodedRow| {
+            r.params
+                .iter()
+                .find(|(k, _)| k == "reverted")
+                .map(|(_, v)| v.to_json().to_string())
+                .unwrap()
+        };
+        assert_ne!(
+            flag(&reverted),
+            flag(&empty),
+            "a revert and an empty return must not read identically"
+        );
+        assert_eq!(flag(&reverted), "true");
+        assert_eq!(flag(&empty), "false");
+    }
+
+    /// Two declarations resolved at one block must not land on the same key.
+    ///
+    /// This is #642's lesson applied before the fact: rows that descend from no log share a key space
+    /// with those that do, and several call results can occur in a single block.
+    #[test]
+    fn two_declarations_at_one_block_get_distinct_keys() {
+        let a = result_for("a", 500, Some("0x01")).to_row("a", 0, "0xbh", 7, true);
+        let b = result_for("b", 500, Some("0x02")).to_row("b", 1, "0xbh", 7, true);
+        assert_ne!(
+            crate::store::Store::entity_key(a.block_number, a.log_index),
+            crate::store::Store::entity_key(b.block_number, b.log_index),
+            "one declaration must not overwrite another at the same block"
+        );
+        // And both sit inside the reserved band, clear of any real log.
+        for r in [&a, &b] {
+            assert!(
+                r.log_index >= crate::registry::CALL_ROW_LOG_INDEX_BASE
+                    && r.log_index < crate::registry::BLOCK_ROW_LOG_INDEX,
+                "call rows belong in the reserved band, below the block row: {}",
+                r.log_index
+            );
+        }
+    }
+
+    /// The stored row carries the content address, so a row can be re-verified without recomputing
+    /// the key from context that may no longer exist.
+    #[test]
+    fn the_row_carries_its_content_address_and_the_contract_it_called() {
+        let res = result_for("t", 900, Some("0xdeadbeef"));
+        let row = res.to_row("t", 0, "0xbh", 7, true);
+        let col = |n: &str| {
+            row.params
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.to_json().to_string())
+                .unwrap()
+        };
+        assert!(
+            col("content_address").contains(&res.address),
+            "content_address must be CallKey::address(): {}",
+            col("content_address")
+        );
+        assert_eq!(
+            row.address, res.contract,
+            "the implicit `address` column is the contract that was called"
+        );
+        assert!(
+            row.tx_hash.is_empty(),
+            "a pinned read has no transaction - borrowing the block hash would be a lie"
+        );
+    }
+
+    /// The declared table is advertised in the same shape everything else consumes.
+    #[test]
+    fn a_declaration_produces_a_queryable_table_schema() {
+        let s = schema(&[decl("oracle__answer", 100)], true);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].table, "oracle__answer");
+        let names: Vec<&str> = s[0].columns.iter().map(|c| c.name.as_str()).collect();
+        for want in [
+            "block_number",
+            "calldata",
+            "result",
+            "reverted",
+            "content_address",
+        ] {
+            assert!(names.contains(&want), "missing column {want}: {names:?}");
+        }
+        assert!(
+            !names.contains(&"contract"),
+            "the contract is the implicit `address` column; a second one would be redundant"
         );
     }
 

@@ -217,6 +217,15 @@ pub const BLOCKS_TABLE: &str = "blocks";
 /// they sort after the logs they summarise; RFC-0023 tier-3 call results will take the rest.
 pub const BLOCK_ROW_LOG_INDEX: u64 = 999_999;
 
+/// The base `log_index` for **pinned call results** (RFC-0023 tier 3), inside the same reserved band
+/// as [`BLOCK_ROW_LOG_INDEX`].
+///
+/// A call result descends from no log either, and unlike a block row there may be several in one
+/// block - one per declaration. They are laid out from this base in declaration order, which is fixed
+/// by the config, so two operators running the same nest produce the same keys as well as the same
+/// content addresses.
+pub const CALL_ROW_LOG_INDEX_BASE: u64 = 999_000;
+
 /// A serializable table schema (per-event table + its columns).
 ///
 /// `event`/`topic0` and `function`/`selector` are the same idea for different [`TableKind`]s, and
