@@ -7104,6 +7104,137 @@ template = "pool"
         }
     }
 
+    /// A nest with **both** a contract and `[extract] blocks = true`, through the real `build_nest`.
+    /// Nothing in `config.rs` refuses this combination, so it is a shape an operator can write.
+    async fn build_blocks_and_contract_nest(dir: &std::path::Path) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"bc\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [extract]\nblocks = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) =
+            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                .await
+                .expect("a nest with a contract and [extract] blocks must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
+    /// RFC-0038 slice 0: **does a block row collide with a log at index 0 in the same block?**
+    ///
+    /// `Store::entity_key` is `(block, log_index)` and assumes every row descends from a log. Block
+    /// rows (RFC-0036) do not: they are written with `log_index: 0`. Nothing refuses a nest that sets
+    /// `[extract] blocks` *and* indexes a contract, and `to_store` is a plain `Vec<(String, String)>`
+    /// committed as written into redb, where a repeated key is an overwrite.
+    ///
+    /// This settles it before RFC-0038 adds a **third** kind of row that descends from no log at all
+    /// (call results). Driven through the real `process_window` - the hot-store path - because the
+    /// seal-direct path buffers by block into append-only Parquet and cannot collide, so testing that
+    /// one proves nothing about this one.
+    ///
+    /// Blocks 1-3, one Ping at block 2 log_index 0: **four rows are owed**.
+    #[tokio::test]
+    async fn a_block_row_and_a_log_at_index_zero_both_survive() {
+        struct HeadersAndOneLog;
+        #[async_trait::async_trait]
+        impl Source for HeadersAndOneLog {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_headers(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                Ok(blocks
+                    .iter()
+                    .map(|&b| {
+                        (
+                            b,
+                            serde_json::json!({
+                                "hash": format!("0x{b:064x}"),
+                                "parentHash": format!("0x{:064x}", b.saturating_sub(1)),
+                                "miner": "0x0000000000000000000000000000000000000000",
+                                "gasUsed": "0x0",
+                                "gasLimit": "0x1388",
+                                "size": "0x220",
+                                "timestamp": format!("0x{:x}", 1_700_000_000 + b),
+                                "transactions": [],
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest = build_blocks_and_contract_nest(dir.path()).await;
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "tok__ping")
+                    .expect("fixture must expose tok__ping")
+                    .topic0
+            )
+        );
+        let src = HeadersAndOneLog;
+        let logs = vec![crate::rpc::Log {
+            address: "0x1111111111111111111111111111111111111111".into(),
+            topics: vec![topic0],
+            data: "0x".into(),
+            block_number: 2,
+            block_hash: format!("0x{:064x}", 2),
+            tx_hash: "0xdeadbeef".into(),
+            log_index: 0,
+        }];
+
+        nest.process_window(&src, &logs, 1, 3, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+
+        // Drop the nest first: redb takes its exclusive flock at `Database::open`, so a second
+        // handle is refused while this one is alive.
+        drop(nest);
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "blocks 1-3 owe three block rows plus one Ping at block 2 log_index 0, but the store \
+             holds {}: {keys:?}. A block row and a log row shared the `(block, log_index)` key and \
+             one overwrote the other.",
+            keys.len()
+        );
+    }
+
     /// #429: a nest with **no contract at all** must not issue a single `getLogs`, on **any** backfill
     /// path.
     ///
