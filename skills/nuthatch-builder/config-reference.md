@@ -63,6 +63,50 @@ secret = "…"                  # optional HMAC signing secret
 [[alerts]]                    # optional (RFC-0008 C5)
 kinds = ["threshold_flag", "sanction_hit"]   # the only two valid kinds (match the emitted annotations)
 url = "https://…"
+
+[[calls]]                     # optional (RFC-0023 tier 3) - a pinned `eth_call`, stored as a table.
+                              # Needs `--state-rpc <archive endpoint>`; the endpoint is NEVER a config
+                              # key, because it usually carries an API key and this file is pinned
+                              # into the nest's content address.
+                              #
+                              # TWO FORMS, and exactly one applies.
+                              #
+                              # 1. SAMPLED - one fixed calldata, every N blocks. For an oracle read or
+                              #    an ungoverned parameter.
+name = "eth_usd"              # becomes the result table
+contract = "0x5f4eC3Df…"      # the contract to call
+calldata = "0xfeaf968c"       # hex, selector included; fixed arguments only
+every = 1000                  # sample every N blocks (default 1000). Anchored on absolute block
+                              # numbers, so a resumed backfill samples the same blocks.
+start = 12369621              # optional: first block to sample from
+
+[[calls]]                     # 2. ROW-DRIVEN (RFC-0038 §3) - one call per row of a table, with the
+                              #    row's own values as arguments. This is what a subgraph mapping does
+                              #    (`c.balanceOf(event.params.to)`), and it fires at the row's block.
+name = "recipient_balance"
+on = "usdc__transfer"         # the source table; mutually exclusive with `every`
+contract = "0xa0b86991…"      # a fixed address, OR:
+contract_column = "{pool}"    #   a column of `on` holding one (a factory's new child)
+signature = "balanceOf(address)"   # the ABI signature; calldata is encoded from it
+args = ["{to}"]               # `{column}` takes the row's value; anything else is a literal.
+                              # An *indexed* dynamic param (string/bytes) is REFUSED: the log holds
+                              # keccak(value), not the value, so it cannot be passed on.
+
+[[ipfs]]                      # optional (RFC-0037) - resolve the documents a column's CIDs name.
+                              # Needs `--ipfs <gateway-or-your-own-node>`; also never a config key,
+                              # because a gateway is an access path and must not enter the content
+                              # address. Every document is verified against its CID before storage;
+                              # one that will not resolve leaves NO row rather than a wrong one.
+name = "token_metadata"       # becomes the result table
+on = "nft__uri_set"           # the table whose rows carry the CID
+cid_column = "uri"            # which column. A bare CID, `ipfs://…`, or a full gateway URL all work -
+                              # only the content address is kept, never the host.
+
+[extract]                     # optional
+top_level_calls = true        # decode transactions sent directly to this nest's contracts - what a
+                              # subgraph's `callHandlers` fire on (RFC-0038 §5). Ordinary RPC; no node
+                              # needed. `traces` (internal calls) and `state` still are, and are
+                              # refused at startup until one exists.
 ```
 
 ## `semantic.toml` - what the data *means* (RFC-0016)
