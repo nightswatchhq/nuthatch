@@ -1,6 +1,16 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). **All five slices built** (see §6). The claim in the title is met, with one stated limit (§6 slice 3). Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** **Accepted, all five slices built** (2026-08-19), and **measured against the live network**
+rather than only against fixtures - see §6b (343 Uniswap V3 swaps row-for-row identical to the gateway)
+and §6c (219 pools discovered, 219 parameterised `eth_call`s each, no misses).
+
+**What the title claims is narrower than it reads, and §6a says why.** Every *input* a subgraph indexes,
+a nest can index. Every entity that is a pure function of those inputs is reproducible exactly.
+Uniswap's `derivedETH` reads back its own prior output, so it is reproducible only as a fixed point -
+a defensible number, and a different one. **By how much is still unmeasured.**
+
+**Known gaps, none of them closed by this RFC:** internal calls (node-gated, RFC-0003), time-travel
+queries, and `@fulltext`. Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
@@ -229,6 +239,177 @@ deleted - it was asserting somebody else's guard. Unscoped, the nest's own addre
 bound, and that is the one that matters: `scope_check` guards `traces`/`state` and returns early for a
 top-level-calls nest, so without the filter an unscoped nest would decode every transaction on the
 chain.
+
+## 6a. The finding that bounds the claim: Uniswap's entity model is path-dependent
+
+Every capability in §6 is built, but capability is not parity. The top 25 subgraphs by query fee are
+**eleven Uniswap deployments**, so whether their *entities* are reproducible decides whether "port the
+top 25" is grind or is impossible. Read against `Uniswap/v3-subgraph`'s `src/common/pricing.ts` rather
+than from memory:
+
+**`getEthPriceInUSD()` is expressible.** It loads one pool and returns `token1Price`, which derives
+from `sqrtPriceX96` - a field carried in the `Initialize` and `Swap` events. A view over the latest
+swap on the reference pool reproduces it exactly.
+
+**`findEthPerToken()` is not, and the reason is structural.** It iterates `token.whitelistPools` and,
+for each, reads **`token1.derivedETH` - the previously *stored* value of another token's price**,
+alongside `pool.totalValueLockedToken1` and `bundle.ethPriceUSD`, all stored entity state:
+
+```ts
+const ethLocked = pool.totalValueLockedToken1.times(token1.derivedETH)
+if (ethLocked.gt(largestLiquidityETH) && ethLocked.gt(MINIMUM_NATIVE_LOCKED)) {
+  priceSoFar = pool.token1Price.times(token1.derivedETH as BigDecimal)
+}
+```
+
+So a token's price is a function of *when the other token was last written*, not of the event log
+alone. Two indexers replaying the same events in a different handler order can legitimately produce
+different numbers. **It is order-dependent by construction.**
+
+### What that costs, precisely
+
+| Surface | Reproducible? |
+|---|---|
+| Raw event tables | **Exactly** |
+| Pool prices from `sqrtPriceX96` | **Exactly** - a pure function of the latest swap |
+| Liquidity, TVL-per-token, volume | **Exactly** - sums over events |
+| `derivedETH`, `ethPriceUSD` | **A fixed point, not the same number** |
+| Anything downstream (`totalValueLockedUSD`, `volumeUSD`) | Inherits that difference |
+
+A declarative view can solve the mutual recursion to convergence at each block. That is arguably a
+*better* answer - it has no dependence on write order - but it is **not the subgraph's answer**, and a
+parity diff would show it.
+
+### The consequence for the claim
+
+Byte-identical entity parity with Uniswap is **not achievable declaratively**, and not because the
+view layer is weak: the source is order-dependent, and reproducing it exactly would mean replaying the
+same stateful writes in the same sequence. That is imperative mapping execution, which §8 rules out on
+purpose.
+
+So the claim this RFC can support is narrower than its title, and should be stated that way:
+
+> Every **input** a subgraph indexes, a nest can index. Every entity that is a *pure function of those
+> inputs* is reproducible exactly. Entities whose definition reads back their own prior output are
+> reproducible as a fixed point, which is a defensible number and a different one.
+
+**How different is unmeasured.** The gap is bounded by how stale the stored values are - one block in
+a busy pool, potentially much longer for a rarely-touched token. Measuring it needs the gateway diff
+§7 calls for, which is still outstanding.
+
+## 6b. The gateway diff, run (2026-08-19)
+
+§7 sets the acceptance criterion: *a real port, diffed against the gateway. Anything less is us marking
+our own homework.* Run against **Uniswap V3 on Arbitrum**, deliberately - eleven of the network's top
+25 subgraphs by query fee are Uniswap, so it is the family that decides the question.
+
+- **Subject:** the WETH/USDC 0.05% pool, `0xc6962004f452be9203591991d15f6b388e09e8d0`, the
+  highest-volume V3 pool on Arbitrum by the subgraph's own ranking.
+- **Range:** blocks 496,000,000 to 496,010,000, long final.
+- **Both sides queried independently:** the subgraph through the decentralised gateway, the nest
+  through `nuthatch sql` over its own store.
+
+```
+subgraph: 343 swaps    nuthatch: 343 swaps
+ROW-FOR-ROW IDENTICAL across all 343 swaps
+(block_number, sqrtPriceX96, tick) matched exactly, with multiplicity
+```
+
+Compared as a multiset rather than a sorted list, so a duplicated or dropped row cannot hide behind a
+matching count. `sqrtPriceX96` and `tick` are raw integers on both sides; `amount0`/`amount1` are
+deliberately excluded because the subgraph decimal-adjusts them, which is a formatting difference and
+not a data one.
+
+**What this settles.** The *input* layer is exactly reproducible against the most-queried subgraph on
+the network, which is §6a's "Exactly" column measured rather than asserted - including
+`sqrtPriceX96`, the field every Uniswap price derives from. The nest was scaffolded by
+`nuthatch init <address> --chain arbitrum-one` and caught up in **8 seconds, 4,781 events, 600 ev/s**.
+
+**What it does not settle.** §6a's other column. `derivedETH` and `ethPriceUSD` are order-dependent in
+the subgraph's own implementation, so a fixed-point view will differ by an amount nobody has measured
+yet. That diff needs the entity layer built first and remains the outstanding work.
+
+## 6c. Uniswap V3, ported and run (2026-08-19)
+
+The nest §6b diffed was one pool, scaffolded by hand. This is the **whole subgraph**, ported by
+`nuthatch init --from-subgraph QmZ5uwhnws…` from the live Arbitrum deployment - the top-25 entry, and
+the family that decides the question.
+
+**The importer needed no help.** It read the manifest, vendored the factory and pool ABIs, and
+**inferred the factory rule by itself**: `factory.PoolCreated → Pool via 'pool' (param 'pool' names the
+template exactly)`. Five tables, matching exactly the four events the subgraph's manifest handles plus
+`PoolCreated`. It also reported honestly that the pool template handles 4 of the 9 events its ABI
+defines, which is the subgraph's choice, not a gap.
+
+**Parameterised `eth_call`, proved on a real mapping's real need.** The subgraph's `fetchTokenSymbol`
+and `fetchTokenDecimals` call `symbol()` and `decimals()` on each new pool's tokens. Declared as
+RFC-0038 §3 intends - `contract_column` naming the address the row itself carries:
+
+```toml
+[[calls]]
+name = "token0_symbol"
+on = "factory__pool_created"
+contract_column = "{token0}"
+signature = "symbol()"
+```
+
+Run over blocks 495,500,000 to tip: **195,515 events in 3m37s (901 ev/s)**.
+
+| Table | Rows |
+|---|---:|
+| `factory__pool_created` | **219** |
+| `token0_symbol` | **219** |
+| `token0_decimals` | **219** |
+| `token1_symbol` | **219** |
+| `pool__swap` | 6,210 |
+
+**Exactly one call per pool, per declaration. No misses, no duplicates.** Factory discovery fed the
+call scheduler, each call resolved at its own row's block against the address that row carried, and
+the counts line up to the unit. That is the capability §3 was written for, and until now it had only
+been proved against stubs I wrote myself.
+
+**Still unproved:** the entity layer. 219 pools is discovery working, not discovery *at scale* - the
+full factory history is 495 million blocks, not 674 thousand. And nothing here computes `derivedETH`,
+so §6a's divergence remains unmeasured.
+
+## 6d. §6a measured, part one: the root of the pricing tree is exact
+
+§6a said Uniswap's entity model is order-dependent and a declarative fixed point would differ *by an
+unmeasured amount*. Measuring it splits cleanly in two, because the pricing tree has a base case and a
+recursion, and only one of them is order-dependent.
+
+**The base case.** `getEthPriceInUSD()` loads exactly one pool - Arbitrum's
+`STABLE_TOKEN_POOL = 0x17c14d2c…` (WETH/USDC) - and returns `token1Price`, since `token0` is the
+reference token. `token1Price` comes from `sqrtPriceX96ToTokenPrices`, a pure function of the pool's
+last `sqrtPriceX96`. Nothing stored, nothing recursive, no write order.
+
+**Verified in three steps, 2026-08-19:**
+
+1. The formula was checked *against the subgraph's own stored value* before being trusted:
+   `(sqrtPrice² / 2¹⁹²) · 10^dec0 / 10^dec1` reproduced their `token0Price` and `token1Price` to a
+   relative difference of **1.3 × 10⁻³⁵** - their `BigDecimal` precision, not an error.
+2. The pool was indexed by a plain `nuthatch init 0x17c14d2c… --chain arbitrum-one` (164 events, 3s).
+3. Both sides read **at the same block**, using the subgraph's own time-travel query to pin it:
+
+| | value |
+|---|---|
+| nuthatch, latest `Swap` at or before block 496,213,467 | `sqrtPriceX96 = 3611630104467636802226442` |
+| subgraph, `pool(block:{number:496213467}).sqrtPrice` | `3611630104467636802226442` |
+| nuthatch `ethPriceUSD` | `2078.008699136272184458689456222861027…` |
+| subgraph `bundle.ethPriceUSD` | `2078.008699136272184458689456222861` |
+
+**Identical.** The difference is 10⁻³² absolute, which is where their decimal type stops and ours
+does not.
+
+### What this narrows
+
+`ethPriceUSD` is the **root** every Uniswap USD figure hangs from, and it is exactly reproducible. So
+§6a's divergence is not "somewhere in the pricing" - it is confined entirely to the **recursive**
+`findEthPerToken` layer, which reads back other tokens' stored `derivedETH`.
+
+That is a much better position than §6a assumed. The remaining measurement - how far a fixed-point
+`derivedETH` drifts from an order-dependent one - needs the full factory history rather than a
+674k-block window, and is the outstanding work.
 
 ## 7. Testing, because this warrants its own release
 

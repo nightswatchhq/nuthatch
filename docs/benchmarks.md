@@ -34,6 +34,82 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 | W2 | [horizon-nest](https://github.com/cargopete/horizon-nest) (Arbitrum) | full history from deployment | sparse multi-contract, L2 cadence |
 | W3 | USDC + WETH + Uniswap V3 factory (mainnet) | 50,000 blocks | mixed density, multi-table fan-out |
 
+
+## What a backfill costs against a metered endpoint (2026-08-19)
+
+Throughput is not the only number an operator cares about. "Be your own indexer" is partly an argument
+about bills, so this is what a day of real backfills actually consumed - measured against one Alchemy
+key, across Arbitrum, BSC, Polygon, Optimism and Gnosis.
+
+**~11.5M compute units for six backfills** - about **$5** at the rate an Alchemy PAYG invoice actually
+charges, **$0.00000045/CU** ($0.45 per million; taken from a real July invoice, not from a pricing
+page). The largest runs were 454M blocks of Arbitrum history for a two-contract nest and 200,000
+blocks of BSC for a single busy ERC-20.
+
+For scale: a whole month of this project's development traffic came to **67.5M CU = $30.39**. Indexing
+is cheap; the interesting question is what fraction of it is *necessary*, which is the next section.
+
+| Run | Estimated CU | Shape |
+|---|---:|---|
+| `graph-allocations`, 454M blocks | ~4.4M | ~5,500 `getLogs` + a header per event-bearing block |
+| BSC, 200k blocks, 1.67M events | ~3.0M | dense contract, ~180k event-bearing blocks |
+| Uniswap V3, 674k blocks, 196k events | ~3.6M | plus retries |
+| Chain sweep + diffs + DOUDOCHAIN | ~0.4M | all bounded |
+
+### The finding: our own default is the cost, not the indexing
+
+**Roughly 80% of that is `eth_getBlockByNumber`, not `eth_getLogs`.** The provider's method breakdown
+put the header call *above* the log call. The cause is `block_timestamps = true`, which nuthatch
+defaults on: one header fetch for every block that carries an event.
+
+It is worse than the raw count suggests. A busy range provokes partial responses - the Uniswap run
+logged two dozen warnings of the form `block_timestamps: 882/1548 block(s) missing from the RPC
+response`, and each one is a re-ask of the same range.
+
+So against a metered endpoint, **nuthatch's default costs several times more than its actual indexing
+work**. That is a fact about our defaults rather than about any provider, and it is the sort of thing
+this project should publish about itself rather than have an operator discover on an invoice.
+
+At today's volumes that is $5 against $1, which nobody would optimise for. At a hundred nests it is
+the difference between a rounding error and a line item, and it is a claim nuthatch makes about
+itself - so it is worth stating the number rather than the adjective.
+
+`block_timestamps = false` (RFC-0029 §6b) removes it entirely, at the cost of the column. A nest that
+never asks "when" should not be paying for it.
+
+### Price a backfill before you start it
+
+A from-deployment backfill on a mature chain is not the same order of expense as a bounded one, and the
+difference is three figures rather than a rounding error. The arithmetic is simple enough that there is
+no excuse for skipping it:
+
+```
+cost ≈ (blocks / measured_blocks) × measured_CU × $0.00000045
+```
+
+Worked, from a run that was actually measured: Uniswap V3 on Arbitrum over 674,425 blocks cost ~3.6M CU
+(~$1.62). Its factory was deployed at block **175**, so the full history is **736 times** that range:
+
+| Range | Events | CU | Cost |
+|---|---:|---:|---:|
+| 674k blocks (measured) | 195,515 | 3.6M | **$1.62** |
+| Full factory history (extrapolated) | ~144M | ~2,650M | **~$1,192** |
+
+Early chain history is far sparser than the tip, so that is an upper bound - but a tenth of it is still
+three figures. **A full-history backfill on a busy factory gets priced and agreed before it is
+started, not after.** A day of bounded proof runs across six chains came to **$5.15**; one unpriced
+backfill would have been two hundred times that.
+
+Two guards worth having on the provider side rather than in a habit: a **spend limit** (the "Set limit"
+control beside each usage chart) turns an accident into a refusal, and a **custom throughput override**
+turns a concurrency spike into throttling rather than billing.
+
+### The other lever: concurrency, not volume
+
+The only limit actually hit that day was **throughput, not spend**: 11,717 CU/s against a 10,000 cap,
+caused by two backfills running at once rather than by either one being large. A provider-side
+throughput cap turns that into throttling instead of billing, and costs nothing to set.
+
 ## Sourcing tiers
 
 - **T1** - public RPC defaults (round-robin), as a new user experiences it.

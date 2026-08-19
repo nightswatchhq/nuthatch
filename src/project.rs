@@ -2027,15 +2027,19 @@ dataSources:
         let pool_cid = crate::cid::cid_v0_for(POOL_ABI.as_bytes());
         // Leaked deliberately: `fake_gateway` wants `'static` paths and this is a test that ends.
         let pool_path: &'static str = Box::leak(format!("/ipfslike/{pool_cid}").into_boxed_str());
-        // The manifest names the ABI by CID, so it has to name the *real* one too.
+        // The manifest names the ABI by CID, so it has to name the *real* one too. It also has to
+        // name a chain nuthatch genuinely does not ship: `bsc` became built-in when the top-25 list
+        // added it, and this test is about the blind-then-remedy flow for an *unshipped* chain, which
+        // stops being exercised the moment the chain is shipped.
         let manifest: &'static str = Box::leak(
             BSC_MANIFEST
                 .replace("Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s", &pool_cid)
+                .replace("bsc", "avalanche")
                 .into_boxed_str(),
         );
         let (gateway, _gw) =
             fake_gateway(vec![("/manifest.yaml", manifest), (pool_path, POOL_ABI)]).await;
-        let (rpc_url, _rpc) = fake_chain_id_rpc(56).await;
+        let (rpc_url, _rpc) = fake_chain_id_rpc(43114).await;
 
         let dir = tempfile::tempdir().unwrap();
         let source = format!("{gateway}/manifest.yaml");
@@ -2056,7 +2060,9 @@ dataSources:
         let err = init_from_subgraph(&source, &args).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("the manifest indexes 'bsc', which nuthatch has no built-in chain for"),
+            msg.contains(
+                "the manifest indexes 'avalanche', which nuthatch has no built-in chain for"
+            ),
             "{msg}"
         );
         assert!(
@@ -2065,15 +2071,15 @@ dataSources:
         );
 
         // Step 2: follow that remedy exactly as printed - `--chain bsc --rpc <url>` - and it must work.
-        args.chain = Some("bsc".to_string());
+        args.chain = Some("avalanche".to_string());
         args.rpc = vec![rpc_url.clone()];
         init_from_subgraph(&source, &args)
             .await
             .expect("the recommended re-run must succeed - the nest format already supports it");
 
         let config = Config::load(dir.path()).unwrap();
-        assert_eq!(config.nest.chain, "bsc");
-        assert_eq!(config.nest.chain_id, 56);
+        assert_eq!(config.nest.chain, "avalanche");
+        assert_eq!(config.nest.chain_id, 43114);
         assert_eq!(config.nest.rpc_urls, vec![rpc_url]);
     }
 }
