@@ -1,6 +1,6 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). Nothing built. Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** Draft (2026-08-19). **Slices 0, 1 and 2 built** (see §6); 3 and 4 outstanding. Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
@@ -162,14 +162,31 @@ calls. Splitting the gate is likely a slice, not a project, and the decoder is a
 
 Each ends runnable. Nothing merges while an earlier slice has a failing test.
 
-**Slice 0 - prove the key collision, or disprove it.** A test, before any feature. §4.
+**Slice 0 - prove the key collision, or disprove it. DONE (#642).** It was real, and worse than
+suspected: block rows are written *second*, so the block row always won and **every log at index 0 was
+silently destroyed** - the first event of every block. Fixed with a reserved index band
+(`BLOCK_ROW_LOG_INDEX`, `CALL_ROW_LOG_INDEX_BASE`) rather than the load-time refusal tried first, which
+broke three existing tests and so turned out to be a regression rather than a stopgap.
 
-**Slice 1 - the tier-3 executor, fixed calls only.** Schedule `blocks_in` over each window, batch via
-`resolve_at`, store results. Delete `refuse_unwired_calls`; the test named after it fails loudly and
-says so, which is the design working as intended.
+The first attempt at the test **passed**, because it drove `backfill_direct` - the seal-direct path
+buffers `(block, json)` into append-only Parquet and cannot collide. A green test against the wrong
+path would have closed this as "no bug".
 
-**Slice 2 - parameterised calls.** The `on`/`signature`/`args` surface, per-block dedupe by `CallKey`,
-the volume bound and its refusal.
+**Slice 1 - the tier-3 executor, fixed calls only. DONE (#262).** The watcher test fired on its own
+the moment `resolve_at` gained a caller and said to delete the refusal, exactly as written. The
+archive endpoint rides on `Config` as `#[serde(skip)] state_rpc_urls` from a new `--state-rpc`, which
+keeps a credential out of the nest's content address by construction. `--seal-direct` with declared
+calls is refused, because tier 3 is wired into `process_window` only and a seal-direct run would have
+sealed the range with the table silently absent - #262's own shape, guarded before shipping it.
+
+**Slice 2 - parameterised calls. DONE.** `on`/`signature`/`args`/`contract_column`, literals beside
+column references, dedupe by `CallKey` **before** the RPC, and the volume bound as a loud refusal.
+
+Two things the build changed about the design. The reserved band had to widen from 1,000 slots to
+**500,000**, because a row-driven declaration fires once per source row and one dense block can want
+thousands - a narrow band would have recreated the very bug slice 0 fixed. And an **indexed dynamic
+parameter is refused as an argument**: the log holds `keccak(value)`, so the original is unrecoverable,
+and encoding the hash would produce a well-formed call asking a question nobody meant.
 
 **Slice 3 - IPFS.** RFC-0037's own slices, verification first.
 
