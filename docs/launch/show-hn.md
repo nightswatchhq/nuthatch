@@ -47,11 +47,21 @@ view treats a reorg as a *retraction*, not a recompute - the same circuit runs a
 and a reorg as a diff. Balances are i128 end-to-end (a transfer above i64::MAX won't silently vanish),
 and they survive a restart.
 
-**Honest limits, because you'll ask:** Ethereum + Arbitrum + Base only; events only (no call/trace
-decoding yet); RPC polling - the reth ExEx in-process path is designed and stubbed, not shipped; no
-GraphQL layer yet (SQL + point-reads + MCP today). It's v0.1.0 and solo-maintained. `MIT OR Apache-2.0`, a
-grant-funded public good, not a startup - the sustainability plan and the "what we'll never build"
-list are both in-repo.
+**Honest limits, because you'll ask:** Ethereum + Arbitrum + Base ship with bundled endpoints
+(anything else needs `--rpc`); no call/trace decoding, which genuinely needs a colocated node; RPC
+polling - the reth ExEx in-process path is designed and stubbed, not shipped; no GraphQL layer yet
+(SQL + point-reads + MCP today). **Contract state is derive-first**, which is the part I'd defend
+rather than apologise for: The Graph makes you run a ~1.77 TB archive node for any subgraph with
+`eth_call` handlers, and most of what those calls ask for is derivable from events you already index -
+`total_supply` as mints minus burns, balances per address, holder count, Uniswap-V2 reserves as the
+latest `Sync`. Those ship and cost nothing. Immutable metadata (`decimals`/`symbol`/`name`) is fetched
+once and cached. What's left is the irreducible residue - an oracle read, an ungoverned parameter - and
+for that a pinned-block `eth_call` against an operator-supplied archive RPC is designed, addressed and
+tested but **has no executor yet**, so a nest declaring one is refused at load rather than silently
+producing nothing. IPFS-derived entities aren't indexed at all yet (RFC-0037).
+
+It's v2.5.0, solo-maintained, and running in production. `MIT OR Apache-2.0`, a grant-funded public
+good, not a startup - the sustainability plan and the "what we'll never build" list are both in-repo.
 
 Install, quickstart, the footprint methodology, and the full progress log:
 https://github.com/nightswatchhq/nuthatch
