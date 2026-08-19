@@ -1,6 +1,6 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). **All five slices built** (see §6). The claim in the title is met, with one stated limit (§6 slice 3). Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** Draft (2026-08-19). **All five slices built** (see §6). Every capability is present; **§6a bounds what that means** - Uniswap's entity model is order-dependent, so entity parity is a fixed point rather than an identity. Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
@@ -229,6 +229,63 @@ deleted - it was asserting somebody else's guard. Unscoped, the nest's own addre
 bound, and that is the one that matters: `scope_check` guards `traces`/`state` and returns early for a
 top-level-calls nest, so without the filter an unscoped nest would decode every transaction on the
 chain.
+
+## 6a. The finding that bounds the claim: Uniswap's entity model is path-dependent
+
+Every capability in §6 is built, but capability is not parity. The top 25 subgraphs by query fee are
+**eleven Uniswap deployments**, so whether their *entities* are reproducible decides whether "port the
+top 25" is grind or is impossible. Read against `Uniswap/v3-subgraph`'s `src/common/pricing.ts` rather
+than from memory:
+
+**`getEthPriceInUSD()` is expressible.** It loads one pool and returns `token1Price`, which derives
+from `sqrtPriceX96` - a field carried in the `Initialize` and `Swap` events. A view over the latest
+swap on the reference pool reproduces it exactly.
+
+**`findEthPerToken()` is not, and the reason is structural.** It iterates `token.whitelistPools` and,
+for each, reads **`token1.derivedETH` - the previously *stored* value of another token's price**,
+alongside `pool.totalValueLockedToken1` and `bundle.ethPriceUSD`, all stored entity state:
+
+```ts
+const ethLocked = pool.totalValueLockedToken1.times(token1.derivedETH)
+if (ethLocked.gt(largestLiquidityETH) && ethLocked.gt(MINIMUM_NATIVE_LOCKED)) {
+  priceSoFar = pool.token1Price.times(token1.derivedETH as BigDecimal)
+}
+```
+
+So a token's price is a function of *when the other token was last written*, not of the event log
+alone. Two indexers replaying the same events in a different handler order can legitimately produce
+different numbers. **It is order-dependent by construction.**
+
+### What that costs, precisely
+
+| Surface | Reproducible? |
+|---|---|
+| Raw event tables | **Exactly** |
+| Pool prices from `sqrtPriceX96` | **Exactly** - a pure function of the latest swap |
+| Liquidity, TVL-per-token, volume | **Exactly** - sums over events |
+| `derivedETH`, `ethPriceUSD` | **A fixed point, not the same number** |
+| Anything downstream (`totalValueLockedUSD`, `volumeUSD`) | Inherits that difference |
+
+A declarative view can solve the mutual recursion to convergence at each block. That is arguably a
+*better* answer - it has no dependence on write order - but it is **not the subgraph's answer**, and a
+parity diff would show it.
+
+### The consequence for the claim
+
+Byte-identical entity parity with Uniswap is **not achievable declaratively**, and not because the
+view layer is weak: the source is order-dependent, and reproducing it exactly would mean replaying the
+same stateful writes in the same sequence. That is imperative mapping execution, which §8 rules out on
+purpose.
+
+So the claim this RFC can support is narrower than its title, and should be stated that way:
+
+> Every **input** a subgraph indexes, a nest can index. Every entity that is a *pure function of those
+> inputs* is reproducible exactly. Entities whose definition reads back their own prior output are
+> reproducible as a fixed point, which is a defensible number and a different one.
+
+**How different is unmeasured.** The gap is bounded by how stale the stored values are - one block in
+a busy pool, potentially much longer for a rarely-touched token. Measuring it needs the gateway diff
+§7 calls for, which is still outstanding.
 
 ## 7. Testing, because this warrants its own release
 
