@@ -156,7 +156,12 @@ default; they must not be the only door.
    needs a shape.
 3. **What canonical CID form?** v0/v1, base32/base58, raw versus dag-pb all name the same bytes and
    spell differently. One form on write, or the primary key is a lie.
-4. **How much does this actually block?** Currently unmeasured. The three subgraph ports in
-   [community.md](../launch/community.md) §2 are the instrument: record which mappings die on
-   `eth_call`, which on IPFS, and which on neither, then weight this against RFC-0023 tier 3's missing
-   executor with a count rather than an intuition.
+4. **How much does this actually block?** Partly measured now, and it has a named customer.
+   **Lodestar's `subgraph-names` and `subgraph-search` routes cannot leave The Graph gateway without
+   this RFC**, because subgraph display names and metadata live in IPFS-pinned JSON behind the GNS and
+   not on chain (RFC-0011 status update, 2026-08-19). That is nuthatch's only production consumer, so
+   it is a real requirement rather than a hypothetical one - though it is **two routes out of 39**, so
+   it does not by itself outrank RFC-0023 tier 3's missing executor. The three subgraph ports in
+   [community.md](../launch/community.md) §2 remain the instrument for the rest: record which mappings
+   die on `eth_call`, which on IPFS, and which on neither, then weight with a count rather than an
+   intuition.
