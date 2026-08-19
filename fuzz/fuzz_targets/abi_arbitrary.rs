@@ -13,7 +13,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use nuthatch::registry::{ContractSpec, DecodeRegistry};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry};
 
 #[derive(Arbitrary, Debug)]
 struct FuzzInput {
@@ -57,22 +57,40 @@ impl SimpleType {
 /// asks for is exactly the depth nuthatch's decode path has to deal with, not bounded by our own
 /// call stack.
 fn nested_tuple_inputs(depth: u16) -> serde_json::Value {
-    let mut components = serde_json::json!([{"name": "leaf", "type": "uint256", "indexed": false}]);
+    let mut components = serde_json::json!([{"name": "leaf", "type": "uint256"}]);
     for i in 0..depth {
         components = serde_json::json!([{
             "name": format!("t{i}"),
             "type": "tuple",
             "components": components,
-            "indexed": false,
         }]);
+    }
+    // "indexed" is only valid on the outermost event input, never on nested tuple components -
+    // alloy-json-abi rejects it there ("indexed is not supported in params"). Setting it at
+    // every level made every tuple_depth > 0 input fail ABI parsing before DecodeRegistry::build
+    // ever ran, so the depth-fuzzing this target exists for (nuthatch#290) had zero coverage.
+    if let serde_json::Value::Array(arr) = &mut components {
+        if let Some(serde_json::Value::Object(obj)) = arr.get_mut(0) {
+            obj.insert("indexed".to_string(), serde_json::Value::Bool(false));
+        }
     }
     components
 }
 
 fuzz_target!(|input: FuzzInput| {
-    // Still absurd (up to 4095 levels), but capped so corpus entries don't balloon the JSON text
-    // itself into gigabytes before nuthatch's parser even runs.
-    let depth = input.tuple_depth % 4096;
+    // Capped at 256, not the old 4096 (nuthatch#603): under the ASan+coverage-instrumented build
+    // this target actually runs as (cargo-fuzz's default, and what CI's fuzz-smoke job now uses
+    // post-#593/#614), the recursive `Param` deserialize call stack for a nested-tuple `components`
+    // chain stack-overflows and aborts the whole fuzzer process - measured on a stock dev box,
+    // crash onset between depth 1700 (5.5s, survives) and depth 1800 (stack-overflow). 256 is a
+    // >100x safety margin below that boundary, well clear of any future ASan/runner-stack variance,
+    // and still two orders of magnitude past any nesting a real Solidity ABI would ever use. Before
+    // this cap, a single near-max-depth draw could cost 20-60s+ under ASan (or crash outright),
+    // which is why a 180s/300000-run CI budget was completing 99-108 executed units total - the
+    // depth space alone was consuming the whole run. See nuthatch#603 / NIG-257 for the full
+    // before/after measurement (also fixes the "indexed" placement bug above, without which
+    // DecodeRegistry::build was never reached for any tuple_depth > 0 in the first place).
+    let depth = input.tuple_depth % 256;
     let huge = input.huge_array_size;
 
     let mut events = vec![serde_json::json!({

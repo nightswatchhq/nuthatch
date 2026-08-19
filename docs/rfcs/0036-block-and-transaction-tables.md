@@ -38,7 +38,7 @@ count alone.
 
 ## 3. Why this is not simply "another table"
 
-Every table in nuthatch today is an [`EventDecoder`](../../src/registry.rs): it has an `alias`, a
+Every table in nuthatch today is an [`EventDecoder`](../../decode/src/registry.rs): it has an `alias`, a
 `topic0`, a `signature`, and an `Event` it decodes a `Log` with. A block has no topic0 and no log.
 
 Measured coupling, because the answer decides the shape of the work:

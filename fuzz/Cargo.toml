@@ -15,18 +15,17 @@ alloy-primitives = "1.6"
 serde_json = "1"
 hex = "0.4"
 
-[dependencies.nuthatch]
-path = ".."
+[dependencies.nuthatch-decode]
+path = "../decode"
 
 # Decode must stay a deterministic, panic-free boundary against attacker-supplied ABIs and logs
 # (CLAUDE.md §4, nuthatch#290) - overflow checks on so an integer-overflow panic in a size
 # computation (e.g. a `uint256[huge]` array type) counts as a crash, not silent wraparound.
 #
-# Deliberately NOT `debug-assertions = true` alongside this: that combination (or ASan) makes
-# nightly's trait solver ICE compiling dbsp (ties into a `dyn StarJoinFuncTrait`/`DynClone` vtable
-# slot - a rustc bug, not ours). `overflow-checks` alone reproducibly does not trigger it. Build
-# with `cargo fuzz build -O --sanitizer none` - see fuzz/README.md and the `fuzz-smoke` CI job for
-# the full story and how to re-check whether upstream has fixed it.
+# debug-assertions and ASan are safe to run alongside this as of nuthatch#581: the crate depends on
+# `nuthatch-decode`, which does not link dbsp, so the trait-solver ICE that used to force
+# `-O --sanitizer none` (dbsp's `StarJoinFuncTrait`/`DynClone` vtable slot, a rustc bug) cannot be
+# reached from this build. See fuzz/README.md for the full history.
 [profile.release]
 overflow-checks = true
 lto = false

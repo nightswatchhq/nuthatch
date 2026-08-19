@@ -47,7 +47,10 @@ ignore = [
   #     on hyper 1.x. actix-web arrives solely because `feldera-types` depends on it, and its h2 0.3
   #     *server* is the vulnerable path.
   #   - The advisory is unbounded empty DATA frames against an HTTP/2 **server**. No actix listener is
-  #     ever constructed in this binary, so no such server accepts a connection.
+  #     ever constructed in this binary, so no such server accepts a connection. Note what that last
+  #     claim rests on: the grep above is a checked fact about our own source, but "no listener
+  #     anywhere in the process" is a reachability argument over dbsp's internals too, not something
+  #     grep proves. It is the assumption to re-test on a dbsp bump, ahead of the version numbers.
   # Not fixable by upgrading: 0.3.27 is the head of the 0.3 line and no patched 0.3 release exists
   # (checked 2026-08-19); the fix shipped in 0.4.16 only. Clearing it needs actix-web to move to h2 0.4
   # or dbsp to drop actix-web. Re-check on the next dbsp bump, same as the quick-xml and rkyv entries.

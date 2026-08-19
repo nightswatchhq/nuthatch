@@ -1,6 +1,9 @@
 //! The thinnest JSON-RPC client that works: `eth_blockNumber` + `eth_getLogs`, with round-robin
 //! failover across the configured endpoints. No ExEx yet - that's the sovereignty upgrade later.
 
+// `Log` lives in nuthatch-decode so fuzz targets build without pulling in dbsp (nuthatch#581).
+pub use nuthatch_decode::rpc::Log;
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -515,20 +518,6 @@ pub struct RpcClient {
     /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
     /// is the condition that makes it safe, not an optimisation on top.
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Log {
-    /// Emitting contract. Unused while we filter by a single address in the query, but retained
-    /// for multi-contract / ABI-priority decode in later slices.
-    #[allow(dead_code)]
-    pub address: String,
-    pub topics: Vec<String>,
-    pub data: String,
-    pub block_number: u64,
-    pub block_hash: String,
-    pub tx_hash: String,
-    pub log_index: u64,
 }
 
 impl RpcClient {

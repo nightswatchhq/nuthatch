@@ -682,7 +682,7 @@ fn write_abi(dir: &Path, alias: &str, abi: &serde_json::Value) -> Result<()> {
 }
 
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
-    let registry = crate::registry::DecodeRegistry::from_nest(dir, config)?;
+    let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
     // RFC-0014: a nest that declares `[extract]` also declares call/state tables. The decode identity
     // folds in the call surface, so two nests differing only in what they extract are not mistaken for
@@ -849,7 +849,7 @@ fn init_from(source: &str, dir_arg: &str) -> Result<()> {
     // Validate: it must be a real nest - toml at a supported schema version, ABIs present + decodable.
     let config = Config::load(&target)
         .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
-    let registry = crate::registry::DecodeRegistry::from_nest(&target, &config)
+    let registry = crate::registry::from_nest(&target, &config)
         .context("nest ABIs failed to build a decode registry (is the nest self-contained?)")?;
     // Validate factory rules (RFC-0009): references must resolve and depth stays within the ceiling.
     let factories = crate::factory::FactorySet::build(&config)
