@@ -1,6 +1,16 @@
 # RFC-0038: Subgraph parity - any subgraph reproducible as a nest
 
-**Status:** Draft (2026-08-19). **All five slices built** (see §6). Every capability is present; **§6a bounds what that means** - Uniswap's entity model is order-dependent, so entity parity is a fixed point rather than an identity. Amends **0023 §3** (tier 3's shape). Depends on 0023
+**Status:** **Accepted, all five slices built** (2026-08-19), and **measured against the live network**
+rather than only against fixtures - see §6b (343 Uniswap V3 swaps row-for-row identical to the gateway)
+and §6c (219 pools discovered, 219 parameterised `eth_call`s each, no misses).
+
+**What the title claims is narrower than it reads, and §6a says why.** Every *input* a subgraph indexes,
+a nest can index. Every entity that is a pure function of those inputs is reproducible exactly.
+Uniswap's `derivedETH` reads back its own prior output, so it is reproducible only as a fixed point -
+a defensible number, and a different one. **By how much is still unmeasured.**
+
+**Known gaps, none of them closed by this RFC:** internal calls (node-gated, RFC-0003), time-travel
+queries, and `@fulltext`. Amends **0023 §3** (tier 3's shape). Depends on 0023
 (tiers 1-2 shipped, tier 3 unwired), 0037 (IPFS resolution), 0009 (factory discovery), 0001 (decode).
 Borrows the scoping argument from 0036. **Release-sized:** this is a programme with its own release
 and its own test plan (§7), not a patch.
