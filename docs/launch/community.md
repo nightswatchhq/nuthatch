@@ -90,18 +90,29 @@ loop.
 - **RFC-0007 already sequences it this way.** Home turf is Phase 1 and Show HN is Phase 2. This is a
   sharper Phase 1, not a departure from the plan.
 
-### Find the first ports by asking, not by building
+### Where the queue comes from - reversed twice, and here is why
 
-An earlier draft of this document said to build the Tier-0 network-subgraph nest first and use its
-output as the port queue. **That was the wrong order** and is corrected here: it is the standard trap
-of building lead-generation tooling for a pipeline nobody has yet demonstrated exists.
+This section has changed position twice and the reasoning is worth keeping rather than tidying away.
 
-The network subgraph does know which deployments have no indexer allocation and which are falling
-behind, and that is a genuinely good queue. But the first one or two ports can be found by posting the
-fallback piece on the Graph forum and asking, or by reading Explorer, with no code written at all.
-**Build the network-subgraph nest at port three**, once the manual version has proved there is a queue
-worth automating. It is an excellent nest on its own merits either way, and by then it is a tool for
-observed demand rather than a bet on it.
+**First draft:** build the Tier-0 network-subgraph nest, use its output as the port queue.
+
+**Second draft, corrected:** do not. Building lead-generation tooling for a pipeline nobody has
+demonstrated exists is a standard trap. Find the first ports by posting and asking, and build the nest
+at port three.
+
+**Current, and the reason for it:** build it first after all, because the cost estimate the second
+draft was priced against turned out to be wrong. `graph-gns-nest` and `graph-staking-nest` are
+**already running in production on Arbitrum**, and the gns nest already indexes `SubgraphPublished`,
+which is the deployment universe. The queue is a three-contract join on live substrate, not a subgraph
+port. When the price of tooling drops that far, the objection to building it early goes with it.
+
+The design, the filter that makes it worth having (**curation signal with no open allocation**, not
+merely "no allocation"), and the one unverified claim it rests on are in
+[port-queue-nest.md](port-queue-nest.md). Read §5 before building §3.
+
+**Ask anyway, in parallel.** Posting the fallback piece and asking on the forum costs nothing, runs
+while the nest is built, and is not blocked on it. The first port should come from whichever arrives
+first.
 
 ## 3. Channels, ranked, for one person
 
@@ -158,7 +169,8 @@ In order. Nothing here blocks on anything below it.
 2. **Post [home-turf.md](home-turf.md) on the Graph forum**, then the fallback piece. In that order.
 3. **Ask for the first unserved deployment** in the same thread and in `#indexers`. No tooling.
 4. **Run the loop three times**, chosen against the criteria in §2.
-5. **Build the Tier-0 network-subgraph nest at port three**, and let it take over the queue.
+5. **Build the port-queue nest** ([port-queue-nest.md](port-queue-nest.md)), starting by confirming
+   the one unverified claim in its §5. Runs in parallel with 3 and 4, blocks neither.
 6. **Then Show HN**, per [strategy-review-2026-08-19.md](strategy-review-2026-08-19.md) and RFC-0007
    Phase 2.
 7. **Open the awesome-selfhosted PR** whenever. It is independent of all of the above and costs an
