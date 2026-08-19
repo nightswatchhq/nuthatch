@@ -3,6 +3,53 @@
 - Status: **Parked after pilot (2026-07-18)** - the wedge is proven in production; the full migration is not done. See "Implementation status" below.
 - Update (2026-07-20): the separate `graph-network-nest` repo - a byte-identical clone of `horizon-nest` that never diverged - has been **retired**. The remaining network-subgraph surface (Indexer Directory, Curation, Epochs) is now planned as an **extension of `horizon-nest`**, not a second nest. This RFC stands as the migration record; "the graph-network nest" throughout means that intended-superset work, now folded into `horizon-nest`.
 
+## Field map: `ingest-allocations`, the first route (2026-08-19)
+
+The status update below says the six `cron/ingest-*` routes are the highest-leverage slice, because
+they hold 53 more hostage through `@/lib/db`. This is the first of them mapped field by field against
+what `graph-allocations-nest` can actually produce, rather than assumed.
+
+Lodestar's `SubgraphAllocation` interface (`src/lib/ingest/allocations.ts:7`) wants thirteen fields:
+
+| Lodestar field | Source event | Available |
+|---|---|---|
+| `id` | `AllocationCreated.allocationId` | yes |
+| `indexer.id` | `AllocationCreated.indexer` | yes |
+| `subgraphDeployment.id` | `AllocationCreated.subgraphDeploymentId` | yes |
+| `subgraphDeployment.signalledTokens` | `L2Curation` `Signalled` − `Burned` | yes |
+| `allocatedTokens` | `AllocationCreated.tokens`, updated by `AllocationResized.newTokens` | yes |
+| `createdAtEpoch` | **`AllocationCreated.currentEpoch`** | yes |
+| `createdAt` | `block_timestamp` | yes |
+| `closedAt` | `AllocationClosed` `block_timestamp` | yes |
+| `poi` | **`IndexingRewardsCollected.poi`** | yes |
+| `indexingRewards` | `IndexingRewardsCollected.tokensRewards` | yes |
+| `queryFeesCollected` | `QueryFeesCollected.tokensCollected` | yes |
+| `status` | derived: an `AllocationClosed` row exists or does not | yes |
+| `closedAtEpoch` | **nothing carries it** | **no** |
+
+**Twelve of thirteen, from two contracts already indexed.** The two surprises are both good ones:
+`AllocationCreated` carries `currentEpoch` directly, so the created epoch needs no `EpochManager`
+lookup, and the POI - which the subgraph exposes on the allocation - is on
+`IndexingRewardsCollected` rather than on `AllocationClosed`, which is where one would look for it.
+
+### The one gap, and it is small
+
+`AllocationClosed(indexer, allocationId, subgraphDeploymentId, tokens, forceClosed)` carries no epoch.
+Three ways out, cheapest first: take the `currentEpoch` from the `IndexingRewardsCollected` in the
+same transaction (rewards are collected on close, so it is usually there); index `EpochManager` and
+resolve block → epoch; or derive it from epoch length, which is guessing and should not be done.
+
+### What it costs to be ready
+
+`graph-allocations-nest`'s allowlist currently carries four allocation events. It needs two more -
+`IndexingRewardsCollected` and `QueryFeesCollected` - both on `SubgraphService`, which it already
+indexes. That is an allowlist edit and a re-index of one nest, not new contracts and not new
+capability.
+
+**So the first ingest route is not blocked on nuthatch.** It is blocked on somebody writing the SQL
+view and pointing the route at `/sql` behind its per-panel flag, exactly as `delegation-events` and
+`developer-activity` already are.
+
 ## Status update (2026-08-19) - measured, not recalled
 
 Counted in `~/Projects/lodestar`, not remembered:
