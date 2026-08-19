@@ -1,6 +1,6 @@
 # The port-queue nest - finding the underserved with nuthatch
 
-- Status: **design, unbuilt. The claim it rested on is now verified** (2026-08-19, §5).
+- Status: **built, proven, parked** (2026-08-19). Runs locally, not hosted. Results in §8.
 - Author: Pete (cargopete), with Jenny
 - Date: 2026-08-19
 - Related: [community.md](community.md) §2 (the loop this feeds), [nest-catalogue.md](../nest-catalogue.md)
@@ -188,3 +188,73 @@ answerable this way either. Signal is the available proxy for demand, and it is 
 
 Step 4 is the gate. A queue nobody has manually validated is a lead-generation system for an
 unconfirmed market, which is the trap this document exists to avoid falling into twice.
+
+---
+
+## 8. Built and measured (2026-08-19)
+
+`~/Projects/graph-allocations-nest`, local only, **deliberately not hosted**. Backfilled once, queried,
+parked. `views/port_queue.sql` carries the query and these numbers as a comment.
+
+**The build.** `nuthatch init` + `nuthatch add`, both proxies resolved to their implementations
+unassisted. `nuthatch doctor` against an archive RPC first, which reported an 81,920-block `getLogs`
+window once probed **with `--address`** - its range-only probe recommends 320, and taking that at face
+value would have made this backfill 256 times longer than it needed to be. Probe with the address.
+
+**The backfill.** 42,449,403 → 496,121,293, both contracts, 8-way seal-direct: **12 minutes, 178 MB
+RSS, 54 MB on disk** (3.5 MB redb + 51 MB sealed segments). Well inside the per-cursor budget.
+
+| Table | Rows |
+|---|---:|
+| `subgraph_service__allocation_created` | 244,952 |
+| `subgraph_service__allocation_closed` | 231,646 |
+| `subgraph_service__allocation_resized` | 24,298 |
+| `curation__signalled` | 21,387 |
+| `curation__burned` | 9,969 |
+| `subgraph_service__legacy_allocation_migrated` | **0** |
+
+### The result, and the correction it forces
+
+| Population | Count |
+|---|---:|
+| Deployments ever signalled | 13,881 |
+| Still carrying net signal | 7,621 |
+| With an open allocation | 6,781 |
+| **Signalled and unserved** | **3,853** |
+| **Signalled > 1,000 and unserved** | **63** |
+
+**§2 was half right.** "Signal with no open allocation" is much sharper than "no allocation", but on
+its own it returns **3,853 rows - over half of everything still signalled**. That is a haystack, not a
+queue. A magnitude threshold is not decoration: at >1,000 net signal it becomes **63 deployments**,
+which is a list a person can actually read. The threshold is now in the query with that reasoning
+attached.
+
+The top entry carries **208,847 GRT signalled and no indexer serving it**. The second, 44,287.
+
+### Four things to be suspicious of before treating these as leads
+
+1. **A repeating 10,000 GRT / 9,900 signal pattern** runs through the middle of the list - 10,000 GRT
+   with a 1% curation tax. That shape is programmatic (a curation programme, a script, a batch), not
+   somebody deciding this dataset matters. The gate in §7 step 4 is to read the top by hand, and this
+   is exactly what it is for. Resolve a handful before believing any of it.
+2. **`LegacyAllocationMigrated` fired zero times.** The event exists in the ABI, is being removed by
+   the staged upgrade, and has never once been emitted. Harmless to have indexed, but it means the
+   pre-Horizon migration path is not visible here, so **"no open allocation on `SubgraphService`" is
+   only equivalent to "unserved" if every live allocation now lives on `SubgraphService`.** 13,306 open
+   allocations is a plausible network-wide figure, which supports that, but it is inference not proof.
+3. **Names are still unavailable.** These are deployment IDs. Turning one into "whose subgraph is
+   this" needs the GNS plus IPFS-pinned metadata - RFC-0037 again, from the other direction.
+4. **`AllocationResized` is deliberately not consulted** by the open/closed logic, since resizing
+   neither opens nor closes. Worth re-checking if the numbers ever look wrong.
+
+### Two small defects found by building it
+
+- **Renaming a contract alias leaves `semantic.toml` stale.** Changing `c0`/`c1` to
+  `subgraph_service`/`curation` produced **38 startup warnings** of the form "semantic.toml describes
+  table `c1__signalled`, which the registry has no decoder for". `nuthatch schema` regenerates
+  `schema.json` and the AI surface but does not re-key `semantic.toml`'s table list. Warnings only,
+  nothing wrong with the data, but it is noise the operator has to learn to ignore - which is how real
+  warnings get missed.
+- **`block_timestamps = true` produced six retry storms** against the archive RPC ("every item in a
+  1-block `eth_getBlockByNumber` batch returned an error, inside an HTTP 200"). It recovered on retry
+  and cost nothing, but a per-block timestamp fetch is the fragile part of this backfill.
