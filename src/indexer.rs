@@ -7263,7 +7263,6 @@ template = "pool"
         );
     }
 
-
     #[async_trait::async_trait]
     impl Source for MockSource {
         async fn tip(&self) -> Result<u64> {
@@ -7890,7 +7889,8 @@ template = "pool"
         gateway: String,
         uri: &str,
     ) -> Vec<(String, serde_json::Value)> {
-        run_ipfs_nest_with_source(dir, gateway, uri, Arc::new(MockSource { logs: Vec::new() })).await
+        run_ipfs_nest_with_source(dir, gateway, uri, Arc::new(MockSource { logs: Vec::new() }))
+            .await
     }
 
     /// The same harness with the `Source` injected, so a test can make the *ingestion* side flaky
