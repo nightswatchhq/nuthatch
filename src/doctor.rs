@@ -35,18 +35,13 @@ use crate::source::Source;
 ///
 /// The no-address probe filters on a topic0 no event can produce (see `probe()`), so its response
 /// is empty at every span and it can never meet a result-count cap - it only ever measures the
-/// provider's raw block-range ceiling, which on a provider with no hard range cap climbs to the
-/// probe loop's own limit rather than to anything the provider actually enforces. Halving that
-/// number is still an unfounded recommendation, since it says nothing about the result-count cap a
-/// nest's real, log-matching traffic will meet.
+/// provider's raw block-range ceiling. The cap is a conservative lower bound: on endpoints whose
+/// real result-count limit exceeds 320 (as measured at 81,920 for one archive RPC in
+/// docs/launch/port-queue-nest.md §8), the actual usable window is much larger and can only be
+/// found with `--address`.
 ///
-/// The one real measurement of that shape in this codebase is `arb1.arbitrum.io`, which refused
-/// the pre-#446 all-logs probe (no address filter, no topic0 filter - the densest traffic an
-/// address-less request can produce) at 640 blocks. That is also the traffic shape a factory nest
-/// legitimately sends on purpose (`LogFilter::new` allows a topic0-only, address-less filter for
-/// exactly that reason - `source.rs`), so it is the right proxy rather than an arbitrary margin.
-/// Halved again for the same headroom `recommended_window()` already applies to a direct
-/// measurement, since 640 is a cross-endpoint data point, not this endpoint's own ceiling.
+/// Derived from `arb1.arbitrum.io` refusing a dense all-logs probe at 640 blocks (pre-#446),
+/// halved for headroom. It is one cross-endpoint data point, not a universal ceiling.
 const RANGE_ONLY_WINDOW_CAP: u64 = 320;
 
 /// What one endpoint can actually do.
@@ -83,9 +78,10 @@ impl Probe {
     /// one by failing first.
     ///
     /// For a **range-only** measurement the halved number is additionally capped at
-    /// [`RANGE_ONLY_WINDOW_CAP`], because halving only produces headroom against *this* number - and
-    /// a range-only `max_window` carries no result-count information at all, so there is no cap in
-    /// it to have headroom against.
+    /// [`RANGE_ONLY_WINDOW_CAP`], because a range-only probe never meets a result-count cap and
+    /// therefore says nothing about what a real nest sustains. The cap is a conservative floor -
+    /// any endpoint whose real address-filtered capacity exceeds 320 will need a re-probe with
+    /// `--address` to surface it.
     pub fn recommended_window(&self) -> Option<u64> {
         self.max_window.map(|w| {
             let halved = (w / 2).max(1);
@@ -272,16 +268,15 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
 
     // This probe filters on a topic0 no event can produce (see above), so its response is empty at
     // every span and it can never meet a result-count cap - it only ever measures the provider's
-    // RANGE limit. A real nest filters by address and topic0 and gets back actual logs, so it
-    // additionally meets whatever result-count cap the provider enforces - which is the tighter
-    // limit in the one case measured in this file (arb1.arbitrum.io refused the pre-#446 all-logs
-    // probe at 640 blocks on result count, not range). So this number OVERSTATES what a real
-    // backfill can sustain, not understates it, and `recommended_window()` caps it accordingly.
+    // RANGE limit. A real nest filtered by address and topic0 additionally meets whatever
+    // result-count cap the provider enforces. The 320-block recommendation is therefore a floor,
+    // not a ceiling: on endpoints where the result-count cap is above 320 (as measured at 81,920
+    // for one archive RPC in docs/launch/port-queue-nest.md §8), the real window is much larger.
     if address.is_none() && max_window.is_some() {
         notes.push(
-            "window measured RANGE-ONLY - it never triggers a result-count cap, so a nest matching \
-             real logs will sustain a narrower window; re-probe with --address <contract> for a \
-             number that reflects both limits"
+            "window measured RANGE-ONLY - capped at 320 because a range-only probe cannot see the \
+             result-count limit; your real window is very likely much larger. Re-probe with \
+             --address <contract> before backfilling to get a number that reflects both limits"
                 .to_string(),
         );
     }
