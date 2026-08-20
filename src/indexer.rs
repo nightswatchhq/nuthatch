@@ -3808,7 +3808,13 @@ impl NestIngest {
                 }
             }
             for (block, items) in per_block {
-                let hash = source.block_hash(block).await?.unwrap_or_default();
+                let hash = retry_transient(
+                    &format!("block hash for {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_hash(block).await },
+                )
+                .await?
+                .unwrap_or_default();
                 let ctx = crate::ipfs::BlockCtx {
                     number: block,
                     hash: &hash,
@@ -3869,7 +3875,12 @@ impl NestIngest {
         if self.top_level_calls {
             if let Some(creg) = self.call_registry.clone() {
                 let want: Vec<u64> = (next..=to).collect();
-                let bodies = source.block_bodies(&want).await?;
+                let bodies = retry_transient(
+                    &format!("block bodies for {} block(s)", want.len()),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_bodies(&want).await },
+                )
+                .await?;
                 for b in &want {
                     let Some(body) = bodies.get(b) else { continue };
                     let bhash = body
@@ -4005,10 +4016,32 @@ impl NestIngest {
                     .iter()
                     .map(|(_, c, d)| (c.clone(), d.clone()))
                     .collect();
-                let results =
-                    crate::calls::resolve_pairs_at(rpc.as_ref(), self.chain_id, &pairs, block)
-                        .await?;
-                let hash = source.block_hash(block).await?.unwrap_or_default();
+                // Retried like every other RPC fetch on this path, and it was not, which cost a
+                // 454M-block backfill 8 hours in at 87.6%: one `transport error: error sending
+                // request` on a pinned batch propagated straight out and killed the nest. `getLogs`
+                // and the timestamp fetches have gone through `retry_transient` since #538; this one
+                // shipped in 2.6.0 with a bare `?`, so any long backfill declaring `[[calls]]` died
+                // on the first blip from the provider.
+                //
+                // Never-give-up with capped backoff, matching the sealed-history path exactly: a
+                // transient provider failure is not a reason to discard hours of work, and the
+                // progress line resumes moving once it clears.
+                let chain_id = self.chain_id;
+                let results = retry_transient(
+                    &format!("pinned eth_call batch at block {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async {
+                        crate::calls::resolve_pairs_at(rpc.as_ref(), chain_id, &pairs, block).await
+                    },
+                )
+                .await?;
+                let hash = retry_transient(
+                    &format!("block hash for {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_hash(block).await },
+                )
+                .await?
+                .unwrap_or_default();
                 let ts = timestamps.get(&block).copied().unwrap_or(0);
                 for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
                     let row = r.to_row(
@@ -7145,6 +7178,71 @@ template = "pool"
     // A Source backed by canned logs - lets us drive both backfill paths deterministically, offline.
     struct MockSource {
         logs: Vec<crate::rpc::Log>,
+    }
+
+    /// A source whose `block_hash` fails a fixed number of times before answering - a transport blip
+    /// with a known end, which is what a provider dropping a connection actually looks like.
+    struct FlakySource {
+        logs: Vec<crate::rpc::Log>,
+        fails_left: std::sync::Mutex<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FlakySource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut left = self.fails_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                anyhow::bail!("transport error: error sending request for url (mock)");
+            }
+            Ok(Some("0xfeed".to_string()))
+        }
+        async fn logs(
+            &self,
+            _f: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(self.logs.clone())
+        }
+    }
+
+    /// #651. A transport blip on an ingestion fetch must be retried, not fatal.
+    ///
+    /// The helper `retry_transient` already has its own unit tests, and they all passed while this
+    /// bug was live - because the bug was never in the helper, it was in a call site that did not
+    /// use it. So this asserts the *wiring*: a source that fails twice and then answers must leave
+    /// the fetch succeeding, and the failure count must prove the failures actually happened rather
+    /// than the test having quietly exercised the happy path.
+    ///
+    /// Cost in the field: a 454M-block backfill died eight hours in at 87.6% on exactly this, one
+    /// dropped connection against a single-endpoint `--state-rpc` where there is no failover either.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_blip_on_an_ingestion_fetch_is_retried_not_fatal() {
+        let src = FlakySource {
+            logs: Vec::new(),
+            fails_left: std::sync::Mutex::new(2),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let got = retry_transient("block hash for 1", BACKFILL_RETRY_BASE, || async {
+            src.block_hash(1).await
+        })
+        .await
+        .expect("two transient failures must not be fatal");
+
+        assert_eq!(got, Some("0xfeed".to_string()));
+        assert_eq!(
+            src.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must have failed twice and succeeded on the third - a lower count means the failures \
+             never happened and this test proved nothing"
+        );
+        assert_eq!(*src.fails_left.lock().unwrap(), 0, "both failures consumed");
     }
 
     #[async_trait::async_trait]
