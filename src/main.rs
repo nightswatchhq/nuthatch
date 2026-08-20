@@ -11,15 +11,29 @@
 //! just the CLI front door; the engine lives in the library crate.
 
 use nuthatch::{
-    analytics, audit, bench, blob, check, cli, config, distribution, doctor, indexer, labels,
+    analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
     lists, mcp, pack, project, runtime, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use std::io::Write as _;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The bare top-level help invocations (clap treats `-h`/`--help`/`help` as equivalent here) get
+    // the grouped `Commands:` listing (#674) instead of clap's flat one. Anything else - subcommand
+    // help, parse errors, `-V` - still goes through `Cli::parse()` untouched.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && matches!(argv[1].as_str(), "-h" | "--help" | "help") {
+        // `print!` panics on EPIPE (e.g. `--help | head`); clap's own help path never did
+        // (`Error::exit()` swallows the io error), so match that behaviour here instead of
+        // introducing a new crash on the one thing this PR touches. NIG-286.
+        let _ = std::io::stdout()
+            .write_all(help::render_top_level_help(cli::Cli::command()).as_bytes());
+        return Ok(());
+    }
+
     let cli = cli::Cli::parse();
 
     let filter = || {

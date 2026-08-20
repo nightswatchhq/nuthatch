@@ -34,6 +34,7 @@ pub mod factory;
 pub mod flags;
 pub mod graft;
 pub mod health;
+pub mod help;
 pub mod indexer;
 pub mod ipfs;
 pub mod labels;

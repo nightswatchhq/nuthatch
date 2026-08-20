@@ -27,14 +27,27 @@ pub enum LogFormat {
     Json,
 }
 
+// Declaration order is display order (clap's default `disp_ord` is the order `.subcommand()` is
+// called in), and that's what `nuthatch --help` groups by (#674): CORE first (the `init` → `dev` →
+// `sql` happy path), then OPERATING, SCALED, COMPLIANCE, ADVANCED - enterprise breadth stays, but
+// ranks behind the two-command story instead of interleaved with it by age. `src/help.rs::GROUPS`
+// is the heading assignment; `cli::tests::every_visible_subcommand_has_exactly_one_help_group`
+// fails the build if a new variant lands here without a matching entry there.
 #[derive(Subcommand)]
 pub enum Command {
+    // --- CORE: the happy path, init -> dev -> sql -> mcp. ---
     /// Scaffold an indexer for a contract: resolve its ABI and write a project here.
     Init(InitArgs),
     /// Add another contract to an existing nest - resolve its ABI and grow the config, no re-init.
     Add(AddArgs),
     /// Run the indexer: poll logs, store entities, and serve the API.
     Dev(DevArgs),
+    /// Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table.
+    Sql(SqlArgs),
+    /// Serve the Model Context Protocol over stdio (bridges to a running `nuthatch dev`).
+    Mcp(McpArgs),
+
+    // --- OPERATING: running and maintaining a nest you already have. ---
     /// Serve a nest without indexing it (RFC-0022 slice 3).
     ///
     /// The query-FE half of scaled mode: it answers entity reads and SQL from state a *writer*
@@ -42,6 +55,20 @@ pub enum Command {
     /// needs `--hot-store`; without it this still serves the nest's local redb, but exclusively -
     /// see `--hot-store`'s own help.
     Serve(ServeArgs),
+    /// Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC
+    /// batch size, and archive depth - and print the largest safe `--window`. Each of those limits
+    /// otherwise surfaces mid-backfill as a retry loop that looks like slowness.
+    Doctor(DoctorArgs),
+    /// Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected results.
+    Check(CheckArgs),
+    /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
+    /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so
+    /// the schema and the derived `*_dec` columns match the tables the config now produces.
+    Schema(SchemaArgs),
+    /// Benchmark the indexing pipeline (measure first, optimise second - RFC-0004).
+    Bench(BenchArgs),
+
+    // --- SCALED: the docker-compose writer-pool / control-plane topology (RFC-0022). ---
     /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
     /// take cursor leases, index what this worker is assigned.
     ///
@@ -53,24 +80,8 @@ pub enum Command {
     /// Writes *desired state* only. Workers reconcile against it on their own tick - nothing here
     /// commands a worker or waits for one.
     Control(ControlArgs),
-    /// Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table.
-    Sql(SqlArgs),
-    /// Run a WASM transform component over a project's stored transfers.
-    Transform(TransformArgs),
-    /// Serve the Model Context Protocol over stdio (bridges to a running `nuthatch dev`).
-    Mcp(McpArgs),
-    /// Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected results.
-    Check(CheckArgs),
-    /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
-    /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so
-    /// the schema and the derived `*_dec` columns match the tables the config now produces.
-    Schema(SchemaArgs),
-    /// Benchmark the indexing pipeline (measure first, optimise second - RFC-0004).
-    Bench(BenchArgs),
-    /// Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC
-    /// batch size, and archive depth - and print the largest safe `--window`. Each of those limits
-    /// otherwise surfaces mid-backfill as a retry loop that looks like slowness.
-    Doctor(DoctorArgs),
+
+    // --- COMPLIANCE: the labeling/screening/audit substrate (RFC-0008). ---
     /// Manage labeled address sets - the compliance annotation substrate (RFC-0008 C1).
     Labels(LabelsArgs),
     /// Manage sanctions/watch lists as content-addressed snapshots (RFC-0008 C2).
@@ -82,14 +93,18 @@ pub enum Command {
     Pack(PackArgs),
     /// Audit the compliance annotations: `replay` re-proves them, `report` summarises them (C6).
     Audit(AuditArgs),
-    /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
-    Nest(NestArgs),
+
+    // --- ADVANCED: authoring extras, packaging, and one-off dataset lifecycle. ---
     /// Derive-first recipes (RFC-0023): add a view that computes a read (e.g. `total_supply`) from
     /// indexed events instead of fetching it with an `eth_call`. No archive node, deterministic, free.
     Recipe(RecipeArgs),
     /// Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-0023 tier 2). Called
     /// once (they never change) and remembered in `metadata.json`; the constants tier 1 can't derive.
     Metadata(MetadataArgs),
+    /// Run a WASM transform component over a project's stored transfers.
+    Transform(TransformArgs),
+    /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
+    Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
     /// and `roost.toml` becomes `mounts.toml` (RFC-0032).
     ///
@@ -102,10 +117,55 @@ pub enum Command {
     /// exists to avoid, so unmount/remount is free. This is the explicit way to get the disk back.
     /// It LISTS by default; `--yes` is what deletes.
     Prune(PruneArgs),
+
     /// Regenerate the builder skill's machine-generated references from clap metadata (RFC-0017).
     /// Hidden: a dev/authoring tool, not part of the user-facing two-command story.
     #[command(hide = true)]
     SkillRefs,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The grouping in `src/help.rs::GROUPS` must cover exactly the visible subcommands declared
+    /// above - no more (a stale name after a rename/removal), no fewer (a new variant nobody sorted
+    /// into a heading, which would otherwise fall through render_top_level_help's "unheaded" bucket
+    /// silently instead of failing a build). This is the "grouping does not silently drift" gate
+    /// #674 asked for.
+    #[test]
+    fn every_visible_subcommand_has_exactly_one_help_group() {
+        let cmd = Cli::command();
+        let visible: Vec<&str> = cmd
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name())
+            .collect();
+
+        for name in &visible {
+            let memberships = crate::help::GROUPS
+                .iter()
+                .filter(|(_, names)| names.contains(name))
+                .count();
+            assert_eq!(
+                memberships, 1,
+                "`{name}` is a visible subcommand but appears in {memberships} help groups (want exactly 1) - update src/help.rs::GROUPS"
+            );
+        }
+
+        let grouped_count: usize = crate::help::GROUPS
+            .iter()
+            .map(|(_, names)| names.len())
+            .sum();
+        assert_eq!(
+            grouped_count,
+            visible.len(),
+            "src/help.rs::GROUPS lists {grouped_count} commands but {} are visible - a group entry \
+             names a command that no longer exists",
+            visible.len()
+        );
+    }
 }
 
 #[derive(Args)]
