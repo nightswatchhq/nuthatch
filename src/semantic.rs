@@ -639,6 +639,80 @@ mod tests {
         );
     }
 
+    /// #655 is an issue about a *number* - a correct nest opened with 38 warnings because renaming
+    /// two aliases orphaned every `semantic.toml` table key. The single-table case above cannot see
+    /// that: with one orphan, "collapsed to one warning" and "one warning per table" are the same
+    /// output, and the count reads `1` however it was computed. This pins the collapse and the
+    /// count on a many-table alias, which is the shape the issue actually reported.
+    ///
+    /// Mutation check: replacing the counter with `alias_orphans.insert(alias.to_string(), 1)`
+    /// leaves every other test in this module green and reds this one on the count.
+    #[test]
+    fn a_renamed_alias_collapses_to_one_warning_carrying_the_real_table_count() {
+        let schema = vec![transfer_table()];
+        let mut sem = Semantic::default();
+        // Four tables orphaned under one renamed alias, plus two under a second.
+        for t in ["swap", "mint", "burn", "collect"] {
+            sem.tables
+                .insert(format!("oldpool__{t}"), TableSemantic::default());
+        }
+        for t in ["deposit", "withdraw"] {
+            sem.tables
+                .insert(format!("oldvault__{t}"), TableSemantic::default());
+        }
+
+        let warnings = drift(&schema, &sem);
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "six orphaned tables under two renamed aliases must yield one warning each, got: \
+             {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("4 tables") && w.contains("`oldpool`")),
+            "the warning must carry the real table count, not a placeholder: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("2 tables") && w.contains("`oldvault`")),
+            "each renamed alias needs its own count: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("oldpool__swap")),
+            "no per-table warning may survive the collapse: {warnings:?}"
+        );
+    }
+
+    /// The singular branch of the same message. One orphaned table under a renamed alias must read
+    /// "1 table", not "1 tables" - the operator-facing string is the whole deliverable of #655.
+    #[test]
+    fn a_single_orphan_under_a_renamed_alias_reads_as_one_table_singular() {
+        let schema = vec![transfer_table()];
+        let mut sem = Semantic::default();
+        sem.tables
+            .insert("oldpool__swap".into(), TableSemantic::default());
+
+        let warnings = drift(&schema, &sem);
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("1 table still"),
+            "singular must read `1 table`: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("1 tables"),
+            "singular must not read `1 tables`: {warnings:?}"
+        );
+    }
+
     #[test]
     fn footguns_survive_a_toml_round_trip() {
         let fg = Footguns {
