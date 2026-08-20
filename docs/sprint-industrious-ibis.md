@@ -37,9 +37,18 @@ into work, and settle the one number that stands against the parity claim.
 ### 1. #659 - what `curatorCount` actually counts
 
 **The headline, and the only one with a thesis attached.** RFC-0038's acceptance criterion is one
-sentence: *acceptance is a real port diffed against the gateway, because parity is the claim.* The
-one port we have reconciles exactly on two fields of fourteen, within 0.03% on three, and is
-materially wrong on nine. `curatorCount` reads **50** against the gateway's **1,819**.
+sentence: *acceptance is a real port diffed against the gateway, because parity is the claim.* It has
+been met once and missed once. RFC-0038 §6b records **343 Uniswap V3 swaps row-for-row identical to
+the gateway**, which is a clean pass and the reason the claim was published at all.
+
+The `network-snapshot` port is the other one. It reconciles exactly on two fields of fourteen, within
+0.03% on three, and is materially wrong on nine. `curatorCount` reads **50** against the gateway's
+**1,819**.
+
+*(Corrected 2026-08-20, before this brief landed on `main`: the first draft said the criterion was
+unmet and that the snapshot was the only port we had. §6b was already there and the board had not
+read that far. The item below is unchanged - one clean port and one that disagrees is exactly the
+state that makes the disagreement worth explaining.)*
 
 This is not missing data. `curation__signalled` has full history and the signal *total* is 3.8% out
 while the distinct-curator count is 36x out, because most L2 signal routes through GNS and the

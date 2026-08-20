@@ -36,6 +36,10 @@ const LAST_BLOCK_KEY: &str = "last_block";
 /// half without the column. The declaration is an `init`-time one precisely because it cannot be
 /// changed in place; this key is what enforces that rather than merely documenting it.
 const TIMESTAMPS_KEY: &str = "block_timestamps";
+/// The decode registry that produced this store's rows (#653). Not the same question as
+/// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
+/// configuration, which is what a nest's content address is a statement about.
+const REGISTRY_KEY: &str = "registry_hash";
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -1835,6 +1839,7 @@ async fn build_nest(
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
+    guard_registry_identity(store.as_ref(), &hex::encode(registry.hash()))?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2307,6 +2312,42 @@ const FACTORY_FLIP_THRESHOLD: usize = 500;
 /// which is correct because before this existed every nest indexed timestamps and the default is
 /// `true`. A pre-existing nest that *declares* `false` is the one case worth catching, and the
 /// `has_indexed` check below is what catches it: an empty store has nothing to contradict.
+/// Refuse to serve rows under a decode registry that did not produce them (#653).
+///
+/// A nest's `registry_hash` is the claim "this data was produced by this decode configuration", and
+/// `blob.rs` already takes it seriously - a packed nest records its expected hash and `mount`
+/// regenerates and verifies it. The ordinary `dev --dir <dir>` path did not, so adding an event to an
+/// existing nest was **silent**: the nest started, found itself already at tip, indexed nothing, and
+/// then stamped the *new* hash onto every query's provenance. Measured: a hash went from
+/// `0xa265740366…` to `0xe3de2aa16d…` with zero events indexed and no warning, the only symptom being
+/// an unrelated view failing to load because it happened to reference one of the new tables. A change
+/// touching tables no view references would have said nothing at all.
+///
+/// Same reasoning as the `--seal-direct` refusal for declared calls (RFC-0038 §6e): a run that
+/// quietly produces a table with no rows is worse than a run that refuses.
+fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &str) -> Result<()> {
+    match store.get_meta(REGISTRY_KEY)? {
+        Some(found) if found != registry_hash => anyhow::bail!(
+            "this nest's stored data was indexed by a different decode registry.\n\n               stored:  0x{found}\n  config:  0x{registry_hash}\n\n             The registry hash covers every contract, event and column this nest decodes, so a              difference means `nuthatch.toml` or an ABI changed after the data was written.              Continuing would serve old rows under a new content address, and any table added by the              change would read as empty rather than as absent.\n\n             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and              `segments/`), or restore the previous configuration to keep serving this data. A nest              whose identity changed is a different nest - that is what content addressing means."
+        ),
+        Some(_) => Ok(()),
+        None => {
+            // Absent means one of two things and they must not be conflated: a fresh store, or a
+            // store written by a build from before this guard existed. Refusing the second would
+            // break every deployment on upgrade for a fault none of them necessarily have, so it
+            // adopts - but says so when there are already rows, because an adopted hash is a claim
+            // nobody verified and it should not read like one that was.
+            if store.get_meta(LAST_BLOCK_KEY)?.is_some() {
+                tracing::warn!(
+                    "adopting registry hash 0x{registry_hash} for a store that predates the identity                      check (#653) - it was recorded, not verified. If this nest's configuration has                      changed since it was indexed, re-index it."
+                );
+            }
+            store.set_meta(REGISTRY_KEY, registry_hash)?;
+            Ok(())
+        }
+    }
+}
+
 fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) -> Result<()> {
     let want = if declared { "1" } else { "0" };
     match store.get_meta(TIMESTAMPS_KEY)? {
@@ -7263,6 +7304,56 @@ template = "pool"
         );
     }
 
+    /// #653. A store must not serve rows under a registry that did not produce them.
+    ///
+    /// Three states, because only asserting the refusal would leave the two accepting paths free to
+    /// break silently - and "accepts everything" is exactly what the bug was.
+    #[test]
+    fn a_store_refuses_a_registry_that_did_not_produce_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+
+        // 1. Fresh store: adopts, and records what it adopted.
+        guard_registry_identity(&store, "aaaa").expect("a fresh store adopts");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("aaaa"),
+            "the adopted hash must be recorded, or the next start adopts again and never compares"
+        );
+
+        // 2. Same registry: still fine.
+        guard_registry_identity(&store, "aaaa").expect("an unchanged registry must be accepted");
+
+        // 3. Different registry: refused, and the message must name both hashes - a refusal that
+        //    does not say what changed sends the operator to the source to find out.
+        let err = guard_registry_identity(&store, "bbbb")
+            .expect_err("a changed registry must be refused, not adopted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
+        assert!(msg.contains("bbbb"), "must name the config hash: {msg}");
+    }
+
+    /// The upgrade path, which is the half that is easy to get wrong in the other direction: a store
+    /// written before this guard existed has no recorded hash, and refusing it would break every
+    /// running deployment on upgrade for a fault it may well not have. It adopts instead.
+    #[test]
+    fn a_store_predating_the_guard_adopts_rather_than_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        // Rows already indexed, no registry hash recorded - exactly an older nest's store.
+        store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
+        assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
+
+        guard_registry_identity(&store, "cccc").expect("an older store must not be refused");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("cccc")
+        );
+        // And having adopted, it is now held to it.
+        guard_registry_identity(&store, "dddd")
+            .expect_err("once adopted, a later change must be refused");
+    }
+
     #[async_trait::async_trait]
     impl Source for MockSource {
         async fn tip(&self) -> Result<u64> {
@@ -9497,6 +9588,83 @@ rpc_urls = ["https://rpc.example"]
         widest: std::sync::atomic::AtomicU64,
     }
 
+    /// A provider with a hard `eth_getLogs` **range** cap, which refuses an over-wide range the way
+    /// the public mainnet endpoints actually do (#672): with a rate-limit-shaped error, not a
+    /// "range too large" one that `is_result_too_large` recognises.
+    ///
+    /// That distinction is the whole point. Alchemy answers an oversized range with a message naming
+    /// its 10,000-block cap, which the chunker understands and halves for. `eth.drpc.org`,
+    /// `eth-pokt.nodies.app` and `eth.api.onfinality.io/public` answer HTTP 429 or 403 under the same
+    /// conditions, and that says nothing about width. This reproduces the second case with no network
+    /// in it, so the cost is a fixed number instead of a sample from a distribution that spanned 2 to
+    /// 198 events across four identical 90-second runs.
+    ///
+    /// Distinct from [`CappedSource`], which refuses on *filter* breadth for the COR-5 path.
+    /// How many width refusals a healthy caller should need to find its way under a cap. Generous:
+    /// halving from 16,000 to under 10,000 is one step.
+    const REFUSAL_GIVE_UP: usize = 50;
+
+    struct RangeCappedSource {
+        logs: Vec<crate::rpc::Log>,
+        /// Widest range this provider will serve, in blocks.
+        cap: u64,
+        served: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+        widest_attempted: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RangeCappedSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let width = to - from + 1;
+            self.widest_attempted
+                .fetch_max(width, std::sync::atomic::Ordering::SeqCst);
+            if width > self.cap {
+                let n = self
+                    .refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                // A real provider refuses indefinitely under sustained load, and so did this one -
+                // which made the test hang rather than fail. A hang is a worse test than a failure:
+                // it reports nothing. So the fake gives up after a bound, turning "never terminates"
+                // into a number the assertion can name.
+                if n > REFUSAL_GIVE_UP {
+                    anyhow::bail!(
+                        "gave up after {n} refusals - the caller never narrowed below {width} \
+                         blocks against a {} block cap",
+                        self.cap
+                    );
+                }
+                anyhow::bail!("HTTP 429 Too Many Requests: rate limited");
+            }
+            self.served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Source for RequestCountingSource {
         async fn tip(&self) -> Result<u64> {
@@ -9527,6 +9695,80 @@ rpc_urls = ["https://rpc.example"]
         ) -> Result<std::collections::HashMap<u64, u64>> {
             Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
         }
+    }
+
+    /// #676 / #672. What the flagship first run *costs*, as a fixed number.
+    ///
+    /// The shape of the real thing: a contract with a long empty prefix, behind a provider that caps
+    /// `eth_getLogs` at 10,000 blocks - Alchemy's documented limit - and refuses anything wider with a
+    /// 429 rather than a width complaint. The chunker grows 4x per empty window, so it *will* walk
+    /// into the cap; the question this pins down is how much it wastes discovering that, and whether
+    /// it learns.
+    ///
+    /// This exists because the same measurement over the network could not be made: four identical
+    /// 90-second runs of the real demo indexed 2, 15, 28 and 198 events. No fix can be evaluated
+    /// against a spread like that, and no regression can hide from a number like the one below.
+    ///
+    /// The assertion is deliberately loose - it pins the *order of magnitude* of the waste, not the
+    /// exact count, so ordinary retuning of the growth factor does not fail it while a return to
+    /// unbounded retrying does.
+    /// **Ignored because it does not currently terminate**, which is the finding rather than a flaw
+    /// in the test. Un-ignore it with the fix for #672: it passes when the caller learns a width the
+    /// provider has refused, and hangs until then. A red test cannot be merged and a hanging one is
+    /// worse, so it is parked here in a form that can be run on demand:
+    ///
+    /// ```sh
+    /// cargo test --lib the_cost_of_a_first_run -- --ignored --nocapture
+    /// ```
+    #[ignore = "reproduces #672: the backfill never narrows below a refused width, so this hangs"]
+    #[tokio::test]
+    async fn the_cost_of_a_first_run_behind_a_capped_provider_is_a_fixed_number() {
+        let reg = transfer_registry();
+        let src = RangeCappedSource {
+            // A late-deployed contract: 200,000 empty blocks, then two logs.
+            logs: ping_logs(&reg, &[199_998, 199_999]),
+            cap: 10_000,
+            served: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::atomic::AtomicUsize::new(0),
+            widest_attempted: std::sync::atomic::AtomicU64::new(0),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let addresses = vec!["0x1111111111111111111111111111111111111111".to_string()];
+
+        let rows = backfill_direct_pipelined(
+            &src,
+            &reg,
+            dir.path(),
+            &addresses,
+            &[],
+            0,
+            199_999,
+            1_000,
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let served = src.served.load(std::sync::atomic::Ordering::SeqCst);
+        let refused = src.refused.load(std::sync::atomic::Ordering::SeqCst);
+        let widest = src
+            .widest_attempted
+            .load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("first-run cost: served={served} refused={refused} widest_attempted={widest}");
+
+        assert_eq!(rows, 2, "it must still find the logs it was looking for");
+        assert!(
+            refused < served,
+            "more requests were refused than served ({refused} refused, {served} served) - the \
+             chunker is spending most of the run discovering a cap it already walked into"
+        );
+        assert!(
+            refused <= 12,
+            "{refused} refusals to cross a 200k-block prefix behind a 10k cap. Each one is a round \
+             trip that returned nothing, and against a real endpoint each carries a backoff"
+        );
     }
 
     /// **The RFC-0029 §6f case.** A long empty prefix at a fixed window costs one request per window
