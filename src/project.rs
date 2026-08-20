@@ -2107,9 +2107,9 @@ dataSources:
     }
 
     /// #675: a Sourcify resolve used to print through a raw `tracing::info!` line (ISO timestamp, log
-    /// level, ANSI codes) crashing through the `→`/`✓` pretty output. It now prints only the tick -
-    /// asserting the tick is *present*, not just that the old line is gone, so a regression that drops
-    /// the resolver name entirely (rather than moving it) still fails this test.
+    /// level, ANSI codes) crashing through the `→`/`✓` pretty output. It now prints only the tick.
+    /// Covers `abi_resolved_lines`'s formatted wording only - not that `resolve_abi` calls it, so a
+    /// regression that drops the call site entirely would still pass this test.
     #[test]
     fn abi_resolved_lines_sourcify_is_a_single_clean_tick() {
         let resolved = abi::Resolved {
