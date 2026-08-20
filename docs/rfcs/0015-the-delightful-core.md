@@ -1,6 +1,6 @@
 # RFC-0015: The delightful core - CLI/UX for the solo dev
 
-- Status: Draft (v1) - the 0.5 theme. Slice 1 (`nuthatch sql` REPL) shipped; slices 2-6 in progress.
+- Status: **Implemented** - the 0.5 theme; all 6 slices shipped (REPL, magical init, live feedback, `add`, MCP one-liner, prod recipes).
 - Author: Pete (cargopete)
 - Date: 2026-07-18
 - Depends on: nothing new - this is polish over the 0.1-0.4 capabilities, which are all shipped.

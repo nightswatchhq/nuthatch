@@ -1,6 +1,6 @@
 # RFC-0017: The builder skill - teaching coding agents to drive nuthatch
 
-- Status: Draft (v1)
+- Status: **Implemented** (generated CLI ref + drift-checked authored skill; authoring eval pending a keyed run)
 - Author: Pete (cargopete)
 - Date: 2026-07-19
 - Depends on: RFC-0016 (Draft - the semantic layer this skill co-reads, and the eval harness it

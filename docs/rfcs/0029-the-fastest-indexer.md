@@ -1,6 +1,6 @@
 # RFC-0029: The fastest indexer - a backfill that finishes, then one that flies
 
-- Status: **Draft** (2026-07-29)
+- Status: **Implemented** (v0.8.2-v0.9.0; all 5 slices)
 - Author: Pete (cargopete)
 - Date: 2026-07-29
 - Depends on: RFC-0004 (the bench harness and the adaptive chunker), RFC-0028 (range control - §3 below

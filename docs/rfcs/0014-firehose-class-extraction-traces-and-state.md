@@ -1,6 +1,6 @@
 # RFC-0014: Firehose-class extraction - traces and state diffs via ExEx
 
-- Status: **Slice 0 implemented (2026-07-29); extraction still deferred on RFC-0003**
+- Status: **Draft** (deferred) - slice 0 implemented (2026-07-29); extraction itself still deferred on RFC-0003
 - Author: Pete (cargopete)
 - Date: 2026-07-17
 - Depends on: RFC-0003 (the ExEx execution-time source this reads from - the hard

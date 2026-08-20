@@ -1,6 +1,6 @@
 # RFC-0035: The 2.0 breaking surface - one migration, batched deliberately
 
-- Status: **Draft** (2026-08-04)
+- Status: **Implemented** (v2.0.0, 2026-08-06)
 - Author: Pete (cargopete)
 - Date: 2026-08-04
 - Depends on: RFC-0032 (retiring the roost - the reason 2.0 exists at all), RFC-0033 §9 (removal of

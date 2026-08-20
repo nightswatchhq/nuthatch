@@ -1,9 +1,9 @@
 # RFC-0031: Optimism and Polygon - the two chains that fail in opposite ways
 
-- Status: **Parked** (2026-08-04; drafted 2026-08-03)
+- Status: **Optimism implemented, Polygon shipped but not yet trustworthy** - both registered in `chains.rs` (#646, 2026-08-19). Drafted 2026-08-03 and parked 2026-08-04; issue #274 (Polygon) stays open and parked, because its own acceptance bar, a sustained live cursor, was never run.
 - Author: Pete (cargopete)
 - Date: 2026-08-03
-- Parked because: a deliberate priority call. Tracked as issues #274 (Polygon) and #275 (Optimism).
+- Parked because (history - this held from 2026-08-04 until both chains were registered on 2026-08-19; #275 has since closed, #274 has not): a deliberate priority call. Tracked as issues #274 (Polygon) and #275 (Optimism).
   Note the two chains are parked for *different* reasons and only one of them is ours to unpark:
   Polygon waits on us building `Finality::Depth` trust (§3), while **Optimism is blocked externally**
   on there being a second endpoint that clears the bar - of ten probed, one qualified. Unparking
