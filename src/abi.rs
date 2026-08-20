@@ -4,16 +4,30 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-/// Resolve a contract ABI. Returns the ABI as a JSON array on success.
-pub async fn resolve(chain_id: u64, address: &str) -> Result<Value> {
+/// An ABI plus which resolver produced it, so a caller with a presentation layer (`init`/`add`'s
+/// pretty printer) can say which one won without a `tracing` line crashing through its output -
+/// see #675. `fallback_reason` is set only when Sourcify was tried and missed before Etherscan won.
+pub struct Resolved {
+    pub abi: Value,
+    pub via: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+/// Resolve a contract ABI: Sourcify first, Etherscan as a keyed fallback.
+pub async fn resolve(chain_id: u64, address: &str) -> Result<Resolved> {
     match sourcify(chain_id, address).await {
-        Ok(abi) => {
-            tracing::info!("ABI resolved via Sourcify");
-            Ok(abi)
-        }
+        Ok(abi) => Ok(Resolved {
+            abi,
+            via: "Sourcify",
+            fallback_reason: None,
+        }),
         Err(e) => {
-            tracing::warn!("Sourcify miss ({e:#}); trying Etherscan");
-            etherscan(chain_id, address).await
+            let abi = etherscan(chain_id, address).await?;
+            Ok(Resolved {
+                abi,
+                via: "Etherscan",
+                fallback_reason: Some(format!("{e:#}")),
+            })
         }
     }
 }
@@ -60,9 +74,7 @@ async fn etherscan(chain_id: u64, address: &str) -> Result<Value> {
         .json()
         .await
         .context("Etherscan response was not JSON")?;
-    let abi = parse_etherscan(&body)?;
-    tracing::info!("ABI resolved via Etherscan");
-    Ok(abi)
+    parse_etherscan(&body)
 }
 
 /// The ABI out of an Etherscan v2 response body - split from the request so it is testable against
