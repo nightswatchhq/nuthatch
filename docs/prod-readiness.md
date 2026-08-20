@@ -3,7 +3,7 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [issue queue](https://github.com/nightswatchhq/nuthatch/issues), and
-[CI](../.github/workflows/ci.yml) on **2026-08-06** (repo at `2.0.0`).
+[CI](../.github/workflows/ci.yml) on **2026-08-20** (repo at `2.6.0`).
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
@@ -26,7 +26,7 @@ guide. Both are green as of 2026-08-06. A checklist nobody re-reads decides what
 | 🟡 | Partial - exists but incomplete, unverified, or narrow |
 | ⛔ | Not started, deferred, or blocked (see "Blocked on") |
 
-**The flag is the status; the `[ ]` box beside it means nothing.** 63 rows here read `- [ ] ✅` -
+**The flag is the status; the `[ ]` box beside it means nothing.** 66 rows here read `- [ ] ✅` -
 done and verified, in an unchecked box - because the boxes were never maintained. GitHub renders
 them as a page of empty checkboxes regardless, so a reader skimming the ticks rather than the flags
 reads this document as far worse than it is. Two rows carry `[x]`, which makes the boxes look
@@ -52,9 +52,10 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   `dev` → live API, no Postgres/Docker/IPFS. - *CI builds the release binary; footprint job runs the
   real `init → dev` path.*
 - [ ] ✅ **Footprint ≤ 2 GB RAM** for a single-chain runtime, CI-enforced. - *`footprint.sh` gate, 256 MB
-  ceiling, measured ~37 MB. The CI scenario is only `--backfill 200` on one nest, so the *dense
-  multi-nest runtime at tip* was measured out-of-band instead: 8 nests on one cursor peaked at 89 MB at
-  tip, 4% of budget - see §5. Wiring that density into the gate itself is still open (§3).*
+  ceiling, measured ~37 MB, for the single-nest backfill tripwire. The dense-multi-nest-at-tip case is
+  now its own **required** CI gate too - `per-cursor RAM budget (dense multi-nest)`, 20 nests on one
+  cursor against the 2048 MB budget, mutation-checked (§3/§5, #284/#391). Two ceilings, two scenarios,
+  neither subsumes the other.*
 - [ ] ✅ **No phone-home.** No telemetry, no mandatory tokens, AI degrades offline. - *Verify per
   release: grep for outbound calls not gated behind explicit user config / BYO-key.*
 - [ ] ✅ **Determinism in the core.** Decode, reorg, entity derivation re-executable; no LLM output in
@@ -70,7 +71,11 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 
 - [ ] ✅ Deterministic decode: topic0-keyed, contract-ABI priority with generic fallback. *(RFC-0001)*
 - [ ] ✅ ABI acquisition Sourcify → Etherscan-class, cached locally.
-- [ ] ✅ Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve.
+- [ ] 🟡 Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve. -
+  *The no-retroactive-re-decode half holds. The versioning half has one narrow gap open and tracked:  **[#653]**
+  a nest whose config **gains** events keeps running on data indexed under the old config and stamps
+  the new `registry_hash` on it anyway - the version tag lies about what actually decoded those rows.
+  A fix exists on an unmerged branch; not credited here.*
 - [ ] ✅ Golden/deterministic tests per handler and view (fixed fixtures in → exact state out).
 - [ ] ✅ Property tests: random reorg depths converge to canonical state (`e2e_reorg.rs`).
 - [ ] ✅ Nest invariant/parity checks (`nuthatch check`) run hermetically in CI against committed
@@ -79,8 +84,12 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   Arbitrum: two nests indexed solo and again behind one shared cursor over the same 2,400-block range,
   compared table by table - **20 tables, 17,108 rows, byte-identical**, including empty tables and the
   topic0-disambiguated `weth__transfer_ddf2`/`_e192` pair.*
-- [ ] 🟡 Factory / dynamic-contract discovery correctness at scale. - *Implemented (0009); child  **[#297]**
-  `end`/expiry conditions and wildcard-address decode still open.*
+- [ ] 🟡 Factory / dynamic-contract discovery correctness at scale. - *Implemented (0009). The getLogs-  **[#271]**
+  cap recovery this row used to name as the open risk shipped and closed real: a factory nest that  **[#272]**
+  crosses the cap no longer dies permanently, it recovers via an address-filtered refetch (`#297`,
+  `6412ee5`, commit-backed close - not a bare issue-close). What is still open is different: the
+  discovered-child watch-set is unbounded, with no `end`/expiry condition (**#271**), and wildcard-
+  address decode is unimplemented (**#272**). Both OPEN, zero commits against either.*
 
 ## 2. Reliability, reorgs & crash safety
 
@@ -104,7 +113,9 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   provider no longer costs a request-timeout on every round-robin hit), the tip loop retries the same
   window (no silent gaps), and a stall is now **loud**: `nuthatch_last_poll_unixtime` in `/metrics`, an
   escalating tip-loop log (warn on the first miss → error every ~60 s of "all endpoints unreachable →
-  STALLED"), and `/ready` returns 503 once no poll has succeeded within 90 s (§7).*
+  STALLED"), and `/ready` returns 503 once no poll has succeeded within 90 s (§7). `/ready` now also
+  catches a second, distinct failure shape: a **wedged** cursor that keeps polling successfully but
+  makes no block progress, not just a dead one (`#578`, `804249f`, 2026-08-14).*
 
 ## 3. Performance & footprint budgets
 
@@ -114,13 +125,26 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 - [ ] ✅ Backfill throughput bench exists and is reproducible (`nuthatch bench backfill`). - *Floor
   ≥10K events/sec, aim 30K.*
 - [ ] 🟡 A **published, current** backfill number for the release commit on reference hardware. -  **[#285]**
-  *Re-run per release; don't ship a stale figure.*
+  *Still open, and the existing artifact is worse than "stale": `docs/bench/obib-case1.json`
+  (3,934.59 events/sec, 2026-07-30) cites commit `707e1af`, which is not a valid object in this repo -
+  unreproducible, not just old - and its own number sits under this file's own "floor ≥10K events/sec"
+  a few lines up. Needs a fresh run pinned to a real 2.6.0 SHA.*
 - [ ] ⛔ Tip-lag benchmark (notification → row queryable) as a tracked number. - *Meaningful number  **[#282]**
   needs ExEx. **Blocked on:** reth node (0003).*
-- [ ] 🟡 Entity point-read p50/p99 bench tracked across releases (regressions fail the build).  **[#283]**
-- [ ] 🟡 Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest  **[#284]**
-  `--backfill 200`. - *The density itself is now measured (§5); what is missing is the **gate** - a
-  one-off run does not catch the release that regresses it.*
+- [ ] ✅ Entity point-read p50/p99 bench tracked across releases, `point-read latency` a **required**  **[#283]**
+  CI context. - *Landed PR #375 (`ef3b619`). Both gaps its own discussion left open are since closed
+  with real evidence: the gate's fixture was a near-empty 256-row store that a 32-core dev-box and a
+  4-core runner couldn't tell apart - re-pointed at the same dense-multi-nest fixture §5/#284 uses,
+  mutation re-measured at 87x above ceiling (was 1.8x) (**#424**, PR #455, `03d296b`). And the
+  committed baseline was dev-box hardware (p50 1.24µs) enforced on 4-core runner numbers (0.59-0.82µs)
+  - `docs/bench/point-read.json` is now a runner-produced artifact, not a ported one (**#385**, PR
+  #451, `00249d9`).*
+- [ ] ✅ Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest  **[#284]**
+  `--backfill 200`. - *`per-cursor RAM budget (dense multi-nest)` is a **required** CI context: 20
+  nests on one cursor, the real 10-event Uniswap V4 ABI, 200 blocks live tip-following, two ceilings
+  (2048 MB budget, 180 MB regression band from 8 runs). Mutation-checked against six cases including a
+  synthetic 2.4x leak caught at 323 MB with 1.7 GB of budget headroom still unused - the case a
+  budget-only ceiling cannot see. PR #391, `76fa504`, 2026-08-10.*
 - [ ] ✅ Regressions fail the build (benchmarks-as-gates principle established). - *Extend coverage as
   the benches above land.*
 
@@ -142,20 +166,35 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 - [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).  **[#289]**
   `reject_file_access` is the only control stopping a file read, so the file-access defence is one layer
   deep, not two. A tripwire test fails if a future bump makes the layer real. *Re-check on every duckdb
-  bump.*
+  bump. Still true today (`duckdb`/`libduckdb-sys` unchanged at `1.10504.0`; the tripwire test still
+  asserts `reject_file_access` is the sole control). The issue itself closed 2026-08-11 with nothing
+  behind it - no commit, no PR, its one comment is an unrelated sprint-allocation note - the same
+  pattern #286 was caught in. The row is accurate regardless; the `[#289]` citation is not.*
 - [ ] ✅ `/sql` surface is structurally read-only (single-writer + read-only attach).
 - [ ] ✅ A security review pass on the **serving surface** (`serve.rs`, `mcp.rs`, `webhooks.rs`,
   `analytics.rs`, `abi.rs`, `rpc.rs`) - *done (0.5.x hardening): no criticals; SQL read-only gate holds
   three-deep, no SSRF (ABI/RPC hosts are fixed constants), no file-read via `/sql`. Fixed: `/nest`
   webhook-URL disclosure, `/sql` error path-scrub, `screen_status` quote-escape, constant-time admin
   token, concurrent webhook delivery. Re-run per release on the diff.*
-- [ ] 🟡 Bind/exposure defaults are safe. - *`dev` binds `127.0.0.1` by default; off-localhost it warns  **[#292]**
-  loudly that the data surface has NO auth (the gateway's job). Confirmed by the review; the one control
-  a fronting gateway must enforce is auth on **every** route, not just `/_admin`.*
+- [ ] ✅ Bind/exposure defaults are safe, admin surface hardened end to end. - *`dev` binds `127.0.0.1`  **[#292]**
+  by default; off-localhost the admin surface requires `NUTHATCH_ADMIN_TOKEN` and is **unmounted**, not
+  merely refused, without it (#412). A hardcoded `NUTHATCH_ADMIN_TOKEN=change-me` shipped in both deploy
+  recipes and was live/exploitable, not theoretical - the Docker image's `CMD` binds `0.0.0.0:8288` -
+  removed in #398. Query-FE derives its admin credential like every other role (#389); the control-API
+  token guard moved to the route layer so a new route cannot forget it (#420); the admin surface is
+  gated where it claims and discloses nothing extra, pinned on the wire (#418); `sanitize_sql_error`'s
+  gap is pinned as structural rather than a fixture limit (#427/#431). **One item #292 named and left
+  open, now closed on evidence:** the live `/nest` probe against a real provider key, the credential
+  shape no synthetic fixture chooses - run 2026-08-15 against Lodestar's `horizon-nest` (a real key in
+  a 25-character path segment), `/nest` `/` `/health` `/tables` probed for host, path segment and full
+  URL, no match (**#428**).*
 - [ ] ✅ Dependency vulnerability scan (`cargo deny`) wired into CI. - *`deny` job runs advisories +
-  licences + bans + sources against `deny.toml`; the permissive-only licence gate is now enforced. Three
-  transitive advisories ignored with written rationale (quick-xml not-reachable ×2; wasmtime-wasi
-  FilePerms tracked for a runtime bump).*
+  licences + bans + sources against `deny.toml`; the permissive-only licence gate is now enforced. Four
+  transitive advisories ignored with written rationale (quick-xml not-reachable ×2; rkyv shared-pointer
+  validation not-reachable; h2 0.3-line HTTP/2-server DoS not-reachable - we never enable axum's http2
+  feature or run actix as a server). The wasmtime-wasi `FilePerms` bypass this row used to name as
+  "tracked for a runtime bump" is no longer ignored at all - it's fixed, cleared by the wasmtime 44→46
+  bump.*
 - [ ] ✅ Effectful (capability-granted) components can only produce **annotations**, never canonical
   entities - purity checkable from the composition manifest. *(transform layer)*
 
@@ -175,17 +214,20 @@ case.
   **workload**. Those 8 nests were small and at tip; a *single* nest doing a 125M-block backfill on
   the same budget reached 427 MB by itself. Per-nest RSS is dominated by what a nest is *doing*, not
   by how many share a cursor - so read this as "co-tenancy is cheap", never as "a cursor uses 84 MB".
-- [ ] ⛔ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
+- [ ] 🟡 Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
   churn).
-  **Still unproven, and #286 being briefly closed is not evidence that it was.** It was closed as
-  completed on 2026-08-10 with no commit referencing it, no PR closing it and no comment recording a
-  measurement; reopened 2026-08-19 on those grounds. Read the row as written, not as the issue's
-  state implies. **The `per-cursor RAM budget (dense multi-nest)` CI job does not cover this** - it is
-  #284's density fixture, and the qualifier four lines above is the reason: density is not workload.
-  The fixture this needs is Uniswap V4 (~17 events/block on mainnet), which lives in
-  `nightswatchhq/uniswap-v4-ethereum` rather than here, and whatever measures it needs a floor
-  proving it indexed anything, since "RSS stayed under 2 GB" passes most confidently when the
-  workload failed to start.
+  **Half-proven, and #286 being briefly closed was not evidence that it was.** It was closed as
+  completed on 2026-08-10 with no commit referencing it and no comment recording a measurement (a
+  second commit-backed close, PR #391, landed the same day but under a different title and was never
+  cross-referenced against this issue's own thread); reopened 2026-08-19 on those grounds.
+  **The high-event-rate half is now measured, and measured hard**: the `per-cursor RAM budget (dense
+  multi-nest)` CI job (§3/#284) runs the **real 10-event Uniswap V4 `PoolManager` ABI** from
+  `nightswatchhq/uniswap-v4-ethereum` at 200 logs/block - above the 18.7 events/block sampled live
+  against mainnet - across 20 co-located nests, peak 111-243 MB against the 2048 MB budget, mutation-
+  checked. **The ABI-breadth half is not.** Ten events on one contract is high rate on a narrow decode
+  surface, not a large ABI: `graph-staking-nest`'s staking ABI runs 28 events, `SubgraphService` 31 -
+  more decoders, more per-(alias, event) tables, more keyspaces, a different pressure on the hot store
+  than more rows through the same ten tables. This issue's title asks for both; the CI job answers one.
 - [ ] ✅ Long-running soak (23h) with no RSS creep (leak check).
   **Two nests on the Lodestar prod box, 0.7.2, 2026-07-29 → 30.** Final RSS **459 MB** and **427 MB**
   against the 2048 MB per-cursor budget - 22% and 21% - and **flat across repeated samples** at the
@@ -207,6 +249,10 @@ case.
   PR + main.
 - [ ] ✅ Release binary builds `--locked`; footprint gate runs against the built artifact.
 - [ ] ✅ e2e harness exists (`TapeSource`) and covers solo, reorg, crash-safety, multi-nest parity.
+- [ ] ✅ Fuzz smoke on the decode path - `fuzz smoke (decode path)`, a **required** CI context. -
+  *libFuzzer/ASan against malformed ABIs and logs on `nuthatch-decode` (`b20ed5f`, #290). A bounded
+  regression run rather than a real fuzzing campaign - nightly-only (SanitizerCoverage), deliberately
+  off the pinned-1.95.0 toolchain the shipped binary uses.*
 - [ ] ✅ MSRV is honest. - *Fixed at 1.0: `Cargo.toml` now declares `rust-version = "1.95"`, matching
   `rust-toolchain.toml`'s pinned `1.95.0`, so the declared floor is the one that is actually tested. The declared MSRV is not cosmetic: it silently selected DataFusion 48 over 54 during the
   RFC-0013 spike, and cargo reports that as a one-line warning nobody reads.*
@@ -287,7 +333,11 @@ case.
 - [ ] ✅ Ships `llms.txt` / docs-as-MCP / `.claude/skills/` in scaffolded projects.
 - [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#304]**
   `explain`) - *in design, measure-first, not shipped.*
-- [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *in design.*  **[#353]**
+- [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *CLI-flags direction  **[#353]**
+  ships (`cli_reference_names_every_real_flag`, PR #514) but that PR does not touch the gap #353 was
+  narrowed to and closed against by mistake: `CONFIG_SOURCES` in `tests/skill_refs.rs` scans
+  `config.rs`/`semantic.rs`/`runtime.rs` but not `src/allowlist.rs`, so `queries.toml`'s `NamedQuery`/
+  `Ceiling` keys can drift from `config-reference.md` with CI green. Reopened; still real.*
 
 ## 10. Docs & first-run UX
 
@@ -297,7 +347,10 @@ case.
 - [ ] ✅ A single "here's how you run this in production, unattended" guide that ties together
   §7 (ops), §4 (safe exposure), and §8 (upgrades). - *[`operators.md`](operators.md) is it: deploy
   recipes, the division of labour, capacity, what to scrape, what to back up, the stability contract,
-  upgrade notes, known gaps, and a go-live checklist. Written against 2.0.0.*
+  upgrade notes, known gaps, and a go-live checklist. Written against 2.0.0; its own container tags
+  were refreshed for 2.5.0 after being caught five releases stale, with the rest of the document
+  named explicitly as not re-read since - a stated staleness rather than a silent one, but at 2.6.0
+  the gap is now six releases and growing. Not this issue's fix; named for whoever's turn it is.*
 
 ---
 
@@ -367,13 +420,24 @@ Almost everything un-buildable-on-a-laptop traces to one missing box.
 
 ## Bottom line
 
-**Embedded, single-chain, single-nest:** the core (§0-§2, §6) is genuinely strong - this is the
-column that can go to `1.0` first. The honest gaps before you'd point a stranger's workload at it
-unattended are the operational and load ones. Several have since closed - the **dense-runtime RAM proof**
-(§5, measured at 4% of budget), **provider-failure resilience** (§2, RFC-0028), **safe-exposure
-defaults** (§4) and the **unattended-operation runbook** (§7, §10) are done. What is left is time-based
-rather than build-based: a **24h+ soak** for RSS creep and a **sustained parity run** (§1). Neither can
-be shortcut by writing more code, which is the honest reason they are still open.
+**Embedded, single-chain, single-nest:** the core (§0-§2, §6) is genuinely strong, and stronger than
+the last stamp on this file recorded. Since 2.0.0: the **dense-multi-nest RSS gate** is real, required
+and mutation-checked (§0/§3/§5, #391), not just a one-off measurement; the **point-read bench** moved
+from a near-empty fixture on the wrong hardware to the dense fixture on the enforcing runner (§3,
+#283/#424/#385); the **factory getLogs-cap recovery** shipped for real (§1, #297); `/ready` now also
+catches a wedged cursor, not just a dead one (§2, #578); the **bind/exposure hardening** closed its
+whole cluster including the live-credential probe against production (§4, #292/#428); a **fuzz gate on
+the decode path** is a required check this file never named (§6, #290); and the **multi-machine run**
+this file spent §11 calling unproven for months finally happened, on 2.4.0 (§11, #281/#597).
+
+What is still genuinely open, not time-based: **ABI breadth** at the ≤2 GB budget is half-proven -
+event rate is measured hard, a large decode surface is not (§5, #286); the **published backfill
+number** is worse than stale, it cites a commit that no longer exists (§3, #285); the **DuckDB
+file-access defence** is still one layer deep by design of the bundled build, not two (§4, #289); and
+the **AI/MCP eval harness and offline path** remain in design (§9, #304). Two issues this walk found
+closed against no evidence or the wrong PR - #289 and #353 - are reopened as of this pass; treat any
+"closed" state on this file's cited issues as a claim to verify, not a fact, which is the whole reason
+this rule exists.
 
 **Scaled mode and anything node-gated (§11, §12):** not production-ready, and correctly deferred - the
 project's "build only what we can verify live" discipline is why. Don't let a red column here read as
