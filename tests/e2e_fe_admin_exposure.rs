@@ -12,10 +12,11 @@
 //! one. This suite therefore drives **`indexer::serve_role`** - the production entry point - and asks
 //! the socket, because the wiring is the thing that was wrong.
 //!
-//! **`127.0.0.2` is the bind on purpose.** `serve::is_localhost` matches the literal host string
-//! (`127.0.0.1`, `::1`, `localhost`, `[::1]`), so `127.0.0.2` is off-localhost by the code's own
-//! definition while still being loopback - the off-localhost path gets exercised without this suite
-//! ever opening a port to the network.
+//! **`0.0.0.0` is the bind on purpose.** `serve::is_localhost` matches the literal host string
+//! (`127.0.0.1`, `::1`, `localhost`, `[::1]`), so a wildcard bind is off-localhost by the code's
+//! own definition - the off-localhost path gets exercised. Tests connect via `127.0.0.1`, which the
+//! wildcard bind accepts. `127.0.0.2` was used previously but is not aliased on macOS, causing four
+//! tests to fail on a clean tree with `EADDRNOTAVAIL` before any nuthatch code runs.
 
 use std::time::{Duration, Instant};
 
@@ -98,17 +99,23 @@ fn scaffold_fe_nest(dir: &std::path::Path) -> nuthatch::config::Config {
     nuthatch::config::Config::load(dir).unwrap()
 }
 
-/// A free port on `127.0.0.2`, released before we hand it to the FE.
+/// A free port on loopback, released before we hand it to the FE.
 async fn free_port() -> u16 {
-    let probe = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     probe.local_addr().unwrap().port()
 }
 
-/// Start `serve_role` on `127.0.0.2:<port>` with the admin UI requested, and wait until it answers.
-/// Returns the base URL and the task, so the caller can abort it.
+/// Start `serve_role` on `0.0.0.0:<port>` with the admin UI requested, and wait until it answers.
+///
+/// `0.0.0.0` is the bind on purpose: `serve::is_localhost` matches only `127.0.0.1`, `::1`,
+/// `localhost`, and `[::1]`, so a wildcard bind is off-localhost by the code's own definition while
+/// remaining reachable on loopback. Unlike `127.0.0.2`, `0.0.0.0` is bindable on macOS without
+/// any loopback-alias setup. The test connects via `127.0.0.1` which the wildcard bind accepts.
+///
+/// Returns the base URL (using `127.0.0.1` for the client) and the task handle.
 async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::JoinHandle<()>) {
     let port = free_port().await;
-    let listen = format!("127.0.0.2:{port}");
+    let listen = format!("0.0.0.0:{port}");
     let args = ServeArgs {
         dir: dir.to_string_lossy().into_owned(),
         listen: listen.clone(),
@@ -120,7 +127,7 @@ async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::J
         let _ = nuthatch::indexer::serve_role(args).await;
     });
 
-    let base = format!("http://{listen}");
+    let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let start = Instant::now();
     while start.elapsed() < POLL_TIMEOUT {
@@ -207,7 +214,7 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
 /// never registered. Re-mounting the routes unconditionally turns this red on the body.
 ///
 /// **The token is set, not removed, and that is the whole point.** `admin_enabled` is
-/// `!no_admin && (is_localhost || token_set)`, so on this suite's off-localhost `127.0.0.2` bind an
+/// `!no_admin && (is_localhost || token_set)`, so on this suite's off-localhost `0.0.0.0` bind an
 /// *unset* token disables the surface on its own - and a test that unset it passed just as well against
 /// a `serve_role` that ignored `--no-admin` altogether (verified: replacing `admin_enabled(!args.admin,
 /// ..)` with `admin_enabled(false, ..)` left this suite 3/3 green). Configuring a token leaves the flag
