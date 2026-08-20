@@ -52,7 +52,15 @@ jobs:
             ./target/release/nuthatch doctor --dir . --rpc "$3" --address "$2" 2>&1 | tee /tmp/out
             # `doctor` reports rather than judges, so the gate is here: an endpoint that cannot serve a
             # windowed getLogs cannot serve a backfill, whatever else it does well.
-            if grep -q "getLogs window   FAILED" /tmp/out; then
+            #
+            # Allowlist, not denylist: a doctor run that never got this far - crashed, timed out,
+            # printed nothing - produces no "getLogs window" line at all, which a `grep FAILED` check
+            # cannot distinguish from a healthy one. Assert the line is present, then require the
+            # healthy string exactly.
+            if ! grep -q "getLogs window" /tmp/out; then
+              echo "::error::$3 produced no getLogs-window line - the probe did not run, so this gate judged nothing"
+              fail=1
+            elif ! grep -q "getLogs window   up to" /tmp/out; then
               echo "::error::$3 cannot serve getLogs - it cannot back a zero-setup nest"
               fail=1
             fi
@@ -74,12 +82,19 @@ jobs:
           for u in https://polygon.drpc.org https://polygon-bor-rpc.publicnode.com; do
             probe polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 "$u"
           done
-          # Archive-depth gate for the first (archive) endpoint.
+          # Archive-depth gate for the first (archive) endpoint. Allowlist, not denylist, for the same
+          # reason as the getLogs gate above: a doctor run that never printed an "archive depth" line -
+          # because it never ran, errored, or the endpoint refused and doctor reported UNKNOWN - must
+          # not read as healthy just because it also isn't the exact string "no". Require the line
+          # present, then require it read "yes" exactly.
           echo "== polygon archive check =="
           ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
             --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 2>&1 | tee /tmp/polygon-archive-out
-          if grep -q "archive depth    no" /tmp/polygon-archive-out; then
-            echo "::error::polygon.drpc.org lost archive depth - it is no longer suitable as the primary endpoint"
+          if ! grep -q "archive depth" /tmp/polygon-archive-out; then
+            echo "::error::doctor produced no archive-depth line for polygon.drpc.org - the probe did not run, so this gate judged nothing"
+            fail=1
+          elif ! grep -q "archive depth    yes" /tmp/polygon-archive-out; then
+            echo "::error::polygon.drpc.org is not archive (or refused to say) - it cannot be the primary endpoint for polygon"
             fail=1
           fi
           # Deliberately fails the job rather than warning. A dead default is a broken promise for
