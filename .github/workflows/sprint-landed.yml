@@ -1,0 +1,337 @@
+# Is the finished work actually in the product?
+#
+# On 2026-08-20 sprint industrious-ibis read as complete by every signal the firm has. Six PRs
+# reviewed and merged (#662, #664, #665, #667, #668, #669), six issues closed, the panel showing
+# 6 / 6. None of it was on `main`. The PRs had merged into `sprint/industrious-ibis` and nobody
+# ever merged that branch forward, so v2.6.1 shipped from `main` that afternoon carrying none of
+# it. Four days of good work, invisible, for as long as nobody happened to look. Reported as #684.
+#
+# Nothing was broken. Each signal was locally true and none of them meant what it was read to mean:
+#
+#   * **Closing the issue is decoupled from landing the code.** GitHub's auto-close only fires for
+#     PRs merged to the *default* branch, so these six were closed by hand - correctly, from the
+#     author's point of view, because their PR really had merged.
+#   * **The panel derives a sprint from the GitHub label.** That is the right source for *scope*
+#     and says nothing at all about *landing*. `6 / 6` was true and misleading at once.
+#   * **Nothing anywhere compared the sprint branch to `main`.** `#527` on the firm's board found
+#     the same seam from the other side: a sprint-branch PR had no gate. That was cancelled.
+#
+# So this job asks the one question none of those signals answer, and it is a question about
+# reachability, not about a diff - which is why it is scheduled and issue-triggered rather than a
+# required check on a PR. A PR cannot tell you that a *different* branch was forgotten.
+#
+# ## The two rules
+#
+# **A. A sprint declared complete must be on main.** When every issue carrying the label `<name>`
+# is closed, `origin/sprint/<name>` must be an ancestor of `origin/main`. This is the sharp one: it
+# fires within minutes of the last issue closing, via the `issues: [closed]` trigger, which is what
+# "would have caught this the same afternoon" actually requires. A grace period would defeat it.
+#
+# **B. Anything merged and left behind, sprint or not.** Any merged PR whose merge commit is not an
+# ancestor of `main` after `STRAND_GRACE_DAYS`. Rule A only sees branches named `sprint/*` whose
+# label bookkeeping is complete; B is the net under it and needs no naming convention, no labels
+# and no issue hygiene. It carries a grace period precisely because a live sprint legitimately has
+# unmerged work sitting on its branch, and screaming about that would train everyone to ignore it.
+#
+# ## Measured, on the repository, before this file was written
+#
+# Neither rule is a guess about what might be noisy. Both were run against real history on
+# 2026-08-20:
+#
+#   * Rule A over every `origin/sprint/*` branch that exists, run against `main` as it stood that
+#     evening. `diligent-dormouse` (13 issues, 1 open), `earnest-echidna` (0), `fastidious-ferret`
+#     (11, 0), `gallant-gecko` (9, 0) and `hardy-heron` (4, 0) are all ancestors of `main` and
+#     pass. `industrious-ibis` - 6 issues, none open, six commits ahead - is the only failure.
+#     `judicious-jackdaw` was in flight and has no branch, so Rule A never saw it, which is right.
+#   * The **other direction**, which is the half that usually goes unmeasured: the same job run
+#     with `main` replaced by the branch that lands #684 exits **0**, and `industrious-ibis` moves
+#     to `yes`. So the red tracks the fault and not something incidental about the repository.
+#   * Rule B with the grace period set to zero, over the **last 200 merged PRs**: exactly six hits,
+#     and they are the same six PRs. **Zero false positives.** The obvious worry - that a stacked
+#     PR merged into a `pete/*` branch which was later squashed would look stranded - did not
+#     materialise once in 200.
+#
+# That matters more than it sounds. This repository has shipped five checks that were green with
+# the mechanism removed, so a gate whose only evidence is that it passes on a healthy tree is worth
+# nothing here. This one was built while a real fault was live and was confirmed to red on that
+# fault and stay quiet on five sprints that had landed properly. The predicates below additionally
+# self-test in both directions against a synthetic repository, for when that live fault is gone.
+#
+# ## The near-miss in this file's own first draft, since it makes the point better than the prose
+#
+# The first version of the issue query omitted `-X GET`. `gh api` silently switches to POST the
+# moment an `-f` flag appears, so it was calling **create-an-issue** on every sprint label. It did
+# not create anything, purely because the call 422'd for want of a `title` - and the 422 body then
+# went to stdout, where it was counted as one row. Every sprint read `1 issue, 0 open`, which is
+# `complete()`, and the job printed exactly the right verdict for exactly the wrong reason. It
+# looked correct. It was tested, and it passed, and it was garbage. Hence the row-shape guard, and
+# hence the both-directions runs above rather than one run that produced a pleasing answer.
+#
+# ## What this job does NOT do
+#
+# It does not open issues, comment, or merge anything. It reds, and the step summary names the
+# branch and the exact command that fixes it. Landing forgotten work is a judgement call about
+# ordering against whatever else is in flight, and this job has no business making it.
+name: sprint landed
+
+on:
+  schedule:
+    # 06:00 UTC daily. The scheduled arm is the backstop, not the mechanism - the `issues` arm
+    # below is what makes this same-afternoon. This one catches a sprint whose issues were closed
+    # while the workflow was failing for some unrelated reason, and Rule B's grace expiring.
+    - cron: '0 6 * * *'
+
+  # The arm that earns the job. Closing the last issue of a sprint is the exact moment the sprint
+  # starts claiming to be finished, so it is the exact moment to ask whether it is. `reopened` and
+  # the label edits are here because they can each change the answer: relabelling an issue moves it
+  # between sprints, and reopening one takes a sprint back out of "complete".
+  issues:
+    types: [closed, reopened, labeled, unlabeled]
+
+  # A merge to main can only ever *clear* a Rule A or Rule B failure, never create one. Without
+  # this arm, landing the forgotten branch leaves the last run red until 06:00 the next morning,
+  # and a stale red is how a real red gets ignored.
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+
+concurrency:
+  # Closing six issues in a row should not queue six identical runs. Not `cancel-in-progress` on
+  # the `push` arm's behalf either - one run per ref is enough, and the newest has the truest view.
+  group: sprint-landed
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  landed:
+    name: every finished sprint is on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Ancestry is the whole question. A shallow clone answers it wrongly and, worse, answers
+          # it wrongly in the *passing* direction for some inputs, because `merge-base` on a
+          # truncated graph can fail to find the link it needs. `0` is not optional here.
+          fetch-depth: 0
+
+      - name: closed sprints and abandoned merges are reachable from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Rule B's grace. Long enough that a sprint running its normal length never trips it,
+          # short enough that a forgotten branch surfaces inside a release cycle.
+          STRAND_GRACE_DAYS: '14'
+        run: |
+          set -uo pipefail
+
+          # ---------------------------------------------------------------------------------
+          # The predicates. Both are one line; both are wrong in a way that is invisible on a
+          # healthy tree, which is why both are proved in both directions before they judge.
+          # ---------------------------------------------------------------------------------
+
+          # `git merge-base --is-ancestor A B` is 0 when A is reachable from B. Note it is 0 when
+          # A *is* B, which is the behaviour we want: a sprint branch merged and then not advanced
+          # is landed, and a sprint branch that was fast-forwarded onto main is landed too.
+          landed() {  # landed <ref> <into> -> 0 if <ref> is reachable from <into>
+            git merge-base --is-ancestor "$1" "$2" 2>/dev/null
+          }
+
+          # A sprint is "declared complete" when its label exists, has at least one issue on it,
+          # and none of those issues is open. The `total > 0` arm is load-bearing and is not
+          # defensive noise: a label with no issues yields `open == 0` and would otherwise read as
+          # a complete sprint, so every branch whose label had been mistyped or not yet applied
+          # would red. Unknown is not the same as finished, and this job says so out loud below
+          # rather than picking whichever answer is quieter.
+          complete() {  # complete <total> <open> -> 0 if the sprint is declared finished
+            [ "$1" -gt 0 ] && [ "$2" -eq 0 ]
+          }
+
+          # ---------------------------------------------------------------------------------
+          # Self-test, both directions, against a synthetic repository.
+          #
+          # The live fault this job was written against (#684) will be gone the moment the branch
+          # lands, and after that a broken `landed()` looks exactly like a healthy firm. These are
+          # the cases that die under mutation: invert the `--is-ancestor` sense and the first two
+          # swap; drop the `total > 0` arm from `complete()` and 'label with no issues' goes green.
+          # ---------------------------------------------------------------------------------
+          selftest=0
+          fixture="$(mktemp -d)"
+          (
+            cd "$fixture"
+            git init -q .
+            git config user.email t@example.com && git config user.name t
+            git commit -q --allow-empty -m base
+            git branch -q trunk
+            git checkout -q -b side
+            git commit -q --allow-empty -m 'work only on side'
+            git checkout -q trunk
+            git commit -q --allow-empty -m 'trunk moves on'
+          ) || { echo "::error::could not build the self-test fixture"; exit 1; }
+
+          ancestry_is() {  # ancestry_is <want-exit> <label> <ref> <into>
+            if ( cd "$fixture" && landed "$3" "$4" ); then got=0; else got=1; fi
+            if [ "$got" != "$1" ]; then
+              echo "::error::landed() self-test failed: '$2' returned $got, wanted $1"
+              selftest=1
+            fi
+          }
+          ancestry_is 1 'stranded branch is not on trunk'   side  trunk
+          ancestry_is 0 'trunk is on trunk'                 trunk trunk
+          ancestry_is 0 'common base is on trunk'           side~1 trunk
+          ancestry_is 0 'trunk base is on the side branch'  side~1 side
+
+          complete_is() {  # complete_is <want-exit> <label> <total> <open>
+            if complete "$3" "$4"; then got=0; else got=1; fi
+            if [ "$got" != "$1" ]; then
+              echo "::error::complete() self-test failed: '$2' returned $got, wanted $1"
+              selftest=1
+            fi
+          }
+          complete_is 0 'six issues, none open'    6 0
+          complete_is 1 'four issues, four open'   4 4
+          complete_is 1 'six issues, one open'     6 1
+          complete_is 1 'label with no issues'     0 0
+
+          rm -rf "$fixture"
+          if [ "$selftest" != 0 ]; then
+            echo "::error::the predicates failed their own self-test - fix this job before trusting it"
+            exit 1
+          fi
+
+          git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+          MAIN=origin/main
+          failed=0
+          {
+            echo "## Is the finished work on \`main\`?"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ---------------------------------------------------------------------------------
+          # Rule A - a sprint whose issues are all closed must be an ancestor of main.
+          # ---------------------------------------------------------------------------------
+          echo "### Rule A: closed sprints" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "| sprint | issues | open | on \`main\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          for ref in $(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/sprint/*'); do
+            name="${ref#origin/sprint/}"
+
+            # `gh issue list --label` has returned zero for every label on this repository while
+            # REST returned the real rows, so this goes to the API directly. `pull_request == null`
+            # drops PRs, which the issues endpoint returns alongside issues.
+            # `-X GET` is load-bearing and its absence is not a style nit. `gh api` switches the
+            # method to **POST** as soon as any `-f` is present, so the same line without it sends
+            # `labels`, `state` and `per_page` to *create-an-issue*. The first draft of this file
+            # did exactly that. It survived only because the call 422'd for want of a `title`, and
+            # the 422 body then went to **stdout**, where `grep -c .` counted it as one issue and
+            # `grep -cx open` found none - so every sprint read `1 issue, 0 open`, `complete()`
+            # said yes, and the job reported the right sprint stranded for entirely the wrong
+            # reason. A check that is right by luck fails silently the day the luck changes.
+            rows="$(gh api --paginate -X GET "repos/$REPO/issues" \
+                      -f "labels=$name" -f state=all -f per_page=100 \
+                      --jq '.[] | select(.pull_request == null) | .state' 2>/dev/null || true)"
+
+            # And because that near-miss turned on unparsed junk being counted as data, the rows
+            # are checked to be what they claim before anything is concluded from them. Anything
+            # that is not literally `open` or `closed` means the query did not do what this job
+            # thinks it did, and the honest answer is then "not judged", not a verdict.
+            if printf '%s' "$rows" | grep -qvE '^(open|closed)$' 2>/dev/null; then
+              echo "::warning::the issue query for label '$name' returned rows that are neither open nor closed - not judging this sprint"
+              rows=""
+            fi
+            total="$(printf '%s' "$rows" | grep -c . || true)"
+            open="$(printf '%s' "$rows" | grep -cx 'open' || true)"
+
+            if landed "$ref" "$MAIN"; then
+              echo "| \`$name\` | $total | $open | yes |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            ahead="$(git rev-list --count "$MAIN..$ref")"
+
+            if ! complete "$total" "$open"; then
+              # In flight, or the label tells us nothing. Either way this is not a finding, but it
+              # is not silence either: a sprint branch whose label has no issues is invisible to
+              # Rule A, and a check that quietly covers less than it appears to is the failure
+              # mode this repository keeps rediscovering. Say what was not judged.
+              if [ "$total" -eq 0 ]; then
+                echo "| \`$name\` | 0 | - | **not judged** - no issues carry the label \`$name\`, so Rule A cannot tell whether this sprint is finished. Rule B still covers it after $STRAND_GRACE_DAYS days. |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| \`$name\` | $total | $open | in flight ($ahead commits ahead) |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              continue
+            fi
+
+            failed=1
+            echo "| \`$name\` | $total | 0 | **NO - $ahead commits stranded** |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::sprint '$name' reads as complete - $total issues, none open - but sprint/$name is $ahead commits ahead of main and not an ancestor of it. None of that work is in the product."
+            {
+              echo
+              echo "\`sprint/$name\` is declared finished and is **not** on \`main\`. To land it:"
+              echo
+              echo '```'
+              echo "git checkout sprint/$name && git merge origin/main"
+              echo "git push origin HEAD:pete/land-$name"
+              echo "gh pr create --base main --head pete/land-$name"
+              echo '```'
+              echo
+              echo "Or, if the work is meant to be abandoned, delete the branch and say so on the issues."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # ---------------------------------------------------------------------------------
+          # Rule B - anything merged, left behind, and past the grace period.
+          # ---------------------------------------------------------------------------------
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "### Rule B: merged more than $STRAND_GRACE_DAYS days ago and still not on \`main\`" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+          cutoff="$(date -u -d "-${STRAND_GRACE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
+          stranded=0
+          while IFS=$'\t' read -r num base sha merged; do
+            [ -n "${sha:-}" ] || continue
+            [ "$merged" \< "$cutoff" ] || continue
+            # A merge commit the local clone has never heard of cannot be judged. This happens for
+            # PRs merged into a branch that was later deleted and garbage collected. Reported, not
+            # silently dropped, and not counted as a failure - absence of the object is not
+            # evidence either way.
+            if ! git cat-file -e "$sha" 2>/dev/null; then
+              echo "- #$num (base \`$base\`): merge commit \`${sha:0:8}\` is not in this clone, not judged" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            # Spelled as a full `if` rather than `landed ... && continue` on purpose: under `bash
+            # -e` an AND-list whose left side fails and whose right side is therefore skipped
+            # returns non-zero as a complete command, and the job dies on the first stranded PR it
+            # finds - which is to say, on exactly the input this rule exists to report.
+            if landed "$sha" "$MAIN"; then continue; fi
+            stranded=1
+            failed=1
+            echo "- **#$num** merged into \`$base\` on ${merged%T*}, merge commit \`${sha:0:8}\`, not reachable from \`main\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PR #$num merged into '$base' on ${merged%T*} and its merge commit is still not an ancestor of main."
+          done < <(gh pr list --repo "$REPO" --state merged --limit 200 \
+                     --json number,baseRefName,mergeCommit,mergedAt \
+                     --jq '.[] | [.number, .baseRefName, (.mergeCommit.oid // ""), .mergedAt] | @tsv')
+
+          if [ "$stranded" = 0 ]; then
+            echo "Nothing. Every PR merged before $cutoff is reachable from \`main\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo
+              echo "Each of these was reviewed, merged, and is not in the product. Land the branch it"
+              echo "sits on, or delete the branch and record on the issue that the work was dropped."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # The 200-PR window is a cap, and a check that covers less than it appears to is worse
+          # than no check. Say so in the open rather than letting the window be discovered later.
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "_Rule B examined the 200 most recently merged PRs. Anything older is out of its window and is covered only by Rule A._" >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$failed"
