@@ -36,6 +36,10 @@ const LAST_BLOCK_KEY: &str = "last_block";
 /// half without the column. The declaration is an `init`-time one precisely because it cannot be
 /// changed in place; this key is what enforces that rather than merely documenting it.
 const TIMESTAMPS_KEY: &str = "block_timestamps";
+/// The decode registry that produced this store's rows (#653). Not the same question as
+/// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
+/// configuration, which is what a nest's content address is a statement about.
+const REGISTRY_KEY: &str = "registry_hash";
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -1835,6 +1839,7 @@ async fn build_nest(
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
+    guard_registry_identity(store.as_ref(), &hex::encode(registry.hash()))?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2307,6 +2312,42 @@ const FACTORY_FLIP_THRESHOLD: usize = 500;
 /// which is correct because before this existed every nest indexed timestamps and the default is
 /// `true`. A pre-existing nest that *declares* `false` is the one case worth catching, and the
 /// `has_indexed` check below is what catches it: an empty store has nothing to contradict.
+/// Refuse to serve rows under a decode registry that did not produce them (#653).
+///
+/// A nest's `registry_hash` is the claim "this data was produced by this decode configuration", and
+/// `blob.rs` already takes it seriously - a packed nest records its expected hash and `mount`
+/// regenerates and verifies it. The ordinary `dev --dir <dir>` path did not, so adding an event to an
+/// existing nest was **silent**: the nest started, found itself already at tip, indexed nothing, and
+/// then stamped the *new* hash onto every query's provenance. Measured: a hash went from
+/// `0xa265740366…` to `0xe3de2aa16d…` with zero events indexed and no warning, the only symptom being
+/// an unrelated view failing to load because it happened to reference one of the new tables. A change
+/// touching tables no view references would have said nothing at all.
+///
+/// Same reasoning as the `--seal-direct` refusal for declared calls (RFC-0038 §6e): a run that
+/// quietly produces a table with no rows is worse than a run that refuses.
+fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &str) -> Result<()> {
+    match store.get_meta(REGISTRY_KEY)? {
+        Some(found) if found != registry_hash => anyhow::bail!(
+            "this nest's stored data was indexed by a different decode registry.\n\n               stored:  0x{found}\n  config:  0x{registry_hash}\n\n             The registry hash covers every contract, event and column this nest decodes, so a              difference means `nuthatch.toml` or an ABI changed after the data was written.              Continuing would serve old rows under a new content address, and any table added by the              change would read as empty rather than as absent.\n\n             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and              `segments/`), or restore the previous configuration to keep serving this data. A nest              whose identity changed is a different nest - that is what content addressing means."
+        ),
+        Some(_) => Ok(()),
+        None => {
+            // Absent means one of two things and they must not be conflated: a fresh store, or a
+            // store written by a build from before this guard existed. Refusing the second would
+            // break every deployment on upgrade for a fault none of them necessarily have, so it
+            // adopts - but says so when there are already rows, because an adopted hash is a claim
+            // nobody verified and it should not read like one that was.
+            if store.get_meta(LAST_BLOCK_KEY)?.is_some() {
+                tracing::warn!(
+                    "adopting registry hash 0x{registry_hash} for a store that predates the identity                      check (#653) - it was recorded, not verified. If this nest's configuration has                      changed since it was indexed, re-index it."
+                );
+            }
+            store.set_meta(REGISTRY_KEY, registry_hash)?;
+            Ok(())
+        }
+    }
+}
+
 fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) -> Result<()> {
     let want = if declared { "1" } else { "0" };
     match store.get_meta(TIMESTAMPS_KEY)? {
@@ -7261,6 +7302,56 @@ template = "pool"
             probe.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
             "block_hash must have been retried past the failures"
         );
+    }
+
+    /// #653. A store must not serve rows under a registry that did not produce them.
+    ///
+    /// Three states, because only asserting the refusal would leave the two accepting paths free to
+    /// break silently - and "accepts everything" is exactly what the bug was.
+    #[test]
+    fn a_store_refuses_a_registry_that_did_not_produce_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+
+        // 1. Fresh store: adopts, and records what it adopted.
+        guard_registry_identity(&store, "aaaa").expect("a fresh store adopts");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("aaaa"),
+            "the adopted hash must be recorded, or the next start adopts again and never compares"
+        );
+
+        // 2. Same registry: still fine.
+        guard_registry_identity(&store, "aaaa").expect("an unchanged registry must be accepted");
+
+        // 3. Different registry: refused, and the message must name both hashes - a refusal that
+        //    does not say what changed sends the operator to the source to find out.
+        let err = guard_registry_identity(&store, "bbbb")
+            .expect_err("a changed registry must be refused, not adopted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
+        assert!(msg.contains("bbbb"), "must name the config hash: {msg}");
+    }
+
+    /// The upgrade path, which is the half that is easy to get wrong in the other direction: a store
+    /// written before this guard existed has no recorded hash, and refusing it would break every
+    /// running deployment on upgrade for a fault it may well not have. It adopts instead.
+    #[test]
+    fn a_store_predating_the_guard_adopts_rather_than_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        // Rows already indexed, no registry hash recorded - exactly an older nest's store.
+        store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
+        assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
+
+        guard_registry_identity(&store, "cccc").expect("an older store must not be refused");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("cccc")
+        );
+        // And having adopted, it is now held to it.
+        guard_registry_identity(&store, "dddd")
+            .expect_err("once adopted, a later change must be refused");
     }
 
     #[async_trait::async_trait]
