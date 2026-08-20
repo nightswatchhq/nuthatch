@@ -1,6 +1,6 @@
 # RFC-0032: The tenant runtime - retiring the roost, keying data by nest identity
 
-- Status: **Draft** (2026-08-04)
+- Status: **Implemented** (slices 1-5; slice 5 shipped in v2.0.0, 2026-08-06)
 - Author: Pete (cargopete)
 - Date: 2026-08-04
 - Depends on: RFC-0012 (the nest bundle and its content address - this RFC promotes that hash to the

@@ -1,6 +1,6 @@
 # RFC-0033: Nest identity and derivation grafting - editing a nest without re-indexing it
 
-- Status: **Draft** (2026-08-04)
+- Status: **Implemented** (slices 1-3, 5 and 6; slice 6 shipped in v2.0.0, 2026-08-06; slice 4 deferred)
 - Author: Pete (cargopete)
 - Date: 2026-08-04
 - Depends on: RFC-0012 (the content-addressed nest bundle - the NID this RFC builds *below*),

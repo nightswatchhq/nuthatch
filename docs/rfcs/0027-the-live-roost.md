@@ -1,6 +1,6 @@
 # RFC-0027: The live roost - mounting and unmounting nests without a restart
 
-- Status: **Draft** (2026-07-28)
+- Status: **Implemented** (2026-07-28) - all 7 slices
 - Author: Pete (cargopete)
 - Date: 2026-07-28
 - Depends on: RFC-0012 (per-nest isolated stores, the shared cursor, nest-as-bundle - the deploy unit

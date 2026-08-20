@@ -1,6 +1,6 @@
 # RFC-0028: Closing the gaps in `eth_getLogs` range control
 
-- Status: **Draft** (2026-07-28; **substantially revised the same day - see §0**)
+- Status: **Implemented** (2026-07-28; **substantially revised the same day - see §0**)
 - Author: Pete (cargopete)
 - Date: 2026-07-28
 - Depends on: RFC-0004 §2 (the adaptive chunker this extends), RFC-0026 (the fault taxonomy).

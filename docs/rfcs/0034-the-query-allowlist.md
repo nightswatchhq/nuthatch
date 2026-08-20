@@ -1,6 +1,6 @@
 # RFC-0034: The query allowlist - a bounded public surface without a resync
 
-- Status: **Draft** (2026-08-04)
+- Status: **Implemented** - phases 1 and 2 (2026-08-05)
 - Author: Pete (cargopete)
 - Date: 2026-08-04
 - Depends on: RFC-0032 (the mount table - phase 1's allowlist is mount config and has nowhere to live

@@ -1,9 +1,9 @@
 # RFC-0030: Adding EVM chains - the registry, the endpoint bar, and Gnosis first
 
-- Status: **Parked** (2026-08-04; drafted 2026-08-03)
+- Status: **Implemented** (shipped 2026-08-19 in #646; issue #273 closed 2026-08-20). Drafted 2026-08-03 and parked 2026-08-04; unparked and built.
 - Author: Pete (cargopete)
 - Date: 2026-08-03
-- Parked because: a deliberate priority call, not a difficulty or a blocker. The design stands and
+- Parked because (history - this held from 2026-08-04 until the RFC was built on 2026-08-19): a deliberate priority call, not a difficulty or a blocker. The design stands and
   needs no revision to resume. Tracked as issue #273. **One slice is carved out and is *not* parked**:
   re-measuring the endpoints we already ship (§7 slice 3), because two of our shipped Arbitrum
   defaults are recorded here as unable to serve a backfill - that is a live defect on a chain we

@@ -1,6 +1,6 @@
 # RFC-0016: The governed semantic layer and the agent-grade MCP experience
 
-- Status: Draft (v1)
+- Status: **Implemented** (S1 eval harness → S2 semantic layer → S3 errors-as-prompts + explain → S4 result shaping → S5 resources/prompts; Tier-B baseline pending a keyed run)
 - Author: Pete (cargopete)
 - Date: 2026-07-19
 - Depends on: RFC-0001 (Implemented - the decode registry and schema manifest this layer describes),
