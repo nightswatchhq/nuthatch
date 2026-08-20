@@ -333,12 +333,31 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
         })
         .collect();
 
+    // Separate orphaned tables into two buckets: those whose alias prefix is entirely absent from
+    // the registry (whole-alias orphans, caused by a contract rename) and genuine per-table drift.
+    // Collapsing the whole-alias case into one warning prevents N×38 noise on a correct nest.
+    let registry_aliases: std::collections::BTreeSet<&str> = known
+        .keys()
+        .filter_map(|t| t.split_once("__").map(|(a, _)| a))
+        .collect();
+
+    let mut alias_orphans: BTreeMap<String, usize> = BTreeMap::new();
     let mut warnings = Vec::new();
+
     for (table, ts) in &sem.tables {
         match known.get(table.as_str()) {
-            None => warnings.push(format!(
-                "semantic.toml describes table `{table}`, which the registry has no decoder for"
-            )),
+            None => {
+                // Whole-alias orphan when the alias prefix no longer exists in the registry.
+                if let Some(alias) = table.split_once("__").map(|(a, _)| a) {
+                    if !registry_aliases.contains(alias) {
+                        *alias_orphans.entry(alias.to_string()).or_insert(0) += 1;
+                        continue;
+                    }
+                }
+                warnings.push(format!(
+                    "semantic.toml describes table `{table}`, which the registry has no decoder for"
+                ));
+            }
             Some(cols) => {
                 for col in ts.columns.keys() {
                     if !cols.contains(col) {
@@ -350,6 +369,19 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
             }
         }
     }
+
+    // One consolidated warning per renamed alias instead of one per table. The remediation names an
+    // edit rather than a command on purpose: `semantic::merge` only ever adds generated tables and
+    // never drops one, so `nuthatch schema` leaves the orphaned keys - and this warning - in place.
+    for (alias, count) in alias_orphans {
+        let plural = if count == 1 { "table" } else { "tables" };
+        warnings.push(format!(
+            "semantic.toml has {count} {plural} still keyed to alias `{alias}`, which is no \
+             longer in this nest; re-key the `[table.{alias}__*]` sections to the new alias to \
+             keep their descriptions, or delete them"
+        ));
+    }
+
     warnings
 }
 
@@ -487,6 +519,25 @@ mod tests {
     use super::*;
     use crate::registry::{ColumnSchema, TableSchema};
 
+    /// A minimal event table under a chosen alias, for the rename repro.
+    fn aliased_table(alias: &str, event: &str) -> TableSchema {
+        TableSchema {
+            table: format!("{alias}__{event}"),
+            alias: alias.into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: event.into(),
+            topic0: "0xddf2".into(),
+            columns: vec![ColumnSchema {
+                name: "sender".into(),
+                sol_type: "address".into(),
+                storage: "address".into(),
+                indexed: true,
+            }],
+        }
+    }
+
     fn transfer_table() -> TableSchema {
         TableSchema {
             table: "usdc__transfer".into(),
@@ -594,11 +645,138 @@ mod tests {
             .insert("ghost__event".into(), TableSemantic::default()); // no such table
 
         let warnings = drift(&schema, &sem);
-        assert!(warnings.iter().any(|w| w.contains("ghost__event")));
+        // `ghost__event` is the only `ghost__*` entry; the whole-alias path fires.
+        assert!(
+            warnings.iter().any(|w| w.contains("`ghost`")),
+            "a whole-alias orphan must warn once about the alias, got: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("ghost__event")),
+            "whole-alias orphan must not fire a per-table warning"
+        );
         assert!(warnings.iter().any(|w| w.contains("usdc__transfer.nope")));
         assert!(
             !warnings.iter().any(|w| w.contains("from")),
             "a real column must not warn"
+        );
+    }
+
+    /// #655 is an issue about a *number* - a correct nest opened with 38 warnings because renaming
+    /// two aliases orphaned every `semantic.toml` table key. The single-table case above cannot see
+    /// that: with one orphan, "collapsed to one warning" and "one warning per table" are the same
+    /// output, and the count reads `1` however it was computed. This pins the collapse and the
+    /// count on a many-table alias, which is the shape the issue actually reported.
+    ///
+    /// Mutation check: replacing the counter with `alias_orphans.insert(alias.to_string(), 1)`
+    /// leaves every other test in this module green and reds this one on the count.
+    #[test]
+    fn a_renamed_alias_collapses_to_one_warning_carrying_the_real_table_count() {
+        let schema = vec![transfer_table()];
+        let mut sem = Semantic::default();
+        // Four tables orphaned under one renamed alias, plus two under a second.
+        for t in ["swap", "mint", "burn", "collect"] {
+            sem.tables
+                .insert(format!("oldpool__{t}"), TableSemantic::default());
+        }
+        for t in ["deposit", "withdraw"] {
+            sem.tables
+                .insert(format!("oldvault__{t}"), TableSemantic::default());
+        }
+
+        let warnings = drift(&schema, &sem);
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "six orphaned tables under two renamed aliases must yield one warning each, got: \
+             {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("4 tables") && w.contains("`oldpool`")),
+            "the warning must carry the real table count, not a placeholder: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("2 tables") && w.contains("`oldvault`")),
+            "each renamed alias needs its own count: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("oldpool__swap")),
+            "no per-table warning may survive the collapse: {warnings:?}"
+        );
+    }
+
+    /// The singular branch of the same message. One orphaned table under a renamed alias must read
+    /// "1 table", not "1 tables" - the operator-facing string is the whole deliverable of #655.
+    #[test]
+    fn a_single_orphan_under_a_renamed_alias_reads_as_one_table_singular() {
+        let schema = vec![transfer_table()];
+        let mut sem = Semantic::default();
+        sem.tables
+            .insert("oldpool__swap".into(), TableSemantic::default());
+
+        let warnings = drift(&schema, &sem);
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("1 table still"),
+            "singular must read `1 table`: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("1 tables"),
+            "singular must not read `1 tables`: {warnings:?}"
+        );
+    }
+
+    /// The remediation the warning prints has to be one the operator can actually run. `merge` only
+    /// ever *adds* generated tables to the existing map (`out.tables.insert` on the `None` arm) and
+    /// never removes one, so a regenerate cannot clear an orphaned alias key - the sections stay and
+    /// the warning fires again next start. This walks the issue's own repro through the three calls
+    /// `nuthatch schema` makes (`project.rs:768-773`: generate → merge → save) and pins that, so the
+    /// message can never drift back to naming a command that does not fix it.
+    #[test]
+    fn a_regenerate_cannot_clear_an_orphaned_alias_so_the_advice_must_not_name_it() {
+        // Seeded when the nest still called its contract `oldpool`, with authored prose on top.
+        let before = vec![
+            aliased_table("oldpool", "swap"),
+            aliased_table("oldpool", "mint"),
+        ];
+        let mut seeded = generate(&before, "n", "mainnet");
+        seeded
+            .tables
+            .get_mut("oldpool__swap")
+            .expect("seeded from the old alias")
+            .description = "every swap through the pool".into();
+
+        // The operator renames the alias in nuthatch.toml and runs `nuthatch schema`.
+        let after = vec![aliased_table("pool", "swap"), aliased_table("pool", "mint")];
+        let regenerated = merge(seeded, generate(&after, "n", "mainnet"));
+
+        assert!(
+            regenerated.tables.contains_key("oldpool__swap"),
+            "merge never drops a table, so the orphan survives the regenerate: {:?}",
+            regenerated.tables.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            regenerated.tables["oldpool__swap"].description, "every swap through the pool",
+            "and it survives with the authored prose still attached to the dead key"
+        );
+
+        let warnings = drift(&after, &regenerated);
+        assert!(
+            warnings.iter().any(|w| w.contains("`oldpool`")),
+            "the warning still fires after a regenerate, which is the whole point: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("nuthatch schema")),
+            "the warning must not send the operator to a command that leaves it firing: {warnings:?}"
         );
     }
 

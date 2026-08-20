@@ -1027,12 +1027,35 @@ const IMPLEMENTATION_SELECTOR: &str = "0x5c60da1b";
 async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<serde_json::Value> {
     if let Some(implementation) = resolve_implementation(rpc, address).await {
         println!("  · proxy → implementation {implementation}");
-        if let Ok(abi) = abi::resolve(chain_id, &implementation).await {
-            return Ok(abi);
+        if let Ok(resolved) = abi::resolve(chain_id, &implementation).await {
+            print_abi_resolved(&resolved);
+            return Ok(resolved.abi);
         }
         println!("  · implementation ABI unresolved; using the proxy's own ABI");
     }
-    abi::resolve(chain_id, address).await
+    let resolved = abi::resolve(chain_id, address).await?;
+    print_abi_resolved(&resolved);
+    Ok(resolved.abi)
+}
+
+/// The pretty lines for a resolved ABI, in the same `→`/`✓`/`·` two-space-indented prose the rest of
+/// `init`/`add` use - a pure function (no I/O) so the exact wording is unit-tested without a live
+/// network call (see `abi_resolved_lines` tests below). Previously this was a raw `tracing::info!`
+/// that printed its own ISO timestamp and log level through the middle of the pretty output (#675);
+/// the resolver name is real information worth keeping, so it moves here rather than disappearing.
+fn abi_resolved_lines(resolved: &abi::Resolved) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(reason) = &resolved.fallback_reason {
+        lines.push(format!("  · Sourcify miss ({reason}); trying Etherscan"));
+    }
+    lines.push(format!("  ✓ ABI resolved via {}", resolved.via));
+    lines
+}
+
+fn print_abi_resolved(resolved: &abi::Resolved) {
+    for line in abi_resolved_lines(resolved) {
+        println!("{line}");
+    }
 }
 
 /// Follow the well-known proxy patterns to an implementation address, or `None` if `address` is not a
@@ -2081,5 +2104,41 @@ dataSources:
         assert_eq!(config.nest.chain, "avalanche");
         assert_eq!(config.nest.chain_id, 43114);
         assert_eq!(config.nest.rpc_urls, vec![rpc_url]);
+    }
+
+    /// #675: a Sourcify resolve used to print through a raw `tracing::info!` line (ISO timestamp, log
+    /// level, ANSI codes) crashing through the `→`/`✓` pretty output. It now prints only the tick.
+    /// Covers `abi_resolved_lines`'s formatted wording only - not that `resolve_abi` calls it, so a
+    /// regression that drops the call site entirely would still pass this test.
+    #[test]
+    fn abi_resolved_lines_sourcify_is_a_single_clean_tick() {
+        let resolved = abi::Resolved {
+            abi: serde_json::json!([]),
+            via: "Sourcify",
+            fallback_reason: None,
+        };
+        assert_eq!(
+            abi_resolved_lines(&resolved),
+            vec!["  ✓ ABI resolved via Sourcify".to_string()]
+        );
+    }
+
+    /// The Etherscan-fallback path (#675's "sweep the other paths" ask): the miss reason is real,
+    /// non-redundant information, so it earns its own `·` line ahead of the `✓` tick rather than being
+    /// dropped along with the redundant Sourcify-success announcement.
+    #[test]
+    fn abi_resolved_lines_etherscan_fallback_names_the_reason_then_the_tick() {
+        let resolved = abi::Resolved {
+            abi: serde_json::json!([]),
+            via: "Etherscan",
+            fallback_reason: Some("Sourcify returned HTTP 404".to_string()),
+        };
+        assert_eq!(
+            abi_resolved_lines(&resolved),
+            vec![
+                "  · Sourcify miss (Sourcify returned HTTP 404); trying Etherscan".to_string(),
+                "  ✓ ABI resolved via Etherscan".to_string(),
+            ]
+        );
     }
 }

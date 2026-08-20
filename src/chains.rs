@@ -167,26 +167,29 @@ const BSC: Chain = Chain {
 
 /// Polygon PoS. Archive is available but narrow; the wide endpoint is not archive.
 ///
-/// Measured 2026-08-19: `polygon-bor-rpc.publicnode.com` gives a 5,120-block window and batch 200+
-/// but **archive depth no**; `polygon.drpc.org` **is** archive but caps getLogs at 80 blocks and
-/// batches at 10. `polygon-rpc.com` was unreachable.
+/// Measured 2026-08-20 (three runs each): `polygon.drpc.org` is archive, getLogs up to 80 blocks,
+/// batch 10, doctor recommends 40. `polygon-bor-rpc.publicnode.com` gives a 5,120-block window and
+/// batch 200+ but **archive depth no** - tip-following only, backfills fail. `polygon-rpc.com` was
+/// unreachable on 2026-08-19.
 ///
-/// The wide one is listed first because it serves the tip, which is most of the work; failover reaches
-/// the archive endpoint for historical windows and the adaptive chunker (RFC-0004 §2) finds its much
-/// narrower ceiling on its own.
+/// Archive depth is the binding constraint for backfill; the archive endpoint goes first so a new
+/// nest does not open against a non-archive URL. The wider endpoint is kept as a secondary for
+/// tip-following fallover once an initial backfill completes.
 const POLYGON: Chain = Chain {
     name: "polygon",
     chain_id: 137,
     rpc_urls: &[
-        "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.drpc.org",
+        "https://polygon-bor-rpc.publicnode.com",
     ],
     // Heimdall checkpoints are the real finality signal and the tag reflects them; the fallback is
     // sized for a checkpoint interval rather than a block time.
     finality: Finality::FinalizedTag {
         fallback_depth: 1000,
     },
-    log_window: 2000,
+    // polygon.drpc.org (archive, first endpoint) caps getLogs at 80 blocks; doctor recommends 40.
+    // Measured 2026-08-20.
+    log_window: 40,
 };
 
 /// Gnosis. The best-served of the four chains added here: two keyless **archive** endpoints, both
