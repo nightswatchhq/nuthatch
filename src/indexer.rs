@@ -3808,7 +3808,13 @@ impl NestIngest {
                 }
             }
             for (block, items) in per_block {
-                let hash = source.block_hash(block).await?.unwrap_or_default();
+                let hash = retry_transient(
+                    &format!("block hash for {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_hash(block).await },
+                )
+                .await?
+                .unwrap_or_default();
                 let ctx = crate::ipfs::BlockCtx {
                     number: block,
                     hash: &hash,
@@ -3869,7 +3875,12 @@ impl NestIngest {
         if self.top_level_calls {
             if let Some(creg) = self.call_registry.clone() {
                 let want: Vec<u64> = (next..=to).collect();
-                let bodies = source.block_bodies(&want).await?;
+                let bodies = retry_transient(
+                    &format!("block bodies for {} block(s)", want.len()),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_bodies(&want).await },
+                )
+                .await?;
                 for b in &want {
                     let Some(body) = bodies.get(b) else { continue };
                     let bhash = body
@@ -4005,10 +4016,32 @@ impl NestIngest {
                     .iter()
                     .map(|(_, c, d)| (c.clone(), d.clone()))
                     .collect();
-                let results =
-                    crate::calls::resolve_pairs_at(rpc.as_ref(), self.chain_id, &pairs, block)
-                        .await?;
-                let hash = source.block_hash(block).await?.unwrap_or_default();
+                // Retried like every other RPC fetch on this path, and it was not, which cost a
+                // 454M-block backfill 8 hours in at 87.6%: one `transport error: error sending
+                // request` on a pinned batch propagated straight out and killed the nest. `getLogs`
+                // and the timestamp fetches have gone through `retry_transient` since #538; this one
+                // shipped in 2.6.0 with a bare `?`, so any long backfill declaring `[[calls]]` died
+                // on the first blip from the provider.
+                //
+                // Never-give-up with capped backoff, matching the sealed-history path exactly: a
+                // transient provider failure is not a reason to discard hours of work, and the
+                // progress line resumes moving once it clears.
+                let chain_id = self.chain_id;
+                let results = retry_transient(
+                    &format!("pinned eth_call batch at block {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async {
+                        crate::calls::resolve_pairs_at(rpc.as_ref(), chain_id, &pairs, block).await
+                    },
+                )
+                .await?;
+                let hash = retry_transient(
+                    &format!("block hash for {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_hash(block).await },
+                )
+                .await?
+                .unwrap_or_default();
                 let ts = timestamps.get(&block).copied().unwrap_or(0);
                 for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
                     let row = r.to_row(
@@ -7147,6 +7180,89 @@ template = "pool"
         logs: Vec<crate::rpc::Log>,
     }
 
+    /// A source whose `block_hash` fails a fixed number of times before answering - a transport blip
+    /// with a known end, which is what a provider dropping a connection actually looks like.
+    struct FlakySource {
+        logs: Vec<crate::rpc::Log>,
+        fails_left: std::sync::Mutex<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FlakySource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut left = self.fails_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                anyhow::bail!("transport error: error sending request for url (mock)");
+            }
+            // Must agree with the hash the fixture logs carry, or the window reads as a reorg and is
+            // discarded - which looks exactly like the bug under test and is not it.
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _f: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(self.logs.clone())
+        }
+    }
+
+    /// #651. A transport blip during a window must be retried, not kill the nest.
+    ///
+    /// Driven through `process_window` with a **flaky `Source`** and a healthy gateway, because the
+    /// bug was never in `retry_transient` - that helper's own unit tests all passed while a 454M-block
+    /// backfill was dying eight hours in at 87.6% on one dropped connection. The bug was a call site
+    /// that did not use it, so only a test that exercises the call site can see it.
+    ///
+    /// Proven by mutation: restore the bare `?` on the IPFS path's `block_hash` fetch and this fails,
+    /// while every other test in the suite stays green.
+    // NOT `start_paused`: this drives a real HTTP request at the stub gateway, and a paused clock
+    // auto-advances past it so the fetch never completes. Three retries at a 250ms base is ~1.75s.
+    #[tokio::test]
+    async fn a_flaky_source_mid_window_is_retried_rather_than_killing_the_nest() {
+        const DOC: &str = r#"{"n":1}"#;
+        let (gateway, handle) = stub_gateway(DOC).await;
+        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+
+        let flaky = Arc::new(FlakySource {
+            logs: Vec::new(),
+            fails_left: std::sync::Mutex::new(3),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let probe = flaky.clone();
+
+        // No `expect` needed here - `run_ipfs_nest_with_source` unwraps the window itself, so a
+        // propagated transport error panics and fails this test, which is precisely the regression.
+        let rows = run_ipfs_nest_with_source(dir.path(), gateway, &cid, flaky).await;
+        handle.abort();
+
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, v)| v["table"] == "token_metadata")
+                .count(),
+            1,
+            "the document must still be resolved and stored after the blips, got {rows:?}"
+        );
+        // The premise: the failures must actually have happened, or this passed on the happy path.
+        assert_eq!(
+            *probe.fails_left.lock().unwrap(),
+            0,
+            "all three transient failures must have been consumed"
+        );
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "block_hash must have been retried past the failures"
+        );
+    }
+
     #[async_trait::async_trait]
     impl Source for MockSource {
         async fn tip(&self) -> Result<u64> {
@@ -7773,6 +7889,19 @@ template = "pool"
         gateway: String,
         uri: &str,
     ) -> Vec<(String, serde_json::Value)> {
+        run_ipfs_nest_with_source(dir, gateway, uri, Arc::new(MockSource { logs: Vec::new() }))
+            .await
+    }
+
+    /// The same harness with the `Source` injected, so a test can make the *ingestion* side flaky
+    /// while the gateway stays healthy - the only way to reach the `block_hash` fetch inside the
+    /// IPFS path from a test.
+    async fn run_ipfs_nest_with_source(
+        dir: &std::path::Path,
+        gateway: String,
+        uri: &str,
+        source: Arc<dyn Source>,
+    ) -> Vec<(String, serde_json::Value)> {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
@@ -7790,7 +7919,6 @@ template = "pool"
         let mut config = Config::load(dir).unwrap();
         config.ipfs_gateways = vec![gateway];
 
-        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let (mut nest, state, worker, _w) =
             build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
                 .await
