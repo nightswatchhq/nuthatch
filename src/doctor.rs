@@ -293,6 +293,11 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
 
 /// `nuthatch doctor` - probe each endpoint and print what it can do.
 pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
+    // Derived only when `--dir` supplies the endpoints and the operator gave no explicit
+    // `--address`: the nest already declares its contracts, so there is no reason to fall back to
+    // the range-only probe - which #644 measured as understating the real window by up to 256x -
+    // when a real address is sitting right there in `nuthatch.toml`.
+    let mut address = args.address.clone();
     let urls = if args.rpc.is_empty() {
         // No `--rpc`: probe whatever the nest in `--dir` is configured to use, which is the case
         // where "my backfill is slow" usually starts.
@@ -317,6 +322,17 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
                 )
             }
         })?;
+        if address.is_none() {
+            if let Some(c) = cfg.contracts.first() {
+                println!(
+                    "no --address given; probing with '{}' ({}), this nest's first declared \
+                     contract - pass --address to probe a different, possibly busier one",
+                    c.alias, c.address
+                );
+                println!();
+                address = Some(c.address.clone());
+            }
+        }
         cfg.nest.rpc_urls
     } else {
         args.rpc
@@ -331,7 +347,7 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
         println!("{host}");
-        let p = probe(url, args.address.as_deref()).await?;
+        let p = probe(url, address.as_deref()).await?;
         print!("{}", p.report());
         if let Some(w) = p.recommended_window() {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
@@ -593,5 +609,88 @@ mod tests {
             p.max_window
         );
         assert_eq!(p.recommended_window(), Some(RANGE_ONLY_WINDOW_CAP));
+    }
+
+    /// #644: the operator-facing note used to claim a range-only measurement OVERSTATES real
+    /// capacity. Every measurement on record says the opposite - address-filtered ceilings came
+    /// back wider, by up to 256x, and two endpoints answered only once filtered. Mutation check:
+    /// revert the note text in `probe()` to the pre-#644 wording ("will sustain a narrower
+    /// window") and this goes red.
+    #[tokio::test]
+    async fn the_range_only_note_says_the_real_window_is_likely_larger_not_smaller() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen, None).await;
+
+        let p = probe(&url, None).await.unwrap();
+        handle.abort();
+
+        let joined = p.notes.join(" ");
+        assert!(
+            joined.contains("much larger"),
+            "the note must say the real window is likely LARGER, not narrower: {joined}"
+        );
+        assert!(
+            !joined.contains("narrower window"),
+            "the pre-#644 backwards claim must be gone: {joined}"
+        );
+    }
+
+    /// #644 item 2 (probe with an address by default where one is derivable): `run()` with `--dir`
+    /// and no `--address` must probe using the nest's own first declared contract rather than
+    /// falling back to the range-only probe, which every #644 measurement showed understates the
+    /// real window - sometimes by 256x, sometimes (`bsc-rpc.publicnode.com`,
+    /// `polygon-bor-rpc.publicnode.com`) all the way to an outright refusal. Mutation check: delete
+    /// the address-derivation block in `run()` and the captured filter carries no `address`, only
+    /// the no-match `topics`.
+    #[tokio::test]
+    async fn run_with_dir_and_no_address_derives_one_from_the_nest() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["{url}"]
+schema_version = 1
+
+[[contracts]]
+alias = "busiest"
+address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+abi = "abis/busiest.json"
+"#
+            ),
+        )
+        .unwrap();
+
+        run(crate::cli::DoctorArgs {
+            rpc: Vec::new(),
+            dir: dir.path().to_string_lossy().into_owned(),
+            address: None,
+        })
+        .await
+        .unwrap();
+        handle.abort();
+
+        let filters = seen.lock().unwrap();
+        assert!(!filters.is_empty(), "no eth_getLogs call was captured");
+        assert!(
+            filters.iter().any(|f| {
+                f.get("address")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter().any(|v| {
+                            v.as_str() == Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                        })
+                    })
+                    .unwrap_or(false)
+            }),
+            "no filter carried the nest's own declared contract address: {filters:?}"
+        );
     }
 }
