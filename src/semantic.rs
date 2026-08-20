@@ -333,12 +333,31 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
         })
         .collect();
 
+    // Separate orphaned tables into two buckets: those whose alias prefix is entirely absent from
+    // the registry (whole-alias orphans, caused by a contract rename) and genuine per-table drift.
+    // Collapsing the whole-alias case into one warning prevents N×38 noise on a correct nest.
+    let registry_aliases: std::collections::BTreeSet<&str> = known
+        .keys()
+        .filter_map(|t| t.split_once("__").map(|(a, _)| a))
+        .collect();
+
+    let mut alias_orphans: BTreeMap<String, usize> = BTreeMap::new();
     let mut warnings = Vec::new();
+
     for (table, ts) in &sem.tables {
         match known.get(table.as_str()) {
-            None => warnings.push(format!(
-                "semantic.toml describes table `{table}`, which the registry has no decoder for"
-            )),
+            None => {
+                // Whole-alias orphan when the alias prefix no longer exists in the registry.
+                if let Some(alias) = table.split_once("__").map(|(a, _)| a) {
+                    if !registry_aliases.contains(alias) {
+                        *alias_orphans.entry(alias.to_string()).or_insert(0) += 1;
+                        continue;
+                    }
+                }
+                warnings.push(format!(
+                    "semantic.toml describes table `{table}`, which the registry has no decoder for"
+                ));
+            }
             Some(cols) => {
                 for col in ts.columns.keys() {
                     if !cols.contains(col) {
@@ -350,6 +369,16 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
             }
         }
     }
+
+    // One consolidated warning per renamed alias instead of one per table.
+    for (alias, count) in alias_orphans {
+        let plural = if count == 1 { "table" } else { "tables" };
+        warnings.push(format!(
+            "semantic.toml has {count} {plural} still keyed to alias `{alias}`, which is no \
+             longer in this nest; run `nuthatch schema` after renaming an alias to regenerate"
+        ));
+    }
+
     warnings
 }
 
@@ -594,7 +623,15 @@ mod tests {
             .insert("ghost__event".into(), TableSemantic::default()); // no such table
 
         let warnings = drift(&schema, &sem);
-        assert!(warnings.iter().any(|w| w.contains("ghost__event")));
+        // `ghost__event` is the only `ghost__*` entry; the whole-alias path fires.
+        assert!(
+            warnings.iter().any(|w| w.contains("`ghost`")),
+            "a whole-alias orphan must warn once about the alias, got: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("ghost__event")),
+            "whole-alias orphan must not fire a per-table warning"
+        );
         assert!(warnings.iter().any(|w| w.contains("usdc__transfer.nope")));
         assert!(
             !warnings.iter().any(|w| w.contains("from")),
