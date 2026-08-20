@@ -7229,7 +7229,10 @@ template = "pool"
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
         guard_registry_identity(&store, "cccc").expect("an older store must not be refused");
-        assert_eq!(store.get_meta(REGISTRY_KEY).unwrap().as_deref(), Some("cccc"));
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("cccc")
+        );
         // And having adopted, it is now held to it.
         guard_registry_identity(&store, "dddd")
             .expect_err("once adopted, a later change must be refused");
