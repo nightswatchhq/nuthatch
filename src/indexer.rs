@@ -7193,14 +7193,16 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut left = self.fails_left.lock().unwrap();
             if *left > 0 {
                 *left -= 1;
                 anyhow::bail!("transport error: error sending request for url (mock)");
             }
-            Ok(Some("0xfeed".to_string()))
+            // Must agree with the hash the fixture logs carry, or the window reads as a reorg and is
+            // discarded - which looks exactly like the bug under test and is not it.
+            Ok(Some(format!("0x{n:064x}")))
         }
         async fn logs(
             &self,
@@ -7212,38 +7214,55 @@ template = "pool"
         }
     }
 
-    /// #651. A transport blip on an ingestion fetch must be retried, not fatal.
+    /// #651. A transport blip during a window must be retried, not kill the nest.
     ///
-    /// The helper `retry_transient` already has its own unit tests, and they all passed while this
-    /// bug was live - because the bug was never in the helper, it was in a call site that did not
-    /// use it. So this asserts the *wiring*: a source that fails twice and then answers must leave
-    /// the fetch succeeding, and the failure count must prove the failures actually happened rather
-    /// than the test having quietly exercised the happy path.
+    /// Driven through `process_window` with a **flaky `Source`** and a healthy gateway, because the
+    /// bug was never in `retry_transient` - that helper's own unit tests all passed while a 454M-block
+    /// backfill was dying eight hours in at 87.6% on one dropped connection. The bug was a call site
+    /// that did not use it, so only a test that exercises the call site can see it.
     ///
-    /// Cost in the field: a 454M-block backfill died eight hours in at 87.6% on exactly this, one
-    /// dropped connection against a single-endpoint `--state-rpc` where there is no failover either.
-    #[tokio::test(start_paused = true)]
-    async fn a_transport_blip_on_an_ingestion_fetch_is_retried_not_fatal() {
-        let src = FlakySource {
-            logs: Vec::new(),
-            fails_left: std::sync::Mutex::new(2),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        };
-        let got = retry_transient("block hash for 1", BACKFILL_RETRY_BASE, || async {
-            src.block_hash(1).await
-        })
-        .await
-        .expect("two transient failures must not be fatal");
+    /// Proven by mutation: restore the bare `?` on the IPFS path's `block_hash` fetch and this fails,
+    /// while every other test in the suite stays green.
+    // NOT `start_paused`: this drives a real HTTP request at the stub gateway, and a paused clock
+    // auto-advances past it so the fetch never completes. Three retries at a 250ms base is ~1.75s.
+    #[tokio::test]
+    async fn a_flaky_source_mid_window_is_retried_rather_than_killing_the_nest() {
+        const DOC: &str = r#"{"n":1}"#;
+        let (gateway, handle) = stub_gateway(DOC).await;
+        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
 
-        assert_eq!(got, Some("0xfeed".to_string()));
+        let flaky = Arc::new(FlakySource {
+            logs: Vec::new(),
+            fails_left: std::sync::Mutex::new(3),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let probe = flaky.clone();
+
+        // No `expect` needed here - `run_ipfs_nest_with_source` unwraps the window itself, so a
+        // propagated transport error panics and fails this test, which is precisely the regression.
+        let rows = run_ipfs_nest_with_source(dir.path(), gateway, &cid, flaky).await;
+        handle.abort();
+
         assert_eq!(
-            src.calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "must have failed twice and succeeded on the third - a lower count means the failures \
-             never happened and this test proved nothing"
+            rows.iter()
+                .filter(|(_, v)| v["table"] == "token_metadata")
+                .count(),
+            1,
+            "the document must still be resolved and stored after the blips, got {rows:?}"
         );
-        assert_eq!(*src.fails_left.lock().unwrap(), 0, "both failures consumed");
+        // The premise: the failures must actually have happened, or this passed on the happy path.
+        assert_eq!(
+            *probe.fails_left.lock().unwrap(),
+            0,
+            "all three transient failures must have been consumed"
+        );
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "block_hash must have been retried past the failures"
+        );
     }
+
 
     #[async_trait::async_trait]
     impl Source for MockSource {
@@ -7871,6 +7890,18 @@ template = "pool"
         gateway: String,
         uri: &str,
     ) -> Vec<(String, serde_json::Value)> {
+        run_ipfs_nest_with_source(dir, gateway, uri, Arc::new(MockSource { logs: Vec::new() })).await
+    }
+
+    /// The same harness with the `Source` injected, so a test can make the *ingestion* side flaky
+    /// while the gateway stays healthy - the only way to reach the `block_hash` fetch inside the
+    /// IPFS path from a test.
+    async fn run_ipfs_nest_with_source(
+        dir: &std::path::Path,
+        gateway: String,
+        uri: &str,
+        source: Arc<dyn Source>,
+    ) -> Vec<(String, serde_json::Value)> {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
@@ -7888,7 +7919,6 @@ template = "pool"
         let mut config = Config::load(dir).unwrap();
         config.ipfs_gateways = vec![gateway];
 
-        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let (mut nest, state, worker, _w) =
             build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
                 .await
