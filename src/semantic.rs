@@ -370,12 +370,15 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
         }
     }
 
-    // One consolidated warning per renamed alias instead of one per table.
+    // One consolidated warning per renamed alias instead of one per table. The remediation names an
+    // edit rather than a command on purpose: `semantic::merge` only ever adds generated tables and
+    // never drops one, so `nuthatch schema` leaves the orphaned keys - and this warning - in place.
     for (alias, count) in alias_orphans {
         let plural = if count == 1 { "table" } else { "tables" };
         warnings.push(format!(
             "semantic.toml has {count} {plural} still keyed to alias `{alias}`, which is no \
-             longer in this nest; run `nuthatch schema` after renaming an alias to regenerate"
+             longer in this nest; re-key the `[table.{alias}__*]` sections to the new alias to \
+             keep their descriptions, or delete them"
         ));
     }
 
@@ -515,6 +518,25 @@ fn describe_table(t: &TableSchema, ts: Option<&TableSemantic>) -> String {
 mod tests {
     use super::*;
     use crate::registry::{ColumnSchema, TableSchema};
+
+    /// A minimal event table under a chosen alias, for the rename repro.
+    fn aliased_table(alias: &str, event: &str) -> TableSchema {
+        TableSchema {
+            table: format!("{alias}__{event}"),
+            alias: alias.into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: event.into(),
+            topic0: "0xddf2".into(),
+            columns: vec![ColumnSchema {
+                name: "sender".into(),
+                sol_type: "address".into(),
+                storage: "address".into(),
+                indexed: true,
+            }],
+        }
+    }
 
     fn transfer_table() -> TableSchema {
         TableSchema {
@@ -710,6 +732,51 @@ mod tests {
         assert!(
             !warnings[0].contains("1 tables"),
             "singular must not read `1 tables`: {warnings:?}"
+        );
+    }
+
+    /// The remediation the warning prints has to be one the operator can actually run. `merge` only
+    /// ever *adds* generated tables to the existing map (`out.tables.insert` on the `None` arm) and
+    /// never removes one, so a regenerate cannot clear an orphaned alias key - the sections stay and
+    /// the warning fires again next start. This walks the issue's own repro through the three calls
+    /// `nuthatch schema` makes (`project.rs:768-773`: generate → merge → save) and pins that, so the
+    /// message can never drift back to naming a command that does not fix it.
+    #[test]
+    fn a_regenerate_cannot_clear_an_orphaned_alias_so_the_advice_must_not_name_it() {
+        // Seeded when the nest still called its contract `oldpool`, with authored prose on top.
+        let before = vec![
+            aliased_table("oldpool", "swap"),
+            aliased_table("oldpool", "mint"),
+        ];
+        let mut seeded = generate(&before, "n", "mainnet");
+        seeded
+            .tables
+            .get_mut("oldpool__swap")
+            .expect("seeded from the old alias")
+            .description = "every swap through the pool".into();
+
+        // The operator renames the alias in nuthatch.toml and runs `nuthatch schema`.
+        let after = vec![aliased_table("pool", "swap"), aliased_table("pool", "mint")];
+        let regenerated = merge(seeded, generate(&after, "n", "mainnet"));
+
+        assert!(
+            regenerated.tables.contains_key("oldpool__swap"),
+            "merge never drops a table, so the orphan survives the regenerate: {:?}",
+            regenerated.tables.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            regenerated.tables["oldpool__swap"].description, "every swap through the pool",
+            "and it survives with the authored prose still attached to the dead key"
+        );
+
+        let warnings = drift(&after, &regenerated);
+        assert!(
+            warnings.iter().any(|w| w.contains("`oldpool`")),
+            "the warning still fires after a regenerate, which is the whole point: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("nuthatch schema")),
+            "the warning must not send the operator to a command that leaves it firing: {warnings:?}"
         );
     }
 
