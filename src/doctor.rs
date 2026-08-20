@@ -35,18 +35,13 @@ use crate::source::Source;
 ///
 /// The no-address probe filters on a topic0 no event can produce (see `probe()`), so its response
 /// is empty at every span and it can never meet a result-count cap - it only ever measures the
-/// provider's raw block-range ceiling, which on a provider with no hard range cap climbs to the
-/// probe loop's own limit rather than to anything the provider actually enforces. Halving that
-/// number is still an unfounded recommendation, since it says nothing about the result-count cap a
-/// nest's real, log-matching traffic will meet.
+/// provider's raw block-range ceiling. The cap is a conservative lower bound: on endpoints whose
+/// real result-count limit exceeds 320 (as measured at 81,920 for one archive RPC in
+/// docs/launch/port-queue-nest.md §8), the actual usable window is much larger and can only be
+/// found with `--address`.
 ///
-/// The one real measurement of that shape in this codebase is `arb1.arbitrum.io`, which refused
-/// the pre-#446 all-logs probe (no address filter, no topic0 filter - the densest traffic an
-/// address-less request can produce) at 640 blocks. That is also the traffic shape a factory nest
-/// legitimately sends on purpose (`LogFilter::new` allows a topic0-only, address-less filter for
-/// exactly that reason - `source.rs`), so it is the right proxy rather than an arbitrary margin.
-/// Halved again for the same headroom `recommended_window()` already applies to a direct
-/// measurement, since 640 is a cross-endpoint data point, not this endpoint's own ceiling.
+/// Derived from `arb1.arbitrum.io` refusing a dense all-logs probe at 640 blocks (pre-#446),
+/// halved for headroom. It is one cross-endpoint data point, not a universal ceiling.
 const RANGE_ONLY_WINDOW_CAP: u64 = 320;
 
 /// What one endpoint can actually do.
@@ -83,9 +78,10 @@ impl Probe {
     /// one by failing first.
     ///
     /// For a **range-only** measurement the halved number is additionally capped at
-    /// [`RANGE_ONLY_WINDOW_CAP`], because halving only produces headroom against *this* number - and
-    /// a range-only `max_window` carries no result-count information at all, so there is no cap in
-    /// it to have headroom against.
+    /// [`RANGE_ONLY_WINDOW_CAP`], because a range-only probe never meets a result-count cap and
+    /// therefore says nothing about what a real nest sustains. The cap is a conservative floor -
+    /// any endpoint whose real address-filtered capacity exceeds 320 will need a re-probe with
+    /// `--address` to surface it.
     pub fn recommended_window(&self) -> Option<u64> {
         self.max_window.map(|w| {
             let halved = (w / 2).max(1);
@@ -272,16 +268,15 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
 
     // This probe filters on a topic0 no event can produce (see above), so its response is empty at
     // every span and it can never meet a result-count cap - it only ever measures the provider's
-    // RANGE limit. A real nest filters by address and topic0 and gets back actual logs, so it
-    // additionally meets whatever result-count cap the provider enforces - which is the tighter
-    // limit in the one case measured in this file (arb1.arbitrum.io refused the pre-#446 all-logs
-    // probe at 640 blocks on result count, not range). So this number OVERSTATES what a real
-    // backfill can sustain, not understates it, and `recommended_window()` caps it accordingly.
+    // RANGE limit. A real nest filtered by address and topic0 additionally meets whatever
+    // result-count cap the provider enforces. The 320-block recommendation is therefore a floor,
+    // not a ceiling: on endpoints where the result-count cap is above 320 (as measured at 81,920
+    // for one archive RPC in docs/launch/port-queue-nest.md §8), the real window is much larger.
     if address.is_none() && max_window.is_some() {
         notes.push(
-            "window measured RANGE-ONLY - it never triggers a result-count cap, so a nest matching \
-             real logs will sustain a narrower window; re-probe with --address <contract> for a \
-             number that reflects both limits"
+            "window measured RANGE-ONLY - capped at 320 because a range-only probe cannot see the \
+             result-count limit; your real window is very likely much larger. Re-probe with \
+             --address <contract> before backfilling to get a number that reflects both limits"
                 .to_string(),
         );
     }
@@ -298,6 +293,11 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
 
 /// `nuthatch doctor` - probe each endpoint and print what it can do.
 pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
+    // Derived only when `--dir` supplies the endpoints and the operator gave no explicit
+    // `--address`: the nest already declares its contracts, so there is no reason to fall back to
+    // the range-only probe - which #644 measured as understating the real window by up to 256x -
+    // when a real address is sitting right there in `nuthatch.toml`.
+    let mut address = args.address.clone();
     let urls = if args.rpc.is_empty() {
         // No `--rpc`: probe whatever the nest in `--dir` is configured to use, which is the case
         // where "my backfill is slow" usually starts.
@@ -322,6 +322,17 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
                 )
             }
         })?;
+        if address.is_none() {
+            if let Some(c) = cfg.contracts.first() {
+                println!(
+                    "no --address given; probing with '{}' ({}), this nest's first declared \
+                     contract - pass --address to probe a different, possibly busier one",
+                    c.alias, c.address
+                );
+                println!();
+                address = Some(c.address.clone());
+            }
+        }
         cfg.nest.rpc_urls
     } else {
         args.rpc
@@ -336,7 +347,7 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
         println!("{host}");
-        let p = probe(url, args.address.as_deref()).await?;
+        let p = probe(url, address.as_deref()).await?;
         print!("{}", p.report());
         if let Some(w) = p.recommended_window() {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
@@ -598,5 +609,88 @@ mod tests {
             p.max_window
         );
         assert_eq!(p.recommended_window(), Some(RANGE_ONLY_WINDOW_CAP));
+    }
+
+    /// #644: the operator-facing note used to claim a range-only measurement OVERSTATES real
+    /// capacity. Every measurement on record says the opposite - address-filtered ceilings came
+    /// back wider, by up to 256x, and two endpoints answered only once filtered. Mutation check:
+    /// revert the note text in `probe()` to the pre-#644 wording ("will sustain a narrower
+    /// window") and this goes red.
+    #[tokio::test]
+    async fn the_range_only_note_says_the_real_window_is_likely_larger_not_smaller() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen, None).await;
+
+        let p = probe(&url, None).await.unwrap();
+        handle.abort();
+
+        let joined = p.notes.join(" ");
+        assert!(
+            joined.contains("much larger"),
+            "the note must say the real window is likely LARGER, not narrower: {joined}"
+        );
+        assert!(
+            !joined.contains("narrower window"),
+            "the pre-#644 backwards claim must be gone: {joined}"
+        );
+    }
+
+    /// #644 item 2 (probe with an address by default where one is derivable): `run()` with `--dir`
+    /// and no `--address` must probe using the nest's own first declared contract rather than
+    /// falling back to the range-only probe, which every #644 measurement showed understates the
+    /// real window - sometimes by 256x, sometimes (`bsc-rpc.publicnode.com`,
+    /// `polygon-bor-rpc.publicnode.com`) all the way to an outright refusal. Mutation check: delete
+    /// the address-derivation block in `run()` and the captured filter carries no `address`, only
+    /// the no-match `topics`.
+    #[tokio::test]
+    async fn run_with_dir_and_no_address_derives_one_from_the_nest() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["{url}"]
+schema_version = 1
+
+[[contracts]]
+alias = "busiest"
+address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+abi = "abis/busiest.json"
+"#
+            ),
+        )
+        .unwrap();
+
+        run(crate::cli::DoctorArgs {
+            rpc: Vec::new(),
+            dir: dir.path().to_string_lossy().into_owned(),
+            address: None,
+        })
+        .await
+        .unwrap();
+        handle.abort();
+
+        let filters = seen.lock().unwrap();
+        assert!(!filters.is_empty(), "no eth_getLogs call was captured");
+        assert!(
+            filters.iter().any(|f| {
+                f.get("address")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter().any(|v| {
+                            v.as_str() == Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                        })
+                    })
+                    .unwrap_or(false)
+            }),
+            "no filter carried the nest's own declared contract address: {filters:?}"
+        );
     }
 }
