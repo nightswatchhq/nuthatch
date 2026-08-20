@@ -9588,6 +9588,83 @@ rpc_urls = ["https://rpc.example"]
         widest: std::sync::atomic::AtomicU64,
     }
 
+    /// A provider with a hard `eth_getLogs` **range** cap, which refuses an over-wide range the way
+    /// the public mainnet endpoints actually do (#672): with a rate-limit-shaped error, not a
+    /// "range too large" one that `is_result_too_large` recognises.
+    ///
+    /// That distinction is the whole point. Alchemy answers an oversized range with a message naming
+    /// its 10,000-block cap, which the chunker understands and halves for. `eth.drpc.org`,
+    /// `eth-pokt.nodies.app` and `eth.api.onfinality.io/public` answer HTTP 429 or 403 under the same
+    /// conditions, and that says nothing about width. This reproduces the second case with no network
+    /// in it, so the cost is a fixed number instead of a sample from a distribution that spanned 2 to
+    /// 198 events across four identical 90-second runs.
+    ///
+    /// Distinct from [`CappedSource`], which refuses on *filter* breadth for the COR-5 path.
+    /// How many width refusals a healthy caller should need to find its way under a cap. Generous:
+    /// halving from 16,000 to under 10,000 is one step.
+    const REFUSAL_GIVE_UP: usize = 50;
+
+    struct RangeCappedSource {
+        logs: Vec<crate::rpc::Log>,
+        /// Widest range this provider will serve, in blocks.
+        cap: u64,
+        served: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+        widest_attempted: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RangeCappedSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let width = to - from + 1;
+            self.widest_attempted
+                .fetch_max(width, std::sync::atomic::Ordering::SeqCst);
+            if width > self.cap {
+                let n = self
+                    .refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                // A real provider refuses indefinitely under sustained load, and so did this one -
+                // which made the test hang rather than fail. A hang is a worse test than a failure:
+                // it reports nothing. So the fake gives up after a bound, turning "never terminates"
+                // into a number the assertion can name.
+                if n > REFUSAL_GIVE_UP {
+                    anyhow::bail!(
+                        "gave up after {n} refusals - the caller never narrowed below {width} \
+                         blocks against a {} block cap",
+                        self.cap
+                    );
+                }
+                anyhow::bail!("HTTP 429 Too Many Requests: rate limited");
+            }
+            self.served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Source for RequestCountingSource {
         async fn tip(&self) -> Result<u64> {
@@ -9618,6 +9695,80 @@ rpc_urls = ["https://rpc.example"]
         ) -> Result<std::collections::HashMap<u64, u64>> {
             Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
         }
+    }
+
+    /// #676 / #672. What the flagship first run *costs*, as a fixed number.
+    ///
+    /// The shape of the real thing: a contract with a long empty prefix, behind a provider that caps
+    /// `eth_getLogs` at 10,000 blocks - Alchemy's documented limit - and refuses anything wider with a
+    /// 429 rather than a width complaint. The chunker grows 4x per empty window, so it *will* walk
+    /// into the cap; the question this pins down is how much it wastes discovering that, and whether
+    /// it learns.
+    ///
+    /// This exists because the same measurement over the network could not be made: four identical
+    /// 90-second runs of the real demo indexed 2, 15, 28 and 198 events. No fix can be evaluated
+    /// against a spread like that, and no regression can hide from a number like the one below.
+    ///
+    /// The assertion is deliberately loose - it pins the *order of magnitude* of the waste, not the
+    /// exact count, so ordinary retuning of the growth factor does not fail it while a return to
+    /// unbounded retrying does.
+    /// **Ignored because it does not currently terminate**, which is the finding rather than a flaw
+    /// in the test. Un-ignore it with the fix for #672: it passes when the caller learns a width the
+    /// provider has refused, and hangs until then. A red test cannot be merged and a hanging one is
+    /// worse, so it is parked here in a form that can be run on demand:
+    ///
+    /// ```sh
+    /// cargo test --lib the_cost_of_a_first_run -- --ignored --nocapture
+    /// ```
+    #[ignore = "reproduces #672: the backfill never narrows below a refused width, so this hangs"]
+    #[tokio::test]
+    async fn the_cost_of_a_first_run_behind_a_capped_provider_is_a_fixed_number() {
+        let reg = transfer_registry();
+        let src = RangeCappedSource {
+            // A late-deployed contract: 200,000 empty blocks, then two logs.
+            logs: ping_logs(&reg, &[199_998, 199_999]),
+            cap: 10_000,
+            served: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::atomic::AtomicUsize::new(0),
+            widest_attempted: std::sync::atomic::AtomicU64::new(0),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let addresses = vec!["0x1111111111111111111111111111111111111111".to_string()];
+
+        let rows = backfill_direct_pipelined(
+            &src,
+            &reg,
+            dir.path(),
+            &addresses,
+            &[],
+            0,
+            199_999,
+            1_000,
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let served = src.served.load(std::sync::atomic::Ordering::SeqCst);
+        let refused = src.refused.load(std::sync::atomic::Ordering::SeqCst);
+        let widest = src
+            .widest_attempted
+            .load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("first-run cost: served={served} refused={refused} widest_attempted={widest}");
+
+        assert_eq!(rows, 2, "it must still find the logs it was looking for");
+        assert!(
+            refused < served,
+            "more requests were refused than served ({refused} refused, {served} served) - the \
+             chunker is spending most of the run discovering a cap it already walked into"
+        );
+        assert!(
+            refused <= 12,
+            "{refused} refusals to cross a 200k-block prefix behind a 10k cap. Each one is a round \
+             trip that returned nothing, and against a real endpoint each carries a backoff"
+        );
     }
 
     /// **The RFC-0029 §6f case.** A long empty prefix at a fixed window costs one request per window
