@@ -13,6 +13,44 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-07-29 to 2026-08-19 - catch-up entry, reconciled retrospectively (2026-08-20).** The log went
+  quiet for three weeks across nineteen tags and two majors - v0.7.1 through v2.6.0 - found while
+  fixing three RFC index rows that had gone stale the same way (issue #658). Rather than back-fill
+  nineteen per-push entries from `git log` at a fidelity the house style does not support, this is one
+  honest summary, in the shape of the 2026-07-22-to-28 catch-up below. Per-push granularity resumes
+  once it does.
+  - **v1.0.0 (2026-08-02).** The 1.0 release.
+  - **v2.0.0 (2026-08-06) - the tenant runtime, [RFC-0032](rfcs/0032-the-tenant-runtime.md) through
+    [RFC-0035](rfcs/0035-the-2-0-breaking-surface.md).** The roost is retired: data moves to
+    `data/<nid>` keyed by content address, mounts become `(tenant, NID)` records, and a shared nest is
+    indexed once with unmount deferring collection behind an explicit `nuthatch prune`. Migration
+    proven on the Lodestar production box, not a fixture. The RFC rows above carry the per-slice
+    detail; this entry exists so the log has a marker for the day.
+  - **v2.1.0 through v2.5.0 (2026-08-11 to 2026-08-15).** Derivation grafting
+    ([RFC-0033](rfcs/0033-nest-identity-and-derivation-grafting.md) - editing a nest without
+    re-indexing the data behind it) and the query allowlist
+    ([RFC-0034](rfcs/0034-the-query-allowlist.md) - an author's ceiling a mount may narrow but never
+    widen), plus the ordinary sprint cadence of fixes the issue queue already carries individually.
+  - **v2.6.0 (2026-08-19) - subgraph parity closed: contract calls and IPFS documents.** The two
+    largest features since 2.0. [RFC-0023](rfcs/0023-contract-state-eth-call-derive-first.md) tier 3
+    gets an executor - `resolve_at` finally has a caller, verified on a live seven-contract Arbitrum
+    nest: 2,725 pinned reads, zero reverts, seven checked value-for-value against an archive node and
+    matching exactly, to the wei. **Issue #268 closed** by that wiring (PR #643, commit `68a5378`) -
+    #262's refusal-at-load was always the interim state, and the guard test that watched for an
+    executor appearing did its job.
+    [RFC-0037](rfcs/0037-ipfs-content-resolution.md) ships `[[ipfs]]`, a verified, content-addressed
+    side table: 5 of 5 documents resolved and verified against a live gateway on Arbitrum GNS, three
+    of the five CIDs computed by hand beforehand and matching.
+    [RFC-0038](rfcs/0038-subgraph-parity.md) closes the two remaining "less than a subgraph" gaps -
+    calls may now be parameterised from the row that triggered them, and top-level calls decode from
+    ordinary RPC with no node required - measured end to end at 343 Uniswap V3 swaps row-for-row
+    identical to the gateway, and 219 pools discovered with 219 parameterised `eth_call`s and no
+    misses. Four new EVM chains (BSC, Polygon, Gnosis, Optimism) shipped alongside (#646).
+  - **The lesson worth keeping.** This file's own header defends never rewriting a past entry, and
+    that is right - it says nothing about not writing new ones. A quiet log reads as no progress to
+    anyone who has not read `git log`, and the RFC index went stale the same direction in the same
+    week: both understated what had shipped.
+
 - **2026-07-28 - RFC-0027 and RFC-0028 complete; three live acceptance runs; relicensed to
   `MIT OR Apache-2.0`.** A long day; the parts worth remembering:
   - **[RFC-0027](rfcs/0027-the-live-roost.md) Implemented (all 7 slices).** A roost's nest set is no
