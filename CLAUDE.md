@@ -151,6 +151,13 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 
 ## Build order (vertical slices; each ends runnable)
 
+> **Status 2026-08-20: slices 1-5 are shipped, and a feature freeze runs to the end of 2026.**
+> `docs/roadmap-2027.md` is the standing direction: no new capability this year, only bug fixes,
+> security, performance, maintenance, marketing, and making the delightful core (RFC-0015) best in
+> class. Slice 6 (ExEx, scaled mode) and the parked RFC work are **not cancelled** and not to be
+> started. Treat a proposal for new capability the way the out-of-scope list below is treated: say
+> so, rather than quietly building it. The list survives as the record of how the product was built.
+
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
    slice alone must hit the <2-minute demo.
