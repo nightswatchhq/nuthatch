@@ -112,7 +112,11 @@ fn off_localhost_addr() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("203.0.113.1:80").ok()?;
     let addr = s.local_addr().ok()?.ip();
-    if addr.is_loopback() { None } else { Some(addr) }
+    if addr.is_loopback() {
+        None
+    } else {
+        Some(addr)
+    }
 }
 
 /// A free port on the given address, released before we hand it to the FE.
