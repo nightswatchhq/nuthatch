@@ -67,6 +67,21 @@ jobs:
           for u in https://mainnet.base.org https://base.drpc.org https://base-pokt.nodies.app; do
             probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
           done
+          # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).
+          # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
+          # silently breaks backfill even when its getLogs window is wide. That is what broke on
+          # 2026-08-20 - polygon-bor-rpc.publicnode.com (non-archive) was first.
+          for u in https://polygon.drpc.org https://polygon-bor-rpc.publicnode.com; do
+            probe polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 "$u"
+          done
+          # Archive-depth gate for the first (archive) endpoint.
+          echo "== polygon archive check =="
+          ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
+            --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 2>&1 | tee /tmp/polygon-archive-out
+          if grep -q "archive depth    no" /tmp/polygon-archive-out; then
+            echo "::error::polygon.drpc.org lost archive depth - it is no longer suitable as the primary endpoint"
+            fail=1
+          fi
           # Deliberately fails the job rather than warning. A dead default is a broken promise for
           # every new user of that chain, and a warning nobody reads is how this one survived a month.
           exit $fail
