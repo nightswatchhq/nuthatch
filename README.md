@@ -75,21 +75,25 @@ after a full dependency build with `error: could not compile dbsp` and installs 
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
 
-**Chains.** Ethereum, Arbitrum One and Base are *built in*, with keyless public endpoints and tuned
-finality settings - **omit `--chain` and nuthatch probes each for your contract's bytecode and picks the
-one it lives on.** Point at your own node with `--rpc`.
+**Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis and Optimism are *built in*, with
+measured public endpoints and tuned finality settings - **omit `--chain` and nuthatch probes each for
+your contract's bytecode and picks the one it lives on.** Point at your own node with `--rpc`.
 
-**Any other EVM chain works too** - BSC, World Chain, Base Sepolia, your own devnet. Name the chain and
+**Any other EVM chain works too** - World Chain, Base Sepolia, your own devnet. Name the chain and
 say where it lives:
 
 ```sh
-nuthatch init 0xADDR --chain bsc --rpc https://your-bsc-endpoint.example
+nuthatch init 0xADDR --chain world-chain --rpc https://your-endpoint.example
 ```
 
 The chain id is read **from the endpoint itself**, so there is no id to look up and nothing to type
-wrong. A built-in chain never dials: `--rpc` is ignored for `mainnet`, `arbitrum-one` and `base`.
-Omit `--rpc` on an unregistered name and the refusal tells you the remedy rather than just listing the
-three built-ins.
+wrong. A built-in chain never dials: `--rpc` is ignored for the seven names above. Omit `--rpc` on an
+unregistered name and the refusal tells you the remedy rather than just listing the built-ins.
+
+Public endpoints are a moving target, and the ones shipped here are measured rather than assumed -
+but a measurement is a snapshot, not a property. Run `nuthatch doctor --rpc <url>` before trusting a
+long backfill to any endpoint, yours or ours: it reports the widest `eth_getLogs` range, the JSON-RPC
+batch limit and whether the node has archive depth, and prints the largest safe `--window`.
 
 Everything downstream was always chain-agnostic - `dev`, `sql` and `bench`, and the indexer's
 unregistered-chain finality and window defaults. `init`'s allow-list was the only thing narrower than
@@ -332,6 +336,18 @@ The core is "your contract → SQL." Beyond that, nuthatch has a full feature se
 who need more - none of it in the way of the happy path:
 
 - **Many contracts, one nest.** Declare several contracts in `nuthatch.toml`; index them together.
+- **Contract state, pinned** (RFC-0023). A `[[calls]]` block reads a contract at a fixed block and
+  stores the result as a table, optionally with calldata built from the row that triggered it - the
+  `contract.balanceOf(event.params.user)` a subgraph would write. Pinning the block is what keeps it
+  deterministic: the answer is fixed, so two operators re-running the same nest get the same bytes,
+  and the result is content-addressed on `(chain_id, block, contract, calldata)`. Needs `--state-rpc`
+  pointed at an archive node.
+- **IPFS documents, verified** (RFC-0037). An `[[ipfs]]` block turns a column of content addresses
+  into a table of resolved documents. Every body is re-hashed and checked against the CID it claims
+  to be, so a gateway serving the wrong bytes yields no row rather than a plausible one. The CID is
+  taken from whatever shape the contract stored - a bare CID, an `ipfs://` URI, a gateway URL, or a
+  raw 32-byte digest - and **the host is discarded**, because that string came from a log and
+  honouring it would let whoever emitted the event choose what your indexer connects to.
 - **Factory / dynamic contracts** (RFC-0009). Watch a factory (e.g. a pool factory); children are
   discovered at runtime and indexed into shared `{template}__*` tables - no redeploy per child.
 - **Declarative + imperative derivation.** Incremental views maintained by DBSP (reorgs become
