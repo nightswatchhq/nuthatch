@@ -26,7 +26,7 @@ guide. Both are green as of 2026-08-06. A checklist nobody re-reads decides what
 | 🟡 | Partial - exists but incomplete, unverified, or narrow |
 | ⛔ | Not started, deferred, or blocked (see "Blocked on") |
 
-**The flag is the status; the `[ ]` box beside it means nothing.** 67 rows here read `- [ ] ✅` -
+**The flag is the status; the `[ ]` box beside it means nothing.** 66 rows here read `- [ ] ✅` -
 done and verified, in an unchecked box - because the boxes were never maintained. GitHub renders
 them as a page of empty checkboxes regardless, so a reader skimming the ticks rather than the flags
 reads this document as far worse than it is. Two rows carry `[x]`, which makes the boxes look
@@ -71,10 +71,11 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 
 - [ ] ✅ Deterministic decode: topic0-keyed, contract-ABI priority with generic fallback. *(RFC-0001)*
 - [ ] ✅ ABI acquisition Sourcify → Etherscan-class, cached locally.
-- [ ] ✅ Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve. -
-  *One narrow gap open and tracked: a nest whose config **gains** events keeps running on data indexed  **[#653]**
-  under the old config and stamps the new `registry_hash` on it anyway - the version tag lies about
-  what actually decoded those rows. A fix exists on an unmerged branch; not credited here.*
+- [ ] 🟡 Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve. -
+  *The no-retroactive-re-decode half holds. The versioning half has one narrow gap open and tracked:  **[#653]**
+  a nest whose config **gains** events keeps running on data indexed under the old config and stamps
+  the new `registry_hash` on it anyway - the version tag lies about what actually decoded those rows.
+  A fix exists on an unmerged branch; not credited here.*
 - [ ] ✅ Golden/deterministic tests per handler and view (fixed fixtures in → exact state out).
 - [ ] ✅ Property tests: random reorg depths converge to canonical state (`e2e_reorg.rs`).
 - [ ] ✅ Nest invariant/parity checks (`nuthatch check`) run hermetically in CI against committed
