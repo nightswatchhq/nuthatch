@@ -11,6 +11,22 @@
 # returning 503 on a healthy cursor at tip). It was caught by a CEO heartbeat happening to land in
 # the right ten-minute window, which is luck, not a control. This job is the control (NIG-235).
 #
+# ## The roster (#619, #691)
+#
+# The first cut of this job checked only that *some* non-blank text followed the colon. Two holes
+# followed directly from that: `Reviewed-by: pending` is non-blank and passed (#619), on live PR
+# #617; and the self-review refusal below compares against the PR's GitHub *login*, which is
+# `cargopete` for every PR this firm opens, while reviewers sign as firm agents or as the shared git
+# identity `pete-fathom` - name spaces that never intersect, so that refusal could never fire here
+# and #688 went through self-signed as `pete-fathom` (#691).
+#
+# Both close the same way: `.github/reviewers.txt` is a committed allowlist of the parties who may
+# **sign** - not who may author, there is no outside-contributor exemption to build, since an
+# outside PR is reviewed and signed by one of the same parties. `pending` is not on it. Neither is
+# `pete-fathom` or `cargopete` - not refused by name, simply absent, because the roster is who can
+# read a diff and neither of those denotes a party who can. See the roster file itself for what
+# that means for the file editing it.
+#
 # ## Why a separate workflow and not a job in `ci.yml`
 #
 # The `edited` trigger below is load-bearing - without it, adding the signature to the body never
@@ -54,7 +70,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: the PR body carries a Reviewed-by line
+      # Needed to read .github/reviewers.txt. Checks out the merge of base + PR head (the
+      # `pull_request` event's default ref), so a PR that edits the roster is judged against its
+      # own edited roster - the same trust boundary this file itself already sits inside, since a
+      # PR can equally edit this workflow. persist-credentials is off; nothing here pushes.
+      - name: check out the roster file
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/reviewers.txt
+          sparse-checkout-cone-mode: false
+
+      - name: the PR body carries a Reviewed-by line naming a roster reviewer
         env:
           # Via the environment, never interpolated into the script. `${{ ... }}` is substituted
           # into the shell source text before bash sees it, so a PR body containing a backtick or
@@ -66,68 +94,96 @@ jobs:
         run: |
           set -uo pipefail
 
-          # A line starting at column 1, `Reviewed-by:`, and at least one non-blank character after
-          # the colon. Everything past that is free text - what the reviewer actually checked.
+          # The name after `Reviewed-by:` at column 1, or empty if no such line exists. Everything
+          # past a matched name is free text - what the reviewer actually checked.
           #
-          # The `tr -d '\r'` is *not* load-bearing for the match and this comment used to claim it
-          # was: GitHub stores bodies CRLF, but `\r` is `[[:space:]]`, so `Reviewed-by:\r` already
-          # fails the non-blank test and a real signature matches with the `\r` still on the end.
-          # Mutation-checked - removing the `tr` failed none of the cases below. It stays because it
-          # keeps a stray `\r` out of the echoed log line, and because the match would otherwise be
-          # quietly locale-dependent, not because it is doing work today.
-          signed() {  # signed <body> -> 0 if that body carries a signature
-            printf '%s' "$1" | tr -d '\r' | grep -qE '^Reviewed-by:[[:space:]]*[^[:space:]]'
+          # The `tr -d '\r'` is *not* load-bearing for the extraction and this comment used to claim
+          # it was: GitHub stores bodies CRLF, but `\r` is `[[:space:]]`, so `Reviewed-by:\r` already
+          # extracts empty and a real signature extracts with the `\r` still on the end, which the
+          # roster match below tolerates. It stays because it keeps a stray `\r` out of the echoed
+          # log line, and because the match would otherwise be quietly locale-dependent, not because
+          # it is doing work today.
+          signed_name() {  # signed_name <body> -> prints the text after the first Reviewed-by:, or nothing
+            printf '%s' "$1" | tr -d '\r' \
+              | grep -E '^Reviewed-by:[[:space:]]*[^[:space:]]' \
+              | head -1 \
+              | sed 's/^Reviewed-by:[[:space:]]*//'
           }
 
-          # The one forgery this mechanism can actually detect (nuthatch#619).
+          # A signature is accepted only if the name matches an entry on the roster (nuthatch#619,
+          # nuthatch#691) - a committed allowlist of the parties who may sign, `.github/reviewers.txt`.
+          # Match is a prefix-with-boundary against each roster line, case-insensitive, so `Reviewed-
+          # by: Iris (NIG-296)` matches roster entry `Iris` and `Reviewed-by: Irisbot` does not.
           #
-          # Reviewers here sign as firm agents - `Iris`, `Rowan` - which are not GitHub accounts, so
-          # no API call can confirm that the named party exists, let alone that they read anything.
-          # This check is an **attestation**, not a verification, and #619 is right that no predicate
-          # over the body alone can make it otherwise: the body is written by the party the rule
-          # constrains.
+          # Deliberately NOT a denylist of `pending`/`tbd`/`todo`/`pete-fathom`/`cargopete`. #619
+          # rejects that shape for `pending` and is correct to - a denylist is a finite list against
+          # an infinite set, and the next placeholder is `Reviewed-by: -`. Inverting it closes the
+          # same hole completely: the accepted set is finite, `pending` is not in it, and the two
+          # machine identities are never *refused* by name - they are simply absent, because the
+          # roster is who can read a diff and neither denotes a party who can.
+          roster_signed() {  # roster_signed <body> <roster, one name per line> -> 0 if the name is on the roster
+            name="$(signed_name "$1")"
+            [ -n "$name" ] || return 1
+            while IFS= read -r entry; do
+              [ -n "$entry" ] || continue
+              if printf '%s' "$name" | grep -qiE "^${entry}([[:space:]]|\\(|\$)"; then
+                return 0
+              fi
+            done < <(printf '%s\n' "$2")
+            return 1
+          }
+
+          # Whether the signature names the PR's own author (nuthatch#691).
           #
-          # What *is* decidable is whether the signature names the author. `Reviewed-by: cargopete`
-          # on a PR cargopete opened asserts, in writing, that nobody else read it. That is a claim
-          # the check can refuse without guessing, and refusing it costs nothing: it has no false
-          # positives, because a genuine reviewer is by definition not the author.
-          #
-          # Deliberately NOT a denylist of `pending`/`tbd`/`todo`. #619 rejects that shape and is
-          # correct to - it is a finite list against an infinite set, and the next placeholder is
-          # `Reviewed-by: -`. This closes the one case that is decidable and claims nothing about
-          # the rest.
+          # Reviewers here sign as firm agents - `Iris`, `Rowan` - or as the shared human/git
+          # identity `pete-fathom`, none of which are GitHub accounts, while this predicate compares
+          # against `github.event.pull_request.user.login`, which is `cargopete` for every PR this
+          # firm opens. Those name spaces do not intersect, so **for this firm this predicate cannot
+          # fire** - it did not catch #688, which was self-signed `Reviewed-by: pete-fathom` and
+          # went through, because `pete-fathom` is not `cargopete`. It is not "the one forgery this
+          # mechanism can actually detect"; for this firm it detects approximately none. It stays
+          # because it costs nothing, its self-tests are load-bearing, and it becomes live the day
+          # separate GitHub identities per agent exist (nuthatch#691) - filed for the board, not
+          # built here.
           self_signed() {  # self_signed <body> <author> -> 0 if the signature names the author
             [ -n "$2" ] || return 1
-            printf '%s' "$1" | tr -d '\r' \
-              | grep -E '^Reviewed-by:' \
-              | sed 's/^Reviewed-by:[[:space:]]*//' \
-              | grep -qiE "^${2}([[:space:]]|\\(|$)"
+            printf '%s' "$(signed_name "$1")" | grep -qiE "^${2}([[:space:]]|\\(|$)"
           }
 
           # The matcher proves itself in BOTH directions before it is allowed to judge anything.
           # A gate asserted only in the passing direction is the mistake this repo has shipped five
           # times: every one of those tests was green with the mechanism removed. These cases are
-          # the ones that died under mutation of the pattern above - drop the `^` anchor and the
-          # last three go green; drop the non-blank test and `colon only` goes green.
+          # the ones that died under mutation of the pattern above - drop the `^` anchor on the
+          # extraction and the last three go green; drop the non-blank test and `colon only` goes
+          # green; drop the roster boundary group and `prefix collision` goes green.
+          #
+          # A fixed test roster, not `.github/reviewers.txt` - this suite characterises the matcher,
+          # and should not go red or green because someone edited the real roster.
+          TEST_ROSTER="$(printf 'Iris\nRowan\nMabel\n')"
           selftest=0
           case_is() {  # case_is <want-exit> <label> <body>
-            if signed "$3"; then got=0; else got=1; fi
+            if roster_signed "$3" "$TEST_ROSTER"; then got=0; else got=1; fi
             if [ "$got" != "$1" ]; then
-              echo "::error::signature matcher self-test failed: '$2' returned $got, wanted $1"
+              echo "::error::roster matcher self-test failed: '$2' returned $got, wanted $1"
               selftest=1
             fi
           }
-          case_is 0 'plain signature'      'Reviewed-by: Iris (NIG-235)'
+          case_is 0 'plain signature'       'Reviewed-by: Iris (NIG-235)'
           case_is 0 'signature after prose' "$(printf 'Fixes a thing.\n\nReviewed-by: Iris (NIG-235)')"
-          case_is 0 'CRLF body'            "$(printf 'Fixes a thing.\r\nReviewed-by: Iris\r\n')"
-          case_is 0 'trailing detail'      'Reviewed-by: Iris (CEO) - read against MountTable'
-          case_is 1 'empty body'           ''
-          case_is 1 'no signature at all'  "$(printf 'Fixes a thing.\n\nCloses #123.')"
-          case_is 1 'colon, nothing after' 'Reviewed-by:'
-          case_is 1 'colon, blanks after'  'Reviewed-by:   '
-          case_is 1 'not at column 1'      '  Reviewed-by: Iris'
-          case_is 1 'mid-line mention'     'I think Reviewed-by: Iris would be good'
-          case_is 1 'prose mention only'   'This was reviewed by Iris, honest.'
+          case_is 0 'CRLF body'             "$(printf 'Fixes a thing.\r\nReviewed-by: Iris\r\n')"
+          case_is 0 'trailing detail'       'Reviewed-by: Iris (CEO) - read against MountTable'
+          case_is 1 'empty body'            ''
+          case_is 1 'no signature at all'   "$(printf 'Fixes a thing.\n\nCloses #123.')"
+          case_is 1 'colon, nothing after'  'Reviewed-by:'
+          case_is 1 'colon, blanks after'   'Reviewed-by:   '
+          case_is 1 'not at column 1'       '  Reviewed-by: Iris'
+          case_is 1 'mid-line mention'      'I think Reviewed-by: Iris would be good'
+          case_is 1 'prose mention only'    'This was reviewed by Iris, honest.'
+          case_is 1 'placeholder text (#619)'       'Reviewed-by: pending'
+          case_is 1 'machine identity, git name'     'Reviewed-by: pete-fathom'
+          case_is 1 'machine identity, github login' 'Reviewed-by: cargopete'
+          case_is 1 'name not on the roster'         'Reviewed-by: Jenny (board)'
+          case_is 1 'prefix collision, no boundary'  'Reviewed-by: Irisbot'
 
           # The self-review predicate proves itself in both directions too, for the same reason: a
           # rule asserted only where it should fire is a rule that can stop firing unnoticed. These
@@ -150,11 +206,19 @@ jobs:
           self_is 1 'author unknown'            'Reviewed-by: cargopete'                 ''
 
           if [ "$selftest" != 0 ]; then
-            echo "::error::The signature matcher is broken, so this run is judging nothing. Fix .github/workflows/review-signature.yml - do not merge past this by disabling the check."
+            echo "::error::The matcher is broken, so this run is judging nothing. Fix .github/workflows/review-signature.yml - do not merge past this by disabling the check."
             exit 1
           fi
 
-          if signed "$PR_BODY"; then
+          # Fail closed if the roster itself is gone - an empty ROSTER matches nothing below, which
+          # already reds every PR, but say why rather than leaving that to be reverse-engineered.
+          if [ ! -f .github/reviewers.txt ]; then
+            echo "::error::.github/reviewers.txt is missing. Restore it - do not merge past this by disabling the check."
+            exit 1
+          fi
+          ROSTER="$(grep -vE '^[[:space:]]*(#|$)' .github/reviewers.txt || true)"
+
+          if roster_signed "$PR_BODY" "$ROSTER"; then
             if self_signed "$PR_BODY" "$PR_AUTHOR"; then
               printf '%s' "$PR_BODY" | tr -d '\r' | grep -E '^Reviewed-by:' | sed 's/^/  /'
               cat <<MSG
@@ -168,32 +232,37 @@ jobs:
             echo "Signed:"
             printf '%s' "$PR_BODY" | tr -d '\r' | grep -E '^Reviewed-by:' | sed 's/^/  /'
             echo
-            echo "Note: this check confirms a signature is present and is not the author's own."
-            echo "It cannot confirm that the named reviewer exists or read anything - reviewers here"
-            echo "sign as firm agents rather than GitHub accounts. This is an attestation, not a"
-            echo "verification. See nuthatch#619."
+            echo "Note: this confirms the name is on the roster of parties who may sign"
+            echo "(.github/reviewers.txt) and is not the PR author's own GitHub login. It cannot"
+            echo "confirm the named reviewer read anything, and for this firm self_signed() above"
+            echo "cannot catch a reviewer signing under an identity other than their login - see"
+            echo "nuthatch#619 and nuthatch#691."
             exit 0
           fi
 
           # A required check that can red a branch needs a recovery path stated *in the failing
           # state* - not "see the docs", which is unreachable advice at the moment it is needed.
           cat <<'MSG'
-          ::error::No `Reviewed-by:` line in the PR body. This PR has not been signed off.
+          ::error::No `Reviewed-by:` line naming a roster reviewer in the PR body. This PR has not been signed off.
 
           To satisfy this check:
 
-            1. Get the change reviewed by someone who is not its author.
+            1. Get the change reviewed by someone on the roster (.github/reviewers.txt) who is not
+               its author.
             2. The reviewer adds a line to the PR *body* (not a comment - the audit and this
                check both read the body only), at the start of its own line:
 
-                 Reviewed-by: <name> (<issue>)
+                 Reviewed-by: <roster name> (<issue>)
 
                for example:  Reviewed-by: Iris (NIG-235)
 
             3. Saving the body fires the `edited` event, which re-runs this check automatically.
                There is nothing to re-trigger by hand and no need to push an empty commit.
 
-          Everything after the colon is free text - what was actually checked belongs there. The
-          only requirement is that the line starts at column 1 and is not empty after the colon.
+          The name must match a line in .github/reviewers.txt (case-insensitive, exact word or a
+          `name (detail)` form). Everything after it is free text - what was actually checked
+          belongs there. `pending`, `tbd` and similar are not on the roster and will not pass, and
+          neither will the login or git identity this firm's agents push under - see the roster
+          file for why.
           MSG
           exit 1

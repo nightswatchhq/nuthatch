@@ -1,0 +1,19 @@
+# Parties who may SIGN a `Reviewed-by:` line, read by .github/workflows/review-signature.yml.
+#
+# This is an allowlist of reviewers, not of authors. There is no outside-contributor exemption to
+# build: an outside PR is reviewed and signed by one of the same parties below, so its author never
+# needs an entry. Add a line when the firm gains a reviewer; remove one when it loses one.
+#
+# Do NOT add a machine identity here - `cargopete` (the shared GitHub login every agent pushes
+# under) or `pete-fathom` (the shared `git config user.name` on the dev box). Both denote the box
+# that carries a commit, not a party who read a diff, and the fix for nuthatch#619 and nuthatch#691
+# is that they are refused by being absent, same as `pending` - not by a denylist entry naming them.
+#
+# One name per line. Match is a case-insensitive prefix with a word boundary (see
+# review-signature.yml), so `Iris` also matches `Reviewed-by: Iris (NIG-296)`.
+Iris
+Jenny
+Mabel
+Rowan
+Pete
+Petko Pavlovski
