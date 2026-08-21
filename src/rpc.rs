@@ -204,10 +204,10 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
 /// pointless.
 ///
 /// **#656:** the narrowing path's per-item error variant returns after exactly one round trip with no
-/// backoff, so the cost was sequential request count (~403 serial RTTs for a full 200→1 descent),
-/// not the retry-cycle waste the comment above originally named. `fetch_timestamp_batch` now
-/// parallelises the two halves of each top-level split (`tokio::try_join!`), halving the sequential
-/// depth to ~202 RTTs at a bounded concurrency burst of TIMESTAMP_FANOUT × 2.
+/// backoff, so the cost is sequential request count (~403 serial RTTs for a full 200→1 descent), not
+/// the retry-cycle waste the comment above originally named. Every level of a descent still `.await`s
+/// its two halves one after the other today - a fix that parallelises them is proposed but not yet
+/// landed. Known cost, not yet addressed.
 fn batch_is_narrowable(err: &anyhow::Error) -> bool {
     match class_of(err) {
         // Auth and rate limits are positive findings about something other than size: splitting an
