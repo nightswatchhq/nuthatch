@@ -590,13 +590,13 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
         max_rows: 5_000_000,
     };
     // Warm-up (attach segments + build temp tables) kept out of the percentiles.
-    crate::analytics::query_hot_cold(&dir, &sql, guard(), &hot, sealed_through)
+    crate::analytics::query_hot_cold(&dir, &sql, guard(), &hot, sealed_through, &[])
         .with_context(|| format!("running bench query: {sql}"))?;
     let rss = RssSampler::start();
     let mut ms: Vec<f64> = Vec::with_capacity(args.iters.max(1));
     for _ in 0..args.iters.max(1) {
         let t = Instant::now();
-        let _ = crate::analytics::query_hot_cold(&dir, &sql, guard(), &hot, sealed_through)?;
+        let _ = crate::analytics::query_hot_cold(&dir, &sql, guard(), &hot, sealed_through, &[])?;
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let sql_peak_rss_mb = rss.stop();
