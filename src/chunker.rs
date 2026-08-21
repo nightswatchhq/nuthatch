@@ -26,6 +26,17 @@ pub struct AdaptiveWindow {
     target: u64,
     min: u64,
     max: u64,
+    /// The widest range the provider has served **whole** - not one the splitter had to cut up.
+    ///
+    /// Growth is otherwise evidence-free: `observed(0)` multiplies the window fourfold on an empty
+    /// range, and an empty range says nothing about capacity. From a 1,000-block start that reaches
+    /// 100,000 in four steps, and discovering the real cap from there costs a binary search down -
+    /// refused at 100k, 50k, 25k and 12.5k before anything succeeds, each refusal carrying a backoff
+    /// against a real provider. Measured: 24 refusals reaching 100,000 blocks, against 4 reaching
+    /// 16,000 once growth is bounded.
+    ///
+    /// One 4x step past proven capacity is exploration. Four steps past it is guessing.
+    served_whole: u64,
 }
 
 impl AdaptiveWindow {
@@ -36,6 +47,7 @@ impl AdaptiveWindow {
             target: target.max(1),
             min: min.max(1),
             max,
+            served_whole: 0,
         }
     }
 
@@ -74,6 +86,12 @@ impl AdaptiveWindow {
 
     /// Feed back how many logs the last response held; adjust toward the target. Change is damped to
     /// at most 4× per step so a single sparse (0-log) or spiky window doesn't swing the window wildly.
+    /// A range the provider served **whole** at this width. Raises the evidence ceiling that bounds
+    /// growth (#672).
+    pub fn served_whole(&mut self, width: u64) {
+        self.served_whole = self.served_whole.max(width);
+    }
+
     pub fn observed(&mut self, logs: u64) {
         let next = if logs == 0 {
             // Nothing came back - grow to cover more ground, but only 4× at a time.
@@ -83,7 +101,40 @@ impl AdaptiveWindow {
             let scaled = (self.window as u128 * self.target as u128 / logs as u128) as u64;
             scaled.clamp((self.window / 4).max(1), self.window.saturating_mul(4))
         };
-        self.window = next.clamp(self.min, self.max);
+        // Never more than one 4x step past a width actually served whole (#672). Before any
+        // evidence exists `served_whole` is 0, which leaves the cold start free to grow as before,
+        // bounded only by `max`.
+        let evidence_ceiling = if self.served_whole == 0 {
+            self.max
+        } else {
+            self.served_whole.saturating_mul(4).min(self.max)
+        };
+        self.window = next.clamp(self.min, evidence_ceiling.max(self.min));
+    }
+
+    /// A fetch only succeeded because something below split it (#672).
+    ///
+    /// This is the signal the controller was missing, and the absence of it is the whole bug.
+    /// `fetch_logs_splitting` recovers from a refused range by halving until the pieces are served,
+    /// then hands back the merged result - so the caller sees `Ok` and, on an empty range, calls
+    /// [`observed`](Self::observed) with zero and **grows the window fourfold**. The controller is
+    /// being told the width was fine by the very code that had to cut it into eight pieces to make it
+    /// work.
+    ///
+    /// Traced on a 200,000-block prefix behind a 10,000-block cap: the window climbed
+    /// `1000 → 4000 → 16000 → 64000 → 100000`, pinned itself at the ceiling, and every window
+    /// thereafter paid for four levels of recursive splitting and the backoff between them. Fifty-three
+    /// requests in four minutes, almost all of them refusals being patiently halved.
+    ///
+    /// `narrowest_served` is the widest range that actually came back, which is the only width there
+    /// is evidence for. Taking it as the ceiling can undershoot a provider's real cap; that is the
+    /// intended direction, because too low is slow and too high does not terminate.
+    pub fn served_by_splitting(&mut self, narrowest_served: u64) {
+        let w = narrowest_served.max(self.min);
+        if w < self.max {
+            self.max = w;
+            self.window = self.window.min(self.max);
+        }
     }
 
     /// The provider rejected the range as too large - halve hard and (the caller) retry the range.
