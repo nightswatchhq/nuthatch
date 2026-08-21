@@ -1149,6 +1149,10 @@ async fn run_sql_query(
     let sql = q.q.clone();
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
+    // The live, registry-derived schema - every table the config declares, whether or not it has
+    // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
+    // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
+    let tables = s.tables.clone();
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
@@ -1178,6 +1182,7 @@ async fn run_sql_query(
             },
             &hot,
             sealed_through,
+            &tables,
         )?;
         out.tip_unavailable = tip_unavailable;
         Ok(out)
@@ -1290,6 +1295,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let probe = format!("SELECT * FROM ({}) AS _explain LIMIT 0", q.q);
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
+    let tables = s.tables.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
@@ -1318,6 +1324,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             },
             &hot,
             sealed_through,
+            &tables,
         )?;
         out.tip_unavailable = tip_unavailable;
         Ok(out)
