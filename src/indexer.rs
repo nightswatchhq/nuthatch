@@ -2420,6 +2420,7 @@ async fn fetch_timestamps(
 ///
 /// Mirrors the tier-3 resolution in `process_window` exactly so the sealed rows are identical
 /// regardless of which path produced them. Returns an empty vec when `calls` is empty.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
