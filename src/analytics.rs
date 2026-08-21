@@ -4448,6 +4448,142 @@ template="pool"
         }
     }
 
+    /// Reviewer question on #723: is the reported failure reachable through the *real* constructor
+    /// chain, or only through a hand-authored `TableSchema`/`schema.json` fixture like the test
+    /// above? Built here with nothing hand-authored: a real `nuthatch.toml` through `Config::load`,
+    /// a real `schema.json` through `project::refresh_stale_artifacts` (the same call `dev` makes on
+    /// startup), a real `declared` through `registry::from_nest` + `indexer::full_schema` (the same
+    /// two calls `dev` makes). The only manual step is the one `refresh_stale_artifacts` cannot take
+    /// for an identity-keyed nest (see the skip and its comment at the `refresh_stale_artifacts` call
+    /// site in `indexer.rs`): editing `nuthatch.toml` to add an event without re-running it, which is
+    /// how a real nest's `schema.json` falls behind - a hand-edit, an out-of-band checkout, or a
+    /// commit that added the event without regenerating.
+    #[test]
+    fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Minted","anonymous":false,"inputs":[
+                {"name":"pool","type":"bytes32","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]},
+               {"type":"event","name":"Withdrawn","anonymous":false,"inputs":[
+                {"name":"recipient","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+
+        // Step 1: declare only `Minted` and generate `schema.json` for real, exactly as `init` does.
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "tok"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+events = ["Minted"]
+"#,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(dir.path()).unwrap();
+        crate::project::refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !on_disk.contains("tok__withdrawn"),
+            "schema.json must only know Minted at this point"
+        );
+
+        // Step 2: hand-edit `nuthatch.toml` to declare `Withdrawn` too - a real event this contract
+        // really emits, just not yet on this chain - and do NOT regenerate. This is the identity-keyed
+        // nest's shape: `refresh_stale_artifacts` deliberately never runs for one (indexer.rs), so a
+        // config edit like this is the concrete way `schema.json` falls behind in production.
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "tok"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+events = ["Minted", "Withdrawn"]
+"#,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(dir.path()).unwrap();
+        let still_on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !still_on_disk.contains("tok__withdrawn"),
+            "schema.json was not touched by the edit - it is genuinely stale, not simulated"
+        );
+
+        // Step 3: the two calls `dev` makes at startup to get `declared` - real registry, real
+        // full_schema, no hand-built `TableSchema`.
+        let registry = crate::registry::from_nest(dir.path(), &cfg).unwrap();
+        let declared = crate::indexer::full_schema(&registry, &cfg);
+        assert!(
+            declared.iter().any(|t| t.table == "tok__withdrawn"),
+            "the live registry must know about Withdrawn even though schema.json does not"
+        );
+
+        std::fs::write(
+            dir.path().join("views/80-tok-network.sql"),
+            "CREATE VIEW tok_network AS SELECT m.pool AS minted_pool, m.value AS minted_value, \
+             w.recipient AS withdrawn_recipient, w.value AS withdrawn_value \
+             FROM tok__minted m LEFT JOIN tok__withdrawn w ON true;",
+        )
+        .unwrap();
+
+        let mut hot = HotRows::new();
+        hot.insert(
+            "tok__minted".to_string(),
+            vec![serde_json::json!({"block_number": 1, "log_index": 0, "pool": "0xpool", "value": "42"})],
+        );
+
+        // Before the fix this view fails to bind at all (pinned with a hand-built fixture above);
+        // here, with everything built through the real chain, it must resolve.
+        let conn = Connection::open_in_memory().unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &hot,
+            u64::MAX,
+            &Default::default(),
+            &declared,
+        )
+        .unwrap();
+        define_nest_views(&conn, dir.path());
+        let row = conn
+            .query_row(
+                "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("real constructor chain: the view must resolve, not just the hand-built one");
+        assert_eq!(row.0, "0xpool");
+        assert_eq!(row.1, "42");
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, None);
+    }
+
     /// `declared_but_never_sealed` is what turns the empty-view fix above into a log line an operator
     /// can read - #663's other half ("the logs must explain it"). Sealed, not just declared, is the
     /// bar: a table only in `hot` (fired moments ago, not yet sealed) still counts as "never sealed"
