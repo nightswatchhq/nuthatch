@@ -236,6 +236,9 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
         "src/runtime.rs",
         Some(&["Mount", "MountTable", "RuntimeMeta", "ChainEndpoint"]),
     ),
+    // `queries.toml` (RFC-0034 phase 2, #353): the author's ceiling. `Surface` also lives here but is
+    // not `Deserialize` (it's the mount-side runtime type, not something read from a file).
+    ("src/allowlist.rs", Some(&["Ceiling", "NamedQuery"])),
 ];
 
 /// Keys that are deliberately absent from the reference, each with the reason it is absent.
