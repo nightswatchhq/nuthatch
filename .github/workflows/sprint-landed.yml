@@ -295,6 +295,33 @@ jobs:
 
           cutoff="$(date -u -d "-${STRAND_GRACE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
           stranded=0
+
+          # Capture the query before reading it, and check it did something (#699). Reading straight
+          # from a process substitution is what made this rule fail *open*: `gh` exits non-zero and
+          # prints nothing on a rate limit, token expiry or API outage, the loop body never runs,
+          # `stranded` stays 0, and the job prints "Nothing. Every PR merged before X is reachable
+          # from main" - a clean bill of health from a query that never ran, on a green job.
+          #
+          # That is the exact failure this whole workflow exists to catch: a signal that reads as
+          # success while nothing was verified. #684 was `6 / 6` on a dashboard over six PRs that had
+          # shipped in nothing. Rule A already answers "not judged" rather than giving a verdict when
+          # its query misbehaves; this is that pattern one function along.
+          #
+          # Rule B is the net *under* Rule A - it needs no label and no naming convention, so the case
+          # it uniquely covers is a merged PR left behind with neither. When the net fails open, that
+          # case is unguarded, and the daily cron repeats the same silent pass.
+          merged_prs=""
+          if ! merged_prs="$(gh pr list --repo "$REPO" --state merged --limit 200 \
+                               --json number,baseRefName,mergeCommit,mergedAt \
+                               --jq '.[] | [.number, .baseRefName, (.mergeCommit.oid // ""), .mergedAt] | @tsv')"; then
+            echo "::error::could not list merged PRs - Rule B is NOT JUDGED this run, which is not the same as finding nothing"
+            echo "**Rule B: not judged.** The merged-PR query failed, so nothing was examined. This is not a clean bill of health." >> "$GITHUB_STEP_SUMMARY"
+            merged_prs=""
+            rule_b_judged=0
+          else
+            rule_b_judged=1
+          fi
+
           while IFS=$'\t' read -r num base sha merged; do
             [ -n "${sha:-}" ] || continue
             [ "$merged" \< "$cutoff" ] || continue
@@ -315,11 +342,11 @@ jobs:
             failed=1
             echo "- **#$num** merged into \`$base\` on ${merged%T*}, merge commit \`${sha:0:8}\`, not reachable from \`main\`" >> "$GITHUB_STEP_SUMMARY"
             echo "::error::PR #$num merged into '$base' on ${merged%T*} and its merge commit is still not an ancestor of main."
-          done < <(gh pr list --repo "$REPO" --state merged --limit 200 \
-                     --json number,baseRefName,mergeCommit,mergedAt \
-                     --jq '.[] | [.number, .baseRefName, (.mergeCommit.oid // ""), .mergedAt] | @tsv')
+          done <<< "$merged_prs"
 
-          if [ "$stranded" = 0 ]; then
+          if [ "$rule_b_judged" = 0 ]; then
+            : # already reported above; do not claim anything was checked
+          elif [ "$stranded" = 0 ]; then
             echo "Nothing. Every PR merged before $cutoff is reachable from \`main\`." >> "$GITHUB_STEP_SUMMARY"
           else
             {

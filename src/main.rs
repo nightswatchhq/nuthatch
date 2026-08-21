@@ -24,14 +24,28 @@ async fn main() -> Result<()> {
     // The bare top-level help invocations (clap treats `-h`/`--help`/`help` as equivalent here) get
     // the grouped `Commands:` listing (#674) instead of clap's flat one. Anything else - subcommand
     // help, parse errors, `-V` - still goes through `Cli::parse()` untouched.
+    //
+    // **Typing `nuthatch` with no arguments counts** (#693). It did not, because the guard tested
+    // `argv.len() == 2` and a bare invocation is length one - so the grouping shipped in 2.6.2 was
+    // absent from the shortest way to ask for it, which is also the first thing a stranger types.
+    //
+    // It is not the same output, though, and pretending otherwise would be its own bug. A bare
+    // invocation is a *usage error* - there is no subcommand - so clap writes to stderr and exits 2.
+    // That is right, and it stays: a shell script running `nuthatch` by mistake must not see success.
+    // Only the listing changes.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.len() == 2 && matches!(argv[1].as_str(), "-h" | "--help" | "help") {
+    let asked_for_help = argv.len() == 2 && matches!(argv[1].as_str(), "-h" | "--help" | "help");
+    if asked_for_help || argv.len() == 1 {
         // `print!` panics on EPIPE (e.g. `--help | head`); clap's own help path never did
         // (`Error::exit()` swallows the io error), so match that behaviour here instead of
         // introducing a new crash on the one thing this PR touches. NIG-286.
-        let _ = std::io::stdout()
-            .write_all(help::render_top_level_help(cli::Cli::command()).as_bytes());
-        return Ok(());
+        let rendered = help::render_top_level_help(cli::Cli::command());
+        if asked_for_help {
+            let _ = std::io::stdout().write_all(rendered.as_bytes());
+            return Ok(());
+        }
+        let _ = std::io::stderr().write_all(rendered.as_bytes());
+        std::process::exit(2);
     }
 
     let cli = cli::Cli::parse();
@@ -40,7 +54,17 @@ async fn main() -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "nuthatch=info".into())
     };
+    // `init` and `add` print prose - `→`, `✓`, `·` - and a raw log line through the middle of it is
+    // the one blemish on the part of the product a stranger sees first (#695). Same filter, same
+    // messages, different presentation: see `help::PrettyLine`.
+    let pretty = matches!(cli.command, cli::Command::Init(_) | cli::Command::Add(_));
     match cli.log_format {
+        cli::LogFormat::Text if pretty => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_target(false)
+            .with_ansi(false)
+            .event_format(help::PrettyLine)
+            .init(),
         // Text stays exactly as it was: no target (the crate is the only binary running), env-filter
         // default `nuthatch=info`.
         cli::LogFormat::Text => tracing_subscriber::fmt()
