@@ -96,7 +96,7 @@ pub type HotRows = std::collections::HashMap<String, Vec<Value>>;
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX)?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[])?.rows)
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -107,28 +107,32 @@ pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
 /// compliance exposure/velocity views. Bounding to the persisted watermark keeps cold (<= watermark)
 /// and hot (everything still in the store) partitioned regardless of crash timing.
 fn query_cold(dir: &Path, sql: &str, sealed_through: u64) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), sealed_through)?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), sealed_through, &[])?.rows)
 }
 
 /// Run a read-only query under a resource guard, over the **sealed segments only** - the cold path used
 /// by trusted callers and the `/table` endpoint's cold fill (which merges hot itself). See [`QueryGuard`].
 pub fn query_guarded(dir: &Path, sql: &str, guard: QueryGuard) -> Result<QueryOutput> {
     // Cold-only: `u64::MAX` includes every sealed segment (no hot rows to keep disjoint from).
-    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX)
+    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX, &[])
 }
 
 /// Run a guarded read-only query over the sealed segments **and the hot tip** - the public `/sql`
 /// surface (RFC-0013). `hot` is the unsealed rows grouped by table; each is `UNION ALL`'d into its
 /// table's view. A query outliving `guard.timeout` is interrupted; a result past `guard.max_rows` is
 /// truncated and flagged.
+///
+/// `declared` is the live, registry-derived schema (`indexer::full_schema`) - see `define_views` (#663)
+/// for why a table this lists gets an empty view even when `schema.json` on disk has fallen behind it.
 pub fn query_hot_cold(
     dir: &Path,
     sql: &str,
     guard: QueryGuard,
     hot: &HotRows,
     sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
 ) -> Result<QueryOutput> {
-    run(dir, sql, Some(guard), hot, sealed_through)
+    run(dir, sql, Some(guard), hot, sealed_through, declared)
 }
 
 /// How one attempt at a query ended.
@@ -189,6 +193,7 @@ fn run(
     guard: Option<QueryGuard>,
     hot: &HotRows,
     sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -206,6 +211,7 @@ fn run(
         sealed_through,
         &nothing_excluded,
         deadline,
+        declared,
     )? {
         Attempt::Ok(out) => return Ok(out),
         Attempt::DiedExecuting { error, tables } => (error, tables),
@@ -261,7 +267,16 @@ fn run(
         }
         return Err(e);
     }
-    match attempt(dir, sql, guard, hot, sealed_through, &corrupt, deadline)? {
+    match attempt(
+        dir,
+        sql,
+        guard,
+        hot,
+        sealed_through,
+        &corrupt,
+        deadline,
+        declared,
+    )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
     }
@@ -278,6 +293,7 @@ fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attempt(
     dir: &Path,
     sql: &str,
@@ -286,6 +302,7 @@ fn attempt(
     sealed_through: u64,
     excluded: &std::collections::BTreeSet<String>,
     deadline: Option<Instant>,
+    declared: &[crate::registry::TableSchema],
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -359,7 +376,7 @@ fn attempt(
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded)?;
+    let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded, declared)?;
     // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
     // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
     // this - they only touch the raw per-event tables.
@@ -1214,10 +1231,31 @@ fn define_views(
     // retry after an execution-phase failure it holds whatever `seal::segments_failing_verification`
     // found, so a page-corrupt segment *reduces* its table instead of failing the whole query (#433).
     excluded: &std::collections::BTreeSet<String>,
+    // The live, registry-derived schema (`indexer::full_schema`/`served`) - every table the config
+    // declares, independent of whether it has ever populated. #663: `schema_columns(dir)` alone reads
+    // `schema.json` off disk, and that file is only as fresh as the last `init`/`add`/`schema`/`dev`
+    // startup that wrote it - a hand-edited `nuthatch.toml`, an out-of-band checkout, or a schema.json
+    // committed before the config gained an event can all leave it behind. A table missing from disk
+    // but present here still gets its empty typed view, so a genuinely-declared-but-never-fired event
+    // degrades to zero rows instead of the whole file failing to bind. Empty when the caller has no
+    // live registry handy (most tests, and the handful of internal callers this fix deliberately
+    // leaves on the disk-only path) - identical to today's behaviour in that case.
+    declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
-    let schema = schema_columns(dir);
+    let mut schema = schema_columns(dir);
+    for t in declared {
+        if !schema.iter().any(|(name, _)| name == &t.table) {
+            schema.push((
+                t.table.clone(),
+                t.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.storage.clone()))
+                    .collect(),
+            ));
+        }
+    }
     let cols_of = |table: &str| -> &[(String, String)] {
         schema
             .iter()
@@ -1644,7 +1682,14 @@ fn view_build_failure_at(
     }
     let conn = Connection::open_in_memory().ok()?;
     let empty_hot = HotRows::new();
-    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default());
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
 
@@ -1712,6 +1757,28 @@ fn view_target_name(stmt: &str) -> Option<String> {
     )
 }
 
+/// Declared tables (`declared`, typically `indexer::full_schema` - live, not `schema.json`) that have
+/// never sealed a single segment - the honest, on-disk-permanent signal for "this event's decoder
+/// exists but the chain has never actually emitted it" (#663). A table that has fired but not yet
+/// sealed (still hot-only, e.g. seconds after its first log on a nest that was just restarted) is
+/// misclassified as empty here until its next seal; that window is narrow and self-corrects, and
+/// erring toward "say something, occasionally early" beats the silence this issue is about.
+///
+/// This is what turns "the day that event first fires, the view starts working, and nothing in the
+/// logs explains either state" into a startup line an operator can read once and stop wondering about.
+pub fn declared_but_never_sealed(
+    dir: &Path,
+    declared: &[crate::registry::TableSchema],
+) -> Vec<String> {
+    let manifest = crate::seal::load_manifest(dir).unwrap_or_default();
+    declared
+        .iter()
+        .map(|t| &t.table)
+        .filter(|t| !manifest.tables.contains_key(*t))
+        .cloned()
+        .collect()
+}
+
 /// Validate a nest's authored views (RFC-0018 §1, the loud gate). Sets up the base surface - empty
 /// typed per-event views + labels + children, from the nest's own `schema.json`; no data needed, we're
 /// *binding*, not running - then defines each view in load order and records any that fail. A failure
@@ -1729,7 +1796,14 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
-    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default());
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
 
@@ -2115,6 +2189,7 @@ template="pool"
             guard,
             &hot,
             10,
+            &[],
         )
         .unwrap();
         assert_eq!(out.rows[0]["n"], Value::from(2u64));
@@ -2146,6 +2221,7 @@ template="pool"
             guard,
             &hot,
             0,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2187,6 +2263,7 @@ template="pool"
             guard,
             &hot,
             0,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2337,7 +2414,8 @@ template="pool"
             r#"SELECT count(*) AS n, SUM(CAST(value AS DECIMAL(38,0))) AS total FROM "usdc__transfer""#,
             guard,
             &hot,
-            0, // nothing sealed → all hot rows (blocks 100/101 > 0) count
+            0, // nothing sealed → all hot rows (blocks 100/101 > 0) count,
+            &[],
         )
         .unwrap();
         assert_eq!(out.rows[0]["n"], Value::from(2u64));
@@ -2379,7 +2457,8 @@ template="pool"
             r#"SELECT count(*) AS n FROM "usdc__transfer""#,
             guard,
             &hot,
-            10, // sealed through block 10 → cold ≤ 10, hot > 10
+            10, // sealed through block 10 → cold ≤ 10, hot > 10,
+            &[],
         )
         .unwrap();
         assert_eq!(both.rows[0]["n"], Value::from(3u64));
@@ -2390,6 +2469,7 @@ template="pool"
             guard,
             &hot,
             10,
+            &[],
         )
         .unwrap();
         assert_eq!(tip.rows.len(), 1);
@@ -2592,6 +2672,7 @@ template="pool"
             guard,
             &hot,
             0,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -3695,6 +3776,7 @@ template="pool"
             &HotRows::new(),
             u64::MAX,
             &std::collections::BTreeSet::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -3764,7 +3846,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
 
         // A name the catalogue does not have: refused by the binder, before a page is touched.
         assert!(
@@ -4166,7 +4256,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         // The base table exists as an empty typed view…
@@ -4198,7 +4296,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         assert!(
@@ -4207,6 +4313,325 @@ template="pool"
                 .is_err(),
             "with no schema.json there is no typed empty view, so the authored view cannot resolve - \
              this is the failure `refresh_stale_artifacts` prevents by regenerating the schema"
+        );
+    }
+
+    /// #663. The reported shape, not a degenerate stand-in for it: one `CREATE VIEW` spans two
+    /// declared tables, one populated and one that has genuinely never fired, and the view supplies
+    /// fields from both. Collapsing this to one table/one field would make "loses every field" and
+    /// "resolves correctly" look the same, which is exactly the fixture the issue warns against.
+    ///
+    /// `schema.json` on disk only knows the table that has always existed - `gns__grt_withdrawn` was
+    /// declared later and the file was never regenerated against it. That is `define_views`'s only
+    /// source of "what tables exist" before this fix; `declared` (the live registry schema `dev`
+    /// already computes as `served`/`full_schema`) is the fix - a second, always-current source that
+    /// doesn't depend on `schema.json` being fresh.
+    #[test]
+    fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"gns__signal_minted","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"value","sol_type":"uint256","storage":"word32","indexed":false},
+                {"name":"pool","sol_type":"bytes32","storage":"bytes32","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/80-gns-network.sql"),
+            "CREATE VIEW gns_network AS SELECT m.value AS minted_value, m.pool AS minted_pool, \
+             w.value AS withdrawn_value, w.recipient AS withdrawn_recipient \
+             FROM gns__signal_minted m LEFT JOIN gns__grt_withdrawn w ON true;",
+        )
+        .unwrap();
+
+        let col = |name: &str, storage: &str, indexed: bool| crate::registry::ColumnSchema {
+            name: name.into(),
+            sol_type: String::new(),
+            storage: storage.into(),
+            indexed,
+        };
+        let declared = vec![
+            crate::registry::TableSchema {
+                table: "gns__signal_minted".into(),
+                alias: "gns".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                event: "SignalMinted".into(),
+                topic0: "0xaaaa".into(),
+                columns: vec![
+                    col("block_number", "u64", false),
+                    col("value", "word32", false),
+                    col("pool", "bytes32", true),
+                ],
+            },
+            crate::registry::TableSchema {
+                table: "gns__grt_withdrawn".into(),
+                alias: "gns".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                // The L1-migration event: really on the ABI, never emitted on this chain (#663's repro).
+                event: "GRTWithdrawn".into(),
+                topic0: "0xbbbb".into(),
+                columns: vec![
+                    col("block_number", "u64", false),
+                    col("value", "word32", false),
+                    col("recipient", "address", true),
+                ],
+            },
+        ];
+
+        let mut hot = HotRows::new();
+        hot.insert(
+            "gns__signal_minted".to_string(),
+            vec![
+                serde_json::json!({"block_number": 100, "log_index": 0, "value": "500", "pool": "0xpool"}),
+            ],
+        );
+
+        // Before: `define_views` only knows `schema.json`, which doesn't have `gns__grt_withdrawn`.
+        // It gets no view at all, and the single `CREATE VIEW gns_network` statement - which touches
+        // both tables - fails to bind. Pinning the bug this issue reports, not just the fix.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            define_views(&conn, dir.path(), &hot, u64::MAX, &Default::default(), &[]).unwrap();
+            define_nest_views(&conn, dir.path());
+            assert!(
+                conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
+                    .get::<_, i64>(0))
+                    .is_err(),
+                "pin the bug: one never-fired table takes the whole view down, all four fields"
+            );
+        }
+
+        // After: `declared` (the live registry schema) knows `gns__grt_withdrawn` even though
+        // `schema.json` doesn't, so it gets an empty typed view and the join resolves - the fired
+        // table's real data intact, the never-fired table's side NULL rather than absent.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            define_views(
+                &conn,
+                dir.path(),
+                &hot,
+                u64::MAX,
+                &Default::default(),
+                &declared,
+            )
+            .unwrap();
+            define_nest_views(&conn, dir.path());
+            let row = conn
+                .query_row(
+                    "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
+                     FROM gns_network",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .expect("the populated half of the join must resolve, not merely avoid erroring");
+            assert_eq!(row.0, "500", "the fired table's real data survives the fix");
+            assert_eq!(row.1, "0xpool");
+            assert_eq!(
+                row.2, None,
+                "the never-fired table degrades to NULL on its side, not an error"
+            );
+            assert_eq!(row.3, None);
+        }
+    }
+
+    /// Reviewer question on #723: is the reported failure reachable through the *real* constructor
+    /// chain, or only through a hand-authored `TableSchema`/`schema.json` fixture like the test
+    /// above? Built here with nothing hand-authored: a real `nuthatch.toml` through `Config::load`,
+    /// a real `schema.json` through `project::refresh_stale_artifacts` (the same call `dev` makes on
+    /// startup), a real `declared` through `registry::from_nest` + `indexer::full_schema` (the same
+    /// two calls `dev` makes). The only manual step is the one `refresh_stale_artifacts` cannot take
+    /// for an identity-keyed nest (see the skip and its comment at the `refresh_stale_artifacts` call
+    /// site in `indexer.rs`): editing `nuthatch.toml` to add an event without re-running it, which is
+    /// how a real nest's `schema.json` falls behind - a hand-edit, an out-of-band checkout, or a
+    /// commit that added the event without regenerating.
+    #[test]
+    fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Minted","anonymous":false,"inputs":[
+                {"name":"pool","type":"bytes32","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]},
+               {"type":"event","name":"Withdrawn","anonymous":false,"inputs":[
+                {"name":"recipient","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+
+        // Step 1: declare only `Minted` and generate `schema.json` for real, exactly as `init` does.
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "tok"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+events = ["Minted"]
+"#,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(dir.path()).unwrap();
+        crate::project::refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !on_disk.contains("tok__withdrawn"),
+            "schema.json must only know Minted at this point"
+        );
+
+        // Step 2: hand-edit `nuthatch.toml` to declare `Withdrawn` too - a real event this contract
+        // really emits, just not yet on this chain - and do NOT regenerate. This is the identity-keyed
+        // nest's shape: `refresh_stale_artifacts` deliberately never runs for one (indexer.rs), so a
+        // config edit like this is the concrete way `schema.json` falls behind in production.
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "tok"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+events = ["Minted", "Withdrawn"]
+"#,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(dir.path()).unwrap();
+        let still_on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !still_on_disk.contains("tok__withdrawn"),
+            "schema.json was not touched by the edit - it is genuinely stale, not simulated"
+        );
+
+        // Step 3: the two calls `dev` makes at startup to get `declared` - real registry, real
+        // full_schema, no hand-built `TableSchema`.
+        let registry = crate::registry::from_nest(dir.path(), &cfg).unwrap();
+        let declared = crate::indexer::full_schema(&registry, &cfg);
+        assert!(
+            declared.iter().any(|t| t.table == "tok__withdrawn"),
+            "the live registry must know about Withdrawn even though schema.json does not"
+        );
+
+        std::fs::write(
+            dir.path().join("views/80-tok-network.sql"),
+            "CREATE VIEW tok_network AS SELECT m.pool AS minted_pool, m.value AS minted_value, \
+             w.recipient AS withdrawn_recipient, w.value AS withdrawn_value \
+             FROM tok__minted m LEFT JOIN tok__withdrawn w ON true;",
+        )
+        .unwrap();
+
+        let mut hot = HotRows::new();
+        hot.insert(
+            "tok__minted".to_string(),
+            vec![serde_json::json!({"block_number": 1, "log_index": 0, "pool": "0xpool", "value": "42"})],
+        );
+
+        // Before the fix this view fails to bind at all (pinned with a hand-built fixture above);
+        // here, with everything built through the real chain, it must resolve.
+        let conn = Connection::open_in_memory().unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &hot,
+            u64::MAX,
+            &Default::default(),
+            &declared,
+        )
+        .unwrap();
+        define_nest_views(&conn, dir.path());
+        let row = conn
+            .query_row(
+                "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("real constructor chain: the view must resolve, not just the hand-built one");
+        assert_eq!(row.0, "0xpool");
+        assert_eq!(row.1, "42");
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, None);
+    }
+
+    /// `declared_but_never_sealed` is what turns the empty-view fix above into a log line an operator
+    /// can read - #663's other half ("the logs must explain it"). Sealed, not just declared, is the
+    /// bar: a table only in `hot` (fired moments ago, not yet sealed) still counts as "never sealed"
+    /// here, which is a documented, self-correcting approximation (see the function's own doc comment).
+    #[test]
+    fn declared_but_never_sealed_names_only_the_table_with_no_sealed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = vec![
+            crate::registry::TableSchema {
+                table: "gns__signal_minted".into(),
+                alias: "gns".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                event: "SignalMinted".into(),
+                topic0: "0xaaaa".into(),
+                columns: vec![],
+            },
+            crate::registry::TableSchema {
+                table: "gns__grt_withdrawn".into(),
+                alias: "gns".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                event: "GRTWithdrawn".into(),
+                topic0: "0xbbbb".into(),
+                columns: vec![],
+            },
+        ];
+        // No manifest on disk at all yet: both tables read as never-sealed.
+        assert_eq!(
+            declared_but_never_sealed(dir.path(), &declared),
+            vec![
+                "gns__signal_minted".to_string(),
+                "gns__grt_withdrawn".to_string()
+            ]
+        );
+
+        // A real sealed segment for `gns__signal_minted` only - `gns__grt_withdrawn` still has none.
+        let entities = vec![
+            r#"{"table":"gns__signal_minted","block_number":1,"log_index":0,"value":"500"}"#
+                .to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 1, 1).unwrap();
+        assert_eq!(
+            declared_but_never_sealed(dir.path(), &declared),
+            vec!["gns__grt_withdrawn".to_string()],
+            "the table with a sealed segment drops off the list; the genuinely never-fired one remains"
         );
     }
 
@@ -4239,7 +4664,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default()).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         for v in ["ok_one", "ok_two"] {

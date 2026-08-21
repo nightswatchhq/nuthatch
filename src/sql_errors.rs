@@ -17,6 +17,27 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     // Unknown table: `Catalog Error: Table with name <X> does not exist!`
     if let Some(name) = between(raw, "Table with name ", " does not exist") {
         let name = name.trim();
+        // #663: `name` can be a table this nest genuinely declares - the config is correct, the event
+        // just has never fired on this chain (or the call/state read has never populated). That is a
+        // different fault from a typo or a table nobody declared, and conflating them is exactly what
+        // left an operator staring at a bare catalog error with nothing explaining why. `define_views`
+        // should already turn this into an empty view rather than a missing table (this schema is the
+        // live one, not a possibly-stale `schema.json`), so reaching this branch for a declared table
+        // means the empty-view path itself didn't cover this query - still worth naming precisely.
+        if let Some(t) = schema.iter().find(|t| t.table == name) {
+            return Some(match t.kind {
+                crate::registry::TableKind::Event => format!(
+                    "`{name}` is declared (event `{}`) but has no data yet - it has likely never \
+                     fired on this chain. The table exists once the event does; until then it reads \
+                     as empty, not absent.",
+                    t.event
+                ),
+                _ => format!(
+                    "`{name}` is declared but has no data yet - it has likely never been populated on \
+                     this chain. The table exists once it is; until then it reads as empty, not absent."
+                ),
+            });
+        }
         let tables: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
         return Some(match closest(name, &tables) {
             Some(c) => format!(
@@ -454,6 +475,32 @@ mod tests {
         let hint = enrich(raw, "SELECT count(*) FROM transfers", &schema()).unwrap();
         assert!(hint.contains("no table `transfers`"));
         assert!(hint.contains("usdc__transfer"), "suggests the real table");
+    }
+
+    /// #663: a table the nest genuinely declares (present in `schema` - the live registry, not
+    /// `schema.json`) hitting the catalog error is a different fault from a typo, and must read
+    /// differently. Before this, `closest("usdc__transfer", [..., "usdc__transfer"])` matched itself
+    /// and said "no table `usdc__transfer`; the closest is `usdc__transfer`" - true, and useless.
+    #[test]
+    fn a_declared_table_with_no_data_yet_is_told_apart_from_an_unknown_one() {
+        let raw = "Catalog Error: Table with name usdc__transfer does not exist!";
+        let hint = enrich(raw, "SELECT count(*) FROM usdc__transfer", &schema()).unwrap();
+        assert!(
+            hint.contains("declared"),
+            "must say this table IS declared, not just closest-matched to itself: {hint}"
+        );
+        assert!(
+            hint.contains("Transfer"),
+            "names the event that would create it: {hint}"
+        );
+        assert!(
+            hint.contains("never fired") || hint.contains("has no data"),
+            "must explain WHY it's missing, per #663's acceptance bar: {hint}"
+        );
+        assert!(
+            !hint.contains("the closest is"),
+            "an exact declared match is not a fuzzy suggestion: {hint}"
+        );
     }
 
     #[test]
