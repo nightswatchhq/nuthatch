@@ -1,7 +1,9 @@
 # Did anyone actually review this?
 #
-# Nine required contexts on `main` and on each `sprint/*` branch, strict, admin-enforced - and until
-# this file existed, not one of them asked whether a human or agent had ever read the change. The
+# Ten required contexts on `main`, strict, admin-enforced - and until this file existed, not one of
+# them asked whether a human or agent had ever read the change. (Counts drift; the list is read from
+# the API, see below. Protected `sprint/*` branches are close but not identical - four of the six are
+# missing `fuzz smoke (decode path)`, which is nuthatch#715's problem, not this file's.) The
 # `Reviewed-by:` rule was honour-system, checked only by a post-hoc audit grep that runs long after
 # the merge. `gh pr merge --auto` arms on an unsigned PR quite happily and lands it the instant the
 # last context goes green.
@@ -13,13 +15,28 @@
 #
 # ## This job is only a control while `reviewed-by signature` is a *required* context
 #
-# It was not, from the day it was written (2026-08-14, NIG-235) until 2026-08-21. The job existed,
-# ran on every PR, and went red exactly as designed - onto a checks list where nothing consumed it.
-# Branch protection required nine other contexts and never this one, so a red signature blocked no
-# merge, and `gh pr merge --auto` still landed on the ninth green context without reading it. #619
-# and #691 then sharpened the matcher inside a job that gated nothing, and were closed on the
-# strength of it. The whole apparatus below - the roster, the self-tests, the both-directions
-# mutation argument - was decorative for a week for a reason none of it can see from in here.
+# It was not, until 2026-08-21. The job existed, ran on every PR, and went red exactly as designed -
+# onto a checks list where nothing consumed it. Branch protection required nine other contexts and
+# never this one, so a red signature blocked no merge, and `gh pr merge --auto` still landed on the
+# ninth green context without reading it. #619 and #691 then sharpened the matcher inside a job that
+# gated nothing, and were closed on the strength of it. The apparatus below - the roster, the
+# self-tests, the both-directions mutation argument - was decorative for a reason none of it can
+# see from in here.
+#
+# The span is bounded at both ends by measurement, not by inference, because the claim "this was
+# never wired up" is exactly the kind that gets asserted rather than checked:
+#
+#   - **Not required at the end.** Read directly on 2026-08-21: nine contexts on `main`, this not
+#     among them, and `rules/branches/main` returning `[]` so no ruleset supplied it either.
+#   - **Not required near the start.** #585, #588, #590, #591, #592, #595 and #596 all merged with
+#     this context *absent* from their head commit - no check-run of this name at all. A required
+#     context that never reports is unsatisfiable and blocks the merge forever, so those merges are
+#     only possible if it was not required when they happened.
+#   - **The middle is inferred, not proven.** Every PR merged after those has this context green,
+#     so no merge demonstrates the gap directly, and the org audit log is not readable with the
+#     token this firm uses. It could in principle have been required and then removed. Nothing
+#     suggests that and nobody recalls it, but it is not measured, and this comment will not
+#     pretend otherwise.
 #
 # So the load-bearing artefact is not this file. It is the entry in
 # `required_status_checks.contexts` on every branch a PR can target, and it lives in GitHub's
