@@ -2431,6 +2431,91 @@ async fn fetch_timestamps(
     source.block_timestamps(blocks).await
 }
 
+/// Resolve declared `[[calls]]` for one window of blocks and return them as `DecodedRow` objects in
+/// `(block_number, log_index)` order - ready to be merged with event rows before sealing.
+///
+/// Mirrors the tier-3 resolution in `process_window` exactly so the sealed rows are identical
+/// regardless of which path produced them. Returns an empty vec when `calls` is empty.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_calls_for_window(
+    source: &dyn Source,
+    calls: &[crate::calls::CallDecl],
+    state_rpc: &crate::rpc::RpcClient,
+    chain_id: u64,
+    event_rows: &[crate::registry::DecodedRow],
+    from: u64,
+    to: u64,
+    timestamps: &std::collections::HashMap<u64, u64>,
+    with_timestamps: bool,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    use std::collections::BTreeMap;
+
+    let mut wanted: BTreeMap<u64, Vec<(usize, String, String)>> = BTreeMap::new();
+    for (i, d) in calls.iter().enumerate() {
+        if d.is_row_driven() {
+            let table = d.on.as_deref().unwrap_or_default();
+            let mut src: Vec<&crate::registry::DecodedRow> =
+                event_rows.iter().filter(|r| r.table == table).collect();
+            src.sort_by_key(|r| (r.block_number, r.log_index));
+            for r in src {
+                let (contract, calldata) = d.resolve_for_row(r)?;
+                wanted
+                    .entry(r.block_number)
+                    .or_default()
+                    .push((i, contract, calldata));
+            }
+        } else {
+            for b in d.blocks_in(from, to) {
+                wanted.entry(b).or_default().push((
+                    i,
+                    d.contract.to_ascii_lowercase(),
+                    d.calldata.to_ascii_lowercase(),
+                ));
+            }
+        }
+    }
+
+    let capacity = crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+    let mut out: Vec<crate::registry::DecodedRow> = Vec::new();
+    for (block, mut items) in wanted {
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
+        if items.len() as u64 >= capacity {
+            anyhow::bail!(
+                "block {block} wants {} distinct pinned reads, and only {capacity} fit in the \
+                 reserved row-index band.\n\n\
+                 A row-driven `[[calls]]` declaration fires once per source row, so a dense \
+                 table can ask for more reads than a block can hold. Narrow the source table \
+                 (index fewer events), or make the declaration sampled instead.",
+                items.len()
+            );
+        }
+        let pairs: Vec<(String, String)> = items
+            .iter()
+            .map(|(_, c, d)| (c.clone(), d.clone()))
+            .collect();
+        let results = retry_transient(
+            &format!("seal-direct pinned eth_call batch at block {block}"),
+            BACKFILL_RETRY_BASE,
+            || async { crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await },
+        )
+        .await?;
+        let hash = retry_transient(
+            &format!("seal-direct block hash for {block}"),
+            BACKFILL_RETRY_BASE,
+            || async { source.block_hash(block).await },
+        )
+        .await?
+        .unwrap_or_default();
+        let ts = timestamps.get(&block).copied().unwrap_or(0);
+        for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
+            out.push(r.to_row(&calls[*i].name, slot, &hash, ts, with_timestamps));
+        }
+    }
+    out.sort_by_key(|r| (r.block_number, r.log_index));
+    Ok(out)
+}
+
 /// Stream a *finalized* block range straight to sealed Parquet, bypassing the hot store entirely
 /// (RFC-0004 §1): decode → buffered rows → content-addressed segments. No redb write, no read-back,
 /// no prune - the churn a from-history backfill otherwise pays for every historical row. Rows carry
@@ -2446,6 +2531,9 @@ pub async fn backfill_direct(
     dir: &std::path::Path,
     addresses: &[String],
     topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
     from: u64,
     to: u64,
     window: u64,
@@ -2511,12 +2599,39 @@ pub async fn backfill_direct(
         // different order would produce different content hashes for identical data.
         rows.sort_by_key(|r| (r.block_number, r.log_index));
         // Stamp block_timestamp (batched), identical to the hot path, so segments match byte-for-byte.
+        // Include the blocks sampled by any [[calls]] declarations so their timestamps are available
+        // for the call rows resolved below.
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+        if state_rpc.is_some() {
+            for d in calls {
+                blocks.extend(d.blocks_in(next, chunk_to));
+            }
+        }
         blocks.sort_unstable();
         blocks.dedup();
         let ts = fetch_timestamps(source, registry, &blocks).await?;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+        }
+        // RFC-0023 tier-3: resolve declared [[calls]] for this window and merge into rows so the
+        // sealed segment is identical to what the hot path would have produced via process_window.
+        if let Some(rpc) = state_rpc {
+            let call_rows = resolve_calls_for_window(
+                source,
+                calls,
+                rpc,
+                chain_id,
+                &rows,
+                next,
+                chunk_to,
+                &ts,
+                registry.timestamps(),
+            )
+            .await?;
+            rows.extend(call_rows);
+            rows.sort_by_key(|r| (r.block_number, r.log_index));
+        }
+        for r in &rows {
             buf.push((r.block_number, r.to_json().to_string()));
             total += 1;
         }
@@ -2860,6 +2975,9 @@ pub async fn backfill_direct_pipelined(
     dir: &std::path::Path,
     addresses: &[String],
     topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
     from: u64,
     to: u64,
     window: u64,
@@ -2973,6 +3091,12 @@ pub async fn backfill_direct_pipelined(
                 })
                 .collect();
             let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+            // Include blocks sampled by [[calls]] so their timestamps are available for call rows.
+            if state_rpc.is_some() {
+                for d in calls {
+                    blocks.extend(d.blocks_in(w_from, w_to));
+                }
+            }
             blocks.sort_unstable();
             blocks.dedup();
             let ts = retry_transient(
@@ -2984,14 +3108,31 @@ pub async fn backfill_direct_pipelined(
             // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
             // (and its content address) are identical across providers - see `backfill_direct`.
             rows.sort_by_key(|r| (r.block_number, r.log_index));
+            for r in &mut rows {
+                r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+            }
+            // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
+            if let Some(rpc) = state_rpc {
+                let call_rows = resolve_calls_for_window(
+                    source,
+                    calls,
+                    rpc,
+                    chain_id,
+                    &rows,
+                    w_from,
+                    w_to,
+                    &ts,
+                    registry.timestamps(),
+                )
+                .await?;
+                rows.extend(call_rows);
+                rows.sort_by_key(|r| (r.block_number, r.log_index));
+            }
             // Carry each row's block so the consumer can seal on a data-determined boundary
             // (RFC-0028 §4) instead of at whichever window filled the buffer.
             let mut json: Vec<(u64, String)> = rows
-                .iter_mut()
-                .map(|r| {
-                    r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-                    (r.block_number, r.to_json().to_string())
-                })
+                .iter()
+                .map(|r| (r.block_number, r.to_json().to_string()))
                 .collect();
             // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
             // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
@@ -3087,6 +3228,9 @@ pub async fn backfill_direct_factory(
     children: &mut ChildRegistry,
     dir: &std::path::Path,
     topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
     from: u64,
     to: u64,
     window: u64,
@@ -3232,6 +3376,11 @@ pub async fn backfill_direct_factory(
 
         // Authoritative decode with the full child set, real timestamps, deterministic order.
         let mut blocks: Vec<u64> = all_logs.iter().map(|l| l.block_number).collect();
+        if state_rpc.is_some() {
+            for d in calls {
+                blocks.extend(d.blocks_in(next, chunk_to));
+            }
+        }
         blocks.sort_unstable();
         blocks.dedup();
         let ts = retry_transient(
@@ -3240,13 +3389,31 @@ pub async fn backfill_direct_factory(
             || fetch_timestamps(source, registry, &blocks),
         )
         .await?;
-        let rows = decode_window(registry, Some(factory), children, &all_logs, &ts);
+        let mut rows = decode_window(registry, Some(factory), children, &all_logs, &ts);
+        // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
+        if let Some(rpc) = state_rpc {
+            let call_rows = resolve_calls_for_window(
+                source,
+                calls,
+                rpc,
+                chain_id,
+                &rows,
+                next,
+                chunk_to,
+                &ts,
+                registry.timestamps(),
+            )
+            .await?;
+            rows.extend(call_rows);
+            rows.sort_by_key(|r| (r.block_number, r.log_index));
+        }
+        let row_count = rows.len();
         for r in &rows {
             buf.push((r.block_number, r.to_json().to_string()));
             total += 1;
         }
         next = chunk_to + 1;
-        on_progress(chunk_to, rows.len() as u64);
+        on_progress(chunk_to, row_count as u64);
 
         // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path.
         if let Some((rows, seal_to)) = take_sealable(&mut buf) {
@@ -3351,26 +3518,6 @@ impl NestIngest {
         concurrency: usize,
         window: u64,
     ) -> Result<u64> {
-        // RFC-0023 tier 3 is resolved in `process_window`, which is the hot path. The seal-direct
-        // backfill does not go through it, so a `--seal-direct` run would sail past every sampled
-        // block and seal the range with the declared table simply absent - accepted, validated, and
-        // silently producing nothing over exactly the range the operator asked to be fast.
-        //
-        // That is issue #262's shape, which this slice exists to remove, so it is refused rather than
-        // warned about. Delete this when the seal-direct paths learn to resolve calls; the test named
-        // after it will fail and say so.
-        if seal_direct && !self.calls.is_empty() {
-            anyhow::bail!(
-                "this nest declares {} `[[calls]]` entr{} and `--seal-direct` was requested, but the \
-                 seal-direct backfill does not resolve pinned reads yet - the sealed range would be \
-                 missing them entirely, without saying so.\n\n\
-                 Drop `--seal-direct` for this nest, or remove the `[[calls]]` block. Tier 3 works on \
-                 the ordinary path.",
-                self.calls.len(),
-                if self.calls.len() == 1 { "y" } else { "ies" },
-            );
-        }
-
         // User webhooks (RFC-0010 Part B): initialise each subscription's cursor before any sealing, so a
         // `since = "registration"` webhook starts at the tip and a `--seal-direct` backfill doesn't fire
         // its history. Best-effort - a tip lookup failure just defers registration to the first live tip.
@@ -3470,6 +3617,9 @@ impl NestIngest {
                         &mut self.children,
                         &self.dir,
                         &self.topic0s,
+                        &self.calls,
+                        self.state_rpc.as_deref(),
+                        self.chain_id,
                         resume_from,
                         finalized_through,
                         window,
@@ -3488,6 +3638,9 @@ impl NestIngest {
                         &self.dir,
                         &self.addresses,
                         &self.topic0s,
+                        &self.calls,
+                        self.state_rpc.as_deref(),
+                        self.chain_id,
                         resume_from,
                         finalized_through,
                         window,
@@ -5625,6 +5778,9 @@ template="pool"
             &mut children,
             dir.path(),
             &[],
+            &[],
+            None,
+            0,
             10,
             20,
             100,
@@ -5783,6 +5939,9 @@ template="pool"
                 &mut children,
                 dir.path(),
                 topic0s,
+                &[],
+                None,
+                0,
                 10,
                 20,
                 100,
@@ -7525,9 +7684,21 @@ template = "pool"
             .collect();
 
         let d_seq = tempfile::tempdir().unwrap();
-        let seq = backfill_direct(&source, &reg, d_seq.path(), &addresses, &topic0s, 10, 39, 5)
-            .await
-            .unwrap();
+        let seq = backfill_direct(
+            &source,
+            &reg,
+            d_seq.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+        )
+        .await
+        .unwrap();
         let d_pipe = tempfile::tempdir().unwrap();
         let pipe = backfill_direct_pipelined(
             &source,
@@ -7535,6 +7706,9 @@ template = "pool"
             d_pipe.path(),
             &addresses,
             &topic0s,
+            &[],
+            None,
+            0,
             10,
             39,
             5,
@@ -7668,6 +7842,9 @@ template = "pool"
             d_with.path(),
             &["0x1111111111111111111111111111111111111111".into()],
             &[],
+            &[],
+            None,
+            0,
             10,
             21,
             100,
@@ -7684,6 +7861,9 @@ template = "pool"
             d_without.path(),
             &["0x1111111111111111111111111111111111111111".into()],
             &[],
+            &[],
+            None,
+            0,
             10,
             21,
             100,
@@ -7971,21 +8151,24 @@ template = "pool"
         handle.abort();
     }
 
-    /// `--seal-direct` with declared calls is refused, because the seal-direct backfill does not
-    /// resolve them and would seal the range with the table silently absent.
+    /// `--seal-direct` with declared `[[calls]]` resolves them and seals their rows, rather than
+    /// silently producing an empty table over the backfill range.
     ///
-    /// This is #262's shape guarded against in advance: the slice that wired tier 3 wired it into
-    /// `process_window` only, and a partial wire that looks whole is the failure this project can
-    /// least afford. **Delete this guard, and this test, when the seal-direct paths resolve calls.**
+    /// The previous guard (RFC-0038 §6e) refused this combination because the seal-direct paths did
+    /// not resolve calls. That guard is gone: the three seal-direct functions now call
+    /// `resolve_calls_for_window` per window, matching what `process_window` does on the hot path.
+    /// This test is the #262-pattern check: it would pass with the mechanism removed only if the
+    /// fixture produces zero sampled blocks, so `every = 1` ensures there is always at least one.
     #[tokio::test]
-    async fn seal_direct_with_declared_calls_is_refused_rather_than_silently_skipping_them() {
+    async fn seal_direct_with_declared_calls_resolves_and_seals_them() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (url, handle) = stub_state_rpc(seen).await;
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
         let dir = tempfile::tempdir().unwrap();
         write_calls_nest(dir.path());
         let mut config = Config::load(dir.path()).unwrap();
         config.state_rpc_urls = vec![url];
 
+        // A source with no events, so any rows in the sealed segment come from [[calls]] only.
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let (mut nest, state, worker, _w) = build_nest(
             &source,
@@ -8002,43 +8185,31 @@ template = "pool"
             w.abort();
         }
 
-        let err = match nest.prepare(source.as_ref(), None, true, 1, 100).await {
-            Ok(_) => panic!("seal-direct plus declared calls must refuse"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("seal-direct"), "name the flag: {err}");
+        // `backfill = Some(5)` asks for blocks 1..=5, `seal_direct = true` takes the fast path.
+        // `every = 1` in the fixture means the call fires at every block in the window.
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
         assert!(
-            err.contains("without saying so"),
-            "the refusal must say *why* it is not merely a warning: {err}"
+            result.is_ok(),
+            "seal-direct with calls must succeed now: {result:?}"
         );
 
-        // Control: the same nest without `--seal-direct` prepares fine, or this test would pass
-        // just as well against a nest that refuses everything.
+        // The stub RPC was hit: at least one `eth_call` was issued for the sampled blocks.
+        let calls = seen.lock().unwrap().clone();
+        assert!(
+            !calls.is_empty(),
+            "seal-direct must have issued at least one eth_call to the state RPC, got none"
+        );
+
+        // The sealed segment carries `oracle_answer` rows - not silently absent.
+        let m = crate::seal::load_manifest(dir.path()).unwrap();
+        assert!(
+            m.tables.contains_key("oracle_answer"),
+            "the [[calls]] table must appear in the sealed manifest; got tables: {:?}",
+            m.tables.keys().collect::<Vec<_>>()
+        );
+
         drop(nest);
         drop(state);
-        let (mut ok_nest, ok_state, w2, _) = build_nest(
-            &source,
-            dir.path().to_path_buf(),
-            &config,
-            None,
-            false,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        if let Some(w) = w2 {
-            w.abort();
-        }
-        assert!(
-            ok_nest
-                .prepare(source.as_ref(), None, false, 1, 100)
-                .await
-                .is_ok(),
-            "the ordinary path must still accept a calls nest"
-        );
-        drop(ok_nest);
-        drop(ok_state);
         handle.abort();
     }
 
@@ -8653,9 +8824,21 @@ template = "pool"
         // Sequential.
         let seq_src = LogCountingSource::new();
         let d_seq = tempfile::tempdir().unwrap();
-        let n_seq = backfill_direct(&seq_src, &blocks_only, d_seq.path(), &[], &[], 1, 20, 5)
-            .await
-            .unwrap();
+        let n_seq = backfill_direct(
+            &seq_src,
+            &blocks_only,
+            d_seq.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            0,
+            1,
+            20,
+            5,
+        )
+        .await
+        .unwrap();
 
         // Pipelined - the path `nuthatch dev` takes for a static nest.
         let pipe_src = LogCountingSource::new();
@@ -8666,6 +8849,9 @@ template = "pool"
             d_pipe.path(),
             &[],
             &[],
+            &[],
+            None,
+            0,
             1,
             20,
             5,
@@ -8706,6 +8892,9 @@ template = "pool"
             d_ctl_seq.path(),
             &addr,
             &[],
+            &[],
+            None,
+            0,
             1,
             20,
             5,
@@ -8721,6 +8910,9 @@ template = "pool"
             d_ctl_pipe.path(),
             &addr,
             &[],
+            &[],
+            None,
+            0,
             1,
             20,
             5,
@@ -9528,6 +9720,9 @@ template = "pool"
             dir.path(),
             &["0x1111111111111111111111111111111111111111".into()],
             &[],
+            &[],
+            None,
+            0,
             5,
             6,
             100,
@@ -9825,6 +10020,9 @@ rpc_urls = ["https://rpc.example"]
             dir.path(),
             &addresses,
             &[],
+            &[],
+            None,
+            0,
             0,
             199_999,
             1_000,
@@ -9899,6 +10097,9 @@ rpc_urls = ["https://rpc.example"]
             dir.path(),
             &addresses,
             &[],
+            &[],
+            None,
+            0,
             0,
             199_999,
             1_000, // a fixed 1,000-block window would need 200 requests
@@ -9951,6 +10152,9 @@ rpc_urls = ["https://rpc.example"]
             dir.path(),
             &addresses,
             &[],
+            &[],
+            None,
+            0,
             0,
             19_999,
             1_000,
