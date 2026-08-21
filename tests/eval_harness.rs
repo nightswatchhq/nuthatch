@@ -145,7 +145,7 @@ async fn every_question_oracle_is_correct_against_the_fixture() {
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_else(|| panic!("question '{}' has a non-array expect", q.id));
 
-        let out = match analytics::query_hot_cold(dir.path(), &q.sql, guard(), &hot, sealed_through)
+        let out = match analytics::query_hot_cold(dir.path(), &q.sql, guard(), &hot, sealed_through, &[])
         {
             Ok(o) => o,
             Err(e) => {

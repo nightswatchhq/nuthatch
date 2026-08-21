@@ -511,6 +511,20 @@ impl SqlBackend {
                         (Default::default(), true)
                     }
                 };
+                // The live, registry-derived schema (config + vendored ABIs) - every table this nest
+                // declares, whether or not it has populated yet. `schema.json` on disk can lag it (a
+                // hand-edit, an out-of-band checkout); this is the same source `dev` builds `served`
+                // from, so a declared-but-never-fired event resolves here too, not only over HTTP
+                // (#663). Best-effort: a bare `data/<nid>` directory has no `nuthatch.toml` to load,
+                // and the query still runs - just without the extra empty-table coverage.
+                let declared = config::Config::load(dir)
+                    .ok()
+                    .and_then(|cfg| {
+                        nuthatch::registry::from_nest(dir, &cfg)
+                            .ok()
+                            .map(|reg| nuthatch::indexer::full_schema(&reg, &cfg))
+                    })
+                    .unwrap_or_default();
                 let sealed_through = store.sealed_through();
                 match analytics::query_hot_cold(
                     dir,
@@ -521,6 +535,7 @@ impl SqlBackend {
                     },
                     &hot,
                     sealed_through,
+                    &declared,
                 ) {
                     Ok(mut out) => {
                         out.tip_unavailable = tip_unavailable;
@@ -528,19 +543,9 @@ impl SqlBackend {
                     }
                     Err(e) => {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
-                        // nest's schema and append a fix hint. Schema is loaded only on the error path.
+                        // nest's schema and append a fix hint.
                         let raw = format!("{e:#}");
-                        let hint = config::Config::load(dir)
-                            .ok()
-                            .and_then(|cfg| nuthatch::registry::from_nest(dir, &cfg).ok())
-                            .and_then(|reg| {
-                                nuthatch::analytics::enrich_query_error(
-                                    dir,
-                                    &raw,
-                                    sql,
-                                    &reg.schema(),
-                                )
-                            });
+                        let hint = nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared);
                         match hint {
                             Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
                             None => anyhow::bail!("{raw}"),

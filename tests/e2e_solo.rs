@@ -127,6 +127,7 @@ async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
         guard(),
         &hot,
         store.sealed_through(),
+        &[],
     )
     .unwrap();
     let hc_blocks: BTreeSet<u64> = hc

@@ -1739,7 +1739,7 @@ pub async fn build_and_prepare_nest(
 /// told an agent it did not exist at all, and the `semantic.toml` drift check warned that a
 /// correctly-described table "has no decoder" - a warning that fires on a correct config, which
 /// teaches operators to ignore warnings.
-fn full_schema(registry: &DecodeRegistry, config: &Config) -> Vec<crate::registry::TableSchema> {
+pub fn full_schema(registry: &DecodeRegistry, config: &Config) -> Vec<crate::registry::TableSchema> {
     let ts = registry.timestamps();
     let mut tables = registry.schema();
     tables.extend(crate::calls::schema(&config.calls, ts));
@@ -1973,6 +1973,19 @@ async fn build_nest(
             Some(h) => tracing::warn!("view {} failed to load: {} - {h}", issue.file, issue.error),
             None => tracing::warn!("view {} failed to load: {}", issue.file, issue.error),
         }
+    }
+    // #663: a declared event that has never fired on this chain is an ordinary state, not a fault -
+    // but it used to be an invisible one, order-dependent and explained nowhere. Say it once, loudly,
+    // at the moment an operator is most likely to be reading the log: the day it stops being true,
+    // this line simply stops naming that table, which is as much of an answer as the day it started.
+    let never_fired = crate::analytics::declared_but_never_sealed(&dir, &served);
+    if !never_fired.is_empty() {
+        tracing::info!(
+            "{} declared table(s) have no data yet - the event has likely never fired on this chain: \
+             {}. Each reads as an empty table, not an error, and starts populating the day it does.",
+            never_fired.len(),
+            never_fired.join(", "),
+        );
     }
 
     // Grafting (RFC-0033): tell the author up front what will and will not be reusable, rather than
