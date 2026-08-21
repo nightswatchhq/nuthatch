@@ -118,7 +118,8 @@ jobs:
       # `exex` test binary - on a documentation-only PR. #640 shared the `decode/` steps' target dir
       # the same day, worth ~0.4G and not the fix. Both figures above are kept as history.
       #
-      # **Re-measured 2026-08-22 (#639), 6 runs on `main`, all successful:** 76G used after the cache
+      # **Baseline before this step gained `/opt/hostedtoolcache` (re-measured 2026-08-21, #639),
+      # 6 runs on `main`, all successful:** 76G used after the cache
       # restore (every run), 60G after the reclaim below (every run, so the 16G it frees hasn't
       # moved), 136G used at the end of the four build steps in all six, free-space-at-end
       # {8.4, 8.4, 8.4, 8.5, 8.5, 8.5}G - **median 8.45G, n=6**. Tighter than #639's crisis figures
@@ -134,9 +135,13 @@ jobs:
       # are the only things before it, and none is a `setup-node`/`setup-python`/`setup-go`/
       # `setup-java` action - the only kind that reads the hosted tool cache. Verified rather than
       # assumed: this job (fmt, clippy, clippy --features exex, test, test --features exex, and the
-      # three `decode/` steps) ran green with it removed, measured over multiple runs of #639's PR -
-      # **figures pending that measurement; see the PR history for the run-by-run numbers this
-      # paragraph is replaced with before merge.**
+      # three `decode/` steps) ran green with `/opt/hostedtoolcache` removed in both runs of #639's
+      # PR (#732, jobs 96914551547 and 96922712938 on 38a7c42), byte-identical at every checkpoint:
+      # 76G used after the cache restore, **54G after the reclaim below - it now frees 22G, not
+      # 16G** - and 131G at the end of the four build steps, **finishing on 14G free (91%), n=2**.
+      # Against the 8.45G baseline directly above, that is **~5.6G bought back**, about two-thirds
+      # more end-of-job headroom. `test (exex)`, the step that hit ENOSPC on 19 August, is green in
+      # both.
       - name: reclaim runner disk
         run: |
           df -h /
