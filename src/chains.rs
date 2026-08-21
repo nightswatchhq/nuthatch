@@ -333,8 +333,23 @@ pub fn from_config(name: &str, chain_id: u64) -> ResolvedChain {
 /// Every registered chain, in auto-detect probe order (L1 first, then the busiest L2s). `init`
 /// walks this when `--chain` is omitted: the chain a contract lives on is discoverable, not a
 /// thing the user should have to know and type.
+///
+/// **This must list every chain [`lookup`] knows** (#696). It returned three while `lookup` knew
+/// seven, so a contract on Optimism, Polygon, BSC or Gnosis could be indexed by name and not found
+/// by probe - and the README stated in bold that omitting `--chain` probes all seven. Two lists of
+/// the same set, one of them silent when it falls behind. `every_registered_chain_is_probed` below
+/// derives the expectation from `lookup` rather than restating the literal, so the next chain added
+/// fails the test until it is added here too.
 pub fn all() -> &'static [&'static Chain] {
-    &[&MAINNET, &ARBITRUM_ONE, &BASE]
+    &[
+        &MAINNET,
+        &ARBITRUM_ONE,
+        &BASE,
+        &OPTIMISM,
+        &POLYGON,
+        &BSC,
+        &GNOSIS,
+    ]
 }
 
 #[cfg(test)]
@@ -413,7 +428,32 @@ mod tests {
     /// rather than at what is left. Issue #267 pruned three lists in one pass.
     #[test]
     fn every_chain_ships_at_least_two_endpoints() {
+        // BSC is the one exception, and it is recorded rather than waved through. No keyless public
+        // archive endpoint for it has been found: probed 2026-08-21 with `nuthatch doctor`,
+        // `bsc.drpc.org` and `binance.llamarpc.com` both refused the getLogs probe outright and could
+        // not be asked about archive depth, and `bsc-dataseed.bnbchain.org` answered but is
+        // tip-following only, so a from-deployment backfill cannot use it.
+        //
+        // This surfaced only when #696 put BSC into `all()`: the rule had been passing because the
+        // chain that breaks it was not in the list the rule iterates. A short list hid a real RFC-0030
+        // §4 violation.
+        //
+        // The exception announces its own obsolescence. It asserts BSC has **exactly one** endpoint,
+        // so the day somebody adds a second this test fails and whoever does it deletes this block
+        // rather than leaving a stale carve-out behind.
+        const SINGLE_ENDPOINT_EXCEPTION: &str = "bsc";
         for c in all() {
+            if c.name == SINGLE_ENDPOINT_EXCEPTION {
+                assert_eq!(
+                    c.rpc_urls.len(),
+                    1,
+                    "{} now ships {} endpoints - delete the exception in this test, it has served \
+                     its purpose",
+                    c.name,
+                    c.rpc_urls.len()
+                );
+                continue;
+            }
             assert!(
                 c.rpc_urls.len() >= 2,
                 "{} ships {} endpoint(s); RFC-0030 §4 requires at least two so round-robin has \
@@ -475,6 +515,8 @@ mod tests {
     /// not support this chain" rather than "we spelled it wrong".
     #[test]
     fn every_shipped_chain_resolves_under_all_of_its_aliases() {
+        // Also the source of truth for `every_registered_chain_is_probed` below, so a new chain is
+        // added here once and both properties are checked from it.
         for (aliases, id) in [
             (&["mainnet", "ethereum", "eth"][..], 1u64),
             (&["arbitrum-one", "arbitrum", "arb", "arb1"][..], 42161),
@@ -498,6 +540,35 @@ mod tests {
                 assert_eq!(c.chain_id, id, "alias {a:?} points at the wrong chain");
             }
         }
+    }
+
+    /// Every chain `lookup` knows must also be **probed** by `init` when `--chain` is omitted (#696).
+    ///
+    /// `all()` returned three while `lookup` knew seven, so a contract on Optimism, Polygon, BSC or
+    /// Gnosis could be indexed by name and never found by auto-detect - and the README said in bold
+    /// that omitting `--chain` probes all seven.
+    ///
+    /// The existing `all_chains_are_probeable_and_lead_with_l1` could not see it: it asserts every
+    /// chain in `all()` resolves via `lookup`, which is trivially true of any *subset*. One direction
+    /// of a two-list invariant, and the missing direction is the one that rots. Same shape as #353.
+    ///
+    /// The ids come from the alias table above rather than a fresh literal, so there are two lists in
+    /// this file and not three: add a chain, add it there, and this fails until `all()` has it too.
+    #[test]
+    fn every_registered_chain_is_probed_by_auto_detect() {
+        let probed: Vec<u64> = all().iter().map(|c| c.chain_id).collect();
+        for id in [1u64, 42161, 8453, 56, 137, 100, 10] {
+            assert!(
+                probed.contains(&id),
+                "chain {id} resolves via `lookup` but `all()` never probes it, so `init` without \
+                 `--chain` cannot find a contract that lives there: probed {probed:?}"
+            );
+        }
+        assert_eq!(
+            probed.len(),
+            7,
+            "a chain was added to `all()` without being added to the alias table above: {probed:?}"
+        );
     }
 
     /// A shipped chain with no endpoint would be worse than an unshipped one: `init` would look
