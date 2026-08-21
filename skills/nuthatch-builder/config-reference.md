@@ -1,10 +1,11 @@
 # nuthatch config reference
 
-The three config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in
-`src/config.rs`, `src/semantic.rs`, and `src/runtime.rs` (mount config moved there when RFC-0032
-retired the roost). CI checks this **both ways**: the build fails if this file names a key those
-structs don't have, and equally if a struct grows a key this file never mentions — a shipped key an
-agent cannot see is one it will never use.
+The four config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in
+`src/config.rs`, `src/semantic.rs`, `src/runtime.rs` (mount config moved there when RFC-0032
+retired the roost), and `src/allowlist.rs` (the query ceiling, RFC-0034 phase 2). CI checks this
+**both ways**: the build fails if this file names a key those structs don't have, and equally if a
+struct grows a key this file never mentions — a shipped key an agent cannot see is one it will never
+use.
 
 ## `nuthatch.toml` - a nest
 
