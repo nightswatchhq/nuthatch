@@ -47,9 +47,39 @@ jobs:
         run: |
           set -uo pipefail
           fail=0
-          probe() {  # probe <chain> <busy-contract>
+          MAX_ATTEMPTS=3
+
+          # #633: eth.drpc.org and arbitrum.drpc.org both failed a scheduled run and answered fine two
+          # days later - one bad minute at a provider read exactly like a shipped default that had
+          # genuinely died, because the gate below judged a single attempt. Retry absorbs the blip;
+          # the gate still has to fire for the case the blip was hiding.
+          #
+          # Runs <cmd>, tee'd to <out-file> same as before retries existed, up to MAX_ATTEMPTS times,
+          # stopping at the first attempt whose output matches <success-pattern>. Leaves RETRY_OK (1
+          # iff a match was found) and RETRY_ATTEMPTS (how many attempts that took, capped at
+          # MAX_ATTEMPTS) for the caller - the caller's own gate decides what a full-attempts failure
+          # means, this just supplies the pattern.
+          retry() {  # retry <success-pattern> <label> <out-file> <cmd...>
+            local success_pattern="$1" label="$2" outfile="$3"
+            shift 3
+            RETRY_OK=0
+            for RETRY_ATTEMPTS in $(seq 1 "$MAX_ATTEMPTS"); do
+              "$@" 2>&1 | tee "$outfile"
+              if grep -q "$success_pattern" "$outfile"; then
+                RETRY_OK=1
+                return 0
+              fi
+              if [ "$RETRY_ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; then
+                backoff=$((RETRY_ATTEMPTS * 15))
+                echo "  [$label] attempt $RETRY_ATTEMPTS/$MAX_ATTEMPTS did not succeed, retrying in ${backoff}s"
+                sleep "$backoff"
+              fi
+            done
+          }
+          probe() {  # probe <chain> <busy-contract> <url>
             echo "== $1 =="
-            ./target/release/nuthatch doctor --dir . --rpc "$3" --address "$2" 2>&1 | tee /tmp/out
+            retry "getLogs window   up to" "$3" /tmp/out \
+              ./target/release/nuthatch doctor --dir . --rpc "$3" --address "$2"
             # `doctor` reports rather than judges, so the gate is here: an endpoint that cannot serve a
             # windowed getLogs cannot serve a backfill, whatever else it does well.
             #
@@ -57,11 +87,19 @@ jobs:
             # printed nothing - produces no "getLogs window" line at all, which a `grep FAILED` check
             # cannot distinguish from a healthy one. Assert the line is present, then require the
             # healthy string exactly.
-            if ! grep -q "getLogs window" /tmp/out; then
-              echo "::error::$3 produced no getLogs-window line - the probe did not run, so this gate judged nothing"
+            #
+            # Only MAX_ATTEMPTS/MAX_ATTEMPTS - every retry exhausted - reds the job. Fewer failed
+            # attempts than that get a line in the log, same as a healthy run, because that is what
+            # they are: a provider having a moment, not a dead default.
+            if [ "$RETRY_OK" -eq 1 ]; then
+              if [ "$RETRY_ATTEMPTS" -gt 1 ]; then
+                echo "::warning::$3 needed $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts to serve a getLogs window - a provider having a moment, not counted as dead"
+              fi
+            elif ! grep -q "getLogs window" /tmp/out; then
+              echo "::error::$3 produced no getLogs-window line in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - the probe did not run, so this gate judged nothing"
               fail=1
-            elif ! grep -q "getLogs window   up to" /tmp/out; then
-              echo "::error::$3 cannot serve getLogs - it cannot back a zero-setup nest"
+            else
+              echo "::error::$3 cannot serve getLogs in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - it cannot back a zero-setup nest"
               fail=1
             fi
           }
@@ -86,15 +124,21 @@ jobs:
           # reason as the getLogs gate above: a doctor run that never printed an "archive depth" line -
           # because it never ran, errored, or the endpoint refused and doctor reported UNKNOWN - must
           # not read as healthy just because it also isn't the exact string "no". Require the line
-          # present, then require it read "yes" exactly.
+          # present, then require it read "yes" exactly. Same retry budget as the getLogs probes above,
+          # for the same reason: this is the same live-provider dependency, just a different question.
           echo "== polygon archive check =="
-          ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
-            --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 2>&1 | tee /tmp/polygon-archive-out
-          if ! grep -q "archive depth" /tmp/polygon-archive-out; then
-            echo "::error::doctor produced no archive-depth line for polygon.drpc.org - the probe did not run, so this gate judged nothing"
+          retry "archive depth    yes" "https://polygon.drpc.org (archive)" /tmp/polygon-archive-out \
+            ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
+            --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
+          if [ "$RETRY_OK" -eq 1 ]; then
+            if [ "$RETRY_ATTEMPTS" -gt 1 ]; then
+              echo "::warning::polygon.drpc.org needed $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts to confirm archive depth - a provider having a moment, not counted as dead"
+            fi
+          elif ! grep -q "archive depth" /tmp/polygon-archive-out; then
+            echo "::error::doctor produced no archive-depth line for polygon.drpc.org in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - the probe did not run, so this gate judged nothing"
             fail=1
-          elif ! grep -q "archive depth    yes" /tmp/polygon-archive-out; then
-            echo "::error::polygon.drpc.org is not archive (or refused to say) - it cannot be the primary endpoint for polygon"
+          else
+            echo "::error::polygon.drpc.org is not archive (or refused to say) in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - it cannot be the primary endpoint for polygon"
             fail=1
           fi
           # Deliberately fails the job rather than warning. A dead default is a broken promise for
