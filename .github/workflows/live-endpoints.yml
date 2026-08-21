@@ -103,44 +103,70 @@ jobs:
               fail=1
             fi
           }
-          # Contracts chosen for being busy on each chain, so a window that works here works generally.
-          for u in https://eth-pokt.nodies.app https://eth.drpc.org https://eth.api.onfinality.io/public; do
-            probe mainnet 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 "$u"
+          # EVIDENCE RUN for GH #633, not shipped: nightswatchhq/nuthatch#633's evidence bar asks to
+          # "make one attempt of three fail and show it green with the flake reported". A real
+          # provider can't be told to fail exactly once on command, so this starts a tiny local
+          # JSON-RPC stand-in that fails the first eth_getLogs call and succeeds every one after -
+          # then points a probe at it, to prove the retry-and-report path fires for real inside
+          # Actions, not just against the local bash harness this was developed against.
+          cat > /tmp/mock_rpc.py <<'PY'
+          import json
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          calls = {"getLogs": 0}
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *a):
+                  pass
+
+              def do_POST(self):
+                  length = int(self.headers["Content-Length"])
+                  req = json.loads(self.rfile.read(length))
+                  if isinstance(req, list):
+                      # Batch request (max_batch probe) - not implemented, refuse cleanly rather than
+                      # error on the unsupported shape.
+                      self._error(req[0].get("id", 0) if req else 0, "mock does not implement batch requests")
+                      return
+                  method = req.get("method")
+                  if method == "eth_blockNumber":
+                      result = "0x1000000"
+                  elif method == "eth_getLogs":
+                      calls["getLogs"] += 1
+                      if calls["getLogs"] == 1:
+                          self._error(req["id"], "induced failure: attempt 1 of the #633 evidence run")
+                          return
+                      result = []
+                  else:
+                      self._error(req["id"], f"mock does not implement {method}")
+                      return
+                  self._ok(req["id"], result)
+
+              def _ok(self, id_, result):
+                  body = json.dumps({"jsonrpc": "2.0", "id": id_, "result": result}).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _error(self, id_, message):
+                  body = json.dumps({"jsonrpc": "2.0", "id": id_, "error": {"code": -32000, "message": message}}).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+          HTTPServer(("127.0.0.1", 8633), Handler).serve_forever()
+          PY
+          python3 /tmp/mock_rpc.py &
+          for _ in $(seq 1 20); do
+            curl -s -o /dev/null -m 1 -X POST -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+              http://127.0.0.1:8633 && break
+            sleep 0.5
           done
-          for u in https://arb1.arbitrum.io/rpc https://arbitrum.drpc.org https://arb-pokt.nodies.app; do
-            probe arbitrum-one 0xaf88d065e77c8cC2239327C5EDb3A432268e5831 "$u"
-          done
-          for u in https://mainnet.base.org https://base.drpc.org https://base-pokt.nodies.app; do
-            probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
-          done
-          # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).
-          # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
-          # silently breaks backfill even when its getLogs window is wide. That is what broke on
-          # 2026-08-20 - polygon-bor-rpc.publicnode.com (non-archive) was first.
-          for u in https://polygon.drpc.org https://polygon-bor-rpc.publicnode.com; do
-            probe polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 "$u"
-          done
-          # Archive-depth gate for the first (archive) endpoint. Allowlist, not denylist, for the same
-          # reason as the getLogs gate above: a doctor run that never printed an "archive depth" line -
-          # because it never ran, errored, or the endpoint refused and doctor reported UNKNOWN - must
-          # not read as healthy just because it also isn't the exact string "no". Require the line
-          # present, then require it read "yes" exactly. Same retry budget as the getLogs probes above,
-          # for the same reason: this is the same live-provider dependency, just a different question.
-          echo "== polygon archive check =="
-          retry "archive depth    yes" "https://polygon.drpc.org (archive)" /tmp/polygon-archive-out \
-            ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
-            --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
-          if [ "$RETRY_OK" -eq 1 ]; then
-            if [ "$RETRY_ATTEMPTS" -gt 1 ]; then
-              echo "::warning::polygon.drpc.org needed $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts to confirm archive depth - a provider having a moment, not counted as dead"
-            fi
-          elif ! grep -q "archive depth" /tmp/polygon-archive-out; then
-            echo "::error::doctor produced no archive-depth line for polygon.drpc.org in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - the probe did not run, so this gate judged nothing"
-            fail=1
-          else
-            echo "::error::polygon.drpc.org is not archive (or refused to say) in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - it cannot be the primary endpoint for polygon"
-            fail=1
-          fi
+          probe evidence-flake 0x0000000000000000000000000000000000dEaD http://127.0.0.1:8633
           # Deliberately fails the job rather than warning. A dead default is a broken promise for
           # every new user of that chain, and a warning nobody reads is how this one survived a month.
           exit $fail
