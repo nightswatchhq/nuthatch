@@ -125,7 +125,12 @@ impl Probe {
 }
 
 /// Probe `url`. Never fails on a bad endpoint - a broken endpoint is the *finding*, not an error.
-pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
+///
+/// `addresses` is the full set a real backfill would filter on - not one representative contract.
+/// More addresses means more logs per block range, so the endpoint's result-count cap bites at a
+/// narrower span than a single-address probe would suggest (#670). An empty slice is the range-only
+/// case: no address filter at all, same as before this could take more than one.
+pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
     let rpc = RpcClient::new(vec![url.to_string()])
         .with_context(|| format!("'{url}' is not a usable URL"))?;
     let mut notes = Vec::new();
@@ -147,7 +152,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
                 archive: false,
                 archive_unknown: true,
                 notes,
-                range_only: address.is_none(),
+                range_only: addresses.is_empty(),
             });
         }
     };
@@ -163,7 +168,6 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
     // empty at every span, so the loop measures the range limit it claims to measure.
     const NO_MATCH_TOPIC0: &str =
         "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    let addrs: Vec<String> = address.map(|a| vec![a.to_string()]).unwrap_or_default();
     let mut max_window = None;
     let mut span = 10u64;
     while span <= 200_000 {
@@ -172,7 +176,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
         // Probing the provider's window cap needs a filter that is actually asked: with no address to
         // probe with, an empty-on-both-halves filter would be the every-log-on-the-chain request
         // rather than a width probe (#432), so the probe uses a topic0 that matches nothing instead.
-        let probe = crate::source::LogFilter::new(&addrs, &[]).unwrap_or_else(|| {
+        let probe = crate::source::LogFilter::new(addresses, &[]).unwrap_or_else(|| {
             crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
                 .expect("a one-topic filter is non-empty")
         });
@@ -272,7 +276,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
     // result-count cap the provider enforces. The 320-block recommendation is therefore a floor,
     // not a ceiling: on endpoints where the result-count cap is above 320 (as measured at 81,920
     // for one archive RPC in docs/launch/port-queue-nest.md §8), the real window is much larger.
-    if address.is_none() && max_window.is_some() {
+    if addresses.is_empty() && max_window.is_some() {
         notes.push(
             "window measured RANGE-ONLY - capped at 320 because a range-only probe cannot see the \
              result-count limit; your real window is very likely much larger. Re-probe with \
@@ -287,7 +291,7 @@ pub async fn probe(url: &str, address: Option<&str>) -> Result<Probe> {
         archive,
         archive_unknown,
         notes,
-        range_only: address.is_none(),
+        range_only: addresses.is_empty(),
     })
 }
 
@@ -297,7 +301,7 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     // `--address`: the nest already declares its contracts, so there is no reason to fall back to
     // the range-only probe - which #644 measured as understating the real window by up to 256x -
     // when a real address is sitting right there in `nuthatch.toml`.
-    let mut address = args.address.clone();
+    let mut addresses: Vec<String> = args.address.clone().into_iter().collect();
     let urls = if args.rpc.is_empty() {
         // No `--rpc`: probe whatever the nest in `--dir` is configured to use, which is the case
         // where "my backfill is slow" usually starts.
@@ -322,16 +326,31 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
                 )
             }
         })?;
-        if address.is_none() {
-            if let Some(c) = cfg.contracts.first() {
+        if addresses.is_empty() && !cfg.contracts.is_empty() {
+            // Every declared contract, not just the first (#670): a real backfill filters logs on
+            // the full set at once, so more contracts means more logs per block range and the
+            // endpoint's result-count cap bites at a narrower span than a single-contract probe
+            // would suggest. Probing with one contract when the nest has several would recommend a
+            // window the real workload cannot sustain.
+            if cfg.contracts.len() == 1 {
+                let c = &cfg.contracts[0];
                 println!(
-                    "no --address given; probing with '{}' ({}), this nest's first declared \
-                     contract - pass --address to probe a different, possibly busier one",
+                    "no --address given; probing with '{}' ({}), this nest's only declared \
+                     contract - pass --address to probe a different one",
                     c.alias, c.address
                 );
-                println!();
-                address = Some(c.address.clone());
+            } else {
+                let aliases: Vec<&str> = cfg.contracts.iter().map(|c| c.alias.as_str()).collect();
+                println!(
+                    "no --address given; probing with all {} of this nest's declared contracts \
+                     ({}) - matches what a real backfill filters on. Pass --address to probe a \
+                     single one instead",
+                    cfg.contracts.len(),
+                    aliases.join(", ")
+                );
             }
+            println!();
+            addresses = cfg.contracts.iter().map(|c| c.address.clone()).collect();
         }
         cfg.nest.rpc_urls
     } else {
@@ -347,7 +366,7 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
         println!("{host}");
-        let p = probe(url, address.as_deref()).await?;
+        let p = probe(url, &addresses).await?;
         print!("{}", p.report());
         if let Some(w) = p.recommended_window() {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
@@ -575,7 +594,7 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
 
-        probe(&url, None).await.unwrap();
+        probe(&url, &[]).await.unwrap();
         handle.abort();
 
         let filters = seen.lock().unwrap();
@@ -600,7 +619,7 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (url, handle) = filter_capturing_rpc(seen, Some(50_000)).await;
 
-        let p = probe(&url, None).await.unwrap();
+        let p = probe(&url, &[]).await.unwrap();
         handle.abort();
 
         assert!(
@@ -621,7 +640,7 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (url, handle) = filter_capturing_rpc(seen, None).await;
 
-        let p = probe(&url, None).await.unwrap();
+        let p = probe(&url, &[]).await.unwrap();
         handle.abort();
 
         let joined = p.notes.join(" ");
@@ -691,6 +710,73 @@ abi = "abis/busiest.json"
                     .unwrap_or(false)
             }),
             "no filter carried the nest's own declared contract address: {filters:?}"
+        );
+    }
+
+    /// #670: a real backfill filters on **every** declared contract at once, not just the first,
+    /// because more addresses means more logs per block range and the endpoint's result-count cap
+    /// bites at a narrower span than a single-contract probe suggests. `run()` with `--dir` and no
+    /// `--address` on a two-contract nest must therefore put *both* addresses in the probe filter.
+    /// Mutation check: revert the derivation in `run()` to `cfg.contracts.first()` and the second
+    /// assertion goes red - only the first contract's address is ever seen.
+    #[tokio::test]
+    async fn run_with_dir_and_no_address_derives_the_full_contract_set_not_just_the_first() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["{url}"]
+schema_version = 1
+
+[[contracts]]
+alias = "first"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/first.json"
+
+[[contracts]]
+alias = "second"
+address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+abi = "abis/second.json"
+"#
+            ),
+        )
+        .unwrap();
+
+        run(crate::cli::DoctorArgs {
+            rpc: Vec::new(),
+            dir: dir.path().to_string_lossy().into_owned(),
+            address: None,
+        })
+        .await
+        .unwrap();
+        handle.abort();
+
+        let filters = seen.lock().unwrap();
+        assert!(!filters.is_empty(), "no eth_getLogs call was captured");
+        let carries = |addr: &str| {
+            filters.iter().any(|f| {
+                f.get("address")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().any(|v| v.as_str() == Some(addr)))
+                    .unwrap_or(false)
+            })
+        };
+        assert!(
+            carries("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the first declared contract must still be probed: {filters:?}"
+        );
+        assert!(
+            carries("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "the second declared contract was dropped - doctor probed only the first, which is \
+             exactly #670: {filters:?}"
         );
     }
 }
