@@ -2612,30 +2612,29 @@ mod tests {
         assert!(batch_is_narrowable(&odd));
     }
 
-    /// **#656, fix timing.** Proves the parallel top-level split halves the serial RTT depth.
+    /// **#656, fix mechanism.** Proves the parallel top-level split actually runs the two halves
+    /// concurrently, asserting on concurrency directly rather than on wall-clock elapsed time.
     ///
-    /// A 8-block descent to width 1 has a sequential RTT depth of 15 (the binary tree has 15 nodes).
-    /// With `try_join!` at the root of each split the wall-clock depth is max(7, 7) + 1 = 8 RTTs.
-    /// At 2ms artificial latency per server round-trip: sequential ≈ 30ms, parallel ≈ 16ms.
-    ///
-    /// This does **not** gate on an exact number because timing on CI is variable, only on
-    /// "meaningfully less than sequential" - which we define as less than 70% of the sequential
-    /// baseline (a lenient bound that survives any reasonable scheduler jitter). The eprintln at
-    /// the end records the actual measured ratio for the run log.
+    /// An earlier version of this test measured elapsed time against a threshold (sequential ceiling
+    /// 30ms, parallel target <21ms - a 2ms/RTT-wide margin) and reded on a loaded CI runner at
+    /// 24.18ms: a busy runner and a broken parallelisation produce the same symptom, so a stopwatch
+    /// cannot tell them apart. What the flag actually changes is **how many requests are in flight at
+    /// once**, not how long anything takes - so that is what this asserts, via a high-water-mark
+    /// counter in the mock server that is independent of scheduler speed.
     #[tokio::test]
-    async fn parallel_top_level_split_halves_serial_rtt_depth() {
+    async fn parallel_top_level_split_runs_two_requests_concurrently() {
         use super::RpcClient;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        const LATENCY_MS: u64 = 2;
-
-        // Sequential baseline: run block_timestamps against a mock that enforces latency, and
-        // counts total connection count (each connection = one serial RPC round-trip at this level).
-        // We use block counts of 8 so the descent tree is shallow enough to be fast.
-        async fn run_once(latency_ms: u64) -> (usize, std::time::Duration) {
-            static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
-            CALL_COUNT.store(0, Ordering::SeqCst);
+        // Runs one `fetch_timestamp_batch(blocks, false, parallel)` call directly - bypassing
+        // `block_timestamps`' hardcoded `true` - so both the `true` and `false` paths are exercised
+        // here rather than only the one production wires up.
+        async fn max_in_flight(parallel: bool) -> usize {
+            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            IN_FLIGHT.store(0, Ordering::SeqCst);
+            MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = l.local_addr().unwrap();
             tokio::spawn(async move {
@@ -2648,8 +2647,13 @@ mod tests {
                         let n = sock.read(&mut buf).await.unwrap_or(0);
                         let req = String::from_utf8_lossy(&buf[..n]).to_string();
                         let n_items = req.matches("eth_getBlockByNumber").count();
-                        CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(std::time::Duration::from_millis(latency_ms)).await;
+                        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+                        // Widens the window a concurrent sibling request would also be in flight -
+                        // without it, two requests issued back-to-back could each complete before the
+                        // other starts, hiding genuine concurrency behind a fast round trip.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                         let items: Vec<String> = (0..n_items)
                             .map(|i| format!(
                                 r#"{{"jsonrpc":"2.0","id":{i},"error":{{"code":-32000,"message":"requested block is not available on this node"}}}}"#
@@ -2667,33 +2671,19 @@ mod tests {
             });
             let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
             let blocks: Vec<u64> = (1..=8).collect();
-            let start = std::time::Instant::now();
-            let _ = c.block_timestamps(&blocks).await;
-            let elapsed = start.elapsed();
-            (CALL_COUNT.load(Ordering::SeqCst) as usize, elapsed)
+            let _ = c.fetch_timestamp_batch(&blocks, false, parallel).await;
+            MAX_IN_FLIGHT.load(Ordering::SeqCst)
         }
 
-        // 5 runs, take the median elapsed.
-        let mut timings = Vec::new();
-        for _ in 0..5 {
-            let (calls, elapsed) = run_once(LATENCY_MS).await;
-            timings.push((calls, elapsed));
-        }
-        timings.sort_by_key(|(_, e)| *e);
-        let (median_calls, median_elapsed) = timings[2];
-
-        // Sequential depth for an 8-block full descent would be 15 RTTs × 2ms = 30ms.
-        // Parallel top-level: 8 RTTs × 2ms = 16ms. We assert < 70% of the sequential ceiling.
-        let sequential_ceiling_ms = 15 * LATENCY_MS;
-        let parallel_ceiling_ms = sequential_ceiling_ms * 70 / 100;
-        eprintln!(
-            "#656 timing: median {median_elapsed:?} over 5 runs, {median_calls} server calls, \
-             sequential ceiling {sequential_ceiling_ms}ms, parallel target <{parallel_ceiling_ms}ms"
+        assert_eq!(
+            max_in_flight(true).await,
+            2,
+            "parallel=true must run the top-level split's two halves concurrently"
         );
-        assert!(
-            median_elapsed.as_millis() < parallel_ceiling_ms as u128,
-            "#656 parallel split must finish in <{parallel_ceiling_ms}ms \
-             (70% of sequential ceiling {sequential_ceiling_ms}ms), got {median_elapsed:?}"
+        assert_eq!(
+            max_in_flight(false).await,
+            1,
+            "parallel=false must never have more than one request in flight at a time"
         );
     }
 }
