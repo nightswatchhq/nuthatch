@@ -1,15 +1,38 @@
 # Did anyone actually review this?
 #
-# Eight required contexts on `main` and `sprint/**`, strict, admin-enforced - and until this file
-# existed, not one of them asked whether a human or agent had ever read the change. The
+# Nine required contexts on `main` and on each `sprint/*` branch, strict, admin-enforced - and until
+# this file existed, not one of them asked whether a human or agent had ever read the change. The
 # `Reviewed-by:` rule was honour-system, checked only by a post-hoc audit grep that runs long after
 # the merge. `gh pr merge --auto` arms on an unsigned PR quite happily and lands it the instant the
-# eighth context goes green.
+# last context goes green.
 #
 # **Three near-misses, one measured.** 2026-08-14 ~19:40 UTC: #583, #588 and #589 all had auto-merge
 # armed with no signature in the body. #583 was one check away and carried a real defect (`/ready`
 # returning 503 on a healthy cursor at tip). It was caught by a CEO heartbeat happening to land in
 # the right ten-minute window, which is luck, not a control. This job is the control (NIG-235).
+#
+# ## This job is only a control while `reviewed-by signature` is a *required* context
+#
+# It was not, from the day it was written (2026-08-14, NIG-235) until 2026-08-21. The job existed,
+# ran on every PR, and went red exactly as designed - onto a checks list where nothing consumed it.
+# Branch protection required nine other contexts and never this one, so a red signature blocked no
+# merge, and `gh pr merge --auto` still landed on the ninth green context without reading it. #619
+# and #691 then sharpened the matcher inside a job that gated nothing, and were closed on the
+# strength of it. The whole apparatus below - the roster, the self-tests, the both-directions
+# mutation argument - was decorative for a week for a reason none of it can see from in here.
+#
+# So the load-bearing artefact is not this file. It is the entry in
+# `required_status_checks.contexts` on every branch a PR can target, and it lives in GitHub's
+# settings, not the repo. Nothing in this workflow can assert its own requiredness: a job cannot
+# tell whether anyone is listening. Two consequences, both operational:
+#
+#   - **A new `sprint/*` branch starts unprotected.** Protection here is per-branch, not a pattern
+#     rule (`repos/.../rules/branches/main` returns `[]` - there are no rulesets). Creating
+#     `sprint/foo` and opening PRs onto it gets you nothing until protection is copied onto it,
+#     this context included. That is a checklist item at sprint start, not an inference.
+#   - **Check it, don't assume it.** `gh api repos/nightswatchhq/nuthatch/branches/main/protection
+#     --jq '.required_status_checks.contexts'` must contain `reviewed-by signature`. If it does
+#     not, this job is back to being scenery and every merge since is unsigned-capable.
 #
 # ## The roster (#619, #691)
 #
