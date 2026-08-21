@@ -203,12 +203,21 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
 /// to fix. So the only failures excluded are the ones where retrying differently is *definitely*
 /// pointless.
 ///
-/// **Known cost, not yet addressed:** narrowing sits *outside* the retry loop in
-/// `fetch_timestamp_batch_once`, so every level pays a full `TIMESTAMP_ATTEMPTS` cycle with backoff
-/// before it splits. Converging 200 → 3 against a count-capping endpoint therefore burns ~8 retry
-/// cycles. Correct, but slow: for a failure that is *definitely* a cap, retrying at the same width
-/// first is pure waste. Splitting immediately on a definite cap and reserving retries for
-/// unclassifiable errors would fix it, and wants its own change rather than being smuggled in here.
+/// **#656:** the narrowing path's per-item error variant returns after exactly one round trip with no
+/// backoff, so the cost was sequential request count (~403 serial RTTs for a full 200→1 descent),
+/// not the retry-cycle waste the comment above originally named. `fetch_timestamp_batch` now
+/// parallelises the two halves of each top-level split (`tokio::try_join!`), halving the sequential
+/// depth to ~202 RTTs at a bounded concurrency burst of TIMESTAMP_FANOUT × 2.
+fn batch_is_narrowable(err: &anyhow::Error) -> bool {
+    match class_of(err) {
+        // Auth and rate limits are positive findings about something other than size: splitting an
+        // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
+        // limit doubles the request count in exactly the wrong direction.
+        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
+        _ => true,
+    }
+}
+
 /// A short, stable token for a [`FailureClass`], for logs that get grepped rather than read.
 ///
 /// `{class:?}` would do, except `RateLimited { retry_after: Some(..) }` and `Narrowable { suggested:
@@ -222,16 +231,6 @@ fn class_label(class: Option<&FailureClass>) -> &'static str {
         Some(FailureClass::Transient) => "Transient",
         Some(FailureClass::Terminal) => "Terminal",
         None => "unclassified",
-    }
-}
-
-fn batch_is_narrowable(err: &anyhow::Error) -> bool {
-    match class_of(err) {
-        // Auth and rate limits are positive findings about something other than size: splitting an
-        // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
-        // limit doubles the request count in exactly the wrong direction.
-        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
-        _ => true,
     }
 }
 
