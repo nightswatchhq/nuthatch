@@ -137,9 +137,11 @@ Measured before/after (same range, same RPC cost, only the storage path differs)
 | seal-direct (decode → Parquet) | same | 12,127 | 4.8 s | **~2,520** |
 
 **~8.7× faster.** The RPC portion is identical between the two (24 requests each); the difference is
-that the hot path commits a redb transaction per row (~12k fsyncs), while seal-direct buffers and
-writes a handful of segments. Single-run public-RPC smoke figures - noisy in absolute terms, but the
-storage-path delta is the point and is not noise. Run it yourself:
+inside the storage path itself, not commit cadence - both the hot store and seal-direct commit once
+per window (`Store::commit_window`, one `begin_write`/fsync per window, not per row, since PERF-2).
+The gap is a redb B-tree point-insert per row, indexed for point-reads, versus a buffered bulk
+Parquet write. Single-run public-RPC smoke figures - noisy in absolute terms, but the storage-path
+delta is the point and is not noise. Run it yourself:
 
 ```sh
 nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
