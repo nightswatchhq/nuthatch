@@ -114,6 +114,37 @@ pub fn render_top_level_help(cmd: Command) -> String {
     format!("{prefix}{}{suffix}", sections.join("\n\n"))
 }
 
+/// Renders a `tracing` event as one `  · message` line, in the idiom `init` and `add` already use
+/// for their own output (#695).
+///
+/// The default `nuthatch=info` filter means every `tracing::warn!` in the crate prints during `init`
+/// with its own timestamp, level and ANSI colouring, straight through the `→`/`✓` block. A clean run
+/// never shows one; a stranger with a slow public endpoint gets the chain-id verification warnings
+/// from `rpc.rs`, which is exactly the run where the tool should look most composed.
+///
+/// **Suppressing them would be the wrong fix.** They are well-written and they are the only signal
+/// that a probe is struggling, which is worth knowing while `init` appears to hang. So the message
+/// survives verbatim and only its presentation changes: no timestamp, no level, no colour, and the
+/// same two-space indent as the ticks it sits between.
+pub struct PrettyLine;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for PrettyLine
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        write!(writer, "  · ")?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
