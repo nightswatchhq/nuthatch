@@ -54,7 +54,17 @@ async fn main() -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "nuthatch=info".into())
     };
+    // `init` and `add` print prose - `→`, `✓`, `·` - and a raw log line through the middle of it is
+    // the one blemish on the part of the product a stranger sees first (#695). Same filter, same
+    // messages, different presentation: see `help::PrettyLine`.
+    let pretty = matches!(cli.command, cli::Command::Init(_) | cli::Command::Add(_));
     match cli.log_format {
+        cli::LogFormat::Text if pretty => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_target(false)
+            .with_ansi(false)
+            .event_format(help::PrettyLine)
+            .init(),
         // Text stays exactly as it was: no target (the crate is the only binary running), env-filter
         // default `nuthatch=info`.
         cli::LogFormat::Text => tracing_subscriber::fmt()

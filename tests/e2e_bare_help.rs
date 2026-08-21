@@ -56,3 +56,89 @@ fn a_bare_invocation_is_still_an_error_on_stderr() {
     assert!(!hout.is_empty(), "help goes to stdout");
     assert!(herr.is_empty(), "help writes nothing to stderr, got {herr:?}");
 }
+
+/// #695. A warning during `init` must arrive in `init`'s idiom, not in log format.
+///
+/// The default filter is `nuthatch=info`, so every `tracing::warn!` in the crate prints during
+/// `init` with a timestamp, a level and ANSI colouring, straight through the `→`/`✓` block. A clean
+/// run never shows one - which is why this went unnoticed - and a stranger with a slow public
+/// endpoint gets several.
+///
+/// Driven with `RUST_LOG` rather than by arranging a slow endpoint: the fault is the *formatter*
+/// chosen for the pretty commands, and any event through that formatter proves it. Arranging a real
+/// timeout would test the network instead.
+#[test]
+fn a_log_line_during_init_arrives_in_inits_own_idiom() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["init", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "--chain", "mainnet"])
+        .current_dir(dir.path())
+        .env("RUST_LOG", "nuthatch=debug")
+        .output()
+        .expect("run init");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Network-dependent: if nothing was logged at all there is nothing to judge, and a test that
+    // silently passes on an empty run is the flattering failure this repository keeps rediscovering.
+    let logged: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("rpc ") || l.contains("failed for"))
+        .collect();
+    if logged.is_empty() {
+        eprintln!("no log lines emitted (offline?) - nothing to judge, not asserting");
+        return;
+    }
+    for line in logged {
+        assert!(
+            line.trim_start().starts_with('·'),
+            "a log line during init must use the `·` idiom, got: {line:?}"
+        );
+        assert!(
+            !line.contains("WARN") && !line.contains("DEBUG") && !line.contains("\x1b["),
+            "no level or ANSI in init's output, got: {line:?}"
+        );
+        assert!(
+            !line.contains("2026-") && !line.contains("Z  "),
+            "no ISO timestamp in init's output, got: {line:?}"
+        );
+    }
+}
+
+/// #694. The ABI-resolved tick is *printed*, not merely formattable.
+///
+/// `project.rs` has `abi_resolved_lines()` (a pure formatter, two unit tests) and
+/// `print_abi_resolved()` (calls it, prints). Nothing covered the wiring: deleting both call sites
+/// left the whole suite green, so the line a stranger relies on to know the ABI was found could have
+/// vanished silently.
+///
+/// The same class as #693 and #672 in this repository - a unit test on the renderer says nothing
+/// about whether anyone calls it.
+#[test]
+fn init_prints_the_abi_resolved_tick_and_not_only_formats_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["init", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "--chain", "mainnet"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run init");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Offline runs cannot resolve an ABI at all, and a test that passes on a run that never got
+    // there would be worse than none. Judge only when the scaffold actually succeeded.
+    if !text.contains("scaffolded nest") {
+        eprintln!("init did not complete (offline?) - nothing to judge, not asserting");
+        return;
+    }
+    assert!(
+        text.contains("ABI resolved via"),
+        "init completed without printing the ABI-resolved tick:\n{text}"
+    );
+}
