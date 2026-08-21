@@ -204,10 +204,11 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
 /// pointless.
 ///
 /// **#656:** the narrowing path's per-item error variant returns after exactly one round trip with no
-/// backoff, so the cost is sequential request count (~403 serial RTTs for a full 200→1 descent), not
-/// the retry-cycle waste the comment above originally named. Every level of a descent still `.await`s
-/// its two halves one after the other today - a fix that parallelises them is proposed but not yet
-/// landed. Known cost, not yet addressed.
+/// backoff, so the cost was sequential request count (~403 serial RTTs for a full 200→1 descent), not
+/// the retry-cycle waste the comment above originally named. `fetch_timestamp_batch` now runs the two
+/// halves of its top-level split concurrently (`tokio::try_join!`), halving the sequential depth to
+/// ~202 RTTs; levels below the top still `.await` sequentially, which bounds the concurrency burst at
+/// `TIMESTAMP_FANOUT` × 2 rather than the exponential blowup a fully-parallel tree would produce.
 fn batch_is_narrowable(err: &anyhow::Error) -> bool {
     match class_of(err) {
         // Auth and rate limits are positive findings about something other than size: splitting an
@@ -1090,7 +1091,7 @@ impl RpcClient {
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
             .chunks(MAX_TIMESTAMP_BATCH)
-            .map(|c| self.fetch_timestamp_batch(c, false))
+            .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
             .buffered(TIMESTAMP_FANOUT)
@@ -1196,7 +1197,7 @@ impl RpcClient {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
                 .chunks(MAX_TIMESTAMP_BATCH)
-                .map(|c| self.fetch_timestamp_batch(c, full))
+                .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
                 .buffered(HEADER_FANOUT)
@@ -1276,9 +1277,14 @@ impl RpcClient {
         &'a self,
         blocks: &'a [u64],
         full: bool,
+        // When true, the top-level split's two halves run concurrently (`tokio::try_join!`).
+        // Recursive calls pass false: one level of parallelism bounds the concurrency burst at
+        // `TIMESTAMP_FANOUT` × 2 rather than the exponential blowup a fully-parallel tree would
+        // produce. #656: a 200→1 descent is ~403 serial RTTs; one parallel split makes it ~202.
+        parallel: bool,
     ) -> TimestampBatchFuture<'a> {
         // The descent starts here, so this width is the one every level below reports as its origin.
-        self.fetch_timestamp_batch_from(blocks, full, blocks.len())
+        self.fetch_timestamp_batch_from(blocks, full, blocks.len(), parallel)
     }
 
     /// The recursive half of [`Self::fetch_timestamp_batch`], carrying `entered_at` - the width the
@@ -1302,6 +1308,7 @@ impl RpcClient {
         blocks: &'a [u64],
         full: bool,
         entered_at: usize,
+        parallel: bool,
     ) -> TimestampBatchFuture<'a> {
         Box::pin(async move {
             match self
@@ -1340,9 +1347,23 @@ impl RpcClient {
                         );
                     }
                     let (a, b) = blocks.split_at(mid);
-                    let mut out = self.fetch_timestamp_batch_from(a, full, entered_at).await?;
-                    out.extend(self.fetch_timestamp_batch_from(b, full, entered_at).await?);
-                    Ok(out)
+                    if parallel {
+                        let (mut out, rest) = tokio::try_join!(
+                            self.fetch_timestamp_batch_from(a, full, entered_at, false),
+                            self.fetch_timestamp_batch_from(b, full, entered_at, false),
+                        )?;
+                        out.extend(rest);
+                        Ok(out)
+                    } else {
+                        let mut out = self
+                            .fetch_timestamp_batch_from(a, full, entered_at, false)
+                            .await?;
+                        out.extend(
+                            self.fetch_timestamp_batch_from(b, full, entered_at, false)
+                                .await?,
+                        );
+                        Ok(out)
+                    }
                 }
                 Err(e) => Err(e),
             }
@@ -2552,12 +2573,14 @@ mod tests {
             "the floor of a descent must say where it descended from, so it cannot be mistaken for a \
              trailing one-block chunk: {msg}"
         );
-        // 8 → 4 → 2 → 1 along the leftmost path, one request each, and `?` propagates from the first
-        // failing leaf rather than exploring the rest of the tree. Four, not the sixteen a full
-        // `TIMESTAMP_ATTEMPTS` cycle per level would cost.
+        // The top-level 8 → {4, 4} split runs its two halves concurrently (`tokio::try_join!`), so
+        // both sides of the tree are explored rather than only the leftmost path: 1 (the width-8
+        // request) + 3 each for the two width-4 halves (4 → 2 → 1 along their own leftmost path,
+        // `?` propagating from the first failing leaf below the parallel split) = 7. Still one
+        // request per level visited, not the sixteen a full `TIMESTAMP_ATTEMPTS` cycle would cost.
         assert_eq!(
             seen.load(Ordering::SeqCst),
-            4,
+            7,
             "a per-item error costs one request per level - it never enters the retry loop"
         );
     }
@@ -2587,6 +2610,81 @@ mod tests {
             "Batch of more than 3 requests".into(),
         );
         assert!(batch_is_narrowable(&odd));
+    }
+
+    /// **#656, fix mechanism.** Proves the parallel top-level split actually runs the two halves
+    /// concurrently, asserting on concurrency directly rather than on wall-clock elapsed time.
+    ///
+    /// An earlier version of this test measured elapsed time against a threshold (sequential ceiling
+    /// 30ms, parallel target <21ms - a 2ms/RTT-wide margin) and reded on a loaded CI runner at
+    /// 24.18ms: a busy runner and a broken parallelisation produce the same symptom, so a stopwatch
+    /// cannot tell them apart. What the flag actually changes is **how many requests are in flight at
+    /// once**, not how long anything takes - so that is what this asserts, via a high-water-mark
+    /// counter in the mock server that is independent of scheduler speed.
+    #[tokio::test]
+    async fn parallel_top_level_split_runs_two_requests_concurrently() {
+        use super::RpcClient;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Runs one `fetch_timestamp_batch(blocks, false, parallel)` call directly - bypassing
+        // `block_timestamps`' hardcoded `true` - so both the `true` and `false` paths are exercised
+        // here rather than only the one production wires up.
+        async fn max_in_flight(parallel: bool) -> usize {
+            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            IN_FLIGHT.store(0, Ordering::SeqCst);
+            MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = l.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1 << 20];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let n_items = req.matches("eth_getBlockByNumber").count();
+                        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+                        // Widens the window a concurrent sibling request would also be in flight -
+                        // without it, two requests issued back-to-back could each complete before the
+                        // other starts, hiding genuine concurrency behind a fast round trip.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        let items: Vec<String> = (0..n_items)
+                            .map(|i| format!(
+                                r#"{{"jsonrpc":"2.0","id":{i},"error":{{"code":-32000,"message":"requested block is not available on this node"}}}}"#
+                            ))
+                            .collect();
+                        let body = format!("[{}]", items.join(","));
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+            let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+            let blocks: Vec<u64> = (1..=8).collect();
+            let _ = c.fetch_timestamp_batch(&blocks, false, parallel).await;
+            MAX_IN_FLIGHT.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            max_in_flight(true).await,
+            2,
+            "parallel=true must run the top-level split's two halves concurrently"
+        );
+        assert_eq!(
+            max_in_flight(false).await,
+            1,
+            "parallel=false must never have more than one request in flight at a time"
+        );
     }
 }
 
