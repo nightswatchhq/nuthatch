@@ -545,7 +545,8 @@ impl SqlBackend {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
                         // nest's schema and append a fix hint.
                         let raw = format!("{e:#}");
-                        let hint = nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared);
+                        let hint =
+                            nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared);
                         match hint {
                             Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
                             None => anyhow::bail!("{raw}"),

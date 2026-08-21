@@ -267,7 +267,16 @@ fn run(
         }
         return Err(e);
     }
-    match attempt(dir, sql, guard, hot, sealed_through, &corrupt, deadline, declared)? {
+    match attempt(
+        dir,
+        sql,
+        guard,
+        hot,
+        sealed_through,
+        &corrupt,
+        deadline,
+        declared,
+    )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
     }
@@ -284,6 +293,7 @@ fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attempt(
     dir: &Path,
     sql: &str,
@@ -1672,7 +1682,14 @@ fn view_build_failure_at(
     }
     let conn = Connection::open_in_memory().ok()?;
     let empty_hot = HotRows::new();
-    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default(), schema);
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
 
@@ -1749,7 +1766,10 @@ fn view_target_name(stmt: &str) -> Option<String> {
 ///
 /// This is what turns "the day that event first fires, the view starts working, and nothing in the
 /// logs explains either state" into a startup line an operator can read once and stop wondering about.
-pub fn declared_but_never_sealed(dir: &Path, declared: &[crate::registry::TableSchema]) -> Vec<String> {
+pub fn declared_but_never_sealed(
+    dir: &Path,
+    declared: &[crate::registry::TableSchema],
+) -> Vec<String> {
     let manifest = crate::seal::load_manifest(dir).unwrap_or_default();
     declared
         .iter()
@@ -1776,7 +1796,14 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
-    let _ = define_views(&conn, dir, &empty_hot, u64::MAX, &Default::default(), schema);
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
 
@@ -3819,7 +3846,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default(), &[]).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
 
         // A name the catalogue does not have: refused by the binder, before a page is touched.
         assert!(
@@ -4221,7 +4256,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default(), &[]).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         // The base table exists as an empty typed view…
@@ -4253,7 +4296,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default(), &[]).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         assert!(
@@ -4276,7 +4327,8 @@ template="pool"
     /// already computes as `served`/`full_schema`) is the fix - a second, always-current source that
     /// doesn't depend on `schema.json` being fresh.
     #[test]
-    fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied() {
+    fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -4349,7 +4401,8 @@ template="pool"
             define_views(&conn, dir.path(), &hot, u64::MAX, &Default::default(), &[]).unwrap();
             define_nest_views(&conn, dir.path());
             assert!(
-                conn.query_row("SELECT count(*) FROM gns_network", [], |r| r.get::<_, i64>(0))
+                conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
+                    .get::<_, i64>(0))
                     .is_err(),
                 "pin the bug: one never-fired table takes the whole view down, all four fields"
             );
@@ -4360,7 +4413,15 @@ template="pool"
         // table's real data intact, the never-fired table's side NULL rather than absent.
         {
             let conn = Connection::open_in_memory().unwrap();
-            define_views(&conn, dir.path(), &hot, u64::MAX, &Default::default(), &declared).unwrap();
+            define_views(
+                &conn,
+                dir.path(),
+                &hot,
+                u64::MAX,
+                &Default::default(),
+                &declared,
+            )
+            .unwrap();
             define_nest_views(&conn, dir.path());
             let row = conn
                 .query_row(
@@ -4419,7 +4480,10 @@ template="pool"
         // No manifest on disk at all yet: both tables read as never-sealed.
         assert_eq!(
             declared_but_never_sealed(dir.path(), &declared),
-            vec!["gns__signal_minted".to_string(), "gns__grt_withdrawn".to_string()]
+            vec![
+                "gns__signal_minted".to_string(),
+                "gns__grt_withdrawn".to_string()
+            ]
         );
 
         // A real sealed segment for `gns__signal_minted` only - `gns__grt_withdrawn` still has none.
@@ -4464,7 +4528,15 @@ template="pool"
 
         let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
-        define_views(&conn, dir.path(), &empty, u64::MAX, &Default::default(), &[]).unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &empty,
+            u64::MAX,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         define_nest_views(&conn, dir.path());
 
         for v in ["ok_one", "ok_two"] {

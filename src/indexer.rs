@@ -1739,7 +1739,10 @@ pub async fn build_and_prepare_nest(
 /// told an agent it did not exist at all, and the `semantic.toml` drift check warned that a
 /// correctly-described table "has no decoder" - a warning that fires on a correct config, which
 /// teaches operators to ignore warnings.
-pub fn full_schema(registry: &DecodeRegistry, config: &Config) -> Vec<crate::registry::TableSchema> {
+pub fn full_schema(
+    registry: &DecodeRegistry,
+    config: &Config,
+) -> Vec<crate::registry::TableSchema> {
     let ts = registry.timestamps();
     let mut tables = registry.schema();
     tables.extend(crate::calls::schema(&config.calls, ts));
