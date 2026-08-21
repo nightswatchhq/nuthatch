@@ -1,0 +1,62 @@
+# yatr - https://github.com/cargopete/yatr
+#
+# Task names are the same across every nightswatchhq repo, so `yatr ci` means
+# the same thing wherever you are. Note that `ci` is deliberately not called
+# `check`: `yatr check` is a builtin that validates this file, and it shadows
+# any task of that name without warning.
+
+[env]
+RUST_BACKTRACE = "1"
+
+[settings]
+cache = true
+watch_debounce_ms = 200
+
+[tasks.fmt]
+desc = "Format the tree"
+run = ["cargo fmt --all"]
+no_cache = true
+
+[tasks.fmt-check]
+desc = "Fail if the tree is unformatted"
+run = ["cargo fmt --all -- --check"]
+sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs"]
+
+[tasks.lint]
+desc = "Clippy with warnings denied"
+run = ["cargo clippy --all-targets -- -D warnings"]
+sources = ["src/**/*.rs", "decode/**/*.rs", "Cargo.toml", "Cargo.lock"]
+
+[tasks.test]
+desc = "Run the test suite"
+run = ["cargo test"]
+sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
+watch = ["src/**/*.rs", "tests/**/*.rs"]
+
+[tasks.deny]
+desc = "cargo-deny: licences, bans, advisories, sources"
+run = ["cargo deny check"]
+sources = ["deny.toml", "Cargo.lock"]
+
+[tasks.build]
+desc = "Build the release binary"
+run = ["cargo build --release"]
+sources = ["src/**/*.rs", "decode/**/*.rs", "Cargo.toml", "Cargo.lock"]
+outputs = ["target/release/nuthatch"]
+
+[tasks.doc]
+desc = "Build the API docs"
+run = ["cargo doc --no-deps"]
+sources = ["src/**/*.rs", "decode/**/*.rs"]
+
+[tasks.fuzz-smoke]
+desc = "Short fuzz run over each target (needs a nightly toolchain)"
+run = ["cargo +nightly fuzz run abi_arbitrary -- -max_total_time=60"]
+cwd = "fuzz"
+no_cache = true
+allow_failure = true
+
+[tasks.ci]
+desc = "What CI runs: fmt-check, lint, test, deny"
+depends = ["fmt-check", "lint", "test", "deny"]
+run = []
