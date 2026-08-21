@@ -1543,9 +1543,13 @@ async fn runtime_index_loop(
                     continue;
                 }
                 chunker.too_large();
-                tracing::debug!("range {global_next}..={to} too large; shrinking and retrying");
+                tracing::debug!("range {global_next}..={to} refused; shrinking and retrying");
             }
             Err(e) => {
+                // A refusal carrying no width information - a 429 or a 403. Retrying at the same
+                // width is right: endpoint failover happens beneath this, and the growth that used
+                // to walk into an unserveable width is bounded by evidence in the chunker now
+                // (#672), so the width being retried is one the provider has already served.
                 tracing::warn!("get_logs {global_next}..={to} failed: {e:#}; retrying");
                 sleep_secs(3).await;
             }
@@ -2467,7 +2471,7 @@ pub async fn backfill_direct(
                         // H3: can't shrink a block
                     }
                     chunker.too_large();
-                    tracing::debug!("range {next}..={chunk_to} too large; shrinking and retrying");
+                    tracing::debug!("range {next}..={chunk_to} refused; shrinking and retrying");
                     continue; // retry the same `next` with a smaller window
                 }
                 Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
@@ -2577,21 +2581,47 @@ fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64>
     (s_from == from && s_to >= from && s_to < to).then_some(s_to)
 }
 
-fn fetch_logs_splitting<'a>(
-    source: &'a dyn Source,
-    filter: &'a LogFilter,
+/// [`fetch_logs_splitting`], reporting **the widest range that was actually served** alongside the
+/// logs (#672).
+///
+/// The plain version hides its own recovery: it halves a refused range until the pieces succeed and
+/// returns the merged result, so a caller cannot tell a window that worked from one that had to be
+/// cut into eight. The controller then grows on the strength of a success that never happened at that
+/// width. This hands back the evidence.
+///
+/// Implemented by threading a cell through the recursion rather than changing the return type,
+/// because the plain form has four call sites in tests that are about splitting behaviour and should
+/// stay as they are.
+async fn fetch_logs_splitting_tracked(
+    source: &dyn Source,
+    filter: &LogFilter,
     from: u64,
     to: u64,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
-{
-    // The empty-filter guard that used to stand here is gone because it moved into the type: a
-    // `LogFilter` cannot be empty on both halves, so this function can no longer be handed the request
-    // for every log on the chain. Holding the guard here was already the second attempt at it - the
-    // first lived inline in `backfill_direct` and missed this path, and this one in turn missed both
-    // tip loops (#432). The caller now decides what "nothing to ask for" means, at the point where it
-    // has the context to decide it, and the amplification risk this comment used to warn about (a
-    // capped response fanning out into a tree of retries below) is unreachable rather than guarded.
-    fetch_logs_splitting_inner(source, filter, from, to, true)
+) -> Result<(Vec<crate::rpc::Log>, u64)> {
+    let widest = std::sync::atomic::AtomicU64::new(0);
+    let logs = fetch_logs_splitting_tracking(source, filter, from, to, true, &widest).await?;
+    // Nothing served means nothing was asked for; report the full width so the caller changes nothing.
+    let w = widest.load(std::sync::atomic::Ordering::SeqCst);
+    Ok((logs, if w == 0 { to - from + 1 } else { w }))
+}
+
+/// [`fetch_logs_splitting_tracked`] with the served width discarded. **Test-only**: production
+/// takes the tracked form, because the controller has to learn what width actually came back.
+///
+/// A wrapper rather than a second recursion, deliberately. There were two near-identical copies of
+/// this walk for a while, and the speculative-split-once fault (#672) lived in exactly the half that
+/// production used and the tests did not - a window ten times over a provider's cap was halved once,
+/// the halves still refused, and the whole window failed and was retried forever.
+#[cfg(test)]
+async fn fetch_logs_splitting(
+    source: &dyn Source,
+    filter: &LogFilter,
+    from: u64,
+    to: u64,
+) -> Result<Vec<crate::rpc::Log>> {
+    fetch_logs_splitting_tracked(source, filter, from, to)
+        .await
+        .map(|(logs, _)| logs)
 }
 
 /// The body of [`fetch_logs_splitting`], plus whether a *speculative* split is still allowed for an
@@ -2611,17 +2641,21 @@ fn fetch_logs_splitting<'a>(
 /// The speculative split is deliberately **not** recursive: `speculative` is cleared for the halves, so
 /// an endpoint that is simply down produces two extra requests rather than an exponential fan-out. A
 /// genuine size failure re-triggers the *classified* path on the halves anyway, which recurses properly.
-fn fetch_logs_splitting_inner<'a>(
+fn fetch_logs_splitting_tracking<'a>(
     source: &'a dyn Source,
     filter: &'a LogFilter,
     from: u64,
     to: u64,
     speculative: bool,
+    widest: &'a std::sync::atomic::AtomicU64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
 {
     Box::pin(async move {
         match source.logs(filter, from, to).await {
-            Ok(logs) => Ok(logs),
+            Ok(logs) => {
+                widest.fetch_max(to - from + 1, std::sync::atomic::Ordering::SeqCst);
+                Ok(logs)
+            }
             Err(e) if chunker::is_result_too_large(&e) => {
                 if from >= to {
                     return Err(e).with_context(|| single_block_over_cap(from));
@@ -2633,9 +2667,11 @@ fn fetch_logs_splitting_inner<'a>(
                 let split_at =
                     suggested_split_point(&e, from, to).unwrap_or(from + (to - from) / 2);
                 let mut left =
-                    fetch_logs_splitting_inner(source, filter, from, split_at, true).await?;
+                    fetch_logs_splitting_tracking(source, filter, from, split_at, true, widest)
+                        .await?;
                 let right =
-                    fetch_logs_splitting_inner(source, filter, split_at + 1, to, true).await?;
+                    fetch_logs_splitting_tracking(source, filter, split_at + 1, to, true, widest)
+                        .await?;
                 left.extend(right);
                 Ok(left)
             }
@@ -2643,10 +2679,12 @@ fn fetch_logs_splitting_inner<'a>(
             Err(e) if speculative && from < to => {
                 let mid = from + (to - from) / 2;
                 tracing::debug!(
-                    "getLogs {from}..={to} failed unclassifiably ({e:#}); trying one speculative split"
+                    "getLogs {from}..={to} failed unclassifiably ({e:#}); splitting speculatively"
                 );
-                let left = fetch_logs_splitting_inner(source, filter, from, mid, false).await;
-                let right = fetch_logs_splitting_inner(source, filter, mid + 1, to, false).await;
+                let left =
+                    fetch_logs_splitting_tracking(source, filter, from, mid, false, widest).await;
+                let right =
+                    fetch_logs_splitting_tracking(source, filter, mid + 1, to, false, widest).await;
                 match (left, right) {
                     (Ok(mut l), Ok(r)) => {
                         tracing::info!(
@@ -2872,18 +2910,32 @@ pub async fn backfill_direct_pipelined(
             // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
             // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
             // blip) so one bad window doesn't abort the run.
+            // Non-zero only when the splitter actually had to recover (#672): the width that came
+            // back, which is narrower than the one asked for. Zero means "no signal", and the last
+            // window of a run - truncated by the end of the range rather than by the provider - must
+            // produce no signal, or every run would cap itself on its final chunk.
+            let mut served_width = 0u64;
+            let mut whole_width = 0u64;
             let logs = match &filter {
                 // Nothing to match on either half means nothing to ask for - and asking anyway is
                 // asking for every log on the chain (#432). The window still flows through the rest
                 // of the pipeline, because a `blocks` nest derives its rows from the window itself.
                 None => Vec::new(),
                 Some(f) => {
-                    retry_transient(
+                    // Tracked, so the controller learns what actually worked (#672). Without it the
+                    // window grows on a success the splitter manufactured by cutting the range up.
+                    let (logs, served) = retry_transient(
                         &format!("seal-direct getLogs {w_from}..={w_to}"),
                         BACKFILL_RETRY_BASE,
-                        || fetch_logs_splitting(source, f, w_from, w_to),
+                        || fetch_logs_splitting_tracked(source, f, w_from, w_to),
                     )
-                    .await?
+                    .await?;
+                    if served < w_to - w_from + 1 {
+                        served_width = served;
+                    } else {
+                        whole_width = served;
+                    }
+                    logs
                 }
             };
             // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
@@ -2951,7 +3003,13 @@ pub async fn backfill_direct_pipelined(
                         .map(|r| (r.block_number, r.to_json().to_string())),
                 );
             }
-            Ok::<(u64, u64, Vec<(u64, String)>), anyhow::Error>((w_to, fetched, json))
+            Ok::<(u64, u64, u64, u64, Vec<(u64, String)>), anyhow::Error>((
+                w_to,
+                fetched,
+                served_width,
+                whole_width,
+                json,
+            ))
         })
         .buffered(concurrency.max(1));
     // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
@@ -2963,12 +3021,24 @@ pub async fn backfill_direct_pipelined(
     let mut batch_from = from;
     let mut total = 0u64;
     while let Some(res) = stream.next().await {
-        let (w_to, fetched, json) = res?;
+        let (w_to, fetched, served_width, whole_width, json) = res?;
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
         // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
         // (waiting for feedback before generating the next window) is just the sequential path.
-        chunker.lock().expect("window controller").observed(fetched);
+        {
+            let mut ctl = chunker.lock().expect("window controller");
+            // Order matters: cap first, then size within the cap. `observed(0)` on an empty window
+            // grows fourfold, and doing that before the cap would let the window spend one more
+            // round asking for a width the provider has already refused (#672).
+            if whole_width > 0 {
+                ctl.served_whole(whole_width);
+            }
+            if served_width > 0 {
+                ctl.served_by_splitting(served_width);
+            }
+            ctl.observed(fetched);
+        }
         let n = json.len() as u64;
         total += n;
         buf.extend(json);
@@ -4309,9 +4379,12 @@ async fn index_loop(
                 }
                 // Provider capped the response - shrink and retry the same range immediately.
                 chunker.too_large();
-                tracing::debug!("range {next}..={to} too large; shrinking and retrying");
+                tracing::debug!("range {next}..={to} refused; shrinking and retrying");
             }
             Err(e) => {
+                // A refusal carrying no width information - a 429 or a 403. Retrying at the same width is
+                // right: endpoint failover happens beneath this, and the growth that used to walk into an
+                // unserveable width is bounded by evidence in the chunker now (#672).
                 tracing::warn!("get_logs {next}..={to} failed: {e:#}; retrying");
                 sleep_secs(3).await;
             }
@@ -9712,15 +9785,10 @@ rpc_urls = ["https://rpc.example"]
     /// The assertion is deliberately loose - it pins the *order of magnitude* of the waste, not the
     /// exact count, so ordinary retuning of the growth factor does not fail it while a return to
     /// unbounded retrying does.
-    /// **Ignored because it does not currently terminate**, which is the finding rather than a flaw
-    /// in the test. Un-ignore it with the fix for #672: it passes when the caller learns a width the
-    /// provider has refused, and hangs until then. A red test cannot be merged and a hanging one is
-    /// worse, so it is parked here in a form that can be run on demand:
-    ///
-    /// ```sh
-    /// cargo test --lib the_cost_of_a_first_run -- --ignored --nocapture
-    /// ```
-    #[ignore = "reproduces #672: the backfill never narrows below a refused width, so this hangs"]
+    /// **No longer ignored, which is the point.** It hung indefinitely when written: the splitter
+    /// recovered from a refused range silently, the controller read the merged result as a success
+    /// at the width it had asked for, grew fourfold, and did it again. It completes in hundredths of
+    /// a second now.
     #[tokio::test]
     async fn the_cost_of_a_first_run_behind_a_capped_provider_is_a_fixed_number() {
         let reg = transfer_registry();
@@ -9759,15 +9827,32 @@ rpc_urls = ["https://rpc.example"]
         eprintln!("first-run cost: served={served} refused={refused} widest_attempted={widest}");
 
         assert_eq!(rows, 2, "it must still find the logs it was looking for");
+        // **Not zero, and that is deliberate.** An earlier version of this asserted zero refusals.
+        // That is unachievable, and asking for it is a trap: a provider that refuses without saying
+        // why cannot be queried for its cap, so the only way to learn one is to be refused by it at
+        // least once. The single configuration that reaches zero is one that never grows - and never
+        // growing costs the case `the_pipelined_path_grows_its_window_across_an_empty_prefix`
+        // defends, where 200,000 empty blocks in front of a late-deployed contract are crossed
+        // cheaply *because* the window grows. Both requirements are real. Unbounded growth is the
+        // fault, not growth.
+        //
+        // The numbers are what the fix delivers rather than what would read well: 24 refusals
+        // reaching 100,000 blocks before, 4 reaching 16,000 after. Each refusal carries a backoff
+        // against a real provider, which is why that difference was 70 seconds of stall.
         assert!(
-            refused < served,
-            "more requests were refused than served ({refused} refused, {served} served) - the \
-             chunker is spending most of the run discovering a cap it already walked into"
+            refused <= 8,
+            "{refused} refusals crossing a 200k-block prefix behind a 10k cap. Discovering an \
+             unqueryable cap costs at least one, but each is a round trip that returned nothing"
         );
         assert!(
-            refused <= 12,
-            "{refused} refusals to cross a 200k-block prefix behind a 10k cap. Each one is a round \
-             trip that returned nothing, and against a real endpoint each carries a backoff"
+            refused < served,
+            "more refused ({refused}) than served ({served}) - the run is spending itself on \
+             discovery rather than on indexing"
+        );
+        assert!(
+            widest <= 20_000,
+            "asked for {widest} blocks against a 10,000-block cap - the controller grew far past \
+             anything the provider had ever served"
         );
     }
 
