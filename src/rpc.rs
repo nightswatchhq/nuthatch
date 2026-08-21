@@ -203,12 +203,12 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
 /// to fix. So the only failures excluded are the ones where retrying differently is *definitely*
 /// pointless.
 ///
-/// **Known cost, not yet addressed:** narrowing sits *outside* the retry loop in
-/// `fetch_timestamp_batch_once`, so every level pays a full `TIMESTAMP_ATTEMPTS` cycle with backoff
-/// before it splits. Converging 200 → 3 against a count-capping endpoint therefore burns ~8 retry
-/// cycles. Correct, but slow: for a failure that is *definitely* a cap, retrying at the same width
-/// first is pure waste. Splitting immediately on a definite cap and reserving retries for
-/// unclassifiable errors would fix it, and wants its own change rather than being smuggled in here.
+/// **#656:** the narrowing path's per-item error variant returns after exactly one round trip with no
+/// backoff, so the cost was sequential request count (~403 serial RTTs for a full 200→1 descent), not
+/// the retry-cycle waste the comment above originally named. `fetch_timestamp_batch` now runs the two
+/// halves of its top-level split concurrently (`tokio::try_join!`), halving the sequential depth to
+/// ~202 RTTs; levels below the top still `.await` sequentially, which bounds the concurrency burst at
+/// `TIMESTAMP_FANOUT` × 2 rather than the exponential blowup a fully-parallel tree would produce.
 fn batch_is_narrowable(err: &anyhow::Error) -> bool {
     match class_of(err) {
         // Auth and rate limits are positive findings about something other than size: splitting an
@@ -216,6 +216,22 @@ fn batch_is_narrowable(err: &anyhow::Error) -> bool {
         // limit doubles the request count in exactly the wrong direction.
         Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
         _ => true,
+    }
+}
+
+/// A short, stable token for a [`FailureClass`], for logs that get grepped rather than read.
+///
+/// `{class:?}` would do, except `RateLimited { retry_after: Some(..) }` and `Narrowable { suggested:
+/// .. }` render differently depending on what the provider volunteered, so the same class does not
+/// produce the same string twice. Issue #656 is a diagnosis that turns on counting how many times
+/// each class appeared across one backfill, and that wants a token that does not move.
+fn class_label(class: Option<&FailureClass>) -> &'static str {
+    match class {
+        Some(FailureClass::Narrowable { .. }) => "Narrowable",
+        Some(FailureClass::RateLimited { .. }) => "RateLimited",
+        Some(FailureClass::Transient) => "Transient",
+        Some(FailureClass::Terminal) => "Terminal",
+        None => "unclassified",
     }
 }
 
@@ -1075,7 +1091,7 @@ impl RpcClient {
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
             .chunks(MAX_TIMESTAMP_BATCH)
-            .map(|c| self.fetch_timestamp_batch(c, false))
+            .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
             .buffered(TIMESTAMP_FANOUT)
@@ -1181,7 +1197,7 @@ impl RpcClient {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
                 .chunks(MAX_TIMESTAMP_BATCH)
-                .map(|c| self.fetch_timestamp_batch(c, full))
+                .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
                 .buffered(HEADER_FANOUT)
@@ -1261,22 +1277,93 @@ impl RpcClient {
         &'a self,
         blocks: &'a [u64],
         full: bool,
+        // When true, the top-level split's two halves run concurrently (`tokio::try_join!`).
+        // Recursive calls pass false: one level of parallelism bounds the concurrency burst at
+        // `TIMESTAMP_FANOUT` × 2 rather than the exponential blowup a fully-parallel tree would
+        // produce. #656: a 200→1 descent is ~403 serial RTTs; one parallel split makes it ~202.
+        parallel: bool,
+    ) -> TimestampBatchFuture<'a> {
+        // The descent starts here, so this width is the one every level below reports as its origin.
+        self.fetch_timestamp_batch_from(blocks, full, blocks.len(), parallel)
+    }
+
+    /// The recursive half of [`Self::fetch_timestamp_batch`], carrying `entered_at` - the width the
+    /// *caller's* chunk started at, unchanged all the way down.
+    ///
+    /// It exists for issue #656. A backfill reported six storms of "every item in a **1**-block
+    /// `eth_getBlockByNumber` batch returned an error", and the fix depends on which of two stories
+    /// produced that line - but the line cannot tell them apart:
+    ///
+    /// - a **descent**, 200 → 100 → … → 1, which by [`batch_is_narrowable`] can only have happened if
+    ///   every level above classified as something *other* than `RateLimited`; or
+    /// - a **trailing chunk** that was one block wide to begin with, because `.chunks(200)` divides a
+    ///   block list of arbitrary length, in which case no level was classified at all and the class
+    ///   could equally have been a rate limit.
+    ///
+    /// Reading the descent backwards off the final width was the tempting shortcut and it is unsound
+    /// for exactly that second reason. So the width is carried rather than inferred, and the class is
+    /// logged at each level instead of being reconstructed afterwards.
+    fn fetch_timestamp_batch_from<'a>(
+        &'a self,
+        blocks: &'a [u64],
+        full: bool,
+        entered_at: usize,
+        parallel: bool,
     ) -> TimestampBatchFuture<'a> {
         Box::pin(async move {
-            match self.fetch_timestamp_batch_once(blocks, full).await {
+            match self
+                .fetch_timestamp_batch_once(blocks, full, entered_at)
+                .await
+            {
                 Ok(v) => Ok(v),
                 // A single block that still fails is a real failure - there is nothing left to halve,
                 // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
                 Err(e) if blocks.len() > 1 && batch_is_narrowable(&e) => {
                     let mid = blocks.len() / 2;
-                    tracing::debug!(
-                        "timestamp batch of {} too large ({e:#}); splitting",
-                        blocks.len()
-                    );
+                    let class = class_label(class_of(&e).as_ref());
+                    // The classifier's decision at *this* level, named. #656 asks which class drove
+                    // the descent, and that is answerable only if each level says so on its way past.
+                    //
+                    // **One `warn` per descent, not one per level**, and the distinction is the whole
+                    // point of #656: a descent is up to 8 levels, `TIMESTAMP_FANOUT` runs 4 chunks at
+                    // once, and a window holds thousands of chunks - so a `warn` at every level turns
+                    // one degraded endpoint into a log flood. Filing a noise complaint by making more
+                    // noise would be a poor joke. The top of the descent is the line an operator needs
+                    // (it carries the class and the width the endpoint actually refused); the levels
+                    // below it are detail for whoever turns `debug` on.
+                    if blocks.len() == entered_at {
+                        tracing::warn!(
+                            "timestamp batch narrowing from {} blocks (class={}): {e:#}",
+                            blocks.len(),
+                            class,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "timestamp batch narrowing: {} -> {} blocks (entered at {}, class={}): {e:#}",
+                            blocks.len(),
+                            mid,
+                            entered_at,
+                            class,
+                        );
+                    }
                     let (a, b) = blocks.split_at(mid);
-                    let mut out = self.fetch_timestamp_batch(a, full).await?;
-                    out.extend(self.fetch_timestamp_batch(b, full).await?);
-                    Ok(out)
+                    if parallel {
+                        let (mut out, rest) = tokio::try_join!(
+                            self.fetch_timestamp_batch_from(a, full, entered_at, false),
+                            self.fetch_timestamp_batch_from(b, full, entered_at, false),
+                        )?;
+                        out.extend(rest);
+                        Ok(out)
+                    } else {
+                        let mut out = self
+                            .fetch_timestamp_batch_from(a, full, entered_at, false)
+                            .await?;
+                        out.extend(
+                            self.fetch_timestamp_batch_from(b, full, entered_at, false)
+                                .await?,
+                        );
+                        Ok(out)
+                    }
                 }
                 Err(e) => Err(e),
             }
@@ -1287,6 +1374,7 @@ impl RpcClient {
         &self,
         blocks: &[u64],
         full: bool,
+        entered_at: usize,
     ) -> Result<HashMap<u64, Value>> {
         let batch: Vec<Value> = blocks
             .iter()
@@ -1365,13 +1453,25 @@ impl RpcClient {
         // because splitting doubles the request count in the wrong direction).
         if out.is_empty() {
             if let Some(class) = first_item_error {
+                // #656: the field report of this exact line named a width and nothing else, which left
+                // its own cause unreadable - a 1-block batch is either the floor of a descent or a
+                // trailing `.chunks(200)` remainder, and only the first says anything about the class
+                // of the levels above. Both the class and the entry width are on the line now, so the
+                // next occurrence answers the question the last one only managed to raise.
+                let descended = entered_at != blocks.len();
                 return Err(anyhow::Error::new(ClassifiedError {
-                    class,
                     detail: format!(
                         "every item in a {}-block eth_getBlockByNumber batch returned an error \
-                         (per-item, inside an HTTP 200 response)",
-                        blocks.len()
+                         (per-item, inside an HTTP 200 response; class={}, {})",
+                        blocks.len(),
+                        class_label(Some(&class)),
+                        if descended {
+                            format!("narrowed down from {entered_at}")
+                        } else {
+                            "not narrowed - this was the width requested".to_string()
+                        },
                     ),
+                    class,
                 }));
             }
         }
@@ -2352,6 +2452,139 @@ mod tests {
         );
     }
 
+    /// A per-item error server: every item of every batch comes back errored, inside an HTTP 200.
+    ///
+    /// This is the shape #656 observed in the field, and the shape `post_one` cannot see - the
+    /// transport succeeded, so the failure only exists once the items are parsed. Returns the bound
+    /// address and a counter of how many batch requests the server was asked to serve.
+    #[cfg(test)]
+    async fn per_item_error_server(
+        err_json: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1 << 20];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let items = req.matches("eth_getBlockByNumber").count();
+                    if items == 0 {
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let it: Vec<String> = (0..items)
+                        .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"error":{err_json}}}"#))
+                        .collect();
+                    let body = format!("[{}]", it.join(","));
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// **Issue #656, the question it says to answer before changing anything.**
+    ///
+    /// The field report was six storms of "every item in a **1**-block batch returned an error", and
+    /// two opposite fixes hung on which class produced it. The width alone cannot say: a 1-block batch
+    /// is either the floor of a 200 → 1 descent *or* a trailing `.chunks(200)` remainder that was one
+    /// block wide when it was handed over.
+    ///
+    /// These two runs are the discriminator, and they differ **only** in the class of the per-item
+    /// error. Under a rate limit the descent must never start, so the width reported is the width
+    /// requested; under a cap it descends and says what it descended from.
+    #[tokio::test]
+    async fn a_per_item_rate_limit_reports_its_own_width_and_never_descends() {
+        use super::RpcClient;
+        use std::sync::atomic::Ordering;
+
+        let (url, seen) = per_item_error_server(
+            r#"{"code":429,"message":"Your app has exceeded its compute units per second capacity"}"#,
+        )
+        .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let err = c
+            .block_timestamps(&(1..=8).collect::<Vec<u64>>())
+            .await
+            .expect_err("every item errored, so the batch cannot succeed");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("class=RateLimited"),
+            "the class must be on the line - naming it is the whole point of #656: {msg}"
+        );
+        assert!(
+            msg.contains("8-block") && msg.contains("not narrowed"),
+            "a rate limit must be reported at the width it was requested at, never halved: {msg}"
+        );
+        // One request, not nine: `batch_is_narrowable` refuses to split, so there is no descent at all.
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "splitting under a rate limit doubles the request count in the wrong direction"
+        );
+    }
+
+    /// The other half of the discriminator, and a measurement #656 needs in its own right.
+    ///
+    /// The note on `batch_is_narrowable` says "every level pays a full `TIMESTAMP_ATTEMPTS` cycle with
+    /// backoff before it splits". That is true of a *transport* failure, and **false of the per-item
+    /// path this test drives**: the response is an HTTP 200, so `post_with_failover` returns `Ok`, the
+    /// retry loop breaks on its first attempt, and the failure is only discovered afterwards while
+    /// parsing items. The request count below is what proves it - one per level, not four.
+    #[tokio::test]
+    async fn a_per_item_cap_descends_and_names_the_width_it_came_from() {
+        use super::RpcClient;
+        use std::sync::atomic::Ordering;
+
+        let (url, seen) = per_item_error_server(
+            r#"{"code":-32602,"message":"query returned more than 10000 results"}"#,
+        )
+        .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let err = c
+            .block_timestamps(&(1..=8).collect::<Vec<u64>>())
+            .await
+            .expect_err("every item errored at every width, so the descent bottoms out");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("class=Narrowable"),
+            "a size cap must classify as Narrowable: {msg}"
+        );
+        assert!(
+            msg.contains("1-block") && msg.contains("narrowed down from 8"),
+            "the floor of a descent must say where it descended from, so it cannot be mistaken for a \
+             trailing one-block chunk: {msg}"
+        );
+        // The top-level 8 → {4, 4} split runs its two halves concurrently (`tokio::try_join!`), so
+        // both sides of the tree are explored rather than only the leftmost path: 1 (the width-8
+        // request) + 3 each for the two width-4 halves (4 → 2 → 1 along their own leftmost path,
+        // `?` propagating from the first failing leaf below the parallel split) = 7. Still one
+        // request per level visited, not the sixteen a full `TIMESTAMP_ATTEMPTS` cycle would cost.
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            7,
+            "a per-item error costs one request per level - it never enters the retry loop"
+        );
+    }
+
     /// The exclusions are deliberate: splitting an unauthorised request yields two unauthorised
     /// requests, and splitting under a rate limit doubles the request count in the wrong direction.
     #[test]
@@ -2377,6 +2610,81 @@ mod tests {
             "Batch of more than 3 requests".into(),
         );
         assert!(batch_is_narrowable(&odd));
+    }
+
+    /// **#656, fix mechanism.** Proves the parallel top-level split actually runs the two halves
+    /// concurrently, asserting on concurrency directly rather than on wall-clock elapsed time.
+    ///
+    /// An earlier version of this test measured elapsed time against a threshold (sequential ceiling
+    /// 30ms, parallel target <21ms - a 2ms/RTT-wide margin) and reded on a loaded CI runner at
+    /// 24.18ms: a busy runner and a broken parallelisation produce the same symptom, so a stopwatch
+    /// cannot tell them apart. What the flag actually changes is **how many requests are in flight at
+    /// once**, not how long anything takes - so that is what this asserts, via a high-water-mark
+    /// counter in the mock server that is independent of scheduler speed.
+    #[tokio::test]
+    async fn parallel_top_level_split_runs_two_requests_concurrently() {
+        use super::RpcClient;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Runs one `fetch_timestamp_batch(blocks, false, parallel)` call directly - bypassing
+        // `block_timestamps`' hardcoded `true` - so both the `true` and `false` paths are exercised
+        // here rather than only the one production wires up.
+        async fn max_in_flight(parallel: bool) -> usize {
+            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            IN_FLIGHT.store(0, Ordering::SeqCst);
+            MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = l.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1 << 20];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let n_items = req.matches("eth_getBlockByNumber").count();
+                        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+                        // Widens the window a concurrent sibling request would also be in flight -
+                        // without it, two requests issued back-to-back could each complete before the
+                        // other starts, hiding genuine concurrency behind a fast round trip.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        let items: Vec<String> = (0..n_items)
+                            .map(|i| format!(
+                                r#"{{"jsonrpc":"2.0","id":{i},"error":{{"code":-32000,"message":"requested block is not available on this node"}}}}"#
+                            ))
+                            .collect();
+                        let body = format!("[{}]", items.join(","));
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+            let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+            let blocks: Vec<u64> = (1..=8).collect();
+            let _ = c.fetch_timestamp_batch(&blocks, false, parallel).await;
+            MAX_IN_FLIGHT.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            max_in_flight(true).await,
+            2,
+            "parallel=true must run the top-level split's two halves concurrently"
+        );
+        assert_eq!(
+            max_in_flight(false).await,
+            1,
+            "parallel=false must never have more than one request in flight at a time"
+        );
     }
 }
 
