@@ -32,11 +32,17 @@
 #     this context *absent* from their head commit - no check-run of this name at all. A required
 #     context that never reports is unsatisfiable and blocks the merge forever, so those merges are
 #     only possible if it was not required when they happened.
-#   - **The middle is inferred, not proven.** Every PR merged after those has this context green,
-#     so no merge demonstrates the gap directly, and the org audit log is not readable with the
-#     token this firm uses. It could in principle have been required and then removed. Nothing
-#     suggests that and nobody recalls it, but it is not measured, and this comment will not
-#     pretend otherwise.
+#   - **Not required the day before it was fixed.** #669 is the clean case. Head `7bb94b1` carried
+#     three runs of this job: `failure` at 2026-08-20T11:43:06Z, `failure` at 11:43:15Z, then one
+#     that started at 12:05:24Z and did not complete until 12:05:28Z. The PR merged at 12:05:26Z -
+#     two seconds *before* that third run finished, with both completed runs on that SHA red. No
+#     required context behaves like that. The merge did not consult this job because nothing had
+#     told it to.
+#
+# Between those points nothing is directly demonstrable - the org audit log is not readable with
+# the token this firm uses - but there is no route by which a red here could have blocked anything
+# even in principle: `main` has no `required_pull_request_reviews`, no rulesets and no CODEOWNERS,
+# so `required_status_checks.contexts` is the only automated gate there is.
 #
 # So the load-bearing artefact is not this file. It is the entry in
 # `required_status_checks.contexts` on every branch a PR can target, and it lives in GitHub's
