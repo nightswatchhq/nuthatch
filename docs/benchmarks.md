@@ -137,11 +137,20 @@ Measured before/after (same range, same RPC cost, only the storage path differs)
 | seal-direct (decode → Parquet) | same | 12,127 | 4.8 s | **~2,520** |
 
 **~8.7× faster.** The RPC portion is identical between the two (24 requests each); the difference is
-inside the storage path itself, not commit cadence - both the hot store and seal-direct commit once
-per window (`Store::commit_window`, one `begin_write`/fsync per window, not per row, since PERF-2).
-The gap is a redb B-tree point-insert per row, indexed for point-reads, versus a buffered bulk
-Parquet write. Single-run public-RPC smoke figures - noisy in absolute terms, but the storage-path
-delta is the point and is not noise. Run it yourself:
+that the hot path commits a redb transaction per row (~12k fsyncs), while seal-direct buffers and
+writes a handful of segments. Single-run public-RPC smoke figures - noisy in absolute terms, but the
+storage-path delta is the point and is not noise.
+
+**Provenance note:** this table and the pipeline table below were both measured 2026-07-16
+(`f1a57de`, `3f7c51e`), before PERF-2 (#224, 2026-07-30) changed `Store::commit_window` to one
+`begin_write`/fsync per window rather than one per row. The `289 events/sec` hot-store baseline both
+tables share was produced by a harness doing very nearly one fsync per row - the sentence above
+describes that harness accurately, not today's `commit_window`. So `8.7×`, `8.4×` and `~20×` are
+upper bounds against a now-fixed harness, not measurements against the current one-commit-per-window
+code; the real gap is a redb B-tree point-insert per row (indexed for point-reads) versus a buffered
+bulk Parquet write, but how much smaller than 8.7× that makes it hasn't been measured. Re-measurement
+against the current harness is tracked in #722 - don't quote these multipliers as current until it
+lands. Run it yourself:
 
 ```sh
 nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
@@ -155,7 +164,9 @@ The pipeline fetches `K` windows concurrently (`futures::stream::buffered`) but 
 **in block order**, so the sealed segments are byte-identical to the sequential path (asserted by
 `indexer::pipelined_backfill_matches_sequential`). Bounded in-flight windows cap RSS.
 
-Stacked measured result (USDC, same 120 blocks, public RPC, same ~24 requests):
+Stacked measured result (USDC, same 120 blocks, public RPC, same ~24 requests). Same provenance note
+as above applies: the `289` denominator predates PERF-2, so `8.4×`/`~20×` are upper bounds, not
+current measurements.
 
 | Path | events/sec | vs hot store |
 |---|---|---|
