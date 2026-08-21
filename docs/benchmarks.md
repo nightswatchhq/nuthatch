@@ -139,7 +139,20 @@ Measured before/after (same range, same RPC cost, only the storage path differs)
 **~8.7× faster.** The RPC portion is identical between the two (24 requests each); the difference is
 that the hot path commits a redb transaction per row (~12k fsyncs), while seal-direct buffers and
 writes a handful of segments. Single-run public-RPC smoke figures - noisy in absolute terms, but the
-storage-path delta is the point and is not noise. Run it yourself:
+storage-path delta is the point and is not noise.
+
+**Provenance note:** this table and the pipeline table below were both measured 2026-07-16
+(`f1a57de`, `3f7c51e`), before #224 (`0cd291e`, 2026-07-30) fixed the benchmark harness itself:
+`hot_store_backfill` wrote rows with `put_entity`, one redb write transaction and one fsync per row,
+rather than going through the `commit_window` path the indexer actually uses. (`Store::commit_window`
+had been correct in production since PERF-2, #77, 2026-07-18 - the strawman was the bench, not the
+store.) The `289 events/sec` hot-store baseline both tables share was produced by that per-row-commit
+harness - the sentence above describes it accurately, not today's `commit_window`. So `8.7×`, `8.4×`
+and `~20×` are upper bounds against a now-fixed harness, not measurements against the current
+one-commit-per-window code; the real gap is a redb B-tree point-insert per row (indexed for
+point-reads) versus a buffered bulk Parquet write, but how much smaller than 8.7× that makes it
+hasn't been measured. Re-measurement against the current harness is tracked in #722 - don't quote
+these multipliers as current until it lands. Run it yourself:
 
 ```sh
 nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
@@ -153,7 +166,9 @@ The pipeline fetches `K` windows concurrently (`futures::stream::buffered`) but 
 **in block order**, so the sealed segments are byte-identical to the sequential path (asserted by
 `indexer::pipelined_backfill_matches_sequential`). Bounded in-flight windows cap RSS.
 
-Stacked measured result (USDC, same 120 blocks, public RPC, same ~24 requests):
+Stacked measured result (USDC, same 120 blocks, public RPC, same ~24 requests). Same provenance note
+as above applies: the `289` denominator predates #224's benchmark-harness fix, so `8.4×`/`~20×` are
+upper bounds, not current measurements.
 
 | Path | events/sec | vs hot store |
 |---|---|---|
