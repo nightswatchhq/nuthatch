@@ -699,6 +699,9 @@ async fn one_run(
                 &mut children,
                 &work,
                 topic0s,
+                &[],
+                None,
+                0,
                 from,
                 to,
                 window,
@@ -719,6 +722,9 @@ async fn one_run(
                 &work,
                 addresses,
                 topic0s,
+                &[],
+                None,
+                0,
                 from,
                 to,
                 window,
@@ -733,7 +739,17 @@ async fn one_run(
         // `Pipelined`, not what production runs.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
-                &source, registry, &work, addresses, topic0s, from, to, window,
+                &source,
+                registry,
+                &work,
+                addresses,
+                topic0s,
+                &[],
+                None,
+                0,
+                from,
+                to,
+                window,
             )
             .await?
         }
