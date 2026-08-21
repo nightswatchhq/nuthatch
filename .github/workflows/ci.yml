@@ -728,13 +728,34 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: cargo install cargo-fuzz --locked
       - name: fuzz decode path (nuthatch#290)
-        # Bounded by iteration count, not wall time, so runner speed doesn't change what this
-        # actually covers run to run. Seeds under fuzz/corpus/abi_json/ are checked in - see that
-        # directory's corpus/.gitignore carve-out - so this always starts from the shapes the issue
-        # named (duplicate topic0, absurd tuple depth, a huge fixed-array size) rather than from an
-        # empty corpus RNG luck would have to rediscover on every run. `abi_arbitrary` and
-        # `decode_log` build their own inputs structurally (see the file-level docs on each target)
-        # and don't need a checked-in seed corpus to reach the same shapes.
+        # abi_json and decode_log are bounded by iteration count, not wall time: both exhaust
+        # -runs=300000 in single-digit/low-double-digit seconds on every recorded run, so runner
+        # speed doesn't change what they cover run to run. abi_arbitrary is not - it has never once
+        # reached -runs in any recorded run (nuthatch#719), so it always pays the full time budget
+        # instead, which is what made it 87-90% of this step's wall-clock despite being one of three
+        # equally-weighted targets (nuthatch#621).
+        #
+        # abi_arbitrary therefore gets its own, shorter budget rather than inheriting the other two's
+        # 180s. #621 asked whether that number could be picked without guessing - it can, and #603 is
+        # the cautionary tale for skipping the measurement: -max_total_time=60 vs 180, three runs
+        # each from a clean (checked-in-seeds-only) corpus to match CI's actual cold start, median
+        # figures:
+        #   60s:  1449 edges, 5107 features, ~3.5k execs
+        #   180s: 1462 edges, 5353 features, ~8.3k execs
+        # 60s keeps 99.1% of the edge coverage and 95.4% of the feature coverage 180s finds, for
+        # roughly a third of the wall-clock. A nightly long-run leg (the other option #621 raised)
+        # was considered and rejected: fuzz/corpus/ is never cached or committed between CI runs
+        # (only target/ is, via rust-cache below), so a longer nightly run would just rediscover the
+        # same territory from the same three checked-in seeds and bank nothing for the next PR -
+        # persisting that would need the corpus committed back, which is a CI redesign of its own and
+        # out of scope here.
+        #
+        # Seeds under fuzz/corpus/abi_json/ are checked in - see that directory's corpus/.gitignore
+        # carve-out - so this always starts from the shapes the issue named (duplicate topic0,
+        # absurd tuple depth, a huge fixed-array size) rather than from an empty corpus RNG luck
+        # would have to rediscover on every run. `abi_arbitrary` and `decode_log` build their own
+        # inputs structurally (see the file-level docs on each target) and don't need a checked-in
+        # seed corpus to reach the same shapes.
         #
         # RUSTUP_TOOLCHAIN=nightly overrides the workspace rust-toolchain.toml (which pins 1.95.0
         # for the shipped binary). Without it, cargo-fuzz's internal `cargo build` invocation runs
@@ -743,8 +764,11 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: nightly
         run: |
-          for target in abi_json abi_arbitrary decode_log; do
+          for target in abi_json decode_log; do
             echo "::group::$target"
             cargo fuzz run "$target" -- -runs=300000 -max_total_time=180 -print_final_stats=1
             echo "::endgroup::"
           done
+          echo "::group::abi_arbitrary"
+          cargo fuzz run abi_arbitrary -- -runs=300000 -max_total_time=60 -print_final_stats=1
+          echo "::endgroup::"
