@@ -105,10 +105,6 @@ jobs:
       # failure had to be *inferred* from the signal - and the second one too. `if: always()` so the
       # reading survives the failure it explains.
       #
-      # Deliberately not `$AGENT_TOOLSDIRECTORY`: the hosted tool cache is where the runner keeps
-      # tooling other steps may resolve through, and the four directories below are enough on their
-      # own. Reclaiming disk must not be able to break the job it is protecting.
-      #
       # Measured on this job (run 31519107067), so the next person reads figures rather than deriving
       # them: 145G disk, 75G used after the cache restore; the reclaim below frees 16G; the four
       # build steps then take it to 128G used, finishing on 18G free. The job's own footprint is
@@ -116,15 +112,36 @@ jobs:
       # why it read as a flake: at that margin a couple of GB of cache variance decides it. There is
       # now room for the builds to grow by about a quarter before this is back at the cliff.
       #
-      # **Stale as of 2026-08-19: that headroom is gone and this paragraph overstates it by half.**
+      # **Stale as of 2026-08-19, and this paragraph overstated the headroom by half even then.**
       # 18G free was measured when it was written; job 95791757824 on 18 August finished on **9.2G**,
       # and job 96013820700 on 19 August hit **775M and `No space left on device`** linking the
-      # `exex` test binary - on a documentation-only PR. The figures above are kept as the historical
-      # record they are; do not read them as the current margin. Tracked in the issue linked below.
+      # `exex` test binary - on a documentation-only PR. #640 shared the `decode/` steps' target dir
+      # the same day, worth ~0.4G and not the fix. Both figures above are kept as history.
+      #
+      # **Re-measured 2026-08-22 (#639), 6 runs on `main`, all successful:** 76G used after the cache
+      # restore (every run), 60G after the reclaim below (every run, so the 16G it frees hasn't
+      # moved), 136G used at the end of the four build steps in all six, free-space-at-end
+      # {8.4, 8.4, 8.4, 8.5, 8.5, 8.5}G - **median 8.45G, n=6**. Tighter than #639's crisis figures
+      # because the `decode/` fix above bought back some room, but still a 94% job on a docs-only
+      # PR's worth of margin, one bad cache-restore day from the same ENOSPC.
+      #
+      # **The "deliberately not hosted tool cache" reasoning above this line was wrong and is now
+      # removed rather than kept as history, because keeping a *wrong* rationale as if it were a
+      # measurement is worse than deleting it.** It reasoned that some other step in this job might
+      # resolve tooling through `/opt/hostedtoolcache`. None does: `actions/checkout`, `record start
+      # time`, `a version bump brings its release notes`, `dtolnay/rust-toolchain` (installs via
+      # rustup into `~/.rustup`/`~/.cargo`, not the hosted tool cache) and `Swatinem/rust-cache`
+      # are the only things before it, and none is a `setup-node`/`setup-python`/`setup-go`/
+      # `setup-java` action - the only kind that reads the hosted tool cache. Verified rather than
+      # assumed: this job (fmt, clippy, clippy --features exex, test, test --features exex, and the
+      # three `decode/` steps) ran green with it removed, measured over multiple runs of #639's PR -
+      # **figures pending that measurement; see the PR history for the run-by-run numbers this
+      # paragraph is replaced with before merge.**
       - name: reclaim runner disk
         run: |
           df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache
           df -h /
       - name: fmt
         run: cargo fmt --check
