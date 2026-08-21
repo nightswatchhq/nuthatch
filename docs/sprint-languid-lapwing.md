@@ -79,3 +79,43 @@ ask, and the recommendation comes out optimistic.
 If #657 runs long, the disposition is the same as `curatorCount` in industrious-ibis: write down what
 was established, name the next place to look, and stop. A half-answer with measurements is worth more
 than a whole one without.
+
+## Notes per issue
+
+**#657** is the headline and the only one with real design in it. The refusal is *correct* and
+stays: a seal-direct run would sail past every sampled block and seal the range with the table
+silently absent. The work is teaching the seal-direct path to resolve calls, which RFC-0038 §6e
+already names as the follow-up.
+
+**#663** is order-dependent. The day that event first fires, the view starts working, and nothing in
+the logs explains either state. Whatever the fix is, the logs must explain it.
+
+**#670** - #669 already fixed the large half of #644. What remains is that `doctor` derives *one*
+address from the first declared contract while a real backfill filters on all of them, so the advice
+comes out optimistic.
+
+## Standing rules
+
+These are not new, and they are here because a sprint brief is where they get read.
+
+- Work discovered during the sprint is **filed as an issue for the board, not picked up**. Pulling
+  anything into scope needs board approval.
+- **One worktree per run**, not per agent. Two agents in one tree has destroyed work twice.
+- **Never `git add -A`.** Stage explicit paths, and diff `main...HEAD` before opening a PR.
+- Every PR needs a `Reviewed-by:` line **in the PR body**, from a name on `.github/reviewers.txt`. A
+  prose verdict in a comment does not count - the audit greps the body.
+- **Do not `@`-mention Rowan in GitHub markdown.** It auto-links to an unrelated real user who has
+  asked us to stop. Name the agent without the `@`.
+- `CFLAGS=-std=gnu17` for every cargo build on the Linux box: GCC 15 against the vendored mimalloc
+  that dbsp pulls in. CI cannot catch this.
+- `main` is protected - strict up-to-date plus ten required contexts - so it is **one merge per CI
+  cycle**, and each merge invalidates the rest. Plan the landing order.
+- **A green mutation is a finding.** If a test survives having the thing it tests removed, that is
+  the bug, and it is worth an issue.
+
+## Context at filing
+
+v2.6.3 shipped on 2026-08-21: the first run on mainnet stopped stalling. kindly-kestrel closed four
+of four. The website, `llms.txt` and `llms-full.txt` were brought current the same morning -
+`llms.txt` had been telling agents to run `nuthatch roost`, a command removed in 2.0, for five
+releases.
