@@ -54,7 +54,10 @@ fn a_bare_invocation_is_still_an_error_on_stderr() {
     let (hcode, hout, herr) = run(&["--help"]);
     assert_eq!(hcode, 0, "asking for help succeeds");
     assert!(!hout.is_empty(), "help goes to stdout");
-    assert!(herr.is_empty(), "help writes nothing to stderr, got {herr:?}");
+    assert!(
+        herr.is_empty(),
+        "help writes nothing to stderr, got {herr:?}"
+    );
 }
 
 /// #695. A warning during `init` must arrive in `init`'s idiom, not in log format.
@@ -71,7 +74,12 @@ fn a_bare_invocation_is_still_an_error_on_stderr() {
 fn a_log_line_during_init_arrives_in_inits_own_idiom() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
-        .args(["init", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "--chain", "mainnet"])
+        .args([
+            "init",
+            "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+            "--chain",
+            "mainnet",
+        ])
         .current_dir(dir.path())
         .env("RUST_LOG", "nuthatch=debug")
         .output()
@@ -121,7 +129,12 @@ fn a_log_line_during_init_arrives_in_inits_own_idiom() {
 fn init_prints_the_abi_resolved_tick_and_not_only_formats_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
-        .args(["init", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "--chain", "mainnet"])
+        .args([
+            "init",
+            "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+            "--chain",
+            "mainnet",
+        ])
         .current_dir(dir.path())
         .output()
         .expect("run init");
