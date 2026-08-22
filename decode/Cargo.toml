@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch-decode"
-version = "2.6.3"
+version = "2.7.0"
 edition = "2021"
 rust-version = "1.95"
 description = "ABI-driven, deterministic event decode for nuthatch - no dbsp dependency."
