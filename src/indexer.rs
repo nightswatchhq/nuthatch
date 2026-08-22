@@ -1830,10 +1830,21 @@ async fn build_nest(
     // dataset reached `data/<nid>` through `migrate` or a verified bundle, so its artifacts were
     // consistent when its identity was computed; if they later are not, that is drift, and
     // `MountTable::identity_drift` is what reports it.
+    //
+    // `info!`, not `debug!` (#727): this fires on every start of every identity-keyed nest, and it is
+    // the *only* explanation an operator ever gets for why a hand-edited `nuthatch.toml` did not move
+    // `schema.json` - at `debug!` it was invisible at the default `nuthatch=info`, which is very likely
+    // how the Lodestar GNS nest's `schema.json` fell behind in the first place. Not `warn!` either:
+    // this is the correct, expected state on every such start, and a `warn!` on the normal path trains
+    // operators to ignore warnings. `nuthatch schema --dir <dir>` is the verified recovery - `regen`
+    // (`project::regen`) writes the derived artifacts unconditionally, with no identity check of its
+    // own, so it applies here exactly as it would to an authored nest.
     if crate::runtime::MountTable::is_identity_keyed(&dir) {
-        tracing::debug!(
+        tracing::info!(
             "identity-keyed dataset: leaving derived artifacts alone (rewriting them would move the \
-             NID its mount record claims)"
+             NID its mount record claims). Hand-edited nuthatch.toml? Run `nuthatch schema --dir {}` \
+             to regenerate schema.json/llms.txt/.claude/skills explicitly.",
+            dir.display()
         );
     } else {
         match crate::project::refresh_stale_artifacts(&dir, config) {
@@ -2436,8 +2447,12 @@ async fn fetch_timestamps(
 ///
 /// Mirrors the tier-3 resolution in `process_window` exactly so the sealed rows are identical
 /// regardless of which path produced them. Returns an empty vec when `calls` is empty.
+///
+/// `pub(crate)` for `bench.rs`, whose hot-store arm is a private reimplementation of this loop and
+/// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
+/// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_calls_for_window(
+pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
     state_rpc: &crate::rpc::RpcClient,
@@ -3295,7 +3310,9 @@ pub async fn backfill_direct_factory(
     } else {
         AdaptiveWindow::for_window(window)
     };
-    while next <= to {
+    // Labelled because the two-pass body below has to be able to restart the *chunk* from inside the
+    // pass-2 fixpoint loop when the provider refuses an over-large response.
+    'chunk: while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
 
         // Filter flip (RFC-0009 §4): a forced override or a discovered set past the threshold switches
@@ -3398,10 +3415,39 @@ pub async fn backfill_direct_factory(
                 // the every-log-on-the-chain request that `LogFilter` refuses to build.
                 let child_filter = LogFilter::new(&new, topic0s)
                     .expect("child filter has a non-empty address list");
-                let more =
-                    logs_with_retry(source, &child_filter, next, chunk_to, BACKFILL_RETRY_BASE)
-                        .await
-                        .with_context(|| format!("getLogs (children) {next}..={chunk_to}"))?;
+                let more = match logs_with_retry(
+                    source,
+                    &child_filter,
+                    next,
+                    chunk_to,
+                    BACKFILL_RETRY_BASE,
+                )
+                .await
+                {
+                    Ok(l) => l,
+                    // The same provider refusal pass 1 already shrinks for. Pass 2 asks a *harder*
+                    // question than pass 1 - the children discovered in this very chunk are the
+                    // busiest ones, freshly created and trading - so it is the pass more likely to
+                    // blow a response cap, and it was the only one of the nine sites in this file
+                    // that treated the cap as fatal. Measured on `uniswap-v2` mainnet: pass 1
+                    // succeeded at a 19,936-block window and pass 2 died on it.
+                    //
+                    // Restarting the chunk is safe rather than merely convenient: `fetched` is
+                    // rebuilt per iteration, and a child already registered by pass 1's decode stays
+                    // registered. A child cannot emit before the block that created it, so carrying
+                    // it into a narrower window that ends before its creation costs nothing.
+                    Err(e) if chunker::is_result_too_large(&e) => {
+                        if next >= chunk_to {
+                            return Err(e).with_context(|| single_block_over_cap(next));
+                        }
+                        chunker.too_large();
+                        continue 'chunk;
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("getLogs (children) {next}..={chunk_to}"));
+                    }
+                };
                 let _ = decode_window(registry, Some(factory), children, &more, &empty_ts);
                 all_logs.extend(more);
             }
@@ -5860,6 +5906,194 @@ template="pool"
         let row =
             crate::analytics::query(dir.path(), r#"SELECT address FROM "pool__swap""#).unwrap();
         assert_eq!(row[0]["address"], serde_json::Value::from(pool_addr));
+    }
+
+    /// Pass 2 must shrink the window on a provider response cap, exactly as pass 1 already does.
+    ///
+    /// Found in the field, not by reading: `uniswap-v2` on mainnet died with
+    /// `getLogs (children) 25791463..=25811399: Log response size exceeded`. Pass 1 had *succeeded*
+    /// at that same 19,936-block window, because its filter is the factory plus already-known
+    /// children; pass 2 asks the harder question - the children born in this chunk, which are the
+    /// freshly-created and therefore busiest ones - and it carried a bare `?` where every other
+    /// cap-handling site in this file shrinks and retries.
+    ///
+    /// The source below refuses any child-filtered request wider than 8 blocks and answers narrower
+    /// ones, so a run that cannot shrink pass 2 cannot finish. Before the fix this returned
+    /// `Err(Log response size exceeded)`.
+    #[tokio::test]
+    async fn pass_two_shrinks_the_window_on_a_provider_cap() {
+        use crate::registry::{ContractSpec, DecodeRegistry, TemplateSpec};
+        use crate::rpc::Log;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+
+        /// Answers pass 1 at any width, refuses pass 2 above `max_child_width`.
+        struct CappedChildSource {
+            logs: Vec<Log>,
+            factory: String,
+            max_child_width: u64,
+            refusals: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Source for CappedChildSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<Log>> {
+                let addrs = filter.addresses();
+                let allow: std::collections::HashSet<String> =
+                    addrs.iter().map(|a| a.to_ascii_lowercase()).collect();
+                // Pass 2 is the request that does *not* carry the factory: it asks only about the
+                // children discovered in this chunk.
+                let is_child_pass =
+                    !allow.is_empty() && !allow.contains(&self.factory.to_ascii_lowercase());
+                if is_child_pass && to.saturating_sub(from) + 1 > self.max_child_width {
+                    self.refusals.fetch_add(1, Ordering::SeqCst);
+                    // Alchemy's wording, which `chunker::is_result_too_large` matches on
+                    // ("response size") via the textual fallback for non-RpcClient sources.
+                    anyhow::bail!("Log response size exceeded for {from}..={to}");
+                }
+                Ok(self
+                    .logs
+                    .iter()
+                    .filter(|l| l.block_number >= from && l.block_number <= to)
+                    .filter(|l| allow.is_empty() || allow.contains(&l.address.to_ascii_lowercase()))
+                    .cloned()
+                    .collect())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+
+        let reg = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: factory_addr.parse().unwrap(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "pool".into(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    reg.tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+
+        let source = CappedChildSource {
+            factory: factory_addr.into(),
+            max_child_width: 8,
+            refusals: AtomicUsize::new(0),
+            logs: vec![
+                Log {
+                    address: factory_addr.into(),
+                    topics: vec![topic0("factory__pool_created")],
+                    data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+                    block_number: 2,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt1".into(),
+                    log_index: 0,
+                },
+                Log {
+                    address: pool_addr.into(),
+                    topics: vec![topic0("pool__swap")],
+                    data: format!("0x{:064x}", 7u64),
+                    block_number: 5,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt2".into(),
+                    log_index: 0,
+                },
+            ],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &reg,
+            &fs,
+            &mut children,
+            dir.path(),
+            &[],
+            &[],
+            None,
+            0,
+            0,
+            40,
+            64,
+            false,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .expect("pass 2 must shrink and finish, not abort");
+
+        assert!(
+            source.refusals.load(Ordering::SeqCst) > 0,
+            "the cap never fired - the test proves nothing unless pass 2 was actually refused"
+        );
+        assert_eq!(
+            sealed, 2,
+            "the factory event and the child's swap both sealed despite the cap"
+        );
+        assert!(
+            children.contains(pool_addr),
+            "the pool was still discovered"
+        );
     }
 
     /// RFC-0009 step 3a: the factory backfill is **deterministic** - the same range over the same
@@ -10935,6 +11169,142 @@ template="pool"
         assert!(
             msg.contains(&table),
             "the error must name the table that could not be read, got: {msg}"
+        );
+    }
+
+    /// #727: the identity-keyed skip logged at `debug!`, invisible at the default `nuthatch=info` an
+    /// operator actually runs with - so hand-editing `nuthatch.toml` under a `data/<nid>` dataset and
+    /// restarting explained nothing about why `schema.json` did not move. Likely how the Lodestar GNS
+    /// nest's `schema.json` fell behind in the first place.
+    ///
+    /// Alternates both arms in one test, captured at the default level, so a regression back to
+    /// `debug!` fails it: an authored, mutable-keyed nest must *not* emit this line (it refreshes
+    /// instead, via `refresh_stale_artifacts`), and an identity-keyed dataset must, at `info!`. An
+    /// absence test on only one arm would pass just as happily with the mechanism deleted outright;
+    /// asserting presence alone would pass just as happily left at `debug!` if the capture were not
+    /// pinned to the default filter.
+    ///
+    /// The identity-keyed dir is the real path, not a hand-built stand-in: a nest is hashed with
+    /// `blob::nest_nid` and moved to `data/<that nid>` - the exact shape `migrate` produces and
+    /// `MountTable::is_identity_keyed` checks in production.
+    #[tokio::test]
+    async fn identity_keyed_skip_logs_at_info_not_debug() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn write_minimal_nest(dir: &std::path::Path, name: &str) {
+            std::fs::create_dir_all(dir.join("abis")).unwrap();
+            std::fs::write(
+                dir.join(crate::config::CONFIG_FILE),
+                format!(
+                    "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                     rpc_urls = []\n\n[[contracts]]\nalias = \"t\"\n\
+                     address = \"0x0000000000000000000000000000000000000001\"\nabi = \"abis/t.json\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("abis/t.json"),
+                r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+            )
+            .unwrap();
+        }
+
+        async fn build(dir: &std::path::Path) {
+            let config = Config::load(dir).unwrap();
+            let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+            let (_nest, _state, worker, _w) =
+                build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                    .await
+                    .unwrap();
+            if let Some(w) = worker {
+                w.abort();
+            }
+        }
+
+        // Same capture shape as `analytics.rs`'s `CapturedLogs`: `tracing`'s per-callsite `Interest`
+        // is a global, process-wide cache, so a positive assertion here is only trustworthy because
+        // this test is the *only* place in the suite that ever builds a `data/<nid>`-shaped dir through
+        // `build_nest` - nothing else can have reached this call site first with no subscriber
+        // installed and cached it uninterested.
+        #[derive(Clone, Default)]
+        struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl CapturedLogs {
+            fn mentioning(&self, needle: &str) -> usize {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.contains(needle))
+                    .count()
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        _f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        const SKIP: &str = "identity-keyed dataset: leaving derived artifacts alone";
+
+        let captured = CapturedLogs::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(captured.clone()),
+        );
+
+        // Arm 1: an authored, mutable-keyed nest - a plain temp dir, nothing shaped like `data/<64-hex>`.
+        let mutable = tempfile::tempdir().unwrap();
+        write_minimal_nest(mutable.path(), "m");
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            build(mutable.path()).await;
+        }
+        assert_eq!(
+            captured.mentioning(SKIP),
+            0,
+            "an authored, mutable-keyed nest refreshes its derived artifacts directly - it must never \
+             log the identity-keyed skip"
+        );
+
+        // Arm 2: the same shape of nest, moved to the identity it genuinely hashes to.
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        write_minimal_nest(&staging, "id");
+        let nid = crate::blob::nest_nid(&staging).unwrap();
+        let identity_dir = crate::runtime::MountTable::data_dir(root.path(), &nid);
+        std::fs::create_dir_all(identity_dir.parent().unwrap()).unwrap();
+        std::fs::rename(&staging, &identity_dir).unwrap();
+        assert!(
+            crate::runtime::MountTable::is_identity_keyed(&identity_dir),
+            "fixture must actually be shaped like data/<nid>, or this test proves nothing"
+        );
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            build(&identity_dir).await;
+        }
+        assert_eq!(
+            captured.mentioning(SKIP),
+            1,
+            "an identity-keyed dataset must log the skip at the default level - #727: this fired only \
+             at debug! before, invisible under the default `nuthatch=info` filter this test pins to"
         );
     }
 }
