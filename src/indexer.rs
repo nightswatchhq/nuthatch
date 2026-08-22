@@ -2476,6 +2476,20 @@ async fn resolve_calls_for_window(
     }
 
     let capacity = crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+    // One batched header fetch for every block this window's calls touch (#720), rather than a
+    // sequential single-block `block_hash` per block below. The blocks' timestamps already came
+    // from a batched fetch (`fetch_timestamps`, above the caller); the hash was the one field still
+    // paying an unbatched round trip per sampled block.
+    let wanted_blocks: Vec<u64> = wanted.keys().copied().collect();
+    let headers = retry_transient(
+        &format!(
+            "seal-direct block headers for {} block(s)",
+            wanted_blocks.len()
+        ),
+        BACKFILL_RETRY_BASE,
+        || async { source.block_headers(&wanted_blocks).await },
+    )
+    .await?;
     let mut out: Vec<crate::registry::DecodedRow> = Vec::new();
     for (block, mut items) in wanted {
         let mut seen = std::collections::HashSet::new();
@@ -2500,13 +2514,12 @@ async fn resolve_calls_for_window(
             || async { crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await },
         )
         .await?;
-        let hash = retry_transient(
-            &format!("seal-direct block hash for {block}"),
-            BACKFILL_RETRY_BASE,
-            || async { source.block_hash(block).await },
-        )
-        .await?
-        .unwrap_or_default();
+        let hash = headers
+            .get(&block)
+            .and_then(|h| h.get("hash"))
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
         let ts = timestamps.get(&block).copied().unwrap_or(0);
         for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
             out.push(r.to_row(&calls[*i].name, slot, &hash, ts, with_timestamps));
@@ -4274,6 +4287,17 @@ impl NestIngest {
 
             let capacity =
                 crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+            // One batched header fetch for every block this window's calls touch (#720), rather
+            // than a sequential single-block `block_hash` per block below. `timestamps` above
+            // already came from a batched fetch; the hash was the one field still paying an
+            // unbatched round trip per sampled block.
+            let wanted_blocks: Vec<u64> = wanted.keys().copied().collect();
+            let headers = retry_transient(
+                &format!("block headers for {} block(s)", wanted_blocks.len()),
+                BACKFILL_RETRY_BASE,
+                || async { source.block_headers(&wanted_blocks).await },
+            )
+            .await?;
             for (block, mut items) in wanted {
                 // `CallKey` is a content address, so N rows asking the same question of the same
                 // contract at the same block are one call and one row. Dedupe before the RPC, not
@@ -4315,13 +4339,12 @@ impl NestIngest {
                     },
                 )
                 .await?;
-                let hash = retry_transient(
-                    &format!("block hash for {block}"),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_hash(block).await },
-                )
-                .await?
-                .unwrap_or_default();
+                let hash = headers
+                    .get(&block)
+                    .and_then(|h| h.get("hash"))
+                    .and_then(|h| h.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let ts = timestamps.get(&block).copied().unwrap_or(0);
                 for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
                     let row = r.to_row(
@@ -8211,6 +8234,381 @@ template = "pool"
         drop(nest);
         drop(state);
         handle.abort();
+    }
+
+    /// Counts hash-fetch round trips the tier-3 `[[calls]]` resolution makes: `block_hash` (the
+    /// unbatched, single-block call #720 found) versus `block_headers` (the batched call it should
+    /// use instead, since the same blocks' timestamps already came from a batched fetch a few lines
+    /// above the calls-resolution loop).
+    struct CallHashCountingSource {
+        block_hash_calls: std::sync::atomic::AtomicUsize,
+        block_headers_calls: std::sync::atomic::AtomicUsize,
+        block_headers_blocks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CallHashCountingSource {
+        fn new() -> CallHashCountingSource {
+            CallHashCountingSource {
+                block_hash_calls: std::sync::atomic::AtomicUsize::new(0),
+                block_headers_calls: std::sync::atomic::AtomicUsize::new(0),
+                block_headers_blocks: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for CallHashCountingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(3)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            self.block_hash_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("0xbh".into()))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            self.block_headers_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.block_headers_blocks
+                .fetch_add(blocks.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(blocks
+                .iter()
+                .map(|&b| (b, serde_json::json!({"hash": format!("0x{b:064x}")})))
+                .collect())
+        }
+    }
+
+    /// #720: tier-3 `[[calls]]` resolution fetched each sampled block's hash with its own unbatched
+    /// `block_hash` round trip, even though the same blocks' timestamps had just come from a batched
+    /// fetch a few lines above. Proven on request shape rather than the clock - a wall-clock
+    /// assertion in this suite has never been reliably green in CI (#736) - so this counts round
+    /// trips instead, on the enforcing surface: delete the batched `block_headers` call and this
+    /// reds because `block_hash_calls` stops being 1.
+    ///
+    /// The floor is 1, not 0: every window - `[[calls]]` or not - fetches the window boundary's
+    /// hash once for the reorg checkpoint (`src/indexer.rs`, the `block_hash(to)` call after
+    /// screening). Confirmed against the pre-fix code before writing this assertion: it reported 4,
+    /// the checkpoint's 1 plus one unbatched call per sampled block (three, for `every = 1` over
+    /// blocks 1..=3) - proving the defect was reachable through the real constructor before fixing
+    /// it, not just reasoned about.
+    #[tokio::test]
+    async fn tier3_calls_hash_fetch_is_batched_not_per_block() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let counting = std::sync::Arc::new(CallHashCountingSource::new());
+        let source: Arc<dyn Source> = counting.clone();
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a calls nest with a state RPC must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        // `every = 1` over blocks 1..=3 samples all three, so a per-block hash fetch would be three
+        // `block_hash` round trips; a batched one is a single `block_headers` call for all three.
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+        handle.abort();
+
+        assert_eq!(
+            counting
+                .block_hash_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "tier-3 calls resolution must not fetch any block's hash with the unbatched, \
+             single-block call - the one remaining call is the window's own reorg-checkpoint \
+             hash, unrelated to [[calls]], not a per-sampled-block fetch"
+        );
+        assert_eq!(
+            counting
+                .block_headers_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the three sampled blocks' hashes must come from one batched call, not three"
+        );
+        assert_eq!(
+            counting
+                .block_headers_blocks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the batched call must cover all three sampled blocks"
+        );
+    }
+
+    /// Wraps [`CallHashCountingSource`] for the seal-direct test only, overriding `tip`/`finalized`
+    /// so `prepare`'s cold-start math actually seals the range under test. The hot-path tests above
+    /// rely on the inner source's `finalized() -> None` (Arbitrum's 1800-block fallback depth) to
+    /// keep `maybe_seal` a no-op, so rows stay visible in the hot store for their own assertions -
+    /// giving the inner source real finality would silently seal those rows out from under them.
+    struct SealDirectSource(std::sync::Arc<CallHashCountingSource>);
+
+    #[async_trait::async_trait]
+    impl Source for SealDirectSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(5)
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            Ok(Some(5))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.0.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.0.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.0.block_timestamps(blocks).await
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            self.0.block_headers(blocks).await
+        }
+    }
+
+    /// NIG-325 review probe (not part of #720's own PR): #720's own request-count test only drives
+    /// `process_window` (the streaming hot path). The PR's own body says `resolve_calls_for_window`
+    /// - the seal-direct / backfill_direct / factory path - got the identical batching change, but
+    /// no test in the PR counts requests on *that* path. This does, via seal-direct's own
+    /// `nest.prepare(..., seal_direct=true, ...)` entry point.
+    #[tokio::test]
+    async fn tier3_seal_direct_calls_hash_fetch_is_batched_not_per_block() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let counting = std::sync::Arc::new(CallHashCountingSource::new());
+        let source: Arc<dyn Source> = std::sync::Arc::new(SealDirectSource(counting.clone()));
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct (`cold_start_block`);
+        // `every = 1` samples all five.
+        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        assert!(
+            result.is_ok(),
+            "seal-direct with calls must succeed: {result:?}"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
+
+        let hash_calls = counting
+            .block_hash_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let headers_calls = counting
+            .block_headers_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let headers_blocks = counting
+            .block_headers_blocks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "seal-direct over 5 blocks: block_hash_calls={hash_calls} block_headers_calls={headers_calls} block_headers_blocks={headers_blocks}"
+        );
+        assert!(
+            hash_calls <= headers_calls.max(1) + 1,
+            "seal-direct's calls resolution should not be issuing an unbatched block_hash per \
+             sampled block: block_hash_calls={hash_calls}, block_headers_calls={headers_calls} \
+             (5 sampled blocks would mean 5 unbatched calls pre-fix)"
+        );
+        assert!(
+            headers_blocks >= 5,
+            "the batched header call(s) must cover all 5 sampled blocks, covered only {headers_blocks}"
+        );
+    }
+
+    /// NIG-325 review probe (not part of #720's own PR): the mapping test below
+    /// (`tier3_calls_stored_hash_matches_its_own_sampled_block`) only drives `process_window`, the
+    /// hot-path fold - it cannot see a misindexed batched header map on the seal-direct path
+    /// (`resolve_calls_for_window`), which got the identical change. This drives seal-direct instead
+    /// and reads the sealed Parquet (`sealed_columns`, defined further down this module) rather than
+    /// the hot store, since a seal-direct backfill never writes through redb at all.
+    #[tokio::test]
+    async fn tier3_seal_direct_calls_stored_hash_matches_its_own_sampled_block() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let counting = std::sync::Arc::new(CallHashCountingSource::new());
+        let source: Arc<dyn Source> = std::sync::Arc::new(SealDirectSource(counting.clone()));
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct; `every = 1` samples
+        // all five, so the sealed segment owes five `oracle_answer` rows.
+        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        assert!(
+            result.is_ok(),
+            "seal-direct with calls must succeed: {result:?}"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
+
+        let cols = sealed_columns(dir.path());
+        let blocks = cols
+            .get("block_number")
+            .expect("sealed oracle_answer rows must carry block_number");
+        let hashes = cols
+            .get("block_hash")
+            .expect("sealed oracle_answer rows must carry block_hash");
+        assert_eq!(
+            blocks.len(),
+            hashes.len(),
+            "block_number and block_hash must be the same length"
+        );
+        assert_eq!(
+            blocks.len(),
+            5,
+            "every = 1 over blocks 1-5 owes five sealed rows: {blocks:?}"
+        );
+        // `sealed_columns` formats each cell as `format!("{:?}", array_value_to_string(...))`, i.e.
+        // `Ok("1")` / `Ok("0x00..01")` - strip that wrapper rather than assume a bare value.
+        let unwrap_cell = |s: &str| -> String {
+            s.strip_prefix("Ok(\"")
+                .and_then(|s| s.strip_suffix("\")"))
+                .unwrap_or_else(|| panic!("unexpected sealed cell format: {s}"))
+                .to_string()
+        };
+        for (b, h) in blocks.iter().zip(hashes) {
+            let block: u64 = unwrap_cell(b)
+                .parse()
+                .unwrap_or_else(|_| panic!("block_number {b} did not parse as u64"));
+            let expected_hash = format!("0x{block:064x}");
+            assert_eq!(
+                unwrap_cell(h),
+                expected_hash,
+                "sealed row for block {block} carries a hash belonging to a different block \
+                 (block_number column: {blocks:?}, block_hash column: {hashes:?})"
+            );
+        }
+    }
+
+    /// NIG-325 review probe (not part of #720's own PR): the count-based test above cannot tell a
+    /// correct block->hash mapping from a shuffled one, because `CallHashCountingSource` never
+    /// checks which hash landed on which row. This does: `CallHashCountingSource::block_headers`
+    /// already returns a *distinct* hash per block (`0x{b:064x}`), so if the batched map were ever
+    /// misindexed - a neighbouring block's hash landing on this block's row - it would show up here.
+    #[tokio::test]
+    async fn tier3_calls_stored_hash_matches_its_own_sampled_block() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let counting = std::sync::Arc::new(CallHashCountingSource::new());
+        let source: Arc<dyn Source> = counting.clone();
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a calls nest with a state RPC must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+        handle.abort();
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let keys = store.entity_keys().unwrap();
+        assert_eq!(keys.len(), 3, "every = 1 over blocks 1-3 owes three rows");
+        for key in &keys {
+            let row: serde_json::Value =
+                serde_json::from_str(&store.get_entity(key).unwrap().unwrap()).unwrap();
+            let block = row["block_number"].as_u64().unwrap();
+            let expected = format!("0x{block:064x}");
+            assert_eq!(
+                row["block_hash"], expected,
+                "row for block {block} carries a hash belonging to a different block: {row}"
+            );
+        }
     }
 
     /// A stub IPFS gateway serving one fixed body for any path.
