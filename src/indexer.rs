@@ -1830,10 +1830,21 @@ async fn build_nest(
     // dataset reached `data/<nid>` through `migrate` or a verified bundle, so its artifacts were
     // consistent when its identity was computed; if they later are not, that is drift, and
     // `MountTable::identity_drift` is what reports it.
+    //
+    // `info!`, not `debug!` (#727): this fires on every start of every identity-keyed nest, and it is
+    // the *only* explanation an operator ever gets for why a hand-edited `nuthatch.toml` did not move
+    // `schema.json` - at `debug!` it was invisible at the default `nuthatch=info`, which is very likely
+    // how the Lodestar GNS nest's `schema.json` fell behind in the first place. Not `warn!` either:
+    // this is the correct, expected state on every such start, and a `warn!` on the normal path trains
+    // operators to ignore warnings. `nuthatch schema --dir <dir>` is the verified recovery - `regen`
+    // (`project::regen`) writes the derived artifacts unconditionally, with no identity check of its
+    // own, so it applies here exactly as it would to an authored nest.
     if crate::runtime::MountTable::is_identity_keyed(&dir) {
-        tracing::debug!(
+        tracing::info!(
             "identity-keyed dataset: leaving derived artifacts alone (rewriting them would move the \
-             NID its mount record claims)"
+             NID its mount record claims). Hand-edited nuthatch.toml? Run `nuthatch schema --dir {}` \
+             to regenerate schema.json/llms.txt/.claude/skills explicitly.",
+            dir.display()
         );
     } else {
         match crate::project::refresh_stale_artifacts(&dir, config) {
@@ -10913,6 +10924,142 @@ template="pool"
         assert!(
             msg.contains(&table),
             "the error must name the table that could not be read, got: {msg}"
+        );
+    }
+
+    /// #727: the identity-keyed skip logged at `debug!`, invisible at the default `nuthatch=info` an
+    /// operator actually runs with - so hand-editing `nuthatch.toml` under a `data/<nid>` dataset and
+    /// restarting explained nothing about why `schema.json` did not move. Likely how the Lodestar GNS
+    /// nest's `schema.json` fell behind in the first place.
+    ///
+    /// Alternates both arms in one test, captured at the default level, so a regression back to
+    /// `debug!` fails it: an authored, mutable-keyed nest must *not* emit this line (it refreshes
+    /// instead, via `refresh_stale_artifacts`), and an identity-keyed dataset must, at `info!`. An
+    /// absence test on only one arm would pass just as happily with the mechanism deleted outright;
+    /// asserting presence alone would pass just as happily left at `debug!` if the capture were not
+    /// pinned to the default filter.
+    ///
+    /// The identity-keyed dir is the real path, not a hand-built stand-in: a nest is hashed with
+    /// `blob::nest_nid` and moved to `data/<that nid>` - the exact shape `migrate` produces and
+    /// `MountTable::is_identity_keyed` checks in production.
+    #[tokio::test]
+    async fn identity_keyed_skip_logs_at_info_not_debug() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn write_minimal_nest(dir: &std::path::Path, name: &str) {
+            std::fs::create_dir_all(dir.join("abis")).unwrap();
+            std::fs::write(
+                dir.join(crate::config::CONFIG_FILE),
+                format!(
+                    "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                     rpc_urls = []\n\n[[contracts]]\nalias = \"t\"\n\
+                     address = \"0x0000000000000000000000000000000000000001\"\nabi = \"abis/t.json\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("abis/t.json"),
+                r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+            )
+            .unwrap();
+        }
+
+        async fn build(dir: &std::path::Path) {
+            let config = Config::load(dir).unwrap();
+            let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+            let (_nest, _state, worker, _w) =
+                build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
+                    .await
+                    .unwrap();
+            if let Some(w) = worker {
+                w.abort();
+            }
+        }
+
+        // Same capture shape as `analytics.rs`'s `CapturedLogs`: `tracing`'s per-callsite `Interest`
+        // is a global, process-wide cache, so a positive assertion here is only trustworthy because
+        // this test is the *only* place in the suite that ever builds a `data/<nid>`-shaped dir through
+        // `build_nest` - nothing else can have reached this call site first with no subscriber
+        // installed and cached it uninterested.
+        #[derive(Clone, Default)]
+        struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl CapturedLogs {
+            fn mentioning(&self, needle: &str) -> usize {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.contains(needle))
+                    .count()
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        _f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        const SKIP: &str = "identity-keyed dataset: leaving derived artifacts alone";
+
+        let captured = CapturedLogs::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(captured.clone()),
+        );
+
+        // Arm 1: an authored, mutable-keyed nest - a plain temp dir, nothing shaped like `data/<64-hex>`.
+        let mutable = tempfile::tempdir().unwrap();
+        write_minimal_nest(mutable.path(), "m");
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            build(mutable.path()).await;
+        }
+        assert_eq!(
+            captured.mentioning(SKIP),
+            0,
+            "an authored, mutable-keyed nest refreshes its derived artifacts directly - it must never \
+             log the identity-keyed skip"
+        );
+
+        // Arm 2: the same shape of nest, moved to the identity it genuinely hashes to.
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        write_minimal_nest(&staging, "id");
+        let nid = crate::blob::nest_nid(&staging).unwrap();
+        let identity_dir = crate::runtime::MountTable::data_dir(root.path(), &nid);
+        std::fs::create_dir_all(identity_dir.parent().unwrap()).unwrap();
+        std::fs::rename(&staging, &identity_dir).unwrap();
+        assert!(
+            crate::runtime::MountTable::is_identity_keyed(&identity_dir),
+            "fixture must actually be shaped like data/<nid>, or this test proves nothing"
+        );
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            build(&identity_dir).await;
+        }
+        assert_eq!(
+            captured.mentioning(SKIP),
+            1,
+            "an identity-keyed dataset must log the skip at the default level - #727: this fired only \
+             at debug! before, invisible under the default `nuthatch=info` filter this test pins to"
         );
     }
 }
