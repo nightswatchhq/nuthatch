@@ -153,22 +153,32 @@ operation most exposed to shared disk contention, more than seal-direct's few la
 **Unconfirmed.** Tracked in #744 for a controlled re-run before either figure is trusted as the
 storage path's true delta.
 
-**Events also don't match the prior entry: 11,758, not 12,933.** Verified directly against
-`eth_getLogs` on three independent providers with no nuthatch binary involved - `eth.drpc.org`,
-`eth.api.onfinality.io/public`, and `eth-pokt.nodies.app` (chunked at its own 50-block cap and
-summed) - all three agree on 11,758. That range is ~9 months past finality, so the result is
-deterministic; 12,933, reported both by this PR's own earlier commit and separately by Iris's
-independent replication, appears to have been wrong rather than provider noise. Also tracked in #744.
+**12,933 was not wrong - it answers a different question.** This bench nest declares `Transfer`
+only, so 11,758 is the right count for *this* table; 12,933, reported by this PR's own earlier
+commit and separately by Iris's independent replication, is the count of every log at the contract
+address, which is what an `init`-scaffolded nest declares (every event in the ABI) over the same
+range. Verified directly against `eth_getLogs` with no nuthatch binary involved, blocks
+25,809,368–25,809,487 in four 30-block chunks summed, on two independent providers (`eth.drpc.org`,
+`eth.api.onfinality.io/public`) that agree exactly: every log at `0xa0b8…eB48` = 12,933;
+`topics[0] = Transfer` = 11,758; `Approval` = 1,046; everything else = 129.
+11,758 + 1,046 + 129 = 12,933 exactly, with nothing left over. Two nests, two workloads, two correct
+counts - a reader who runs this same range through `init` instead of this Transfer-only bench
+config should expect 12,933, not 11,758. This closes item 1 of #744: there is no
+retry-without-dedup bug to hunt.
 
 **Provenance:** measured 2026-08-22 at commit `6145386`, 5 runs (median reported), provider
 `eth-pokt.nodies.app` (`BenchReport.provider` - the first of the nest's RPC pool; public endpoints are
 noisy and interchangeable within a run), 32 cores / 62 GB RAM. **Caveats:** public-endpoint throughput
 varies several-fold run to run - Iris's own hot-store check on 2026-08-22 saw a 3.8× spread inside one
 arm (172 ev/s on run 1 against 658-649 ev/s on runs 2-3) - so absolute ev/s is "what this provider gave
-today," not a target. Both arms here declare no `[[calls]]`: every seal-direct path hardcodes an empty
-calls slice (`src/bench.rs:695/719/741`, #725, open), so this is a bare-event workload and a nest with
-`[[calls]]` will not reach these figures. The earlier 8.7× figure (2026-07-16, `f1a57de`) was measured
-against a harness that called `put_entity` per row - one redb write transaction and one fsync per row -
+today," not a target. Both arms here declare no `[[calls]]`, so this is a bare-event workload and a
+nest with `[[calls]]` will not reach these figures - `BenchReport.calls_declared` is the field that
+would prove that from the artifact rather than the prose, but these two were measured at `6145386`,
+before #742 added it, so they predate `calls_declared: 0`. (#725 - every seal-direct path hardcoding
+an empty calls slice regardless of what the nest declared - is closed; `bench` now refuses a
+declared-`[[calls]]` nest run without `--state-rpc` outright, `src/bench.rs:220-233`.) The earlier
+8.7× figure (2026-07-16, `f1a57de`) was measured against a harness that called `put_entity` per row -
+one redb write transaction and one fsync per row -
 rather than the `commit_window` path the indexer uses. #224 (`0cd291e`, 2026-07-30) fixed the harness;
 8.7× was an upper bound against that strawman, not a measurement of the current code. Run it yourself:
 
@@ -204,13 +214,15 @@ of the ~2.9× vs. hot store is fewer, wider requests (24 against the hot arm's 3
 overlapped latency alone; against your own node (`--rpc`, `--concurrency 16`) it goes further. What
 collapsed is the *storage-path* half
 of the old ~22.5× (hot store vs. pipeline): see the seal-direct-vs-hot-store discrepancy above - see
-also #744 - today's hot-store baseline came in far faster than the 607 ev/s this page previously
+also #744 - today's hot-store baseline came in far faster than the 289 ev/s this page previously
 quoted, and that drags every "vs hot store" ratio in this table down with it. RSS rose to ~68 MB with
 8 windows in flight - bounded by `K` and well within the 256 MB budget.
 
 **Caveats:** public-endpoint throughput varies several-fold run to run (see the note above) - the
-*ratios* here are the claim, not the absolute ev/s. All three arms declare no `[[calls]]` (#725, open)
-- a bare-event workload; a nest with `[[calls]]` will not reach these multipliers.
+*ratios* here are the claim, not the absolute ev/s. All three arms declare no `[[calls]]` - a
+bare-event workload; a nest with `[[calls]]` will not reach these multipliers. #725 (every
+seal-direct path hardcoding an empty calls slice regardless of what the nest declared) is closed;
+`bench` now refuses to run a declared-`[[calls]]` nest without `--state-rpc` instead.
 
 ## Baseline matrix (pre-optimization)
 
