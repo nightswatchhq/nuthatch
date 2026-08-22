@@ -235,6 +235,10 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     // seal-direct call sites below used to pass an empty calls slice regardless of what the nest
     // declared, so a run against a calls nest with no `--state-rpc` looked identical to one that had
     // resolved every call. Same guard and message shape as the production refusal at nest build time.
+    //
+    // The guard sits above path selection and therefore covers the hot-store arm too, which was only
+    // correct from #743 onwards - before it, that arm could not resolve a call whatever endpoint you
+    // supplied, so the refusal demanded a flag the path it selected had no way to use.
     let state_rpc = if config.state_rpc_urls.is_empty() {
         if !config.calls.is_empty() {
             bail!(
@@ -759,6 +763,9 @@ async fn one_run(
     // A fresh child registry per run: discovery is part of what the run measures, so carrying one
     // across runs would make run 2 cheaper than run 1 and the median a blend of two workloads.
     let mut children = ChildRegistry::new();
+    // The hot arm writes call rows to redb rather than to a Parquet manifest, so it has to hand its
+    // resolved count back directly - see `calls_resolved` below.
+    let mut hot_calls_resolved: Option<u64> = None;
     let events = match choose_path(factory.is_some(), seal_direct, concurrency) {
         // Sequential two-pass factory backfill - the same path `dev` takes (RFC-0009 §3). Pass 2
         // fetches the children pass 1 discovered, so it cannot be pipelined against itself.
@@ -817,10 +824,13 @@ async fn one_run(
             .await?
         }
         BackfillPath::HotStore => {
-            hot_store_backfill(
-                &source, registry, &work, addresses, topic0s, from, to, window,
+            let (events, resolved) = hot_store_backfill(
+                &source, registry, &work, addresses, topic0s, calls, state_rpc, chain_id, from, to,
+                window,
             )
-            .await?
+            .await?;
+            hot_calls_resolved = Some(resolved);
+            events
         }
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
@@ -828,10 +838,14 @@ async fn one_run(
     // Read before the directory is torn down below: `calls_resolved` is the count of rows sealed
     // under each declared call's own table (#725) - the seal-direct paths write those to Parquet the
     // same as event rows, so the manifest already has the number, no new bookkeeping needed. A nest
-    // with no `[[calls]]` (or the hot-store path, which does not resolve them at all) reads 0 here
-    // because `load_manifest` on a directory with no manifest yet returns an empty catalogue.
+    // with no `[[calls]]` reads 0 here because `load_manifest` on a directory with no manifest yet
+    // returns an empty catalogue. The hot arm resolves the same calls (#743) but commits them to
+    // redb, where there is no manifest to count, so it returns its own count instead - the number
+    // means the same thing on both arms, which is the point of #743.
     let calls_resolved: u64 = if calls.is_empty() {
         0
+    } else if let Some(n) = hot_calls_resolved {
+        n
     } else {
         let manifest = crate::seal::load_manifest(&work)?;
         calls
@@ -863,7 +877,17 @@ async fn one_run(
 }
 
 /// The baseline path: decode → redb hot store, with the same batched `block_timestamp` fetch the
-/// live `dev` loop does - so the only thing that differs from seal-direct is the storage write.
+/// live `dev` loop does - and, since #743, the same tier-3 `[[calls]]` resolution - so the only
+/// thing that differs from seal-direct is the storage write.
+///
+/// That sentence was false for one release. #725 taught the three seal-direct arms to resolve
+/// declared `[[calls]]`; this arm, the one `bench backfill` takes with no path flag, took no
+/// `calls` parameter at all, so for a nest declaring calls it measured a workload `nuthatch dev`
+/// does not run - and it is the *denominator* of both published multipliers, so the ratio would
+/// have flattered seal-direct by exactly the work this arm skipped (#743).
+///
+/// Returns `(rows committed, call rows among them)`. The call count is returned rather than read
+/// back, because redb has no manifest for `one_run` to count the way it counts sealed segments.
 #[allow(clippy::too_many_arguments)]
 async fn hot_store_backfill(
     source: &RpcClient,
@@ -871,15 +895,19 @@ async fn hot_store_backfill(
     dir: &std::path::Path,
     addresses: &[String],
     topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&RpcClient>,
+    chain_id: u64,
     from: u64,
     to: u64,
     window: u64,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     // `DB_FILE`, not a bench-specific name: with `--keep` this directory is meant to be opened by
     // `nuthatch sql --dir <path>`, which looks for the standard store. A private filename would
     // persist the data and still leave it unqueryable, which is the failure this flag exists to fix.
     let store = Store::open(&dir.join(crate::config::DB_FILE))?;
     let mut events = 0u64;
+    let mut call_rows_total = 0u64;
     let mut next = from;
     while next <= to {
         let chunk_to = (next + window - 1).min(to);
@@ -916,9 +944,38 @@ async fn hot_store_backfill(
             rows.append(&mut block_rows);
         }
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+        // Include the blocks a sampled `[[calls]]` declaration fires at, exactly as the seal-direct
+        // paths do: a sampled call can land on a block that emitted no matching log, and a call row
+        // with `block_timestamp: 0` is not the row `dev` would have stored.
+        if state_rpc.is_some() {
+            for d in calls {
+                blocks.extend(d.blocks_in(next, chunk_to));
+            }
+        }
         blocks.sort_unstable();
         blocks.dedup();
         let ts = source.block_timestamps(&blocks).await.unwrap_or_default();
+        for r in &mut rows {
+            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+        }
+        // RFC-0023 tier 3, shared with the seal-direct arms rather than reimplemented (#743): the
+        // resolution loop lives in `indexer.rs` and both arms call it, so this harness cannot drift
+        // from the path it is meant to be measuring for a third time.
+        let mut call_rows = Vec::new();
+        if let Some(rpc) = state_rpc {
+            call_rows = crate::indexer::resolve_calls_for_window(
+                source,
+                calls,
+                rpc,
+                chain_id,
+                &rows,
+                next,
+                chunk_to,
+                &ts,
+                registry.timestamps(),
+            )
+            .await?;
+        }
         // **One commit per window, as the real path does** (RFC-0029 §4b).
         //
         // This used to call `put_entity` per row, which is one redb write transaction - and one fsync -
@@ -929,10 +986,13 @@ async fn hot_store_backfill(
         //
         // **Any improvement from this change is a harness correction, never a product gain.** Recording
         // it as a speedup would be claiming credit for fixing our own measurement.
+        //
+        // Call rows go into the *same* commit as the event rows, which is what `process_window`
+        // does: two commits per window would measure a write pattern production does not have.
         let batch: Vec<(String, String)> = rows
-            .iter_mut()
+            .iter()
+            .chain(call_rows.iter())
             .map(|r| {
-                r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
                 (
                     Store::entity_key(r.block_number, r.log_index),
                     r.to_json().to_string(),
@@ -940,10 +1000,11 @@ async fn hot_store_backfill(
             })
             .collect();
         events += batch.len() as u64;
+        call_rows_total += call_rows.len() as u64;
         store.commit_window(&batch, None, chunk_to)?;
         next = chunk_to + 1;
     }
-    Ok(events)
+    Ok((events, call_rows_total))
 }
 
 /// Samples this process's resident set size on a background thread, tracking the peak.
@@ -1575,6 +1636,107 @@ abi = "abis/c.json"
              run, got calls_resolved = {} - #725 is that every seal-direct call site hardcoded an \
              empty calls slice regardless of what the nest declared",
             r.calls_resolved
+        );
+    }
+
+    /// #743: #725 fixed the three seal-direct arms and left the fourth - `BackfillPath::HotStore`,
+    /// the arm `bench backfill` takes with no path flag, and the *denominator* of both published
+    /// multipliers. `hot_store_backfill` took no `calls` parameter at all, so against a calls nest
+    /// the numerator paid tier-3 cost and the denominator did not.
+    ///
+    /// Asserted as an equality between the two arms rather than `hot > 0` alone: the defect is not
+    /// that the hot number was zero, it is that the two arms measured different workloads, and only
+    /// a comparison between them can see that. Both arms run against the same fixture and the same
+    /// stub, so anything other than equality is one arm doing work the other skipped.
+    #[tokio::test]
+    async fn hot_store_bench_resolves_the_same_calls_as_seal_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        assert!(
+            !config.calls.is_empty(),
+            "control: the fixture must actually declare a call, or this test proves nothing"
+        );
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        let (main_url, main_handle) = stub_full_rpc().await;
+        let (state_url, state_handle) = stub_full_rpc().await;
+        let state_rpc = RpcClient::new(vec![state_url]).unwrap();
+
+        // An explicit work directory per arm, rather than `one_run`'s default. That default is
+        // `temp_dir()/nuthatch-bench-<pid>-<run>`, keyed by run *index*, so it is shared by every
+        // test in this binary using that index - two in flight at once (cargo runs the tests as
+        // threads of one process) clear each other's work dir mid-run. Passing `keep` is what makes
+        // these two arms independent of the rest of the module.
+        let hot_dir = tempfile::tempdir().unwrap();
+        let sealed_dir = tempfile::tempdir().unwrap();
+        let run_arm = |seal_direct: bool, work: &std::path::Path| {
+            let (main_url, addresses, topic0s, registry, state_rpc) = (
+                main_url.clone(),
+                addresses.clone(),
+                topic0s.clone(),
+                &registry,
+                &state_rpc,
+            );
+            let calls = config.calls.clone();
+            let chain_id = config.nest.chain_id;
+            let work = work.to_path_buf();
+            async move {
+                one_run(
+                    &[main_url],
+                    registry,
+                    None,
+                    &addresses,
+                    &topic0s,
+                    &calls,
+                    Some(state_rpc),
+                    chain_id,
+                    1,
+                    3,
+                    10,
+                    seal_direct,
+                    1,
+                    1,
+                    Some(&work),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let hot = run_arm(false, hot_dir.path()).await;
+        let sealed = run_arm(true, sealed_dir.path()).await;
+
+        main_handle.abort();
+        state_handle.abort();
+
+        assert!(
+            sealed.calls_resolved > 0,
+            "control: the seal-direct arm must resolve calls (#725), or the equality below is two \
+             zeroes agreeing"
+        );
+        assert_eq!(
+            hot.calls_resolved, sealed.calls_resolved,
+            "the hot-store arm must resolve the same declared [[calls]] as the seal-direct arm - \
+             it is the denominator of every published multiplier, so an arm that skips tier 3 \
+             flatters seal-direct by exactly the work it skipped (#743)"
+        );
+        assert!(
+            hot.events >= sealed.calls_resolved,
+            "call rows are committed alongside event rows, so the hot arm's row count must \
+             include them: events = {}, calls = {}",
+            hot.events,
+            hot.calls_resolved
         );
     }
 }
