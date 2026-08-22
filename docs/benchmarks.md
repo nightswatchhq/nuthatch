@@ -194,8 +194,11 @@ rather than the `commit_window` path the indexer uses. #224 (`0cd291e`, 2026-07-
 8.7× was an upper bound against that strawman, not a measurement of the current code. Run it yourself:
 
 ```sh
-nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
-nuthatch bench backfill --dir <nest> --from A --to B --seal-direct   # seal-direct
+# --window-adaptive on the seal-direct arm because that is what the artifact above recorded
+# (`window_adaptive: true`); since #744 decoupled the two flags, `--seal-direct` on its own is the
+# fixed-window arm and reproduces a different run.
+nuthatch bench backfill --dir <nest> --from A --to B                                    # hot store (baseline)
+nuthatch bench backfill --dir <nest> --from A --to B --seal-direct --window-adaptive     # seal-direct
 ```
 
 ## Pipeline (`--concurrency K`, seal-direct only)
