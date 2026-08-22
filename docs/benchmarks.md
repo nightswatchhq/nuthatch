@@ -129,11 +129,14 @@ read-back, no prune. The bounded buffer caps RSS by construction. `seal_range` i
 writer, so a given range yields **byte-identical** segments whether sealed directly or via the hot
 store (asserted by `seal::seal_direct_matches_seal_via_hot_store`).
 
-Measured before/after. `--seal-direct` changes two things at once, not one: the storage path, and the
-fetch-windowing strategy (`window_adaptive: args.seal_direct` at `src/bench.rs:383-384` - no flag
-separates them, so this table cannot isolate the storage path alone). On this range both arms did 34
-requests, so the windowing difference never actually diverged the two runs here, and the sequential
-comparison below is unaffected. Artifacts:
+Measured before/after. At the time of this run, `--seal-direct` changed two things at once, not one:
+the storage path, and the fetch-windowing strategy (`window_adaptive: args.seal_direct` - no flag
+separated them, so this table could not isolate the storage path alone). On this range both arms did
+34 requests, so the windowing difference never actually diverged the two runs here, and the
+sequential comparison below is unaffected. **`--window-adaptive` (#744) now decouples the two** -
+hot-fixed, hot-adaptive, seal-fixed and seal-adaptive are all reachable independently - but the runs
+below predate the flag and have not been re-measured with it; treat this table's windowing caveat as
+historical, not as a live gap. Artifacts:
 [`docs/bench/722-hot.json`](bench/722-hot.json), [`docs/bench/722-seal-direct.json`](bench/722-seal-direct.json).
 
 | Path | Range | Events | Wall-clock | events/sec | RPC requests |

@@ -54,6 +54,19 @@ fn choose_path(is_factory: bool, seal_direct: bool, concurrency: usize) -> Backf
     }
 }
 
+/// What the run actually did with the fetch window, independent of what `--window-adaptive` asked
+/// for (#744). `Pipelined` and `Factory` adapt unconditionally - the same as `nuthatch dev` - so the
+/// flag has no effect on them; only `Direct` and `HotStore` (the concurrency-1, non-factory paths)
+/// take it. `BenchReport.window_adaptive` is built from this, not from the flag directly, because
+/// echoing the flag is the exact mistake this issue replaces (`window_adaptive: args.seal_direct`
+/// echoed the storage flag rather than reporting what the run did).
+fn effective_window_adaptive(path: BackfillPath, requested: bool) -> bool {
+    match path {
+        BackfillPath::Factory | BackfillPath::Pipelined => true,
+        BackfillPath::Direct | BackfillPath::HotStore => requested,
+    }
+}
+
 /// One run's raw measurements.
 struct Run {
     events: u64,
@@ -91,7 +104,12 @@ pub struct BenchReport {
     /// the 454 it took. `rpc_requests` is the honest measure of range control, and the reason there is
     /// no `--window` override here is that there is no longer anything useful to override.
     pub initial_window: u64,
-    /// Whether the window adapted during the run (true on the seal-direct paths).
+    /// Whether the fetch window actually adapted during this run. Set from
+    /// [`effective_window_adaptive`], not echoed from `--seal-direct` - the coupling this replaces
+    /// (`window_adaptive: args.seal_direct`) is what made every "vs hot store" ratio this project
+    /// published a comparison across two variables at once, with `--window-adaptive` (#744) the
+    /// independent flag that separates them. Always `true` on the pipelined/factory paths, which
+    /// adapt unconditionally like `nuthatch dev` does.
     pub window_adaptive: bool,
     pub seal_direct: bool,
     pub concurrency: usize,
@@ -297,6 +315,24 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             String::new()
         }
     );
+    // #744: computed independently of the storage-path println above, since the two used to be the
+    // same flag in disguise (`window_adaptive: args.seal_direct`).
+    let path = choose_path(factory.is_some(), args.seal_direct, args.concurrency);
+    let window_adaptive = effective_window_adaptive(path, args.window_adaptive);
+    println!(
+        "fetch window: {}{}",
+        if window_adaptive {
+            "adaptive (RFC-0004 §2 controller)"
+        } else {
+            "fixed"
+        },
+        if args.window_adaptive && !window_adaptive {
+            " (--window-adaptive has no effect here: the pipelined/factory path always adapts, the \
+             same as `nuthatch dev`)"
+        } else {
+            ""
+        }
+    );
     if let Some(fs) = &factory {
         // Say it out loud rather than silently ignoring the flag: the factory backfill is the
         // sequential two-pass path (pass 2 needs pass 1's discoveries), so `--concurrency` does not
@@ -344,6 +380,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             args.to,
             window,
             args.seal_direct,
+            args.window_adaptive,
             args.concurrency,
             run,
             keep.as_deref(),
@@ -380,8 +417,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         to_block: args.to,
         blocks: args.to - args.from + 1,
         initial_window: window,
-        // The hot-store path still fetches at a fixed width; only the seal-direct paths adapt.
-        window_adaptive: args.seal_direct,
+        // What the run actually did, not the flag echoed back - see `effective_window_adaptive`.
+        window_adaptive,
         seal_direct: args.seal_direct,
         // The factory path is sequential, so reporting the flag's value would describe a run that did
         // not happen.
@@ -723,6 +760,7 @@ async fn one_run(
     to: u64,
     window: u64,
     seal_direct: bool,
+    window_adaptive: bool,
     concurrency: usize,
     run: usize,
     keep: Option<&std::path::Path>,
@@ -795,17 +833,37 @@ async fn one_run(
         }
         // Sequential seal-direct: decode → Parquet, bypassing the hot store. Reachable only from the
         // bench (`backfill_direct` has no other non-test caller) - it is the sequential control for
-        // `Pipelined`, not what production runs.
+        // `Pipelined`, not what production runs. `window_adaptive` reaches it here, decoupled from
+        // `seal_direct`, which is what #744 asked for: this is the one place in the whole binary
+        // where a caller can ask for the seal-direct storage path with a *fixed* fetch window.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
-                &source, registry, &work, addresses, topic0s, calls, state_rpc, chain_id, from, to,
+                &source,
+                registry,
+                &work,
+                addresses,
+                topic0s,
+                calls,
+                state_rpc,
+                chain_id,
+                from,
+                to,
                 window,
+                window_adaptive,
             )
             .await?
         }
         BackfillPath::HotStore => {
             hot_store_backfill(
-                &source, registry, &work, addresses, topic0s, from, to, window,
+                &source,
+                registry,
+                &work,
+                addresses,
+                topic0s,
+                from,
+                to,
+                window,
+                window_adaptive,
             )
             .await?
         }
@@ -851,6 +909,12 @@ async fn one_run(
 
 /// The baseline path: decode → redb hot store, with the same batched `block_timestamp` fetch the
 /// live `dev` loop does - so the only thing that differs from seal-direct is the storage write.
+///
+/// `adaptive` is the "hot-adaptive" control arm added for #744: `nuthatch dev`'s hot-store tip loop
+/// never adapts (it runs one fixed-width fetch per finalized window, not a from-history backfill),
+/// so this exists only to isolate the fetch-window controller's own contribution from the
+/// storage-path delta - never to change what production's hot path does. When `false` (the
+/// existing, and still the default, behaviour) `window` is held fixed for the whole run.
 #[allow(clippy::too_many_arguments)]
 async fn hot_store_backfill(
     source: &RpcClient,
@@ -861,6 +925,7 @@ async fn hot_store_backfill(
     from: u64,
     to: u64,
     window: u64,
+    adaptive: bool,
 ) -> Result<u64> {
     // `DB_FILE`, not a bench-specific name: with `--keep` this directory is meant to be opened by
     // `nuthatch sql --dir <path>`, which looks for the standard store. A private filename would
@@ -868,17 +933,52 @@ async fn hot_store_backfill(
     let store = Store::open(&dir.join(crate::config::DB_FILE))?;
     let mut events = 0u64;
     let mut next = from;
+    // `None` in fixed mode: the width then never moves off `window`. Same controller and same
+    // per-workload choice `backfill_direct` makes (a blocks nest pays per block, not per log).
+    let mut chunker = adaptive.then(|| {
+        if registry.blocks() {
+            crate::chunker::AdaptiveWindow::for_window_with_headers(window)
+        } else {
+            crate::chunker::AdaptiveWindow::for_window(window)
+        }
+    });
     while next <= to {
-        let chunk_to = (next + window - 1).min(to);
+        let chunk_to = (next
+            + chunker
+                .as_ref()
+                .map_or(window, crate::chunker::AdaptiveWindow::window)
+            - 1)
+        .min(to);
         // Same rule as `indexer.rs`: an empty address AND topic filter means *every log on the
         // chain*, not none. A blocks-only nest has neither, and no log could decode without them.
         // The rule is now carried by `LogFilter` rather than restated here (#432).
         let logs = match crate::source::LogFilter::new(addresses, topic0s) {
             None => Vec::new(),
-            Some(filter) => source
-                .logs(&filter, next, chunk_to)
-                .await
-                .with_context(|| format!("getLogs {next}..={chunk_to}"))?,
+            Some(filter) => match source.logs(&filter, next, chunk_to).await {
+                Ok(logs) => {
+                    if let Some(c) = &mut chunker {
+                        c.observed(logs.len() as u64);
+                    }
+                    logs
+                }
+                // Only reachable in adaptive mode: fixed mode has no chunker to shrink, so a cap
+                // falls straight through to the final arm and the run fails loudly - the same
+                // trade `backfill_direct` makes for its own fixed mode.
+                Err(e) if chunker.is_some() && crate::chunker::is_result_too_large(&e) => {
+                    if next >= chunk_to {
+                        bail!(
+                            "block {next} alone exceeds the provider's getLogs result cap - use a \
+                             provider with a higher/no cap"
+                        );
+                    }
+                    chunker
+                        .as_mut()
+                        .expect("checked chunker.is_some() above")
+                        .too_large();
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
+            },
         };
         let mut rows: Vec<_> = logs
             .iter()
@@ -1417,6 +1517,139 @@ abi = "abis/c.json"
         assert_eq!(choose_path(false, false, 1), BackfillPath::HotStore);
     }
 
+    /// #744: `BenchReport.window_adaptive` must report what the run actually did, not the flag it
+    /// was asked for - the exact bug it replaces (`window_adaptive: args.seal_direct`) echoed a
+    /// *different* flag regardless of what happened. `Direct` and `HotStore` take the request
+    /// as-is, all four combinations reachable; `Pipelined` and `Factory` always adapt, the same as
+    /// `nuthatch dev`, so a `--window-adaptive` absent there must still report `true`.
+    #[test]
+    fn window_adaptive_reports_what_the_run_did_not_what_was_asked() {
+        for requested in [false, true] {
+            assert_eq!(
+                effective_window_adaptive(BackfillPath::HotStore, requested),
+                requested
+            );
+            assert_eq!(
+                effective_window_adaptive(BackfillPath::Direct, requested),
+                requested
+            );
+            assert!(effective_window_adaptive(
+                BackfillPath::Pipelined,
+                requested
+            ));
+            assert!(effective_window_adaptive(BackfillPath::Factory, requested));
+        }
+    }
+
+    /// A stub that answers every `eth_getLogs` (batched or not) with an empty result - the shape
+    /// that makes `AdaptiveWindow::observed(0)` grow the window 4× per step, so an adaptive and a
+    /// fixed run diverge sharply in request count over the same dense range.
+    async fn stub_empty_logs() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Router};
+        async fn handler(body: String) -> axum::Json<serde_json::Value> {
+            let req: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
+            let one = |r: &serde_json::Value| -> serde_json::Value {
+                let id = r.get("id").cloned().unwrap_or(serde_json::json!(1));
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": serde_json::json!([])})
+            };
+            axum::Json(match req.as_array() {
+                Some(rs) => serde_json::Value::Array(rs.iter().map(one).collect()),
+                None => one(&req),
+            })
+        }
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// **#744, the behaviour, not just the label.** `--window-adaptive` has to change what actually
+    /// gets fetched, on both the hot-store and the seal-direct (`Direct`) path independently of one
+    /// another - a flag that only flipped `BenchReport.window_adaptive` while fetching identically
+    /// would be decorative. Over a 4,000-block entirely-empty range starting from a 20-block window,
+    /// a fixed run issues one `getLogs` per 20 blocks (200 requests) while an adaptive run quadruples
+    /// the window on every empty response and finishes in a handful. Asserted on `rpc_requests`,
+    /// never on wall-clock, per this sprint's own rule for a heavily shared box.
+    #[tokio::test]
+    async fn window_adaptive_changes_request_count_independently_of_seal_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        for seal_direct in [false, true] {
+            let (url_fixed, h_fixed) = stub_empty_logs().await;
+            let fixed = one_run(
+                &[url_fixed],
+                &registry,
+                None,
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                1,
+                1,
+                4_000,
+                20,
+                seal_direct,
+                false, // window_adaptive
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+            h_fixed.abort();
+
+            let (url_adaptive, h_adaptive) = stub_empty_logs().await;
+            let adaptive = one_run(
+                &[url_adaptive],
+                &registry,
+                None,
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                1,
+                1,
+                4_000,
+                20,
+                seal_direct,
+                true, // window_adaptive
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+            h_adaptive.abort();
+
+            assert!(
+                adaptive.rpc_requests < fixed.rpc_requests / 10,
+                "seal_direct={seal_direct}: adaptive ({}) must issue far fewer getLogs requests \
+                 than fixed ({}) over the same dense empty range - if these are close, \
+                 --window-adaptive did not reach the {} path",
+                adaptive.rpc_requests,
+                fixed.rpc_requests,
+                if seal_direct { "Direct" } else { "HotStore" },
+            );
+        }
+    }
+
     /// A nest declaring one sampled `[[calls]]` entry (`every = 1`), mirroring `indexer.rs`'s own
     /// `write_calls_nest` fixture - built through `nuthatch.toml`, not hand-assembled structs, so
     /// the test exercises the real `Config::load` + `from_nest` path `backfill()` itself takes.
@@ -1535,7 +1768,8 @@ abi = "abis/c.json"
             1,
             3,
             10,
-            true, // seal_direct: the Direct path (concurrency 1)
+            true,  // seal_direct: the Direct path (concurrency 1)
+            false, // window_adaptive: irrelevant to this test, fixed is the cheaper default
             1,
             1,
             None,
