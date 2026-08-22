@@ -2573,15 +2573,31 @@ mod tests {
             "the floor of a descent must say where it descended from, so it cannot be mistaken for a \
              trailing one-block chunk: {msg}"
         );
-        // The top-level 8 → {4, 4} split runs its two halves concurrently (`tokio::try_join!`), so
-        // both sides of the tree are explored rather than only the leftmost path: 1 (the width-8
-        // request) + 3 each for the two width-4 halves (4 → 2 → 1 along their own leftmost path,
-        // `?` propagating from the first failing leaf below the parallel split) = 7. Still one
-        // request per level visited, not the sixteen a full `TIMESTAMP_ATTEMPTS` cycle would cost.
-        assert_eq!(
-            seen.load(Ordering::SeqCst),
-            7,
-            "a per-item error costs one request per level - it never enters the retry loop"
+        // The top-level 8 → {4, 4} split runs its two halves concurrently (`tokio::try_join!`, #728),
+        // so both sides of the tree are explored rather than only the leftmost path: 1 (the width-8
+        // request) + up to 3 each for the two width-4 halves (4 → 2 → 1 along their own leftmost
+        // path) = at most 7.
+        //
+        // **A range, not an equality, and that is not slack (#735).** `try_join!` cancels the
+        // sibling the instant one side returns `Err`. Whether the losing half got all the way down
+        // its own path (3 requests) or was cut short (2) is a scheduling question, not a protocol
+        // one, and both are correct. Asserting `== 7` made this test fail nine runs in ten on a
+        // developer machine while passing on CI, which is a worse outcome than not testing the
+        // count at all: `fmt · clippy · test` is a required context, so it reddens `main` at random.
+        //
+        // The claim worth pinning survives the range intact. The floor of 4 is the width-8 request
+        // plus one full 4 → 2 → 1 descent, so a regression that stopped exploring past the split
+        // still fails. The ceiling is what the note on `batch_is_narrowable` gets wrong: a per-item
+        // failure is an HTTP 200, so the retry loop breaks on its first attempt and each level costs
+        // **one** request, not `TIMESTAMP_ATTEMPTS`. Were that wrong, the count would be a multiple
+        // of four and land far outside this range.
+        let n = seen.load(Ordering::SeqCst);
+        assert!(
+            (4..=7).contains(&n),
+            "a per-item error costs one request per level and never enters the retry loop, so the \
+             descent is 4..=7 requests depending on where `try_join!` cancelled the losing half; \
+             got {n}, and a full retry cycle would be {}",
+            7 * super::TIMESTAMP_ATTEMPTS
         );
     }
 
