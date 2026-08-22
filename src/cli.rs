@@ -582,6 +582,12 @@ pub struct BackfillBenchArgs {
     #[arg(long)]
     pub rpc: Option<String>,
 
+    /// Archive endpoint(s) for resolving declared `[[calls]]` (RFC-0023 tier 3), same flag and
+    /// reasoning as `nuthatch dev --state-rpc`. Without it, a nest declaring `[[calls]]` is refused
+    /// rather than silently benched with zero of them resolved (#725).
+    #[arg(long = "state-rpc", value_name = "URL")]
+    pub state_rpc: Vec<String>,
+
     /// Write the bench-report JSON here (e.g. `docs/bench/w1.json`). Prints to stdout regardless.
     #[arg(long)]
     pub out: Option<String>,

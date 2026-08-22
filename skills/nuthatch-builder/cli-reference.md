@@ -54,6 +54,7 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--to <TO>` - Last block of the pinned range (inclusive)
 - `--runs <RUNS>` - How many runs to take (the report is the median). Public RPC is noisy - 3 is sensible
 - `--rpc <RPC>` - Override the nest's `rpc_urls` (e.g. point at your own archive node for a T2 run)
+- `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` (RFC-0023 tier 3), same flag and reasoning as `nuthatch dev --state-rpc`. Without it, a nest declaring `[[calls]]` is refused rather than silently benched with zero of them resolved (#725)
 - `--out <OUT>` - Write the bench-report JSON here (e.g. `docs/bench/w1.json`). Prints to stdout regardless
 - `--label <LABEL>` - A label for the workload in the report (e.g. "W1: USDC 100k dense")
 - `--seal-direct` - Measure the seal-direct path (decode → Parquet, bypassing the hot store) instead of the default decode → redb hot-store path. Use to compare the two backfill storage paths
