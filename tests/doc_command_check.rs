@@ -63,6 +63,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          closes - it would be a strange irony for this check to make that sentence unwritable",
     ),
     (
+        "docs/sprint-nocturnal-nightjar.md",
+        "roost",
+        "this sprint doc's own #769 entry states the regression test this file is - \"reintroducing \
+         `nuthatch roost` into any documented file must fail the build\" - same reasoning as the \
+         sprint-languid-lapwing.md entry above",
+    ),
+    (
         "docs/progress-log.md",
         "upgrade",
         "the 2026-07-21 entry documents `nuthatch nest upgrade` as it was that day (RFC-0020); the \
