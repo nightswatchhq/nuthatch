@@ -65,6 +65,9 @@ struct Run {
     /// reports 0 here has measured nothing but its own factory events, which is the failure this
     /// field exists to make visible.
     children: u64,
+    /// Call rows sealed across the run's declared `[[calls]]` - 0 for a nest with none. See
+    /// [`BenchReport::calls_resolved`].
+    calls_resolved: u64,
 }
 
 /// The published artifact: medians across runs plus the pinned inputs and provenance.
@@ -108,6 +111,15 @@ pub struct BenchReport {
     /// harness actually followed the templates: `"factory": true` with `"children": 0` is a broken
     /// measurement, not a fast one.
     pub children: u64,
+    /// How many `[[calls]]` the nest declares. Recorded so `calls_resolved: 0` is visibly a control
+    /// (nothing declared) rather than indistinguishable from a run that resolved every one and just
+    /// happened to declare none (#725).
+    pub calls_declared: usize,
+    /// Call rows actually sealed/stored across the run's declared `[[calls]]` - the number #725
+    /// exists because nothing recorded before it. A nest with `calls_declared > 0` and
+    /// `calls_resolved: 0` measured a strawman, the same failure #224 found in this file for the
+    /// hot-store path three weeks earlier.
+    pub calls_resolved: u64,
     pub commit: Option<String>,
     /// The RPC endpoint's host, never the full URL - an API key in a committed benchmark report is a
     /// credential leak, and these get pasted into issues.
@@ -199,8 +211,34 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         bail!("--to ({}) is before --from ({})", args.to, args.from);
     }
     let dir = PathBuf::from(&args.dir);
-    let config = Config::load(&dir)?;
+    let mut config = Config::load(&dir)?;
+    // RFC-0023 tier 3's archive endpoint, same flag and the same reason `dev` carries it off
+    // `nuthatch.toml`: an archive endpoint usually carries an API key.
+    config.state_rpc_urls = args.state_rpc.clone();
     let registry = Arc::new(crate::registry::from_nest(&dir, &config)?);
+
+    // Refuse rather than silently bench a declared-but-unresolved `[[calls]]` nest (#725): all three
+    // seal-direct call sites below used to pass an empty calls slice regardless of what the nest
+    // declared, so a run against a calls nest with no `--state-rpc` looked identical to one that had
+    // resolved every call. Same guard and message shape as the production refusal at nest build time.
+    let state_rpc = if config.state_rpc_urls.is_empty() {
+        if !config.calls.is_empty() {
+            bail!(
+                "this nest declares {} `[[calls]]` entr{}, which need historical `eth_call` and \
+                 therefore an archive endpoint.\n\n\
+                 Pass `--state-rpc <url>` to `nuthatch bench backfill`, the same flag `nuthatch dev` \
+                 takes. Benching without it would resolve zero of them and report a number \
+                 indistinguishable from a run that resolved every one.",
+                config.calls.len(),
+                if config.calls.len() == 1 { "y" } else { "ies" },
+            );
+        }
+        None
+    } else {
+        Some(Arc::new(crate::rpc::RpcClient::new(
+            config.state_rpc_urls.clone(),
+        )?))
+    };
 
     // **A factory nest must be measured through the factory path** (RFC-0009 §3). The static
     // `addresses` filter below is fixed at start-up, so a factory nest measured through the plain
@@ -274,6 +312,14 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             }
         );
     }
+    if !config.calls.is_empty() {
+        // Reaching here means `state_rpc` is `Some` - the guard above refused otherwise.
+        println!(
+            "declared [[calls]]: {} - resolved against {}",
+            config.calls.len(),
+            config.state_rpc_urls.first().map_or("?", String::as_str)
+        );
+    }
 
     let keep = resolve_keep(&args.keep)?;
     if let Some(p) = keep.as_deref() {
@@ -291,6 +337,9 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             factory.as_ref(),
             &addresses,
             &topic0s,
+            &config.calls,
+            state_rpc.as_deref(),
+            config.nest.chain_id,
             args.from,
             args.to,
             window,
@@ -301,7 +350,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         )
         .await?;
         println!(
-            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req{}",
+            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req{}{}",
             args.runs,
             r.events,
             r.wall_clock_s,
@@ -312,6 +361,11 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
                 format!(", {} children", r.children)
             } else {
                 String::new()
+            },
+            if config.calls.is_empty() {
+                String::new()
+            } else {
+                format!(", {} call row(s) resolved", r.calls_resolved)
             }
         );
         runs.push(r);
@@ -344,6 +398,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         rpc_requests: median_u64(runs.iter().map(|r| r.rpc_requests)),
         factory: factory.is_some(),
         children: median_u64(runs.iter().map(|r| r.children)),
+        calls_declared: config.calls.len(),
+        calls_resolved: median_u64(runs.iter().map(|r| r.calls_resolved)),
         commit: git_commit(),
         provider: rpc_urls.first().and_then(|u| provider_of(u)),
         hardware: hardware_summary(),
@@ -660,6 +716,9 @@ async fn one_run(
     factory: Option<&FactorySet>,
     addresses: &[String],
     topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&RpcClient>,
+    chain_id: u64,
     from: u64,
     to: u64,
     window: u64,
@@ -699,9 +758,9 @@ async fn one_run(
                 &mut children,
                 &work,
                 topic0s,
-                &[],
-                None,
-                0,
+                calls,
+                state_rpc,
+                chain_id,
                 from,
                 to,
                 window,
@@ -722,9 +781,9 @@ async fn one_run(
                 &work,
                 addresses,
                 topic0s,
-                &[],
-                None,
-                0,
+                calls,
+                state_rpc,
+                chain_id,
                 from,
                 to,
                 window,
@@ -739,16 +798,7 @@ async fn one_run(
         // `Pipelined`, not what production runs.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
-                &source,
-                registry,
-                &work,
-                addresses,
-                topic0s,
-                &[],
-                None,
-                0,
-                from,
-                to,
+                &source, registry, &work, addresses, topic0s, calls, state_rpc, chain_id, from, to,
                 window,
             )
             .await?
@@ -762,6 +812,22 @@ async fn one_run(
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
     let peak_rss_mb = rss.stop();
+    // Read before the directory is torn down below: `calls_resolved` is the count of rows sealed
+    // under each declared call's own table (#725) - the seal-direct paths write those to Parquet the
+    // same as event rows, so the manifest already has the number, no new bookkeeping needed. A nest
+    // with no `[[calls]]` (or the hot-store path, which does not resolve them at all) reads 0 here
+    // because `load_manifest` on a directory with no manifest yet returns an empty catalogue.
+    let calls_resolved: u64 = if calls.is_empty() {
+        0
+    } else {
+        let manifest = crate::seal::load_manifest(&work)?;
+        calls
+            .iter()
+            .filter_map(|c| manifest.tables.get(&c.name))
+            .flat_map(|segs| segs.iter())
+            .map(|s| s.rows as u64)
+            .sum()
+    };
     // Keep the data when asked. Without this the flag would create the directory, fill it, and then
     // delete it — which is the whole defect it exists to fix, just relocated.
     if keep.is_none() {
@@ -779,6 +845,7 @@ async fn one_run(
         peak_rss_mb,
         rpc_requests: source.request_count(),
         children: children.len() as u64,
+        calls_resolved,
     })
 }
 
@@ -1348,5 +1415,143 @@ abi = "abis/c.json"
         assert_eq!(choose_path(false, true, 1), BackfillPath::Direct);
         assert_eq!(choose_path(false, false, 8), BackfillPath::HotStore);
         assert_eq!(choose_path(false, false, 1), BackfillPath::HotStore);
+    }
+
+    /// A nest declaring one sampled `[[calls]]` entry (`every = 1`), mirroring `indexer.rs`'s own
+    /// `write_calls_nest` fixture - built through `nuthatch.toml`, not hand-assembled structs, so
+    /// the test exercises the real `Config::load` + `from_nest` path `backfill()` itself takes.
+    fn write_calls_nest(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"c\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"oracle_answer\"\n\
+             contract = \"0x2222222222222222222222222222222222222222\"\n\
+             calldata = \"0x18160ddd\"\nevery = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+    }
+
+    /// A JSON-RPC stub answering every method `one_run`'s backfill paths need: empty `eth_getLogs`
+    /// (the fixture has no events), a fixed `eth_call` result (RFC-0023 tier 3 reads), and a
+    /// `eth_getBlockByNumber` header (timestamps, and the per-block hash fetch `resolve_calls_for_
+    /// window` still makes pre-#720). One server serves both the ingestion and archive endpoints -
+    /// nothing here cares which role asked.
+    async fn stub_full_rpc() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Router};
+        async fn handler(body: String) -> axum::Json<serde_json::Value> {
+            let req: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
+            let one = |r: &serde_json::Value| -> serde_json::Value {
+                let method = r.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = r.get("id").cloned().unwrap_or(serde_json::json!(1));
+                let result = match method {
+                    "eth_getLogs" => serde_json::json!([]),
+                    "eth_call" => serde_json::json!(format!("0x{:064x}", 42)),
+                    "eth_getBlockByNumber" => {
+                        let n = r
+                            .get("params")
+                            .and_then(|p| p.get(0))
+                            .and_then(|b| b.as_str())
+                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0);
+                        serde_json::json!({
+                            "hash": format!("0x{n:064x}"),
+                            "number": format!("0x{n:x}"),
+                            "timestamp": format!("0x{:x}", 1_700_000_000 + n),
+                            "transactions": [],
+                        })
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+            };
+            axum::Json(match req.as_array() {
+                Some(rs) => serde_json::Value::Array(rs.iter().map(one).collect()),
+                None => one(&req),
+            })
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #725: all three seal-direct bench call sites hardcoded an empty `[[calls]]` slice regardless
+    /// of what the nest declared, so `nuthatch bench backfill --seal-direct` against a calls nest
+    /// measured a nest with none - the same "harness measures a strawman" failure #224 found in
+    /// this file three weeks earlier, for a different reason. Built the fixture through the real
+    /// constructor (`Config::load` + `from_nest`), not hand-assembled structs, so the defect and
+    /// the fix are both proven against what `backfill()` itself runs, not a stand-in for it.
+    #[tokio::test]
+    async fn seal_direct_bench_resolves_declared_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        assert!(
+            !config.calls.is_empty(),
+            "control: the fixture must actually declare a call, or this test proves nothing"
+        );
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        let (main_url, main_handle) = stub_full_rpc().await;
+        let (state_url, state_handle) = stub_full_rpc().await;
+        let state_rpc = RpcClient::new(vec![state_url]).unwrap();
+
+        // `every = 1` over blocks 1..=3 samples all three - a per-block hash fetch would be three
+        // `block_hash` round trips (pre-#720), a batched one a single `block_headers` call. Either
+        // way this test only cares whether the call rows made it to the manifest.
+        let r = one_run(
+            &[main_url],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &config.calls,
+            Some(&state_rpc),
+            config.nest.chain_id,
+            1,
+            3,
+            10,
+            true, // seal_direct: the Direct path (concurrency 1)
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        main_handle.abort();
+        state_handle.abort();
+
+        assert!(
+            r.calls_resolved > 0,
+            "seal-direct bench must resolve the nest's declared [[calls]] and record it on the \
+             run, got calls_resolved = {} - #725 is that every seal-direct call site hardcoded an \
+             empty calls slice regardless of what the nest declared",
+            r.calls_resolved
+        );
     }
 }
