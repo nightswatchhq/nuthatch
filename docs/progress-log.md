@@ -1459,6 +1459,9 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   the ask), and the r/rust determinism-proof angle. RFC-0007 rewritten to v2: records the operator
   conversation, adds the operator pilot as a launch phase (decoupled from public launch), revises the
   conversation roster, and resolves the demo-instance + Base-gate open questions. Docs only.
+  _(2026-08-22: this is a contemporaneous record of the draft as it read on 2026-07-19, not a current
+  claim - the ~20× figure it describes is under re-measurement, #722, with a discrepancy open in
+  #744; the draft itself has since been edited to drop the multiplier.)_
 
 - **2026-07-16 - RFC-0005 step 2: operator runtime surface (`/metrics`, SIGTERM, bind warning).**
   The §6 operator signals - the endpoint an operator alerts and bills against. New `GET /metrics`
@@ -1485,6 +1488,8 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   ~20× seal-direct/pipelined backfill, and the operator surface (`/metrics`, `/sql` guards, graceful
   shutdown). Published to crates.io and as prebuilt binaries on the GitHub Release. `cargo install`
   compiles on rustc ≥ 1.95; the binaries are the recommended path (no compile, no toolchain quirks).
+  _(2026-08-22: a contemporaneous record of what shipped in v0.1.0 - the ~20× figure is under
+  re-measurement, #722, with a discrepancy open in #744.)_
 - **2026-07-16 - RFC-0005 step 1: Base chain registry entry.** Adds `base` (chain 8453, OP-stack) to
   the registry - keyless Base RPCs, the same L1-aware `FinalizedTag` finality policy as Arbitrum, a
   moderate `log_window` the adaptive chunker tunes. Completes the operator launch matrix the RFC-0005
@@ -1512,6 +1517,8 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   silently ignored on a nest that declares them. Now `--backfill N` is an `Option` that **explicitly
   overrides** `start_block` (recent-history mode); omitting it backfills from deployment. `cold_start_block`
   policy tightened + re-tested. 51 tests.
+  _(2026-08-22: a contemporaneous record - the "20×" in this entry's own heading is under
+  re-measurement, #722, with a discrepancy open in #744.)_
 - **2026-07-16 - RFC-0004 step 3: pipelined backfill (~20× stacked, measured).** With storage cheap
   (seal-direct), wall-clock is dominated by sequential `getLogs` latency. `indexer::backfill_direct_pipelined`
   fetches `K` windows concurrently (`futures::stream::buffered`) but consumes results **in block
@@ -1521,6 +1528,9 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   ~24 requests): seal-direct 2,420 ev/s → **8-way pipeline 5,837 ev/s (~2.4×)**, stacking to **~20×
   over the redb baseline** (289 ev/s). Public-RPC-bound here (4 endpoints); higher against an own node.
   RSS 62 MB (K windows in flight - bounded, within budget). 51 tests (+1 determinism).
+  _(2026-08-22: a contemporaneous record of the 2026-07-16 measurement - the redb baseline and the
+  resulting ~20× are under re-measurement, #722, with a discrepancy open in #744; the pipeline's own
+  concurrency speedup, independent of the storage-path baseline, has held up.)_
 - **2026-07-16 - RFC-0004 step 2: seal-direct backfill (~8.7× measured).** Past-finality history can
   skip the hot store entirely: `indexer::backfill_direct` streams decode → buffered rows →
   content-addressed Parquet segments, no redb write, no read-back, no prune - with the same implicit
@@ -1530,6 +1540,10 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   and reusable by a future `dev --seal-direct`. Measured on USDC (same 120 blocks, same 24 RPC
   requests, only the storage path differing): hot store 289 ev/s vs **seal-direct 2,521 ev/s - ~8.7×**;
   the gap is ~12k per-row redb fsyncs the direct path never pays. 50 tests (+1 path-equivalence).
+  _(2026-08-22: a contemporaneous record - #224 (2026-07-30) later found this harness measured
+  `put_entity` per row rather than the `commit_window` path the indexer actually uses, making the
+  ~8.7× an upper bound against a fixed strawman, not a measurement of the current code. Re-measurement
+  is #722; its own result is itself disputed as of this date, tracked in #744.)_
 - **2026-07-16 - RFC-0004 step 1: `nuthatch bench backfill` (measure first).** An honest,
   reproducible backfill-throughput harness - runs the real fetch → decode → store path over a *pinned*
   block range and reports the **median** of events/sec, wall-clock, peak RSS, and RPC requests (incl.

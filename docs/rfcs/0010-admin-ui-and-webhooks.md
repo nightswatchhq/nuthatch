@@ -77,6 +77,8 @@ UI's status page consumes the same numbers over JSON, it does not define them.
   screencast's second act. With `--seal-direct` now in `dev`, the status page should
   show the phased cold start explicitly (fast-seal progress, then live tail) -
   the 20× is invisible in curl output and *very* visible here.
+  _(2026-08-22: the "20×" here is under re-measurement, #722, with a discrepancy open
+  in #744.)_
 
 ### Acceptance - unchanged from v1
 (Quickstart → tables visibly filling; ≤150 KB binary delta, ≤5 MB RSS delta;

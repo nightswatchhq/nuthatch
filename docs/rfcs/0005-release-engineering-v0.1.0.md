@@ -52,6 +52,8 @@ about what won't break between versions.
 Explicitly NOT required: RFC-0003 ExEx wiring (0.2.x after the node soak; both
 toolchain blockers already cleared), further RFC-0004 optimization (measured ~20×
 suffices; adaptive chunker lands incrementally), RFC-0008 compliance slices.
+_(2026-08-22: the ~20× cited here is under re-measurement, #722, with a discrepancy
+open in #744.)_
 
 ## Design
 

@@ -82,6 +82,8 @@ disclosed per Rule 4: "An independent infrastructure operator (GraphOps) is prep
 a hosted offering of Nuthatch and shares revenue with the maintainer; this
 application funds the commons-facing roadmap that hosting revenue would not
 prioritize."
+_(2026-08-22: the ~20× cited here is under re-measurement, #722, with a discrepancy
+open in #744; `docs/grants/nlnet.md` itself no longer quotes the multiplier.)_
 
 ### Budget (€38,400 requested; NLnet range €5-50K) - revised per Rule 1
 
