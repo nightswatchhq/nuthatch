@@ -343,11 +343,13 @@ means you are the one who sees it.
 
 **Measured on our own reference deployment**
 ([#750](https://github.com/nightswatchhq/nuthatch/issues/750), audited 2026-08-22): four nests, one
-week, **~11.8M RPC requests** against **~97 HTTP requests served** - roughly **122,000 RPC requests
-per HTTP request answered**. That HTTP count is itself an overstatement: it includes the auditor's own
-`/metrics` probes. Corrected for that on the busiest of the four, `graph-staking-nest` served **~39
-external HTTP requests over 7.2 days** (about five a day) against **3,954,332 RPC requests** in the
-same window - so the true ratio on that nest is worse than 122,000:1, not better.
+week, **~11.8M RPC requests** against **~100 HTTP requests served** (the sum of the table below) -
+roughly **118,000 RPC requests per HTTP request answered**. Only `graph-staking-nest`'s figure was
+checked against the auditor's own `/metrics` probes and corrected down, from a raw 40 to **~39
+external requests over 7.2 days** (about five a day) against its unchanged 3,954,332 RPC requests;
+the other three nests' counts are as directly measured and may still include some of that same probe
+traffic. So ~100, and the ~118,000:1 built on it, are if anything an understatement of the true RPC
+cost per real request, not an overstatement.
 
 | Nest | Role | RPC requests | HTTP requests served | Window |
 |---|---|---:|---:|---|
