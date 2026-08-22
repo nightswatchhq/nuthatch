@@ -1941,6 +1941,7 @@ abi = "abis/c.json"
                     3,
                     10,
                     seal_direct,
+                    false, // window_adaptive: irrelevant to this test, fixed is the cheaper default
                     1,
                     1,
                     Some(&work),
