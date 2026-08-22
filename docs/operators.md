@@ -334,6 +334,86 @@ events, not chain history: a nest tracking a few events on a few contracts stays
 
 ---
 
+## What a nest costs at tip
+
+Capacity above is about RAM. This section is about a different bill: **RPC requests**, which is what
+your provider actually charges for, and which does not stop after backfill - a nest following tip
+keeps paying it for as long as it runs. "Be your own indexer" does not mean this cost disappears; it
+means you are the one who sees it.
+
+**Measured on our own reference deployment**
+([#750](https://github.com/nightswatchhq/nuthatch/issues/750), audited 2026-08-22): four nests, one
+week, **~11.8M RPC requests** against **~97 HTTP requests served** - roughly **122,000 RPC requests
+per HTTP request answered**. That HTTP count is itself an overstatement: it includes the auditor's own
+`/metrics` probes. Corrected for that on the busiest of the four, `graph-staking-nest` served **~39
+external HTTP requests over 7.2 days** (about five a day) against **3,954,332 RPC requests** in the
+same window - so the true ratio on that nest is worse than 122,000:1, not better.
+
+| Nest | Role | RPC requests | HTTP requests served | Window |
+|---|---|---:|---:|---|
+| `graph-staking-nest` | Lodestar delegation feed | 3,954,332 | ~39 (corrected; excludes audit probes) | 7.2 days |
+| `graph-gns-nest` | Lodestar developer-activity | 3,952,456 | 28 | 7.2 days |
+| `horizon-nest` | Lodestar Oracle; paid Alchemy state RPC | 1,110,323 | 1 | 7.2 days |
+| `doudouchain-v2-nest` | labelled *temporary*, 3 entities, 98 MB on disk; **stopped 2026-08-22** | 2,806,035 | 32 | 5 days |
+
+The fourth row, explicitly labelled *temporary*, was stopped on the board's instruction once the
+audit surfaced it: 2.8M RPC requests over five days to hold three entities. What remains running is
+**~9M RPC requests a week** across the first three nests, and the audit's own conclusion about that
+remainder is that none of it is waste - it is load established, not assumed, to be necessary (next
+section).
+
+### Why: `block_timestamps` is a header round trip, every block
+
+The mechanism is the one already described under [Configuration
+surface](#configuration-surface): a timestamp lives in the block header, not in the log
+`eth_getLogs` returns, so serving `block_timestamp` costs one extra `eth_getBlockByNumber` per
+distinct block (RFC-0029 §4). That cost does not end when backfill does - a nest at tip pays it again
+on every new block, indefinitely.
+
+Arbitrum produces about 345,600 blocks a day. `graph-staking-nest` averaged **~549,000 requests a
+day** over the audit window - the right order of magnitude for a header fetch per block plus its log
+polling on top.
+
+Both Lodestar panels turned out to need the column, confirmed by reading the app's own SQL rather than
+assumed: `graph-staking-nest` filters on `block_timestamp` for a "last seven days" delegation view,
+and `graph-gns-nest` uses it as the entity's `createdAt` for a weekly publication trend. So the column
+stays on for both - not because it was left at its default, but because each nest's actual consumer
+asked for it. That is a decision made against your own consumers, not a recommendation this page is
+making either way; see the `block_timestamps` guidance under [Configuration
+surface](#configuration-surface) for how to decide it for a new nest.
+
+### What that costs against a priced endpoint
+
+None of the request volume above was billed: three of the four nests run against
+`arb1.arbitrum.io`, the same class of free public endpoint the [README](../README.md) already flags
+as "rate-limited and shared" and "not fine for real work." `horizon-nest` is the one exception, on
+paid Alchemy - 1.1M requests to serve a single HTTP request over the audit window, with no invoice
+figure quoted for it in #750.
+
+Pricing the header-fetch load alone against a metered endpoint, the same way
+[`benchmarks.md`](benchmarks.md) prices a backfill:
+
+```
+cost/month ≈ blocks/day × CU(eth_getBlockByNumber) × days/month × $/CU
+           ≈ 345,600     × 20                       × 30         × $0.00000045
+           ≈ $93/month
+```
+
+`eth_getBlockByNumber` at 20 CU, and $0.45 per million CU for the first 300M CU/month, are Alchemy's
+own published pay-as-you-go rates, checked 2026-08-22 - not the invoiced rate `benchmarks.md` uses
+for its backfill figures, though the two happen to agree. Sources:
+[compute unit costs](https://www.alchemy.com/docs/reference/compute-unit-costs),
+[pricing](https://www.alchemy.com/pricing).
+
+This is the header-fetch term only, for one chain at Arbitrum's block rate. It excludes
+`eth_getLogs` polling - the rest of the ~549,000 daily requests observed - and any other RPC method a
+nest calls, so it is a floor, not a full bill. A nest sitting at tip, answering nobody, still costs
+on the order of **~$100/month** against a paid provider. That figure is this computation, not a
+measurement - the reference deployment itself paid nothing for it, because it runs against a free
+endpoint.
+
+---
+
 ## Configuration surface
 
 **Files:** `mounts.toml` (chains, mounted nests, budget), `nuthatch.toml` per nest (contracts, events,
