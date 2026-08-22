@@ -2585,17 +2585,21 @@ mod tests {
         // developer machine while passing on CI, which is a worse outcome than not testing the
         // count at all: `fmt · clippy · test` is a required context, so it reddens `main` at random.
         //
-        // The claim worth pinning survives the range intact. The floor of 4 is the width-8 request
-        // plus one full 4 → 2 → 1 descent, so a regression that stopped exploring past the split
-        // still fails. The ceiling is what the note on `batch_is_narrowable` gets wrong: a per-item
+        // **The floor is 5, not 4 (#738).** 4 is the sequential count: width-8 plus the winning
+        // half's 4 → 2 → 1 descent without the sibling ever being polled. Because `try_join!`
+        // polls both futures from the first await, the losing half always issues at least its own
+        // width-4 request before the winner's `Err` propagates - making the true minimum
+        // 1 + 3 + 1 = 5. Measured on dev box at f0e2ca3: `parallel: true` → 7 (20/20);
+        // `parallel: false` (reverts #728) → 4 (20/20). The floor of 4 admitted the regression.
+        // The ceiling is what the note on `batch_is_narrowable` gets wrong: a per-item
         // failure is an HTTP 200, so the retry loop breaks on its first attempt and each level costs
         // **one** request, not `TIMESTAMP_ATTEMPTS`. Were that wrong, the count would be a multiple
         // of four and land far outside this range.
         let n = seen.load(Ordering::SeqCst);
         assert!(
-            (4..=7).contains(&n),
+            (5..=7).contains(&n),
             "a per-item error costs one request per level and never enters the retry loop, so the \
-             descent is 4..=7 requests depending on where `try_join!` cancelled the losing half; \
+             concurrent descent is 5..=7 requests (#728); \
              got {n}, and a full retry cycle would be {}",
             7 * super::TIMESTAMP_ATTEMPTS
         );
