@@ -60,6 +60,7 @@ async fn seal_with_window(dir: &std::path::Path, window: u64) -> Vec<String> {
         1,
         60,
         window,
+        true,
     )
     .await
     .expect("backfill_direct");

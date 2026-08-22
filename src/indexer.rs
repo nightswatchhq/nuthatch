@@ -2551,6 +2551,13 @@ pub(crate) async fn resolve_calls_for_window(
 /// [`seal::seal_range`], so a given range yields byte-identical segments regardless of path (the
 /// determinism guarantee, asserted in seal's path-equivalence test). The bounded buffer caps RSS by
 /// construction. Only valid for ranges already past finality - there is no reorg risk to roll back.
+///
+/// `adaptive` selects the fetch-windowing strategy independently of the fact that this is the
+/// seal-direct path (#744): `true` is what every other caller of this function wants (and what
+/// `backfill_direct_pipelined`/`backfill_direct_factory` always do), `false` holds `window` fixed
+/// for the whole run, with no shrink-and-retry on a provider cap - the "seal-fixed" bench control
+/// that isolates the storage-path delta from the adaptive chunker's own contribution. This function
+/// has no caller outside `bench` and its own tests, so `false` never reaches `nuthatch dev`.
 /// Returns the number of rows sealed.
 #[allow(clippy::too_many_arguments)]
 pub async fn backfill_direct(
@@ -2565,6 +2572,7 @@ pub async fn backfill_direct(
     from: u64,
     to: u64,
     window: u64,
+    adaptive: bool,
 ) -> Result<u64> {
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
     let mut buf: Vec<(u64, String)> = Vec::new();
@@ -2575,13 +2583,17 @@ pub async fn backfill_direct(
     // from the chain's default window - so dense and sparse ranges self-tune and provider result
     // caps are handled by shrink-and-retry rather than a hard failure.
     // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
-    let mut chunker = if registry.blocks() {
-        AdaptiveWindow::for_window_with_headers(window)
-    } else {
-        AdaptiveWindow::for_window(window)
-    };
+    // `None` when `adaptive` is false: the width then never moves off `window`, and a provider
+    // result cap surfaces as a hard error instead of a shrink (see the `Err` arm below).
+    let mut chunker = adaptive.then(|| {
+        if registry.blocks() {
+            AdaptiveWindow::for_window_with_headers(window)
+        } else {
+            AdaptiveWindow::for_window(window)
+        }
+    });
     while next <= to {
-        let chunk_to = (next + chunker.window() - 1).min(to);
+        let chunk_to = (next + chunker.as_ref().map_or(window, AdaptiveWindow::window) - 1).min(to);
         // Nothing to decode means nothing to ask for. An empty address AND topic filter is not
         // "no logs" to a node - it is *every log on the chain*, which a blocks-only nest (OBIB case
         // 3: no contract at all) would otherwise request for every window and then discard, since
@@ -2594,15 +2606,23 @@ pub async fn backfill_direct(
             None => Vec::new(),
             Some(filter) => match source.logs(&filter, next, chunk_to).await {
                 Ok(logs) => {
-                    chunker.observed(logs.len() as u64);
+                    if let Some(c) = &mut chunker {
+                        c.observed(logs.len() as u64);
+                    }
                     logs
                 }
-                Err(e) if chunker::is_result_too_large(&e) => {
+                // Only reachable in adaptive mode: fixed mode has no chunker to shrink, so a cap
+                // falls through to the plain `Err(e)` arm below and the run fails loudly rather than
+                // silently changing the width `--window-adaptive` was asked not to change.
+                Err(e) if chunker.is_some() && chunker::is_result_too_large(&e) => {
                     if next >= chunk_to {
                         return Err(e).with_context(|| single_block_over_cap(next));
                         // H3: can't shrink a block
                     }
-                    chunker.too_large();
+                    chunker
+                        .as_mut()
+                        .expect("checked chunker.is_some() above")
+                        .too_large();
                     tracing::debug!("range {next}..={chunk_to} refused; shrinking and retrying");
                     continue; // retry the same `next` with a smaller window
                 }
@@ -7953,6 +7973,7 @@ template = "pool"
             10,
             39,
             5,
+            true,
         )
         .await
         .unwrap();
@@ -8105,6 +8126,7 @@ template = "pool"
             10,
             21,
             100,
+            true,
         )
         .await
         .unwrap();
@@ -8124,6 +8146,7 @@ template = "pool"
             10,
             21,
             100,
+            true,
         )
         .await
         .unwrap();
@@ -9468,6 +9491,7 @@ template = "pool"
             1,
             20,
             5,
+            true,
         )
         .await
         .unwrap();
@@ -9530,6 +9554,7 @@ template = "pool"
             1,
             20,
             5,
+            true,
         )
         .await
         .unwrap();
@@ -10358,6 +10383,7 @@ template = "pool"
             5,
             6,
             100,
+            true,
         )
         .await
         .unwrap();
