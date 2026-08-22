@@ -2447,8 +2447,12 @@ async fn fetch_timestamps(
 ///
 /// Mirrors the tier-3 resolution in `process_window` exactly so the sealed rows are identical
 /// regardless of which path produced them. Returns an empty vec when `calls` is empty.
+///
+/// `pub(crate)` for `bench.rs`, whose hot-store arm is a private reimplementation of this loop and
+/// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
+/// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_calls_for_window(
+pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
     state_rpc: &crate::rpc::RpcClient,
