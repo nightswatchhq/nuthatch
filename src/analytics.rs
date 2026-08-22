@@ -2739,10 +2739,8 @@ template="pool"
             "word32-storage non-counter column must stub VARCHAR, got: {s}"
         );
         // The four counter columns stay UBIGINT (by name).
-        let s2 = with_declared_base_cols(
-            "src",
-            &[("block_number".to_string(), "word32".to_string())],
-        );
+        let s2 =
+            with_declared_base_cols("src", &[("block_number".to_string(), "word32".to_string())]);
         assert!(
             s2.contains(r#"CAST(NULL AS UBIGINT) AS "block_number""#),
             "got: {s2}"
