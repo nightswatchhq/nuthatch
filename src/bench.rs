@@ -1650,7 +1650,14 @@ abi = "abis/c.json"
         let (state_url, state_handle) = stub_full_rpc().await;
         let state_rpc = RpcClient::new(vec![state_url]).unwrap();
 
-        let run_arm = |seal_direct: bool, run: usize| {
+        // An explicit work directory per arm, rather than `one_run`'s default. That default is
+        // `temp_dir()/nuthatch-bench-<pid>-<run>`, keyed by run *index*, so it is shared by every
+        // test in this binary using that index - two in flight at once (cargo runs the tests as
+        // threads of one process) clear each other's work dir mid-run. Passing `keep` is what makes
+        // these two arms independent of the rest of the module.
+        let hot_dir = tempfile::tempdir().unwrap();
+        let sealed_dir = tempfile::tempdir().unwrap();
+        let run_arm = |seal_direct: bool, work: &std::path::Path| {
             let (main_url, addresses, topic0s, registry, state_rpc) = (
                 main_url.clone(),
                 addresses.clone(),
@@ -1660,6 +1667,7 @@ abi = "abis/c.json"
             );
             let calls = config.calls.clone();
             let chain_id = config.nest.chain_id;
+            let work = work.to_path_buf();
             async move {
                 one_run(
                     &[main_url],
@@ -1675,16 +1683,16 @@ abi = "abis/c.json"
                     10,
                     seal_direct,
                     1,
-                    run,
-                    None,
+                    1,
+                    Some(&work),
                 )
                 .await
                 .unwrap()
             }
         };
 
-        let hot = run_arm(false, 1).await;
-        let sealed = run_arm(true, 2).await;
+        let hot = run_arm(false, hot_dir.path()).await;
+        let sealed = run_arm(true, sealed_dir.path()).await;
 
         main_handle.abort();
         state_handle.abort();
