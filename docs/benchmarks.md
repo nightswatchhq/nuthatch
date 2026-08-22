@@ -129,7 +129,11 @@ read-back, no prune. The bounded buffer caps RSS by construction. `seal_range` i
 writer, so a given range yields **byte-identical** segments whether sealed directly or via the hot
 store (asserted by `seal::seal_direct_matches_seal_via_hot_store`).
 
-Measured before/after (same range, same RPC cost, only the storage path differs). Artifacts:
+Measured before/after. `--seal-direct` changes two things at once, not one: the storage path, and the
+fetch-windowing strategy (`window_adaptive: args.seal_direct` at `src/bench.rs:383-384` - no flag
+separates them, so this table cannot isolate the storage path alone). On this range both arms did 34
+requests, so the windowing difference never actually diverged the two runs here, and the sequential
+comparison below is unaffected. Artifacts:
 [`docs/bench/722-hot.json`](bench/722-hot.json), [`docs/bench/722-seal-direct.json`](bench/722-seal-direct.json).
 
 | Path | Range | Events | Wall-clock | events/sec | RPC requests |
@@ -195,8 +199,10 @@ nuthatch bench backfill --dir <nest> --from A --to B --seal-direct --concurrency
 ```
 
 The pipeline itself still shows a real speedup - concurrent fetch genuinely overlaps public-endpoint
-round-trip latency, ~3.2× over single-threaded seal-direct here, bounded by this provider; against
-your own node (`--rpc`, `--concurrency 16`) it goes further. What collapsed is the *storage-path* half
+round-trip latency, ~3.2× over single-threaded seal-direct here, bounded by this provider - though part
+of the ~2.9× vs. hot store is fewer, wider requests (24 against the hot arm's 34) rather than the
+overlapped latency alone; against your own node (`--rpc`, `--concurrency 16`) it goes further. What
+collapsed is the *storage-path* half
 of the old ~22.5× (hot store vs. pipeline): see the seal-direct-vs-hot-store discrepancy above - see
 also #744 - today's hot-store baseline came in far faster than the 607 ev/s this page previously
 quoted, and that drags every "vs hot store" ratio in this table down with it. RSS rose to ~68 MB with
