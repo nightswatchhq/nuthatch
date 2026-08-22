@@ -1,6 +1,7 @@
 # Sprint: nocturnal-nightjar
 
-Filed by the board on 2026-08-22, after meticulous-magpie closed six of six in a day.
+Filed by the board on 2026-08-22, after meticulous-magpie closed six of seven in a day - the seventh
+being #744, carried into this sprint and relabelled at 17:13Z.
 **Four issues of new work**, plus #744 which #767 closes as its first customer - **five carry the
 label**. Runs **Saturday 2026-08-22 to Friday 2026-08-28** - a week, not a weekend, and the reason is
 in *How this sprint runs differently* below.
@@ -101,7 +102,7 @@ board's remaining budget to zero.
 Three amendments, and they are standing rather than specific to this sprint.
 
 **1. Scope is the board's, and a label is not approval.** meticulous-magpie was filed with four issues
-and finished with six carrying the label, the extra two self-labelled in flight. Every one was on-theme and the work was good,
+and finished with seven, all self-labelled in flight. Every one was on-theme and the work was good,
 which is exactly why this needs saying: a sprint that can extend itself has no natural end, and the
 allowance stops it rather than the plan. Discovered work is filed **unlabelled**. Pulling it into
 scope needs a board reply on the sprint issue.
