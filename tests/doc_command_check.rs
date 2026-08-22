@@ -18,7 +18,7 @@
 //! that blind scan, safely, because its scope is `skills/nuthatch-builder/*.md` alone - a skill
 //! that is entirely about nuthatch usage. This file does not widen that one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::CommandFactory;
@@ -29,42 +29,55 @@ fn repo_root() -> PathBuf {
 }
 
 /// Deliberate historical or explanatory mentions of a command/flag the binary no longer accepts.
-/// Every entry needs the file it appears in, the exact unresolved word, and why it stays. This is
-/// the useful artifact acceptance #4 asks for, not a way to make the check quieter - an entry that
-/// stops matching anything is dead weight and fails the build too (see `allowlist_has_no_stale_entries`).
-const ALLOWED: &[(&str, &str, &str)] = &[
+/// Every entry needs the file it appears in, the exact unresolved word, how many times it is
+/// expected to appear, and why it stays. Keying on `(file, token)` alone would exempt *every*
+/// mention of that token in that file forever, not just the historical one that justified the
+/// entry - acceptance #1 says "any documented file", and a file that already carries an entry is
+/// not an exception to that. Pinning the count closes it: a new mention pushes the actual count
+/// above the declared one and fails the build same as an unlisted file would; a removed mention
+/// pulls it below and fails too, so a dead entry can't sit unnoticed (`allowlist_has_no_stale_entries`
+/// no longer needs to exist as a separate check - a stale entry is just the actual-count-0 case).
+const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "docs/operators.md",
         "roost",
+        1,
         "the pre-2.0 -> 2.0 migration table maps the retired `nuthatch roost dev` to its \
          replacement; the mapping needs both names",
     ),
     (
         "docs/progress-log.md",
         "roost",
+        2,
         "dated progress-log entries describe RFC-0012 as it was built, before RFC-0032 retired the \
-         roost - it's a record of the past, not current usage",
+         roost - it's a record of the past, not current usage. Two mentions: the 2026-07-16 slice-1 \
+         entry (line ~954) and the 2026-07-18 slice-1 recap (line ~989)",
     ),
     (
         "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
         "roost",
+        1,
         "RFC-0012 is the design doc that introduced `nuthatch roost dev`; RFC-0032 retired it and \
          RFCs are dated writing, not current docs (same exemption `version-check.sh` gives them)",
     ),
     (
         "docs/rfcs/0027-the-live-roost.md",
         "roost",
-        "RFC-0027 is titled around the roost and designs its CLI; dated writing, same as 0012",
+        2,
+        "RFC-0027 is titled around the roost and designs its CLI; dated writing, same as 0012. Two \
+         mentions on one line (~181): `nuthatch roost mount` and `nuthatch roost unmount`",
     ),
     (
         "docs/sprint-languid-lapwing.md",
         "roost",
+        1,
         "the sprint doc that fixed the incident names the removed command as the regression it \
          closes - it would be a strange irony for this check to make that sentence unwritable",
     ),
     (
         "docs/sprint-nocturnal-nightjar.md",
         "roost",
+        1,
         "this sprint doc's own #769 entry states the regression test this file is - \"reintroducing \
          `nuthatch roost` into any documented file must fail the build\" - same reasoning as the \
          sprint-languid-lapwing.md entry above",
@@ -72,6 +85,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "docs/progress-log.md",
         "upgrade",
+        1,
         "the 2026-07-21 entry documents `nuthatch nest upgrade` as it was that day (RFC-0020); the \
          file's own header warns no entry is kept in step with the binary - it does not exist in \
          2.2.0+",
@@ -79,52 +93,61 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "docs/progress-log.md",
         "diff",
+        1,
         "same RFC-0020 entry, `nuthatch nest diff` - dated progress-log writing, not current usage",
     ),
     (
         "docs/progress-log.md",
         "mount",
+        1,
         "the 2026-07-18 RFC-0012 slice 6 entry documents `nuthatch nest mount` as shipped that day; \
          dated progress-log writing describing history, same as the roost entries above",
     ),
     (
         "docs/progress-log.md",
         "pack",
+        1,
         "the 2026-07-18 RFC-0012 slice 5 entry documents `nuthatch nest pack` as shipped that day - \
          the verb was later folded into `nuthatch nest bundle`",
     ),
     (
         "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
         "pack",
+        1,
         "RFC-0012 §5 designs `nuthatch nest pack`, the verb `nest bundle` later replaced; dated \
          design writing, same exemption `version-check.sh` gives docs/rfcs/",
     ),
     (
         "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
         "mount",
+        1,
         "RFC-0012 §6 designs `nuthatch nest mount`, since removed; dated design writing",
     ),
     (
         "docs/rfcs/0001-generalized-decode-and-nests.md",
         "build",
+        1,
         "\"a future `nuthatch build --aot` could revisit\" - explicitly a proposal for later, never \
          built; the RFC says so itself",
     ),
     (
         "docs/rfcs/0001-generalized-decode-and-nests.md",
         "--aot",
+        1,
         "the same never-built proposal - see the `build` entry above",
     ),
     (
         "docs/rfcs/0016-governed-semantic-layer-and-agent-grade-mcp.md",
         "eval",
+        1,
         "RFC-0016 §1 proposes a `nuthatch eval` harness; not a shipped top-level subcommand",
     ),
     (
         "docs/rfcs/0024-eth-call-execution-engine.md",
         "state-cache",
+        2,
         "RFC-0024 proposes `nuthatch state-cache clear` for the L3 call-result cache; not a shipped \
-         subcommand",
+         subcommand. Two mentions (lines ~175, ~255)",
     ),
 ];
 
@@ -141,7 +164,7 @@ impl Finding {
     fn is_allowed(&self) -> bool {
         ALLOWED
             .iter()
-            .any(|(f, tok, _)| *f == self.file && *tok == self.bad_token)
+            .any(|(f, tok, _, _)| *f == self.file && *tok == self.bad_token)
     }
 }
 
@@ -445,38 +468,45 @@ fn every_documented_command_and_flag_is_real() {
          add a reasoned entry to ALLOWED in tests/doc_command_check.rs:\n{}",
         offenders.join("\n")
     );
+
+    // Every entry's declared count must match the number of unresolved mentions actually found -
+    // in either direction. A count too low (including zero - a stale entry matching nothing) is
+    // the old `allowlist_has_no_stale_entries` check; a count too high is the bug that check never
+    // caught: an entry keyed on `(file, token)` alone exempts every future mention in that file,
+    // not just the one that justified it, so acceptance #1 ("any documented file") silently stops
+    // holding for files that already carry an entry. Pinning the count closes both directions.
+    let miscounted = miscounted_allowlist_entries(&findings);
+    assert!(
+        miscounted.is_empty(),
+        "ALLOWED counts in tests/doc_command_check.rs no longer match the doc set:\n{}",
+        miscounted.join("\n")
+    );
 }
 
-#[test]
-fn allowlist_has_no_stale_entries() {
-    let root = repo_root();
-    let real = real_flags();
-    let mut findings = Vec::new();
-    for path in doc_files() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let file = rel(&root, &path);
-        check_text(&text, &file, &real, &mut findings);
+/// Entries in `ALLOWED` whose declared count doesn't match the number of unresolved mentions
+/// actually present in `findings` for that `(file, token)` pair - see the assertion in
+/// `every_documented_command_and_flag_is_real` for why both directions matter.
+fn miscounted_allowlist_entries(findings: &[Finding]) -> Vec<String> {
+    let mut actual_counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for f in findings {
+        *actual_counts
+            .entry((f.file.as_str(), f.bad_token.as_str()))
+            .or_insert(0) += 1;
     }
-
-    let seen: BTreeSet<(&str, &str)> = findings
+    ALLOWED
         .iter()
-        .map(|f| (f.file.as_str(), f.bad_token.as_str()))
-        .collect();
-
-    let stale: Vec<String> = ALLOWED
-        .iter()
-        .filter(|(file, tok, _)| !seen.contains(&(*file, *tok)))
-        .map(|(file, tok, _)| format!("{file}: `{tok}` (no longer an unresolved mention here)"))
-        .collect();
-
-    assert!(
-        stale.is_empty(),
-        "ALLOWED entries in tests/doc_command_check.rs no longer match anything, which hides the \
-         next real gap - remove them:\n{}",
-        stale.join("\n")
-    );
+        .filter_map(|(file, tok, declared, _)| {
+            let actual = actual_counts.get(&(*file, *tok)).copied().unwrap_or(0);
+            (actual != *declared).then(|| {
+                format!(
+                    "{file}: `{tok}` allow-listed for exactly {declared} mention(s), found {actual} \
+                     - a new mention needs its own reviewed entry, not a free ride on this one's \
+                     count; a removed mention needs the count brought down (or the entry deleted if \
+                     it hits zero)"
+                )
+            })
+        })
+        .collect()
 }
 
 // ── Proving the mechanism can fail before it is trusted (acceptance #3) ──────────────────────
@@ -572,7 +602,7 @@ fn an_allowlisted_mention_is_suppressed_only_in_its_own_file() {
     assert!(
         ALLOWED
             .iter()
-            .any(|(f, t, _)| *f == "docs/operators.md" && *t == "roost"),
+            .any(|(f, t, _, _)| *f == "docs/operators.md" && *t == "roost"),
         "sanity: the allow-list this test exercises must still name the operators.md roost entry"
     );
     let finding = Finding {
@@ -592,5 +622,66 @@ fn an_allowlisted_mention_is_suppressed_only_in_its_own_file() {
     assert!(
         !same_word_elsewhere.is_allowed(),
         "an allow-list entry is pinned to its file - the same word elsewhere must still fail"
+    );
+}
+
+/// The gap NIG-341's review found: `is_allowed()` alone (the check above) treats every mention of
+/// an allow-listed token in its file as fine, so a *second*, brand-new `roost` mention landing in
+/// `docs/operators.md` - already exempt for the historical migration-table one - would pass
+/// silently, against acceptance #1 ("reintroducing `nuthatch roost` into any documented file fails
+/// the build"). `miscounted_allowlist_entries` is the fix: it compares the declared count against
+/// how many times the pair actually shows up.
+#[test]
+fn a_second_mention_in_an_already_allowlisted_file_is_not_free() {
+    let declared = ALLOWED
+        .iter()
+        .find(|(f, t, _, _)| *f == "docs/operators.md" && *t == "roost")
+        .map(|(_, _, count, _)| *count)
+        .expect("sanity: the allow-list this test exercises must still name the entry");
+    assert_eq!(
+        declared, 1,
+        "this test's synthetic two-mention fixture assumes the real entry declares exactly one"
+    );
+
+    // `miscounted_allowlist_entries` walks the whole real `ALLOWED` table, not just the pair under
+    // test, so a findings list built from scratch reads every *other* entry as a zero-actual
+    // mismatch too - filter down to the one entry this test is about before asserting on it.
+    let concerns_operators_roost =
+        |m: &String| m.contains("docs/operators.md") && m.contains("roost");
+
+    let one_mention = vec![Finding {
+        file: "docs/operators.md".to_string(),
+        line: 1,
+        bad_token: "roost".to_string(),
+        detail: String::new(),
+    }];
+    assert!(
+        !miscounted_allowlist_entries(&one_mention)
+            .iter()
+            .any(concerns_operators_roost),
+        "the declared, single historical mention must not itself be flagged"
+    );
+
+    let two_mentions = vec![
+        Finding {
+            file: "docs/operators.md".to_string(),
+            line: 1,
+            bad_token: "roost".to_string(),
+            detail: String::new(),
+        },
+        Finding {
+            file: "docs/operators.md".to_string(),
+            line: 200,
+            bad_token: "roost".to_string(),
+            detail: String::new(),
+        },
+    ];
+    let miscounted = miscounted_allowlist_entries(&two_mentions);
+    assert!(
+        miscounted
+            .iter()
+            .any(|m| m.contains("docs/operators.md") && m.contains("roost")),
+        "a second, new `roost` mention in the already-exempt file must be reported, not waved \
+         through on the first mention's count: {miscounted:?}"
     );
 }
