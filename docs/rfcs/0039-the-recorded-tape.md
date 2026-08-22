@@ -94,8 +94,17 @@ arguments (a singleton key each); `block_hash` keys on the block number. Order-k
 N verbatim" - breaks the instant concurrency is on the table: the `Pipelined` arm fires several
 window fetches at once, and a record session and a replay session can resolve them in a different
 interleaving without either being wrong. Content-keying is indifferent to interleaving by
-construction, which is also what makes one tape answer both the sequential and the pipelined arms
-in §7 without a second recording.
+construction - two sessions asking for the same set of ranges in a different order still hit the
+same keys. It is not indifferent to which ranges get asked for in the first place, and window
+policy changes exactly that: fixed windows, sequential adaptive windows, and pipelined adaptive
+windows are three different range decompositions, not one. So content-keying alone does not make
+one tape answer every arm in §7 - §7 says which arms share a decomposition, and therefore a tape,
+and which don't.
+
+**Recorded error strings are preserved byte for byte, not summarised.** They are control flow, not
+diagnostics: the pass-two shrink-retry logic (`is_result_too_large`, `suggested_split_point`) parses
+the provider's error text directly, so a replayed error has to reproduce the exact string a live
+provider sent, not just the fact that a call failed.
 
 Each key maps to a **queue** of recorded outcomes, consumed FIFO, rather than a single value - the
 same call can legitimately happen more than once in one run. (A shrink-retry after a provider cap
@@ -257,14 +266,21 @@ Named command, predicted numbers stated before the command runs - not asserted o
 
 ```sh
 # Once, from a real provider. Same nest, same range #744 already used - nothing new to justify here.
+# Fixed window, so this tape also serves §7's arms 1 and 3 (window decomposition doesn't depend
+# on storage path).
 nuthatch bench backfill --dir <usdc-nest> --from 25809368 --to 25809487 \
-  --record docs/bench/tapes/usdc-120-transfer.jsonl --runs 1
+  --record docs/bench/tapes/usdc-120-fixed.jsonl --runs 1
 
 # The demonstration. Precondition: an idle box - check `uptime` before starting and record it
 # (§4 item 6); a run taken on a loaded box is void, not evidence.
 nuthatch bench backfill --dir <usdc-nest> --from 25809368 --to 25809487 \
-  --replay docs/bench/tapes/usdc-120-transfer.jsonl --runs 5 --out replay-hot.json
+  --replay docs/bench/tapes/usdc-120-fixed.jsonl --runs 5 --out replay-hot.json
 ```
+
+§7 needs two more tapes, recorded the same way against the same range: one with `--window-adaptive`
+(sequential, serves arms 2 and 4) and one with `--window-adaptive --concurrency 8` (serves the
+pipelined arm only) - see §7 for why those are separate decompositions and this one isn't shared
+with either.
 
 **Predicted, before running, and falsifiable:**
 
@@ -295,14 +311,27 @@ trusting, rather than inventing a new one:
 3. seal-direct sequential, fixed window (`BackfillPath::Direct`, `window_adaptive: false`)
 4. seal-direct sequential, adaptive window (`BackfillPath::Direct`, `window_adaptive: true`)
 
-All four against the one `usdc-120-transfer.jsonl` tape from §6. Content-keying (§2) makes this safe
-regardless of window policy or storage path, since none of these four issue concurrent fetches.
+**Three tapes, one per range decomposition, not one tape for all four and not one tape per arm.**
+§2's content-keying is indifferent to interleaving, but it is not indifferent to which ranges get
+asked for at all, and window policy changes exactly that:
 
-`Pipelined` (seal-direct + `--concurrency 8`) runs as a fifth, informational arm on the *same* tape,
-for the separate pipeline-multiplier claim `docs/benchmarks.md`'s "Pipeline" section makes.
-Concurrency changes request *interleaving*, not request *content*, and content-keyed replay is
-indifferent to interleaving by construction (§2) - so one recording answers both questions, no
-second tape needed.
+- Arms 1 and 3 (fixed window) walk identical uniform windows regardless of storage path - the
+  chunker's fixed-size boundaries don't consult `BackfillPath` at all. One tape,
+  `usdc-120-fixed.jsonl` (§6), serves both.
+- Arms 2 and 4 (adaptive window, sequential) both consume controller feedback one window at a time,
+  in the same order, off the same log content - the adaptive controller's trajectory depends on what
+  came back, not on which storage path wrote it. One tape, `usdc-120-adaptive-seq.jsonl`, recorded
+  the same way as §6 but with `--window-adaptive`, serves both.
+
+`Pipelined` (seal-direct + `--concurrency 8`) runs as a fifth, informational arm on its own third
+tape, `usdc-120-adaptive-pipelined.jsonl`, for the separate pipeline-multiplier claim
+`docs/benchmarks.md`'s "Pipeline" section makes. It is always adaptive (`bench.rs:63`,
+`effective_window_adaptive` returns `true` unconditionally for `Pipelined`), but its feedback lags by
+up to `concurrency` windows (`indexer.rs:3208`) - windows already in flight when a given window's
+feedback lands - so its window trajectory, and therefore its range decomposition, differs from the
+sequential adaptive arm even though both are "adaptive." Concurrency changes request *interleaving*,
+which content-keyed replay (§2) handles fine within one decomposition; it's the feedback lag changing
+request *content* that rules out sharing arm 5's tape with arms 2 and 4.
 
 Whatever the five numbers say, publish them - closing #744 means the number is trusted, not that it
 favours seal-direct. "If seal-direct really is ~0.92x, we publish that. If it is 8x, we publish
@@ -325,9 +354,9 @@ tape *is* the range, the provider's actual response, and the declared event set,
 byte, forever - which is what "the tape has to be an artifact the repo holds and CI can reach"
 concretely requires:
 
-- `docs/bench/tapes/usdc-120-transfer.jsonl` (and siblings for W2/W3 as they're recorded) is
-  committed alongside the `bench-report.json` artifacts already living in `docs/bench/`, referenced
-  by content address from the report that used it.
+- `docs/bench/tapes/usdc-120-fixed.jsonl` and its two §7 siblings (and further siblings for W2/W3
+  as they're recorded) are committed alongside the `bench-report.json` artifacts already living in
+  `docs/bench/`, each referenced by content address from the report that used it.
 - A cheap, always-on CI check replays the tape and asserts the decoded event count against a
   hardcoded expectation (11,758) - a *correctness* check, not a perf gate, needing no network and no
   idle-box precondition. No CI YAML change is needed for this: the same precedent #769/PR #775
