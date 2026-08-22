@@ -37,10 +37,13 @@ The numbers I actually care about, all measured on the release build and reprodu
 - **~58 MB peak RAM** for a live 3-contract nest (USDC + WETH + DAI, 23 tables, indexing + sealing +
   DuckDB SQL + incremental balance views all at once); ~37 MB for a single contract. The RAM budget is
   ≤2 GB and CI fails the build above 256 MB - it's a budget, not a hope.
-- Backfill throughput optimised in the open: **~289 → ~5,837 events/sec (~20× stacked)** - a
-  seal-direct path that bypasses the hot store's per-row fsync (8.7×) plus an 8-way in-order pipeline
-  (2.4× on top), with byte-identical output proven across paths so the fast path is provably the same
-  data as the slow one. Public-RPC-bound at that figure; higher against your own node.
+- Backfill throughput is benchmarked in the open, not asserted: byte-identical output is proven
+  across the hot-store, seal-direct, and pipelined paths (whichever one writes, the sealed segments
+  are the same), and an 8-way concurrent pipeline gets a real, reproducible speedup by overlapping
+  RPC round-trip latency. The storage-path multiplier (seal-direct vs. hot store) is under active
+  re-measurement after a harness fix exposed the earlier figure as an artifact of a fixed strawman -
+  current numbers, machine, and harness commit are in `docs/benchmarks.md` (#722); a discrepancy in
+  that re-measurement is still open in #744, so no multiplier is quoted here until it settles.
 
 One genuinely different bit: entity views are **incremental** (Feldera/DBSP). A per-address balance
 view treats a reorg as a *retraction*, not a recompute - the same circuit runs a backfill as a batch
