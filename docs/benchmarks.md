@@ -129,12 +129,18 @@ read-back, no prune. The bounded buffer caps RSS by construction. `seal_range` i
 writer, so a given range yields **byte-identical** segments whether sealed directly or via the hot
 store (asserted by `seal::seal_direct_matches_seal_via_hot_store`).
 
-Measured before/after. `--seal-direct` changes two things at once, not one: the storage path, and the
-fetch-windowing strategy (`window_adaptive: args.seal_direct` at `src/bench.rs:383-384` - no flag
-separates them, so this table cannot isolate the storage path alone). On this range both arms did 34
-requests, so the windowing difference never actually diverged the two runs here, and the sequential
-comparison below is unaffected. Artifacts:
+Measured before/after. At the time of this run, `--seal-direct` changed two things at once, not one:
+the storage path, and the fetch-windowing strategy (`window_adaptive: args.seal_direct` - no flag
+separated them, so this table could not isolate the storage path alone). On this range both arms did
+34 requests, so the windowing difference never actually diverged the two runs here, and the
+sequential comparison below is unaffected. **`--window-adaptive` (#744) now decouples the two** -
+hot-fixed, hot-adaptive, seal-fixed and seal-adaptive are all reachable independently - but the runs
+below predate the flag and have not been re-measured with it; treat this table's windowing caveat as
+historical, not as a live gap. Artifacts:
 [`docs/bench/722-hot.json`](bench/722-hot.json), [`docs/bench/722-seal-direct.json`](bench/722-seal-direct.json).
+`722-seal-direct.json` records `window_adaptive: true`, so now that `--seal-direct` alone is the
+fixed-window arm, reproducing that artifact takes `--seal-direct --window-adaptive`, not
+`--seal-direct` by itself.
 
 | Path | Range | Events | Wall-clock | events/sec | RPC requests |
 |---|---|---|---|---|---|
@@ -188,8 +194,11 @@ rather than the `commit_window` path the indexer uses. #224 (`0cd291e`, 2026-07-
 8.7× was an upper bound against that strawman, not a measurement of the current code. Run it yourself:
 
 ```sh
-nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
-nuthatch bench backfill --dir <nest> --from A --to B --seal-direct   # seal-direct
+# --window-adaptive on the seal-direct arm because that is what the artifact above recorded
+# (`window_adaptive: true`); since #744 decoupled the two flags, `--seal-direct` on its own is the
+# fixed-window arm and reproduces a different run.
+nuthatch bench backfill --dir <nest> --from A --to B                                    # hot store (baseline)
+nuthatch bench backfill --dir <nest> --from A --to B --seal-direct --window-adaptive     # seal-direct
 ```
 
 ## Pipeline (`--concurrency K`, seal-direct only)

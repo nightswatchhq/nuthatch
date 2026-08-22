@@ -601,6 +601,18 @@ pub struct BackfillBenchArgs {
     #[arg(long)]
     pub seal_direct: bool,
 
+    /// Adapt the `eth_getLogs` window during the run (RFC-0004 §2) instead of holding it fixed at
+    /// the chain default - independent of `--seal-direct`.
+    ///
+    /// Before this flag the window strategy was welded to the storage path
+    /// (`window_adaptive: args.seal_direct`), so every "vs hot store" ratio this project has
+    /// published compared two variables at once with no way to isolate either. Pass this with or
+    /// without `--seal-direct` to reach all four combinations: hot-fixed (the default), hot-adaptive,
+    /// seal-fixed, seal-adaptive. Has no effect on the pipelined (`--concurrency > 1`) or factory
+    /// paths, which always adapt, the same as `nuthatch dev` (#744).
+    #[arg(long)]
+    pub window_adaptive: bool,
+
     /// Concurrent window fetches (seal-direct only). >1 overlaps RPC round-trip latency; results are
     /// still consumed in block order so segments are identical. Try 8-16 against your own node.
     #[arg(long, default_value_t = 1)]
