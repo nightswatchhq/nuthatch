@@ -133,26 +133,18 @@ Measured before/after (same range, same RPC cost, only the storage path differs)
 
 | Path | Range | Events | Wall-clock | events/sec |
 |---|---|---|---|---|
-| hot store (decode → redb) | USDC, 120 recent blocks (public RPC) | 12,127 | 42.0 s | **289** |
-| seal-direct (decode → Parquet) | same | 12,127 | 4.8 s | **~2,520** |
+| hot store (decode → redb) | USDC, blocks 25,809,368–25,809,487 (public RPC) | 12,933 | 21.3 s | **607** |
+| seal-direct (decode → Parquet) | same | 12,933 | 4.1 s | **3,137** |
 
-**~8.7× faster.** The RPC portion is identical between the two (24 requests each); the difference is
-that the hot path commits a redb transaction per row (~12k fsyncs), while seal-direct buffers and
-writes a handful of segments. Single-run public-RPC smoke figures - noisy in absolute terms, but the
-storage-path delta is the point and is not noise.
+**~5.2× faster.** The difference is a redb B-tree point-insert per row (indexed for point-reads)
+versus a buffered bulk Parquet write; the RPC cost is similar between the two paths.
 
-**Provenance note:** this table and the pipeline table below were both measured 2026-07-16
-(`f1a57de`, `3f7c51e`), before #224 (`0cd291e`, 2026-07-30) fixed the benchmark harness itself:
-`hot_store_backfill` wrote rows with `put_entity`, one redb write transaction and one fsync per row,
-rather than going through the `commit_window` path the indexer actually uses. (`Store::commit_window`
-had been correct in production since PERF-2, #77, 2026-07-18 - the strawman was the bench, not the
-store.) The `289 events/sec` hot-store baseline both tables share was produced by that per-row-commit
-harness - the sentence above describes it accurately, not today's `commit_window`. So `8.7×`, `8.4×`
-and `~20×` are upper bounds against a now-fixed harness, not measurements against the current
-one-commit-per-window code; the real gap is a redb B-tree point-insert per row (indexed for
-point-reads) versus a buffered bulk Parquet write, but how much smaller than 8.7× that makes it
-hasn't been measured. Re-measurement against the current harness is tracked in #722 - don't quote
-these multipliers as current until it lands. Run it yourself:
+**Provenance:** measured 2026-08-22 at commit `f0e2ca3`, 5 runs (median reported), public RPC
+(eth-pokt.nodies.app / publicnode.com), 32 cores / 62 GB RAM. The earlier 8.7× figure (2026-07-16,
+`f1a57de`) was measured against a harness that called `put_entity` per row - one redb write
+transaction and one fsync per row - rather than the `commit_window` path the indexer uses. #224
+(`0cd291e`, 2026-07-30) fixed the harness; 8.7× was an upper bound against that strawman, not a
+measurement of the current code. Run it yourself:
 
 ```sh
 nuthatch bench backfill --dir <nest> --from A --to B                 # hot store (baseline)
@@ -166,23 +158,22 @@ The pipeline fetches `K` windows concurrently (`futures::stream::buffered`) but 
 **in block order**, so the sealed segments are byte-identical to the sequential path (asserted by
 `indexer::pipelined_backfill_matches_sequential`). Bounded in-flight windows cap RSS.
 
-Stacked measured result (USDC, same 120 blocks, public RPC, same ~24 requests). Same provenance note
-as above applies: the `289` denominator predates #224's benchmark-harness fix, so `8.4×`/`~20×` are
-upper bounds, not current measurements.
+Stacked measured result (USDC, same 120 blocks, public RPC). Provenance: 2026-08-22, commit
+`f0e2ca3`, 5 runs (median), 32 cores / 62 GB RAM.
 
 | Path | events/sec | vs hot store |
 |---|---|---|
-| hot store (decode → redb) | 289 | 1× |
-| seal-direct | 2,420 | 8.4× |
-| seal-direct + 8-way pipeline | **5,837** | **~20×** |
+| hot store (decode → redb) | 607 | 1× |
+| seal-direct | 3,137 | 5.2× |
+| seal-direct + 8-way pipeline | **13,638** | **~22.5×** |
 
 ```sh
 nuthatch bench backfill --dir <nest> --from A --to B --seal-direct --concurrency 8
 ```
 
-The pipeline's 2.4× here is bounded by the four public endpoints the requests spread across; against
-your own node (`--rpc`, `--concurrency 16`) it goes further. RSS rose to ~62 MB with 8 windows in
-flight - bounded by `K` and well within the 256 MB budget.
+The pipeline's 4.3× over single-threaded seal-direct here is bounded by public endpoint round-trip
+latency; against your own node (`--rpc`, `--concurrency 16`) it goes further. RSS rose to ~73 MB
+with 8 windows in flight - bounded by `K` and well within the 256 MB budget.
 
 ## Baseline matrix (pre-optimization)
 
