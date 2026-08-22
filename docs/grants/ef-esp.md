@@ -21,9 +21,11 @@ verifiable re-execution.
 
 **Already shipped (v0.1.0):** multi-contract full-ABI decode across **Ethereum, Arbitrum One, and
 Base**; reorg-safe redb-hot / Parquet-cold storage with DuckDB SQL; a DBSP incremental balance view
-(reorg = retraction); a compiled-in MCP server; **measured ~40 MB RAM** and a **~20×** in-the-open
-backfill-throughput progression (~289 → ~5,837 ev/s) with byte-identical determinism proven across
-paths. On crates.io and as prebuilt binaries.
+(reorg = retraction); a compiled-in MCP server; **measured ~40 MB RAM** and backfill throughput
+benchmarked in the open with byte-identical determinism proven across the hot-store, seal-direct, and
+pipelined paths (`docs/benchmarks.md`). On crates.io and as prebuilt binaries. (The storage-path
+speedup multiplier is under active re-measurement after a harness fix invalidated the earlier figure -
+#722, discrepancy open in #744 - so it is not quoted here.)
 
 ## Why now - two facts that de-risk this
 

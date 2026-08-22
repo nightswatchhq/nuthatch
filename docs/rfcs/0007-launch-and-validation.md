@@ -60,6 +60,9 @@ better; both are measured. First comment gains the RFC-0004 progression (~289 �
 ~5,837 ev/s on public RPC, ~20×, path-equivalence proven, methodology in-repo) and
 keeps the honest limits verbatim from the README (now: "Ethereum + Arbitrum + Base,
 events only, RPC polling - ExEx designed and stubbed, GraphQL not yet").
+_(2026-08-22: this RFC's ~20× figure is under re-measurement, #722, with a
+discrepancy open in #744; `docs/launch/show-hn.md` itself no longer quotes the
+multiplier.)_
 r/rust angle unchanged (DBSP retractions, batched Arrow over WIT, DuckDB
 single-writer design - add the seal-direct path-equivalence test as the hook; r/rust
 loves a determinism proof). One channel per launch-day, unchanged.
