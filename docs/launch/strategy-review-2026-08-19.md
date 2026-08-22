@@ -190,6 +190,8 @@ The figure I would demote is **~289 → ~5,837 events/sec (~20× stacked)**. Tha
 benchmark brag, and the honest answer to "20× versus what" is "our own first attempt" - a fine answer,
 a weak headline. Move it down and let the **byte-identical output across the fast and slow paths**
 carry that paragraph instead. That is the sentence engineers actually stop on.
+_(2026-08-22: the ~20× cited here is under re-measurement, #722, with a discrepancy open in #744;
+`docs/benchmarks.md` itself no longer quotes the multiplier.)_
 
 ### Adopted from the report
 

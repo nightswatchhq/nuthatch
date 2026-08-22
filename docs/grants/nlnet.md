@@ -37,8 +37,11 @@ Not a proposal for vapourware. As of v0.1.0 (on crates.io and as prebuilt binari
 - **Incremental view maintenance** (Feldera/DBSP): a per-address balance view where a reorg is a
   retraction, not a recompute - the differentiator vs imperative indexers.
 - **Honest, published numbers** (the figure nobody else publishes): **~40 MB peak RAM**, CI-enforced.
-  Backfill throughput measured and optimised in the open - **~289 → ~5,837 events/sec (~20× stacked)**
-  with byte-identical determinism proven across paths; full methodology and artifacts in-repo.
+  Backfill throughput is benchmarked in the open, with byte-identical determinism proven across the
+  hot-store, seal-direct, and pipelined paths; full methodology and artifacts in-repo
+  (`docs/benchmarks.md`). The storage-path speedup multiplier is under active re-measurement after a
+  harness fix invalidated the earlier figure (#722, discrepancy open in #744), so we are not quoting
+  one here until it settles.
 - **AI-native, offline**: a Model Context Protocol server compiled into the binary, so a coding
   agent queries a running index with real schema instead of hallucinating - fully local.
 - **Operator surface**: Prometheus `/metrics`, `/sql` resource guards, graceful shutdown.

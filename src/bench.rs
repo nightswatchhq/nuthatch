@@ -143,6 +143,20 @@ fn provider_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// The `[[calls]]` archive endpoint mention, routed through `provider_of` for the same reason as
+/// every other endpoint mention (see `provider_of` above) - `--state-rpc` is exactly the kind of
+/// URL that carries an API key in the path.
+fn calls_summary_line(calls_len: usize, state_rpc_urls: &[String]) -> String {
+    format!(
+        "declared [[calls]]: {} - resolved against {}",
+        calls_len,
+        state_rpc_urls
+            .first()
+            .and_then(|u| provider_of(u))
+            .unwrap_or_else(|| "?".to_string())
+    )
+}
+
 /// Cores and total RAM, best-effort. `None` rather than a guess when it cannot be read - an invented
 /// hardware string is worse than an absent one, because it looks authoritative.
 fn hardware_summary() -> Option<String> {
@@ -315,9 +329,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     if !config.calls.is_empty() {
         // Reaching here means `state_rpc` is `Some` - the guard above refused otherwise.
         println!(
-            "declared [[calls]]: {} - resolved against {}",
-            config.calls.len(),
-            config.state_rpc_urls.first().map_or("?", String::as_str)
+            "{}",
+            calls_summary_line(config.calls.len(), &config.state_rpc_urls)
         );
     }
 
@@ -1057,6 +1070,16 @@ mod tests {
             .unwrap()
             .contains("SECRETKEY123"));
         assert_eq!(provider_of("not-a-url"), None);
+    }
+
+    /// #748: the `[[calls]]` summary line is the only place in this file an endpoint URL reached
+    /// stdout without going through `provider_of` first. Assert on the rendered line, not the
+    /// flag - a test that only checks the host is present would pass with the leak still in.
+    #[test]
+    fn calls_summary_line_carries_a_host_and_never_a_key() {
+        let line = calls_summary_line(3, &["https://example.invalid/v2/deadbeefkey".to_string()]);
+        assert!(line.contains("example.invalid"), "got {line}");
+        assert!(!line.contains("deadbeefkey"), "got {line}");
     }
 
     /// An invented hardware string is worse than an absent one: it looks authoritative and is not.
