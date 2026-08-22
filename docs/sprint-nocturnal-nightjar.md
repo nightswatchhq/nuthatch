@@ -1,12 +1,15 @@
 # Sprint: nocturnal-nightjar
 
-Filed by the board on 2026-08-22, after meticulous-magpie closed six of seven in a day.
-**Four issues.** Runs **Saturday 2026-08-22 to Friday 2026-08-28** - a week, not a weekend, and the
-reason is in *How this sprint runs differently* below.
+Filed by the board on 2026-08-22, after meticulous-magpie closed six of six in a day.
+**Four issues of new work**, plus #744 which #767 closes as its first customer - **five carry the
+label**. Runs **Saturday 2026-08-22 to Friday 2026-08-28** - a week, not a weekend, and the reason is
+in *How this sprint runs differently* below.
 
 ## Definition of done
 
 Every issue carrying the **`nocturnal-nightjar`** label is closed, and no open PR is for one of them.
+That is five issues: #767, #768, #769, #770, and #744. #744 is not separate work - it is closed by
+#767's fourth acceptance criterion and must not be started on its own.
 
 ## The theme
 
@@ -41,8 +44,17 @@ once, replay from disk, and a benchmark becomes a function of the code alone.
 The acceptance bar is the **variance**, not the feature: five replay runs within **±2%** of their
 median. It also closes #744 by answering the seal-direct question on a rig that can be trusted.
 
-`Source` is a six-method trait with **25 implementations already in the tree**. This is wiring an
-existing abstraction, not new machinery.
+`Source` (`src/source.rs:72`) is an **eight-method trait, five of them defaulted** - a new source has
+to answer `tip`, `block_hash` and `logs` and can inherit the rest. There are **26 implementations in
+the tree**, but read that number carefully: 23 are test doubles inside `src/indexer.rs`, and
+production has exactly two, `RpcClient` and `ExExSource`. The point stands - the seam exists and the
+loop already talks to it through this trait - but the cheapness of #767 rests on the trait's small
+required surface, not on breadth of production use.
+
+`tests/common/tape.rs` is worth reading first: `TapeSource` is a 504-line `Source` implementation
+that already drives the real `spawn_nest` loop through land → seal → reorg without a network. It is
+scripted in code rather than recorded off the wire, so it is not the rig - but it is the nearest
+thing to it and settles most of the plumbing questions.
 
 ### 2. #768 - mutation coverage as a required gate, delightful core only
 
@@ -89,7 +101,7 @@ board's remaining budget to zero.
 Three amendments, and they are standing rather than specific to this sprint.
 
 **1. Scope is the board's, and a label is not approval.** meticulous-magpie was filed with four issues
-and finished with seven, all self-labelled in flight. Every one was on-theme and the work was good,
+and finished with six carrying the label, the extra two self-labelled in flight. Every one was on-theme and the work was good,
 which is exactly why this needs saying: a sprint that can extend itself has no natural end, and the
 allowance stops it rather than the plan. Discovered work is filed **unlabelled**. Pulling it into
 scope needs a board reply on the sprint issue.
@@ -109,8 +121,10 @@ pieces, with the design argued up front rather than discovered in review.
 
 ## Explicitly not in this sprint
 
-- **#744** - the seal-direct measurement question. Not dropped: it is #767's first customer, and
-  re-running it before the rig exists would produce another number nobody can trust.
+- **#744 as separate work.** The issue *is* in the sprint and carries the label - it is #767's first
+  customer, closed by that issue's fourth acceptance criterion. What is out of scope is picking it up
+  on its own, because re-running it before the rig exists would produce another number nobody can
+  trust.
 - **#649, #638** - Lodestar. Board work. Gap 3 closed 2026-08-22 (`graph-allocations-nest#1`); gap 2's
   recorded rule was found wrong and is now narrowed to three unattributed entities.
 - **#750** - the production RPC audit. The one action taken (stopping a *temporary* nest that had
