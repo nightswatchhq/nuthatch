@@ -2447,8 +2447,12 @@ async fn fetch_timestamps(
 ///
 /// Mirrors the tier-3 resolution in `process_window` exactly so the sealed rows are identical
 /// regardless of which path produced them. Returns an empty vec when `calls` is empty.
+///
+/// `pub(crate)` for `bench.rs`, whose hot-store arm is a private reimplementation of this loop and
+/// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
+/// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_calls_for_window(
+pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
     state_rpc: &crate::rpc::RpcClient,
@@ -3286,7 +3290,9 @@ pub async fn backfill_direct_factory(
     } else {
         AdaptiveWindow::for_window(window)
     };
-    while next <= to {
+    // Labelled because the two-pass body below has to be able to restart the *chunk* from inside the
+    // pass-2 fixpoint loop when the provider refuses an over-large response.
+    'chunk: while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
 
         // Filter flip (RFC-0009 §4): a forced override or a discovered set past the threshold switches
@@ -3389,10 +3395,39 @@ pub async fn backfill_direct_factory(
                 // the every-log-on-the-chain request that `LogFilter` refuses to build.
                 let child_filter = LogFilter::new(&new, topic0s)
                     .expect("child filter has a non-empty address list");
-                let more =
-                    logs_with_retry(source, &child_filter, next, chunk_to, BACKFILL_RETRY_BASE)
-                        .await
-                        .with_context(|| format!("getLogs (children) {next}..={chunk_to}"))?;
+                let more = match logs_with_retry(
+                    source,
+                    &child_filter,
+                    next,
+                    chunk_to,
+                    BACKFILL_RETRY_BASE,
+                )
+                .await
+                {
+                    Ok(l) => l,
+                    // The same provider refusal pass 1 already shrinks for. Pass 2 asks a *harder*
+                    // question than pass 1 - the children discovered in this very chunk are the
+                    // busiest ones, freshly created and trading - so it is the pass more likely to
+                    // blow a response cap, and it was the only one of the nine sites in this file
+                    // that treated the cap as fatal. Measured on `uniswap-v2` mainnet: pass 1
+                    // succeeded at a 19,936-block window and pass 2 died on it.
+                    //
+                    // Restarting the chunk is safe rather than merely convenient: `fetched` is
+                    // rebuilt per iteration, and a child already registered by pass 1's decode stays
+                    // registered. A child cannot emit before the block that created it, so carrying
+                    // it into a narrower window that ends before its creation costs nothing.
+                    Err(e) if chunker::is_result_too_large(&e) => {
+                        if next >= chunk_to {
+                            return Err(e).with_context(|| single_block_over_cap(next));
+                        }
+                        chunker.too_large();
+                        continue 'chunk;
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("getLogs (children) {next}..={chunk_to}"));
+                    }
+                };
                 let _ = decode_window(registry, Some(factory), children, &more, &empty_ts);
                 all_logs.extend(more);
             }
@@ -5851,6 +5886,194 @@ template="pool"
         let row =
             crate::analytics::query(dir.path(), r#"SELECT address FROM "pool__swap""#).unwrap();
         assert_eq!(row[0]["address"], serde_json::Value::from(pool_addr));
+    }
+
+    /// Pass 2 must shrink the window on a provider response cap, exactly as pass 1 already does.
+    ///
+    /// Found in the field, not by reading: `uniswap-v2` on mainnet died with
+    /// `getLogs (children) 25791463..=25811399: Log response size exceeded`. Pass 1 had *succeeded*
+    /// at that same 19,936-block window, because its filter is the factory plus already-known
+    /// children; pass 2 asks the harder question - the children born in this chunk, which are the
+    /// freshly-created and therefore busiest ones - and it carried a bare `?` where every other
+    /// cap-handling site in this file shrinks and retries.
+    ///
+    /// The source below refuses any child-filtered request wider than 8 blocks and answers narrower
+    /// ones, so a run that cannot shrink pass 2 cannot finish. Before the fix this returned
+    /// `Err(Log response size exceeded)`.
+    #[tokio::test]
+    async fn pass_two_shrinks_the_window_on_a_provider_cap() {
+        use crate::registry::{ContractSpec, DecodeRegistry, TemplateSpec};
+        use crate::rpc::Log;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+
+        /// Answers pass 1 at any width, refuses pass 2 above `max_child_width`.
+        struct CappedChildSource {
+            logs: Vec<Log>,
+            factory: String,
+            max_child_width: u64,
+            refusals: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Source for CappedChildSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<Log>> {
+                let addrs = filter.addresses();
+                let allow: std::collections::HashSet<String> =
+                    addrs.iter().map(|a| a.to_ascii_lowercase()).collect();
+                // Pass 2 is the request that does *not* carry the factory: it asks only about the
+                // children discovered in this chunk.
+                let is_child_pass =
+                    !allow.is_empty() && !allow.contains(&self.factory.to_ascii_lowercase());
+                if is_child_pass && to.saturating_sub(from) + 1 > self.max_child_width {
+                    self.refusals.fetch_add(1, Ordering::SeqCst);
+                    // Alchemy's wording, which `chunker::is_result_too_large` matches on
+                    // ("response size") via the textual fallback for non-RpcClient sources.
+                    anyhow::bail!("Log response size exceeded for {from}..={to}");
+                }
+                Ok(self
+                    .logs
+                    .iter()
+                    .filter(|l| l.block_number >= from && l.block_number <= to)
+                    .filter(|l| allow.is_empty() || allow.contains(&l.address.to_ascii_lowercase()))
+                    .cloned()
+                    .collect())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+
+        let reg = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: factory_addr.parse().unwrap(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "pool".into(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    reg.tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+
+        let source = CappedChildSource {
+            factory: factory_addr.into(),
+            max_child_width: 8,
+            refusals: AtomicUsize::new(0),
+            logs: vec![
+                Log {
+                    address: factory_addr.into(),
+                    topics: vec![topic0("factory__pool_created")],
+                    data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+                    block_number: 2,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt1".into(),
+                    log_index: 0,
+                },
+                Log {
+                    address: pool_addr.into(),
+                    topics: vec![topic0("pool__swap")],
+                    data: format!("0x{:064x}", 7u64),
+                    block_number: 5,
+                    block_hash: "0xbh".into(),
+                    tx_hash: "0xt2".into(),
+                    log_index: 0,
+                },
+            ],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &reg,
+            &fs,
+            &mut children,
+            dir.path(),
+            &[],
+            &[],
+            None,
+            0,
+            0,
+            40,
+            64,
+            false,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .expect("pass 2 must shrink and finish, not abort");
+
+        assert!(
+            source.refusals.load(Ordering::SeqCst) > 0,
+            "the cap never fired - the test proves nothing unless pass 2 was actually refused"
+        );
+        assert_eq!(
+            sealed, 2,
+            "the factory event and the child's swap both sealed despite the cap"
+        );
+        assert!(
+            children.contains(pool_addr),
+            "the pool was still discovered"
+        );
     }
 
     /// RFC-0009 step 3a: the factory backfill is **deterministic** - the same range over the same

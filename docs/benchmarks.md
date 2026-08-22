@@ -176,7 +176,12 @@ nest with `[[calls]]` will not reach these figures - `BenchReport.calls_declared
 would prove that from the artifact rather than the prose, but these two were measured at `6145386`,
 before #742 added it, so they predate `calls_declared: 0`. (#725 - every seal-direct path hardcoding
 an empty calls slice regardless of what the nest declared - is closed; `bench` now refuses a
-declared-`[[calls]]` nest run without `--state-rpc` outright, `src/bench.rs:220-233`.) The earlier
+declared-`[[calls]]` nest run without `--state-rpc` outright, `src/bench.rs:220-233`. #743 closed the
+same hole in the *hot* arm, which is this table's denominator: until then it took no `calls`
+parameter at all, so a calls nest would have paid tier-3 cost in the numerator and not in the
+denominator, and the ratio would have flattered seal-direct by exactly the work the hot arm skipped.
+Both arms resolve calls through the same `resolve_calls_for_window` now, so a calls-nest comparison
+is like for like. No figure on this page moves: both arms below declare none.) The earlier
 8.7× figure (2026-07-16, `f1a57de`) was measured against a harness that called `put_entity` per row -
 one redb write transaction and one fsync per row -
 rather than the `commit_window` path the indexer uses. #224 (`0cd291e`, 2026-07-30) fixed the harness;
@@ -222,7 +227,9 @@ quoted, and that drags every "vs hot store" ratio in this table down with it. RS
 *ratios* here are the claim, not the absolute ev/s. All three arms declare no `[[calls]]` - a
 bare-event workload; a nest with `[[calls]]` will not reach these multipliers. #725 (every
 seal-direct path hardcoding an empty calls slice regardless of what the nest declared) is closed;
-`bench` now refuses to run a declared-`[[calls]]` nest without `--state-rpc` instead.
+`bench` now refuses to run a declared-`[[calls]]` nest without `--state-rpc` instead. #743 closed it
+on the hot arm too, so the "vs hot store" column is a comparison between two arms doing the same
+tier-3 work rather than one doing it and one skipping it.
 
 ## Baseline matrix (pre-optimization)
 
