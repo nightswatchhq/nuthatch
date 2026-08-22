@@ -1245,15 +1245,43 @@ fn define_views(
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
     let mut schema = schema_columns(dir);
+    // #729: the table-name check above (#663) stops here at the table's *existence* - a table already
+    // on disk kept exactly the columns `schema.json` had, even when the live registry (a re-fetched ABI,
+    // same event, an added field) now declares more. Diff column *names* too, per table, and append what
+    // the disk copy is missing; an on-disk column never loses its declared type, and this only ever adds.
     for t in declared {
-        if !schema.iter().any(|(name, _)| name == &t.table) {
-            schema.push((
-                t.table.clone(),
-                t.columns
+        let declared_cols: Vec<(String, String)> = t
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.storage.clone()))
+            .collect();
+        match schema.iter_mut().find(|(name, _)| name == &t.table) {
+            Some((_, cols)) => {
+                let added: Vec<&str> = declared_cols
                     .iter()
-                    .map(|c| (c.name.clone(), c.storage.clone()))
-                    .collect(),
-            ));
+                    .filter(|(name, _)| !cols.iter().any(|(n, _)| n == name))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !added.is_empty() {
+                    // Loud on purpose (#729 acceptance bar): this used to be silent, and silent
+                    // correctness in `define_views` is what made #663 and this issue both findable
+                    // only by reading the view's output rather than the log.
+                    tracing::warn!(
+                        "table {t} in schema.json is missing column(s) the live registry declares: {} \
+                         - merging them in; segments sealed before this column existed read back NULL \
+                         for it, never an error. Re-run `nuthatch schema` (or restart `dev`) to refresh \
+                         schema.json and stop seeing this.",
+                        added.join(", "),
+                        t = t.table,
+                    );
+                    for (name, storage) in &declared_cols {
+                        if !cols.iter().any(|(n, _)| n == name) {
+                            cols.push((name.clone(), storage.clone()));
+                        }
+                    }
+                }
+            }
+            None => schema.push((t.table.clone(), declared_cols)),
         }
     }
     let cols_of = |table: &str| -> &[(String, String)] {
@@ -1359,7 +1387,7 @@ fn define_views(
                 Ok(()) => Some(format!(
                     "SELECT *{} FROM {}",
                     derived_bigint_cols(cols),
-                    with_bigint_base_cols(&format!("\"{hot_tbl}\""), cols)
+                    with_declared_base_cols(&format!("\"{hot_tbl}\""), cols)
                 )),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
@@ -1380,7 +1408,7 @@ fn define_views(
                 parts.push(format!(
                     "SELECT *{} FROM {}",
                     derived_bigint_cols(cols),
-                    with_bigint_base_cols(
+                    with_declared_base_cols(
                         &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
                         cols
                     )
@@ -1917,8 +1945,8 @@ fn derived_bigint_cols(cols: &[(String, String)]) -> String {
     s
 }
 
-/// Wrap a row source so every declared big-integer column is present in its schema, NULL-filled where
-/// no input carries it.
+/// Wrap a row source so every declared column is present in its schema, NULL-filled where no input
+/// carries it.
 ///
 /// COR-2's `union_by_name=true` only unions the schemas of the *listed inputs*, and `derived_bigint_cols`
 /// projects its casts one level above them - so a `word16`/`word32` column that **no** input carries is
@@ -1927,15 +1955,27 @@ fn derived_bigint_cols(cols: &[(String, String)]) -> String {
 /// between `schema.json` gaining a big-int column and the first segment carrying it sealing. One input
 /// out of N carrying the column already worked, which is what made this easy to believe was covered.
 ///
+/// #729 broadens this from big-integer columns to every declared column, for the same reason with a
+/// quieter failure mode: a plain column no listed input carries doesn't fail the DDL (nothing above it
+/// casts it) - `SELECT *` simply omits it, so the view builds "successfully" and is silently missing the
+/// column, exactly the state #729 reported for a `schema.json` reconciled with a re-fetched ABI whose
+/// new field predates every currently-sealed segment. Confirmed against DuckDB directly (not assumed):
+/// `read_parquet([...], union_by_name=true)` NULL-fills a column across the *listed* files that carry it
+/// unevenly, but a column *no listed file* carries is absent from the result schema outright, and an
+/// explicit `SELECT that_col` against it is a binder error, not a NULL row - so the fix is this same
+/// stub, one level up, for every declared column rather than only the bigint-derived ones.
+///
 /// A zero-row typed branch fixes it where the drift belongs - inside the union, so the column is
 /// NULL-filled exactly as a partially-present one is, rather than by weakening the cast. `WHERE false`
 /// contributes schema and no rows, and it costs no extra scan or bind of the segments themselves.
 /// Types come from `hot_col_type` (COR-4: by column *name*), matching `empty_view_ddl` and the hot temp
-/// table, so a column does not change type the instant its first segment seals.
-fn with_bigint_base_cols(from_item: &str, cols: &[(String, String)]) -> String {
+/// table, so a column does not change type the instant its first segment seals. Stubbing a column the
+/// input already carries is harmless - `UNION ALL BY NAME` merges same-named columns from both sides
+/// rather than duplicating them - so this does not need to special-case which columns are actually
+/// missing from `from_item`.
+fn with_declared_base_cols(from_item: &str, cols: &[(String, String)]) -> String {
     let stubs: Vec<String> = cols
         .iter()
-        .filter(|(_, s)| is_bigint(s))
         .map(|(c, _)| format!("CAST(NULL AS {}) AS \"{c}\"", hot_col_type(c)))
         .collect();
     if stubs.is_empty() {
@@ -2693,17 +2733,97 @@ template="pool"
         // NAME, matching `empty_view_ddl` and `seal::rows_to_batch`: a `word32` column with a
         // non-counter name stubs VARCHAR, so `WHERE value LIKE '7%'` does not become a binder error on
         // the 0-of-N state this stub exists to make survivable (#467).
-        let s = with_bigint_base_cols("src", &[("fee".to_string(), "word32".to_string())]);
+        let s = with_declared_base_cols("src", &[("fee".to_string(), "word32".to_string())]);
         assert!(
             s.contains(r#"CAST(NULL AS VARCHAR) AS "fee""#),
             "word32-storage non-counter column must stub VARCHAR, got: {s}"
         );
         // The four counter columns stay UBIGINT (by name).
-        let s2 =
-            with_bigint_base_cols("src", &[("block_number".to_string(), "word32".to_string())]);
+        let s2 = with_declared_base_cols(
+            "src",
+            &[("block_number".to_string(), "word32".to_string())],
+        );
         assert!(
             s2.contains(r#"CAST(NULL AS UBIGINT) AS "block_number""#),
             "got: {s2}"
+        );
+    }
+
+    /// #729: `define_views` merged a declared table into `schema.json`'s copy only when no entry of
+    /// that *name* existed yet (#663's fix) - a table already on disk kept its on-disk *columns*
+    /// forever, even once the live registry (a re-fetched ABI, same event, one more field) knows more.
+    /// The view built "successfully" and was silently missing the column: no error, no log, unlike
+    /// #663's total-failure case. Confirmed directly against DuckDB (see `with_declared_base_cols`'s
+    /// doc) that a column no listed segment carries is a binder error on explicit reference, not a NULL
+    /// row - so the fix is a name-keyed column merge plus generalizing #434's null-stub from
+    /// big-integer columns to every declared column, not a replacement of the disk column set. CLAUDE.md
+    /// rules out ever re-decoding the sealed segment itself.
+    #[test]
+    fn define_views_merges_a_stale_schema_json_columns_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // schema.json as it stood at the last `dev`/`schema` run: `t__transfer` known, but only `value`.
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"registry_hash":"0x0","tables":[{"table":"t__transfer","alias":"t","event":"Transfer","topic0":"0x","columns":[{"name":"value","sol_type":"uint256","storage":"varchar","indexed":false}]}]}"#,
+        )
+        .unwrap();
+        // One sealed segment, written under the old ABI - it genuinely has no `memo` column.
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xa","to":"0xb","value":"9","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+
+        // The registry has been re-fetched since: the ABI gained `memo` on the same `Transfer` event.
+        // `schema.json` was never regenerated, so it still only knows `value` - a stale *column set* on
+        // an already-declared table, not a missing table (#663's case). A degenerate fixture (A == A)
+        // would pass with the merge never running, so the two sets deliberately differ.
+        let declared = vec![crate::registry::TableSchema {
+            table: "t__transfer".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "Transfer".into(),
+            topic0: "0x".into(),
+            columns: vec![
+                crate::registry::ColumnSchema {
+                    name: "value".into(),
+                    sol_type: "uint256".into(),
+                    storage: "varchar".into(),
+                    indexed: false,
+                },
+                crate::registry::ColumnSchema {
+                    name: "memo".into(),
+                    sol_type: "string".into(),
+                    storage: "varchar".into(),
+                    indexed: false,
+                },
+            ],
+        }];
+
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT value, memo FROM "t__transfer" ORDER BY block_number"#,
+            guard,
+            &HotRows::new(),
+            u64::MAX,
+            &declared,
+        )
+        .expect("the live registry's new column must resolve to NULL, not a binder error");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0]["value"], Value::from("9"));
+        assert_eq!(
+            out.rows[0]["memo"],
+            Value::Null,
+            "no sealed segment carries `memo` yet - it must read back NULL, matching #434's precedent \
+             for a declared column no input carries, not disappear from the view or error"
         );
     }
 
@@ -4582,6 +4702,118 @@ events = ["Minted", "Withdrawn"]
         assert_eq!(row.1, "42");
         assert_eq!(row.2, None);
         assert_eq!(row.3, None);
+    }
+
+    /// #729's counterpart to the #663 test above: the table itself is never missing, only its *column
+    /// set* falls behind. Built the same way, with nothing hand-authored - a real `nuthatch.toml`
+    /// through `Config::load`, a real `schema.json` through `project::refresh_stale_artifacts`, a real
+    /// sealed segment through `seal::seal_range`, and a real `declared` through `registry::from_nest` +
+    /// `indexer::full_schema` reading the ABI file *after* it changes. No config edit is needed at all
+    /// here (unlike #663's added-event case): `events = ["Transfer"]` never changes, only the ABI's
+    /// field list for that same event - which is exactly how a re-fetched ABI drifts from an
+    /// already-generated `schema.json` in production.
+    #[test]
+    fn the_real_constructor_chain_reproduces_729_and_the_fix_resolves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "tok"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "tok"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/tok.json"
+events = ["Transfer"]
+"#,
+        )
+        .unwrap();
+
+        // Step 1: generate `schema.json` for real, exactly as `init` does, against the pre-refetch ABI.
+        let cfg = crate::config::Config::load(dir.path()).unwrap();
+        crate::project::refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !on_disk.contains("memo"),
+            "schema.json must only know the pre-refetch ABI at this point"
+        );
+
+        // One sealed segment, written under the ABI as it stood when schema.json was generated - it
+        // genuinely has no `memo` column, the same way a real segment sealed before an ABI bump can't.
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"tok__transfer","from":"0xa","to":"0xb","value":"9","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+
+        // Step 2: the ABI is re-fetched (Sourcify/Etherscan-class, per CLAUDE.md) and now carries `memo`
+        // on the same `Transfer` event - a real ABI change, not a hand-built fixture. `schema.json` is
+        // not regenerated, which is the concrete way it falls behind in production: nobody re-ran
+        // `nuthatch schema` (or restarted `dev`) the moment the ABI changed.
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false},
+                {"name":"memo","type":"string","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let still_on_disk = std::fs::read_to_string(dir.path().join("schema.json")).unwrap();
+        assert!(
+            !still_on_disk.contains("memo"),
+            "schema.json was not touched by the ABI re-fetch - it is genuinely stale, not simulated"
+        );
+
+        // Step 3: the two calls `dev` makes at startup to get `declared` - real registry, real
+        // full_schema, no hand-built `TableSchema`.
+        let registry = crate::registry::from_nest(dir.path(), &cfg).unwrap();
+        let declared = crate::indexer::full_schema(&registry, &cfg);
+        assert!(
+            declared
+                .iter()
+                .find(|t| t.table == "tok__transfer")
+                .expect("tok__transfer must still be declared")
+                .columns
+                .iter()
+                .any(|c| c.name == "memo"),
+            "the live registry must know about `memo` even though schema.json does not"
+        );
+
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        // Before the fix this is a binder error ("Referenced column memo not found"); with everything
+        // built through the real chain, it must resolve, and `memo` must read back NULL for the segment
+        // that predates it.
+        let out = query_hot_cold(
+            dir.path(),
+            r#"SELECT value, memo FROM "tok__transfer""#,
+            guard,
+            &HotRows::new(),
+            u64::MAX,
+            &declared,
+        )
+        .expect("real constructor chain: the new column must resolve, not error");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0]["value"], Value::from("9"));
+        assert_eq!(out.rows[0]["memo"], Value::Null);
     }
 
     /// `declared_but_never_sealed` is what turns the empty-view fix above into a log line an operator
