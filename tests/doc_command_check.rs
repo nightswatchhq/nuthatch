@@ -143,6 +143,15 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0016 §1 proposes a `nuthatch eval` harness; not a shipped top-level subcommand",
     ),
     (
+        "docs/kicking-the-tyres.md",
+        "roost",
+        1,
+        "A deliberate historical mention: the page cites `llms.txt` telling agents to run `nuthatch \
+         roost` for five releases after 2.0 removed it, as a worked example of documentation rotting \
+         faster than code. Naming the incident is the point, so this is a fact about a past release \
+         rather than an instruction. Fittingly, this check caught it in the very page that cites it",
+    ),
+    (
         "docs/rfcs/0024-eth-call-execution-engine.md",
         "state-cache",
         2,
