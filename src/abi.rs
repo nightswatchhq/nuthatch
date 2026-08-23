@@ -96,13 +96,26 @@ async fn blockscout(chain_id: u64, address: &str) -> Result<Value> {
     parse_etherscan(&body).context("Blockscout could not return an ABI")
 }
 
+/// Why `init` cannot continue without `ETHERSCAN_API_KEY`. The key is the last resort, never the
+/// only option: `--abi` is always available, and Blockscout is named only on chains where we have
+/// measured an instance. Inventing one for BSC (#762) would be the same class of lie as a $93
+/// formula that omits the rest of the bill.
+fn missing_etherscan_key(chain_id: u64) -> String {
+    match blockscout_api(chain_id) {
+        Some(_) => "Sourcify and Blockscout had no verified ABI, and ETHERSCAN_API_KEY is not set. \
+                    Set it, pass --abi path/to.json, or use a Sourcify-verified contract."
+            .into(),
+        None => format!(
+            "Sourcify had no verified ABI, chain {chain_id} has no keyless Blockscout ABI endpoint, \
+             and ETHERSCAN_API_KEY is not set. Set it, pass --abi path/to.json, or use a \
+             Sourcify-verified contract."
+        ),
+    }
+}
+
 async fn etherscan(chain_id: u64, address: &str) -> Result<Value> {
-    let key = std::env::var("ETHERSCAN_API_KEY").map_err(|_| {
-        anyhow!(
-            "Sourcify had no verified ABI and ETHERSCAN_API_KEY is not set - \
-                 set it, or use a Sourcify-verified contract"
-        )
-    })?;
+    let key = std::env::var("ETHERSCAN_API_KEY")
+        .map_err(|_| anyhow!("{}", missing_etherscan_key(chain_id)))?;
     let url = format!(
         "https://api.etherscan.io/v2/api?chainid={chain_id}&module=contract&action=getabi&address={address}&apikey={key}"
     );
@@ -211,5 +224,21 @@ mod tests {
             Some("https://gnosis.blockscout.com/api")
         );
         assert_eq!(blockscout_api(56), None, "do not invent a BSC fallback");
+    }
+
+    #[test]
+    fn missing_etherscan_key_does_not_claim_a_blockscout_that_does_not_exist() {
+        let bsc = missing_etherscan_key(56);
+        assert!(
+            bsc.contains("chain 56 has no keyless Blockscout"),
+            "BSC must not be told to try a host we do not ship: {bsc}"
+        );
+        assert!(bsc.contains("--abi"), "{bsc}");
+        let mainnet = missing_etherscan_key(1);
+        assert!(
+            mainnet.contains("Sourcify and Blockscout"),
+            "mainnet already tried Blockscout: {mainnet}"
+        );
+        assert!(!mainnet.contains("has no keyless Blockscout"), "{mainnet}");
     }
 }

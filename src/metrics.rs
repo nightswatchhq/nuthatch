@@ -118,6 +118,12 @@ impl NestMetrics {
     pub fn set_started_at_for_test(&self, t: u64) {
         self.started_at.store(t, Relaxed);
     }
+    /// Nest-only: does not bump the process-global flag, so a runtime `/ready` fixture cannot
+    /// leak into a later solo-dev test that reads [`Metrics::poll_failed`].
+    #[cfg(test)]
+    pub fn set_poll_failed_for_test(&self, v: bool) {
+        self.poll_failed.store(v, Relaxed);
+    }
     pub fn last_block(&self) -> u64 {
         self.last_block.load(Relaxed)
     }
@@ -167,6 +173,7 @@ pub struct Metrics {
     sql_queries: AtomicU64,
     sql_rejections: AtomicU64,
     rpc_requests: AtomicU64,
+    rpc_methods: Mutex<BTreeMap<String, u64>>,
     /// Per-nest handles, keyed by nest name (SEC-9). `BTreeMap` so `/metrics` renders in a stable
     /// order. Populated once per nest at build; a solo `dev` has a single entry.
     per_nest: Mutex<BTreeMap<String, Arc<NestMetrics>>>,
@@ -190,6 +197,7 @@ impl Metrics {
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
             rpc_requests: AtomicU64::new(0),
+            rpc_methods: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
         }
     }
@@ -289,6 +297,24 @@ impl Metrics {
     pub fn inc_rpc(&self) {
         self.rpc_requests.fetch_add(1, Relaxed);
     }
+    pub fn inc_rpc_method(&self, method: &str) {
+        self.inc_rpc_methods(method, 1);
+    }
+    pub fn inc_rpc_methods(&self, method: &str, count: u64) {
+        if count == 0 || method.is_empty() {
+            return;
+        }
+        let mut map = self.rpc_methods.lock().unwrap();
+        *map.entry(method.to_string()).or_insert(0) += count;
+    }
+    /// Test seam for the solo `/ready` path, which reads these process-global fields rather than
+    /// a per-nest handle.
+    #[cfg(test)]
+    pub fn reset_readiness_for_test(&self) {
+        self.last_poll_ok.store(0, Relaxed);
+        self.poll_failed.store(false, Relaxed);
+        self.started_at.store(0, Relaxed);
+    }
 
     /// Render the registry as Prometheus text (`text/plain; version=0.0.4`).
     pub fn render(&self) -> String {
@@ -373,9 +399,19 @@ impl Metrics {
         ));
         s.push_str(&counter(
             "nuthatch_rpc_requests_total",
-            "Outbound JSON-RPC requests issued (incl. failover retries).",
+            "Outbound HTTP POSTs to JSON-RPC endpoints (one per request or batch envelope, including failover retries). Not a method count; see nuthatch_rpc_methods_total.",
             self.rpc_requests.load(Relaxed),
         ));
+
+        // Always advertised, even at zero observations: an operator pricing a just-started nest
+        // against a provider CU schedule needs the series to exist before the first batch lands.
+        s.push_str("# HELP nuthatch_rpc_methods_total Individual JSON-RPC method invocations. A batch of 200 eth_getBlockByNumber counts 200 here and 1 on nuthatch_rpc_requests_total. Multiply by a provider's per-method CU schedule to estimate a bill.\n# TYPE nuthatch_rpc_methods_total counter\n");
+        let methods = self.rpc_methods.lock().unwrap();
+        for (method, count) in methods.iter() {
+            s.push_str(&format!(
+                "nuthatch_rpc_methods_total{{method=\"{method}\"}} {count}\n"
+            ));
+        }
 
         // Per-nest series (SEC-9): in a runtime, one `{nest="…"}`-labelled line per mounted nest, so the
         // blended aggregates above can be broken down by nest. Distinct `_nest_` metric names keep the
@@ -542,5 +578,29 @@ mod tests {
         );
         m.set_last_block(101); // a genuine advance restamps
         assert!(m.last_progress() >= first);
+    }
+
+    #[test]
+    fn rpc_methods_series_are_rendered() {
+        let m = Metrics::new();
+        assert!(
+            m.render()
+                .contains("# TYPE nuthatch_rpc_methods_total counter"),
+            "the series must be advertised before any RPC has been issued"
+        );
+        m.inc_rpc_method("eth_getBlockByNumber");
+        m.inc_rpc_methods("eth_getLogs", 3);
+        m.inc_rpc_methods("", 9);
+        let out = m.render();
+        assert!(out.contains("nuthatch_rpc_methods_total{method=\"eth_getBlockByNumber\"} 1"));
+        assert!(out.contains("nuthatch_rpc_methods_total{method=\"eth_getLogs\"} 3"));
+        assert!(
+            !out.contains("method=\"\""),
+            "empty method names are not a billable CU line"
+        );
+        assert!(
+            out.contains("Outbound HTTP POSTs"),
+            "help text must say this is envelopes, not methods: {out}"
+        );
     }
 }

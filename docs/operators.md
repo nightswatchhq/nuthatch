@@ -392,27 +392,31 @@ as "rate-limited and shared" and "not fine for real work." `horizon-nest` is the
 paid Alchemy - 1.1M requests to serve a single HTTP request over the audit window, with no invoice
 figure quoted for it in #750.
 
-Pricing the header-fetch load alone against a metered endpoint, the same way
-[`benchmarks.md`](benchmarks.md) prices a backfill:
+Pricing the steady-state load against a metered endpoint (e.g. Alchemy):
+
+- **Block headers** (`eth_getBlockByNumber`): 20 CU. On Arbitrum (~4 blocks/s), 345,600 blocks/day = ~6.91M CU/day.
+- **Tip polling** (`eth_blockNumber`): 10 CU. Polling every ~2 s = 43,200 calls/day = ~0.43M CU/day.
+- **Log polling** (`eth_getLogs`): 60 CU. Polling every ~2 s = 43,200 calls/day = ~2.59M CU/day.
 
 ```
+Header-only baseline:
 cost/month ≈ blocks/day × CU(eth_getBlockByNumber) × days/month × $/CU
            ≈ 345,600     × 20                       × 30         × $0.00000045
            ≈ $93/month
+
+Total tip-following composition (headers + polling):
+CU/day     ≈ 6.91M (headers) + 0.43M (tip) + 2.59M (logs) ≈ 9.93M CU/day
+cost/month ≈ 9.93M CU/day × 30 days × $0.00000045/CU ≈ ~$134/month
 ```
 
-`eth_getBlockByNumber` at 20 CU, and $0.45 per million CU for the first 300M CU/month, are Alchemy's
-own published pay-as-you-go rates, checked 2026-08-22 - not the invoiced rate `benchmarks.md` uses
-for its backfill figures, though the two happen to agree. Sources:
+`eth_getBlockByNumber` at 20 CU, `eth_getLogs` at 60 CU, `eth_blockNumber` at 10 CU, and $0.45 per million CU for the first 300M CU/month, are Alchemy's
+own published pay-as-you-go rates, checked 2026-08-22. Sources:
 [compute unit costs](https://www.alchemy.com/docs/reference/compute-unit-costs),
 [pricing](https://www.alchemy.com/pricing).
 
-This is the header-fetch term only, for one chain at Arbitrum's block rate. It excludes
-`eth_getLogs` polling - the rest of the ~549,000 daily requests observed - and any other RPC method a
-nest calls, so it is a floor, not a full bill. A nest sitting at tip, answering nobody, still costs
-on the order of **~$100/month** against a paid provider. That figure is this computation, not a
-measurement - the reference deployment itself paid nothing for it, because it runs against a free
-endpoint.
+`nuthatch_rpc_methods_total` exposes method-labelled counters (e.g. `nuthatch_rpc_methods_total{method="eth_getBlockByNumber"}`), allowing operators to multiply each method by their provider's compute-unit schedule to compute exact invoices. `nuthatch_rpc_requests_total` tracks total outbound HTTP requests / batch envelopes.
+
+A nest sitting at tip on Arbitrum costs on the order of **~$134/month** against a paid provider (with ~$93 of that being the header fetches). That figure is this computation, not a measurement - the reference deployment itself paid nothing for it, because it runs against a free endpoint.
 
 ---
 
@@ -714,7 +718,8 @@ Global series (whole process):
 | `nuthatch_sealed_through` | cold-layer watermark |
 | `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
-| `nuthatch_rpc_requests_total` | upstream load |
+| `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
+| `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |
 | `nuthatch_last_poll_unixtime` | liveness of the ingest loop itself |
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |

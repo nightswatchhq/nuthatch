@@ -288,6 +288,22 @@ mod tests {
         assert!(is_result_too_large(&anyhow!(
             "ranges over 10000 blocks are not supported on free plan"
         )));
+        // #801 as logged by `index_loop`: the 2.7.0 classifier called this Transient, then retried
+        // the same 81,920-block window forever. Either classification must split.
+        let logged = "HTTP 400 Bad Request: {\"message\":\"ranges over 10000 blocks are not supported on free plan\"}";
+        for class in [
+            crate::rpc::FailureClass::Transient,
+            crate::rpc::FailureClass::Narrowable { suggested: None },
+        ] {
+            let err = anyhow::Error::new(crate::rpc::ClassifiedError {
+                class: class.clone(),
+                detail: logged.into(),
+            });
+            assert!(
+                is_result_too_large(&err),
+                "Alchemy free-plan range cap must split even when classed {class:?}: {err:#}"
+            );
+        }
         assert!(!is_result_too_large(&anyhow!("connection reset by peer")));
         assert!(!is_result_too_large(&anyhow!("HTTP status 521")));
     }

@@ -1144,6 +1144,9 @@ enum AbiFit {
     Fits,
     /// Logs exist and **none** of them match. This is the proxy signature.
     Mismatch { sampled: usize },
+    /// Recent tip logs match, but historical logs near deployment do not match the current ABI.
+    /// This happens when a proxy was upgraded across an event rename (#773).
+    HistoricalMismatch { sampled: usize },
     /// The sample was empty, so there is nothing to conclude. A dormant contract and a wrong ABI look
     /// identical from here, and claiming otherwise would train people to ignore the warning.
     NoSample,
@@ -1179,23 +1182,44 @@ async fn check_abi_fits(
     let windows = probe_windows(tip, start_block, log_window);
 
     let mut any_error = false;
-    for (from, to) in windows {
+    let mut tip_fit: Option<AbiFit> = None;
+    let mut hist_fit: Option<AbiFit> = None;
+
+    for (i, (from, to)) in windows.into_iter().enumerate() {
         match rpc.get_logs(&[address.to_string()], &[], from, to).await {
             Ok(logs) if !logs.is_empty() => {
                 let sample: Vec<Option<&str>> = logs
                     .iter()
                     .map(|l| l.topics.first().map(|s| s.as_str()))
                     .collect();
-                return fit_from_sample(&topic0s, &sample);
+                let fit = fit_from_sample(&topic0s, &sample);
+                if i == 0 {
+                    tip_fit = Some(fit);
+                } else {
+                    hist_fit = Some(fit);
+                }
             }
             Ok(_) => {}
             Err(_) => any_error = true,
         }
     }
-    if any_error {
-        AbiFit::Unknown
-    } else {
-        AbiFit::NoSample
+
+    combine_abi_fits(tip_fit, hist_fit, any_error)
+}
+
+/// Verdict from the two probe windows. Split from fetching so #773 can be tested without a chain:
+/// tip matches the current ABI, history near deployment matches none of it.
+fn combine_abi_fits(tip_fit: Option<AbiFit>, hist_fit: Option<AbiFit>, any_error: bool) -> AbiFit {
+    match (tip_fit, hist_fit) {
+        (Some(AbiFit::Mismatch { sampled }), _) => AbiFit::Mismatch { sampled },
+        (Some(AbiFit::Fits), Some(AbiFit::Mismatch { sampled })) => {
+            AbiFit::HistoricalMismatch { sampled }
+        }
+        (None, Some(AbiFit::Mismatch { sampled })) => AbiFit::Mismatch { sampled },
+        (Some(AbiFit::Fits), _) | (_, Some(AbiFit::Fits)) => AbiFit::Fits,
+        (None, None) if any_error => AbiFit::Unknown,
+        (None, None) => AbiFit::NoSample,
+        _ => AbiFit::Unknown,
     }
 }
 
@@ -1237,28 +1261,44 @@ fn fit_from_sample(topic0s: &[String], sample: &[Option<&str>]) -> AbiFit {
     }
 }
 
-/// Print the verdict from [`check_abi_fits`]. Only [`AbiFit::Mismatch`] is worth interrupting for;
-/// the other three are silence, because a warning that fires when nothing is wrong gets ignored on
-/// the day it fires when something is.
+/// Print the verdict from [`check_abi_fits`].
 fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
-    let AbiFit::Mismatch { sampled } = fit else {
-        return;
-    };
-    let seen = if sampled == 0 {
-        "the resolved ABI declares no events at all".to_string()
-    } else {
-        format!("none of its last {sampled} log(s) match any event in the resolved ABI")
-    };
-    eprintln!();
-    eprintln!("  ⚠ {alias} ({address}): {seen}.");
-    eprintln!("    As configured this contract will index **zero rows**, silently.");
-    eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
-    eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
-    eprintln!("    the standard proxy slots automatically, so this one uses a bespoke pattern.");
-    eprintln!("    Fix: get the implementation's ABI and re-run with");
-    eprintln!("      nuthatch init {address} --abi path/to/implementation.json");
-    eprintln!("    or overwrite abis/{alias}.json and run `nuthatch schema` to regenerate.");
-    eprintln!();
+    match fit {
+        AbiFit::Mismatch { sampled } => {
+            let seen = if sampled == 0 {
+                "the resolved ABI declares no events at all".to_string()
+            } else {
+                format!("none of its last {sampled} log(s) match any event in the resolved ABI")
+            };
+            eprintln!();
+            eprintln!("  ⚠ {alias} ({address}): {seen}.");
+            eprintln!("    As configured this contract will index **zero rows**, silently.");
+            eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
+            eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
+            eprintln!(
+                "    the standard proxy slots automatically, so this one uses a bespoke pattern."
+            );
+            eprintln!("    Fix: get the implementation's ABI and re-run with");
+            eprintln!("      nuthatch init {address} --abi path/to/implementation.json");
+            eprintln!(
+                "    or overwrite abis/{alias}.json and run `nuthatch schema` to regenerate."
+            );
+            eprintln!();
+        }
+        AbiFit::HistoricalMismatch { sampled } => {
+            eprintln!();
+            eprintln!(
+                "  ⚠ {alias} ({address}): pre-upgrade history (sampled near deployment) emitted"
+            );
+            eprintln!("    {sampled} log(s) matching none of the current implementation's events.");
+            eprintln!("    This contract appears to have been upgraded across an event rename or ABI change.");
+            eprintln!("    Pre-upgrade history will index **zero rows** under the current ABI.");
+            eprintln!("    Fix: add an older [[contracts]] entry for {alias} in nuthatch.toml with the legacy ABI,");
+            eprintln!("    bounded to the era that emitted those events.");
+            eprintln!();
+        }
+        _ => {}
+    }
 }
 
 /// Per-address `--abi` overrides, positionally aligned with the addresses like `--alias`. An empty
@@ -1895,6 +1935,35 @@ mod tests {
         let tip = 25_745_042u64;
         let windows = probe_windows(tip, Some(tip - 10), 20);
         assert_eq!(windows.len(), 1);
+    }
+
+    /// #773: Graph staking's shape. Tip logs match the Horizon ABI; logs near deployment match none
+    /// of it. The height heuristic cannot see this (the current impl address predates the proxy).
+    #[test]
+    fn tip_fit_and_historical_mismatch_is_the_upgrade_trap() {
+        assert_eq!(
+            combine_abi_fits(
+                Some(AbiFit::Fits),
+                Some(AbiFit::Mismatch { sampled: 32 }),
+                false
+            ),
+            AbiFit::HistoricalMismatch { sampled: 32 }
+        );
+        // A wrong current ABI is still a full mismatch, even if older history happens to fit.
+        assert_eq!(
+            combine_abi_fits(
+                Some(AbiFit::Mismatch { sampled: 10 }),
+                Some(AbiFit::Fits),
+                false
+            ),
+            AbiFit::Mismatch { sampled: 10 }
+        );
+        assert_eq!(
+            combine_abi_fits(Some(AbiFit::Fits), None, false),
+            AbiFit::Fits
+        );
+        assert_eq!(combine_abi_fits(None, None, true), AbiFit::Unknown);
+        assert_eq!(combine_abi_fits(None, None, false), AbiFit::NoSample);
     }
 
     // ---- --abi override -------------------------------------------------------------------------

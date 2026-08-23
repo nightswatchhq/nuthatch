@@ -649,6 +649,7 @@ impl RpcClient {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            crate::metrics::METRICS.inc_rpc_method(method);
             attempts += 1;
             match self.call_one(url, method, &params).await {
                 Ok(v) => {
@@ -681,6 +682,25 @@ impl RpcClient {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            match body {
+                Value::Array(items) => {
+                    let mut counts: HashMap<&str, u64> = HashMap::new();
+                    for item in items {
+                        if let Some(m) = item.get("method").and_then(Value::as_str) {
+                            *counts.entry(m).or_insert(0) += 1;
+                        }
+                    }
+                    for (m, c) in counts {
+                        crate::metrics::METRICS.inc_rpc_methods(m, c);
+                    }
+                }
+                Value::Object(map) => {
+                    if let Some(m) = map.get("method").and_then(Value::as_str) {
+                        crate::metrics::METRICS.inc_rpc_method(m);
+                    }
+                }
+                _ => {}
+            }
             attempts += 1;
             match self.post_one(url, body).await {
                 Ok(v) => {
@@ -869,6 +889,8 @@ impl RpcClient {
         const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let checks = self.urls.iter().enumerate().map(|(j, url)| async move {
             self.requests.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::METRICS.inc_rpc();
+            crate::metrics::METRICS.inc_rpc_method("eth_chainId");
             let r = tokio::time::timeout(
                 VERIFY_TIMEOUT,
                 self.call_one(url, "eth_chainId", &json!([])),

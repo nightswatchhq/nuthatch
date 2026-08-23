@@ -1862,6 +1862,37 @@ mod tests {
         assert_eq!(json["ready"], json!(false));
     }
 
+    /// #799: a nest whose first poll failed must immediately answer `/ready` with 503 and
+    /// `ready: false`, without waiting out the 90s startup grace window.
+    #[tokio::test]
+    async fn a_nest_with_failed_first_poll_is_unready_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "unreachable-first-poll";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_started_at_for_test(now.saturating_sub(5));
+        handle.set_poll_failed_for_test(true);
+        assert_eq!(handle.last_poll_ok(), 0, "premise: this nest never polled");
+        assert!(handle.poll_failed(), "premise: poll marked failed");
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a nest with failed first poll must immediately fail readiness: {json}"
+        );
+        assert_eq!(json["stalled"], json!(true));
+        assert_eq!(json["ready"], json!(false));
+        assert_eq!(json["initial_poll_failed"], json!(true));
+    }
+
     /// #578, reproduced from the GH issue verbatim: a cursor whose source keeps answering (so
     /// `poll_stalled` alone sees nothing wrong) but whose `last_block` never leaves zero, holding
     /// position on an unfetchable block timestamp rather than seal it (correct - `indexer.rs:3437`).
