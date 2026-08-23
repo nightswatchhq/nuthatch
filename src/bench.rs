@@ -1188,7 +1188,25 @@ async fn hot_store_backfill(
         }
         blocks.sort_unstable();
         blocks.dedup();
-        let ts = source.block_timestamps(&blocks).await.unwrap_or_default();
+        // **Propagate, never `unwrap_or_default()`** (#784). That call collapsed a provider error into
+        // an empty map, every row took `block_timestamp = 0`, and the run reported success: on a
+        // 120-block USDC range against the bundled public endpoints, five of six timestamp batches
+        // 429'd and **9,115 of 11,758 rows (77.5%) were written dated 1970**. `count(block_timestamp)`
+        // counts a zero, so the damage read as healthy.
+        //
+        // This does what the production paths already do rather than inventing a third behaviour:
+        // `backfill_direct*` propagates, and `process_window` (`indexer.rs`) declines to advance the
+        // cursor and re-fetches the window - it will not seal a fabricated timestamp (finding H4).
+        // Third time this harness has been caught measuring something other than what it claims,
+        // after #224's strawman and #725's empty `[[calls]]`, and `--keep` means its rows are a
+        // surface someone reads.
+        //
+        // An `Ok` empty map stays legitimate: `block_timestamps` is documented best-effort, and a
+        // nest that does not index timestamps never reaches here. Only a genuine failure stops the run.
+        let ts = source
+            .block_timestamps(&blocks)
+            .await
+            .with_context(|| format!("block timestamps for {next}..={chunk_to}"))?;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
         }
@@ -1783,6 +1801,117 @@ abi = "abis/c.json"
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// **#784: the harness must not fabricate a stored column.** A provider error on the timestamp
+    /// batch used to become `unwrap_or_default()` - an empty map - so every row took
+    /// `block_timestamp = 0` and the run reported success. On a real 120-block USDC range that was
+    /// 9,115 of 11,758 rows dated 1970, and `count(block_timestamp)` counts a zero, so it read healthy.
+    ///
+    /// Driven through `one_run`'s real hot-store arm against a tape whose timestamp calls fail, so it
+    /// asserts the disposition of the *bench path* rather than of a helper.
+    #[tokio::test]
+    async fn a_failed_timestamp_batch_stops_the_run_rather_than_storing_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        let (url, handle) = stub_empty_logs().await;
+        let tape_dir = tempfile::tempdir().unwrap();
+        let tape_path = tape_dir.path().join("tape");
+        one_run(
+            &[url],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            1,
+            None,
+            &TapeMode::Record(&tape_path),
+        )
+        .await
+        .unwrap();
+        handle.abort();
+
+        // Rewrite every recorded timestamp outcome as the provider error we actually saw live.
+        let entries = tape_path.join("entries.jsonl");
+        let mut out = String::new();
+        let mut rewrote = 0;
+        for line in std::fs::read_to_string(&entries).unwrap().lines() {
+            if line.contains("\"key\":\"block_timestamps:") {
+                let key = line.split('"').nth(3).unwrap().to_string();
+                out.push_str(&format!(
+                    "{{\"key\":\"{key}\",\"outcomes\":[{{\"outcome\":\"err\",\"message\":\"HTTP 429 Too Many Requests\"}}]}}\n"
+                ));
+                rewrote += 1;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert!(
+            rewrote > 0,
+            "the recording must contain timestamp calls to rewrite"
+        );
+        std::fs::write(&entries, out).unwrap();
+        // Drop the manifest: its address no longer matches, and that refusal is covered by its own
+        // test. This one is about the timestamp disposition.
+        std::fs::remove_file(tape_path.join("manifest.json")).unwrap();
+
+        let kept = tempfile::tempdir().unwrap();
+        let result = one_run(
+            &["http://127.0.0.1:1/".to_string()],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            2,
+            Some(kept.path()),
+            &TapeMode::Replay(&tape_path),
+        )
+        .await;
+
+        let err = match result {
+            Ok(r) => panic!(
+                "a run whose timestamps all failed must not report success - got {} events, which \
+                 would be stored with block_timestamp = 0",
+                r.events
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("block timestamps"),
+            "the failure must name what could not be fetched: {err}"
+        );
     }
 
     /// **RFC-0039 end to end, through the real bench path.** Record a live run, then replay it with
