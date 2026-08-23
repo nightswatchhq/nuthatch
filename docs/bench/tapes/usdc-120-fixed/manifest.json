@@ -1,0 +1,9 @@
+{
+  "chain": "1",
+  "provider": "eth-pokt.nodies.app",
+  "from_block": 25809368,
+  "to_block": 25809487,
+  "recorded_at": "unix:1787472495",
+  "commit": null,
+  "content_address": "727e9dad7f7954ab66328a55a464bcc0ec7d941eb32137f068108d3505aaa39b"
+}

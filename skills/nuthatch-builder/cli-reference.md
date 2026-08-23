@@ -61,6 +61,8 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--window-adaptive` - Adapt the `eth_getLogs` window during the run (RFC-0004 §2) instead of holding it fixed at the chain default - independent of `--seal-direct`
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches (seal-direct only). >1 overlaps RPC round-trip latency; results are still consumed in block order so segments are identical. Try 8-16 against your own node
 - `--keep <KEEP>` - Keep the run's data at this path instead of a temp dir that is discarded
+- `--record <RECORD>` - Record every source call this run makes into a tape at `<path>`, alongside the live run (RFC-0039)
+- `--replay <REPLAY>` - Replay a tape recorded by `--record` instead of touching the network (RFC-0039)
 
 ## `nuthatch bench query`
 

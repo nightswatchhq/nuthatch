@@ -629,6 +629,26 @@ pub struct BackfillBenchArgs {
     /// a path holding a `nuthatch.toml`, since clearing a nest is never what was meant.
     #[arg(long)]
     pub keep: Option<String>,
+
+    /// Record every source call this run makes into a tape at `<path>`, alongside the live run
+    /// (RFC-0039).
+    ///
+    /// A benchmark against a live endpoint measures the endpoint's mood: #722 found a **3.8x spread
+    /// inside a single arm** in one session. Record once from a real provider, then `--replay` that
+    /// tape and the run becomes a function of the code alone. Written as a directory -
+    /// `manifest.json` plus a `entries.jsonl` sorted by key - so it is diffable in review and
+    /// content-addressable.
+    #[arg(long, conflicts_with = "replay")]
+    pub record: Option<String>,
+
+    /// Replay a tape recorded by `--record` instead of touching the network (RFC-0039).
+    ///
+    /// Mutually exclusive with `--record`, `--rpc` and `--state-rpc`: a replay source holds no RPC
+    /// client, so there is nothing to point at a live endpoint even by mistake. A call the tape does
+    /// not contain is a loud, named failure rather than a synthesised empty result - a rig that
+    /// quietly invents data is worse than no rig.
+    #[arg(long, conflicts_with_all = ["record", "rpc", "state_rpc"])]
+    pub replay: Option<String>,
 }
 
 #[derive(Args)]
