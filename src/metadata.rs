@@ -96,7 +96,7 @@ pub fn save(dir: &Path, cache: &MetadataCache) -> Result<()> {
 /// contract in the nest. Immutable, so already-cached contracts are skipped (no re-fetch).
 pub async fn fetch_cli(dir: &Path, rpc_override: Vec<String>) -> Result<()> {
     let config = crate::config::Config::load(dir)?;
-    let rpc_urls = crate::rpc::merge_rpcs(&rpc_override, config.nest.rpc_urls.clone());
+    let rpc_urls = crate::rpc::select_rpcs(&rpc_override, config.nest.rpc_urls.clone());
     if rpc_urls.is_empty() {
         anyhow::bail!("no rpc_urls (set them in nuthatch.toml or pass --rpc)");
     }

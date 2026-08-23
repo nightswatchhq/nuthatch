@@ -633,6 +633,13 @@ fn poll_stalled(last_poll: u64, started_at: u64, now: u64, threshold: u64) -> bo
     since != 0 && now.saturating_sub(since) > threshold
 }
 
+/// A source which has not answered successfully is allowed startup grace only until its first
+/// failed poll. At that point there is evidence of an unusable endpoint pool, rather than merely an
+/// in-flight connection, and returning 200 would make a bad `--rpc` look healthy.
+fn initial_poll_failed(last_poll: u64, poll_failed: bool) -> bool {
+    last_poll == 0 && poll_failed
+}
+
 /// No advance in `last_block` within this many seconds means the cursor is wedged (#578). Same value as
 /// `READINESS_STALL_SECS` - a cursor that is actually getting somewhere, backfilling or at tip, advances
 /// far more often than this on any chain with sub-minute blocks.
@@ -709,7 +716,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         .runtime_health
         .as_ref()
         .map(|(name, _)| METRICS.nest(name));
-    let (last_poll, tip, last, sealed, started_at, last_progress) = match &nest {
+    let (last_poll, tip, last, sealed, started_at, last_progress, poll_failed) = match &nest {
         Some(m) => (
             m.last_poll_ok(),
             m.tip(),
@@ -717,6 +724,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             m.sealed_through(),
             m.started_at(),
             m.last_progress(),
+            m.poll_failed(),
         ),
         None => (
             METRICS.last_poll_ok(),
@@ -725,6 +733,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             METRICS.sealed_through_val(),
             METRICS.started_at(),
             METRICS.last_progress(),
+            METRICS.poll_failed(),
         ),
     };
     let now = now_unix();
@@ -737,11 +746,14 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         READINESS_PROGRESS_STALL_SECS,
         lag,
     );
-    let stalled = poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS) || wedged;
+    let initial_failure = initial_poll_failed(last_poll, poll_failed);
+    let stalled =
+        initial_failure || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS) || wedged;
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
         "wedged": wedged,
+        "initial_poll_failed": initial_failure,
         "tip": tip,
         "last_block": last,
         "lag_blocks": lag,
@@ -1571,6 +1583,13 @@ mod tests {
         assert!(!poll_stalled(now - 90, now - 1_000, now, 90));
         // Neither timestamp stamped (an un-stamped fixture) → old unconditional grace, not stalled.
         assert!(!poll_stalled(0, 0, now, 90));
+    }
+
+    #[test]
+    fn a_failed_first_poll_is_unready_without_waiting_out_startup_grace() {
+        assert!(initial_poll_failed(0, true));
+        assert!(!initial_poll_failed(0, false));
+        assert!(!initial_poll_failed(123, true));
     }
 
     /// #510: a pool that has been unreachable since before the very first poll must eventually report

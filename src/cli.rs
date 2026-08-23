@@ -224,7 +224,7 @@ pub struct MetadataFetchArgs {
     /// The nest directory.
     #[arg(long, default_value = ".")]
     pub dir: String,
-    /// Override `rpc_urls` at runtime (repeatable); tried ahead of the configured endpoints.
+    /// Use only these `rpc_urls` at runtime (repeatable), without changing the config on disk.
     #[arg(long)]
     pub rpc: Vec<String>,
 }
@@ -767,9 +767,8 @@ pub struct InitArgs {
     #[arg(long)]
     pub chain: Option<String>,
 
-    /// Prefer these RPC URL(s) over the chain defaults (repeatable). They're written first in the
-    /// nest's `rpc_urls` and also used for ABI/deploy-block resolution during init, with the
-    /// built-in chain endpoints kept as fallback. Point at your own node to dodge public-RPC limits.
+    /// Use only these RPC URL(s) (repeatable). They are written to the nest's `rpc_urls` and used
+    /// for ABI/deploy-block resolution during init. Point at your own node to avoid public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
 
@@ -817,8 +816,8 @@ pub struct AddArgs {
     #[arg(long, default_value = ".")]
     pub dir: String,
 
-    /// Prefer these RPC URL(s) over the nest's configured endpoints for ABI/deploy-block resolution
-    /// (repeatable). Point at your own node to dodge public-RPC limits.
+    /// Use only these RPC URL(s) for ABI/deploy-block resolution (repeatable). Point at your own
+    /// node to avoid public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
 }
@@ -956,8 +955,8 @@ pub struct DevArgs {
     #[arg(long = "state-rpc", value_name = "URL")]
     pub state_rpc: Vec<String>,
 
-    /// Override the nest's `rpc_urls` at runtime without editing the config (repeatable). These are
-    /// tried first; the nest's configured endpoints remain as fallback. Point at your own node.
+    /// Use only these `rpc_urls` at runtime without editing the config (repeatable). Point at your
+    /// own node.
     #[arg(long)]
     pub rpc: Vec<String>,
 

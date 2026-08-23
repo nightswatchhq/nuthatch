@@ -6,7 +6,7 @@
 //! Nothing here phones home: metrics are exposed on the same local API and scraped by the operator.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 /// The one process-wide metrics registry. `const`-constructed, so it needs no lazy init.
@@ -30,6 +30,10 @@ pub struct NestMetrics {
     /// Every nest on the same cursor holds the same value, which is correct: they share a chain.
     tip: AtomicU64,
     last_poll_ok: AtomicU64,
+    /// Set after a failed source poll and cleared by the next success. This distinguishes "the
+    /// process has only just begun" from "the process has already proved its only RPC pool dead".
+    /// `/ready` must not give the latter a 90-second green grace period.
+    poll_failed: AtomicBool,
     /// Unix seconds this nest's ingest was built, i.e. when it first started trying to reach the chain.
     /// `0` until [`NestMetrics::mark_started`] runs. Bounds `/ready`'s "never polled yet" grace period
     /// (#510): without it, a pool that is dead from the very first poll never sets `last_poll_ok` and
@@ -74,10 +78,20 @@ impl NestMetrics {
     }
     pub fn mark_poll_ok(&self) {
         self.last_poll_ok.store(now_unix(), Relaxed);
+        self.poll_failed.store(false, Relaxed);
         METRICS.mark_poll_ok();
     }
     pub fn last_poll_ok(&self) -> u64 {
         self.last_poll_ok.load(Relaxed)
+    }
+    /// Record a failed source poll. A later successful poll clears this, so this is only a
+    /// readiness failure while no successful poll has happened yet.
+    pub fn mark_poll_failed(&self) {
+        self.poll_failed.store(true, Relaxed);
+        METRICS.mark_poll_failed();
+    }
+    pub fn poll_failed(&self) -> bool {
+        self.poll_failed.load(Relaxed)
     }
     /// Test seam: force this nest's last successful poll to an absolute unix time, so a test can make
     /// one cursor *look* dark without waiting out `serve`'s 90-second stall threshold. Deliberately
@@ -137,6 +151,8 @@ pub struct Metrics {
     /// readiness signal: if now − this exceeds the stall threshold, every RPC endpoint is unreachable
     /// and indexing has stalled (as opposed to "caught up and idle", which keeps this fresh).
     last_poll_ok: AtomicU64,
+    /// See [`NestMetrics::poll_failed`]. The solo `dev` readiness path reads this global value.
+    poll_failed: AtomicBool,
     /// Unix seconds the first nest was built, i.e. process/runtime start. `0` until set. See
     /// [`NestMetrics::started_at`] - a solo `dev` reads this one, since it has no per-nest health.
     started_at: AtomicU64,
@@ -163,6 +179,7 @@ impl Metrics {
             last_block: AtomicU64::new(0),
             sealed_through: AtomicU64::new(0),
             last_poll_ok: AtomicU64::new(0),
+            poll_failed: AtomicBool::new(false),
             started_at: AtomicU64::new(0),
             last_progress: AtomicU64::new(0),
             rows_decoded: AtomicU64::new(0),
@@ -212,10 +229,17 @@ impl Metrics {
     /// so readiness reflects "we can still reach the chain", independent of whether we're behind.
     pub fn mark_poll_ok(&self) {
         self.last_poll_ok.store(now_unix(), Relaxed);
+        self.poll_failed.store(false, Relaxed);
     }
     /// Unix seconds of the last successful poll (`0` = never). Read by the readiness endpoint.
     pub fn last_poll_ok(&self) -> u64 {
         self.last_poll_ok.load(Relaxed)
+    }
+    pub fn mark_poll_failed(&self) {
+        self.poll_failed.store(true, Relaxed);
+    }
+    pub fn poll_failed(&self) -> bool {
+        self.poll_failed.load(Relaxed)
     }
     /// First-wins stamp of process/runtime start, called from [`NestMetrics::mark_started`]. Only the
     /// first caller sets it - later nests built in the same startup burst must not push it forward.

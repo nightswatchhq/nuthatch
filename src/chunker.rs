@@ -189,25 +189,7 @@ pub fn is_result_too_large(err: &anyhow::Error) -> bool {
             _ => return false,
         }
     }
-    let s = format!("{err:#}").to_ascii_lowercase();
-    const CAP_MARKERS: &[&str] = &[
-        "response size",            // Alchemy: "Log response size exceeded"
-        "too many results",         // generic
-        "query returned more than", // Infura: "query returned more than 10000 results"
-        "more than 10000",
-        "result set too large",
-        "range is too", // "block range is too wide/large"
-        "range too large",
-        "too large", // catch-all for "* too large"
-        "limit exceeded",
-        // arb1.arbitrum.io: "logs matched by query exceeds limit of 10000" - measured, and the reason
-        // this list grew. Two markers because providers phrase the same cap either way round.
-        "exceeds limit of",
-        "exceeds max",
-        "logs matched by query",
-        "exceeds the limit",
-    ];
-    CAP_MARKERS.iter().any(|m| s.contains(m))
+    crate::rpc::looks_like_cap(&format!("{err:#}"))
 }
 
 #[cfg(test)]
@@ -303,6 +285,9 @@ mod tests {
             "query returned more than 10000 results"
         )));
         assert!(is_result_too_large(&anyhow!("block range is too wide")));
+        assert!(is_result_too_large(&anyhow!(
+            "ranges over 10000 blocks are not supported on free plan"
+        )));
         assert!(!is_result_too_large(&anyhow!("connection reset by peer")));
         assert!(!is_result_too_large(&anyhow!("HTTP status 521")));
     }
