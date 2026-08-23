@@ -156,8 +156,33 @@ same ~2,600-2,900 ev/s band for *both* paths): not a single noisy sample. Leadin
 ran on a heavily shared dev box with two other agents' `cargo test`/`cargo build` active during the
 measurement window (load 4.8-6.4 on 32 cores) - redb's many small synchronous writes are exactly the
 operation most exposed to shared disk contention, more than seal-direct's few large buffered ones.
-**Unconfirmed.** Tracked in #744 for a controlled re-run before either figure is trusted as the
-storage path's true delta.
+**No longer unconfirmed - and the leading suspect above was wrong.** The controlled re-run happened on
+2026-08-23 against the RFC-0039 replay rig (#767), which removes the network entirely. It settles
+#744, and not in the direction anyone expected:
+
+| the same workload, same tape, same box | wall clock | events/sec |
+|---|---:|---:|
+| live, against `eth-pokt.nodies.app` | 20.7-21.3 s | **553-568** |
+| replayed from disk, network removed | **0.15 s** | **77,640** (median of 8) |
+
+**The network was 99.3% of the live wall clock.** Every seal-direct-versus-hot-store ratio this page
+has ever published was therefore reading a *0.7% signal through 99.3% noise* - which is the whole
+explanation for a figure that read 8.7x in July, 5.2x one morning and 0.92x the same afternoon. The
+storage-path delta was never measurable through a public endpoint at all. It was not a shared box, or
+not mainly; it was that the quantity being compared was two orders of magnitude smaller than the
+thing being measured.
+
+The replay arm's own spread is **1.029x** across 8 runs, against the 3.8x measured live - and the
+event count is *identical* on every run, which is the mechanism working rather than a secondary
+observation. It does **not** yet meet #767's own ±2% acceptance bar: worst deviation from median is
+2.03%, and the residue is box jitter, which the rig explicitly does not claim to fix. Stated as a
+miss rather than rounded down to a pass.
+
+**What this means for the multipliers on this page: they are not comparable to a replayed number and
+never were.** A live figure measures a provider; a replayed figure measures decode plus store. Both
+are honest; they answer different questions, and a ratio built from one cannot be restated in terms
+of the other. The storage-path comparison is now a question for the rig, on a quiet box, and the
+numbers above are the first credible instrument this project has had for it.
 
 **12,933 was not wrong - it answers a different question.** This bench nest declares `Transfer`
 only, so 11,758 is the right count for *this* table; 12,933, reported by this PR's own earlier
