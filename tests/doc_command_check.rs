@@ -158,16 +158,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0024 proposes `nuthatch state-cache clear` for the L3 call-result cache; not a shipped \
          subcommand. Two mentions (lines ~175, ~255)",
     ),
-    (
-        "docs/rfcs/0039-the-recorded-tape.md",
-        "--replay",
-        1,
-        "RFC-0039 designs `nuthatch bench backfill --replay <tape>`; #767 builds it, and this entry \
-         goes when it lands. The one counted mention is the prose one (line ~371) - the copy-paste \
-         block at ~276 writes `--replay` (and ~272 `--record`) on a `\\`-continuation line, which \
-         this check cannot see today, so the count is 1 rather than 2. See #782: fixing that hole \
-         makes this entry 2 and adds a `--record` entry",
-    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.

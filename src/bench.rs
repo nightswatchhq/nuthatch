@@ -21,7 +21,6 @@ use crate::config::Config;
 use crate::factory::{ChildRegistry, FactorySet};
 use crate::registry::DecodeRegistry;
 use crate::rpc::RpcClient;
-use crate::source::Source;
 use crate::store::Store;
 
 /// Which backfill path a run takes. Extracted from `one_run`'s `if` chain so the choice is testable
@@ -81,6 +80,9 @@ struct Run {
     /// Call rows sealed across the run's declared `[[calls]]` - 0 for a nest with none. See
     /// [`BenchReport::calls_resolved`].
     calls_resolved: u64,
+    /// sha256 of the tape this run recorded or replayed (RFC-0039), so a published number names the
+    /// exact bytes it came from. `None` on a live run.
+    fixture_content_address: Option<String>,
 }
 
 /// The published artifact: medians across runs plus the pinned inputs and provenance.
@@ -149,6 +151,22 @@ pub struct BenchReport {
     pub provider: Option<String>,
     /// Enough hardware to make two reports comparable: cores and total RAM.
     pub hardware: Option<String>,
+    /// sha256 of the RFC-0039 tape this run recorded or replayed. `None` on a live run.
+    ///
+    /// This is what lets a published figure name the exact bytes it came from. `289 events/sec`
+    /// outlived the harness that produced it by five weeks because nothing tied the number to a run;
+    /// provider, hardware, date and commit describe the *conditions*, and a content address describes
+    /// the *input*.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_content_address: Option<String>,
+    /// True when the run answered from a tape rather than a network.
+    ///
+    /// Stated once here rather than left for a reader to infer from a suspiciously low
+    /// `rpc_requests`: on a replayed run that field counts **tape reads served**, not HTTP requests
+    /// sent. It keeps its meaning - *how many times did the code under test ask the source for
+    /// something* - and loses only "how many bytes went over a wire".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 /// The endpoint's host, with any credentials stripped.
@@ -382,6 +400,20 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         );
     }
 
+    // RFC-0039. `--replay` touches no network by construction; `--record` wraps the live client and
+    // flushes a tape once the runs are done.
+    let tape_mode = match (
+        args.record.as_deref().map(std::path::Path::new),
+        args.replay.as_deref().map(std::path::Path::new),
+    ) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--record and --replay are mutually exclusive: one writes a tape, the other reads one")
+        }
+        (Some(p), None) => TapeMode::Record(p),
+        (None, Some(p)) => TapeMode::Replay(p),
+        (None, None) => TapeMode::Live,
+    };
+
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
         let r = one_run(
@@ -401,6 +433,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             args.concurrency,
             run,
             keep.as_deref(),
+            &tape_mode,
         )
         .await?;
         println!(
@@ -456,6 +489,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         calls_resolved: median_u64(runs.iter().map(|r| r.calls_resolved)),
         commit: git_commit(),
         provider: rpc_urls.first().and_then(|u| provider_of(u)),
+        fixture_content_address: runs.first().and_then(|r| r.fixture_content_address.clone()),
+        replayed: matches!(tape_mode, TapeMode::Replay(_)),
         hardware: hardware_summary(),
     };
 
@@ -764,6 +799,60 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Which source a bench run drives (RFC-0039). `Replay` holds no `RpcClient`, so a replayed run
+/// cannot reach a network even by mistake.
+pub enum TapeMode<'a> {
+    Live,
+    Record(&'a std::path::Path),
+    Replay(&'a std::path::Path),
+}
+
+/// Owns the constructed source and answers "how many times did the code under test ask for
+/// something", which is what `BenchReport.rpc_requests` has always meant.
+enum BenchSource {
+    Live(RpcClient),
+    Recording(
+        Option<crate::tape::RecordingSource<RpcClient>>,
+        std::path::PathBuf,
+    ),
+    Replay(crate::tape::ReplaySource),
+}
+
+impl BenchSource {
+    fn as_source(&self) -> &dyn crate::source::Source {
+        match self {
+            BenchSource::Live(c) => c,
+            BenchSource::Recording(r, _) => r.as_ref().expect("recording source taken early"),
+            BenchSource::Replay(r) => r,
+        }
+    }
+
+    /// On a live or recording arm this is HTTP requests sent, including failover retries. On replay
+    /// it is tape reads served - the same question ("how many times did the code ask?"), minus the
+    /// wire. `BenchReport.replayed` says which, so nobody has to infer it from a low number.
+    fn requests(&self) -> u64 {
+        match self {
+            BenchSource::Live(c) => c.request_count(),
+            BenchSource::Recording(r, _) => r
+                .as_ref()
+                .map(|x| x.inner().request_count())
+                .unwrap_or_default(),
+            BenchSource::Replay(r) => r.reads(),
+        }
+    }
+
+    fn content_address(&self) -> Option<String> {
+        match self {
+            BenchSource::Replay(r) => r.content_address(),
+            _ => None,
+        }
+    }
+}
+
+// Matching the rest of this file and `indexer.rs`: this is a harness entrypoint threading one run's
+// full configuration, and bundling it into a struct would move the argument list rather than shorten
+// it (#657 made the same call for `resolve_calls_for_window`).
+#[allow(clippy::too_many_arguments)]
 async fn one_run(
     rpc_urls: &[String],
     registry: &DecodeRegistry,
@@ -781,8 +870,19 @@ async fn one_run(
     concurrency: usize,
     run: usize,
     keep: Option<&std::path::Path>,
+    tape: &TapeMode<'_>,
 ) -> Result<Run> {
-    let source = RpcClient::new(rpc_urls.to_vec())?;
+    let bench_source = match tape {
+        TapeMode::Live => BenchSource::Live(RpcClient::new(rpc_urls.to_vec())?),
+        TapeMode::Record(path) => BenchSource::Recording(
+            Some(crate::tape::RecordingSource::new(RpcClient::new(
+                rpc_urls.to_vec(),
+            )?)),
+            path.to_path_buf(),
+        ),
+        TapeMode::Replay(path) => BenchSource::Replay(crate::tape::ReplaySource::open(path)?),
+    };
+    let source = bench_source.as_source();
     // Normally a throwaway work dir per run (redb and/or Parquet segments) - never the nest's own
     // database. `--keep` points it somewhere durable instead, because a case whose criterion is a
     // ROW COUNT cannot be answered by a harness that deletes its rows: OBIB case 3 asks for 100,001
@@ -810,7 +910,7 @@ async fn one_run(
         BackfillPath::Factory => {
             let fs = factory.expect("choose_path returned Factory without a FactorySet");
             crate::indexer::backfill_direct_factory(
-                &source,
+                source,
                 registry,
                 fs,
                 &mut children,
@@ -834,7 +934,7 @@ async fn one_run(
         // `factory.is_some()`. Benching `Direct` instead measures a path only the bench takes.
         BackfillPath::Pipelined => {
             crate::indexer::backfill_direct_pipelined(
-                &source,
+                source,
                 registry,
                 &work,
                 addresses,
@@ -858,7 +958,7 @@ async fn one_run(
         // where a caller can ask for the seal-direct storage path with a *fixed* fetch window.
         BackfillPath::Direct => {
             crate::indexer::backfill_direct(
-                &source,
+                source,
                 registry,
                 &work,
                 addresses,
@@ -875,7 +975,7 @@ async fn one_run(
         }
         BackfillPath::HotStore => {
             let (events, resolved) = hot_store_backfill(
-                &source,
+                source,
                 registry,
                 &work,
                 addresses,
@@ -921,6 +1021,37 @@ async fn one_run(
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    // Count before flushing: writing the tape consumes the recorder.
+    let rpc_requests = bench_source.requests();
+    let fixture_content_address = match bench_source {
+        BenchSource::Recording(mut r, path) => {
+            let mut tape = r.take().expect("recording source flushed twice").into_tape(
+                crate::tape::Manifest {
+                    chain: Some(chain_id.to_string()),
+                    provider: rpc_urls.first().and_then(|u| provider_of(u)),
+                    from_block: Some(from),
+                    to_block: Some(to),
+                    recorded_at: Some({
+                        // Same shape `lists.rs` uses for its content-addressed snapshots: no date
+                        // crate, and a value that cannot drift with a locale.
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        format!("unix:{secs}")
+                    }),
+                    commit: option_env!("NUTHATCH_COMMIT").map(str::to_string),
+                    content_address: None,
+                },
+            );
+            tape.write_dir(&path)
+                .with_context(|| format!("writing tape to {}", path.display()))?;
+            tape.manifest.content_address.clone()
+        }
+        other => other.content_address(),
+    };
+
     Ok(Run {
         events,
         wall_clock_s,
@@ -930,7 +1061,8 @@ async fn one_run(
             0.0
         },
         peak_rss_mb,
-        rpc_requests: source.request_count(),
+        rpc_requests,
+        fixture_content_address,
         children: children.len() as u64,
         calls_resolved,
     })
@@ -956,7 +1088,7 @@ async fn one_run(
 /// back, because redb has no manifest for `one_run` to count the way it counts sealed segments.
 #[allow(clippy::too_many_arguments)]
 async fn hot_store_backfill(
-    source: &RpcClient,
+    source: &dyn crate::source::Source,
     registry: &DecodeRegistry,
     dir: &std::path::Path,
     addresses: &[String],
@@ -1056,7 +1188,25 @@ async fn hot_store_backfill(
         }
         blocks.sort_unstable();
         blocks.dedup();
-        let ts = source.block_timestamps(&blocks).await.unwrap_or_default();
+        // **Propagate, never `unwrap_or_default()`** (#784). That call collapsed a provider error into
+        // an empty map, every row took `block_timestamp = 0`, and the run reported success: on a
+        // 120-block USDC range against the bundled public endpoints, five of six timestamp batches
+        // 429'd and **9,115 of 11,758 rows (77.5%) were written dated 1970**. `count(block_timestamp)`
+        // counts a zero, so the damage read as healthy.
+        //
+        // This does what the production paths already do rather than inventing a third behaviour:
+        // `backfill_direct*` propagates, and `process_window` (`indexer.rs`) declines to advance the
+        // cursor and re-fetches the window - it will not seal a fabricated timestamp (finding H4).
+        // Third time this harness has been caught measuring something other than what it claims,
+        // after #224's strawman and #725's empty `[[calls]]`, and `--keep` means its rows are a
+        // surface someone reads.
+        //
+        // An `Ok` empty map stays legitimate: `block_timestamps` is documented best-effort, and a
+        // nest that does not index timestamps never reaches here. Only a genuine failure stops the run.
+        let ts = source
+            .block_timestamps(&blocks)
+            .await
+            .with_context(|| format!("block timestamps for {next}..={chunk_to}"))?;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
         }
@@ -1653,6 +1803,254 @@ abi = "abis/c.json"
         (format!("http://{addr}/"), handle)
     }
 
+    /// **#784: the harness must not fabricate a stored column.** A provider error on the timestamp
+    /// batch used to become `unwrap_or_default()` - an empty map - so every row took
+    /// `block_timestamp = 0` and the run reported success. On a real 120-block USDC range that was
+    /// 9,115 of 11,758 rows dated 1970, and `count(block_timestamp)` counts a zero, so it read healthy.
+    ///
+    /// Driven through `one_run`'s real hot-store arm against a tape whose timestamp calls fail, so it
+    /// asserts the disposition of the *bench path* rather than of a helper.
+    #[tokio::test]
+    async fn a_failed_timestamp_batch_stops_the_run_rather_than_storing_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        let (url, handle) = stub_empty_logs().await;
+        let tape_dir = tempfile::tempdir().unwrap();
+        let tape_path = tape_dir.path().join("tape");
+        one_run(
+            &[url],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            1,
+            None,
+            &TapeMode::Record(&tape_path),
+        )
+        .await
+        .unwrap();
+        handle.abort();
+
+        // Rewrite every recorded timestamp outcome as the provider error we actually saw live.
+        let entries = tape_path.join("entries.jsonl");
+        let mut out = String::new();
+        let mut rewrote = 0;
+        for line in std::fs::read_to_string(&entries).unwrap().lines() {
+            if line.contains("\"key\":\"block_timestamps:") {
+                let key = line.split('"').nth(3).unwrap().to_string();
+                out.push_str(&format!(
+                    "{{\"key\":\"{key}\",\"outcomes\":[{{\"outcome\":\"err\",\"message\":\"HTTP 429 Too Many Requests\"}}]}}\n"
+                ));
+                rewrote += 1;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert!(
+            rewrote > 0,
+            "the recording must contain timestamp calls to rewrite"
+        );
+        std::fs::write(&entries, out).unwrap();
+        // Drop the manifest: its address no longer matches, and that refusal is covered by its own
+        // test. This one is about the timestamp disposition.
+        std::fs::remove_file(tape_path.join("manifest.json")).unwrap();
+
+        let kept = tempfile::tempdir().unwrap();
+        let result = one_run(
+            &["http://127.0.0.1:1/".to_string()],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            2,
+            Some(kept.path()),
+            &TapeMode::Replay(&tape_path),
+        )
+        .await;
+
+        let err = match result {
+            Ok(r) => panic!(
+                "a run whose timestamps all failed must not report success - got {} events, which \
+                 would be stored with block_timestamp = 0",
+                r.events
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("block timestamps"),
+            "the failure must name what could not be fetched: {err}"
+        );
+    }
+
+    /// **RFC-0039 end to end, through the real bench path.** Record a live run, then replay it with
+    /// the server torn down - so a replayed run that produced the same events can only have got them
+    /// from the tape.
+    ///
+    /// The teardown is the assertion. A replay that still worked against a live stub would prove
+    /// nothing about whether the tape was ever read.
+    #[tokio::test]
+    async fn a_recorded_run_replays_with_the_server_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let addresses: Vec<String> = registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        let tape_dir = tempfile::tempdir().unwrap();
+        let tape_path = tape_dir.path().join("tape");
+
+        let (url, handle) = stub_empty_logs().await;
+        let recorded = one_run(
+            &[url],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            1,
+            None,
+            &TapeMode::Record(&tape_path),
+        )
+        .await
+        .unwrap();
+
+        // The recording must have produced a content address, or nothing was written.
+        let addr = recorded
+            .fixture_content_address
+            .clone()
+            .expect("a recorded run must name the tape it wrote");
+        assert_eq!(addr.len(), 64, "sha256 hex: {addr}");
+        assert!(tape_path.join("entries.jsonl").is_file());
+        assert!(tape_path.join("manifest.json").is_file());
+
+        // Tear the network down. Anything the replay answers now came off the disk.
+        handle.abort();
+
+        let replayed = one_run(
+            &["http://127.0.0.1:1/".to_string()],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            2,
+            None,
+            &TapeMode::Replay(&tape_path),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            replayed.events, recorded.events,
+            "a replayed run must reproduce the recorded workload exactly"
+        );
+        assert_eq!(
+            replayed.fixture_content_address.as_deref(),
+            Some(addr.as_str()),
+            "a replayed run names the bytes it came from"
+        );
+
+        // `rpc_requests` deliberately does NOT match across the two arms, and asserting that it did
+        // was this test's first mistake. On the recording arm it counts HTTP requests `RpcClient`
+        // sent; on replay it counts `Source` calls served. `RpcClient` batches several source calls
+        // into one request, so the replay figure is legitimately the larger of the two (here 20
+        // against 10). That is the semantic split `BenchReport.replayed` exists to declare - the
+        // field keeps meaning "how many times did the code ask the source for something" and loses
+        // only "how many bytes went over a wire".
+        assert!(
+            replayed.rpc_requests > 0,
+            "a replayed run still counts what the code asked for"
+        );
+
+        // What *must* be identical is one replay against another: that is the entire deliverable.
+        let again = one_run(
+            &["http://127.0.0.1:1/".to_string()],
+            &registry,
+            None,
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            1,
+            1,
+            200,
+            20,
+            false,
+            false,
+            1,
+            3,
+            None,
+            &TapeMode::Replay(&tape_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again.events, replayed.events,
+            "two replays must agree exactly"
+        );
+        assert_eq!(
+            again.rpc_requests, replayed.rpc_requests,
+            "two replays must ask the source for exactly the same things"
+        );
+    }
+
     /// **#744, the behaviour, not just the label.** `--window-adaptive` has to change what actually
     /// gets fetched, on both the hot-store and the seal-direct (`Direct`) path independently of one
     /// another - a flag that only flipped `BenchReport.window_adaptive` while fetching identically
@@ -1696,6 +2094,7 @@ abi = "abis/c.json"
                 1,
                 1,
                 None,
+                &TapeMode::Live,
             )
             .await
             .unwrap();
@@ -1719,6 +2118,7 @@ abi = "abis/c.json"
                 1,
                 1,
                 None,
+                &TapeMode::Live,
             )
             .await
             .unwrap();
@@ -1859,6 +2259,7 @@ abi = "abis/c.json"
             1,
             1,
             None,
+            &TapeMode::Live,
         )
         .await
         .unwrap();
@@ -1945,6 +2346,7 @@ abi = "abis/c.json"
                     1,
                     1,
                     Some(&work),
+                    &TapeMode::Live,
                 )
                 .await
                 .unwrap()
