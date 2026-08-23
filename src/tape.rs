@@ -227,6 +227,12 @@ impl<S: Source> RecordingSource<S> {
             .push(outcome);
     }
 
+    /// The wrapped source, so a caller can still reach concrete facts about it - a bench run
+    /// recording through an `RpcClient` still wants that client's real HTTP request count.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     /// Consume the recording into a tape.
     pub fn into_tape(self, manifest: Manifest) -> Tape {
         let log = self.log.into_inner().unwrap();
