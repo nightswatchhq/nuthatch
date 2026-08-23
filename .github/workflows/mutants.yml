@@ -1,0 +1,69 @@
+# Mutation coverage on the delightful core (#768).
+#
+# **Nightly, not per-PR, and the reason is measured rather than assumed.** On an 18-core box:
+#
+#   - unmutated baseline: 114s build + 154s test (all targets), or 122s + 28s with `--lib`
+#   - each mutant needs its own rebuild, so ~150s apiece even with the test phase scoped
+#   - at `-j 6` the box hit **load 70** and individual builds stretched to 802s
+#   - `src/chunker.rs` alone is 26 mutants; the scoped set below is ~300
+#
+# A per-PR gate at those numbers is one people learn to skip, which is the exact disease this is
+# meant to cure. #768's own "honest risk" section said so before any of it was measured, and the
+# measurement agreed.
+#
+# **This workflow does not fail the build and is required on no branch.** Per #768's acceptance
+# criterion 2 and the sequence #593 spent a whole sprint getting right: prove it can go red, let it
+# run red-capable on `main`, *then* decide whether it becomes required. A context that cannot fail is
+# worse than no context, and this repo has installed one of those before.
+name: mutants (delightful core)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  mutants:
+    name: mutation coverage (nightly, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      # Scoped deliberately. Not the whole crate: 4,503 mutants crate-wide against ~300 here, and a
+      # signal nobody reads is not a signal. These are the paths that feed stored state or decide what
+      # gets fetched - where a decorative test is most expensive.
+      #
+      # `src/registry.rs` carries only 3 mutants because #581 moved decode into its own crate, so the
+      # decode path is covered by the `decode` entry rather than by the file it used to live in.
+      - name: run mutants
+        id: mutants
+        run: |
+          set +e
+          cargo mutants --no-shuffle -j 2 \
+            --file src/chunker.rs \
+            --file src/seal.rs \
+            --file src/registry.rs \
+            -- --lib
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      # **This step can go red, and that is the point** (#768 acceptance criterion 1). A survivor not
+      # in the baseline fails the job and names the mutation and the file. The job going red is not
+      # the same as the build going red: this workflow is required on no branch, per criterion 2 and
+      # the sequence #593 established.
+      - name: new survivors fail this job
+        if: always()
+        run: |
+          python3 scripts/mutants-check.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: keep the output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          retention-days: 14
