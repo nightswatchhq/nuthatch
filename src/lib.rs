@@ -70,6 +70,7 @@ pub mod source;
 pub mod sql_errors;
 pub mod store;
 pub mod subgraph_import;
+pub mod tape;
 pub mod transform;
 pub mod velocity;
 pub mod views;
