@@ -16,6 +16,28 @@ us than a clean run.
 
 ---
 
+## Before you start: use a paid RPC endpoint
+
+**This is the setup instruction, not a footnote.** nuthatch assumes a paid endpoint for serious work.
+The public RPCs bundled with a scaffolded nest exist so that `init` → `dev` works with zero setup and
+nothing else - they are rate-limited, shared, and will sometimes return an empty result rather than an
+error.
+
+Evaluate on a free tier and you will mostly be measuring the free tier. We have measured that
+directly: on a rate-limited endpoint, **12 calls the indexer made became 84 HTTP requests** - a 7x
+retry amplification - because a `429` gets retried up to four times across the endpoint pool. Being
+throttled makes a nest send more, which throttles it harder. You would be benchmarking that loop.
+
+So: **the primary pass is against an endpoint you pay for.** If you want the free-tier numbers too,
+run them as an explicit second arm and label them as such - it is a fair question, and it is not the
+same question.
+
+If a paid endpoint is not something you are willing to provide, that is worth knowing before you go
+further: it is a real cost of running this, [what it costs](https://nuthatch-indexer.com/docs/operate/costs/)
+puts a figure on it, and no amount of testing will make that go away.
+
+---
+
 ## Rule zero: write down what you expect, before you run anything
 
 Not ceremony. We have been caught by this repeatedly, and so will you.
@@ -97,10 +119,10 @@ The dominant term is `block_timestamps`: a timestamp lives in the block header, 
 serving `block_timestamp` costs an extra `eth_getBlockByNumber` per distinct block. It defaults on
 because most useful queries are time-filtered.
 
-**Watch for the multiplier.** On a rate-limited endpoint we measured **12 source calls becoming 84
-HTTP requests - 7x** - because a `429` gets retried up to four times across the endpoint pool. Being
-throttled makes a nest send *more*, which throttles it harder. If you are testing on a free tier, you
-are measuring that loop as much as anything else. See RFC-0040.
+**Watch for the multiplier if you run the free-tier arm.** The 7x described in *Before you start*
+is the thing to look for: request count several times nominal, and rising as the endpoint throttles
+harder. On the paid arm it should not appear at all, because the retry loop never starts - and if it
+does appear, that is a more interesting finding than anything else on this page. See RFC-0040.
 
 **What a bad answer looks like:** you cannot attribute the bill. Take the reading before you form an
 opinion about the cost.
