@@ -1405,7 +1405,7 @@ pub async fn dev(
     let health = Arc::new(crate::health::RuntimeHealth::new());
 
     for group in groups {
-        let rpc_urls = rpc::merge_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
+        let rpc_urls = rpc::select_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
         if rpc_urls.is_empty() {
             bail!(
                 "mounts '{}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \

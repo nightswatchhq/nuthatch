@@ -56,9 +56,9 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     config.state_rpc_urls = args.state_rpc.clone();
     config.ipfs_gateways = args.ipfs.clone();
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
-    // with no change to anything downstream. `--rpc` overrides are tried ahead of the configured
-    // endpoints without touching the nest's config on disk.
-    let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
+    // touching the nest's config on disk.
+    let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::new(rpc_urls)?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
@@ -166,7 +166,7 @@ pub async fn upgrade(
     }
 
     // Neither a compatible nor a breaking update changes chains, so one source feeds both indexers.
-    let rpc_urls = crate::rpc::merge_rpcs(&rpc_override, old_config.nest.rpc_urls.clone());
+    let rpc_urls = crate::rpc::select_rpcs(&rpc_override, old_config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::new(rpc_urls)?;
     rpc.verify_chain_ids(old_config.nest.chain_id).await?;
@@ -1398,6 +1398,9 @@ async fn runtime_index_loop(
                 t
             }
             Err(e) => {
+                for &i in &live {
+                    live_ref(&nests, i).metrics.mark_poll_failed();
+                }
                 poll_failures = escalate_stall(poll_failures, &e);
                 sleep_secs(3).await;
                 continue;
@@ -4504,6 +4507,7 @@ async fn prepare_retrying(
         {
             Ok(next) => return Ok(next),
             Err(e) if is_cold_start_unreachable(&e) => {
+                nest.metrics.mark_poll_failed();
                 poll_failures = escalate_stall(poll_failures, &e);
                 sleep_secs(3).await;
             }
@@ -4565,6 +4569,7 @@ async fn index_loop(
                 t
             }
             Err(e) => {
+                METRICS.mark_poll_failed();
                 poll_failures = escalate_stall(poll_failures, &e);
                 sleep_secs(3).await;
                 continue;

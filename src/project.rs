@@ -27,7 +27,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
     // is on - so when they don't say, we go and find out.
     let chain = match &args.chain {
         Some(name) => chains::resolve(name, &args.rpc).await?,
-        None => detect_chain(&args.addresses).await?.into(),
+        None if args.rpc.is_empty() => detect_chain(&args.addresses).await?.into(),
+        None => detect_chain_on_rpc(&args.addresses, &args.rpc).await?,
     };
     let dir = PathBuf::from(&args.dir);
     std::fs::create_dir_all(dir.join("abis"))
@@ -40,9 +41,9 @@ pub async fn init(args: InitArgs) -> Result<()> {
         .collect::<Result<_>>()?;
     let aliases = resolve_aliases(&args.alias, addresses.len())?;
 
-    // Prefer any user-supplied `--rpc` endpoints, falling back to the chain defaults. The same list
-    // drives both resolution below and the nest's persisted `rpc_urls`.
-    let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
+    // An explicit `--rpc` is the whole endpoint pool, both for first-run resolution and in the
+    // persisted config. Otherwise use the chain defaults.
+    let rpc_urls = crate::rpc::select_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
 
     // One RPC client for best-effort deployment-block detection.
     let rpc = RpcClient::new(rpc_urls.clone())?;
@@ -52,14 +53,15 @@ pub async fn init(args: InitArgs) -> Result<()> {
 
     let mut contracts = Vec::with_capacity(addresses.len());
     for (i, (address, alias)) in addresses.iter().zip(&aliases).enumerate() {
-        let abi_json = match &overrides[i] {
+        let (abi_json, implementation) = match &overrides[i] {
             Some(path) => {
                 println!("→ using local ABI {path} for {alias} ({address})");
-                read_local_abi(path)?
+                (read_local_abi(path)?, None)
             }
             None => {
                 println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
-                resolve_abi(&rpc, chain.chain_id, address).await?
+                let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
+                (resolved.abi, resolved.implementation)
             }
         };
         let abi_path = format!("abis/{alias}.json");
@@ -82,6 +84,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
             },
             None => None,
         };
+
+        report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
 
         // Does the ABI we just vendored actually decode what this address emits? Best-effort and
         // never fatal - but loud when the answer is no, because the alternative is a nest that
@@ -190,7 +194,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
     }
     let aliases = add_aliases(&config.contracts, &args.alias, new_addresses.len())?;
 
-    let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, config.nest.rpc_urls.iter().cloned());
+    let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.iter().cloned());
     let rpc = RpcClient::new(rpc_urls)?;
     let tip = rpc.block_number().await.ok();
 
@@ -200,14 +204,15 @@ pub async fn add(args: AddArgs) -> Result<()> {
     let overrides = resolve_abi_overrides(&args.abi, new_addresses.len())?;
 
     for (i, (address, alias)) in new_addresses.iter().zip(&aliases).enumerate() {
-        let abi_json = match &overrides[i] {
+        let (abi_json, implementation) = match &overrides[i] {
             Some(path) => {
                 println!("→ using local ABI {path} for {alias} ({address})");
-                read_local_abi(path)?
+                (read_local_abi(path)?, None)
             }
             None => {
                 println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
-                resolve_abi(&rpc, chain.chain_id, address).await?
+                let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
+                (resolved.abi, resolved.implementation)
             }
         };
         let abi_path = format!("abis/{alias}.json");
@@ -230,6 +235,8 @@ pub async fn add(args: AddArgs) -> Result<()> {
             },
             None => None,
         };
+
+        report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
 
         report_abi_fit(
             check_abi_fits(&rpc, address, &abi_json, tip, start_block, chain.log_window).await,
@@ -577,7 +584,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         })
         .collect();
 
-    let rpc_urls = crate::rpc::merge_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
+    let rpc_urls = crate::rpc::select_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
     let config = Config {
         state_rpc_urls: Vec::new(),
         ipfs_gateways: Vec::new(),
@@ -1024,18 +1031,30 @@ const IMPLEMENTATION_SELECTOR: &str = "0x5c60da1b";
 /// to the address's own ABI if it isn't a proxy or the implementation can't resolve. Init-time only -
 /// the resolved ABI is vendored and frozen, so the deterministic decode path never depends on a live
 /// proxy read.
-async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<serde_json::Value> {
+struct ResolvedAbi {
+    abi: serde_json::Value,
+    /// `Some` only when the vendored ABI came from an implementation rather than the address itself.
+    implementation: Option<String>,
+}
+
+async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<ResolvedAbi> {
     if let Some(implementation) = resolve_implementation(rpc, address).await {
         println!("  · proxy → implementation {implementation}");
         if let Ok(resolved) = abi::resolve(chain_id, &implementation).await {
             print_abi_resolved(&resolved);
-            return Ok(resolved.abi);
+            return Ok(ResolvedAbi {
+                abi: resolved.abi,
+                implementation: Some(implementation),
+            });
         }
         println!("  · implementation ABI unresolved; using the proxy's own ABI");
     }
     let resolved = abi::resolve(chain_id, address).await?;
     print_abi_resolved(&resolved);
-    Ok(resolved.abi)
+    Ok(ResolvedAbi {
+        abi: resolved.abi,
+        implementation: None,
+    })
 }
 
 /// The pretty lines for a resolved ABI, in the same `→`/`✓`/`·` two-space-indented prose the rest of
@@ -1046,7 +1065,7 @@ async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<se
 fn abi_resolved_lines(resolved: &abi::Resolved) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(reason) = &resolved.fallback_reason {
-        lines.push(format!("  · Sourcify miss ({reason}); trying Etherscan"));
+        lines.push(format!("  · {reason}"));
     }
     lines.push(format!("  ✓ ABI resolved via {}", resolved.via));
     lines
@@ -1060,13 +1079,23 @@ fn print_abi_resolved(resolved: &abi::Resolved) {
 
 /// Follow the well-known proxy patterns to an implementation address, or `None` if `address` is not a
 /// recognised proxy. Direct-slot proxies (EIP-1967 / EIP-1822 / legacy zeppelinos) hold the impl
-/// address in a storage slot; a beacon proxy holds a beacon whose `implementation()` we then call.
+/// address in a storage slot; an EIP-897 proxy exposes `implementation()` directly; a beacon proxy
+/// holds a beacon whose `implementation()` we then call.
 async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String> {
     for slot in PROXY_IMPL_SLOTS {
         if let Ok(word) = rpc.get_storage_at(address, slot).await {
             if let Some(implementation) = impl_from_slot(&word) {
                 return Some(implementation);
             }
+        }
+    }
+    // EIP-897 / Aragon AppProxyUpgradeable: unlike a beacon, the proxy itself exposes the logic
+    // address through `implementation()`. stETH is this shape. We used to call this selector only
+    // on a beacon found in EIP-1967 storage, so a proxy that had the standard public method but no
+    // standard storage slot was needlessly treated as a bespoke, unresolvable proxy.
+    if let Ok(ret) = rpc.eth_call(address, IMPLEMENTATION_SELECTOR).await {
+        if let Some(implementation) = impl_from_slot(&ret) {
+            return Some(implementation);
         }
     }
     // Beacon proxy: the implementation is one hop further - the proxy points at a beacon, and the
@@ -1115,6 +1144,9 @@ enum AbiFit {
     Fits,
     /// Logs exist and **none** of them match. This is the proxy signature.
     Mismatch { sampled: usize },
+    /// Recent tip logs match, but historical logs near deployment do not match the current ABI.
+    /// This happens when a proxy was upgraded across an event rename (#773).
+    HistoricalMismatch { sampled: usize },
     /// The sample was empty, so there is nothing to conclude. A dormant contract and a wrong ABI look
     /// identical from here, and claiming otherwise would train people to ignore the warning.
     NoSample,
@@ -1150,23 +1182,44 @@ async fn check_abi_fits(
     let windows = probe_windows(tip, start_block, log_window);
 
     let mut any_error = false;
-    for (from, to) in windows {
+    let mut tip_fit: Option<AbiFit> = None;
+    let mut hist_fit: Option<AbiFit> = None;
+
+    for (i, (from, to)) in windows.into_iter().enumerate() {
         match rpc.get_logs(&[address.to_string()], &[], from, to).await {
             Ok(logs) if !logs.is_empty() => {
                 let sample: Vec<Option<&str>> = logs
                     .iter()
                     .map(|l| l.topics.first().map(|s| s.as_str()))
                     .collect();
-                return fit_from_sample(&topic0s, &sample);
+                let fit = fit_from_sample(&topic0s, &sample);
+                if i == 0 {
+                    tip_fit = Some(fit);
+                } else {
+                    hist_fit = Some(fit);
+                }
             }
             Ok(_) => {}
             Err(_) => any_error = true,
         }
     }
-    if any_error {
-        AbiFit::Unknown
-    } else {
-        AbiFit::NoSample
+
+    combine_abi_fits(tip_fit, hist_fit, any_error)
+}
+
+/// Verdict from the two probe windows. Split from fetching so #773 can be tested without a chain:
+/// tip matches the current ABI, history near deployment matches none of it.
+fn combine_abi_fits(tip_fit: Option<AbiFit>, hist_fit: Option<AbiFit>, any_error: bool) -> AbiFit {
+    match (tip_fit, hist_fit) {
+        (Some(AbiFit::Mismatch { sampled }), _) => AbiFit::Mismatch { sampled },
+        (Some(AbiFit::Fits), Some(AbiFit::Mismatch { sampled })) => {
+            AbiFit::HistoricalMismatch { sampled }
+        }
+        (None, Some(AbiFit::Mismatch { sampled })) => AbiFit::Mismatch { sampled },
+        (Some(AbiFit::Fits), _) | (_, Some(AbiFit::Fits)) => AbiFit::Fits,
+        (None, None) if any_error => AbiFit::Unknown,
+        (None, None) => AbiFit::NoSample,
+        _ => AbiFit::Unknown,
     }
 }
 
@@ -1208,28 +1261,44 @@ fn fit_from_sample(topic0s: &[String], sample: &[Option<&str>]) -> AbiFit {
     }
 }
 
-/// Print the verdict from [`check_abi_fits`]. Only [`AbiFit::Mismatch`] is worth interrupting for;
-/// the other three are silence, because a warning that fires when nothing is wrong gets ignored on
-/// the day it fires when something is.
+/// Print the verdict from [`check_abi_fits`].
 fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
-    let AbiFit::Mismatch { sampled } = fit else {
-        return;
-    };
-    let seen = if sampled == 0 {
-        "the resolved ABI declares no events at all".to_string()
-    } else {
-        format!("none of its last {sampled} log(s) match any event in the resolved ABI")
-    };
-    eprintln!();
-    eprintln!("  ⚠ {alias} ({address}): {seen}.");
-    eprintln!("    As configured this contract will index **zero rows**, silently.");
-    eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
-    eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
-    eprintln!("    the standard proxy slots automatically, so this one uses a bespoke pattern.");
-    eprintln!("    Fix: get the implementation's ABI and re-run with");
-    eprintln!("      nuthatch init {address} --abi path/to/implementation.json");
-    eprintln!("    or overwrite abis/{alias}.json and run `nuthatch schema` to regenerate.");
-    eprintln!();
+    match fit {
+        AbiFit::Mismatch { sampled } => {
+            let seen = if sampled == 0 {
+                "the resolved ABI declares no events at all".to_string()
+            } else {
+                format!("none of its last {sampled} log(s) match any event in the resolved ABI")
+            };
+            eprintln!();
+            eprintln!("  ⚠ {alias} ({address}): {seen}.");
+            eprintln!("    As configured this contract will index **zero rows**, silently.");
+            eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
+            eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
+            eprintln!(
+                "    the standard proxy slots automatically, so this one uses a bespoke pattern."
+            );
+            eprintln!("    Fix: get the implementation's ABI and re-run with");
+            eprintln!("      nuthatch init {address} --abi path/to/implementation.json");
+            eprintln!(
+                "    or overwrite abis/{alias}.json and run `nuthatch schema` to regenerate."
+            );
+            eprintln!();
+        }
+        AbiFit::HistoricalMismatch { sampled } => {
+            eprintln!();
+            eprintln!(
+                "  ⚠ {alias} ({address}): pre-upgrade history (sampled near deployment) emitted"
+            );
+            eprintln!("    {sampled} log(s) matching none of the current implementation's events.");
+            eprintln!("    This contract appears to have been upgraded across an event rename or ABI change.");
+            eprintln!("    Pre-upgrade history will index **zero rows** under the current ABI.");
+            eprintln!("    Fix: add an older [[contracts]] entry for {alias} in nuthatch.toml with the legacy ABI,");
+            eprintln!("    bounded to the era that emitted those events.");
+            eprintln!();
+        }
+        _ => {}
+    }
 }
 
 /// Per-address `--abi` overrides, positionally aligned with the addresses like `--alias`. An empty
@@ -1341,6 +1410,48 @@ async fn detect_deploy_block(rpc: &RpcClient, address: &str, tip: u64) -> Result
     Ok(lo)
 }
 
+/// A proxy cannot have emitted events decoded by its *current* implementation before that
+/// implementation was deployed. This is not a proof that its event surface changed, but it is a
+/// cheap, concrete warning that the automatically vendored ABI cannot describe all declared history.
+fn proxy_history_may_be_missing(proxy_start: u64, implementation_start: u64) -> bool {
+    proxy_start < implementation_start
+}
+
+/// Warn about the current-implementation trap from #773. Resolving the current ABI correctly is not
+/// enough when the nest starts before that implementation existed: the old event names are absent
+/// from the registry, so their logs would be skipped while the cursor appears healthy.
+async fn report_proxy_history_gap(
+    rpc: &RpcClient,
+    implementation: Option<&str>,
+    proxy_start: Option<u64>,
+    tip: Option<u64>,
+    alias: &str,
+) {
+    let (Some(implementation), Some(proxy_start), Some(tip)) = (implementation, proxy_start, tip)
+    else {
+        return;
+    };
+    let Ok(implementation_start) = detect_deploy_block(rpc, implementation, tip).await else {
+        return;
+    };
+    if proxy_history_may_be_missing(proxy_start, implementation_start) {
+        eprintln!();
+        eprintln!(
+            "  ⚠ {alias}: the proxy starts at block {proxy_start}, but its current implementation \
+             was deployed at block {implementation_start}."
+        );
+        eprintln!(
+            "    Events before block {implementation_start} may use earlier implementation ABIs and \
+             will not be decoded by this scaffold."
+        );
+        eprintln!(
+            "    Add the earlier ABI as a second contract entry at the same address, bounded to its \
+             implementation era, before trusting historical totals."
+        );
+        eprintln!();
+    }
+}
+
 fn is_empty_code(code: &str) -> bool {
     code.trim_start_matches("0x").is_empty()
 }
@@ -1389,6 +1500,52 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
             Ok(first)
         }
     }
+}
+
+/// Detect a known chain through the endpoint(s) the operator supplied, without probing public
+/// defaults. `--rpc` is commonly supplied precisely to keep a run inside a paid, audited pool.
+async fn detect_chain_on_rpc(
+    addresses: &[String],
+    rpc_urls: &[String],
+) -> Result<chains::ResolvedChain> {
+    let probe = normalise_address(&addresses[0])?;
+    println!("→ no --chain given; checking {probe} through the supplied RPC endpoint(s)…");
+    let rpc = RpcClient::new(rpc_urls.to_vec())?;
+    let chain_id = rpc
+        .chain_id()
+        .await
+        .context("could not read chain id from --rpc")?;
+    let chain = chains::all()
+        .iter()
+        .find(|chain| chain.chain_id == chain_id)
+        .copied()
+        .with_context(|| {
+            format!(
+                "--rpc reports unregistered chain id {chain_id}; pass --chain <name> to name it"
+            )
+        })?;
+    let tip = rpc
+        .block_number()
+        .await
+        .context("could not read tip from --rpc")?;
+    let code = rpc
+        .get_code(&probe, tip)
+        .await
+        .context("could not read contract bytecode from --rpc")?;
+    if is_empty_code(&code) {
+        bail!(
+            "no bytecode for {probe} on {} via the supplied RPC endpoint(s)",
+            chain.name
+        );
+    }
+    println!("  ✓ found on {}", chain.name);
+    Ok(chains::ResolvedChain {
+        name: chain.name.to_string(),
+        chain_id: chain.chain_id,
+        rpc_urls: rpc_urls.to_vec(),
+        finality: chain.finality,
+        log_window: chain.log_window,
+    })
 }
 
 fn scaffold_ai_surface(
@@ -1606,6 +1763,21 @@ mod tests {
         );
         // An empty `eth_call` return (non-proxy / reverted) yields no implementation, not a bad address.
         assert!(impl_from_slot("0x").is_none());
+
+        // stETH's Aragon AppProxyUpgradeable answers `implementation()` directly with this word.
+        // Keep the observed shape here: its public ABI has only ProxyDeposit, so missing this hop
+        // makes an otherwise ordinary `init <address>` scaffold an event surface that cannot match.
+        assert_eq!(
+            impl_from_slot("0x000000000000000000000000028271e30a695c0527a0c50ca30603fed004cdb0"),
+            Some("0x028271e30a695c0527a0c50ca30603fed004cdb0".to_string())
+        );
+    }
+
+    #[test]
+    fn current_implementation_cannot_describe_history_before_it_existed() {
+        assert!(proxy_history_may_be_missing(100, 200));
+        assert!(!proxy_history_may_be_missing(200, 200));
+        assert!(!proxy_history_may_be_missing(300, 200));
     }
 
     #[test]
@@ -1763,6 +1935,35 @@ mod tests {
         let tip = 25_745_042u64;
         let windows = probe_windows(tip, Some(tip - 10), 20);
         assert_eq!(windows.len(), 1);
+    }
+
+    /// #773: Graph staking's shape. Tip logs match the Horizon ABI; logs near deployment match none
+    /// of it. The height heuristic cannot see this (the current impl address predates the proxy).
+    #[test]
+    fn tip_fit_and_historical_mismatch_is_the_upgrade_trap() {
+        assert_eq!(
+            combine_abi_fits(
+                Some(AbiFit::Fits),
+                Some(AbiFit::Mismatch { sampled: 32 }),
+                false
+            ),
+            AbiFit::HistoricalMismatch { sampled: 32 }
+        );
+        // A wrong current ABI is still a full mismatch, even if older history happens to fit.
+        assert_eq!(
+            combine_abi_fits(
+                Some(AbiFit::Mismatch { sampled: 10 }),
+                Some(AbiFit::Fits),
+                false
+            ),
+            AbiFit::Mismatch { sampled: 10 }
+        );
+        assert_eq!(
+            combine_abi_fits(Some(AbiFit::Fits), None, false),
+            AbiFit::Fits
+        );
+        assert_eq!(combine_abi_fits(None, None, true), AbiFit::Unknown);
+        assert_eq!(combine_abi_fits(None, None, false), AbiFit::NoSample);
     }
 
     // ---- --abi override -------------------------------------------------------------------------
@@ -2123,6 +2324,22 @@ dataSources:
         );
     }
 
+    #[test]
+    fn abi_resolved_lines_names_the_keyless_fallback() {
+        let resolved = abi::Resolved {
+            abi: serde_json::json!([]),
+            via: "Blockscout",
+            fallback_reason: Some("Sourcify miss: no ABI".into()),
+        };
+        assert_eq!(
+            abi_resolved_lines(&resolved),
+            vec![
+                "  · Sourcify miss: no ABI".to_string(),
+                "  ✓ ABI resolved via Blockscout".to_string(),
+            ]
+        );
+    }
+
     /// The Etherscan-fallback path (#675's "sweep the other paths" ask): the miss reason is real,
     /// non-redundant information, so it earns its own `·` line ahead of the `✓` tick rather than being
     /// dropped along with the redundant Sourcify-success announcement.
@@ -2131,12 +2348,15 @@ dataSources:
         let resolved = abi::Resolved {
             abi: serde_json::json!([]),
             via: "Etherscan",
-            fallback_reason: Some("Sourcify returned HTTP 404".to_string()),
+            fallback_reason: Some(
+                "Sourcify miss: Sourcify returned HTTP 404; Blockscout miss: no ABI".to_string(),
+            ),
         };
         assert_eq!(
             abi_resolved_lines(&resolved),
             vec![
-                "  · Sourcify miss (Sourcify returned HTTP 404); trying Etherscan".to_string(),
+                "  · Sourcify miss: Sourcify returned HTTP 404; Blockscout miss: no ABI"
+                    .to_string(),
                 "  ✓ ABI resolved via Etherscan".to_string(),
             ]
         );

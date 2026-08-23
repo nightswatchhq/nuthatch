@@ -35,12 +35,23 @@ type CallBatchFuture<'a> =
 /// where we currently re-fetch every timestamp in a range we just split.
 const TIMESTAMP_CACHE_MAX: usize = 262_144;
 
-/// Merge `preferred` RPC endpoints ahead of a `fallback` list, preserving order and dropping
-/// duplicates. Used by `init --rpc` and `dev --rpc` to prefer a user's own node while keeping the
-/// built-in / configured endpoints as fallback. An empty `preferred` leaves `fallback` untouched.
-pub fn merge_rpcs(preferred: &[String], fallback: impl IntoIterator<Item = String>) -> Vec<String> {
+/// Select the RPC endpoint pool for a command, preserving order and dropping duplicates.
+///
+/// An explicit `--rpc` is an isolation boundary, not a preference hint: it is the complete pool
+/// the operator authorised this invocation to contact. Without it, use the configured/default
+/// pool. In particular, never silently append public endpoints after a paid endpoint: that makes
+/// both the privacy promise and any request-cost measurement untrue.
+pub fn select_rpcs(
+    override_urls: &[String],
+    configured: impl IntoIterator<Item = String>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for url in preferred.iter().cloned().chain(fallback) {
+    let urls: Box<dyn Iterator<Item = String>> = if override_urls.is_empty() {
+        Box::new(configured.into_iter())
+    } else {
+        Box::new(override_urls.iter().cloned())
+    };
+    for url in urls {
         if !out.contains(&url) {
             out.push(url);
         }
@@ -250,6 +261,7 @@ pub(crate) fn looks_like_cap(body: &str) -> bool {
         "result set too large",
         "range is too",
         "range too large",
+        "ranges over", // Alchemy free plan: "ranges over 10000 blocks are not supported"
         "too large",
         "limit exceeded",
         "exceeds limit of",
@@ -637,6 +649,7 @@ impl RpcClient {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            crate::metrics::METRICS.inc_rpc_method(method);
             attempts += 1;
             match self.call_one(url, method, &params).await {
                 Ok(v) => {
@@ -669,6 +682,25 @@ impl RpcClient {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
+            match body {
+                Value::Array(items) => {
+                    let mut counts: HashMap<&str, u64> = HashMap::new();
+                    for item in items {
+                        if let Some(m) = item.get("method").and_then(Value::as_str) {
+                            *counts.entry(m).or_insert(0) += 1;
+                        }
+                    }
+                    for (m, c) in counts {
+                        crate::metrics::METRICS.inc_rpc_methods(m, c);
+                    }
+                }
+                Value::Object(map) => {
+                    if let Some(m) = map.get("method").and_then(Value::as_str) {
+                        crate::metrics::METRICS.inc_rpc_method(m);
+                    }
+                }
+                _ => {}
+            }
             attempts += 1;
             match self.post_one(url, body).await {
                 Ok(v) => {
@@ -857,6 +889,8 @@ impl RpcClient {
         const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let checks = self.urls.iter().enumerate().map(|(j, url)| async move {
             self.requests.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::METRICS.inc_rpc();
+            crate::metrics::METRICS.inc_rpc_method("eth_chainId");
             let r = tokio::time::timeout(
                 VERIFY_TIMEOUT,
                 self.call_one(url, "eth_chainId", &json!([])),
@@ -1736,6 +1770,21 @@ mod tests {
         );
     }
 
+    /// The exact response from the public free-plan run behind #801. It is a range cap even though
+    /// it does not use any of the older "response size" wording, and must shrink rather than retry
+    /// the same 81,920-block request forever.
+    #[test]
+    fn alchemy_free_plan_range_cap_is_narrowable() {
+        let body = r#"{"message":"ranges over 10000 blocks are not supported on free plan"}"#;
+        assert!(
+            matches!(
+                super::classify_status(400, body),
+                super::FailureClass::Narrowable { .. }
+            ),
+            "the provider's explicit block-range cap must narrow"
+        );
+    }
+
     /// And the provider's own suggestion survives, which is the difference between halving blindly and
     /// asking for the range it just told us would work.
     #[test]
@@ -2156,7 +2205,7 @@ mod tests {
         h.abort();
     }
 
-    use super::{merge_rpcs, redact_url, RpcClient};
+    use super::{redact_url, select_rpcs, RpcClient};
 
     fn v<const N: usize>(xs: [&str; N]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
@@ -2190,24 +2239,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_preferred_leaves_fallback_untouched() {
-        assert_eq!(merge_rpcs(&[], v(["a", "b"])), v(["a", "b"]));
+    fn no_override_keeps_the_configured_pool() {
+        assert_eq!(select_rpcs(&[], v(["a", "b"])), v(["a", "b"]));
     }
 
     #[test]
-    fn preferred_go_first_then_fallback() {
-        assert_eq!(
-            merge_rpcs(&v(["mine"]), v(["a", "b"])),
-            v(["mine", "a", "b"])
-        );
+    fn explicit_override_excludes_configured_fallbacks() {
+        assert_eq!(select_rpcs(&v(["mine"]), v(["a", "b"])), v(["mine"]));
     }
 
     #[test]
-    fn duplicates_are_dropped_keeping_first_position() {
-        // A preferred URL already present in the fallback should surface once, at the front.
-        assert_eq!(merge_rpcs(&v(["a"]), v(["a", "b"])), v(["a", "b"]));
-        // Repeated preferred entries collapse too.
-        assert_eq!(merge_rpcs(&v(["m", "m", "n"]), v(["n"])), v(["m", "n"]));
+    fn selected_pool_deduplicates_its_own_urls() {
+        assert_eq!(select_rpcs(&v(["m", "m", "n"]), v(["a"])), v(["m", "n"]));
     }
 
     #[test]

@@ -16,7 +16,7 @@ Add another contract to an existing nest - resolve its ABI and grow the config, 
 - `--alias <ALIAS>` - Optional aliases, one per address in order (comma-separated). Defaults to the next free c<N> slots after the nest's existing contracts
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; an empty entry resolves that address normally). Same proxy escape hatch as `init --abi`
 - `--dir <DIR>` - The nest directory to grow (must contain a nuthatch.toml). Defaults to the current directory
-- `--rpc <RPC>` - Prefer these RPC URL(s) over the nest's configured endpoints for ABI/deploy-block resolution (repeatable). Point at your own node to dodge public-RPC limits
+- `--rpc <RPC>` - Use only these RPC URL(s) for ABI/deploy-block resolution (repeatable). Point at your own node to avoid public-RPC limits
 
 ## `nuthatch audit`
 
@@ -102,7 +102,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--listen <LISTEN>` - Address to bind the HTTP API to
 - `--ipfs <IPFS>` - IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable)
 - `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable)
-- `--rpc <RPC>` - Override the nest's `rpc_urls` at runtime without editing the config (repeatable). These are tried first; the nest's configured endpoints remain as fallback. Point at your own node
+- `--rpc <RPC>` - Use only these `rpc_urls` at runtime without editing the config (repeatable). Point at your own node
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
 - `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following - much faster for a from-deployment backfill (RFC-0004). The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency). Try 8-16 against your own node; keep low on rate-limited public RPC
@@ -128,7 +128,7 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--alias <ALIAS>` - Optional aliases, one per address in order (comma-separated). Defaults to c0, c1, …
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; use an empty entry to resolve that address normally). The escape hatch for a proxy whose implementation ABI the public resolvers don't return - point this at the implementation's ABI and the nest decodes the events the proxy actually emits
 - `--chain <CHAIN>` - Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known chain for the contract's bytecode and picks the one it lives on - you rarely need to say
-- `--rpc <RPC>` - Prefer these RPC URL(s) over the chain defaults (repeatable). They're written first in the nest's `rpc_urls` and also used for ABI/deploy-block resolution during init, with the built-in chain endpoints kept as fallback. Point at your own node to dodge public-RPC limits
+- `--rpc <RPC>` - Use only these RPC URL(s) (repeatable). They are written to the nest's `rpc_urls` and used for ABI/deploy-block resolution during init. Point at your own node to avoid public-RPC limits
 - `--dir <DIR>` - Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the nest's own name)
 - `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
 
@@ -187,7 +187,7 @@ Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-002
 Fetch + cache immutable metadata for every contract in the nest (skips already-cached ones)
 
 - `--dir <DIR>` - The nest directory
-- `--rpc <RPC>` - Override `rpc_urls` at runtime (repeatable); tried ahead of the configured endpoints
+- `--rpc <RPC>` - Use only these `rpc_urls` at runtime (repeatable), without changing the config on disk
 
 ## `nuthatch migrate`
 
