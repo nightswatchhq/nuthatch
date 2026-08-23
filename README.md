@@ -459,6 +459,12 @@ run this for real rather than after. **[`docs/verification.md`](docs/verificatio
 counterpart: an acceptance runbook that *proves* a deployment works, step by falsifiable step, and says
 plainly which levels we have verified ourselves and which we have not.
 
+**Still deciding whether to trust it at all?** [`docs/kicking-the-tyres.md`](docs/kicking-the-tyres.md)
+is written for that: a guide to *falsifying* nuthatch rather than confirming it, with the cold walk,
+correctness against a public subgraph, what it costs to keep running, a red-team pass on `/sql`, and a
+section listing where we have already been wrong - including two of our own security patches and an
+open finding. We would rather you found the next one than a user did.
+
 The guide covers the questions people actually hit:
 
 | If you're wondering | Go to |
