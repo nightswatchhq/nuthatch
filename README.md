@@ -102,13 +102,24 @@ what nuthatch actually scaffolds, and it went in 2.4.0. See
 caveat, which is the part worth reading: a chain whose `finalized` tag runs close to the tip needs a
 depth-based policy instead, or you seal immutable Parquet that could never be corrected.
 
-### A word on the free public RPCs
+### Bring your own RPC endpoint
 
-nuthatch ships with free public endpoints per chain so that `init` → `dev` works with **zero setup** -
-that is the two-minute demo, and it is deliberate. They are fine for trying it out, following the tip of
-a low-traffic contract, or a modest recent-history backfill.
+**nuthatch assumes a paid RPC endpoint, or your own node, for anything you intend to keep running.**
+That is the golden path.
 
-They are **not** fine for real work, and it is better to hear that here than to discover it at 3am:
+Worth knowing, since we are being precise about it: most figures currently in
+[`docs/benchmarks.md`](docs/benchmarks.md) were measured against *public* endpoints, and that is a
+known weakness of those numbers rather than a recommendation - a benchmark taken through a
+rate-limited endpoint measures the endpoint. We measured the network at **99.3% of backfill wall
+clock**, which is why the replay rig (RFC-0039) exists and why those figures carry that caveat on the
+page itself.
+
+The free public endpoints bundled per chain exist for one job: so `init` → `dev` works with **zero
+setup**, which is the two-minute demo, and it is deliberate. Treat them as **testing and initial
+validation** - trying it out, checking a contract resolves, following the tip of something quiet.
+They are the on-ramp, not the road.
+
+Why they are not fine for real work, said here rather than discovered at 3am:
 
 - **They are rate-limited and shared.** You are queueing behind everyone else using the same free tier
   from the same IP range. Throughput varies by the hour.
