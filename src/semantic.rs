@@ -281,6 +281,28 @@ pub fn merge(existing: Semantic, generated: Semantic) -> Semantic {
     out
 }
 
+/// Declared alias rename (#671). Moves `[table.<old>__*]` keys to `[table.<new>__*]`, keeping
+/// authored prose. `merge` must not do this itself: it cannot tell a rename from a removal.
+pub fn rekey_alias(sem: &mut Semantic, old: &str, new: &str) {
+    let prefix = format!("{old}__");
+    let moving: Vec<String> = sem
+        .tables
+        .keys()
+        .filter(|k| k.starts_with(&prefix) || *k == old)
+        .cloned()
+        .collect();
+    for k in moving {
+        if let Some(ts) = sem.tables.remove(&k) {
+            let nk = if k == old {
+                new.to_string()
+            } else {
+                format!("{new}__{}", k.strip_prefix(&prefix).unwrap_or(&k))
+            };
+            sem.tables.insert(nk, ts);
+        }
+    }
+}
+
 /// Load `semantic.toml` from a nest directory, if present. Absent is fine (a nest predating the
 /// semantic layer still describes itself from the registry alone) - returns `Ok(None)`.
 pub fn load(dir: &std::path::Path) -> Result<Option<Semantic>> {
@@ -370,15 +392,15 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
         }
     }
 
-    // One consolidated warning per renamed alias instead of one per table. The remediation names an
-    // edit rather than a command on purpose: `semantic::merge` only ever adds generated tables and
-    // never drops one, so `nuthatch schema` leaves the orphaned keys - and this warning - in place.
+    // One consolidated warning per renamed alias instead of one per table. The command that
+    // actually keeps the prose is `nuthatch nest rename-alias`; `merge` still will not infer a
+    // rename, so `nuthatch schema` leaves the orphaned keys - and this warning - in place.
     for (alias, count) in alias_orphans {
         let plural = if count == 1 { "table" } else { "tables" };
         warnings.push(format!(
             "semantic.toml has {count} {plural} still keyed to alias `{alias}`, which is no \
-             longer in this nest; re-key the `[table.{alias}__*]` sections to the new alias to \
-             keep their descriptions, or delete them"
+             longer in this nest; run `nuthatch nest rename-alias {alias} <new>` to keep their \
+             descriptions, or re-key the `[table.{alias}__*]` sections by hand, or delete them"
         ));
     }
 
@@ -778,6 +800,49 @@ mod tests {
             !warnings.iter().any(|w| w.contains("nuthatch schema")),
             "the warning must not send the operator to a command that leaves it firing: {warnings:?}"
         );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("nuthatch nest rename-alias")),
+            "the warning must name the command that actually keeps the prose: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn rekey_alias_moves_authored_descriptions_and_merge_still_does_not() {
+        let mut sem = Semantic::default();
+        let ts = TableSemantic {
+            description: "every transfer through the token".into(),
+            ..Default::default()
+        };
+        sem.tables.insert("c0__transfer".into(), ts.clone());
+        sem.tables.insert("c0__approval".into(), ts);
+
+        rekey_alias(&mut sem, "c0", "gns");
+        assert_eq!(
+            sem.tables["gns__transfer"].description,
+            "every transfer through the token"
+        );
+        assert_eq!(
+            sem.tables["gns__approval"].description,
+            "every transfer through the token"
+        );
+        assert!(!sem.tables.contains_key("c0__transfer"));
+        assert!(!sem.tables.contains_key("c0__approval"));
+
+        // merge still does not infer a rename: generated keys under the new alias are added,
+        // the old keys (if still present) stay. This is the #671 invariant.
+        let mut leftover = Semantic::default();
+        leftover
+            .tables
+            .insert("c0__transfer".into(), TableSemantic::default());
+        let mut generated = Semantic::default();
+        generated
+            .tables
+            .insert("gns__transfer".into(), TableSemantic::default());
+        let merged = merge(leftover, generated);
+        assert!(merged.tables.contains_key("c0__transfer"));
+        assert!(merged.tables.contains_key("gns__transfer"));
     }
 
     #[test]
