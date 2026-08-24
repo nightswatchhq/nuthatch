@@ -13,6 +13,8 @@ nuthatch.toml
 # measurement - the whole point of OBIB is that it is reproducible. These files are deliberately
 # keyless: the endpoint arrives via `--rpc "$RPC"`, which is OBIB's own methodology.
 !obib-case*/nuthatch.toml
+# …and the committed tape-companion nests. Same rule as OBIB: keyless, endpoint via `--rpc`.
+!docs/bench/nests/**/nuthatch.toml
 
 # guest component build dirs (the staged component .wasm at components/*.wasm IS committed)
 components/*/target
