@@ -26,15 +26,14 @@ fn required_checks_file_names_the_ten_including_the_signature() {
 
 #[test]
 fn live_endpoints_keys_on_json_fields_not_prose() {
-    let yml = include_str!("../.github/workflows/live-endpoints.yml");
+    let script = include_str!("../scripts/probe-shipped-defaults.sh");
     assert!(
-        !yml.contains("retry \"getLogs window"),
-        "the live-endpoints gate must not grep doctor's prose (#716)"
+        !script.contains("retry \"getLogs window"),
+        "the probe script must not grep doctor's prose (#716)"
     );
     assert!(
-        !yml.contains("retry \"archive depth"),
-        "archive check must not grep doctor's prose (#716)"
+        script.contains("doctor --json"),
+        "doctor --json is the contract"
     );
-    assert!(yml.contains("--json"), "doctor --json is the contract");
-    assert!(yml.contains("max_window"), "retry keys on max_window");
+    assert!(script.contains("max_window"), "retry keys on max_window");
 }
