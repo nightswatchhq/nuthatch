@@ -9,6 +9,15 @@
 
 use std::process::Command;
 
+/// #710: silent skip is not a verdict. Locally, a missing network is a skip. In CI it is a
+/// failure, unless `NUTHATCH_ALLOW_NET_SKIP=1` is set for a documented override.
+fn network_skip(why: &str) {
+    if std::env::var("CI").is_ok() && std::env::var("NUTHATCH_ALLOW_NET_SKIP").is_err() {
+        panic!("{why} - CI cannot skip a network test (#710)");
+    }
+    eprintln!("{why} - nothing to judge, not asserting");
+}
+
 fn run(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .args(args)
@@ -97,7 +106,7 @@ fn a_log_line_during_init_arrives_in_inits_own_idiom() {
         .filter(|l| l.contains("rpc ") || l.contains("failed for"))
         .collect();
     if logged.is_empty() {
-        eprintln!("no log lines emitted (offline?) - nothing to judge, not asserting");
+        network_skip("no log lines emitted (offline?)");
         return;
     }
     for line in logged {
@@ -147,7 +156,7 @@ fn init_prints_the_abi_resolved_tick_and_not_only_formats_it() {
     // Offline runs cannot resolve an ABI at all, and a test that passes on a run that never got
     // there would be worse than none. Judge only when the scaffold actually succeeded.
     if !text.contains("scaffolded nest") {
-        eprintln!("init did not complete (offline?) - nothing to judge, not asserting");
+        network_skip("init did not complete (offline?)");
         return;
     }
     assert!(

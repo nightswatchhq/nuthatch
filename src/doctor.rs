@@ -26,7 +26,7 @@
 //! output says what the endpoint *is*, and which nests it suits.
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::rpc::RpcClient;
 use crate::source::Source;
@@ -121,6 +121,21 @@ impl Probe {
             out.push_str(&format!("  · {n}\n"));
         }
         out
+    }
+
+    /// Machine-readable form of [`report`]. Host only, never the URL: providers put keys in the
+    /// path. `max_window` is `null` when getLogs failed; that is what the live-endpoints retry
+    /// keys on (#716), not the `getLogs window   up to` sentence.
+    pub fn to_json(&self, host: &str) -> Value {
+        json!({
+            "host": host,
+            "max_window": self.max_window,
+            "recommended_window": self.recommended_window(),
+            "max_batch": self.max_batch,
+            "archive": self.archive,
+            "archive_unknown": self.archive_unknown,
+            "notes": self.notes,
+        })
     }
 }
 
@@ -332,24 +347,27 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             // endpoint's result-count cap bites at a narrower span than a single-contract probe
             // would suggest. Probing with one contract when the nest has several would recommend a
             // window the real workload cannot sustain.
-            if cfg.contracts.len() == 1 {
-                let c = &cfg.contracts[0];
-                println!(
-                    "no --address given; probing with '{}' ({}), this nest's only declared \
-                     contract - pass --address to probe a different one",
-                    c.alias, c.address
-                );
-            } else {
-                let aliases: Vec<&str> = cfg.contracts.iter().map(|c| c.alias.as_str()).collect();
-                println!(
-                    "no --address given; probing with all {} of this nest's declared contracts \
-                     ({}) - matches what a real backfill filters on. Pass --address to probe a \
-                     single one instead",
-                    cfg.contracts.len(),
-                    aliases.join(", ")
-                );
+            if !args.json {
+                if cfg.contracts.len() == 1 {
+                    let c = &cfg.contracts[0];
+                    println!(
+                        "no --address given; probing with '{}' ({}), this nest's only declared \
+                         contract - pass --address to probe a different one",
+                        c.alias, c.address
+                    );
+                } else {
+                    let aliases: Vec<&str> =
+                        cfg.contracts.iter().map(|c| c.alias.as_str()).collect();
+                    println!(
+                        "no --address given; probing with all {} of this nest's declared contracts \
+                         ({}) - matches what a real backfill filters on. Pass --address to probe a \
+                         single one instead",
+                        cfg.contracts.len(),
+                        aliases.join(", ")
+                    );
+                }
+                println!();
             }
-            println!();
             addresses = cfg.contracts.iter().map(|c| c.address.clone()).collect();
         }
         cfg.nest.rpc_urls
@@ -358,6 +376,7 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     };
 
     let mut worst_window: Option<u64> = None;
+    let mut json_rows = Vec::new();
     for url in &urls {
         // Host only: providers put API keys in the path, and this output gets pasted into issues.
         let host = url
@@ -365,13 +384,23 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .nth(1)
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
-        println!("{host}");
         let p = probe(url, &addresses).await?;
-        print!("{}", p.report());
+        if args.json {
+            json_rows.push(p.to_json(host));
+        } else {
+            println!("{host}");
+            print!("{}", p.report());
+            println!();
+        }
         if let Some(w) = p.recommended_window() {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
         }
-        println!();
+    }
+
+    if args.json {
+        // Stdout is JSON only so `jq` can be the gate. Human asides stay off this stream.
+        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        return Ok(());
     }
 
     // The pool is only as wide as its narrowest member: failover means any request may land on any
@@ -416,6 +445,20 @@ mod tests {
         // Never zero: a 1-block window is useless but at least valid.
         assert_eq!(probe_of(Some(1), None, false).recommended_window(), Some(1));
         assert_eq!(probe_of(None, None, false).recommended_window(), None);
+    }
+
+    /// #716: the live-endpoints gate keys on these fields, not on `report()` prose. A failed getLogs
+    /// is `max_window: null`; a healthy one is a number. Rewording the human line must not matter.
+    #[test]
+    fn json_probe_carries_max_window_and_archive_not_the_prose() {
+        let ok = probe_of(Some(40), Some(10), true).to_json("eth.example");
+        assert_eq!(ok["host"], "eth.example");
+        assert_eq!(ok["max_window"], 40);
+        assert_eq!(ok["archive"], true);
+        assert!(ok.get("getLogs window").is_none());
+        let bad = probe_of(None, None, false).to_json("dead.example");
+        assert!(bad["max_window"].is_null(), "{bad}");
+        assert_eq!(bad["archive"], false);
     }
 
     /// A narrow batch limit must be *called out*, because it is the one that silently costs the most:
@@ -691,6 +734,7 @@ abi = "abis/busiest.json"
             rpc: Vec::new(),
             dir: dir.path().to_string_lossy().into_owned(),
             address: None,
+            json: false,
         })
         .await
         .unwrap();
@@ -754,6 +798,7 @@ abi = "abis/second.json"
             rpc: Vec::new(),
             dir: dir.path().to_string_lossy().into_owned(),
             address: None,
+            json: false,
         })
         .await
         .unwrap();

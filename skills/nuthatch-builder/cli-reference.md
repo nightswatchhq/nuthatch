@@ -116,6 +116,7 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--rpc <RPC>` - Endpoint(s) to probe. Repeatable. Omit to probe whatever the nest in `--dir` is configured to use - which is where "my backfill is slow" usually starts
 - `--dir <DIR>` - Nest directory to read `rpc_urls` from when no `--rpc` is given
 - `--address <ADDRESS>` - Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one
+- `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
 
 ## `nuthatch init`
 
