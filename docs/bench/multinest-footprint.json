@@ -13,5 +13,6 @@
   "regression_ceiling_mb": 180,
   "seconds_to_final_tip": 141,
   "commit": "76fa504",
+  "provider": "local",
   "hardware": "32 cores, 62 GB, Linux"
 }

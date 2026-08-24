@@ -50,6 +50,10 @@ pub struct Chain {
     /// Block span per `eth_getLogs` call. Small on dense L1 (dodge result-size caps); large on a
     /// sparse L2 like Arbitrum where events are few but block heights climb fast.
     pub log_window: u64,
+    /// Whether a `getLogs` with an empty address list (topic0-only, the factory flip) is accepted.
+    /// `false` means the shipped default returns an error such as "Please specify an address"; a
+    /// factory nest on that chain must not discover the refusal mid-backfill.
+    pub topic0_only_getlogs: bool,
 }
 
 const MAINNET: Chain = Chain {
@@ -59,25 +63,26 @@ const MAINNET: Chain = Chain {
         // **Ordered by measured backfill capability, best first** - see the module note above on why
         // this list has an expiry date. Re-measured 2026-07-31 with a 10-block address-filtered
         // `eth_getLogs` 5,000 blocks behind tip, which is the smallest request a real backfill makes.
-        // Measured with `nuthatch doctor --rpc … --address <usdc>` on 2026-08-07, **ordered
-        // archive-first** because that is the only limit here with no workaround:
-        //   eth-pokt.nodies.app   window 40   batch 10  archive YES
-        //   eth.drpc.org          window 160  batch 3   archive YES
-        //   onfinality (public)   window 160  batch 3   archive NO
-        // A batch cap *degrades* - the timestamp fetcher splits down to it. Missing archive state is
-        // fatal to a from-genesis backfill and cannot be split around, so it outranks batch width.
+        // Re-measured 2026-08-23 with `nuthatch doctor --rpc … --address <usdc>` (#761), confirmed
+        // 2026-08-24 with a 10-block address-filtered getLogs 5,000 behind tip:
+        //   eth-pokt.nodies.app   archive YES, topic0-only YES
+        //   eth.drpc.org          archive YES, topic0-only YES (batch-of-5 500s; the timestamp
+        //                         fetcher already splits down to the cap)
+        // `eth.api.onfinality.io/public` dropped: the 23rd's doctor probe did not complete (empty
+        // hang). A spare that stalls the run is not failover. It answered the same probes on the
+        // 24th; it stays off the list until it survives a doctor run, not a one-shot getLogs.
+        // A batch cap *degrades* - the timestamp fetcher splits down to it.
         "https://eth-pokt.nodies.app",
         "https://eth.drpc.org",
-        "https://eth.api.onfinality.io/public",
-        // Removed 2026-07-31: `ethereum-rpc.publicnode.com` now answers
-        // `Archive requests require a personal token` for anything more than ~100 blocks behind tip,
-        // so it cannot serve a backfill at all - and it was listed *first*. `eth.llamarpc.com` was
-        // returning HTTP 521 (origin down). Both had been "verified" in 2026-07.
+        // Removed 2026-08-23 (#761): `eth.api.onfinality.io/public` - doctor probe does not complete,
+        // and it was never archive. Removed 2026-07-31: `ethereum-rpc.publicnode.com` (archive token)
+        // and `eth.llamarpc.com` (HTTP 521).
     ],
     // ~2 epochs; real finality signals arrive with the ExEx mode. The `finalized` tag exists
     // post-merge but Depth keeps a single conservative policy until ExEx lands.
     finality: Finality::Depth(64),
     log_window: 20,
+    topic0_only_getlogs: true,
 };
 
 const ARBITRUM_ONE: Chain = Chain {
@@ -110,6 +115,7 @@ const ARBITRUM_ONE: Chain = Chain {
     // rather than failing it. The cost of that rescue is a burst of retries at the start of a
     // backfill, which reads as slowness - so a busy contract wants `--window` set from `doctor`.
     log_window: 2000,
+    topic0_only_getlogs: true,
 };
 
 const BASE: Chain = Chain {
@@ -136,21 +142,24 @@ const BASE: Chain = Chain {
     // Same reasoning as Arbitrum: the optimistic default is recovered by adaptive splitting, at the
     // cost of early retries.
     log_window: 1000,
+    topic0_only_getlogs: true,
 };
 
-/// BNB Smart Chain. **Tip-following works out of the box; a from-deployment backfill does not.**
+/// BNB Smart Chain. **Tip-following of a static contract works out of the box; a from-deployment
+/// backfill does not; a factory nest does not.**
 ///
-/// Measured 2026-08-19 against the RFC-0030 §4 bar. `bsc-rpc.publicnode.com` is the only keyless
-/// endpoint that passes at all - getLogs 5/5, batch-of-5 OK, `finalized` OK - and even it reports
-/// **archive depth no**. Six others were probed and every one returned getLogs **0/5** on a 10-block
-/// address-filtered request 5,000 behind tip (`bsc-dataseed*.bnbchain.org`, `.defibit.io`,
-/// `.ninicoin.io`, `bsc-mainnet.public.blastapi.io`); `1rpc.io/bnb` managed 4/5 with a 40-block
-/// ceiling and refused the archive probe on quota; `binance.llamarpc.com`, `bsc.drpc.org`,
-/// `bsc-pokt.nodies.app` and `rpc.therpc.io/bsc` were unreachable.
+/// Re-measured 2026-08-23 (#761), confirmed 2026-08-24. `bsc-rpc.publicnode.com` is still the only
+/// keyless endpoint that answers address-filtered getLogs at all, and historical getLogs at block
+/// 1,000,000 is HTTP 403 - **archive depth no**. `bsc-dataseed.binance.org` fails a 10-block getLogs
+/// (`limit exceeded`) and has no trie state ~1M behind tip; `bsc.drpc.org` 429s the public plan;
+/// `1rpc.io/bnb` is over quota; `binance.llamarpc.com` does not connect.
 ///
-/// So this is shipped honestly rather than not shipped: a nest that tip-follows is fine, and one that
-/// wants history needs `--rpc <your archive endpoint>`. Saying that here beats a default that dies a
-/// thousand blocks into a backfill.
+/// It also **refuses address-less getLogs** (`-32701 Please specify an address`) - the shape
+/// RFC-0009 §4's factory flip issues. A pancakeswap-style nest works until 500 children and then
+/// fails every window. `topic0_only_getlogs` is false so `build_nest` names that at load.
+///
+/// So this is shipped honestly: tip-follow a static contract on the default; history and factories
+/// need `--rpc <your archive endpoint>`.
 const BSC: Chain = Chain {
     name: "bsc",
     chain_id: 56,
@@ -163,6 +172,7 @@ const BSC: Chain = Chain {
     // Measured max 320 address-filtered. Set at the measurement rather than optimistically above it:
     // with one endpoint there is no sibling to absorb a retry storm.
     log_window: 320,
+    topic0_only_getlogs: false,
 };
 
 /// Polygon PoS. Archive is available but narrow; the wide endpoint is not archive.
@@ -190,6 +200,7 @@ const POLYGON: Chain = Chain {
     // polygon.drpc.org (archive, first endpoint) caps getLogs at 80 blocks; doctor recommends 40.
     // Measured 2026-08-20.
     log_window: 40,
+    topic0_only_getlogs: true,
 };
 
 /// Gnosis. The best-served of the four chains added here: two keyless **archive** endpoints, both
@@ -211,6 +222,7 @@ const GNOSIS: Chain = Chain {
     // Both endpoints measured at 163,840; 20,000 leaves headroom for the adaptive chunker to climb
     // without opening on a window neither can serve.
     log_window: 20_000,
+    topic0_only_getlogs: true,
 };
 
 /// Optimism. OP-stack L2, so the same finality reasoning as Base: the `finalized` tag is L1-aware.
@@ -230,6 +242,7 @@ const OPTIMISM: Chain = Chain {
         fallback_depth: 900,
     },
     log_window: 600,
+    topic0_only_getlogs: true,
 };
 
 pub fn lookup(name: &str) -> Option<&'static Chain> {
@@ -381,6 +394,37 @@ mod tests {
         let c = lookup("mainnet").unwrap();
         assert_eq!(c.finality, Finality::Depth(64));
         assert_eq!(c.log_window, 20);
+    }
+
+    /// #761: onfinality's public URL was a third mainnet default that could not serve a backfill
+    /// (no archive, and on 2026-08-23 the doctor probe did not complete). Failover across a corpse
+    /// is not failover.
+    #[test]
+    fn mainnet_does_not_ship_onfinality_or_a_single_live_host() {
+        let urls = lookup("mainnet").unwrap().rpc_urls;
+        assert!(
+            !urls.iter().any(|u| u.contains("onfinality")),
+            "onfinality public is not archive and does not complete a doctor probe: {urls:?}"
+        );
+        assert!(
+            urls.len() >= 2,
+            "mainnet must keep a spare after pruning: {urls:?}"
+        );
+        assert!(
+            lookup("mainnet").unwrap().topic0_only_getlogs,
+            "mainnet factory flip is the ordinary case"
+        );
+    }
+
+    /// #761: BSC's only keyless default refuses address-less getLogs, which is the factory flip.
+    #[test]
+    fn bsc_shipped_default_does_not_claim_topic0_only_getlogs() {
+        let c = lookup("bsc").unwrap();
+        assert!(
+            !c.topic0_only_getlogs,
+            "bsc-rpc.publicnode.com refuses an empty address list"
+        );
+        assert_eq!(c.rpc_urls, &["https://bsc-rpc.publicnode.com"]);
     }
 
     #[test]
