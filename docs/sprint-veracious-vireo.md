@@ -1,12 +1,12 @@
 # Sprint: veracious-vireo
 
 Filed after unhurried-urial (#811), sprints-are-groups (#810) and tenacious-thrush (#809) landed.
-**Five issues.** A sprint is a labelled set. It has no calendar.
+**Six issues.** A sprint is a labelled set. It has no calendar.
 
 ## Definition of done
 
 Every issue carrying the **`veracious-vireo`** label is closed, and no open PR is for one of
-them. That is five issues: #661, #687, #776, #789, #807. Work discovered in flight is filed
+them. That is six issues: #661, #687, #776, #789, #807, #812. Work discovered in flight is filed
 **unlabelled**. Pulling it into scope needs a board reply.
 
 ## The theme
@@ -15,12 +15,13 @@ them. That is five issues: #661, #687, #776, #789, #807. Work discovered in flig
 
 `/ready` reporting WAITING through a seal-direct pass that is fetching, decoding and sealing is the
 same class as launch copy that still says there is no `eth_call` executor. Both surfaces tell a
-stranger the product is not doing the thing it is doing.
+stranger the product is not doing the thing it is doing. `/metrics` that cannot name CPU, disk or
+RPC health is the same hole on the other socket.
 
-Freeze-legal throughout: bug, documentation, observability of a phase that already exists. Not
-RFC-0040. #807 was frozen; the board unfroze it into this sprint.
+Freeze-legal throughout: bug, documentation, observability of a process and a phase that already
+exist. Not RFC-0040. #807 and #812 were frozen; the board unfroze them into this sprint.
 
-## The five
+## The six
 
 ### 1. #661 - launch copy still describes 2.5.0
 
@@ -91,10 +92,29 @@ mode, not RFC-0040, and not a second cursor.
 3. A test fails if those fields stay at zero through a seal-direct pass that actually sealed
    rows. Deleting the gauges fails it.
 
+### 6. #812 - `/metrics` cannot name CPU, disk, or RPC health
+
+The TUI can already render what `/metrics` publishes. It cannot honestly show process CPU, hot
+versus sealed footprint, or endpoint health, because those series do not exist. The process
+already burns CPU, already writes a hot store and sealed segments, already retries RPC. This is
+passive observation of that, labelled by a bounded endpoint identifier, not a raw URL.
+
+Unfrozen with #807. Not a new extraction mode, not a probe that mutates, not an admin endpoint,
+not RFC-0040.
+
+**Acceptance**
+
+1. Prometheus exposes a process CPU-time **counter** (`nuthatch_process_cpu_seconds_total` or
+   equivalent), gauges for hot-store bytes and sealed-segment bytes, and RPC request / failure /
+   retry counters plus a duration histogram, labelled by a bounded endpoint id.
+2. Semantics are written down: counter versus gauge, reset behaviour, no unbounded label
+   cardinality. A raw RPC URL is not a label.
+3. A test fails if those series are absent from the scrape text, or if an endpoint label contains
+   `://` or a path. Deleting the exporters fails it.
+
 ## Explicitly not in this sprint
 
-- **RFC-0040** and anything still `frozen`. #812 (process/storage/RPC metrics for the TUI) is
-  new capability; freeze it, do not pick it up.
+- **RFC-0040** and anything still `frozen`.
 - **#698**, the live site. No deploy automation, needs a Vercel token. Board-only.
 - **#790**, the tyre-kicking pass. Someone without today's scars runs it. Filing its findings in
   advance would be inventing them.
