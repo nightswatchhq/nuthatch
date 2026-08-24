@@ -202,6 +202,9 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 /// - `views/**` - authored SQL is **not materialised**. `analytics::define_nest_views` defines views
 ///   per query on an ephemeral in-memory DuckDB over the segments and the hot tip; nothing persists
 ///   them, so no view can influence a byte that is stored.
+/// - `entities.toml` and `entities/**` - RFC-0041 declarations and definitions affect derived entity
+///   state only. Slice one validates them, and slice two rebuilds that state from the adopted facts;
+///   they must move the package NID without forcing the decoded dataset to be re-indexed.
 /// - `semantic.toml` - descriptions and derived footguns, read by the MCP/semantic surface only.
 /// - `llms.txt`, `README.md` - documentation.
 /// - `.claude/**` - the scaffolded agent skill.
@@ -211,11 +214,13 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 /// it anyway), and anything under `abis/` (the decode itself).
 const NON_DATA_INPUTS: &[&str] = &[
     "views/",
+    "entities/",
     // The author's query ceiling (RFC-0034 §3). An authored input, so it is in the NID - but it
     // cannot change a stored byte, and if it moved the *data* identity then every security tweak
     // would re-index the chain, which is precisely what phase 2 was sequenced behind early cutoff to
     // avoid.
     "queries.toml",
+    "entities.toml",
     "semantic.toml",
     "llms.txt",
     "README.md",
@@ -922,6 +927,7 @@ abi = "abis/c.json"
         let a = tempfile::tempdir().unwrap();
         write_nest(a.path());
         std::fs::create_dir_all(a.path().join("views")).unwrap();
+        std::fs::create_dir_all(a.path().join("entities")).unwrap();
         std::fs::write(a.path().join("views/10-v.sql"), "CREATE VIEW v AS SELECT 1").unwrap();
         let before = build_manifest(a.path(), None).unwrap();
 
@@ -936,6 +942,16 @@ abi = "abis/c.json"
                 "semantic.toml",
                 "[nest]\ndescription = \"x\"\n",
                 "descriptions",
+            ),
+            (
+                "entities.toml",
+                "[[entities]]\nname = \"delegations\"\nsql = \"entities/delegations.sql\"\nkey = [\"delegator\"]\nmax_rows = 100\n",
+                "an incremental entity declaration",
+            ),
+            (
+                "entities/delegations.sql",
+                "SELECT delegator, count(*) AS n FROM events GROUP BY delegator",
+                "an incremental entity definition",
             ),
         ] {
             std::fs::write(a.path().join(file), contents).unwrap();
@@ -1032,6 +1048,8 @@ abi = "abis/c.json"
         for excluded in [
             "views/10-a.sql",
             "queries.toml",
+            "entities.toml",
+            "entities/delegations.sql",
             "views/nested/deep.sql",
             "semantic.toml",
             "llms.txt",

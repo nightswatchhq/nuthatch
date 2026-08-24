@@ -158,6 +158,9 @@ async fn main() -> Result<()> {
         cli::Command::Bench(args) => match args.what {
             cli::BenchWhat::Backfill(a) => bench::backfill(a).await,
             cli::BenchWhat::Query(a) => bench::query(a),
+            cli::BenchWhat::AuthoredEntity(a) => {
+                tokio::task::spawn_blocking(move || bench::authored_entity(a)).await?
+            }
         },
         cli::Command::Doctor(args) => doctor::run(args).await,
         cli::Command::Labels(args) => run_labels(args),

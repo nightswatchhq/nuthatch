@@ -68,13 +68,18 @@ pub fn check(args: CheckArgs) -> Result<()> {
         }
         n
     });
+    let entity_issues = crate::entities::validate(&dir);
+    for issue in &entity_issues {
+        println!("✗ incremental entity {}: {}", issue.name, issue.error);
+        failures += 1;
+    }
 
     if checks.is_empty() {
         let has_views = !analytics::nest_view_files(&dir).is_empty();
         // Only truly nothing to check - no checks, and either no views or no schema to validate them
         // against - keeps the original bail. A nest with views that were actually validated above
         // got a real answer instead, even with `checks/` empty.
-        if !has_views || views_validated.is_none() {
+        if (!has_views || views_validated.is_none()) && entity_issues.is_empty() {
             bail!(
                 "no checks found in {} (expected checks/*.sql)",
                 dir.join("checks").display()
