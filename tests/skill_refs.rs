@@ -239,6 +239,35 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // `queries.toml` (RFC-0034 phase 2, #353): the author's ceiling. `Surface` also lives here but is
     // not `Deserialize` (it's the mount-side runtime type, not something read from a file).
     ("src/allowlist.rs", Some(&["Ceiling", "NamedQuery"])),
+    // Nested under `nuthatch.toml` but defined in their own files. Missing here is how a new
+    // `[[calls]]` key ships undocumented, the same hole #713 is for `allowlist.rs`.
+    ("src/calls.rs", Some(&["CallDecl"])),
+    ("src/ipfs.rs", Some(&["IpfsDecl"])),
+];
+
+/// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
+/// operator-authored nest/runtime config. A reason is required: an empty excuse is how the next
+/// config file lands on this list by accident.
+const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
+    ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
+    (
+        "src/blob.rs",
+        "content-addressed bundle manifest, not nest config",
+    ),
+    (
+        "src/seal.rs",
+        "sealed-segment catalogue, written by the indexer",
+    ),
+    ("src/pack.rs", "compliance-pack manifest, not nest config"),
+    ("src/labels.rs", "imported label snapshots, not nest toml"),
+    ("src/lists.rs", "fetched list snapshots, not nest toml"),
+    ("src/metadata.rs", "cached token metadata, not nest toml"),
+    ("src/lifecycle.rs", "HTTP request bodies for the admin API"),
+    (
+        "src/control_api.rs",
+        "HTTP request bodies for the control plane",
+    ),
+    ("src/serve.rs", "HTTP request bodies for the query API"),
 ];
 
 /// Keys that are deliberately absent from the reference, each with the reason it is absent.
@@ -259,6 +288,55 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     ("Config.state_rpc_urls", "`#[serde(skip)]` - the tier-3 archive endpoint comes from `--state-rpc` and is deliberately never a config key, because it carries an API key and this file is pinned into the nest's content address"),
     ("Config.ipfs_gateways", "`#[serde(skip)]` - IPFS gateways come from `--ipfs`. A gateway is an *access path*: two operators resolving one CID through different gateways must get the same bytes, so it must not enter the nest's content address"),
 ];
+
+#[test]
+fn config_sources_names_every_operator_config_file() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let listed: std::collections::BTreeSet<&str> = CONFIG_SOURCES.iter().map(|(f, _)| *f).collect();
+    let exempt: std::collections::BTreeMap<&str, &str> =
+        NOT_OPERATOR_CONFIG.iter().copied().collect();
+
+    assert!(
+        listed.contains("src/allowlist.rs"),
+        "deleting the allowlist.rs row is #713: the next queries.toml-shaped file will escape \
+         the same way. Put it back, or this gate is decorative."
+    );
+
+    let src = root.join("src");
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let rel = format!("src/{}", path.file_name().unwrap().to_string_lossy());
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !text.contains("Deserialize") {
+            continue;
+        }
+        if listed.contains(rel.as_str()) || exempt.contains_key(rel.as_str()) {
+            continue;
+        }
+        missing.push(format!(
+            "{rel} derives Deserialize and is in neither CONFIG_SOURCES nor NOT_OPERATOR_CONFIG"
+        ));
+    }
+    assert!(
+        missing.is_empty(),
+        "a Deserialize file in src/*.rs is operator config until named otherwise (#713):\n{}",
+        missing.join("\n")
+    );
+
+    let stale: Vec<&str> = NOT_OPERATOR_CONFIG
+        .iter()
+        .filter(|(f, _)| listed.contains(f))
+        .map(|(f, _)| *f)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "NOT_OPERATOR_CONFIG overlaps CONFIG_SOURCES, so the completeness check cannot fail: {stale:?}"
+    );
+}
 
 #[test]
 fn config_reference_names_every_real_config_key() {
