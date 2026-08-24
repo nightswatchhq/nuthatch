@@ -1,6 +1,6 @@
 # RFC-0015: The delightful core - CLI/UX for the solo dev
 
-- Status: **Implemented** - the 0.5 theme; all 6 slices shipped (REPL, magical init, live feedback, `add`, MCP one-liner, prod recipes).
+- Status: **Implemented** - the 0.5 theme; all 6 slices shipped (REPL, magical init, live feedback, `add`, MCP one-liner, prod recipes). The two-minute acceptance bar is unmet (#672).
 - Author: Pete (cargopete)
 - Date: 2026-07-18
 - Depends on: nothing new - this is polish over the 0.1-0.4 capabilities, which are all shipped.
@@ -82,6 +82,13 @@ The bar is subjective but real: **can a stranger go from a contract address to q
 terminal, delighted, in under two minutes, with the docs open only for the address?** When the answer is
 an obvious yes, 0.5 is done. Instrument time-to-first-query in the demo; keep a 60-second asciinema as
 the proof.
+
+**Measured 2026-08-22 against 2.6.0 (#672) and unmet.** `init` of a mainnet address is five seconds, and
+the first non-empty `SELECT` is five seconds after `dev` starts. Then the first-run window overshoots to
+20,480 blocks, a width no mainnet provider serves, and ninety seconds in the stranger sees 15 events,
+0.1%, 0 ev/s. The six slices shipped. The bar they were meant to clear did not. There is no instrumented
+time-to-first-query and no asciinema. A status line that tracks the slice list rather than this
+paragraph will hide the next regression the same way.
 
 ## Open questions
 

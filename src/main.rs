@@ -197,6 +197,9 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            cli::NestWhat::RenameAlias(a) => {
+                project::rename_alias(std::path::Path::new(&a.dir), &a.old, &a.new)
+            }
         },
         cli::Command::SkillRefs => {
             nuthatch::skill::write_refs(std::path::Path::new("."))?;

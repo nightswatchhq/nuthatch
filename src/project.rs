@@ -39,7 +39,13 @@ pub async fn init(args: InitArgs) -> Result<()> {
         .iter()
         .map(|a| normalise_address(a))
         .collect::<Result<_>>()?;
-    let aliases = resolve_aliases(&args.alias, addresses.len())?;
+    if !args.alias.is_empty() && args.alias.len() != addresses.len() {
+        bail!(
+            "{} aliases for {} address(es) - provide one alias per address or none",
+            args.alias.len(),
+            addresses.len()
+        );
+    }
 
     // An explicit `--rpc` is the whole endpoint pool, both for first-run resolution and in the
     // persisted config. Otherwise use the chain defaults.
@@ -52,18 +58,33 @@ pub async fn init(args: InitArgs) -> Result<()> {
     let overrides = resolve_abi_overrides(&args.abi, addresses.len())?;
 
     let mut contracts = Vec::with_capacity(addresses.len());
-    for (i, (address, alias)) in addresses.iter().zip(&aliases).enumerate() {
-        let (abi_json, implementation) = match &overrides[i] {
+    let mut aliases: Vec<String> = Vec::with_capacity(addresses.len());
+    let used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (i, address) in addresses.iter().enumerate() {
+        let (abi_json, implementation, contract_name) = match &overrides[i] {
             Some(path) => {
-                println!("→ using local ABI {path} for {alias} ({address})");
-                (read_local_abi(path)?, None)
+                println!("→ using local ABI {path} for {address}");
+                let (abi, name) = read_local_abi(path)?;
+                (abi, None, name)
             }
             None => {
-                println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
+                println!("→ resolving ABI for {address} on {}…", chain.name);
                 let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
-                (resolved.abi, resolved.implementation)
+                (
+                    resolved.abi,
+                    resolved.implementation,
+                    resolved.contract_name,
+                )
             }
         };
+        let provided = args.alias.get(i).map(|s| s.as_str());
+        let name = contract_name
+            .as_deref()
+            .or_else(|| contract_name_from_abi(&abi_json));
+        let alias = pick_alias(provided, name, &used, &aliases)?;
+        println!("  · alias {alias}");
+        aliases.push(alias);
+        let alias = aliases.last().unwrap();
         let abi_path = format!("abis/{alias}.json");
         std::fs::write(
             dir.join(&abi_path),
@@ -137,13 +158,19 @@ pub async fn init(args: InitArgs) -> Result<()> {
     // Build the registry from the vendored ABIs to generate the schema artifact + AI surface (one
     // source of truth: schema.json, llms.txt, the skill, and `/tables` all come from here).
     let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
+    let skipped = crate::registry::from_nest(&dir, &config)
+        .map(|r| r.skipped_anonymous())
+        .unwrap_or(0);
 
     println!(
-        "✓ scaffolded nest '{}' ({} contract(s), {} table(s)) in {}",
-        config.nest.name,
-        config.contracts.len(),
-        table_count,
-        dir.display()
+        "{}",
+        scaffold_summary(
+            &config.nest.name,
+            config.contracts.len(),
+            table_count,
+            skipped,
+            &dir.display().to_string(),
+        )
     );
     println!("    nuthatch.toml              config");
     println!("    abis/                      resolved ABIs");
@@ -192,7 +219,13 @@ pub async fn add(args: AddArgs) -> Result<()> {
             bail!("{addr} is already in this nest");
         }
     }
-    let aliases = add_aliases(&config.contracts, &args.alias, new_addresses.len())?;
+    if !args.alias.is_empty() && args.alias.len() != new_addresses.len() {
+        bail!(
+            "{} aliases for {} address(es) - provide one alias per address or none",
+            args.alias.len(),
+            new_addresses.len()
+        );
+    }
 
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.iter().cloned());
     let rpc = RpcClient::new(rpc_urls)?;
@@ -203,18 +236,34 @@ pub async fn add(args: AddArgs) -> Result<()> {
 
     let overrides = resolve_abi_overrides(&args.abi, new_addresses.len())?;
 
-    for (i, (address, alias)) in new_addresses.iter().zip(&aliases).enumerate() {
-        let (abi_json, implementation) = match &overrides[i] {
+    let mut new_aliases: Vec<String> = Vec::with_capacity(new_addresses.len());
+    for (i, address) in new_addresses.iter().enumerate() {
+        let (abi_json, implementation, contract_name) = match &overrides[i] {
             Some(path) => {
-                println!("→ using local ABI {path} for {alias} ({address})");
-                (read_local_abi(path)?, None)
+                println!("→ using local ABI {path} for {address}");
+                let (abi, name) = read_local_abi(path)?;
+                (abi, None, name)
             }
             None => {
-                println!("→ resolving ABI for {alias} ({address}) on {}…", chain.name);
+                println!("→ resolving ABI for {address} on {}…", chain.name);
                 let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
-                (resolved.abi, resolved.implementation)
+                (
+                    resolved.abi,
+                    resolved.implementation,
+                    resolved.contract_name,
+                )
             }
         };
+        let used: std::collections::HashSet<&str> =
+            config.contracts.iter().map(|c| c.alias.as_str()).collect();
+        let provided = args.alias.get(i).map(|s| s.as_str());
+        let name = contract_name
+            .as_deref()
+            .or_else(|| contract_name_from_abi(&abi_json));
+        let alias = pick_alias(provided, name, &used, &new_aliases)?;
+        println!("  · alias {alias}");
+        new_aliases.push(alias);
+        let alias = new_aliases.last().unwrap();
         let abi_path = format!("abis/{alias}.json");
         std::fs::write(
             dir.join(&abi_path),
@@ -281,6 +330,44 @@ pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
         .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
     let n = write_nest_artifacts(&dir, &config.nest.chain, &config)?;
     println!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
+    Ok(())
+}
+
+/// `nuthatch nest rename-alias <old> <new>` (#671). Declared, not inferred: `merge` still will not
+/// guess a rename, because it cannot tell one from a removal.
+pub fn rename_alias(dir: &Path, old: &str, new: &str) -> Result<()> {
+    if !is_valid_alias(new) {
+        bail!("alias '{new}' must match [a-z][a-z0-9_]*");
+    }
+    if old == new {
+        bail!("old and new alias are the same");
+    }
+    let mut config = Config::load(dir)
+        .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
+    let idx = config
+        .contracts
+        .iter()
+        .position(|c| c.alias == old)
+        .ok_or_else(|| anyhow::anyhow!("no contract with alias '{old}' in this nest"))?;
+    if config.contracts.iter().any(|c| c.alias == new) {
+        bail!("alias '{new}' is already used in this nest");
+    }
+    let old_abi = dir.join(&config.contracts[idx].abi);
+    let new_rel = format!("abis/{new}.json");
+    let new_abi = dir.join(&new_rel);
+    if old_abi.exists() && old_abi != new_abi {
+        std::fs::rename(&old_abi, &new_abi)
+            .with_context(|| format!("moving {} → {}", old_abi.display(), new_abi.display()))?;
+    }
+    config.contracts[idx].alias = new.to_string();
+    config.contracts[idx].abi = new_rel;
+    config.save(dir)?;
+    if let Some(mut sem) = crate::semantic::load(dir)? {
+        crate::semantic::rekey_alias(&mut sem, old, new);
+        crate::semantic::save(dir, &sem)?;
+    }
+    write_nest_artifacts(dir, &config.nest.chain, &config)?;
+    println!("✓ renamed alias {old} → {new}");
     Ok(())
 }
 
@@ -833,45 +920,6 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     Ok(())
 }
 
-/// Default aliases for `add`ed contracts: continue the `c<N>` sequence past the nest's existing
-/// contracts, skipping any slot already taken. An explicit `--alias` list is validated and checked
-/// for collisions with the existing contracts instead.
-fn add_aliases(existing: &[Contract], provided: &[String], n: usize) -> Result<Vec<String>> {
-    if !provided.is_empty() {
-        if provided.len() != n {
-            bail!("--alias expects {n} name(s), got {}", provided.len());
-        }
-        for a in provided {
-            if !is_valid_alias(a) {
-                bail!("alias '{a}' must match [a-z][a-z0-9_]*");
-            }
-            if existing.iter().any(|c| &c.alias == a) {
-                bail!("alias '{a}' is already used in this nest");
-            }
-        }
-        // Reject duplicates within the provided list too.
-        for (i, a) in provided.iter().enumerate() {
-            if provided[i + 1..].contains(a) {
-                bail!("alias '{a}' given twice");
-            }
-        }
-        return Ok(provided.to_vec());
-    }
-    let used: std::collections::HashSet<&str> = existing.iter().map(|c| c.alias.as_str()).collect();
-    let mut out: Vec<String> = Vec::with_capacity(n);
-    let mut k = existing.len();
-    for _ in 0..n {
-        let mut cand = format!("c{k}");
-        while used.contains(cand.as_str()) || out.contains(&cand) {
-            k += 1;
-            cand = format!("c{k}");
-        }
-        out.push(cand);
-        k += 1;
-    }
-    Ok(out)
-}
-
 /// Initialise a nest from a published one - a git URL or a local directory - instead of resolving
 /// from addresses. The nest is self-contained (ABIs vendored, `nuthatch.toml` committed), so this
 /// clones/copies it and validates it: the toml parses at a supported schema version and the decode
@@ -1035,6 +1083,8 @@ struct ResolvedAbi {
     abi: serde_json::Value,
     /// `Some` only when the vendored ABI came from an implementation rather than the address itself.
     implementation: Option<String>,
+    /// Sourcify (or a wrapped ABI) sometimes names the contract. Used as the default alias (#774).
+    contract_name: Option<String>,
 }
 
 async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<ResolvedAbi> {
@@ -1045,6 +1095,7 @@ async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<Re
             return Ok(ResolvedAbi {
                 abi: resolved.abi,
                 implementation: Some(implementation),
+                contract_name: resolved.contract_name,
             });
         }
         println!("  · implementation ABI unresolved; using the proxy's own ABI");
@@ -1054,6 +1105,7 @@ async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<Re
     Ok(ResolvedAbi {
         abi: resolved.abi,
         implementation: None,
+        contract_name: resolved.contract_name,
     })
 }
 
@@ -1331,11 +1383,18 @@ fn resolve_abi_overrides(provided: &[String], n: usize) -> Result<Vec<Option<Str
 /// Read and validate a local ABI file. Parsed as a `JsonAbi` before it is accepted so a wrong file
 /// (a subgraph manifest, a contract artifact wrapping the ABI under `"abi"`) fails here with a clear
 /// message rather than at decode time as an empty registry.
-fn read_local_abi(path: &str) -> Result<serde_json::Value> {
+/// ABI JSON plus an optional `contractName` from a Hardhat/Foundry wrapper. The name is taken
+/// from the wrapper *before* the ABI array is unwrapped - after that, it is gone (#774).
+fn read_local_abi(path: &str) -> Result<(serde_json::Value, Option<String>)> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("cannot read ABI file '{path}'"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("'{path}' is not valid JSON"))?;
+    let name = parsed
+        .get("contractName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     // Solidity build artifacts (Hardhat/Foundry) wrap the ABI in an object. Accepting that shape is
     // two lines here and saves everyone a confusing failure later.
     let abi = match parsed.get("abi") {
@@ -1344,7 +1403,7 @@ fn read_local_abi(path: &str) -> Result<serde_json::Value> {
     };
     serde_json::from_value::<alloy_json_abi::JsonAbi>(abi.clone())
         .with_context(|| format!("'{path}' does not parse as a contract ABI"))?;
-    Ok(abi)
+    Ok((abi, name))
 }
 
 /// `0x`-prefixed topic0 of every event in an ABI. Uses the same `alloy_json_abi` selector the decode
@@ -1359,29 +1418,106 @@ fn abi_event_topic0s(abi: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Aliases from `--alias` (validated, one per address) or defaults c0, c1, ….
-fn resolve_aliases(provided: &[String], n: usize) -> Result<Vec<String>> {
-    if provided.is_empty() {
-        return Ok((0..n).map(|i| format!("c{i}")).collect());
-    }
-    if provided.len() != n {
-        bail!(
-            "{} aliases for {n} address(es) - provide one alias per address or none",
-            provided.len()
-        );
-    }
-    for a in provided {
-        if !is_valid_alias(a) {
-            bail!("alias '{a}' must match [a-z][a-z0-9_]*");
-        }
-    }
-    Ok(provided.to_vec())
-}
-
 fn is_valid_alias(a: &str) -> bool {
     let mut chars = a.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `DelegationManager` → `delegation_manager`, `Vat` → `vat`, `L2GNS` → `l2gns`.
+/// None when the result is empty or would not pass [`is_valid_alias`].
+fn slugify_alias(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            if prev_lower {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+            prev_lower = false;
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+            prev_lower = c.is_ascii_lowercase();
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+            prev_lower = false;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    is_valid_alias(&out).then_some(out)
+}
+
+/// A name from Sourcify metadata or a wrapped ABI's `contractName`.
+fn contract_name_from_abi(abi: &serde_json::Value) -> Option<&str> {
+    abi.get("contractName").and_then(|v| v.as_str())
+}
+
+/// Next unused `cN`, then `cN+1`, skipping anything already taken.
+fn next_c_alias(used: &std::collections::HashSet<&str>, taken: &[String]) -> String {
+    let mut k = 0usize;
+    loop {
+        let cand = format!("c{k}");
+        if !used.contains(cand.as_str()) && !taken.contains(&cand) {
+            return cand;
+        }
+        k += 1;
+    }
+}
+
+/// Prefer an explicit alias, then a slugified contract name, then `cN`.
+fn pick_alias(
+    provided: Option<&str>,
+    contract_name: Option<&str>,
+    used: &std::collections::HashSet<&str>,
+    taken: &[String],
+) -> Result<String> {
+    if let Some(a) = provided {
+        if !is_valid_alias(a) {
+            bail!("alias '{a}' must match [a-z][a-z0-9_]*");
+        }
+        if used.contains(a) || taken.iter().any(|t| t == a) {
+            bail!("alias '{a}' is already used in this nest");
+        }
+        return Ok(a.to_string());
+    }
+    if let Some(slug) = contract_name.and_then(slugify_alias) {
+        if !used.contains(slug.as_str()) && !taken.contains(&slug) {
+            return Ok(slug);
+        }
+        let mut k = 2usize;
+        loop {
+            let cand = format!("{slug}_{k}");
+            if is_valid_alias(&cand) && !used.contains(cand.as_str()) && !taken.contains(&cand) {
+                return Ok(cand);
+            }
+            k += 1;
+        }
+    }
+    Ok(next_c_alias(used, taken))
+}
+
+/// The line `init` prints after scaffolding. A 0-table nest whose ABI was entirely anonymous
+/// must not look like USDC's success (#766).
+fn scaffold_summary(
+    nest: &str,
+    contracts: usize,
+    tables: usize,
+    skipped_anonymous: usize,
+    dir: &str,
+) -> String {
+    if tables == 0 && skipped_anonymous > 0 {
+        format!(
+            "WARN nest '{nest}' has {tables} table(s) from {contracts} contract(s) in {dir}. \
+             {skipped_anonymous} anonymous event(s) were skipped: they have no topic0, and \
+             nuthatch's decode is topic0-keyed. This nest cannot index that ABI. Not a successful \
+             scaffold of an empty protocol - a limit. See docs/rfcs/0001-generalized-decode-and-nests.md."
+        )
+    } else {
+        format!("✓ scaffolded nest '{nest}' ({contracts} contract(s), {tables} table(s)) in {dir}")
+    }
 }
 
 fn nest_name(dir: &Path) -> String {
@@ -1664,47 +1800,143 @@ mod tests {
     }
 
     #[test]
-    fn aliases_default_and_validate() {
-        assert_eq!(resolve_aliases(&[], 2).unwrap(), vec!["c0", "c1"]);
+    fn slugify_and_pick_alias_prefer_the_contract_name() {
+        // Deleting slugify (always None) makes DelegationManager fall through to c0.
         assert_eq!(
-            resolve_aliases(&["usdc".into(), "weth".into()], 2).unwrap(),
-            vec!["usdc", "weth"]
+            slugify_alias("DelegationManager").as_deref(),
+            Some("delegation_manager")
         );
-        assert!(resolve_aliases(&["usdc".into()], 2).is_err()); // count mismatch
-        assert!(resolve_aliases(&["USDC".into()], 1).is_err()); // uppercase invalid
-        assert!(resolve_aliases(&["1bad".into()], 1).is_err()); // leading digit invalid
-    }
+        assert_eq!(slugify_alias("Vat").as_deref(), Some("vat"));
+        assert_eq!(slugify_alias("L2GNS").as_deref(), Some("l2gns"));
+        assert_eq!(slugify_alias("").as_deref(), None);
+        assert_eq!(slugify_alias("123").as_deref(), None); // would not pass is_valid_alias
 
-    fn contract(alias: &str) -> Contract {
-        Contract {
-            alias: alias.into(),
-            address: format!("0x{alias}"),
-            start_block: None,
-            abi: format!("abis/{alias}.json"),
-            events: Vec::new(),
-        }
+        let empty = std::collections::HashSet::new();
+        let none: &[String] = &[];
+        assert_eq!(
+            pick_alias(None, Some("DelegationManager"), &empty, none).unwrap(),
+            "delegation_manager"
+        );
+        assert_eq!(pick_alias(None, Some("Vat"), &empty, none).unwrap(), "vat");
+        assert_eq!(
+            pick_alias(None, None, &empty, none).unwrap(),
+            "c0",
+            "a nameless ABI still gets cN"
+        );
+        assert_eq!(
+            pick_alias(Some("gns"), Some("DelegationManager"), &empty, none).unwrap(),
+            "gns",
+            "--alias still wins"
+        );
+        assert!(pick_alias(Some("WETH"), None, &empty, none).is_err());
+        assert!(pick_alias(Some("1bad"), None, &empty, none).is_err());
+
+        let used: std::collections::HashSet<&str> = ["delegation_manager"].into_iter().collect();
+        assert_eq!(
+            pick_alias(None, Some("DelegationManager"), &used, none).unwrap(),
+            "delegation_manager_2",
+            "a collision is uniqued, not overwritten"
+        );
+
+        let used_c: std::collections::HashSet<&str> = ["c0", "c1"].into_iter().collect();
+        assert_eq!(pick_alias(None, None, &used_c, none).unwrap(), "c2");
+        let mixed: std::collections::HashSet<&str> = ["usdc", "c1"].into_iter().collect();
+        assert_eq!(
+            pick_alias(None, None, &mixed, none).unwrap(),
+            "c0",
+            "cN is the next free slot, not nest.len()"
+        );
+        assert!(pick_alias(Some("c0"), None, &used_c, none).is_err());
     }
 
     #[test]
-    fn add_aliases_continue_and_avoid_collisions() {
-        // Auto: continue the c<N> sequence past the existing count.
-        let existing = vec![contract("c0"), contract("c1")];
-        assert_eq!(add_aliases(&existing, &[], 2).unwrap(), vec!["c2", "c3"]);
-
-        // Auto: skip a slot already taken by a custom alias so we never collide.
-        let mixed = vec![contract("usdc"), contract("c1")];
-        // len() == 2 → start at c2 (c1 is taken but c2 is free anyway).
-        assert_eq!(add_aliases(&mixed, &[], 1).unwrap(), vec!["c2"]);
-
-        // Explicit aliases are validated and collision-checked against the existing set.
-        assert_eq!(
-            add_aliases(&existing, &["weth".into()], 1).unwrap(),
-            vec!["weth"]
+    fn scaffold_summary_does_not_tick_an_anonymous_only_abi() {
+        let warn = scaffold_summary("vat", 1, 0, 1, "/tmp/vat");
+        assert!(
+            warn.starts_with("WARN"),
+            "0 tables + skipped anonymous must not look like a successful scaffold: {warn}"
         );
-        assert!(add_aliases(&existing, &["c0".into()], 1).is_err()); // collides with existing
-        assert!(add_aliases(&existing, &["WETH".into()], 1).is_err()); // invalid charset
-        assert!(add_aliases(&existing, &["a".into()], 2).is_err()); // count mismatch
-        assert!(add_aliases(&existing, &["x".into(), "x".into()], 2).is_err()); // dup in list
+        assert!(
+            warn.contains("anonymous") && warn.contains("topic0"),
+            "the warning must name the limit, got: {warn}"
+        );
+        assert!(
+            !warn.contains('✓'),
+            "a checkmark on 0 tables is the bug: {warn}"
+        );
+
+        let ok = scaffold_summary("usdc", 1, 2, 0, "/tmp/usdc");
+        assert!(
+            ok.starts_with('✓') && ok.contains("2 table(s)"),
+            "a Transfer ABI still prints the ordinary success line: {ok}"
+        );
+        assert!(!ok.contains("WARN"), "{ok}");
+    }
+
+    #[test]
+    fn rename_alias_rekeys_authored_prose_and_moves_the_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        let abis = dir.path().join("abis");
+        std::fs::create_dir_all(&abis).unwrap();
+        const TRANSFER: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        std::fs::write(abis.join("c0.json"), TRANSFER).unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            r#"
+                [nest]
+                name = "t"
+                chain = "mainnet"
+                chain_id = 1
+                rpc_urls = ["http://127.0.0.1:1"]
+                schema_version = 1
+                block_timestamps = true
+
+                [[contracts]]
+                alias = "c0"
+                address = "0x0000000000000000000000000000000000000001"
+                abi = "abis/c0.json"
+            "#,
+        )
+        .unwrap();
+        let mut sem = crate::semantic::Semantic::default();
+        let mut ts = crate::semantic::TableSemantic {
+            description: "every transfer through the token".into(),
+            ..Default::default()
+        };
+        ts.columns
+            .insert("from".into(), "the sender, authored".into());
+        sem.tables.insert("c0__transfer".into(), ts);
+        crate::semantic::save(dir.path(), &sem).unwrap();
+
+        rename_alias(dir.path(), "c0", "gns").unwrap();
+
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.contracts[0].alias, "gns");
+        assert_eq!(cfg.contracts[0].abi, "abis/gns.json");
+        assert!(dir.path().join("abis/gns.json").exists());
+        assert!(!dir.path().join("abis/c0.json").exists());
+
+        let after = crate::semantic::load(dir.path()).unwrap().unwrap();
+        assert!(
+            after.tables.contains_key("gns__transfer"),
+            "re-key must land the table under the new alias: {:?}",
+            after.tables.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.tables["gns__transfer"].description, "every transfer through the token",
+            "authored prose must survive; deleting rekey_alias fails this"
+        );
+        assert_eq!(
+            after.tables["gns__transfer"].columns["from"],
+            "the sender, authored"
+        );
+        assert!(
+            !after.tables.contains_key("c0__transfer"),
+            "the old key must be gone"
+        );
     }
 
     #[test]
@@ -1990,19 +2222,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain.json");
         std::fs::write(&plain, IMPL_ABI).unwrap();
-        let got = read_local_abi(plain.to_str().unwrap()).unwrap();
+        let (got, name) = read_local_abi(plain.to_str().unwrap()).unwrap();
         assert_eq!(abi_event_topic0s(&got).len(), 1);
+        assert_eq!(name, None, "a bare ABI array has no contractName");
 
         // A Hardhat/Foundry artifact wraps the ABI under "abi" - the file people reach for first.
+        // The name lives on the wrapper and is gone once the array is unwrapped, so it has to be
+        // taken here (#774).
         let wrapped = dir.path().join("artifact.json");
         std::fs::write(
             &wrapped,
-            format!(r#"{{"contractName":"X","abi":{IMPL_ABI},"bytecode":"0x"}}"#),
+            format!(r#"{{"contractName":"Vat","abi":{IMPL_ABI},"bytecode":"0x"}}"#),
         )
         .unwrap();
+        let (abi, name) = read_local_abi(wrapped.to_str().unwrap()).unwrap();
+        assert_eq!(abi_event_topic0s(&abi).len(), 1);
         assert_eq!(
-            abi_event_topic0s(&read_local_abi(wrapped.to_str().unwrap()).unwrap()).len(),
-            1
+            name.as_deref(),
+            Some("Vat"),
+            "unwrapping must not drop contractName"
         );
 
         let junk = dir.path().join("junk.json");
@@ -2317,6 +2555,7 @@ dataSources:
             abi: serde_json::json!([]),
             via: "Sourcify",
             fallback_reason: None,
+            contract_name: None,
         };
         assert_eq!(
             abi_resolved_lines(&resolved),
@@ -2330,6 +2569,7 @@ dataSources:
             abi: serde_json::json!([]),
             via: "Blockscout",
             fallback_reason: Some("Sourcify miss: no ABI".into()),
+            contract_name: None,
         };
         assert_eq!(
             abi_resolved_lines(&resolved),
@@ -2351,6 +2591,7 @@ dataSources:
             fallback_reason: Some(
                 "Sourcify miss: Sourcify returned HTTP 404; Blockscout miss: no ABI".to_string(),
             ),
+            contract_name: None,
         };
         assert_eq!(
             abi_resolved_lines(&resolved),

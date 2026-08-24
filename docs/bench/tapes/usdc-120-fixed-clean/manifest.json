@@ -1,0 +1,9 @@
+{
+  "chain": "1",
+  "provider": "ethereum-mainnet.core.chainstack.com",
+  "from_block": 25809368,
+  "to_block": 25809487,
+  "recorded_at": "unix:1787563557",
+  "commit": null,
+  "content_address": "16c989dd37c5eda8c9636c21abb7c2242aeeb0933e5ba45bed29b8af69ab67be"
+}

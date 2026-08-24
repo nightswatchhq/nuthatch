@@ -411,26 +411,33 @@ That is a much better position than §6a assumed. The remaining measurement - ho
 `derivedETH` drifts from an order-dependent one - needs the full factory history rather than a
 674k-block window, and is the outstanding work.
 
-## 6e. The seal-direct refusal, met in practice (2026-08-19)
+## 6e. The seal-direct refusal, met in practice (2026-08-19), then removed
 
-Slice 1 refuses `--seal-direct` alongside declared `[[calls]]`, because tier 3 is wired into
-`process_window` only and a seal-direct run would sail past every sampled block and seal the range with
-the table silently absent. That guard is right and it fired on the first real nest to need it.
+When this section was written, slice 1 refused `--seal-direct` alongside declared `[[calls]]`.
+Tier 3 was wired into `process_window` only, so a seal-direct run would sail past every sampled
+block and seal the range with the table silently absent. That guard was right, and it fired on
+the first real nest to need it.
 
-The cost is now measured rather than assumed. `graph-allocations-nest` grew a one-line `[[calls]]`
-entry for GRT `totalSupply` - a single pinned read, sampled every 100,000 blocks - and the same
-454M-block backfill went from **~12 minutes on seal-direct to ~66 minutes on the hot path**. Five and a
-half times slower, for one number.
+The cost of the *refusal* was measured rather than assumed. `graph-allocations-nest` grew a
+one-line `[[calls]]` entry for GRT `totalSupply` - a single pinned read, sampled every 100,000
+blocks - and the same 454M-block backfill went from ~12 minutes on seal-direct to ~66 minutes on
+the hot path, the only path the guard left open. Five and a half times slower, for one number.
+That figure is the price of not having the combination, not advice about the combination.
 
-That is a bad trade and the guard is not the thing to change: silently missing rows would be far worse.
-What it argues for is **teaching the seal-direct paths to resolve calls**, which is the follow-up the
-slice already names. Until then the honest advice is that a nest wanting both a from-deployment
-backfill and a pinned read pays for it in wall-clock, and should know that before starting rather than
-after.
+The follow-up this section named - **teaching the seal-direct paths to resolve calls** - shipped
+in 2.7.0 (#657). The guard is gone. `--seal-direct` with declared `[[calls]]` resolves them and
+seals their rows; `seal_direct_with_declared_calls_resolves_and_seals_them` covers it. A reader
+planning a `[[calls]]` backfill who takes the present-tense refusal as current is pointed at the
+slow path for no reason.
+
+The reasoning that justified the guard aged well and is why it existed rather than being skipped:
+a silently absent table is worse than a refusal. The honest current advice is the opposite of
+what this section first said. Speed claims for the combination live in
+[`docs/benchmarks.md`](../benchmarks.md), not here.
 
 Worth noting the alternative was worse: deriving `totalSupply` from events means indexing every
-`L2GraphToken` Transfer to sum mints minus burns - millions of rows for one scalar. The pinned read is
-the right shape; only the backfill path is wrong.
+`L2GraphToken` Transfer to sum mints minus burns - millions of rows for one scalar. The pinned
+read is the right shape; with the guard gone, the backfill path is no longer wrong.
 
 ## 7. Testing, because this warrants its own release
 
