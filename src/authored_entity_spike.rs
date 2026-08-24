@@ -879,7 +879,11 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn corpus() -> (Vec<(DelegationFact, i64)>, Vec<(IndexerFact, i64)>) {
+    type WeightedDelegations = Vec<(DelegationFact, i64)>;
+    type WeightedIndexers = Vec<(IndexerFact, i64)>;
+    type Corpus = (WeightedDelegations, WeightedIndexers);
+
+    fn corpus() -> Corpus {
         (
             vec![
                 (
