@@ -2185,6 +2185,10 @@ impl RuntimeHandles {
             return Ok(());
         };
         let chain = self.states[idx].1.chain.clone();
+        let dataset_dir = match self.mount_ctx.mounts.iter().find(|m| m.alias == name) {
+            Some(m) => MountTable::data_dir(&self.mount_ctx.dir, &m.nid),
+            None => MountTable::nest_dir(&self.mount_ctx.dir, name),
+        };
 
         // 1. Drain the cursor and wait for it to let go.
         //
@@ -2235,6 +2239,8 @@ impl RuntimeHandles {
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
+        crate::analytics::invalidate_duck_cache(&dataset_dir);
+        crate::metrics::METRICS.remove_nest(name);
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
         let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);

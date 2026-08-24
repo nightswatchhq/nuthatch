@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,11 +50,21 @@ struct DuckCache {
     dir: PathBuf,
     sealed_through: u64,
     excluded: std::collections::BTreeSet<String>,
+    inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
+    last_used: u64,
     conn: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DuckInputStamp {
+    len: u64,
+    modified_ns: u128,
 }
 
 static DUCK_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, DuckCache>>> = OnceLock::new();
 static DUCK_OPENS: OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> = OnceLock::new();
+static DUCK_USE: AtomicU64 = AtomicU64::new(0);
+const DUCK_CACHE_CAPACITY: usize = 16;
 
 fn duck_cache_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, DuckCache>>
 {
@@ -71,6 +81,67 @@ fn note_duck_open(dir: &Path) {
         .unwrap_or_else(|p| p.into_inner())
         .entry(dir.to_path_buf())
         .or_default() += 1;
+}
+
+/// Drop a nest's analytical connection when its runtime ownership ends (#824).
+pub fn invalidate_duck_cache(dir: &Path) {
+    duck_cache_lock().remove(dir);
+}
+
+fn duck_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, DuckInputStamp> {
+    let mut paths = vec![dir.join(crate::config::CONFIG_FILE)];
+    if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sql")),
+        );
+    }
+    if let Ok(entries) = std::fs::read_dir(dir.join(crate::labels::LABELS_DIR)) {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json")),
+        );
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            let modified_ns = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some((
+                path,
+                DuckInputStamp {
+                    len: meta.len(),
+                    modified_ns,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn retain_duck_cache(
+    mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, DuckCache>>,
+    slot: DuckCache,
+) {
+    cache.insert(slot.dir.clone(), slot);
+    while cache.len() > DUCK_CACHE_CAPACITY {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(dir, _)| dir.clone())
+        else {
+            break;
+        };
+        cache.remove(&victim);
+    }
 }
 
 #[cfg(test)]
@@ -435,19 +506,23 @@ fn attempt(
     // reload below (`define_views`); new sealed segments change `sealed_through` and miss the cache.
     // Taken out of the slot for the query so an interrupt can drop it without fighting the mutex
     // borrow; put back only if DuckDB was not cancelled underneath us.
+    let inputs = duck_inputs(dir);
     let mut slot = duck_cache_lock().remove(dir);
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|c| c.sealed_through == sealed_through && c.excluded == *excluded);
+    let reusable = slot.as_ref().is_some_and(|c| {
+        c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
+    });
     if !reusable {
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
             excluded: excluded.clone(),
+            inputs,
+            last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
             conn: open_locked_duckdb(dir).context("failed to open DuckDB")?,
         });
     }
-    let slot = slot.expect("just inserted");
+    let mut slot = slot.expect("just inserted");
+    slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
     let (referenced, degraded_tables, interrupted, outcome, cap) = {
         let conn = &slot.conn;
         let referenced = reject_unknown_table_refs(conn, sql)?;
@@ -509,7 +584,7 @@ fn attempt(
     if interrupted.load(Ordering::SeqCst) {
         drop(slot);
     } else {
-        duck_cache_lock().insert(slot.dir.clone(), slot);
+        retain_duck_cache(duck_cache_lock(), slot);
     }
 
     let (mut rows, over_cap) = match outcome {
@@ -3130,6 +3205,59 @@ template="pool"
             2,
             "a new sealed_through must not reuse the stale connection"
         );
+    }
+
+    /// #825: a cached connection is valid only for the authored inputs it was built from. Both an
+    /// added view and its deletion must force a fresh catalogue; otherwise the old view stays
+    /// queryable until process restart.
+    #[test]
+    fn changing_or_removing_an_authored_view_invalidates_the_duckdb_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(duck_opens_for(dir.path()), 1);
+
+        let views = dir.path().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let view = views.join("one.sql");
+        std::fs::write(&view, "CREATE VIEW one AS SELECT 1 AS n").unwrap();
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(
+            duck_opens_for(dir.path()),
+            2,
+            "a new view changes the inputs"
+        );
+
+        std::fs::remove_file(view).unwrap();
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(
+            duck_opens_for(dir.path()),
+            3,
+            "removing a view must not leave the old catalogue cached"
+        );
+    }
+
+    #[test]
+    fn removing_label_snapshots_drops_the_cached_labels_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("labels.csv");
+        std::fs::write(&input, "0x1111111111111111111111111111111111111111,mixer\n").unwrap();
+        crate::labels::import(dir.path(), &input).unwrap();
+        query(dir.path(), "SELECT count(*) AS n FROM labels").unwrap();
+
+        std::fs::remove_dir_all(dir.path().join(crate::labels::LABELS_DIR)).unwrap();
+        assert!(
+            query(dir.path(), "SELECT count(*) AS n FROM labels").is_err(),
+            "a removed label snapshot must not remain readable through the cached connection"
+        );
+    }
+
+    #[test]
+    fn explicit_invalidation_releases_a_mounted_nests_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        invalidate_duck_cache(dir.path());
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(duck_opens_for(dir.path()), 2);
     }
 
     /// A declared-but-unsealed table still resolves as an empty typed view, so a nest view that
