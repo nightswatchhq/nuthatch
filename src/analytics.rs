@@ -12,7 +12,7 @@
 
 use anyhow::{bail, Context, Result};
 use duckdb::types::{Value as DuckValue, ValueRef};
-use duckdb::Connection;
+use duckdb::{Config, Connection};
 use serde_json::{Map, Value};
 #[cfg(test)]
 use std::collections::HashMap;
@@ -25,7 +25,39 @@ use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
 const MEM_LIMIT: &str = "512MB";
-const MAX_THREADS: u32 = 2;
+const MAX_THREADS: i64 = 2;
+
+/// Open an in-memory DuckDB whose file access is pinned to the nest's data dirs (#289).
+///
+/// DuckDB's `allowed_directories` is an *addition* to the allow-list while `enable_external_access`
+/// is on, and a restriction only when it is off. The flag is startup-only, so it has to go on the
+/// `Config`, not in a later `SET`. `lock_configuration` then freezes both so a query cannot widen
+/// them. Measured against `libduckdb-sys` 1.10504.0, the bundled build.
+fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
+    let allowed: Vec<String> = [crate::seal::SEGMENTS_DIR, "labels"]
+        .iter()
+        .map(|sub| dir.join(sub))
+        .filter(|p| p.exists())
+        .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+        .collect();
+    // DuckDB's docs set the allow-list first, then turn external access off. Doing it the other
+    // way round is refused: "Cannot change allowed_directories when enable_external_access is
+    // disabled". The flag is *not* startup-only on 1.10504.0; a `SET` after open works, which is
+    // why this was inert until now - we set the list and never flipped the flag.
+    let config = Config::default()
+        .max_memory(MEM_LIMIT)
+        .context("duckdb max_memory")?
+        .threads(MAX_THREADS)
+        .context("duckdb threads")?;
+    let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
+    let lockdown = format!(
+        "SET allowed_directories=[{}]; SET enable_external_access=false; SET lock_configuration=true;",
+        allowed.join(", ")
+    );
+    conn.execute_batch(&lockdown)
+        .context("failed to lock down DuckDB filesystem access")?;
+    Ok(conn)
+}
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
 /// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
@@ -324,13 +356,11 @@ fn attempt(
     // SEC-2: refuse DuckDB filesystem/network table functions (`read_text`, `glob`, …) - they read
     // files from inside a plain SELECT, past the keyword gate, and would otherwise leak any file the
     // process can read (e.g. `nuthatch.toml`'s secrets). This is the primary control; the
-    // `allowed_directories` lockdown below is defense-in-depth (its runtime enforcement is
-    // version-dependent in the bundled DuckDB).
+    // `allowed_directories` lockdown below is defense-in-depth and, as of #289, actually enforced.
     reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
     reject_replacement_scan(sql)?;
 
-    let conn = Connection::open_in_memory().context("failed to open DuckDB")?;
     // **The allowlist, and the control that is meant to outlive the others** (audit finding 5).
     //
     // Everything above enumerates what is *forbidden*, over a vocabulary DuckDB grows every release.
@@ -345,37 +375,11 @@ fn attempt(
     //
     // Kept *beside* the denylist rather than replacing it: two independent controls that must both
     // pass, so a gap in either is covered while this one earns trust.
+    // Open with `enable_external_access=false` first (#289): `allowed_directories` is an *addition*
+    // to the allow-list when external access is on, and a restriction only when it is off. That is
+    // DuckDB's own docs, and it is why the lockdown was inert until this flag went in at startup.
+    let conn = open_locked_duckdb(dir).context("failed to open DuckDB")?;
     let referenced = reject_unknown_table_refs(&conn, sql)?;
-    conn.execute_batch(&format!(
-        "SET memory_limit='{MEM_LIMIT}'; SET threads={MAX_THREADS};"
-    ))
-    .context("failed to configure DuckDB")?;
-    // Defense-in-depth for SEC-2 (the query denylist above is the primary control): pin DuckDB's file
-    // access to the nest's own data dirs (segments + labels, never the nest root that holds the config)
-    // and `lock_configuration` so a query can't widen it.
-    //
-    // MEASURED, not assumed: on the DuckDB we currently bundle, `allowed_directories` does **not**
-    // block an out-of-allowlist read - see
-    // `tests::the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read`. So this layer buys
-    // nothing today beyond `lock_configuration` (which does hold, preventing a query widening the
-    // setting). It is kept because it costs nothing and becomes real if upstream starts enforcing it -
-    // but `reject_file_access` is the control that actually stops a file read, and it must never be
-    // weakened on the belief that this is behind it.
-    let allowed: Vec<String> = [crate::seal::SEGMENTS_DIR, "labels"]
-        .iter()
-        .map(|sub| dir.join(sub))
-        .filter(|p| p.exists())
-        .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-        .collect();
-    // `enable_external_access` is a startup-only setting, so we scope at runtime with
-    // `allowed_directories` (an empty allowlist blocks all file access - the fresh-nest/tip-only case)
-    // and freeze it with `lock_configuration` so the untrusted query can't widen it back.
-    let lockdown = format!(
-        "SET allowed_directories=[{}]; SET lock_configuration=true;",
-        allowed.join(", ")
-    );
-    conn.execute_batch(&lockdown)
-        .context("failed to lock down DuckDB filesystem access")?;
     let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded, declared)?;
     // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
     // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
@@ -3230,52 +3234,51 @@ template="pool"
         }
     }
 
-    /// The `allowed_directories` + `lock_configuration` lockdown is documented as defence-in-depth
-    /// behind the `reject_file_access` denylist. This pins **which of the two actually stops a read**
-    /// on the DuckDB we ship, because the answer turned out not to be "both".
-    ///
-    /// The denylist blocks it. The lockdown, set exactly as `run` sets it, does **not** - an
-    /// out-of-allowlist `read_text` succeeds. That is worth an assertion rather than a hopeful comment:
-    /// if a DuckDB bump ever starts enforcing it, this test fails and tells us the layer became real.
+    /// #289: the directory lockdown, configured the way `run` configures it, must refuse an
+    /// out-of-allowlist read *on its own*. The denylist is still the primary control; this is the
+    /// second layer. Deleting `enable_external_access(false)` from `open_locked_duckdb` fails this.
     #[test]
-    fn the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read() {
-        let allowed = tempfile::tempdir().unwrap();
+    fn the_directory_lockdown_blocks_an_out_of_allowlist_file_read() {
+        let nest = tempfile::tempdir().unwrap();
+        let segments = nest.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&segments).unwrap();
         let secret = tempfile::tempdir().unwrap();
         let secret_file = secret.path().join("nuthatch.toml");
         std::fs::write(&secret_file, "[nest]\napi_key = \"hunter2\"\n").unwrap();
         let sql = format!("SELECT * FROM read_text('{}')", secret_file.display());
 
-        // The primary control refuses it outright - this is the guarantee that actually holds.
         assert!(
             reject_file_access(&sql).is_err(),
-            "the denylist must refuse read_text - it is the control we rely on"
+            "the denylist must still refuse read_text - it is the control in front"
         );
 
-        // The backstop, configured exactly as `run` configures it, does not stop the read on this
-        // build. Documented, not relied upon.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!(
-            "SET allowed_directories=['{}']; SET lock_configuration=true;",
-            allowed.path().display()
-        ))
-        .unwrap();
+        let conn = open_locked_duckdb(nest.path()).unwrap();
         let read_succeeded = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
             Err(_) => false,
         };
         assert!(
-            read_succeeded,
-            "allowed_directories now blocks out-of-allowlist reads - the defence-in-depth layer has \
-             become load-bearing. Good news: update this test and the comments in `run`, which \
-             currently say it is not enforced."
+            !read_succeeded,
+            "allowed_directories + enable_external_access=false must refuse an out-of-allowlist read"
         );
 
-        // `lock_configuration` does hold, at least: a query cannot widen the setting back.
         assert!(
             conn.execute_batch("SET allowed_directories=['/'];")
                 .is_err(),
             "lock_configuration must prevent widening file access"
         );
+
+        // A file inside the allow-list still reads: the lockdown is a restriction, not a total ban.
+        let allowed_file = segments.join("ok.txt");
+        std::fs::write(&allowed_file, "ok\n").unwrap();
+        let ok_sql = format!("SELECT * FROM read_text('{}')", allowed_file.display());
+        let mut stmt = conn
+            .prepare(&ok_sql)
+            .expect("in-allowlist read_text prepares");
+        let got: String = stmt
+            .query_row([], |r| r.get(0))
+            .expect("in-allowlist read_text runs");
+        assert!(got.contains("ok"), "got {got:?}");
     }
 
     /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the

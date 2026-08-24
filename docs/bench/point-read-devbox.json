@@ -15,6 +15,6 @@
   "sql_p50_ms": 10.81,
   "sql_p99_ms": 12.83,
   "sql_peak_rss_mb": 44,
-  "commit": "f1c9f58",
+  "commit": "ef3b619",
   "hardware": "32 cores, 62 GB RAM"
 }

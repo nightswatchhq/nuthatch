@@ -13,17 +13,19 @@ distinct milestone ownership (Rule 1: no milestone funded twice)._
 
 Ethereum's read side is quietly centralised: most apps reach the chain through a few hosted indexers
 and RPC providers. **nuthatch is local-first Ethereum indexing** - one Rust binary, `init 0xAddr
---chain mainnet`, live queryable API in under two minutes, ~40 MB RAM, no mandatory third party in
-the data path. It is the same public-good lane the EF funded with **TrueBlocks** (local-first
+--chain mainnet`, live queryable API in under two minutes, no mandatory third party in
+the data path. Peak RSS is CI-gated; we are not quoting a megabyte figure here until it has a
+committed bench artefact (#757). It is the same public-good lane the EF funded with **TrueBlocks** (local-first
 indexing, 2018), generalised: arbitrary contracts from their ABI, a declarative incremental-view
 layer, an SQL + point-read + offline-AI (MCP) surface, and content-addressed sealed history for
 verifiable re-execution.
 
 **Already shipped (v0.1.0):** multi-contract full-ABI decode across **Ethereum, Arbitrum One, and
 Base**; reorg-safe redb-hot / Parquet-cold storage with DuckDB SQL; a DBSP incremental balance view
-(reorg = retraction); a compiled-in MCP server; **measured ~40 MB RAM** and backfill throughput
+(reorg = retraction); a compiled-in MCP server; backfill throughput
 benchmarked in the open with byte-identical determinism proven across the hot-store, seal-direct, and
-pipelined paths (`docs/benchmarks.md`). On crates.io and as prebuilt binaries. (The storage-path
+pipelined paths (`docs/benchmarks.md`). Peak RSS is CI-gated at 256 MB; a single-digit-tens-of-MB
+claim wants a `docs/bench/*.json` before it is restated here (#757). On crates.io and as prebuilt binaries. (The storage-path
 speedup multiplier is under active re-measurement after a harness fix invalidated the earlier figure -
 #722, discrepancy open in #744 - so it is not quoted here.)
 

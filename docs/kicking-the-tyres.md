@@ -170,9 +170,9 @@ Both were ours. So:
 - If you put it behind a proxy, check the proxy is not the only thing standing between the internet
   and an unauthenticated SQL endpoint.
 - Webhook signatures: `X-Nuthatch-Signature` is HMAC. Verify it actually verifies.
-- **Known open finding:** [#289](https://github.com/nightswatchhq/nuthatch/issues/289) - DuckDB's
-  `allowed_directories` is **not enforced on the build we bundle**. Open, ours, and exactly where we
-  would press first.
+- **Was an open finding:** [#289](https://github.com/nightswatchhq/nuthatch/issues/289) - DuckDB's
+  `allowed_directories` did nothing unless `enable_external_access` was false at startup. That flag
+  is now passed. Press the denylist anyway; it is still the layer in front.
 
 **What a bad answer looks like:** a guard that matches on a string. If you can find one, it is
 probably bypassable, and that is the shape both previous holes had.

@@ -60,7 +60,7 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--seal-direct` - Measure the seal-direct path (decode → Parquet, bypassing the hot store) instead of the default decode → redb hot-store path. Use to compare the two backfill storage paths
 - `--window-adaptive` - Adapt the `eth_getLogs` window during the run (RFC-0004 §2) instead of holding it fixed at the chain default - independent of `--seal-direct`
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches (seal-direct only). >1 overlaps RPC round-trip latency; results are still consumed in block order so segments are identical. Try 8-16 against your own node
-- `--keep <KEEP>` - Keep the run's data at this path instead of a temp dir that is discarded
+- `--keep <KEEP>` - Keep the run's data at this path instead of the cache dir that is discarded
 - `--record <RECORD>` - Record every source call this run makes into a tape at `<path>`, alongside the live run (RFC-0039)
 - `--replay <REPLAY>` - Replay a tape recorded by `--record` instead of touching the network (RFC-0039)
 
@@ -104,7 +104,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable)
 - `--rpc <RPC>` - Use only these `rpc_urls` at runtime without editing the config (repeatable). Point at your own node
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
-- `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following - much faster for a from-deployment backfill (RFC-0004). The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments
+- `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following. Prerequisite for `--concurrency` pipelining, which is where the measured speedup is; the storage path alone is not "faster" - see `docs/benchmarks.md`. The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency). Try 8-16 against your own node; keep low on rate-limited public RPC
 - `--window <WINDOW>` - Override the `eth_getLogs` block-window (the chain default otherwise). For a *sparse* contract over a long backfill - few events across many blocks - a large window (e.g. 50000) turns tens of thousands of near-empty requests into a few, so a from-history backfill finishes in minutes. Keep it under your provider's max block-range for `getLogs` (many allow 100k+ when the result set is small); the concurrent backfill fails the range rather than auto-shrinking it
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
