@@ -1899,6 +1899,10 @@ abi = "abis/c.json"
         let (url, handle) = stub_empty_logs().await;
         let tape_dir = tempfile::tempdir().unwrap();
         let tape_path = tape_dir.path().join("tape");
+        // `one_run`'s default work dir is keyed by pid and run index, so every test in this binary
+        // sharing that index races for one redb (cargo runs the tests as threads of one process).
+        // Passing `keep` is what makes this independent of the rest of the module.
+        let record_dir = tempfile::tempdir().unwrap();
         one_run(
             &[url],
             &registry,
@@ -1915,7 +1919,7 @@ abi = "abis/c.json"
             false,
             1,
             1,
-            None,
+            Some(record_dir.path()),
             &TapeMode::Record(&tape_path),
         )
         .await
@@ -2010,6 +2014,9 @@ abi = "abis/c.json"
         let tape_path = tape_dir.path().join("tape");
 
         let (url, handle) = stub_empty_logs().await;
+        // Same isolation as the timestamp-failure test: the default work dir is pid+run, shared
+        // across every parallel test using that index.
+        let recorded_dir = tempfile::tempdir().unwrap();
         let recorded = one_run(
             &[url],
             &registry,
@@ -2026,7 +2033,7 @@ abi = "abis/c.json"
             false,
             1,
             1,
-            None,
+            Some(recorded_dir.path()),
             &TapeMode::Record(&tape_path),
         )
         .await
@@ -2044,6 +2051,7 @@ abi = "abis/c.json"
         // Tear the network down. Anything the replay answers now came off the disk.
         handle.abort();
 
+        let replayed_dir = tempfile::tempdir().unwrap();
         let replayed = one_run(
             &["http://127.0.0.1:1/".to_string()],
             &registry,
@@ -2060,7 +2068,7 @@ abi = "abis/c.json"
             false,
             1,
             2,
-            None,
+            Some(replayed_dir.path()),
             &TapeMode::Replay(&tape_path),
         )
         .await
@@ -2089,6 +2097,7 @@ abi = "abis/c.json"
         );
 
         // What *must* be identical is one replay against another: that is the entire deliverable.
+        let again_dir = tempfile::tempdir().unwrap();
         let again = one_run(
             &["http://127.0.0.1:1/".to_string()],
             &registry,
@@ -2105,7 +2114,7 @@ abi = "abis/c.json"
             false,
             1,
             3,
-            None,
+            Some(again_dir.path()),
             &TapeMode::Replay(&tape_path),
         )
         .await
@@ -2146,6 +2155,7 @@ abi = "abis/c.json"
 
         for seal_direct in [false, true] {
             let (url_fixed, h_fixed) = stub_empty_logs().await;
+            let fixed_dir = tempfile::tempdir().unwrap();
             let fixed = one_run(
                 &[url_fixed],
                 &registry,
@@ -2162,7 +2172,7 @@ abi = "abis/c.json"
                 false, // window_adaptive
                 1,
                 1,
-                None,
+                Some(fixed_dir.path()),
                 &TapeMode::Live,
             )
             .await
@@ -2170,6 +2180,7 @@ abi = "abis/c.json"
             h_fixed.abort();
 
             let (url_adaptive, h_adaptive) = stub_empty_logs().await;
+            let adaptive_dir = tempfile::tempdir().unwrap();
             let adaptive = one_run(
                 &[url_adaptive],
                 &registry,
@@ -2186,7 +2197,7 @@ abi = "abis/c.json"
                 true, // window_adaptive
                 1,
                 1,
-                None,
+                Some(adaptive_dir.path()),
                 &TapeMode::Live,
             )
             .await
@@ -2311,6 +2322,7 @@ abi = "abis/c.json"
         // `every = 1` over blocks 1..=3 samples all three - a per-block hash fetch would be three
         // `block_hash` round trips (pre-#720), a batched one a single `block_headers` call. Either
         // way this test only cares whether the call rows made it to the manifest.
+        let work = tempfile::tempdir().unwrap();
         let r = one_run(
             &[main_url],
             &registry,
@@ -2327,7 +2339,7 @@ abi = "abis/c.json"
             false, // window_adaptive: irrelevant to this test, fixed is the cheaper default
             1,
             1,
-            None,
+            Some(work.path()),
             &TapeMode::Live,
         )
         .await
