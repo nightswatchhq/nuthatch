@@ -1,7 +1,9 @@
 //! RFC-0041 slice one: explicit authored incremental-entity declarations and conservative refusal.
 
 use anyhow::{bail, Result};
+use duckdb::Connection;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -29,6 +31,10 @@ pub struct EntityIssue {
 }
 
 pub fn validate(dir: &Path) -> Vec<EntityIssue> {
+    let schema = crate::config::Config::load(dir)
+        .ok()
+        .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok())
+        .map(|registry| registry.schema());
     let path = dir.join(ENTITY_FILE);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -77,6 +83,57 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
         };
         if let Err(e) = validate_sql(&sql) {
             issues.push(issue(&name, e.to_string()));
+        } else if let Some(schema) = &schema {
+            match crate::analytics::entity_output_columns(dir, schema, &sql) {
+                Ok(columns) => {
+                    for key in &entity.key {
+                        if !columns
+                            .iter()
+                            .any(|column| column.eq_ignore_ascii_case(key))
+                        {
+                            issues.push(issue(
+                                &name,
+                                format!("declared key `{key}` is not an output column"),
+                            ));
+                        }
+                    }
+                    if entity.key.len() != entity.key.iter().collect::<BTreeSet<_>>().len() {
+                        issues.push(issue(&name, "declared key repeats a column"));
+                    }
+                    if !entity.key.is_empty() && !issues.iter().any(|i| i.name == name) {
+                        match crate::analytics::query(dir, &sql) {
+                            Ok(rows) => {
+                                let mut seen = BTreeSet::new();
+                                for row in rows {
+                                    let values: Vec<&Value> =
+                                        entity.key.iter().filter_map(|key| row.get(key)).collect();
+                                    if values.len() != entity.key.len()
+                                        || values.iter().any(|value| value.is_null())
+                                    {
+                                        issues.push(issue(
+                                            &name,
+                                            "declared key is nullable in the reference result",
+                                        ));
+                                        break;
+                                    }
+                                    if !seen
+                                        .insert(serde_json::to_string(&values).unwrap_or_default())
+                                    {
+                                        issues.push(issue(
+                                            &name,
+                                            "declared key is not unique in the reference result",
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => issues
+                                .push(issue(&name, format!("entity reference query failed: {e}"))),
+                        }
+                    }
+                }
+                Err(e) => issues.push(issue(&name, format!("entity SQL does not bind: {e}"))),
+            }
         }
     }
     for mut missing in undeclared_files(dir) {
@@ -95,16 +152,25 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
 }
 
 fn validate_sql(sql: &str) -> Result<()> {
-    let statements = crate::analytics::split_sql_statements(sql);
-    if statements.len() != 1
-        || !statements[0]
-            .trim_start()
-            .to_ascii_uppercase()
-            .starts_with("SELECT")
+    let conn = Connection::open_in_memory()?;
+    let literal = format!("'{}'", sql.replace('\'', "''"));
+    let ast: String =
+        conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+            r.get(0)
+        })?;
+    let ast: Value = serde_json::from_str(&ast)?;
+    if ast
+        .pointer("/statements")
+        .and_then(Value::as_array)
+        .is_none_or(|s| s.len() != 1)
+        || ast
+            .pointer("/statements/0/node/type")
+            .and_then(Value::as_str)
+            != Some("SELECT_NODE")
     {
         bail!("entity must contain exactly one SELECT; keep other SQL as views/*.sql")
     }
-    let upper = statements[0].to_ascii_uppercase();
+    let upper = sql.to_ascii_uppercase();
     for (needle, why) in [
         (" DISTINCT ", "DISTINCT"),
         (" ORDER BY ", "ORDER BY"),
@@ -143,5 +209,59 @@ fn issue(name: &str, error: impl Into<String>) -> EntityIssue {
     EntityIssue {
         name: name.into(),
         error: error.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("entities")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn declaration_is_ast_parsed_and_rejects_non_incremental_shapes() {
+        let dir = nest();
+        std::fs::write(
+            dir.path().join(ENTITY_FILE),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("entities/totals.sql"), "SELECT 1 AS owner").unwrap();
+        assert!(validate(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT 1 AS owner; SELECT 2",
+        )
+        .unwrap();
+        assert!(validate(dir.path())
+            .iter()
+            .any(|i| i.error.contains("exactly one SELECT")));
+
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT DISTINCT 1 AS owner",
+        )
+        .unwrap();
+        assert!(validate(dir.path())
+            .iter()
+            .any(|i| i.error.contains("DISTINCT")));
+    }
+
+    #[test]
+    fn every_entity_sql_file_requires_a_declaration() {
+        let dir = nest();
+        std::fs::write(
+            dir.path().join("entities/forgotten.sql"),
+            "SELECT 1 AS owner",
+        )
+        .unwrap();
+        let issues = validate(dir.path());
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].error.contains("no entities.toml declaration"));
     }
 }

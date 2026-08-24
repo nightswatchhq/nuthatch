@@ -2204,6 +2204,29 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     issues
 }
 
+/// Bind one incremental-entity SELECT against the same empty typed fact surface used by view
+/// validation. It does not execute the query, so a cold nest can validate authoring safely.
+pub fn entity_output_columns(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    sql: &str,
+) -> Result<Vec<String>> {
+    let conn = Connection::open_in_memory()?;
+    let empty_hot = HotRows::new();
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
+    define_labels_view(&conn, dir);
+    define_children_views(&conn, dir);
+    let stmt = conn.prepare(sql)?;
+    Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+}
+
 /// The table name out of a DuckDB catalog error, if that is what this is.
 ///
 /// Format-dependent by necessity - DuckDB gives no structured error code for it - so it fails soft:
