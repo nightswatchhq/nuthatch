@@ -710,7 +710,9 @@ Two things worth knowing first:
 
 ### Metrics
 
-Global series (whole process):
+Global series (whole process). Chain-height globals are present only for a solo runtime: there is no
+honest way to aggregate mainnet and Arbitrum block numbers. In a multi-nest runtime use the labelled
+per-nest series below.
 
 | Series | Meaning |
 |---|---|
@@ -725,7 +727,8 @@ Global series (whole process):
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
 
 Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operable:
-`nuthatch_nest_last_block`, `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
+`nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
+`nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_health` (1 indexing /
 0 quarantined), `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
 
@@ -738,7 +741,7 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 |---|---|---|
 | **Nest quarantined** | `nuthatch_nest_health == 0` | something is broken and a human should look |
 | **Cursor dead** | `nuthatch_cursor_live == 0` | a whole chain stopped advancing |
-| **Tip lag growing** | `nuthatch_tip_lag_blocks` trending up over 15m | RPC trouble or an overloaded box |
+| **Tip lag growing** | `nuthatch_tip_lag_blocks` trending up over 15m in solo mode, or `nuthatch_nest_tip_lag_blocks` per nest | RPC trouble or an overloaded box |
 | **Ingest stalled** | `time() - nuthatch_last_poll_unixtime > 300` | the loop is wedged even if the process is alive |
 | **Outbox backing up** | `nuthatch_alert_outbox_depth` rising | a webhook sink is down or slow |
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
