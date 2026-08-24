@@ -1,8 +1,7 @@
 # Sprint: tenacious-thrush
 
-Filed 2026-08-24, while quizzical-quail (#805) and steady-starling (#808) were still landing.
-**Four issues.** Runs **Sunday 2026-09-21 to Sunday 2026-09-28**, or the Monday after #808
-merges, whichever is later. Implementation may land earlier; the dates are the done-by.
+Filed while quizzical-quail (#805) and steady-starling (#808) were still landing.
+**Four issues.**
 
 ## Definition of done
 
