@@ -293,6 +293,12 @@ correctness of everything after them.
 > Slices 1-3 are not wasted: early cutoff needs exactly the DAG and the keys they built, to know which
 > derivations moved and whether their outputs did.
 >
+> **Amendment (2026-08-24): RFC-0041 now specifies that derivation.** Its first implementation keeps
+> entity state rebuildable rather than durable, so slice 4 still has nothing persistent to graft.
+> RFC-0041 slice 4 activates this slice only after measured restart cost justifies immutable entity
+> checkpoints: unchanged entity keys graft, changed nodes and descendants rebuild from adopted facts,
+> and no definition edit refetches chain history.
+>
 > The general lesson, since this is the third acceptance criterion this RFC series has had to correct:
 > **a criterion phrased as the absence of an effect passes trivially when the mechanism is missing.**
 > Prefer one that fails loudly against today's build before the work starts.

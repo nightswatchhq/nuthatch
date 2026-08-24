@@ -840,4 +840,235 @@ mod tests {
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&note, &client, "http://127.0.0.1:1").await.is_none());
     }
+
+    /// A nest that answers the HTTP surface MCP bridges to. Enough routes for every generic tool
+    /// `call_tool` dispatches, so deleting an arm fails the matching assertion rather than leaving
+    /// a brochure.
+    async fn fake_serving_nest() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::{Path, Query},
+            routing::get,
+            Json, Router,
+        };
+        use std::collections::HashMap;
+
+        let app = Router::new()
+            .route("/", get(|| async { Json(json!({"ok": true, "last_block": 42})) }))
+            .route("/schema", get(|| async { "tables are {alias}__{event}" }))
+            .route(
+                "/tables",
+                get(|| async { Json(json!([{"name": "usdc__transfer"}])) }),
+            )
+            .route(
+                "/shape",
+                get(|| async { Json(json!({"transfers": true, "compliance": false})) }),
+            )
+            .route(
+                "/table/{name}",
+                get(
+                    |Path(name): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
+                        Json(json!({"name": name, "limit": q.get("limit"), "rows": []}))
+                    },
+                ),
+            )
+            .route(
+                "/sql",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    Json(json!({
+                        "count": 1,
+                        "truncated": false,
+                        "rows": [{"n": 1, "q": q.get("q")}],
+                        "provenance": {
+                            "as_of": 42,
+                            "sealed_through": 40,
+                            "source": "hot+sealed",
+                            "registry_hash": "0xdeadbeef"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/explain",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    Json(json!({"valid": true, "query": q.get("q")}))
+                }),
+            )
+            .route(
+                "/entity/{id}",
+                get(|Path(id): Path<String>| async move {
+                    Json(json!({"id": id, "table": "usdc__transfer"}))
+                }),
+            )
+            .route(
+                "/balance/{address}",
+                get(|Path(address): Path<String>| async move {
+                    Json(json!({"address": address, "balance": "0"}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    /// #304: schema discovery, SQL exec, entity lookup - the MCP surface the docs advertise -
+    /// exercised through `tools/call` against a fake nest. Streaming subscribe is not shipped
+    /// (RFC-0010) and is not advertised.
+    #[tokio::test]
+    async fn tools_call_covers_the_documented_surface() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_serving_nest().await;
+
+        let list = handle(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            &client,
+            &base,
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"subscribe"),
+            "RFC-0010: streaming subscribe is not shipped, so it must not be advertised"
+        );
+        for required in [
+            "status", "schema", "tables", "table", "sql", "explain", "entity",
+        ] {
+            assert!(
+                names.contains(&required),
+                "{required} must be advertised: {names:?}"
+            );
+        }
+
+        async fn call(client: &reqwest::Client, base: &str, name: &str, arguments: Value) -> Value {
+            handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments }
+                }),
+                client,
+                base,
+            )
+            .await
+            .unwrap()
+        }
+
+        let status = call(&client, &base, "status", json!({})).await;
+        assert!(tool_text(&status).contains("last_block"), "{status}");
+        assert_ne!(status["result"]["isError"], true);
+
+        let schema = call(&client, &base, "schema", json!({})).await;
+        assert!(tool_text(&schema).contains("{alias}__{event}"), "{schema}");
+
+        let tables = call(&client, &base, "tables", json!({})).await;
+        assert!(tool_text(&tables).contains("usdc__transfer"), "{tables}");
+
+        let table = call(
+            &client,
+            &base,
+            "table",
+            json!({ "name": "usdc__transfer", "limit": 10 }),
+        )
+        .await;
+        assert!(tool_text(&table).contains("usdc__transfer"), "{table}");
+
+        let sql = call(
+            &client,
+            &base,
+            "sql",
+            json!({ "query": "SELECT 1", "limit": 5 }),
+        )
+        .await;
+        let sql_text = tool_text(&sql);
+        assert!(
+            sql_text.contains("as of block 42") && sql_text.contains("SELECT 1"),
+            "sql must run and stamp provenance: {sql_text}"
+        );
+        assert_ne!(sql["result"]["isError"], true);
+
+        let explain = call(&client, &base, "explain", json!({ "query": "SELECT 1" })).await;
+        assert!(tool_text(&explain).contains("valid"), "{explain}");
+
+        let entity = call(
+            &client,
+            &base,
+            "entity",
+            json!({ "id": "000000000042-000001" }),
+        )
+        .await;
+        assert!(
+            tool_text(&entity).contains("000000000042-000001"),
+            "{entity}"
+        );
+
+        let balance = call(&client, &base, "balance", json!({ "address": "0xabc" })).await;
+        assert!(tool_text(&balance).contains("0xabc"), "{balance}");
+
+        let read = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": { "uri": "nuthatch://schema" }
+            }),
+            &client,
+            &base,
+        )
+        .await
+        .unwrap();
+        assert!(
+            read["result"]["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("{alias}__{event}"),
+            "{read}"
+        );
+
+        h.abort();
+    }
+
+    /// #304: the no-network degrade path. `initialize` / `tools/list` already answer with no nest
+    /// (fail-open). A tool call against an unreachable nest must not panic or hang: it returns
+    /// `isError` and names `nuthatch dev`. There is no `--offline` flag; this test is the path.
+    #[tokio::test]
+    async fn tools_call_degrades_when_the_nest_is_unreachable() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "status", "arguments": {} }
+            }),
+            &client,
+            "http://127.0.0.1:1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "an unreachable nest is an error, not an empty result: {resp}"
+        );
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("cannot reach nuthatch") && text.contains("nuthatch dev"),
+            "tell the caller to start the local instance: {text}"
+        );
+    }
 }
