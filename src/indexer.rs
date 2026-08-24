@@ -1933,6 +1933,18 @@ async fn build_nest(
                 config.templates.len(),
                 config.factories.len()
             );
+            if let Some(chain) = crate::chains::lookup(&config.nest.chain) {
+                if !chain.topic0_only_getlogs {
+                    tracing::warn!(
+                        "chain '{}' shipped RPC refuses address-less eth_getLogs (the factory \
+                         flip after {FACTORY_FLIP_THRESHOLD} children, and the tip fetch from \
+                         the first window). A factory nest on the default endpoint will fail \
+                         with an address-required error. Pass --rpc at an archive endpoint that \
+                         allows topic0-only getLogs.",
+                        chain.name
+                    );
+                }
+            }
             Some(Arc::new(fs))
         }
     };
@@ -2443,6 +2455,32 @@ async fn fetch_timestamps(
         return Ok(std::collections::HashMap::new());
     }
     source.block_timestamps(blocks).await
+}
+
+/// Blocks that still need a header after local filtering (#765).
+///
+/// A topic0-only fetch (factory flip, RFC-0009 §4) returns every log on the chain with that
+/// topic0, including other protocols that share the event shape. Stamping timestamps from the
+/// raw log list paid `eth_getBlockByNumber` for blocks whose rows we then discarded. The kept
+/// rows plus any `[[calls]]` sample blocks are the only headers worth buying.
+fn blocks_needing_timestamps(
+    rows: &[crate::registry::DecodedRow],
+    extra: impl IntoIterator<Item = u64>,
+) -> Vec<u64> {
+    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+    blocks.extend(extra);
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+}
+
+fn apply_row_timestamps(
+    rows: &mut [crate::registry::DecodedRow],
+    ts: &std::collections::HashMap<u64, u64>,
+) {
+    for r in rows {
+        r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+    }
 }
 
 /// Resolve declared `[[calls]]` for one window of blocks and return them as `DecodedRow` objects in
@@ -3456,22 +3494,25 @@ pub async fn backfill_direct_factory(
             }
         }
 
-        // Authoritative decode with the full child set, real timestamps, deterministic order.
-        let mut blocks: Vec<u64> = all_logs.iter().map(|l| l.block_number).collect();
-        if state_rpc.is_some() {
-            for d in calls {
-                blocks.extend(d.blocks_in(next, chunk_to));
-            }
-        }
-        blocks.sort_unstable();
-        blocks.dedup();
+        // Authoritative decode with the full child set, then headers only for kept rows (#765).
+        let mut rows = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
+        let extra = if state_rpc.is_some() {
+            calls
+                .iter()
+                .flat_map(|d| d.blocks_in(next, chunk_to))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let blocks = blocks_needing_timestamps(&rows, extra);
         let ts = retry_transient(
             &format!("factory block_timestamps {next}..={chunk_to}"),
             BACKFILL_RETRY_BASE,
             || fetch_timestamps(source, registry, &blocks),
         )
         .await?;
-        let mut rows = decode_window(registry, Some(factory), children, &all_logs, &ts);
+        apply_row_timestamps(&mut rows, &ts);
+        children.apply_timestamps(&ts);
         // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
         if let Some(rpc) = state_rpc {
             let call_rows = resolve_calls_for_window(
@@ -3955,18 +3996,24 @@ impl NestIngest {
         to: u64,
         tip: u64,
     ) -> Result<Option<usize>> {
-        // Fetch timestamps for the blocks these logs touch, then decode in chain order so
-        // factory discovery is inline: a child created at log i is in the registry before its
-        // own activity at log j>i in the same window decodes (RFC-0009 same-block handling).
-        let mut blocks: Vec<u64> = logs.iter().map(|l| l.block_number).collect();
-        // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row with
-        // `block_timestamp = 0` seals that zero permanently once it finalizes (the H4 finding below).
-        // So the sampled blocks join the timestamp fetch rather than being handled after it.
-        for d in &self.calls {
-            blocks.extend(d.blocks_in(next, to));
-        }
-        blocks.sort_unstable();
-        blocks.dedup();
+        // Decode first so factory discovery is inline (a child created at log i is in the
+        // registry before its own activity at log j>i - RFC-0009 same-block handling), then
+        // buy headers only for blocks that produced a kept row (#765). A topic0-only fetch
+        // returns every matching event on the chain; stamping from the raw log list paid
+        // eth_getBlockByNumber for foreign protocols we then discarded.
+        let empty_ts = std::collections::HashMap::new();
+        let mut rows = decode_window(
+            &self.registry,
+            self.factory.as_deref(),
+            &mut self.children,
+            logs,
+            &empty_ts,
+        );
+        // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row
+        // with `block_timestamp = 0` seals that zero permanently once it finalizes (H4). Sampled
+        // blocks join the timestamp fetch rather than being handled after it.
+        let extra = self.calls.iter().flat_map(|d| d.blocks_in(next, to));
+        let blocks = blocks_needing_timestamps(&rows, extra);
         let timestamps = match fetch_timestamps(source, &self.registry, &blocks).await {
             Ok(t) => t,
             Err(e) => {
@@ -3980,13 +4027,8 @@ impl NestIngest {
                 return Ok(None);
             }
         };
-        let mut rows = decode_window(
-            &self.registry,
-            self.factory.as_deref(),
-            &mut self.children,
-            logs,
-            &timestamps,
-        );
+        apply_row_timestamps(&mut rows, &timestamps);
+        self.children.apply_timestamps(&timestamps);
 
         let mut stored = 0usize;
         let mut deltas = Vec::new();
@@ -5167,8 +5209,9 @@ fn rebuild_views(
 
 /// Decode a window's logs in chain order (block, log_index), routing each to a contract decoder or -
 /// for a factory nest - a discovered child's template decoder, and discovering new children inline so
-/// same-window child activity decodes (RFC-0009). Each row is stamped with its block timestamp before
-/// discovery so a child's `discovered_timestamp` is exact. Pure aside from growing `children`.
+/// same-window child activity decodes (RFC-0009). Timestamps may be empty here: #765 fetches headers
+/// only after local filtering, then `apply_row_timestamps` / `ChildRegistry::apply_timestamps` fill
+/// `block_timestamp` and `discovered_timestamp`. Pure aside from growing `children`.
 fn decode_window(
     registry: &DecodeRegistry,
     factory: Option<&FactorySet>,
@@ -8103,6 +8146,170 @@ template = "pool"
                 tx_hash: format!("0xaa{b:062x}"),
             })
             .collect()
+    }
+
+    /// #765: a topic0 match on a foreign address must not pull a header. Collecting stamp
+    /// blocks from the raw log list is the mutation this fails under.
+    #[test]
+    fn timestamp_blocks_exclude_logs_that_do_not_decode() {
+        use crate::factory::ChildRegistry;
+        let reg = transfer_registry();
+        let kept = ping_logs(&reg, &[10]);
+        let mut foreign = kept[0].clone();
+        foreign.address = "0x9999999999999999999999999999999999999999".into();
+        foreign.block_number = 99;
+        foreign.log_index = 1;
+        let logs = vec![kept[0].clone(), foreign];
+        let mut children = ChildRegistry::new();
+        let empty = std::collections::HashMap::new();
+        let rows = decode_window(&reg, None, &mut children, &logs, &empty);
+        assert_eq!(rows.len(), 1, "only the nest's own address decodes");
+        assert_eq!(rows[0].block_number, 10);
+        let stamp = blocks_needing_timestamps(&rows, std::iter::empty());
+        assert_eq!(stamp, vec![10]);
+        assert!(
+            !stamp.contains(&99),
+            "a discarded topic0 match must not buy a header"
+        );
+    }
+
+    /// #765 acceptance: a topic0-only factory backfill must not buy headers for foreign addresses
+    /// that share the event shape. `CountingSource` returns every log in range (the topic0-only
+    /// shape); deleting the filter-before-stamp and collecting blocks from the raw log list makes
+    /// `ts_blocks` 3 instead of 2.
+    #[tokio::test]
+    async fn factory_topic0_backfill_does_not_stamp_foreign_blocks() {
+        use crate::registry::{ContractSpec, DecodeRegistry, TemplateSpec};
+        use crate::rpc::Log;
+        use std::sync::atomic::Ordering;
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+        let foreign_addr = "0x9999999999999999999999999999999999999999";
+
+        let reg = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: factory_addr.parse().unwrap(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+                )
+                .unwrap(),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "pool".into(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+                )
+                .unwrap(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    reg.tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = crate::factory::FactorySet::build(&config).unwrap();
+
+        let source = CountingSource::new(vec![
+            Log {
+                address: factory_addr.into(),
+                topics: vec![topic0("factory__pool_created")],
+                data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+                block_number: 10,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt1".into(),
+                log_index: 0,
+            },
+            Log {
+                address: pool_addr.into(),
+                topics: vec![topic0("pool__swap")],
+                data: format!("0x{:064x}", 7u64),
+                block_number: 15,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt2".into(),
+                log_index: 0,
+            },
+            Log {
+                address: foreign_addr.into(),
+                topics: vec![topic0("factory__pool_created")],
+                data: format!("0x{:0>64}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                block_number: 19,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt3".into(),
+                log_index: 0,
+            },
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut children = crate::factory::ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &reg,
+            &fs,
+            &mut children,
+            dir.path(),
+            &[topic0("factory__pool_created"), topic0("pool__swap")],
+            &[],
+            None,
+            0,
+            10,
+            20,
+            100,
+            true,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sealed, 2,
+            "factory event and child swap; not the foreign log"
+        );
+        assert!(children.contains(pool_addr));
+        assert_eq!(
+            children.get(pool_addr).unwrap().discovered_timestamp,
+            1_700_000_000 + 10,
+            "decode-then-stamp must still fill discovered_timestamp"
+        );
+        assert_eq!(
+            source.ts_blocks.load(Ordering::SeqCst),
+            2,
+            "headers only for kept rows (blocks 10 and 15), not the foreign topic0 at 19"
+        );
     }
 
     /// **The RFC-0029 acceptance criterion for slice 4.** A nest declaring no use of `block_timestamp`

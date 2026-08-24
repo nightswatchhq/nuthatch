@@ -307,6 +307,19 @@ impl ChildRegistry {
         true
     }
 
+    /// Fill `discovered_timestamp` from a block-timestamp map when discovery ran before the stamp
+    /// (#765: timestamps are fetched only for blocks that produced a kept row). Does not bump
+    /// `version` - the set of children is unchanged.
+    pub fn apply_timestamps(&mut self, ts: &HashMap<u64, u64>) {
+        for child in self.children.values_mut() {
+            if child.discovered_timestamp == 0 {
+                if let Some(&t) = ts.get(&child.discovered_block) {
+                    child.discovered_timestamp = t;
+                }
+            }
+        }
+    }
+
     pub fn contains(&self, address: &str) -> bool {
         self.children.contains_key(address)
     }
@@ -536,6 +549,29 @@ template = "pool"
         let mut other = pool_created_row(100, 3, pool);
         other.table = "factory__other_event".into();
         assert!(fs.discover(&other).is_empty());
+    }
+
+    /// #765: discovery now runs before the stamp, so a child is inserted with timestamp 0 and
+    /// filled in afterwards. Filling must not look like a set change.
+    #[test]
+    fn apply_timestamps_fills_zero_without_bumping_version() {
+        let fs = FactorySet::build(&cfg(UNIV3)).unwrap();
+        let mut reg = ChildRegistry::new();
+        let a = "0x00000000000000000000000000000000000000a1";
+        let mut child = fs.discover(&pool_created_row(10, 0, a)).remove(0);
+        child.discovered_timestamp = 0;
+        assert!(reg.insert(child));
+        assert_eq!(reg.version(), 1);
+        let ts = HashMap::from([(10u64, 1_700_000_010u64), (99, 1)]);
+        reg.apply_timestamps(&ts);
+        assert_eq!(reg.get(a).unwrap().discovered_timestamp, 1_700_000_010);
+        assert_eq!(reg.version(), 1, "the set of children is unchanged");
+        reg.apply_timestamps(&HashMap::from([(10u64, 999u64)]));
+        assert_eq!(
+            reg.get(a).unwrap().discovered_timestamp,
+            1_700_000_010,
+            "an already-stamped child is left alone"
+        );
     }
 
     #[test]
