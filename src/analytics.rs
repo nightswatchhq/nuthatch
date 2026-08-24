@@ -2204,6 +2204,32 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     issues
 }
 
+/// Bind one incremental-entity SELECT against the same empty typed fact surface used by view
+/// validation. DuckDB's Rust binding only materialises result metadata after `query`, even for a
+/// prepared statement. The entity has already passed the single-SELECT gate, and no rows are read.
+pub fn entity_output_columns(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    sql: &str,
+) -> Result<Vec<String>> {
+    let conn = Connection::open_in_memory()?;
+    let empty_hot = HotRows::new();
+    let _ = define_views(
+        &conn,
+        dir,
+        &empty_hot,
+        u64::MAX,
+        &Default::default(),
+        schema,
+    );
+    define_labels_view(&conn, dir);
+    define_children_views(&conn, dir);
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query([])?;
+    drop(rows);
+    Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+}
+
 /// The table name out of a DuckDB catalog error, if that is what this is.
 ///
 /// Format-dependent by necessity - DuckDB gives no structured error code for it - so it fails soft:

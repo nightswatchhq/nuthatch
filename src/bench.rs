@@ -16,12 +16,50 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::chains;
-use crate::cli::BackfillBenchArgs;
+use crate::cli::{AuthoredEntityBenchArgs, BackfillBenchArgs};
 use crate::config::Config;
 use crate::factory::{ChildRegistry, FactorySet};
 use crate::registry::DecodeRegistry;
 use crate::rpc::RpcClient;
 use crate::store::Store;
+
+/// Run the RFC-0041 slice-zero measurement over a sealed, manifest-bound Horizon capture. This
+/// does not start a cursor, dial an RPC, or write into the fixture directory.
+pub fn authored_entity(args: AuthoredEntityBenchArgs) -> Result<()> {
+    let report = match (
+        args.segments.as_deref(),
+        args.record.as_deref(),
+        args.replay.as_deref(),
+    ) {
+        (_, _, Some(replay)) => crate::authored_entity_spike::measure_horizon_tape(
+            std::path::Path::new(replay),
+            args.max_rows,
+        )?,
+        (Some(segments), Some(record), None) => {
+            crate::authored_entity_spike::record_horizon_tape(
+                std::path::Path::new(segments),
+                std::path::Path::new(record),
+                args.batch_rows,
+            )?;
+            crate::authored_entity_spike::measure_horizon_tape(
+                std::path::Path::new(record),
+                args.max_rows,
+            )?
+        }
+        (Some(segments), None, None) => crate::authored_entity_spike::measure_horizon_fixture(
+            std::path::Path::new(segments),
+            args.max_rows,
+        )?,
+        _ => bail!("authored-entity requires --segments or --replay"),
+    };
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    if let Some(out) = args.out {
+        std::fs::write(&out, format!("{json}\n"))
+            .with_context(|| format!("write authored-entity measurement {out}"))?;
+    }
+    Ok(())
+}
 
 /// Which backfill path a run takes. Extracted from `one_run`'s `if` chain so the choice is testable
 /// without a network: the factory-nest bug this exists to prevent was a *dispatch* bug, not a decode

@@ -528,6 +528,39 @@ pub enum BenchWhat {
     /// (query latency + peak RSS). The regression guard for the perf refactors - run offline against
     /// an already-indexed nest.
     Query(QueryBenchArgs),
+    /// Measure the RFC-0041 embedded authored-entity spike over a sealed Horizon fixture.
+    AuthoredEntity(AuthoredEntityBenchArgs),
+}
+
+#[derive(Args)]
+pub struct AuthoredEntityBenchArgs {
+    /// Directory holding the captured, manifest-bound Horizon `segments/` files.
+    #[arg(long, required_unless_present = "replay")]
+    pub segments: Option<String>,
+
+    /// The entity's declared live-input admission bound. The run fails before DBSP receives more.
+    #[arg(long, default_value_t = 1_000)]
+    pub max_rows: usize,
+
+    /// Rows per recorded entity-input batch. The tape contains the normalised weighted inputs, not
+    /// synthetic RPC responses, and replay applies them through the same DBSP boundary offline.
+    #[arg(long, default_value_t = 256)]
+    pub batch_rows: usize,
+
+    /// Normalise the sealed fixture once and write its content-addressed entity-input tape here.
+    /// The command then measures a replay of that tape, so the published timing excludes DuckDB's
+    /// one-off raw-history scan.
+    #[arg(long, conflicts_with = "replay")]
+    pub record: Option<String>,
+
+    /// Replay a recorded entity-input tape. This takes no fixture or RPC path and cannot contact a
+    /// network endpoint.
+    #[arg(long, conflicts_with_all = ["record", "segments"])]
+    pub replay: Option<String>,
+
+    /// Write the measurement JSON here as well as printing it.
+    #[arg(long)]
+    pub out: Option<String>,
 }
 
 #[derive(Args)]
