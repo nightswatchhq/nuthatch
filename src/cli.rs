@@ -1007,4 +1007,9 @@ pub struct DoctorArgs {
     /// real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one.
     #[arg(long)]
     pub address: Option<String>,
+
+    /// Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on
+    /// these fields, not on the wording of the human report (#716).
+    #[arg(long)]
+    pub json: bool,
 }
