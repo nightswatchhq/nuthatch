@@ -83,10 +83,13 @@ affected chain's cursor, isolated from other cursors in the same runtime. Segmen
 Parquet strictly past finality, so the columnar layer is append-only and immutable. If a
 change requires mutating sealed segments, the design is wrong - go back.
 
-**Entity derivation:** two authoring modes.
-- Declarative (default): entities as incremental views over decoded events, maintained by
-  DBSP (Feldera crates). This is the differentiator - reorgs become retractions, backfills
-  become batch runs of the same circuit.
+**Entity derivation.**
+- Built-in IVM (shipped): `balances`, `exposure`, and `velocity`, maintained by DBSP. Reorgs
+  are retractions; backfills are batch runs of the same circuit.
+- Authored SQL (shipped, RFC-0018 §1): `views/*.sql` are named queries evaluated at request
+  time over hot ∪ sealed. Not incremental.
+- Authored incremental entities: [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
+  frozen for 2026. Do not start. Do not describe them as shipped.
 - Imperative (escape hatch): WASM component handlers, per the transform layer below.
 
 ## The transform layer: lessons from liminal (nightswatchhq/liminal)

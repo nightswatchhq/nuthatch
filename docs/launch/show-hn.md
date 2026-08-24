@@ -45,10 +45,11 @@ The numbers I actually care about, all measured on the release build and reprodu
   current numbers, machine, and harness commit are in `docs/benchmarks.md` (#722); a discrepancy in
   that re-measurement is still open in #744, so no multiplier is quoted here until it settles.
 
-One genuinely different bit: entity views are **incremental** (Feldera/DBSP). A per-address balance
-view treats a reorg as a *retraction*, not a recompute - the same circuit runs a backfill as a batch
-and a reorg as a diff. Balances are i128 end-to-end (a transfer above i64::MAX won't silently vanish),
-and they survive a restart.
+One genuinely different bit: **balances, exposure and velocity** are incremental (Feldera/DBSP). A
+per-address balance view treats a reorg as a *retraction*, not a recompute - the same circuit runs a
+backfill as a batch and a reorg as a diff. Balances are i128 end-to-end (a transfer above i64::MAX
+won't silently vanish), and they survive a restart. Nest-authored `views/*.sql` are query-time SQL,
+not IVM ([RFC-0041](../rfcs/0041-authored-incremental-entities.md), frozen for 2026).
 
 **Honest limits, because you'll ask:** Ethereum, Arbitrum, Base, BSC, Polygon, Gnosis and Optimism
 ship with bundled endpoints (anything else needs `--rpc`); internal call traces still need a

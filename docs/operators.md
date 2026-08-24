@@ -836,7 +836,8 @@ de-duplicating segments. **Across nuthatch versions built on different arrow-rs 
 identity may differ** even when every decoded row is identical. Do not use a segment hash as a
 cross-version equality proof; compare decoded rows for that.
 
-**Consistency: entity reads versus derived views.** The entity store and the derived (IVM) views
+**Consistency: entity reads versus derived IVM views** (balances, exposure, velocity - the three
+built-in DBSP relations, not authored `views/*.sql`). The entity store and those views
 advance independently, so **a read taken during a reorg window can see transient skew between them**:
 `/balances` (a view) and `/sql` (over stored rows) may briefly disagree about the same block. Both
 converge within a tick; neither is wrong in isolation. This matters if you **join across the two

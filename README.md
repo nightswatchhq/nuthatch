@@ -361,8 +361,11 @@ who need more - none of it in the way of the happy path:
   honouring it would let whoever emitted the event choose what your indexer connects to.
 - **Factory / dynamic contracts** (RFC-0009). Watch a factory (e.g. a pool factory); children are
   discovered at runtime and indexed into shared `{template}__*` tables - no redeploy per child.
-- **Declarative + imperative derivation.** Incremental views maintained by DBSP (reorgs become
-  retractions), plus a WASM transform layer for custom pure-function pipelines.
+- **Derivation, two speeds.** Decoded events are tables, sealed as they index. Three built-in
+  relations - balances, exposure, velocity - are incremental DBSP circuits; a reorg is a
+  retraction. Nest-authored `views/*.sql` are named SQL evaluated at query time over hot ∪ sealed,
+  not IVM. General authored incremental entities are [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
+  frozen for the rest of 2026. A WASM transform layer remains the imperative escape hatch.
 - **Compliance pack** (RFC-0008). Address labels, sanctions/watch-list screening, threshold & velocity
   flags, counterparty-exposure views, and a signed, replayable audit manifest.
 - **Alerts & webhooks** (RFC-0010). HMAC-signed egress with a durable at-least-once outbox; a slow
@@ -421,9 +424,10 @@ who need more - none of it in the way of the happy path:
   hash comparison.
 - **Derive-first - the `eth_call` you don't need** (RFC-0023). >70% of subgraphs call `eth_call` for
   reads that are *derivable* from the events they already index - they fetch only because they have no
-  incremental-view engine. Nuthatch does: `nuthatch recipe add total_supply` drops in a derived view
+  way to derive. Nuthatch does: `nuthatch recipe add total_supply` drops in a SQL view
   that computes an ERC-20's `totalSupply()` as Σ minted − Σ burned from Transfer events - deterministic,
-  free, no archive node. It derives what a subgraph pays an archive node to fetch. For the handful of
+  free, no archive node. That view runs at query time; it is not a DBSP circuit. It derives what a
+  subgraph pays an archive node to fetch. For the handful of
   reads that *aren't* derivable but never change - `decimals`/`symbol`/`name` - `nuthatch metadata fetch`
   calls once and caches forever.
 - **Ingestion that survives real providers** (RFC-0028). An oversized `eth_getLogs` is split and

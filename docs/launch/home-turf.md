@@ -25,8 +25,8 @@ Why post it here first: the thing indexers and data-service operators keep needi
 observability* - a way to answer "what did this contract actually do" without standing up a whole
 stack or renting a metered API. Nuthatch runs a live 3-contract nest in **~58 MB of RAM** (CI-enforced
 ≤256 MB, budget is 2 GB), follows the tip reorg-safely, and seals content-addressed Parquet past
-finality that DuckDB queries read-only. Incremental views (DBSP) mean a reorg is a retraction, not a
-recompute.
+finality that DuckDB queries read-only. Balances, exposure and velocity are incremental (DBSP): a
+reorg is a retraction, not a recompute. Nest-authored SQL views run at query time.
 
 It ships a **Horizon nest** as the worked example - the Graph Horizon contracts on Arbitrum One,
 decoded, with parity checks (`nuthatch check parity`) against the canonical source. That's the demo I'd
@@ -52,8 +52,9 @@ failure you'd hit that I haven't.
 
 Lead with the engineering, not the domain. Hooks that play in r/rust:
 
-- **DBSP retractions**: incremental view maintenance where a chain reorg falls out as a retraction in
-  the same circuit that runs the backfill as a batch. Feldera crates, MIT/Apache.
+- **DBSP retractions**: the three built-in circuits (balances, exposure, velocity) treat a reorg as
+  a retraction in the same circuit that runs the backfill as a batch. Feldera crates, MIT/Apache.
+  Arbitrary authored views are not this; they are query-time SQL (RFC-0041, frozen).
 - **Batched Arrow over WIT**: the transform host passes Arrow IPC buffers across the component
   boundary, never one event per call - because a per-event WASM call can't survive a ≥10K ev/s floor.
 - **DuckDB single-writer by design**: only the ingestion thread writes; queries attach read-only. The
@@ -61,5 +62,5 @@ Lead with the engineering, not the domain. Hooks that play in r/rust:
   path, and there's a test that asserts it. r/rust likes a determinism proof more than a benchmark.
 - The honest footprint number and the CI job that enforces it.
 
-Title candidate: *"Nuthatch: incremental-view blockchain indexing in one Rust binary - reorgs as DBSP
-retractions, byte-identical fast/slow paths"*.
+Title candidate: *"Nuthatch: one Rust binary that indexes a contract into SQL - reorgs as DBSP
+retractions on balances, byte-identical fast/slow paths"*.
