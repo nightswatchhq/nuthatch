@@ -1,6 +1,7 @@
 # RFC-0041: Authored incremental entities - make predefined computation pay at indexing time
 
-- Status: **Proposed - design only.** No implementation under the 2026 feature freeze.
+- Status: **Approved for implementation (2026-08-24).** The work proceeds only through the
+  ordered issue sequence in §9. RFC-0033's durable grafting follow-up (#357) is not part of v1.
 - Author: Jenny
 - Date: 2026-08-24
 - Depends on: RFC-0018 §1/§3 (authored SQL and the deferred hot-view promise), RFC-0013 §3
@@ -83,7 +84,7 @@ data, because none existed.
 - A transparent result cache with expiry and invalidation rules.
 - Persisting a second copy of every source event under a more fashionable table name.
 - Partial-range reuse of holistic aggregates.
-- Starting implementation during the 2026 feature freeze.
+- Skipping the slice-zero gate or the dependency order in §9.
 
 ## §3 - The authoring contract
 
@@ -350,11 +351,28 @@ RFC.
 | 1 | **Authoring and validation.** `entities/*.sql`, `entities.toml`, schema/dependency/refusal reporting in `check`. | An eligible entity is accepted; every unsupported construct names the reason and remains expressible as a normal view. |
 | 2 | **One lifecycle.** Backfill/tip `+1`, reorg `-1`, restart seed plus hot replay, health and resource admission. | A killed/restarted/reorged runtime converges to the reference result without serving stale state as healthy. |
 | 3 | **Serving.** Keyed entity reads, `/sql` relation, schema/MCP/semantic exposure and provenance. | The Lodestar panel reads maintained state and its raw-history scan disappears in a captured plan. |
-| 4 | **Per-entity grafting.** Persisted entity output and RFC-0033 whole-derivation reuse, designed in a follow-up once restart measurements justify persistence. | Edit one of several entities: unchanged siblings graft, descendants rebuild locally, historical RPC count is zero. |
+| Post-v1, not a v1 slice | **Per-entity grafting.** Persisted entity output and RFC-0033 whole-derivation reuse, designed in a follow-up once restart measurements justify persistence. | Edit one of several entities: unchanged siblings graft, descendants rebuild locally, historical RPC count is zero. |
 
-Slices 1-3 are new capability and remain behind the 2026 freeze. Slice 4 is deliberately not smuggled
-into the first implementation: persistence has its own corruption, atomicity, collection and migration
-surface, and should be paid for only after the in-memory model proves product value.
+## Implementation order and the #357 boundary
+
+The active implementation path is deliberately short and linear:
+
+```text
+#818 compiler and budget gate
+  -> #820 authoring, validation and identity
+  -> #821 lifecycle, reorg and restart reconstruction
+  -> #822 serving and the measured Lodestar disappearing-scan proof
+```
+
+Each arrow is a real dependency, not a suggested reading order. #818 must first produce an explicit
+go decision. If it parks, none of the later slices start. #820, #821 and #822 remain blocked until
+their preceding work has landed and been verified.
+
+#357 is **not** “slice 4 next”. It is RFC-0033's durable whole-derivation grafting follow-up. V1
+rebuilds maintained state from local canonical facts and replays the hot tail, with zero historical
+RPC. Durable checkpoints add atomic commit, verification, pruning, migration and corruption recovery.
+Revisit #357 only after #822 measures a material restart-rebuild problem that v1 cannot accept. The
+trigger must be that measurement, not the mere existence of maintained entities.
 
 ## §10 - Risks
 
