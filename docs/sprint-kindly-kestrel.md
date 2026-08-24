@@ -1,7 +1,6 @@
 # Sprint: kindly-kestrel
 
-Filed by the board on 2026-08-21, after judicious-jackdaw closed all four of its issues and v2.6.2
-shipped. **Four issues.** Runs **Friday 2026-08-21 to Monday 2026-08-24**.
+Filed after judicious-jackdaw closed all four of its issues and v2.6.2 shipped. **Four issues.**
 
 ## Definition of done
 

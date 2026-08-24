@@ -1,7 +1,6 @@
 # Sprint: hardy-heron
 
-Filed by the board on 2026-08-16, during the post-2.5.0 freeze. **Four issues.** Runs **Wednesday
-2026-08-19 to Friday 2026-08-21**, resuming after the GraphOps sync on Tuesday the 18th.
+Filed during the post-2.5.0 freeze. **Four issues.**
 
 ## Definition of done
 

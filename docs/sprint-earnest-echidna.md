@@ -1,18 +1,10 @@
 # Sprint: earnest-echidna
 
-Filed by the board on 2026-08-12, immediately after auditing diligent-dormouse and releasing v2.2.0.
-**Two days: 2026-08-13 to 2026-08-15.** Fifteen issues.
+Filed after auditing diligent-dormouse and releasing v2.2.0. **Fifteen issues.**
 
-*Scoped as three days and filed on the 12th; the board did not actually dispatch it until the
-morning of the 13th, so it is two. Recorded rather than quietly reworded, because the sprint's
-own theme forbids the alternative. The scope is unchanged - fifteen issues in two days is still
-inside dormouse's measured rate, and the slack the third day was meant to provide is now gone.*
-
-Three days rather than a week because the previous sprint was measured, not guessed: diligent-dormouse
-merged its first PR at 2026-08-11 16:19Z and its last at 2026-08-12 11:02Z - 23 PRs and 13 issues in
-under nineteen hours of wall clock, part of which the firm spent stopped. Fifteen issues is therefore
-not a stretch. The slack is deliberate and goes into the p0 and into the new artifact rule, not into
-more scope.
+Fifteen because the previous sprint was measured, not guessed: diligent-dormouse
+merged 23 PRs and 13 issues, part of which the firm spent stopped. The slack is deliberate and
+goes into the p0 and into the new artifact rule, not into more scope.
 
 ## Definition of done
 

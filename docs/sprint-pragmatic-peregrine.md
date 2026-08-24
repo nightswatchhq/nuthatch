@@ -1,7 +1,6 @@
 # Sprint: pragmatic-peregrine
 
-Filed 2026-08-23, after ominous-owl closed its labelled set and **v2.7.1** shipped. **Four issues.**
-Runs **Sunday 2026-08-24 to Sunday 2026-08-31**.
+Filed after ominous-owl closed its labelled set and **v2.7.1** shipped. **Four issues.**
 
 ## Definition of done
 

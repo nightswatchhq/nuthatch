@@ -1,11 +1,7 @@
 # Sprint: gallant-gecko
 
-Filed by the board on 2026-08-14, after auditing fastidious-ferret and reconciling the whole of the
-2026-08-04 architecture session against the code. **Eight issues**, two of them board-only.
-
-*Dates to be set at dispatch. The board's constraint is that its results are in hand before the
-GraphOps sync on Tuesday 2026-08-18, which is also the day the weekly subscription allowance resets -
-so this sprint spends from what is left of the current one.*
+Filed after auditing fastidious-ferret and reconciling the architecture session against the code.
+**Eight issues**, two of them board-only.
 
 ## Definition of done
 
