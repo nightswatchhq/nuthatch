@@ -263,18 +263,17 @@ fn backtick_spans(text: &str) -> Vec<(usize, String)> {
 /// Stops requiring subcommand resolution the moment a leaf (a command with no further subcommands)
 /// is reached - the rest of the tokens are that leaf's own args/positionals, out of scope here.
 fn walk_invocation(
-    tokens: &[&str],
+    tokens: &[(usize, &str)],
     root: &clap::Command,
     real_flags: &BTreeSet<String>,
     file: &str,
-    line: usize,
     findings: &mut Vec<Finding>,
 ) {
     let mut cmd = root;
     let mut resolving = true; // still expecting subcommand words
     let mut i = 0;
     while i < tokens.len() {
-        let tok = tokens[i];
+        let (line, tok) = tokens[i];
         if tok == "#" {
             break; // shell comment: nothing after this is a real token
         }
@@ -401,47 +400,90 @@ fn real_flags() -> BTreeSet<String> {
 /// service/container *name* argument) apart from an actual invocation, and lets `claude mcp add
 /// nuthatch -- nuthatch mcp --url ...` resolve only the second `nuthatch` - the one after `--` that
 /// is actually being run.
+///
+/// A line ending in `\` continues the invocation onto the next physical line (#782). Flags on the
+/// continuation are attributed to *that* line, not the line the `nuthatch` token sat on.
 fn check_text(text: &str, file: &str, real_flags: &BTreeSet<String>, findings: &mut Vec<Finding>) {
     let root = Cli::command();
     for (start_line, span) in backtick_spans(text) {
-        for (offset, line) in span.lines().enumerate() {
-            let line_no = start_line + offset;
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            let mut i = 0;
-            let mut at_segment_start = true;
-            while i < tokens.len() {
-                let is_separator = matches!(tokens[i], "&&" | "||" | ";" | "|" | "--");
-                if tokens[i] == "nuthatch" && at_segment_start {
-                    let mut end = i + 1;
-                    while end < tokens.len()
-                        && !matches!(tokens[end], "&&" | "||" | ";" | "|" | "--")
-                        && tokens[end] != "nuthatch"
-                    {
-                        end += 1;
-                    }
-                    walk_invocation(
-                        &tokens[i + 1..end],
-                        &root,
-                        real_flags,
-                        file,
-                        line_no,
-                        findings,
-                    );
-                    i = end;
-                    // `end` may itself be a separator/`nuthatch` - re-examine it as the start of
-                    // the next segment rather than skipping past it.
-                    at_segment_start = true;
-                    continue;
-                } else if is_separator || tokens[i] == "sudo" {
+        let tokens = token_stream(&span, start_line);
+        let mut i = 0;
+        let mut at_segment_start = true;
+        while i < tokens.len() {
+            match &tokens[i] {
+                StreamTok::Eol => {
                     at_segment_start = true;
                     i += 1;
-                } else {
+                }
+                StreamTok::Word { word, .. } if word == "nuthatch" && at_segment_start => {
+                    let mut end = i + 1;
+                    while end < tokens.len() {
+                        match &tokens[end] {
+                            StreamTok::Eol => break,
+                            StreamTok::Word { word: w, .. }
+                                if matches!(w.as_str(), "&&" | "||" | ";" | "|" | "--")
+                                    || w == "nuthatch" =>
+                            {
+                                break;
+                            }
+                            StreamTok::Word { .. } => end += 1,
+                        }
+                    }
+                    let slice: Vec<(usize, &str)> = tokens[i + 1..end]
+                        .iter()
+                        .filter_map(|t| match t {
+                            StreamTok::Word { line, word } => Some((*line, word.as_str())),
+                            StreamTok::Eol => None,
+                        })
+                        .collect();
+                    walk_invocation(&slice, &root, real_flags, file, findings);
+                    i = end;
+                    at_segment_start = true;
+                }
+                StreamTok::Word { word, .. }
+                    if matches!(word.as_str(), "&&" | "||" | ";" | "|" | "--")
+                        || word == "sudo" =>
+                {
+                    at_segment_start = true;
+                    i += 1;
+                }
+                StreamTok::Word { .. } => {
                     at_segment_start = false;
                     i += 1;
                 }
             }
         }
     }
+}
+
+enum StreamTok {
+    Word { line: usize, word: String },
+    Eol,
+}
+
+/// Physical lines become a token stream. A trailing `\` swallows the line break so the next
+/// line's tokens continue the same invocation; any other newline is an `Eol` that ends it (#782).
+fn token_stream(span: &str, start_line: usize) -> Vec<StreamTok> {
+    let mut out = Vec::new();
+    for (offset, line) in span.lines().enumerate() {
+        let line_no = start_line + offset;
+        let cont = line.trim_end().ends_with('\\');
+        let body = if cont {
+            line.trim_end().trim_end_matches('\\')
+        } else {
+            line
+        };
+        for word in body.split_whitespace() {
+            out.push(StreamTok::Word {
+                line: line_no,
+                word: word.to_string(),
+            });
+        }
+        if !cont {
+            out.push(StreamTok::Eol);
+        }
+    }
+    out
 }
 
 fn rel(root: &Path, path: &Path) -> String {
@@ -555,6 +597,29 @@ fn detects_an_unreal_flag() {
             .iter()
             .any(|f| f.bad_token == "--this-flag-does-not-exist"),
         "a nonexistent flag inside a real invocation must be detected"
+    );
+}
+
+/// #782: a `\`-continued fenced block used to drop every flag on the next physical line. The
+/// flag is attributed to the line it is written on (3, after the opening fence), not the line
+/// `nuthatch` sat on.
+#[test]
+fn a_backslash_continuation_still_sees_the_flag_on_the_next_line() {
+    let real = real_flags();
+    let mut findings = Vec::new();
+    check_text(
+        "```sh\nnuthatch bench backfill --dir x --from 1 --to 2 \\\n  --not-a-real-nuthatch-flag\n```\n",
+        "docs/example.md",
+        &real,
+        &mut findings,
+    );
+    let hit = findings
+        .iter()
+        .find(|f| f.bad_token == "--not-a-real-nuthatch-flag")
+        .unwrap_or_else(|| panic!("continuation flag was invisible: {findings:?}"));
+    assert_eq!(
+        hit.line, 3,
+        "must point at the flag, not the invocation start"
     );
 }
 
