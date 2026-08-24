@@ -33,10 +33,20 @@ const MAX_THREADS: i64 = 2;
 /// is on, and a restriction only when it is off. The flag is startup-only, so it has to go on the
 /// `Config`, not in a later `SET`. `lock_configuration` then freezes both so a query cannot widen
 /// them. Measured against `libduckdb-sys` 1.10504.0, the bundled build.
+fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.join(crate::seal::SEGMENTS_DIR), dir.join("labels")];
+    // Runtime layout (RFC-0033): Parquet lives at `<root>/segments/{hash}.parquet`, not under
+    // `data/<nid>/segments`. Locking only the per-dataset dir made `/sql` succeed with zero rows
+    // on every mounted nest (#289 follow-up, `e2e_early_cutoff`).
+    if let Some(shared) = crate::seal::shared_store(dir) {
+        dirs.push(shared);
+    }
+    dirs
+}
+
 fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
-    let allowed: Vec<String> = [crate::seal::SEGMENTS_DIR, "labels"]
-        .iter()
-        .map(|sub| dir.join(sub))
+    let allowed: Vec<String> = allowed_read_dirs(dir)
+        .into_iter()
         .filter(|p| p.exists())
         .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
         .collect();
@@ -3279,6 +3289,26 @@ template="pool"
             .query_row([], |r| r.get(0))
             .expect("in-allowlist read_text runs");
         assert!(got.contains("ok"), "got {got:?}");
+    }
+
+    /// Runtime layout: Parquet is at `<root>/segments/`, the nest dir is `<root>/data/<nid>/`.
+    /// Locking only the nest dir made every mounted `/sql` return empty (#289, e2e_early_cutoff).
+    #[test]
+    fn the_lockdown_allows_the_shared_segment_store() {
+        let root = tempfile::tempdir().unwrap();
+        let nid_dir = root.path().join("data").join("nid");
+        std::fs::create_dir_all(&nid_dir).unwrap();
+        let shared = root.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&shared).unwrap();
+        let file = shared.join("ok.txt");
+        std::fs::write(&file, "shared\n").unwrap();
+        let conn = open_locked_duckdb(&nid_dir).unwrap();
+        let sql = format!("SELECT * FROM read_text('{}')", file.display());
+        let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
+        let got: String = stmt
+            .query_row([], |r| r.get(0))
+            .expect("shared-store read_text runs");
+        assert!(got.contains("shared"), "got {got:?}");
     }
 
     /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the

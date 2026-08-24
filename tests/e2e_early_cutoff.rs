@@ -187,7 +187,7 @@ fn transfers(dir: &Path, nest: &str) -> Vec<serde_json::Value> {
             transfer_table(nest)
         ),
     )
-    .unwrap_or_default()
+    .unwrap_or_else(|e| panic!("querying sealed transfers at {}: {e:#}", dir.display()))
 }
 
 /// Install an edited copy of a dataset's inputs under the identity they now hash to - what any
