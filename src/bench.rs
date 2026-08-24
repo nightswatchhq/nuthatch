@@ -1391,13 +1391,13 @@ fn is_tmpfs(path: &std::path::Path) -> bool {
                 let _dev = bits.next();
                 let Some(mnt) = bits.next() else { continue };
                 let Some(fstype) = bits.next() else { continue };
-                if abs_s == mnt
-                    || abs_s.starts_with(&format!("{mnt}/"))
-                    || (mnt == "/" && abs_s.starts_with('/'))
-                {
-                    if best.is_none_or(|(_, n)| mnt.len() >= n) {
-                        best = Some((fstype, mnt.len()));
-                    }
+                let covered = if mnt == "/" {
+                    abs_s.starts_with('/')
+                } else {
+                    abs_s == mnt || abs_s.starts_with(&format!("{mnt}/"))
+                };
+                if covered && best.is_none_or(|(_, n)| mnt.len() >= n) {
+                    best = Some((fstype, mnt.len()));
                 }
             }
             if best.is_some_and(|(t, _)| t == "tmpfs" || t == "ramfs") {
