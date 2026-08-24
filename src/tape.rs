@@ -335,6 +335,12 @@ impl ReplaySource {
         self.tape.lock().unwrap().manifest.content_address.clone()
     }
 
+    /// Host the recording came from. A replayed `BenchReport.provider` that names the nest's
+    /// configured pool instead is the live endpoint wearing a `replayed: true` badge.
+    pub fn provider(&self) -> Option<String> {
+        self.tape.lock().unwrap().manifest.provider.clone()
+    }
+
     /// **A miss is a loud, specific failure, never a synthesised default.** A miss means the code
     /// under test asked for something the recording does not contain - a changed chunker, a changed
     /// retry policy, a different range - and that is a real signal. A rig that quietly invents data is
