@@ -224,14 +224,35 @@ pub fn generate(schema: &[TableSchema], nest_name: &str, chain: &str) -> Semanti
             columns.insert(col.name.clone(), desc);
         }
         let footguns = derive_footguns(t);
-        tables.insert(
-            t.table.clone(),
-            TableSemantic {
-                description: format!(
+        let (description, grain) = match t.kind {
+            crate::registry::TableKind::Call => (
+                format!(
+                    "Result of the `{}` call (selector `{}`). {SEEDED}",
+                    t.table, t.selector
+                ),
+                "one row per sampled block this declaration fires at".to_string(),
+            ),
+            crate::registry::TableKind::Block => (
+                format!("One row per block on this nest. {SEEDED}"),
+                "one row per block".to_string(),
+            ),
+            crate::registry::TableKind::State => (
+                format!("Storage writes for `{}`. {SEEDED}", t.alias),
+                "one row per storage write".to_string(),
+            ),
+            crate::registry::TableKind::Event => (
+                format!(
                     "`{}` events emitted by the `{}` contract. {SEEDED}",
                     t.event, t.alias
                 ),
-                grain: format!("one row per {} event", t.event),
+                format!("one row per {} event", t.event),
+            ),
+        };
+        tables.insert(
+            t.table.clone(),
+            TableSemantic {
+                description,
+                grain,
                 columns,
                 footguns,
             },
@@ -532,7 +553,16 @@ FACTORIES (RFC-0009; only in a nest with templates/factories)
 fn describe_table(t: &TableSchema, ts: Option<&TableSemantic>) -> String {
     match ts {
         Some(ts) if !ts.description.is_empty() => ts.description.clone(),
-        _ => format!("`{}` events from `{}`", t.event, t.alias),
+        _ => match t.kind {
+            crate::registry::TableKind::Call => {
+                format!("result of the `{}` call", t.table)
+            }
+            crate::registry::TableKind::Block => "one row per block".into(),
+            crate::registry::TableKind::State => format!("storage writes for `{}`", t.alias),
+            crate::registry::TableKind::Event => {
+                format!("`{}` events from `{}`", t.event, t.alias)
+            }
+        },
     }
 }
 
@@ -617,6 +647,38 @@ mod tests {
     /// #539: the seeded description used to read "The `enabled` bool parameter" - a promise that it
     /// *is* a SQL boolean. It is exact text `'true'`/`'false'`, so the seeded text (the one every
     /// column gets, edited or not) must say so and give the working comparison.
+    #[test]
+    fn a_call_table_is_not_seeded_as_an_empty_event() {
+        let table = TableSchema {
+            table: "token0_symbol".into(),
+            alias: "token0_symbol".into(),
+            kind: crate::registry::TableKind::Call,
+            event: String::new(),
+            topic0: String::new(),
+            function: String::new(),
+            selector: "0x18160ddd".into(),
+            columns: vec![],
+        };
+        let sem = generate(&[table], "uni", "mainnet");
+        let ts = &sem.tables["token0_symbol"];
+        assert!(
+            !ts.description.contains("``") && !ts.grain.contains("per  event"),
+            "a call table must not interpolate an empty event name: description={:?} grain={:?}",
+            ts.description,
+            ts.grain
+        );
+        assert!(
+            ts.description.contains("call") && ts.description.contains("0x18160ddd"),
+            "must name a call result, not a contract event: {}",
+            ts.description
+        );
+        assert!(
+            !ts.description.contains("contract"),
+            "a declaration name is not a contract: {}",
+            ts.description
+        );
+    }
+
     #[test]
     fn a_seeded_bool_description_warns_it_is_stored_as_text() {
         let sem = generate(&[transfer_table()], "usdc", "ethereum");

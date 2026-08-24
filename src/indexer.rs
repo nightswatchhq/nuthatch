@@ -8705,6 +8705,84 @@ template="pool"
         handle.abort();
     }
 
+    /// #745: `backfill_direct_factory` is the third seal-direct path. The other two go red if their
+    /// `state_rpc` branch is deleted. This one did not: 659 tests still passed. A factory nest
+    /// with `[[calls]]` is the production shape that reaches it.
+    #[tokio::test]
+    async fn seal_direct_factory_with_declared_calls_resolves_them() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"f\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+             abi = \"abis/fac.json\"\n\n\
+             [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\n\
+             template = \"child\"\n\n\
+             [[calls]]\nname = \"oracle_answer\"\n\
+             contract = \"0x2222222222222222222222222222222222222222\"\n\
+             calldata = \"0x18160ddd\"\nevery = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/fac.json"),
+            r#"[{"type":"event","name":"ChildCreated","inputs":[{"name":"child","type":"address","indexed":true}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/child.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+
+        let source: Arc<dyn Source> = Arc::new(MockSource {
+            logs: vec![crate::rpc::Log {
+                address: "0x0000000000000000000000000000000000000022".into(),
+                topics: vec!["0x".into()],
+                data: "0x".into(),
+                block_number: 5,
+                block_hash: format!("0x{:064x}", 5),
+                tx_hash: "0x1".into(),
+                log_index: 0,
+            }],
+        });
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(nest.factory.is_some(), "fixture must be a factory nest");
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
+        assert!(
+            result.is_ok(),
+            "seal-direct factory with calls must succeed: {result:?}"
+        );
+        let calls = seen.lock().unwrap().clone();
+        assert!(
+            !calls.is_empty(),
+            "backfill_direct_factory must have issued at least one eth_call, got none - #745 is \
+             that this path can be deleted and the suite stays green"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
     /// Counts hash-fetch round trips the tier-3 `[[calls]]` resolution makes: `block_hash` (the
     /// unbatched, single-block call #720 found) versus `block_headers` (the batched call it should
     /// use instead, since the same blocks' timestamps already came from a batched fetch a few lines

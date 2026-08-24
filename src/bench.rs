@@ -140,6 +140,12 @@ pub struct BenchReport {
     /// `calls_resolved: 0` measured a strawman, the same failure #224 found in this file for the
     /// hot-store path three weeks earlier.
     pub calls_resolved: u64,
+    /// Event names the nest declared (`[[contracts]].events` / `[[templates]].events`). Empty
+    /// means every event in the ABI - the default, and the 12,933 nest. A `Transfer`-only nest
+    /// is `["Transfer"]`, the 11,758 nest. Always present so those two cannot produce identical
+    /// artefacts (#751).
+    #[serde(default)]
+    pub events_declared: Vec<String>,
     pub commit: Option<String>,
     /// The RPC endpoint's host, never the full URL - an API key in a committed benchmark report is a
     /// credential leak, and these get pasted into issues.
@@ -176,6 +182,26 @@ pub struct BenchReport {
 ///
 /// Providers put API keys in the path (`/v2/<key>`) as often as in a header, so the path goes too -
 /// host and scheme identify the provider, which is all a report needs.
+/// Declared event names across contracts and templates, sorted and uniqued. Empty is "every
+/// event in the ABI", not "none were recorded" - a missing field on an old artefact is that
+/// second meaning, and `#[serde(default)]` is how those still load.
+fn events_declared_of(config: &crate::config::Config) -> Vec<String> {
+    let mut v: Vec<String> = config
+        .contracts
+        .iter()
+        .flat_map(|c| c.events.iter().cloned())
+        .chain(
+            config
+                .templates
+                .iter()
+                .flat_map(|t| t.events.iter().cloned()),
+        )
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 fn provider_of(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let host = rest.split('/').next()?;
@@ -502,6 +528,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         children: median_u64(runs.iter().map(|r| r.children)),
         calls_declared: config.calls.len(),
         calls_resolved: median_u64(runs.iter().map(|r| r.calls_resolved)),
+        events_declared: events_declared_of(&config),
         commit: git_commit(),
         provider: report_provider(&tape_mode, &rpc_urls),
         fixture_content_address: runs.first().and_then(|r| r.fixture_content_address.clone()),
@@ -1452,6 +1479,28 @@ mod tests {
             .unwrap()
             .contains("SECRETKEY123"));
         assert_eq!(provider_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn a_transfer_only_nest_and_an_all_events_nest_are_not_the_same_artefact() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let all = crate::config::Config::load(dir.path()).unwrap();
+        let mut transfer_only = crate::config::Config::load(dir.path()).unwrap();
+        transfer_only.contracts[0].events = vec!["Transfer".into()];
+        let a = events_declared_of(&all);
+        let b = events_declared_of(&transfer_only);
+        assert!(
+            a.is_empty(),
+            "an undeclared nest is the all-events nest, got {a:?}"
+        );
+        assert_eq!(b, vec!["Transfer".to_string()]);
+        let sa = serde_json::to_string(&a).unwrap();
+        let sb = serde_json::to_string(&b).unwrap();
+        assert_ne!(
+            sa, sb,
+            "the two event sets must not serialize identically - that is the 11,758 vs 12,933 day"
+        );
     }
 
     #[test]

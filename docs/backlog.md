@@ -19,8 +19,9 @@ one better written than the entry it came from. A second list is a list that dri
 ## Reading the queue
 
 Labels carry the meaning that this file's "tracks" used to. Every open issue carries **exactly one of
-a priority or `parked`** - that is the invariant this queue is kept to, and a bare issue with neither
-is a bug in the backlog rather than a style choice.
+a priority, `parked`, or `frozen`** - that is the invariant this queue is kept to, and a bare issue
+with none of those is a bug in the backlog rather than a style choice. `frozen` may sit alongside
+`parked`. It must not sit alongside a `p*`.
 
 **How urgent is it?**
 
@@ -30,6 +31,7 @@ is a bug in the backlog rather than a style choice.
 | `p1` | Next: a real correctness or coverage gap, with no immediate exposure |
 | `p2` | Later: tidy-up, ergonomics, or a gap with a known workaround |
 | `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker.** Carries no priority, on purpose - re-raising it as one is how a settled decision gets relitigated |
+| `frozen` | **Feature freeze (rest of 2026): no new capability.** Do not start. Revisit in 2027. Not a close and not a repudiation. `docs/roadmap-2027.md` is the decision |
 
 **What kind of thing is it?** More than one may apply.
 
@@ -54,9 +56,9 @@ is a bug in the backlog rather than a style choice.
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
 are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
-closed one it means nothing but provenance.** Current in-flight label: `unhurried-urial`
-([sprint doc](sprint-unhurried-urial.md)). `quizzical-quail` landed as #805. `steady-starling`
-(#808) and `tenacious-thrush` (#809) are still open.
+closed one it means nothing but provenance.** Current in-flight label: `tenacious-thrush`
+([sprint doc](sprint-tenacious-thrush.md)). `unhurried-urial` landed as #811.
+`steady-starling` landed as #808. `quizzical-quail` landed as #805. `rigorous-raven` landed as #806.
 
 The queries that matter:
 
@@ -65,11 +67,13 @@ gh issue list --limit 100 --json number,title,labels          # everything open
 gh issue list --label p0                                      # drop what you are doing
 gh issue list --label p1                                      # the real queue
 gh issue list --label parked                                  # deliberately not now
+gh issue list --label frozen                                  # not until 2027
 gh issue list --label verification                            # claims owing a measurement
 ```
 
-Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label, and
-`grep -v parked` used to be the recommendation here only because priorities did not exist yet.
+Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label and
+does not carry `frozen`. `grep -v parked` used to be the recommendation here only because priorities
+did not exist yet.
 
 ## Standing decisions - do not re-raise these as blockers
 
