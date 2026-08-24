@@ -1,6 +1,6 @@
 # RFC-0018: What a nest is - first-class authored logic (SQL views) and composable, parameterized nests (Starlark)
 
-- Status: **§1 Implemented · §2 (Starlark) retired · §3 deferred** (updated 2026-07-21)
+- Status: **§1 Implemented · §2 (Starlark) retired · §3 promoted to RFC-0041** (updated 2026-08-24)
 - Author: Pete (cargopete)
 - Date: 2026-07-19
 - Update (2026-07-21): **§2 (Starlark composition) is retired as an authoring path, and the two-nest
@@ -323,6 +323,14 @@ once at load and is dropped; it adds a dependency (`starlark-rust`) and a modest
 weighed in §4's gate. No runtime, hot-path, or per-block cost.
 
 ## §3 - Deferred: hot incremental author-views (named, not built)
+
+> **Amendment (2026-08-24): promoted to RFC-0041.** GraphOps product feedback supplied the real
+> workload gate this section required: a predefined view that is recreated on every request gives a
+> nest a reusable name but no query-performance advantage. RFC-0041 turns the sketch below into
+> **authored incremental entities**: an explicit keyed subset in `entities/`, compiled to DBSP,
+> bounded under the per-cursor memory budget, checked continuously against DuckDB, and composed with
+> RFC-0033 grafting. Ordinary `views/*.sql` remain query-time SQL. The proposal is design-only under
+> the 2026 feature freeze.
 
 `views.rs` maintains one *hardcoded* incremental view - per-address balances as a DBSP circuit,
 reorg-safe (a reorg is the same transfer re-fed at weight −1). Letting an **authored** view be
