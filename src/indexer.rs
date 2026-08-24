@@ -2119,7 +2119,15 @@ async fn build_nest(
         factory: factory.clone(),
         children: ChildRegistry::new(),
         finality,
-        metrics: METRICS.nest(&config.nest.name),
+        metrics: {
+            let m = METRICS.nest(&config.nest.name);
+            m.set_storage_paths(
+                dir.join(crate::config::DB_FILE),
+                crate::seal::shared_store(&dir)
+                    .unwrap_or_else(|| dir.join(crate::seal::SEGMENTS_DIR)),
+            );
+            m
+        },
         addresses,
         topic0s,
         start_block,
@@ -3709,9 +3717,18 @@ impl NestIngest {
                 }
                 // Persist the sealed watermark after every segment, so the backfill is resumable rather
                 // than all-or-nothing (deadlock-review finding C1).
-                let on_seal = |sealed_to: u64| {
-                    self.store
-                        .set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())
+                self.metrics
+                    .begin_seal_direct(resume_from, finalized_through);
+                let store = self.store.clone();
+                let metrics = self.metrics.clone();
+                let on_seal = {
+                    let metrics = metrics.clone();
+                    let store = store.clone();
+                    move |sealed_to: u64| {
+                        metrics.set_seal_direct_completed(sealed_to);
+                        metrics.mark_poll_ok();
+                        store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())
+                    }
                 };
                 // Live feedback for the multi-minute bulk seal (RFC-0015 slice 3).
                 let mut prog = crate::progress::Backfill::new(
@@ -3748,7 +3765,10 @@ impl NestIngest {
                         window,
                         fs.force_topic0(),
                         on_seal,
-                        |blk, n| prog.tick(blk, n),
+                        |blk, n| {
+                            metrics.set_seal_direct_completed(blk);
+                            prog.tick(blk, n);
+                        },
                     )
                     .await?
                 } else {
@@ -3769,12 +3789,16 @@ impl NestIngest {
                         window,
                         concurrency,
                         on_seal,
-                        |blk, n| prog.tick(blk, n),
+                        |blk, n| {
+                            metrics.set_seal_direct_completed(blk);
+                            prog.tick(blk, n);
+                        },
                     )
                     .await?
                 };
                 let _ = sealed;
                 prog.finish(finalized_through, false);
+                self.metrics.end_seal_direct();
                 self.store
                     .set_meta(SEALED_THROUGH_KEY, &finalized_through.to_string())?;
                 self.store

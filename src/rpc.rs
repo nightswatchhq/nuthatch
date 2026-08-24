@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How many times a whole `block_timestamps` batch is retried before it's returned as an error rather
 /// than silently yielding an all-zeros timestamp map into the sealed path.
@@ -651,12 +651,25 @@ impl RpcClient {
             crate::metrics::METRICS.inc_rpc();
             crate::metrics::METRICS.inc_rpc_method(method);
             attempts += 1;
+            let t0 = Instant::now();
             match self.call_one(url, method, &params).await {
                 Ok(v) => {
+                    crate::metrics::METRICS.observe_rpc(
+                        &crate::metrics::endpoint_label(url),
+                        t0.elapsed(),
+                        false,
+                        attempts > 1,
+                    );
                     self.mark_healthy(j);
                     return Ok(v);
                 }
                 Err(e) => {
+                    crate::metrics::METRICS.observe_rpc(
+                        &crate::metrics::endpoint_label(url),
+                        t0.elapsed(),
+                        true,
+                        attempts > 1,
+                    );
                     if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
@@ -702,12 +715,25 @@ impl RpcClient {
                 _ => {}
             }
             attempts += 1;
+            let t0 = Instant::now();
             match self.post_one(url, body).await {
                 Ok(v) => {
+                    crate::metrics::METRICS.observe_rpc(
+                        &crate::metrics::endpoint_label(url),
+                        t0.elapsed(),
+                        false,
+                        attempts > 1,
+                    );
                     self.mark_healthy(j);
                     return Ok(v);
                 }
                 Err(e) => {
+                    crate::metrics::METRICS.observe_rpc(
+                        &crate::metrics::endpoint_label(url),
+                        t0.elapsed(),
+                        true,
+                        attempts > 1,
+                    );
                     if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }

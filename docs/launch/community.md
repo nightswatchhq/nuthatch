@@ -83,10 +83,11 @@ loop.
   question - some form of "is anyone actually running this" - is answered with one operator
   conversation. Three ports in, it is answered with three names and three working repos. Same post,
   different reception, and the delay costs nothing that cannot be recovered.
-- **It hardens the honest-limits list empirically.** "Events only, no `eth_call`, no IPFS" is currently
-  reasoned from first principles. The DOUDOCHAIN_V2 port already converted part of it into fact
-  (IPFS-derived entities deliberately not claimed as parity). Two more do the same for the rest, and
-  that is better copy as well as better engineering.
+- **It hardens the honest-limits list empirically.** "Events only, no `eth_call`, no IPFS" was the
+  2.5.0 limit and is no longer true: RFC-0023 tier 3 and RFC-0037 shipped in 2.6.0, and RFC-0038
+  §6b/§6c measured them against the live network (343 Uniswap V3 swaps, 219 pools). The remaining
+  honest limits are traces (node-gated) and time-travel. Ports still convert a reasoned limit into a
+  measured one.
 - **RFC-0007 already sequences it this way.** Home turf is Phase 1 and Show HN is Phase 2. This is a
   sharper Phase 1, not a departure from the plan.
 
