@@ -212,20 +212,16 @@ case.
   **workload**. Those 8 nests were small and at tip; a *single* nest doing a 125M-block backfill on
   the same budget reached 427 MB by itself. Per-nest RSS is dominated by what a nest is *doing*, not
   by how many share a cursor - so read this as "co-tenancy is cheap", never as "a cursor uses 84 MB".
-- [ ] 🟡 Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
+- [ ] ✅ Large-ABI / high-event-rate contract at tip (memory doesn't grow unbounded with hot-store  **[#286]**
   churn).
-  **Half-proven, and #286 being briefly closed was not evidence that it was.** It was closed as
-  completed on 2026-08-10 with no commit referencing it and no comment recording a measurement (a
-  second commit-backed close, PR #391, landed the same day but under a different title and was never
-  cross-referenced against this issue's own thread); reopened 2026-08-19 on those grounds.
-  **The high-event-rate half is now measured, and measured hard**: the `per-cursor RAM budget (dense
-  multi-nest)` CI job (§3/#284) runs the **real 10-event Uniswap V4 `PoolManager` ABI** from
-  `nightswatchhq/uniswap-v4-ethereum` at 200 logs/block - above the 18.7 events/block sampled live
-  against mainnet - across 20 co-located nests, peak 111-243 MB against the 2048 MB budget, mutation-
-  checked. **The ABI-breadth half is not.** Ten events on one contract is high rate on a narrow decode
-  surface, not a large ABI: `graph-staking-nest`'s staking ABI runs 28 events, `SubgraphService` 31 -
-  more decoders, more per-(alias, event) tables, more keyspaces, a different pressure on the hot store
-  than more rows through the same ten tables. This issue's title asks for both; the CI job answers one.
+  **The high-event-rate half** is the `per-cursor RAM budget (dense multi-nest)` job: twenty nests,
+  real 10-event Uniswap V4 `PoolManager` ABI, 200 logs/block, at tip, 2048 MB budget plus a
+  regression ceiling. **The ABI-breadth half** is `wideabi-footprint.sh` in the same job: **one
+  nest, 31 event types** (the SubgraphService figure named on the issue), 31 logs/block so every
+  table is non-empty, at tip after a backfill, same 2048 MB budget. Floor on every table and on
+  row count, so "under 2 GB" cannot pass when the workload indexed nothing. Hermetic; a fork can
+  satisfy it. A regression ceiling for the breadth scenario waits on a runner noise band of its
+  own - do not copy the density job's 180 MB.
 - [ ] ✅ Long-running soak (23h) with no RSS creep (leak check).
   **Two nests on the Lodestar prod box, 0.7.2, 2026-07-29 → 30.** Final RSS **459 MB** and **427 MB**
   against the 2048 MB per-cursor budget - 22% and 21% - and **flat across repeated samples** at the
@@ -431,8 +427,7 @@ whole cluster including the live-credential probe against production (§4, #292/
 the decode path** is a required check this file never named (§6, #290); and the **multi-machine run**
 this file spent §11 calling unproven for months finally happened, on 2.4.0 (§11, #281/#597).
 
-What is still genuinely open, not time-based: **ABI breadth** at the ≤2 GB budget is half-proven -
-event rate is measured hard, a large decode surface is not (§5, #286); the **published backfill
+What is still genuinely open, not time-based: the **published backfill
 number** is worse than stale, it cites a commit that no longer exists (§3, #285); the **DuckDB
 file-access defence** is still one layer deep by design of the bundled build, not two (§4, #289); and
 the **AI/MCP keyed evals** remain pending a keyed run (§9, #815). Two issues this walk found
