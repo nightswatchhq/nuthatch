@@ -243,6 +243,7 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // `[[calls]]` key ships undocumented, the same hole #713 is for `allowlist.rs`.
     ("src/calls.rs", Some(&["CallDecl"])),
     ("src/ipfs.rs", Some(&["IpfsDecl"])),
+    ("src/entities.rs", Some(&["EntityFile", "EntityDecl"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -268,6 +269,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "HTTP request bodies for the control plane",
     ),
     ("src/serve.rs", "HTTP request bodies for the query API"),
+    (
+        "src/authored_entity_spike.rs",
+        "RFC-0041 sealed measurement tapes and DBSP fixture data, not nest config",
+    ),
 ];
 
 /// Keys that are deliberately absent from the reference, each with the reason it is absent.

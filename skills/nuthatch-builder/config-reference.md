@@ -1,9 +1,9 @@
 # nuthatch config reference
 
-The four config files a nest or a multi-nest runtime uses. Keys mirror the serde structs in
+The configuration surfaces a nest or a multi-nest runtime uses. Keys mirror the serde structs in
 `src/config.rs`, `src/semantic.rs`, `src/runtime.rs` (mount config moved there when RFC-0032
 retired the roost), `src/allowlist.rs` (the query ceiling, RFC-0034 phase 2), `src/calls.rs`
-(`[[calls]]`), and `src/ipfs.rs` (`[[ipfs]]`). CI checks this
+(`[[calls]]`), `src/ipfs.rs` (`[[ipfs]]`), and `src/entities.rs` (`[[entities]]`). CI checks this
 **both ways**: the build fails if this file names a key those structs don't have, and equally if a
 struct grows a key this file never mentions — a shipped key an agent cannot see is one it will never
 use.
@@ -110,6 +110,26 @@ top_level_calls = true        # decode transactions sent directly to this nest's
                               # needed. `traces` (internal calls) and `state` still are, and are
                               # refused at startup until one exists.
 ```
+
+## `entities.toml` - authored incremental relations (RFC-0041)
+
+An entity is a maintained keyed relation. Its declaration is authored input, included in the nest
+identity, and its SQL lives beside it under `entities/`. The declaration is deliberately separate
+from an ordinary view: it names the point-read key and the maximum live input admitted to the
+incremental runtime.
+
+```toml
+[[entities]]
+name = "delegated_balance"          # stable entity name, and the SQL file stem
+sql = "entities/delegated_balance.sql" # exactly one file under entities/
+key = ["indexer", "delegator"]     # one or more output columns, in point-read order
+max_rows = 1000                      # refuse a live input batch larger than this
+```
+
+`name` must match the SQL filename, `key` must name output columns, and `max_rows` must be greater
+than zero. An empty manifest is refused rather than quietly meaning that the runtime has no work to
+do. This is the authored declaration surface only: lifecycle, maintained-state storage, and serving
+arrive with the remaining RFC-0041 work.
 
 ## `semantic.toml` - what the data *means* (RFC-0016)
 
