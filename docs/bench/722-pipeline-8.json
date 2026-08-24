@@ -18,7 +18,7 @@
   "rpc_requests": 24,
   "factory": false,
   "children": 0,
-  "commit": "6145386",
+  "commit": "4aba9b5",
   "provider": "eth-pokt.nodies.app",
   "hardware": "32 cores, 62 GB RAM"
 }

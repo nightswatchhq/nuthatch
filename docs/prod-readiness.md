@@ -163,13 +163,11 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   crates.io package. Worth revisiting if that ever changes.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
-- [ ] 🟡 **DuckDB `allowed_directories` is not enforced on the build we bundle** (measured 2026-07-27).  **[#289]**
-  `reject_file_access` is the only control stopping a file read, so the file-access defence is one layer
-  deep, not two. A tripwire test fails if a future bump makes the layer real. *Re-check on every duckdb
-  bump. Still true today (`duckdb`/`libduckdb-sys` unchanged at `1.10504.0`; the tripwire test still
-  asserts `reject_file_access` is the sole control). The issue itself closed 2026-08-11 with nothing
-  behind it - no commit, no PR, its one comment is an unrelated sprint-allocation note - the same
-  pattern #286 was caught in. The row is accurate regardless; the `[#289]` citation is not.*
+- [ ] ✅ **DuckDB `allowed_directories` is enforced** when `enable_external_access=false` is set at
+  connection open (**[#289]**, quizzical-quail). Measured against `libduckdb-sys` 1.10504.0: the
+  list is a restriction only with that startup flag, which we now pass. `reject_file_access` remains
+  the primary control. The tripwire now asserts the second layer *does* refuse an out-of-allowlist
+  `read_text`.
 - [ ] ✅ `/sql` surface is structurally read-only (single-writer + read-only attach).
 - [ ] ✅ A security review pass on the **serving surface** (`serve.rs`, `mcp.rs`, `webhooks.rs`,
   `analytics.rs`, `abi.rs`, `rpc.rs`) - *done (0.5.x hardening): no criticals; SQL read-only gate holds

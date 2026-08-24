@@ -16,7 +16,7 @@
   "events_per_sec": 3821.79,
   "peak_rss_mb": 310,
   "rpc_requests": 321,
-  "commit": "707e1af",
+  "commit": "8e94f6c",
   "provider": "eth-mainnet.g.alchemy.com",
   "hardware": "11 cores, 18 GB RAM"
 }

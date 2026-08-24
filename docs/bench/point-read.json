@@ -15,7 +15,7 @@
   "sql_p50_ms": 144.25,
   "sql_p99_ms": 149.54,
   "sql_peak_rss_mb": 107,
-  "commit": "6de5647",
+  "commit": "03d296b",
   "provider": "local",
   "hardware": "4 cores, 16 GB RAM"
 }

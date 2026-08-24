@@ -433,13 +433,13 @@ SQL surfaces). Full key reference:
 |---|---|
 | `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
 
-**Runtime flags that matter operationally** (`dev` and `dev`):
+**Runtime flags that matter operationally** (`dev` and `bench backfill`):
 
 | Flag | Use |
 |---|---|
 | `--listen` | bind address. Defaults to `127.0.0.1:8288` |
 | `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
-| `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Much faster from deployment |
+| `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
 | `--window` | override the `eth_getLogs` block window. A *sparse* contract wants a large window (50k) to turn thousands of near-empty requests into a few. Keep under your provider's range cap |
 | `--backfill N` | index only the last N blocks (recent-history mode) |
