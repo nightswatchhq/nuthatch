@@ -1488,6 +1488,45 @@ mod tests {
         assert_eq!(j["block_timestamp"], json!(1_700_000_000u64));
     }
 
+    fn row_at(block: u64, log_index: u64) -> DecodedRow {
+        DecodedRow {
+            table: "t".into(),
+            params: vec![],
+            block_number: block,
+            block_hash: "0xbh".into(),
+            block_timestamp: 0,
+            timestamps: false,
+            log_index,
+            tx_hash: "0xtx".into(),
+            address: "0xa".into(),
+        }
+    }
+
+    /// COR-10: `_seq` is `block << 20 | log_index`. A log_index that fills the 20-bit field must
+    /// still sort immediately before the next block's index 0, or the packing is not an order.
+    #[test]
+    fn seq_packs_block_and_log_index_in_the_20_bit_field() {
+        assert_eq!(row_at(7, 0).seq(), 7u64 << 20);
+        assert_eq!(
+            row_at(7, (1 << 20) - 1).seq(),
+            (7u64 << 20) | ((1 << 20) - 1)
+        );
+        assert_eq!(
+            row_at(8, 0).seq(),
+            row_at(7, (1 << 20) - 1).seq() + 1,
+            "a full 20-bit log_index in block N must not collide with block N+1"
+        );
+    }
+
+    /// COR-10: the 20-bit field is unreachable under current gas limits. If that changes, a debug
+    /// build must not silently mask. Deleting the `debug_assert` in `DecodedRow::seq` fails this.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "exceeds the 20-bit _seq field")]
+    fn a_log_index_past_the_20_bit_field_is_not_silent() {
+        let _ = row_at(1, 1 << 20).seq();
+    }
+
     #[test]
     fn registry_hash_is_stable_and_order_independent() {
         let a = DecodeRegistry::build(vec![

@@ -254,9 +254,12 @@ case.
 - [ ] ✅ MSRV is honest. - *Fixed at 1.0: `Cargo.toml` now declares `rust-version = "1.95"`, matching
   `rust-toolchain.toml`'s pinned `1.95.0`, so the declared floor is the one that is actually tested. The declared MSRV is not cosmetic: it silently selected DataFusion 48 over 54 during the
   RFC-0013 spike, and cargo reports that as a one-line warning nobody reads.*
-- [ ] 🟡 Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup, subscribe) with  **[#304]**
-  the RFC-0016 eval harness. - *S1 eval harness gates the semantic-layer work; wire it in.*
-- [ ] 🟡 `--offline` / no-network test path proving AI features degrade gracefully.  **[#304]**
+- [ ] ✅ Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup) through
+  `tools/call` against a fake nest. Streaming subscribe is not shipped (RFC-0010) and is not
+  advertised. The RFC-0016/0017 keyed evals are **[#815]**.
+- [ ] ✅ No-network test path proving AI features degrade gracefully. - *`initialize` / `tools/list`
+  answer with no nest (fail-open). `tools/call` against an unreachable nest returns `isError` and
+  names `nuthatch dev`. There is no `--offline` flag; the test is the path. [#304]*
 
 ## 7. Operability & observability
 
@@ -329,8 +332,8 @@ case.
 - [ ] ✅ MCP server compiled into the binary (`mcp.rs`), works offline against the local instance.
 - [ ] ✅ `init` scaffolds schema + views + handlers + tests from the ABI.
 - [ ] ✅ Ships `llms.txt` / docs-as-MCP / `.claude/skills/` in scaffolded projects.
-- [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#304]**
-  `explain`) - *in design, measure-first, not shipped.*
+- [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#815]**
+  `explain`) - *Tier-B keyed eval still pending. The layer itself is in the binary; the eval is not.*
 - [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *CLI-flags direction  **[#353]**
   ships (`cli_reference_names_every_real_flag`, PR #514) but that PR does not touch the gap #353 was
   narrowed to and closed against by mistake: `CONFIG_SOURCES` in `tests/skill_refs.rs` scans
@@ -432,7 +435,7 @@ What is still genuinely open, not time-based: **ABI breadth** at the ≤2 GB bud
 event rate is measured hard, a large decode surface is not (§5, #286); the **published backfill
 number** is worse than stale, it cites a commit that no longer exists (§3, #285); the **DuckDB
 file-access defence** is still one layer deep by design of the bundled build, not two (§4, #289); and
-the **AI/MCP eval harness and offline path** remain in design (§9, #304). Two issues this walk found
+the **AI/MCP keyed evals** remain pending a keyed run (§9, #815). Two issues this walk found
 closed against no evidence or the wrong PR - #289 and #353 - are reopened as of this pass; treat any
 "closed" state on this file's cited issues as a claim to verify, not a fact, which is the whole reason
 this rule exists.
