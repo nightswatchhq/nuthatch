@@ -21,3 +21,7 @@ Five of its six `block_timestamps` keys carry a **recorded 429** from the public
 deliberately. That is not a spoiled recording - it is what these endpoints actually do, it is how
 #784 was found, and it is what makes that bug reproducible without a network. A tape that recorded
 only the successes would have hidden it.
+
+**`usdc-120-fixed-clean`** - the same nest, range and window, recorded against an endpoint whose
+timestamp batches all succeed. Both storage-path arms replay this one. `tests/tape_clean.rs` fails
+if a recorded error appears in it. Do not "fix" `usdc-120-fixed` by copying this over it.

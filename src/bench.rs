@@ -182,6 +182,18 @@ fn provider_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// A replayed report names the host the tape was recorded against, not the nest's configured
+/// pool. The nest still has `rpc_urls` on disk; `--replay` never dials them.
+fn report_provider(tape: &TapeMode<'_>, rpc_urls: &[String]) -> Option<String> {
+    match tape {
+        TapeMode::Replay(path) => crate::tape::ReplaySource::open(path)
+            .ok()
+            .and_then(|s| s.provider())
+            .or_else(|| rpc_urls.first().and_then(|u| provider_of(u))),
+        _ => rpc_urls.first().and_then(|u| provider_of(u)),
+    }
+}
+
 /// The `[[calls]]` archive endpoint mention, routed through `provider_of` for the same reason as
 /// every other endpoint mention (see `provider_of` above) - `--state-rpc` is exactly the kind of
 /// URL that carries an API key in the path.
@@ -491,7 +503,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         calls_declared: config.calls.len(),
         calls_resolved: median_u64(runs.iter().map(|r| r.calls_resolved)),
         commit: git_commit(),
-        provider: rpc_urls.first().and_then(|u| provider_of(u)),
+        provider: report_provider(&tape_mode, &rpc_urls),
         fixture_content_address: runs.first().and_then(|r| r.fixture_content_address.clone()),
         replayed: matches!(tape_mode, TapeMode::Replay(_)),
         hardware: hardware_summary(),
@@ -1440,6 +1452,26 @@ mod tests {
             .unwrap()
             .contains("SECRETKEY123"));
         assert_eq!(provider_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn a_replayed_report_names_the_tape_host_not_the_nest_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("entries.jsonl"),
+            "{\"key\":\"tip\",\"outcomes\":[{\"outcome\":\"ok\",\"value\":1}]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{"provider":"recorded.example"}"#,
+        )
+        .unwrap();
+        let got = report_provider(
+            &TapeMode::Replay(dir.path()),
+            &["https://nest.example/v2/SECRET".to_string()],
+        );
+        assert_eq!(got.as_deref(), Some("recorded.example"));
     }
 
     /// #748: the `[[calls]]` summary line is the only place in this file an endpoint URL reached
