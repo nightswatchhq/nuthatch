@@ -30,7 +30,7 @@ with none of those is a bug in the backlog rather than a style choice. `frozen` 
 | `p0` | Do now: a gate that cannot fail, a live defect, or a **published claim that is false** |
 | `p1` | Next: a real correctness or coverage gap, with no immediate exposure |
 | `p2` | Later: tidy-up, ergonomics, or a gap with a known workaround |
-| `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker.** Carries no priority, on purpose - re-raising it as one is how a settled decision gets relitigated |
+| `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker please.** Carries no priority, on purpose - re-raising it as one is how a settled decision gets relitigated |
 | `frozen` | **Feature freeze (rest of 2026): no new capability.** Do not start. Revisit in 2027. Not a close and not a repudiation. `docs/roadmap-2027.md` is the decision |
 
 **What kind of thing is it?** More than one may apply.
@@ -56,9 +56,9 @@ with none of those is a bug in the backlog rather than a style choice. `frozen` 
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
 are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
-closed one it means nothing but provenance.** Current in-flight label: `tenacious-thrush`
-([sprint doc](sprint-tenacious-thrush.md)). `unhurried-urial` landed as #811.
-`steady-starling` landed as #808. `quizzical-quail` landed as #805. `rigorous-raven` landed as #806.
+closed one it means nothing but provenance.** Current in-flight label: `veracious-vireo`
+([sprint doc](sprint-veracious-vireo.md)). `tenacious-thrush` landed as #809.
+`unhurried-urial` landed as #811. `steady-starling` landed as #808. `quizzical-quail` landed as #805.
 
 The queries that matter:
 
