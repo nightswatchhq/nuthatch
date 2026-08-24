@@ -58,6 +58,11 @@ pub struct NestMetrics {
     /// Hot-store file and sealed-segment directory, for #812 footprint gauges. `None` until the
     /// nest is built.
     storage: Mutex<Option<(PathBuf, PathBuf)>>,
+    /// Disk usage is expensive to discover for a Parquet tree. Cache it between scrapes; the value
+    /// is a gauge with at most a minute of staleness, not a recursive walk per HTTP request (#826).
+    hot_bytes: AtomicU64,
+    sealed_bytes: AtomicU64,
+    storage_scanned_at: AtomicU64,
 }
 
 impl NestMetrics {
@@ -193,12 +198,27 @@ impl NestMetrics {
 
     pub fn set_storage_paths(&self, hot: PathBuf, sealed: PathBuf) {
         *self.storage.lock().unwrap() = Some((hot, sealed));
+        self.storage_scanned_at.store(0, Relaxed);
     }
     pub fn storage_bytes(&self) -> (u64, u64) {
-        match self.storage.lock().unwrap().as_ref() {
-            Some((hot, sealed)) => (path_bytes(hot), path_bytes(sealed)),
-            None => (0, 0),
+        const STORAGE_REFRESH_SECS: u64 = 60;
+        let now = now_unix();
+        let scanned = self.storage_scanned_at.load(Relaxed);
+        if now.saturating_sub(scanned) >= STORAGE_REFRESH_SECS
+            && self
+                .storage_scanned_at
+                .compare_exchange(scanned, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            if let Some((hot, sealed)) = self.storage.lock().unwrap().as_ref() {
+                self.hot_bytes.store(path_bytes(hot), Relaxed);
+                self.sealed_bytes.store(path_bytes(sealed), Relaxed);
+            }
         }
+        (
+            self.hot_bytes.load(Relaxed),
+            self.sealed_bytes.load(Relaxed),
+        )
     }
 }
 
@@ -294,6 +314,12 @@ impl Metrics {
         let h = Arc::new(NestMetrics::default());
         map.insert(name.to_string(), h.clone());
         h
+    }
+
+    /// Remove a departed nest's series and its storage paths. Its handle may live briefly in an
+    /// in-flight request, but it is no longer reachable from `/metrics` (#827).
+    pub fn remove_nest(&self, name: &str) {
+        self.per_nest.lock().unwrap().remove(name);
     }
 
     pub fn set_tip(&self, v: u64) {
@@ -454,8 +480,33 @@ impl Metrics {
 
     /// Render the registry as Prometheus text (`text/plain; version=0.0.4`).
     pub fn render(&self) -> String {
-        let tip = self.tip_height.load(Relaxed);
-        let last = self.last_block.load(Relaxed);
+        // Heights and watermarks have no meaningful cross-chain aggregate. In a runtime with more
+        // than one mounted nest, expose only the labelled series below rather than letting the last
+        // cursor to poll impersonate the whole process (#828).
+        let (solo, multi_nest) = {
+            let per = self.per_nest.lock().unwrap();
+            match per.len() {
+                0 => (None, false),
+                1 => (Some(per.values().next().unwrap().clone()), false),
+                _ => (None, true),
+            }
+        };
+        let tip = solo
+            .as_ref()
+            .map(|m| m.tip.load(Relaxed))
+            .unwrap_or_else(|| self.tip_height.load(Relaxed));
+        let last = solo
+            .as_ref()
+            .map(|m| m.last_block.load(Relaxed))
+            .unwrap_or_else(|| self.last_block.load(Relaxed));
+        let sealed_through = solo
+            .as_ref()
+            .map(|m| m.sealed_through.load(Relaxed))
+            .unwrap_or_else(|| self.sealed_through.load(Relaxed));
+        let last_poll_ok = solo
+            .as_ref()
+            .map(|m| m.last_poll_ok.load(Relaxed))
+            .unwrap_or_else(|| self.last_poll_ok.load(Relaxed));
         // Blocks behind the tip. 0 (not negative) once caught up.
         let lag = tip.saturating_sub(last);
         let rss = rss_bytes();
@@ -468,36 +519,40 @@ impl Metrics {
         };
 
         let mut s = String::with_capacity(2048);
-        s.push_str(&gauge(
-            "nuthatch_tip_height",
-            "Latest block height seen from the source.",
-            tip,
-        ));
-        s.push_str(&gauge(
-            "nuthatch_last_block",
-            "Highest block the indexer has committed.",
-            last,
-        ));
-        s.push_str(&gauge(
-            "nuthatch_tip_lag_blocks",
-            "Blocks the indexer is behind the source tip.",
-            lag,
-        ));
-        s.push_str(&gauge(
-            "nuthatch_sealed_through",
-            "Highest block sealed to the immutable cold layer.",
-            self.sealed_through.load(Relaxed),
-        ));
+        if !multi_nest {
+            s.push_str(&gauge(
+                "nuthatch_tip_height",
+                "Latest block height seen from the source (solo runtime only; use nuthatch_nest_tip_height in a multi-nest runtime).",
+                tip,
+            ));
+            s.push_str(&gauge(
+                "nuthatch_last_block",
+                "Highest block the indexer has committed (solo runtime only; use nuthatch_nest_last_block in a multi-nest runtime).",
+                last,
+            ));
+            s.push_str(&gauge(
+                "nuthatch_tip_lag_blocks",
+                "Blocks the indexer is behind the source tip (solo runtime only; use nuthatch_nest_tip_lag_blocks in a multi-nest runtime).",
+                lag,
+            ));
+            s.push_str(&gauge(
+                "nuthatch_sealed_through",
+                "Highest block sealed to the immutable cold layer (solo runtime only).",
+                sealed_through,
+            ));
+        }
         s.push_str(&gauge(
             "nuthatch_rss_bytes",
             "Resident set size of this process, in bytes.",
             rss,
         ));
-        s.push_str(&gauge(
-            "nuthatch_last_poll_unixtime",
-            "Unix time of the last successful source poll (0 = never). Staleness ⇒ RPC stalled.",
-            self.last_poll_ok.load(Relaxed),
-        ));
+        if !multi_nest {
+            s.push_str(&gauge(
+                "nuthatch_last_poll_unixtime",
+                "Unix time of the last successful source poll (0 = never; solo runtime only).",
+                last_poll_ok,
+            ));
+        }
         s.push_str(&gauge(
             "nuthatch_alert_outbox_depth",
             "Pending alert-webhook deliveries in the durable outbox.",
@@ -653,10 +708,26 @@ impl Metrics {
                     }
                 };
             labelled(
+                "nuthatch_nest_tip_height",
+                "Latest source block height, per nest and therefore per chain.",
+                "gauge",
+                &|m| m.tip.load(Relaxed),
+            );
+            labelled(
                 "nuthatch_nest_last_block",
                 "Highest block committed, per nest.",
                 "gauge",
                 &|m| m.last_block.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_tip_lag_blocks",
+                "Blocks behind the source tip, per nest and therefore per chain.",
+                "gauge",
+                &|m| {
+                    m.tip
+                        .load(Relaxed)
+                        .saturating_sub(m.last_block.load(Relaxed))
+                },
             );
             labelled(
                 "nuthatch_nest_sealed_through",
@@ -837,9 +908,76 @@ mod tests {
     }
 
     #[test]
+    fn multi_nest_render_omits_unlabelled_chain_heights() {
+        let m = Metrics::new();
+        let eth = m.nest("eth");
+        let arb = m.nest("arb");
+        eth.set_tip(25_632_906);
+        eth.set_last_block(25_632_840);
+        arb.set_tip(488_677_305);
+        arb.set_last_block(488_677_300);
+        let out = m.render();
+        assert!(out.contains("nuthatch_nest_tip_height{nest=\"eth\"} 25632906"));
+        assert!(out.contains("nuthatch_nest_tip_height{nest=\"arb\"} 488677305"));
+        assert!(
+            !out.contains("\nnuthatch_tip_height "),
+            "a last-writer-wins process-wide chain height is nonsense in a multichain runtime"
+        );
+        assert!(!out.contains("\nnuthatch_tip_lag_blocks "));
+
+        m.remove_nest("arb");
+        let solo = m.render();
+        assert!(solo.contains("nuthatch_tip_height 25632906"));
+        assert!(solo.contains("nuthatch_last_block 25632840"));
+    }
+
+    #[test]
+    fn removing_a_nest_removes_its_series_and_storage_from_scrapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot.redb");
+        let sealed = dir.path().join("segments");
+        std::fs::write(&hot, vec![0u8; 11]).unwrap();
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("one.parquet"), vec![0u8; 13]).unwrap();
+
+        let m = Metrics::new();
+        let nest = m.nest("departed");
+        nest.set_storage_paths(hot, sealed);
+        nest.set_last_block(7);
+        assert!(m.render().contains("nest=\"departed\""));
+        m.remove_nest("departed");
+        let out = m.render();
+        assert!(!out.contains("nest=\"departed\""));
+        assert!(out.contains("nuthatch_hot_store_bytes 0"));
+        assert!(out.contains("nuthatch_sealed_segments_bytes 0"));
+    }
+
+    #[test]
+    fn storage_size_is_cached_between_scrapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot.redb");
+        let sealed = dir.path().join("segments");
+        std::fs::write(&hot, vec![0u8; 11]).unwrap();
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("one.parquet"), vec![0u8; 13]).unwrap();
+        let nest = NestMetrics::default();
+        nest.set_storage_paths(hot.clone(), sealed.clone());
+        assert_eq!(nest.storage_bytes(), (11, 13));
+        std::fs::write(&hot, vec![0u8; 99]).unwrap();
+        std::fs::write(sealed.join("two.parquet"), vec![0u8; 77]).unwrap();
+        assert_eq!(
+            nest.storage_bytes(),
+            (11, 13),
+            "a second scrape uses the bounded-refresh value rather than walking the tree again"
+        );
+    }
+
+    #[test]
     fn no_nests_means_no_per_nest_block() {
         // A fresh registry with no nests registered renders only the aggregates - no labelled series.
-        assert!(!Metrics::new().render().contains("nuthatch_nest_last_block"));
+        assert!(!Metrics::new()
+            .render()
+            .contains("\nnuthatch_nest_last_block{"));
     }
 
     #[test]
