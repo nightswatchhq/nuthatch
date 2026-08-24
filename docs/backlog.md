@@ -57,8 +57,8 @@ with none of those is a bug in the backlog rather than a style choice. `frozen` 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
 are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
 closed one it means nothing but provenance.** Current in-flight label: `tenacious-thrush`
-([sprint doc](sprint-tenacious-thrush.md)). `steady-starling` landed as #808.
-`quizzical-quail` landed as #805. `rigorous-raven` landed as #806.
+([sprint doc](sprint-tenacious-thrush.md)). `unhurried-urial` landed as #811.
+`steady-starling` landed as #808. `quizzical-quail` landed as #805. `rigorous-raven` landed as #806.
 
 The queries that matter:
 

@@ -196,6 +196,21 @@ fn truncate(s: &str) -> String {
     }
 }
 
+/// #676: RFC-0015's status used to say slices 2-6 were in progress six releases after they
+/// shipped. The acceptance bar is the two-minute first query, not the slice list; the status
+/// line tracking slices hid that the bar was unmet (#672). This fails if the status line goes
+/// back to talking about work in progress.
+#[test]
+fn rfc_0015_status_line_does_not_say_in_progress() {
+    let doc =
+        std::fs::read_to_string(rfc_dir().join("0015-the-delightful-core.md")).expect("RFC-0015");
+    let status = doc_status_line(&doc).expect("RFC-0015 has a Status line");
+    assert!(
+        !status.to_ascii_lowercase().contains("in progress"),
+        "RFC-0015 status still talks about slices in progress:\n{status}"
+    );
+}
+
 fn rfc_number(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     if path.extension()?.to_str()? != "md" || name == "README.md" {
