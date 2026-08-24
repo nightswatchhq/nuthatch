@@ -352,21 +352,25 @@ fn attempt(
     if !(head.starts_with("select") || head.starts_with("with")) {
         bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
     }
-    // Read-only is enforced three-deep - do NOT loosen any of these without re-reasoning SEC-7:
+    // Read-only is enforced four-deep - do NOT loosen any of these without re-reasoning SEC-7:
     //   1. this leading-keyword gate rejects a *statement* that opens with INSERT/UPDATE/DELETE/COPY/
-    //      ATTACH/PRAGMA/… (a `WITH cte AS (…) INSERT …` is the only way DML could ride a `with`
-    //      prefix, and DuckDB won't parse INSERT/COPY *inside* a CTE/subquery);
-    //   2. `reject_statement_stacking` refuses a `;`-stacked second statement. This used to say
+    //      ATTACH/PRAGMA/…;
+    //   2. `reject_with_prefixed_dml` refuses `WITH cte AS (…) INSERT/UPDATE/DELETE/COPY …`. The
+    //      leading gate accepts any `WITH`. The previous comment claimed DuckDB would not parse
+    //      DML after a CTE list; that is DuckDB's choice, not ours, and it is the same class of
+    //      claim as "`conn.prepare` is single-statement", which was false;
+    //   3. `reject_statement_stacking` refuses a `;`-stacked second statement. This used to say
     //      "`conn.prepare` is single-statement" - it is NOT (the bundled duckdb-rs prepares AND runs
     //      `SELECT 1; INSERT …`), which made a stacked `COPY … TO` an arbitrary file write. See that
     //      function's docs;
-    //   3. the connection is a fresh in-memory instance whose only tables are read-only views over
+    //   4. the connection is a fresh in-memory instance whose only tables are read-only views over
     //      Parquet plus an ephemeral hot temp table, so even a hypothetical write has no durable target.
-    // `COPY … TO` (a file write) must *lead* the statement, which (1) blocks.
+    // `COPY … TO` (a file write) must *lead* the statement or follow a CTE list, which (1) and (2) block.
     // SEC-2: refuse DuckDB filesystem/network table functions (`read_text`, `glob`, …) - they read
     // files from inside a plain SELECT, past the keyword gate, and would otherwise leak any file the
     // process can read (e.g. `nuthatch.toml`'s secrets). This is the primary control; the
     // `allowed_directories` lockdown below is defense-in-depth and, as of #289, actually enforced.
+    reject_with_prefixed_dml(sql)?;
     reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
     reject_replacement_scan(sql)?;
@@ -669,10 +673,153 @@ fn strip_all_sql_comments(sql: &str) -> String {
     out
 }
 
-/// Refuse a query that *calls* any [`FORBIDDEN_FNS`] function. Comments are stripped first, then each
-/// name is matched only when it's a real call: a word boundary before it and (after optional
-/// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
-/// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
+/// Refuse `WITH cte AS (…) INSERT/UPDATE/DELETE/COPY …` (SEC-7).
+///
+/// The leading-keyword gate accepts any statement that opens with `WITH`. A CTE list is only
+/// prefix; the actual statement follows the last `AS (subquery)`. That statement must be SELECT
+/// (or VALUES / TABLE, which DuckDB treats as a query). Anything else is DML or DDL riding a
+/// prefix the keyword gate already blessed.
+///
+/// String-literal and identifier aware, same as [`reject_statement_stacking`]: `WITH t AS
+/// (SELECT 'INSERT') SELECT 1` is a query, `WITH t AS (SELECT 1) INSERT INTO t SELECT 1` is not.
+/// Comments are stripped first. A CTE list we cannot parse is refused rather than handed to
+/// DuckDB - fail closed, the same direction as a `;` inside an unparsed `$$` block.
+fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
+    let cleaned = strip_all_sql_comments(sql);
+    let head = cleaned.trim_start();
+    if !sql_keyword_at(head, "with") {
+        return Ok(());
+    }
+    let Some(rest) = skip_ctes(head) else {
+        bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
+    };
+    let rest = rest.trim_start();
+    if sql_keyword_at(rest, "select")
+        || sql_keyword_at(rest, "values")
+        || sql_keyword_at(rest, "table")
+    {
+        return Ok(());
+    }
+    bail!(
+        "WITH-prefixed DML is not allowed on the read-only SQL surface \
+         (WITH … INSERT/UPDATE/DELETE/COPY)"
+    )
+}
+
+/// True when `s` opens with `kw` as a whole SQL word (case-insensitive, not `without` for `with`).
+fn sql_keyword_at(s: &str, kw: &str) -> bool {
+    let s = s.trim_start();
+    if s.len() < kw.len() {
+        return false;
+    }
+    if !s[..kw.len()].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    match s[kw.len()..].chars().next() {
+        None => true,
+        Some(c) => !sql_ident_cont(c),
+    }
+}
+
+fn sql_ident_cont(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Consume `WITH [RECURSIVE] name AS [(…)] [, name AS (…)]*` and return the remainder.
+fn skip_ctes(sql: &str) -> Option<&str> {
+    let s = strip_sql_keyword(sql, "with")?;
+    let s = strip_sql_keyword(s, "recursive").unwrap_or(s);
+    let mut s = s;
+    loop {
+        let (_, rest) = next_sql_ident(s)?;
+        s = rest.trim_start();
+        if s.starts_with('(') {
+            s = skip_balanced_parens(s)?.trim_start();
+        }
+        s = strip_sql_keyword(s, "as")?.trim_start();
+        if let Some(rest) = strip_sql_keyword(s, "not") {
+            s = strip_sql_keyword(rest.trim_start(), "materialized")?.trim_start();
+        } else if let Some(rest) = strip_sql_keyword(s, "materialized") {
+            s = rest.trim_start();
+        }
+        if !s.starts_with('(') {
+            return None;
+        }
+        s = skip_balanced_parens(s)?.trim_start();
+        if s.starts_with(',') {
+            s = s[1..].trim_start();
+            continue;
+        }
+        return Some(s);
+    }
+}
+
+fn strip_sql_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let s = s.trim_start();
+    if !sql_keyword_at(s, kw) {
+        return None;
+    }
+    Some(&s[kw.len()..])
+}
+
+/// Next SQL identifier: a quoted `"name"` (with `""` escapes) or a bare `[A-Za-z0-9_]+`.
+fn next_sql_ident(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let b = s.as_bytes();
+    if b.first() == Some(&b'"') {
+        let mut i = 1;
+        while i < b.len() {
+            if b[i] == b'"' {
+                if i + 1 < b.len() && b[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                return Some((&s[..=i], &s[i + 1..]));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let end = s.find(|c: char| !sql_ident_cont(c)).unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&s[..end], &s[end..]))
+}
+
+/// `s` starts with `(`. Return the suffix after the matching `)`, string-aware.
+fn skip_balanced_parens(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'(') {
+        return None;
+    }
+    let mut i = 0;
+    let mut depth = 0;
+    let (mut in_single, mut in_double) = (false, false);
+    while i < b.len() {
+        match b[i] {
+            b'\'' if !in_double => {
+                if in_single && i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            b'"' if !in_single => in_double = !in_double,
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Refuse a `;`-stacked second statement (SEC-7, and a **real** hole found by the audit-tail test work).
 ///
 /// The read-only story used to rest on three layers, and the second one did not exist:
@@ -935,6 +1082,10 @@ fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
     }
 }
 
+/// Refuse a query that *calls* any [`FORBIDDEN_FNS`] function. Comments are stripped first, then each
+/// name is matched only when it's a real call: a word boundary before it and (after optional
+/// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
+/// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
 fn reject_file_access(sql: &str) -> Result<()> {
     // **Double quotes are removed before scanning.** DuckDB accepts a quoted function name and calls
     // it exactly as the bare form, so `"read_csv"('/etc/passwd')` executed while sailing past a check
@@ -3242,6 +3393,72 @@ template="pool"
                 "stacked query accepted: {bad}"
             );
         }
+    }
+
+    /// SEC-7: a CTE list is only a prefix. The statement after it must still be a query.
+    ///
+    /// The leading-keyword gate accepts `WITH`, and the previous comment claimed DuckDB would not
+    /// parse INSERT after a CTE. That is the same class of claim as "`conn.prepare` is
+    /// single-statement". This guard is ours, on the public `query` path, so deleting the call
+    /// from `attempt` fails the last assertion rather than leaving a unit-tested function with
+    /// no caller.
+    #[test]
+    fn with_prefixed_dml_is_refused_on_the_public_query_path() {
+        for ok in [
+            "WITH t AS (SELECT 1 AS x) SELECT x FROM t",
+            "with t as (select 1 as x) select x from t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t",
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS x) SELECT * FROM a UNION ALL SELECT * FROM b",
+            r#"WITH "t" AS (SELECT 1 AS x) SELECT x FROM "t""#,
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
+            "WITH t AS NOT MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
+            // INSERT is data, not a statement, when it lives in a string inside the CTE.
+            "WITH t AS (SELECT 'INSERT' AS s) SELECT s FROM t",
+            "SELECT 1",
+        ] {
+            assert!(
+                reject_with_prefixed_dml(ok).is_ok(),
+                "legitimate query refused: {ok}"
+            );
+        }
+        for bad in [
+            "WITH t AS (SELECT 1 AS x) INSERT INTO t SELECT 1",
+            "with t as (select 1 as x) insert into t select 1",
+            "WITH t AS (SELECT 1 AS x) UPDATE t SET x = 2",
+            "WITH t AS (SELECT 1 AS x) DELETE FROM t",
+            "WITH t AS (SELECT 1 AS x) COPY t TO '/tmp/x.csv'",
+            "WITH t AS (SELECT 1 AS x) MERGE INTO t USING t ON true",
+            "WITH t AS (SELECT 1 AS x) CREATE TABLE x AS SELECT 1",
+            // Comments must not smuggle DML past the CTE list.
+            "WITH t AS (SELECT 1 AS x) /* hi */ INSERT INTO t SELECT 1",
+        ] {
+            let err = reject_with_prefixed_dml(bad)
+                .expect_err(&format!("must be refused: {bad}"))
+                .to_string();
+            assert!(err.contains("WITH-prefixed DML"), "{bad} -> {err}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = query(
+            dir.path(),
+            "WITH t AS (SELECT 1 AS x) INSERT INTO t SELECT 1",
+        )
+        .expect_err("WITH-prefixed INSERT must be refused on the public path")
+        .to_string();
+        assert!(
+            err.contains("WITH-prefixed DML"),
+            "the refusal must come from our gate, not DuckDB later: {err}"
+        );
+
+        let exfil = dir.path().join("exfil.csv");
+        let err = query(
+            dir.path(),
+            &format!("WITH t AS (SELECT 42 AS x) COPY t TO '{}'", exfil.display()),
+        )
+        .expect_err("WITH-prefixed COPY must be refused")
+        .to_string();
+        assert!(err.contains("WITH-prefixed DML"), "{err}");
+        assert!(!exfil.exists(), "a WITH-prefixed COPY wrote a file");
     }
 
     /// #289: the directory lockdown, configured the way `run` configures it, must refuse an
