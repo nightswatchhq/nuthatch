@@ -618,7 +618,7 @@ pub struct BackfillBenchArgs {
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
 
-    /// Keep the run's data at this path instead of a temp dir that is discarded.
+    /// Keep the run's data at this path instead of the cache dir that is discarded.
     ///
     /// The bench normally measures throughput and throws the rows away, which is right for a timing
     /// number and wrong for a benchmark whose criterion is a **row count** - OBIB case 3 asks for
@@ -966,9 +966,10 @@ pub struct DevArgs {
     #[arg(long)]
     pub backfill: Option<u64>,
 
-    /// Backfill finalized history straight to Parquet (skip the hot store) before tip-following -
-    /// much faster for a from-deployment backfill (RFC-0004). The near-tip window still uses the hot
-    /// path; the IVM view is rebuilt from the sealed segments.
+    /// Backfill finalized history straight to Parquet (skip the hot store) before tip-following.
+    /// Prerequisite for `--concurrency` pipelining, which is where the measured speedup is; the
+    /// storage path alone is not "faster" - see `docs/benchmarks.md`. The near-tip window still uses
+    /// the hot path; the IVM view is rebuilt from the sealed segments.
     #[arg(long)]
     pub seal_direct: bool,
 

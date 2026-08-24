@@ -151,6 +151,9 @@ pub struct BenchReport {
     pub provider: Option<String>,
     /// Enough hardware to make two reports comparable: cores and total RAM.
     pub hardware: Option<String>,
+    /// Where the throwaway redb/Parquet landed (#781). `"tmpfs"` means the storage comparison was
+    /// measured on RAM; a number that does not say this is not comparable to one that sat on disk.
+    pub work_backing: String,
     /// sha256 of the RFC-0039 tape this run recorded or replayed. `None` on a live run.
     ///
     /// This is what lets a published figure name the exact bytes it came from. `289 events/sec`
@@ -504,6 +507,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         fixture_content_address: runs.first().and_then(|r| r.fixture_content_address.clone()),
         replayed: matches!(tape_mode, TapeMode::Replay(_)),
         hardware: hardware_summary(),
+        work_backing: work_backing_of(keep.as_deref().unwrap_or(&default_bench_work(0))),
     };
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -903,7 +907,7 @@ async fn one_run(
     // run's data - stated because a median over 3 runs and a row count from 1 are different things.
     let work = match keep {
         Some(p) => p.to_path_buf(),
-        None => std::env::temp_dir().join(format!("nuthatch-bench-{}-{run}", std::process::id())),
+        None => default_bench_work(run),
     };
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
@@ -1363,6 +1367,59 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// The short commit the bench ran at (provenance for the report), or None outside a git checkout.
+/// Throwaway bench store on real disk (#781). `$XDG_CACHE_HOME` or `$HOME/.cache`, never `temp_dir()`
+/// - on the box that publishes numbers `/tmp` is tmpfs and the storage comparison was RAM vs RAM.
+fn default_bench_work(run: usize) -> std::path::PathBuf {
+    cache_root().join(format!("nuthatch-bench-{}-{run}", std::process::id()))
+}
+
+fn cache_root() -> std::path::PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(xdg);
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return std::path::PathBuf::from(home).join(".cache");
+    }
+    std::path::PathBuf::from(".cache")
+}
+
+fn work_backing_of(path: &std::path::Path) -> String {
+    if is_tmpfs(path) {
+        "tmpfs".into()
+    } else {
+        "disk".into()
+    }
+}
+
+fn is_tmpfs(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let abs_s = abs.to_string_lossy();
+            let mut best: Option<(&str, usize)> = None;
+            for line in mounts.lines() {
+                let mut bits = line.split_whitespace();
+                let _dev = bits.next();
+                let Some(mnt) = bits.next() else { continue };
+                let Some(fstype) = bits.next() else { continue };
+                let covered = if mnt == "/" {
+                    abs_s.starts_with('/')
+                } else {
+                    abs_s == mnt || abs_s.starts_with(&format!("{mnt}/"))
+                };
+                if covered && best.is_none_or(|(_, n)| mnt.len() >= n) {
+                    best = Some((fstype, mnt.len()));
+                }
+            }
+            if best.is_some_and(|(t, _)| t == "tmpfs" || t == "ramfs") {
+                return true;
+            }
+        }
+    }
+    path.starts_with(std::env::temp_dir())
+}
+
 fn git_commit() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -1432,6 +1489,18 @@ mod tests {
     fn hardware_is_reported_or_omitted_never_guessed() {
         let h = hardware_summary().expect("this platform reports core count");
         assert!(h.contains("cores"), "got {h}");
+    }
+
+    /// #781: the default work dir must not be `temp_dir()`. On the publishing box that is tmpfs.
+    #[test]
+    fn default_bench_work_is_not_under_temp_dir() {
+        let p = default_bench_work(0);
+        let tmp = std::env::temp_dir();
+        assert!(
+            !p.starts_with(&tmp),
+            "default work dir {p:?} is still under temp_dir {tmp:?}"
+        );
+        assert_eq!(work_backing_of(&tmp), "tmpfs");
     }
     use super::*;
 
@@ -1864,6 +1933,7 @@ abi = "abis/c.json"
         let tape_path = tape_dir.path().join("tape");
         // `one_run`'s default work dir is keyed by pid and run index, so every test in this binary
         // sharing that index races for one redb (cargo runs the tests as threads of one process).
+        // Passing `keep` is what makes this independent of the rest of the module.
         let record_dir = tempfile::tempdir().unwrap();
         one_run(
             &[url],
@@ -1976,6 +2046,8 @@ abi = "abis/c.json"
         let tape_path = tape_dir.path().join("tape");
 
         let (url, handle) = stub_empty_logs().await;
+        // Same isolation as the timestamp-failure test: the default work dir is pid+run, shared
+        // across every parallel test using that index.
         let recorded_dir = tempfile::tempdir().unwrap();
         let recorded = one_run(
             &[url],
@@ -2352,10 +2424,10 @@ abi = "abis/c.json"
         let state_rpc = RpcClient::new(vec![state_url]).unwrap();
 
         // An explicit work directory per arm, rather than `one_run`'s default. That default is
-        // `temp_dir()/nuthatch-bench-<pid>-<run>`, keyed by run *index*, so it is shared by every
-        // test in this binary using that index - two in flight at once (cargo runs the tests as
-        // threads of one process) clear each other's work dir mid-run. Passing `keep` is what makes
-        // these two arms independent of the rest of the module.
+        // keyed by run *index*, so it is shared by every test in this binary using that index - two
+        // in flight at once (cargo runs the tests as threads of one process) clear each other's work
+        // dir mid-run. Passing `keep` is what makes these two arms independent of the rest of the
+        // module.
         let hot_dir = tempfile::tempdir().unwrap();
         let sealed_dir = tempfile::tempdir().unwrap();
         let run_arm = |seal_direct: bool, work: &std::path::Path| {

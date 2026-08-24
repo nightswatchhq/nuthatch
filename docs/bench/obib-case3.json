@@ -18,7 +18,7 @@
   "rpc_requests": 19300,
   "factory": false,
   "children": 0,
-  "commit": "4540e25",
+  "commit": "2373e46",
   "provider": "ethereum-rpc.publicnode.com",
   "hardware": "8 cores, 8 GB RAM",
   "obib_case": 3,
