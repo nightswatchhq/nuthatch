@@ -1,8 +1,6 @@
 # Sprint: steady-starling
 
-Filed 2026-08-24, after rigorous-raven landed on main as #806. **Three issues.**
-Runs **Sunday 2026-09-14 to Sunday 2026-09-21**, or the Monday after quizzical-quail's four close,
-whichever is later. Implementation may land earlier; the dates are the done-by.
+Filed after rigorous-raven landed on main as #806. **Three issues.**
 
 ## Definition of done
 
