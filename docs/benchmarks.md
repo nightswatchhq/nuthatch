@@ -153,8 +153,38 @@ miss rather than rounded down to a pass.
 **What this means for the multipliers on this page: they are not comparable to a replayed number and
 never were.** A live figure measures a provider; a replayed figure measures decode plus store. Both
 are honest; they answer different questions, and a ratio built from one cannot be restated in terms
-of the other. The storage-path comparison is now a question for the rig, on a quiet box, and the
-numbers above are the first credible instrument this project has had for it.
+of the other.
+
+**The storage-path question, answered on the rig.** The 2026-08-23 replay aborted the seal-direct
+arm on a recorded 429, which is the error-preservation mechanism working and also means the
+comparison did not run. A second tape of the same 120-block Transfer-only range, recorded against
+an endpoint whose timestamp batches all succeed, is
+[`docs/bench/tapes/usdc-120-fixed-clean`](bench/tapes/usdc-120-fixed-clean). Both arms replay it,
+fixed window, `--keep` on disk, five-run median, commit `9b3bb6f`, 18 cores / 48 GB RAM. The
+429-bearing tape stays; it is the #784 reproduction. Artifacts:
+[`docs/bench/744-hot-replay.json`](bench/744-hot-replay.json),
+[`docs/bench/744-seal-direct-replay.json`](bench/744-seal-direct-replay.json).
+
+| Path | Events | Wall-clock | events/sec | vs hot store | RPC requests |
+|---|---|---|---|---|---|
+| hot store (replay) | 11,758 | 0.16 s | **74,978** | 1× | 12 |
+| seal-direct (replay) | 11,758 | 0.06 s | **185,628** | **2.48×** | 12 |
+
+Same event count on every run of both arms. Same 12 source calls. The only variable is where the
+rows are written. Seal-direct is 2.48× the hot store once the network is not in the measurement.
+That is smaller than 8.7× or 5.2×, larger than 0.92×, and is the first of those figures that was
+measuring the storage path.
+
+Reproduce it:
+
+```sh
+nuthatch bench backfill --dir docs/bench/nests/usdc-120 \
+  --from 25809368 --to 25809487 --runs 5 \
+  --replay docs/bench/tapes/usdc-120-fixed-clean --keep /var/tmp/nuthatch-744-hot
+nuthatch bench backfill --dir docs/bench/nests/usdc-120 \
+  --from 25809368 --to 25809487 --runs 5 --seal-direct \
+  --replay docs/bench/tapes/usdc-120-fixed-clean --keep /var/tmp/nuthatch-744-seal
+```
 
 **12,933 was not wrong - it answers a different question.** This bench nest declares `Transfer`
 only, so 11,758 is the right count for *this* table; 12,933, reported by this PR's own earlier
@@ -225,8 +255,9 @@ of the ~2.9× vs. hot store is fewer, wider requests (24 against the hot arm's 3
 overlapped latency alone; against your own node (`--rpc`, `--concurrency 16`) it goes further. What
 collapsed is the *storage-path* half
 of the old ~22.5× (hot store vs. pipeline): see the seal-direct-vs-hot-store discrepancy above - see
-also #744 - today's hot-store baseline came in far faster than the 289 ev/s this page previously
-quoted, and that drags every "vs hot store" ratio in this table down with it. RSS rose to ~68 MB with
+also #744, now measured on the rig at 2.48× rather than collapsed to 0.92×. Today's live hot-store
+baseline came in far faster than the 289 ev/s this page previously
+quoted, and that drags every live "vs hot store" ratio in this table down with it. RSS rose to ~68 MB with
 8 windows in flight - bounded by `K` and well within the 256 MB budget.
 
 **Caveats:** public-endpoint throughput varies several-fold run to run (see the note above) - the
