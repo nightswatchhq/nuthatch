@@ -18,9 +18,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
@@ -44,7 +42,47 @@ fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// One cached read-only DuckDB (#295). A fresh in-memory instance per query was the rebuild the
+/// issue named: open, lockdown, attach, teardown. The connection is still read-only and still
+/// single-user; queries take the mutex, ingestion never writes here. An interrupt drops the slot
+/// rather than leaving DuckDB half-cancelled for the next caller.
+struct DuckCache {
+    dir: PathBuf,
+    sealed_through: u64,
+    excluded: std::collections::BTreeSet<String>,
+    conn: Connection,
+}
+
+static DUCK_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, DuckCache>>> = OnceLock::new();
+static DUCK_OPENS: OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> = OnceLock::new();
+
+fn duck_cache_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, DuckCache>>
+{
+    DUCK_CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn note_duck_open(dir: &Path) {
+    *DUCK_OPENS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(dir.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+fn duck_opens_for(dir: &Path) -> u64 {
+    DUCK_OPENS
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| g.get(dir).copied().unwrap_or(0)))
+        .unwrap_or(0)
+}
+
 fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
+    note_duck_open(dir);
     let allowed: Vec<String> = allowed_read_dirs(dir)
         .into_iter()
         .filter(|p| p.exists())
@@ -388,60 +426,86 @@ fn attempt(
     // Open with `enable_external_access=false` first (#289): `allowed_directories` is an *addition*
     // to the allow-list when external access is on, and a restriction only when it is off. That is
     // DuckDB's own docs, and it is why the lockdown was inert until this flag went in at startup.
-    let conn = open_locked_duckdb(dir).context("failed to open DuckDB")?;
-    let referenced = reject_unknown_table_refs(&conn, sql)?;
-    let degraded_tables = define_views(&conn, dir, hot, sealed_through, excluded, declared)?;
-    // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
-    // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
-    // this - they only touch the raw per-event tables.
-    define_nest_views(&conn, dir);
-    // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
-    // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
-    define_labels_view(&conn, dir);
-    // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
-    // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
-    define_children_views(&conn, dir);
-
-    // Every view this query could be reading now exists, so the names it used can be widened to the
-    // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
-    // happen here rather than beside the security walk: at that point the catalogue was empty.
-    let referenced = referenced.map(|names| expand_through_views(&conn, &names));
-
-    // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
-    // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
-    // alone). `interrupt()` makes the running query fail; we translate that into a clear timeout error
-    // below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
-    // queries skip all of this and run to completion.
     //
-    // Waits on `deadline`, not a fresh `guard.timeout`, so a second `attempt` (the #433 reduced retry)
-    // only gets whatever's left of the *first* attempt's budget rather than a brand-new full timeout
-    // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
-    // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let watchdog = guard.zip(deadline).map(|(_, d)| {
-        let handle = conn.interrupt_handle();
-        let flag = interrupted.clone();
-        let (tx, rx) = mpsc::channel::<()>();
-        let join = std::thread::spawn(move || {
-            let remaining = d.saturating_duration_since(Instant::now());
-            // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
-            // (panic) leaves the query alone.
-            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
-                flag.store(true, Ordering::SeqCst);
-                handle.interrupt();
-            }
+    // #295: reuse the connection when the nest, watermark and exclusion set match. Hot rows still
+    // reload below (`define_views`); new sealed segments change `sealed_through` and miss the cache.
+    // Taken out of the slot for the query so an interrupt can drop it without fighting the mutex
+    // borrow; put back only if DuckDB was not cancelled underneath us.
+    let mut slot = duck_cache_lock().remove(dir);
+    let reusable = slot
+        .as_ref()
+        .is_some_and(|c| c.sealed_through == sealed_through && c.excluded == *excluded);
+    if !reusable {
+        slot = Some(DuckCache {
+            dir: dir.to_path_buf(),
+            sealed_through,
+            excluded: excluded.clone(),
+            conn: open_locked_duckdb(dir).context("failed to open DuckDB")?,
         });
-        (tx, join)
-    });
+    }
+    let slot = slot.expect("just inserted");
+    let (referenced, degraded_tables, interrupted, outcome, cap) = {
+        let conn = &slot.conn;
+        let referenced = reject_unknown_table_refs(conn, sql)?;
+        let degraded_tables = define_views(conn, dir, hot, sealed_through, excluded, declared)?;
+        // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
+        // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
+        // this - they only touch the raw per-event tables.
+        define_nest_views(conn, dir);
+        // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
+        // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
+        define_labels_view(conn, dir);
+        // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
+        // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
+        define_children_views(conn, dir);
 
-    let cap = guard.map(|g| g.max_rows);
-    let outcome = collect(&conn, sql, cap);
+        // Every view this query could be reading now exists, so the names it used can be widened to the
+        // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
+        // happen here rather than beside the security walk: at that point the catalogue was empty.
+        let referenced = referenced.map(|names| expand_through_views(conn, &names));
 
-    // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
-    // `recv_timeout` return `Ok`, so it won't interrupt; then join so it can't fire late.
-    if let Some((tx, join)) = watchdog {
-        let _ = tx.send(());
-        let _ = join.join();
+        // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
+        // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
+        // alone). `interrupt()` makes the running query fail; we translate that into a clear timeout error
+        // below. On normal completion we signal the watchdog so it never fires. Unguarded (trusted)
+        // queries skip all of this and run to completion.
+        //
+        // Waits on `deadline`, not a fresh `guard.timeout`, so a second `attempt` (the #433 reduced retry)
+        // only gets whatever's left of the *first* attempt's budget rather than a brand-new full timeout
+        // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
+        // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let watchdog = guard.zip(deadline).map(|(_, d)| {
+            let handle = conn.interrupt_handle();
+            let flag = interrupted.clone();
+            let (tx, rx) = mpsc::channel::<()>();
+            let join = std::thread::spawn(move || {
+                let remaining = d.saturating_duration_since(Instant::now());
+                // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
+                // (panic) leaves the query alone.
+                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
+                    flag.store(true, Ordering::SeqCst);
+                    handle.interrupt();
+                }
+            });
+            (tx, join)
+        });
+
+        let cap = guard.map(|g| g.max_rows);
+        let outcome = collect(conn, sql, cap);
+
+        // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
+        // `recv_timeout` return `Ok`, so it won't interrupt; then join so it can't fire late.
+        if let Some((tx, join)) = watchdog {
+            let _ = tx.send(());
+            let _ = join.join();
+        }
+        (referenced, degraded_tables, interrupted, outcome, cap)
+    };
+    if interrupted.load(Ordering::SeqCst) {
+        drop(slot);
+    } else {
+        duck_cache_lock().insert(slot.dir.clone(), slot);
     }
 
     let (mut rows, over_cap) = match outcome {
@@ -1135,7 +1199,7 @@ fn define_labels_view(conn: &Connection, dir: &Path) {
     }
     let glob = labels_dir.join("*.json");
     let ddl = format!(
-        "CREATE VIEW labels AS SELECT lower(address) AS address, label \
+        "CREATE OR REPLACE VIEW labels AS SELECT lower(address) AS address, label \
          FROM read_json('{}', format='array', columns={{address: 'VARCHAR', label: 'VARCHAR'}})",
         glob.display()
     );
@@ -1198,7 +1262,7 @@ fn define_children_views(conn: &Connection, dir: &Path) {
             .collect();
         let union = selects.join(" UNION ALL ");
         let ddl = format!(
-            "CREATE VIEW \"{template}__children\" AS \
+            "CREATE OR REPLACE VIEW \"{template}__children\" AS \
              SELECT address, discovered_block, discovered_log_index, {cols}parent_address \
              FROM ({union}) \
              QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
@@ -1441,7 +1505,7 @@ fn define_views(
                 // all-null over the sealed range is dropped from its Parquet schema; hot may still
                 // carry it).
                 Some(format!(
-                    "CREATE VIEW \"{table}\" AS {}",
+                    "CREATE OR REPLACE VIEW \"{table}\" AS {}",
                     parts.join(" UNION ALL BY NAME ")
                 ))
             }
@@ -1529,7 +1593,7 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
         .map(|c| format!("\"{c}\" {}", hot_col_type(c)))
         .collect();
     conn.execute_batch(&format!(
-        "CREATE TEMP TABLE \"{name}\" ({})",
+        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
         coldefs.join(", ")
     ))?;
     let mut app = conn.appender(name)?;
@@ -1573,10 +1637,30 @@ fn define_nest_views(conn: &Connection, dir: &Path) {
         // uncommenting them once the event fired, which is a poor trade for a fault-isolation gain
         // that was never needed at this granularity.
         for stmt in split_sql_statements(&v.sql) {
-            if let Err(e) = conn.execute_batch(&stmt) {
+            if let Err(e) = conn.execute_batch(&with_or_replace_view(&stmt)) {
                 tracing::debug!("nest view {} statement skipped: {e}", v.file);
             }
         }
+    }
+}
+
+/// Make a nest-authored `CREATE VIEW` re-runnable on a cached connection (#295).
+fn with_or_replace_view(stmt: &str) -> String {
+    let s = stmt.trim_start();
+    if s.len() < 11 || !s[..6].eq_ignore_ascii_case("create") {
+        return stmt.to_string();
+    }
+    let rest = s[6..].trim_start();
+    if rest.len() >= 4
+        && rest[..4].eq_ignore_ascii_case("view")
+        && rest
+            .get(4..)
+            .and_then(|r| r.chars().next())
+            .is_some_and(|c| c.is_whitespace() || c == '"')
+    {
+        format!("CREATE OR REPLACE VIEW{}", &rest[4..])
+    } else {
+        stmt.to_string()
     }
 }
 
@@ -2020,7 +2104,7 @@ fn empty_view_ddl(table: &str, cols: &[(String, String)]) -> String {
         }
     }
     format!(
-        "CREATE VIEW \"{table}\" AS SELECT {} WHERE false",
+        "CREATE OR REPLACE VIEW \"{table}\" AS SELECT {} WHERE false",
         sel.join(", ")
     )
 }
@@ -2856,6 +2940,45 @@ template="pool"
         // A comment-prefixed SELECT must be accepted (not rejected as non-SELECT); a DROP still fails.
         assert!(query(dir.path(), "-- a note\nSELECT 42 AS n").is_ok());
         assert!(query(dir.path(), "/* x */ DROP TABLE t").is_err());
+    }
+
+    /// #295: two queries on the same nest, same watermark, share one DuckDB. Deleting the cache
+    /// (or opening every time) fails this. Other tests use other dirs and do not evict this slot.
+    #[test]
+    fn a_second_query_reuses_the_duckdb_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(
+            duck_opens_for(dir.path()),
+            1,
+            "the first query opens DuckDB"
+        );
+        query(dir.path(), "SELECT 42 AS n").unwrap();
+        assert_eq!(
+            duck_opens_for(dir.path()),
+            1,
+            "the second query must not rebuild the world"
+        );
+    }
+
+    /// #295: new sealed segments change the watermark; reusing the old connection would serve
+    /// a view that never saw them.
+    #[test]
+    fn a_new_watermark_opens_a_fresh_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+        };
+        let hot = HotRows::new();
+        query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, 0, &[]).unwrap();
+        assert_eq!(duck_opens_for(dir.path()), 1);
+        query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, 10, &[]).unwrap();
+        assert_eq!(
+            duck_opens_for(dir.path()),
+            2,
+            "a new sealed_through must not reuse the stale connection"
+        );
     }
 
     /// A declared-but-unsealed table still resolves as an empty typed view, so a nest view that

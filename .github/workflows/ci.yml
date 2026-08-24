@@ -703,6 +703,17 @@ jobs:
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/multinest-footprint.sh
+      - name: measure peak RSS, wide ABI, one nest (#286)
+        # The density job above is twenty nests × ten events. This is one nest × 31 events - the
+        # ABI-breadth half #286 asked for and the density job cannot answer. Same binary, same
+        # budget, a different pressure on the hot store. Floor: every table non-empty.
+        env:
+          BIN: bin/nuthatch
+          MAX_RSS_MB: "2048"
+          REPORT: wideabi-footprint.json
+        run: |
+          chmod +x bin/nuthatch
+          bash .github/workflows/wideabi-footprint.sh
       - name: upload the report
         # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
         # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
@@ -710,7 +721,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: multinest-footprint-report
-          path: multinest-footprint.json
+          path: |
+            multinest-footprint.json
+            wideabi-footprint.json
+          if-no-files-found: warn
           retention-days: 30
 
   fuzz-smoke:
