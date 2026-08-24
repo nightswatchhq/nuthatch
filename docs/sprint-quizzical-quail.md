@@ -1,8 +1,6 @@
 # Sprint: quizzical-quail
 
-Filed 2026-08-24, while pragmatic-peregrine's CI was still running. **Four issues.**
-Runs **Sunday 2026-08-31 to Sunday 2026-09-07**, or the Monday after peregrine's four close,
-whichever is later. Implementation may land earlier; the dates are the done-by.
+Filed while pragmatic-peregrine's CI was still running. **Four issues.**
 
 ## Definition of done
 

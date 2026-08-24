@@ -1,10 +1,9 @@
 # Sprint: nocturnal-nightjar
 
-Filed by the board on 2026-08-22, after meticulous-magpie closed six of seven in a day - the seventh
-being #744, carried into this sprint and relabelled at 17:13Z.
+Filed after meticulous-magpie closed six of seven - the seventh
+being #744, carried into this sprint and relabelled.
 **Four issues of new work**, plus #744 which #767 closes as its first customer - **five carry the
-label**. Runs **Saturday 2026-08-22 to Friday 2026-08-28** - a week, not a weekend, and the reason is
-in *How this sprint runs differently* below.
+label**.
 
 ## Definition of done
 
@@ -84,15 +83,13 @@ waste: a "last seven days" panel needs timestamps, timestamps need a header per 
 
 ## Sequencing, and it is a cost decision
 
-The weekly Claude allowance stood at **79% on 2026-08-22** and resets **Tuesday the 25th at 10:00**.
-Three days on a fifth of a week, against a burn of $472 in the preceding 24 hours. That sizes this
-sprint whether we like it or not, so it is stated rather than discovered on Monday:
+The remaining allowance at filing sized this sprint. Stated rather than discovered later:
 
-| when | what | why |
+| order | what | why |
 |---|---|---|
-| now → Tuesday | **#769**, **#770** | small and docs-shaped; cheap in runs |
-| now → end of week | **#767** | the long piece; start the design now, build through the reset |
-| after Tuesday 10:00 | **#768** | large, and there is no allowance for two large pieces this side of the reset |
+| first | **#769**, **#770** | small and docs-shaped; cheap in runs |
+| then | **#767** | the long piece |
+| last | **#768** | large, and there is no allowance for two large pieces at once |
 
 If the allowance runs out before Tuesday, **stop and say so**. Do not finish a piece by running the
 board's remaining budget to zero.

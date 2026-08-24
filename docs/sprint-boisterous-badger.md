@@ -1,7 +1,7 @@
-# Sprint: boisterous-badger (2026-07-30 - 2026-08-06) - **closed**
+# Sprint: boisterous-badger - **closed**
 
-> Closed 2026-08-06 by the **2.0.0 release**. The road-to-1.0 plan below was overtaken: 1.0 shipped
-> on 2026-08-04 and the August architecture session then produced RFCs 0032-0035, which became 2.0 -
+> Closed by the **2.0.0 release**. The road-to-1.0 plan below was overtaken: 1.0 shipped
+> and the August architecture session then produced RFCs 0032-0035, which became 2.0 -
 > tenancy in the runtime, nest identity and grafting, the query allowlist, and one deliberate
 > migration. The quality track survives as issues #287-#309; **those issues are the live state, this
 > file is the record of what was planned.**

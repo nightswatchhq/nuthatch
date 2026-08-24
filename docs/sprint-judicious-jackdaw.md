@@ -1,7 +1,6 @@
 # Sprint: judicious-jackdaw
 
-Filed by the board on 2026-08-20, the day industrious-ibis closed all six of its issues and the day
-v2.6.1 shipped. **Four issues.** Runs **Friday 2026-08-21 to Monday 2026-08-24**.
+Filed after industrious-ibis closed all six of its issues and v2.6.1 shipped. **Four issues.**
 
 ## Definition of done
 

@@ -1,6 +1,6 @@
 # Sprint: diligent-dormouse
 
-**2026-08-11 to 2026-08-18.** Membership is defined by the `diligent-dormouse` label on GitHub, not
+Membership is defined by the `diligent-dormouse` label on GitHub, not
 by this file. If the two disagree, the label is right and this file is stale.
 
 Follows [circumspect-capybara](sprint-circumspect-capybara.md), which closed 13 of 13 and shipped

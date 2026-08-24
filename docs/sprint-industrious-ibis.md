@@ -1,7 +1,6 @@
 # Sprint: industrious-ibis
 
-Filed by the board on 2026-08-20, the day after 2.6.0 and a day after hardy-heron closed its fourth
-issue. **Six issues.** Runs **Thursday 2026-08-20 to Sunday 2026-08-23**.
+Filed after 2.6.0 and after hardy-heron closed its fourth issue. **Six issues.**
 
 ## Definition of done
 
