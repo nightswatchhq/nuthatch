@@ -3303,12 +3303,12 @@ template="pool"
         let file = shared.join("ok.txt");
         std::fs::write(&file, "shared\n").unwrap();
         let conn = open_locked_duckdb(&nid_dir).unwrap();
-        let sql = format!("SELECT * FROM read_text('{}')", file.display());
+        let sql = format!("SELECT content FROM read_text('{}')", file.display());
         let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
         let got: String = stmt
             .query_row([], |r| r.get(0))
             .expect("shared-store read_text runs");
-        assert!(got.contains("shared"), "got {got:?}");
+        assert_eq!(got.trim(), "shared");
     }
 
     /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the
