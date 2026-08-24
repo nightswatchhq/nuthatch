@@ -15,7 +15,7 @@ anything shipped moves from "budget" to "evidence")._
 Blockchain applications almost universally depend on a handful of hosted data providers to read the
 chain - indexing services and RPC gateways that meter, gate, and can revoke access. **nuthatch lets
 anyone be their own indexer**: one Rust binary, one command, a live queryable API in under two
-minutes, with **no mandatory third-party data dependency, ever**. It runs in ~40 MB of RAM on a
+minutes, with **no mandatory third-party data dependency, ever**. It runs on a
 laptop, decodes any contract from its ABI, serves SQL + a point-read API + an offline AI (MCP)
 surface, and - uniquely among self-hosted indexers - has **zero phone-home**: no telemetry, no
 tokens, no gated service in the data path. This is data sovereignty for the read side of web3, the
@@ -36,8 +36,9 @@ Not a proposal for vapourware. As of v0.1.0 (on crates.io and as prebuilt binari
   segments past finality; DuckDB read-only analytical SQL over them.
 - **Incremental view maintenance** (Feldera/DBSP): a per-address balance view where a reorg is a
   retraction, not a recompute - the differentiator vs imperative indexers.
-- **Honest, published numbers** (the figure nobody else publishes): **~40 MB peak RAM**, CI-enforced.
-  Backfill throughput is benchmarked in the open, with byte-identical determinism proven across the
+- **Honest, published numbers.** Peak RSS is CI-gated (256 MB ceiling); we are not quoting a
+  megabyte figure here until it has a committed `docs/bench/*.json` artefact (#757). Backfill
+  throughput is benchmarked in the open, with byte-identical determinism proven across the
   hot-store, seal-direct, and pipelined paths; full methodology and artifacts in-repo
   (`docs/benchmarks.md`). The storage-path speedup multiplier is under active re-measurement after a
   harness fix invalidated the earlier figure (#722, discrepancy open in #744), so we are not quoting

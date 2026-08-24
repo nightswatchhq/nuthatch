@@ -357,8 +357,8 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 /// the third bullet above - not the `allowed_directories` lockdown, which an earlier revision of this
 /// paragraph offered: `SET` errors do not echo the failing statement, the option accepts nonexistent
 /// directories and empty lists so it barely fails at all, and
-/// `analytics::tests::the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read` already
-/// records that it does not enforce on this build.
+/// `analytics::tests::the_directory_lockdown_blocks_an_out_of_allowlist_file_read` records that the
+/// second layer now does enforce (#289).
 ///
 /// The absolute-path assertion below is therefore about the *payload* routes, not the error path, and
 /// it has teeth there: adding the nest directory to `nest_info` turns it red.

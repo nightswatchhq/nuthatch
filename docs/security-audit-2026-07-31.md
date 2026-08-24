@@ -81,7 +81,11 @@ That matters mostly for how finding 1 should be read: there was no second layer 
 DuckDB correctly; the bundled build does not enforce it. We cannot make it work from here, and quietly
 dropping it would remove the free upgrade if upstream ever starts enforcing.
 
-What *was* wrong was the belief attached to it. `the_denylist_not_the_directory_lockdown_is_what_blocks_a_file_read`
+_(2026-08-24, #289: it was ours. `allowed_directories` is a restriction only when
+`enable_external_access` is false, a startup-only flag the 31 July pass never set. quizzical-quail
+sets it on the `/sql` connection. The dated finding above is kept as what we believed that day.)_
+
+What *was* wrong was the belief attached to it. `the_directory_lockdown_blocks_an_out_of_allowlist_file_read`
 now pins which control does the work, so nobody can weaken the denylist on the assumption that something
 sits behind it. `lock_configuration` is real and does hold — a query cannot widen the setting — but an
 empty allowlist that nothing enforces is a comment, not a control. A defence-in-depth layer nobody has

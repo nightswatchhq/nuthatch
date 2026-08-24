@@ -54,8 +54,8 @@ is a bug in the backlog rather than a style choice.
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
 are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
-closed one it means nothing but provenance.** Current in-flight label: `rigorous-raven`
-([sprint doc](sprint-rigorous-raven.md)). `quizzical-quail` is in review on another branch.
+closed one it means nothing but provenance.** Current in-flight label: `quizzical-quail`
+([sprint doc](sprint-quizzical-quail.md)). `rigorous-raven` landed as #806.
 
 The queries that matter:
 
