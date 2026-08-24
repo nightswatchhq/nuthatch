@@ -1077,7 +1077,9 @@ fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 }
 
 /// Every base-table name a serialized AST reads.
-fn table_refs(ast: &Value) -> Vec<String> {
+/// Base-table references from DuckDB's serialized AST. Shared with incremental-entity validation so
+/// dependency identity has one parser boundary across ordinary views and entities.
+pub fn table_refs(ast: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     walk(ast, &mut |obj| {
         if obj.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {

@@ -2205,7 +2205,8 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
 }
 
 /// Bind one incremental-entity SELECT against the same empty typed fact surface used by view
-/// validation. It does not execute the query, so a cold nest can validate authoring safely.
+/// validation. DuckDB's Rust binding only materialises result metadata after `query`, even for a
+/// prepared statement. The entity has already passed the single-SELECT gate, and no rows are read.
 pub fn entity_output_columns(
     dir: &Path,
     schema: &[crate::registry::TableSchema],
@@ -2223,7 +2224,9 @@ pub fn entity_output_columns(
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
-    let stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query([])?;
+    drop(rows);
     Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
 }
 

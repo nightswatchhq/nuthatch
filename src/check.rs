@@ -76,19 +76,20 @@ pub fn check(args: CheckArgs) -> Result<()> {
 
     if checks.is_empty() {
         let has_views = !analytics::nest_view_files(&dir).is_empty();
+        let has_entities = crate::entities::has_declarations(&dir);
         // Only truly nothing to check - no checks, and either no views or no schema to validate them
         // against - keeps the original bail. A nest with views that were actually validated above
         // got a real answer instead, even with `checks/` empty.
-        if (!has_views || views_validated.is_none()) && entity_issues.is_empty() {
+        if (!has_views || views_validated.is_none()) && !has_entities {
             bail!(
                 "no checks found in {} (expected checks/*.sql)",
                 dir.join("checks").display()
             );
         }
         if failures > 0 {
-            bail!("{failures} view issue(s) found");
+            bail!("{failures} authored-definition issue(s) found");
         }
-        println!("✓ no checks/*.sql, but all view(s) build cleanly");
+        println!("✓ no checks/*.sql, but all authored view(s) and entity declaration(s) validate cleanly");
         return Ok(());
     }
 
@@ -269,7 +270,7 @@ mod tests {
             !err.contains("no checks found"),
             "must not be the generic empty-checks bail: {err}"
         );
-        assert!(err.contains("view issue"), "{err}");
+        assert!(err.contains("authored-definition issue"), "{err}");
     }
 
     /// Unchanged: a nest with neither `checks/*.sql` nor any views has truly nothing to check.
@@ -286,6 +287,29 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("no checks found"), "{err}");
+    }
+
+    #[test]
+    fn no_checks_directory_still_validates_a_clean_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_nest(dir.path());
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname = \"constant\"\nsql = \"entities/constant.sql\"\nkey = [\"id\"]\nmax_rows = 1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("entities/constant.sql"), "SELECT 1 AS id").unwrap();
+
+        let result = check(CheckArgs {
+            name: None,
+            dir: dir.path().display().to_string(),
+            update: false,
+        });
+        assert!(
+            result.is_ok(),
+            "a clean entity with no checks/ must not bail on the missing directory: {result:?}"
+        );
     }
 
     #[test]
