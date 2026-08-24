@@ -2324,6 +2324,12 @@ abi = "abis/c.json"
     /// `eth_getBlockByNumber` header (timestamps, and the per-block hash fetch `resolve_calls_for_
     /// window` still makes pre-#720). One server serves both the ingestion and archive endpoints -
     /// nothing here cares which role asked.
+    /// Two calls-bench tests stand up stub HTTP servers and a work dir. Under `cargo test
+    /// --features exex` they share a process with a larger sibling set, and a race on the stub
+    /// becoming reachable showed up as `calls_resolved = 0` on one leg only (#789). They take this
+    /// lock so they cannot share a server, a port, or a work dir with each other.
+    static CALLS_BENCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn stub_full_rpc() -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::post, Router};
         async fn handler(body: String) -> axum::Json<serde_json::Value> {
@@ -2366,6 +2372,14 @@ abi = "abis/c.json"
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        // Bound is not the same as accepting. Under load the first POST can lose the race with
+        // `serve` starting, and `calls_resolved = 0` looks like the harness measured a strawman.
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         (format!("http://{addr}/"), handle)
     }
 
@@ -2377,6 +2391,7 @@ abi = "abis/c.json"
     /// the fix are both proven against what `backfill()` itself runs, not a stand-in for it.
     #[tokio::test]
     async fn seal_direct_bench_resolves_declared_calls() {
+        let _serial = CALLS_BENCH_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         write_calls_nest(dir.path());
         let config = Config::load(dir.path()).unwrap();
@@ -2449,6 +2464,7 @@ abi = "abis/c.json"
     /// stub, so anything other than equality is one arm doing work the other skipped.
     #[tokio::test]
     async fn hot_store_bench_resolves_the_same_calls_as_seal_direct() {
+        let _serial = CALLS_BENCH_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         write_calls_nest(dir.path());
         let config = Config::load(dir.path()).unwrap();

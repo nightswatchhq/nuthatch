@@ -54,8 +54,9 @@ every `Signalled` and `Burned` since 2022. `SubgraphService` is ten months old b
 An earlier version of this section listed three sources including `L2GNS`. It buys nothing here.
 Allocations and signal both key on `subgraphDeploymentID`, so **"signal with no open allocation" is
 answerable from two contracts**. `L2GNS` adds only human-readable identity, and the display names
-actually live in IPFS-pinned JSON (RFC-0037), which nuthatch cannot resolve yet - so it would deliver a
-deployment ID we already hold.
+actually live in IPFS-pinned JSON (RFC-0037). nuthatch can resolve those as a declared `[[ipfs]]`
+table; it is extra work, not a missing capability, and the join is still on a deployment ID we
+already hold.
 
 ### Why a *new* nest, rather than extending one that exists
 

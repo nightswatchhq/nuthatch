@@ -1,18 +1,20 @@
 # RFC-0023: Contract state (eth_call) - derive-first, with a verifiable fallback
 
-- Status: **Accepted** (2026-07-21) - **tiers 1-2 building (2026-07-22)**. **Tier 1**: the derive-first
+- Status: **Accepted** (2026-07-21) - **tiers 1-3 shipped**. **Tier 1**: the derive-first
   recipe library (`src/recipes.rs`) + `nuthatch recipe list|add` - **four recipes**, all derived with
   **no eth_call** and derive-correctness proven by e2e: three ERC-20-generic (`total_supply` = Σ mints −
   Σ burns; `balances` = per-address Σ(in) − Σ(out); `holder_count` = non-zero holders) plus the
   protocol-specific **`reserves`** (Uniswap-V2 `getReserves()` = the latest `Sync` per pair).
   **Tier 2**: the immutable-metadata cache (`src/metadata.rs`) + `nuthatch metadata fetch` - `decimals`/
   `symbol`/`name` fetched once (they never change) and cached in `metadata.json`; the pure encode/decode
-  (uint8 / ABI-string) is unit-tested, the RPC fetch is live-verified. **Pending:** tier 3 (a *simple*
-  RPC eth_call fallback, sealed + `latest`-guarded - **needs an operator-supplied archive RPC**; the
-  derive-first tiers 1-2 need none and remain the zero-dependency default), tier 4 (hosted verifiable
-  cache). **Operator note:** an operator only ever needs an archive RPC for the *irreducible residue* a
-  nest genuinely can't derive; the recipe library covers the common surface for free. The
-  **local-execution engine** for tier 3/4 (running the fallback without an archive RPC) is designed in
+  (uint8 / ABI-string) is unit-tested, the RPC fetch is live-verified. **Tier 3 Implemented, shipped in
+  v2.6.0** (2026-08-19, #262/#268): `resolve_at` is wired into `process_window`; a declared `[[calls]]`
+  block resolves against an operator-supplied archive RPC (`--state-rpc`) rather than being refused at
+  load. The derive-first tiers 1-2 still need none and remain the zero-dependency default. **Tier 4**
+  (hosted verifiable cache) is parked. **Operator note:** an operator only ever needs an archive RPC for
+  the *irreducible residue* a nest genuinely can't derive; the recipe library covers the common surface
+  for free. The **local-execution engine** for tier 3/4 (running the fallback without an archive RPC)
+  is designed in
   **RFC-0024** (Draft, deferred build).
 - Author: Pete (cargopete)
 - Date: 2026-07-21

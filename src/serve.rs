@@ -716,39 +716,57 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         .runtime_health
         .as_ref()
         .map(|(name, _)| METRICS.nest(name));
-    let (last_poll, tip, last, sealed, started_at, last_progress, poll_failed) = match &nest {
-        Some(m) => (
-            m.last_poll_ok(),
-            m.tip(),
-            m.last_block(),
-            m.sealed_through(),
-            m.started_at(),
-            m.last_progress(),
-            m.poll_failed(),
-        ),
-        None => (
-            METRICS.last_poll_ok(),
-            METRICS.tip_height(),
-            METRICS.last_block(),
-            METRICS.sealed_through_val(),
-            METRICS.started_at(),
-            METRICS.last_progress(),
-            METRICS.poll_failed(),
-        ),
-    };
+    let (last_poll, tip, last, sealed, started_at, last_progress, poll_failed, seal_direct) =
+        match &nest {
+            Some(m) => (
+                m.last_poll_ok(),
+                m.tip(),
+                m.last_block(),
+                m.sealed_through(),
+                m.started_at(),
+                m.last_progress(),
+                m.poll_failed(),
+                (
+                    m.seal_direct_active(),
+                    m.seal_direct_origin(),
+                    m.seal_direct_completed(),
+                    m.seal_direct_target(),
+                ),
+            ),
+            None => (
+                METRICS.last_poll_ok(),
+                METRICS.tip_height(),
+                METRICS.last_block(),
+                METRICS.sealed_through_val(),
+                METRICS.started_at(),
+                METRICS.last_progress(),
+                METRICS.poll_failed(),
+                (
+                    METRICS.seal_direct_active(),
+                    METRICS.seal_direct_origin(),
+                    METRICS.seal_direct_completed(),
+                    METRICS.seal_direct_target(),
+                ),
+            ),
+        };
+    let (seal_direct_active, seal_direct_origin, seal_direct_completed, seal_direct_target) =
+        seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
     let lag = tip.saturating_sub(last);
-    let wedged = progress_stalled(
-        last_progress,
-        started_at,
-        now,
-        READINESS_PROGRESS_STALL_SECS,
-        lag,
-    );
+    let wedged = !seal_direct_active
+        && progress_stalled(
+            last_progress,
+            started_at,
+            now,
+            READINESS_PROGRESS_STALL_SECS,
+            lag,
+        );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
-    let stalled =
-        initial_failure || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS) || wedged;
+    let stalled = !seal_direct_active
+        && (initial_failure
+            || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
+            || wedged);
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
@@ -760,6 +778,10 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
+        "seal_direct_active": seal_direct_active,
+        "seal_direct_origin": seal_direct_origin,
+        "seal_direct_completed": seal_direct_completed,
+        "seal_direct_target": seal_direct_target,
     });
     let code = if stalled {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2000,6 +2022,40 @@ mod tests {
         assert_eq!(json["stalled"], json!(false));
         assert_eq!(json["wedged"], json!(false));
         assert_eq!(json["lag_blocks"], json!(0));
+    }
+
+    /// #807: a seal-direct pass that has actually sealed rows must not look like WAITING.
+    #[tokio::test]
+    async fn seal_direct_ready_reports_progress_not_waiting() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "sealing";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        handle.set_started_at_for_test(now.saturating_sub(200));
+        handle.begin_seal_direct(1_000, 2_000);
+        handle.set_seal_direct_completed(1_500);
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "seal-direct progress is ready: {json}"
+        );
+        assert_eq!(json["ready"], json!(true));
+        assert_eq!(json["stalled"], json!(false));
+        assert_eq!(json["seal_direct_active"], json!(true));
+        assert_eq!(json["seal_direct_origin"], json!(1000));
+        assert_eq!(json["seal_direct_completed"], json!(1500));
+        assert_eq!(json["seal_direct_target"], json!(2000));
+        handle.end_seal_direct();
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.

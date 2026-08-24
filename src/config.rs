@@ -496,10 +496,11 @@ impl Config {
 
     /// Parse and validate a nest **without** the serving-path policy refusals.
     ///
-    /// `load` ends with `refuse_unwired_calls` (#262) and
-    /// `refuse_tip_finality_webhooks` (#577). Both are right for anything that
-    /// is about to *serve*: a declaration that parses and then silently does
-    /// nothing is the failure this project can least afford.
+    /// `load` ends with `refuse_tip_finality_webhooks` (#577). That is right for
+    /// anything that is about to *serve*: a declaration that parses and then
+    /// silently does nothing is the failure this project can least afford.
+    /// A declared `[[calls]]` block used to be refused the same way, until
+    /// tier 3 shipped in v2.6.0 and `load` started accepting it.
     ///
     /// They are wrong for a diagnostic. `nuthatch doctor` is what an operator
     /// reaches for when a nest misbehaves, and it refused to run on any nest
@@ -562,9 +563,9 @@ impl Config {
     ///
     /// `finality` parses fine either way and `Webhook::finality` is a bare `Option<String>`, so a
     /// typo'd or aspirational `"tip"` would otherwise be accepted, start clean, and never deliver a
-    /// single row - the exact "accepted, validated, and then ignored forever" shape
-    /// `refuse_unwired_calls` exists to prevent for `[[calls]]` (#262). A load error costs an
-    /// operator one clear message; silent non-delivery costs them finding out from a consumer.
+    /// single row - the exact "accepted, validated, and then ignored forever" shape that a declared
+    /// `[[calls]]` block used to be until tier 3 shipped (#262). A load error costs an operator one
+    /// clear message; silent non-delivery costs them finding out from a consumer.
     fn refuse_tip_finality_webhooks(&self) -> Result<()> {
         let tip_webhooks: Vec<&str> = self
             .webhooks
@@ -883,8 +884,18 @@ rpc_urls = ["https://rpc.example"]
         );
     }
 
-    /// A file claiming v1 while declaring a v2-only feature is refused - it is precisely the file an
-    /// older binary would accept and get wrong.
+    /// #687: `load` used to call `refuse_unwired_calls`. Claiming that it still does, after the
+    /// function was deleted, is the same class as an RFC header that still says tier 3 is pending.
+    #[test]
+    fn load_comments_do_not_claim_to_call_refuse_unwired_calls() {
+        let src = include_str!("config.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !prod.contains("load` ends with `refuse_unwired_calls"),
+            "`load` docs still name a function it does not call"
+        );
+    }
+
     /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never
     /// delivered (issue #577 - the same shape as #262's `[[calls]]` refusal above).
     #[test]

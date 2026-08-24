@@ -211,6 +211,25 @@ fn rfc_0015_status_line_does_not_say_in_progress() {
     );
 }
 
+/// #687: RFC-0023's own header still said tiers 1-2 were building after tier 3 shipped in 2.6.0.
+/// The index row was current; the document was not. Deleting the shipped wording fails this.
+#[test]
+fn rfc_0023_status_line_does_not_say_building() {
+    let doc =
+        std::fs::read_to_string(rfc_dir().join("0023-contract-state-eth-call-derive-first.md"))
+            .expect("RFC-0023");
+    let status = doc_status_line(&doc).expect("RFC-0023 has a Status line");
+    let lower = status.to_ascii_lowercase();
+    assert!(
+        !lower.contains("building"),
+        "RFC-0023 status still talks about tiers building:\n{status}"
+    );
+    assert!(
+        !status.contains("Pending: tier 3"),
+        "RFC-0023 status still lists tier 3 as pending:\n{status}"
+    );
+}
+
 fn rfc_number(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     if path.extension()?.to_str()? != "md" || name == "README.md" {
