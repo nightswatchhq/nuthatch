@@ -1,6 +1,6 @@
-# Sprint: amiable-axolotl (2026-07-27 - 2026-07-30) - **closed**
+# Sprint: amiable-axolotl - **closed**
 
-> Closed 2026-07-30. Everything in scope shipped, and the window then absorbed RFC-0022 in full
+> Closed. Everything in scope shipped, and the sprint then absorbed RFC-0022 in full
 > (built, released as 0.8.0/0.8.1, verified 10/10 on a clean box, documented). Successor:
 > [boisterous-badger](sprint-boisterous-badger.md).
 

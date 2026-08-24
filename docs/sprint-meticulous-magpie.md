@@ -1,7 +1,7 @@
 # Sprint: meticulous-magpie
 
-Filed by the board on 2026-08-22, after languid-lapwing closed four of four and was audited.
-**Four issues.** Runs **Saturday 2026-08-22 to Monday 2026-08-24**.
+Filed after languid-lapwing closed four of four and was audited.
+**Four issues.**
 
 ## Definition of done
 
@@ -79,7 +79,7 @@ here because it is the kind of thing a benchmark should have shown and did not.
 ## Ordering
 
 **#722 first, #726 after it.** The other two are independent and can run in parallel with either.
-If #722 has not produced a number by Sunday, say so and take #726's caveat-only path rather than
+If #722 has not produced a number, say so and take #726's caveat-only path rather than
 holding both.
 
 ## Explicitly not in this sprint

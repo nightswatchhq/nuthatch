@@ -1,7 +1,7 @@
 # Sprint: languid-lapwing
 
-Filed by the board on 2026-08-21, after kindly-kestrel closed its issues and v2.6.3 shipped.
-**Four issues.** Runs **Friday 2026-08-21 to Monday 2026-08-24**.
+Filed after kindly-kestrel closed its issues and v2.6.3 shipped.
+**Four issues.**
 
 ## Definition of done
 

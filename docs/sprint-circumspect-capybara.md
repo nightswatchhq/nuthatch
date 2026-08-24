@@ -1,8 +1,8 @@
-# Sprint: circumspect-capybara (2026-08-07 - 2026-08-21)
+# Sprint: circumspect-capybara - **closed**
 
 ---
 
-## CLOSED 2026-08-11: 13 of 13
+## CLOSED: 13 of 13
 
 Shipped as [v2.1.0](https://github.com/nightswatchhq/nuthatch/releases/tag/v2.1.0). 56 commits, 27
 merged PRs, two of them from outside contributors (#421, #440).

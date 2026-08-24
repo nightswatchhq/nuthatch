@@ -1,8 +1,7 @@
 # Sprint: rigorous-raven
 
-Filed 2026-08-24, after quizzical-quail's labelled set closed on the branch (PR #805 still
-landing). **Four issues.** Runs **Sunday 2026-09-07 to Sunday 2026-09-14**, or the Monday after
-#805 merges, whichever is later.
+Filed after quizzical-quail's labelled set closed on the branch (PR #805 still
+landing). **Four issues.**
 
 ## Definition of done
 
