@@ -12,6 +12,8 @@ pub struct Resolved {
     pub abi: Value,
     pub via: &'static str,
     pub fallback_reason: Option<String>,
+    /// Sourcify v2 `name` when present. Not a decode input; `init`/`add` use it as a default alias.
+    pub contract_name: Option<String>,
 }
 
 /// Resolve a contract ABI without making an API token the normal path. Sourcify is the primary
@@ -19,16 +21,18 @@ pub struct Resolved {
 /// operates; Etherscan is retained for chains Blockscout does not cover and as a final fallback.
 pub async fn resolve(chain_id: u64, address: &str) -> Result<Resolved> {
     match sourcify(chain_id, address).await {
-        Ok(abi) => Ok(Resolved {
+        Ok((abi, name)) => Ok(Resolved {
             abi,
             via: "Sourcify",
             fallback_reason: None,
+            contract_name: name,
         }),
         Err(sourcify_err) => match blockscout(chain_id, address).await {
             Ok(abi) => Ok(Resolved {
                 abi,
                 via: "Blockscout",
                 fallback_reason: Some(format!("Sourcify miss: {sourcify_err:#}")),
+                contract_name: None,
             }),
             Err(blockscout_err) => {
                 let abi = etherscan(chain_id, address).await?;
@@ -38,15 +42,17 @@ pub async fn resolve(chain_id: u64, address: &str) -> Result<Resolved> {
                     fallback_reason: Some(format!(
                         "Sourcify miss: {sourcify_err:#}; Blockscout miss: {blockscout_err:#}"
                     )),
+                    contract_name: None,
                 })
             }
         },
     }
 }
 
-async fn sourcify(chain_id: u64, address: &str) -> Result<Value> {
+async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>)> {
     // Sourcify server API v2. The legacy /server/files endpoint is retired.
-    let url = format!("https://sourcify.dev/server/v2/contract/{chain_id}/{address}?fields=abi");
+    let url =
+        format!("https://sourcify.dev/server/v2/contract/{chain_id}/{address}?fields=abi,name");
     let resp = reqwest::get(&url)
         .await
         .context("Sourcify request failed")?;
@@ -57,7 +63,16 @@ async fn sourcify(chain_id: u64, address: &str) -> Result<Value> {
         .json()
         .await
         .context("Sourcify response was not JSON")?;
-    parse_sourcify(&body)
+    Ok((parse_sourcify(&body)?, sourcify_contract_name(&body)))
+}
+
+/// Sourcify v2 `name` - the verified contract's identifier, not an ABI field. Used as the default
+/// alias when `init`/`add` are not given `--alias` (#774).
+fn sourcify_contract_name(body: &Value) -> Option<String> {
+    body.get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// The ABI out of a Sourcify v2 response body - split from the request so it is testable against
@@ -153,6 +168,19 @@ mod tests {
     use serde_json::json;
 
     const ABI: &str = r#"[{"type":"event","name":"Transfer","inputs":[]}]"#;
+
+    #[test]
+    fn sourcify_name_is_the_alias_hint_and_empty_is_absent() {
+        assert_eq!(
+            sourcify_contract_name(&json!({"name": "DelegationManager", "abi": []})).as_deref(),
+            Some("DelegationManager")
+        );
+        assert_eq!(
+            sourcify_contract_name(&json!({"name": "", "abi": []})),
+            None
+        );
+        assert_eq!(sourcify_contract_name(&json!({"abi": []})), None);
+    }
 
     #[test]
     fn sourcify_success_error_and_malformed() {

@@ -267,6 +267,22 @@ pub enum NestWhat {
     /// on by default). A self-built bundle and `nest load <file|dir>` never need one.
     /// Prints the content address.
     Publish(NestPublishArgs),
+    /// Re-key a contract alias: `nuthatch.toml`, the ABI file, and `semantic.toml`.
+    ///
+    /// Declared, not inferred. `nuthatch schema` will not guess a rename, because it cannot tell
+    /// one from a removal, and silent deletion of authored prose is worse than a warning.
+    RenameAlias(RenameAliasArgs),
+}
+
+#[derive(Args)]
+pub struct RenameAliasArgs {
+    /// Current alias, e.g. `c0`.
+    pub old: String,
+    /// New alias, e.g. `gns`. Must match `[a-z][a-z0-9_]*`.
+    pub new: String,
+    /// Nest directory (must contain a nuthatch.toml).
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]
@@ -751,7 +767,9 @@ pub struct InitArgs {
     #[arg(long, value_name = "URL_PREFIX")]
     pub ipfs: Vec<String>,
 
-    /// Optional aliases, one per address in order (comma-separated). Defaults to c0, c1, ….
+    /// Optional aliases, one per address in order (comma-separated). When omitted, the alias is
+    /// the contract name from the ABI (`DelegationManager` → `delegation_manager`), falling back
+    /// to c0, c1, … only when no usable name is present.
     #[arg(long, value_delimiter = ',')]
     pub alias: Vec<String>,
 
@@ -801,8 +819,9 @@ pub struct AddArgs {
     #[arg(num_args = 1..)]
     pub addresses: Vec<String>,
 
-    /// Optional aliases, one per address in order (comma-separated). Defaults to the next free
-    /// c<N> slots after the nest's existing contracts.
+    /// Optional aliases, one per address in order (comma-separated). When omitted, the alias is
+    /// the contract name from the ABI (`DelegationManager` → `delegation_manager`), falling back
+    /// to the next free c<N> slot only when no usable name is present.
     #[arg(long, value_delimiter = ',')]
     pub alias: Vec<String>,
 
