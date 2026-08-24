@@ -3,10 +3,12 @@
 Two harnesses: **backfill** (the write path - this page's main subject) and **query** (the read path,
 [below](#query-benchmarks-the-read-path)).
 
-**House rule:** every performance number nuthatch publishes traces to a `bench-report.json`
-produced by `nuthatch bench backfill` - with date, provider, hardware, and commit. No hand-typed
-numbers, including flattering ones. This page documents the harness and the pinned workloads; the
-baseline matrix is filled in from real runs (an archive node is needed for the historical ranges).
+**House rule:** every performance number nuthatch publishes traces to a committed
+`docs/bench/*.json` - with **commit**, **provider**, and **hardware** (and date when the harness
+recorded one). No hand-typed numbers, including flattering ones. `tests/bench_citations.rs` fails
+the build when a citation on this page has no such file, or when the file is missing those fields.
+This page documents the harness and the pinned workloads; the baseline matrix is filled in from
+real runs (an archive node is needed for the historical ranges).
 
 ## The harness
 
@@ -35,74 +37,44 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 | W3 | USDC + WETH + Uniswap V3 factory (mainnet) | 50,000 blocks | mixed density, multi-table fan-out |
 
 
-## What a backfill costs against a metered endpoint (2026-08-19)
+## What a backfill costs against a metered endpoint
 
 Throughput is not the only number an operator cares about. "Be your own indexer" is partly an argument
-about bills, so this is what a day of real backfills actually consumed - measured against one Alchemy
-key, across Arbitrum, BSC, Polygon, Optimism and Gnosis.
+about bills. Header CU is **20** for `eth_getBlockByNumber` - Alchemy's published schedule, confirmed
+by a counting proxy in front of a paid key (#765). `eth_getLogs` is 60 CU, `eth_blockNumber` is 10 CU.
+`$0.45` per million CU for the first 300M/month. Same rates as [`operators.md`](operators.md).
 
-**~11.5M compute units for six backfills** - about **$5** at the rate an Alchemy PAYG invoice actually
-charges, **$0.00000045/CU** ($0.45 per million; taken from a real July invoice, not from a pricing
-page). The largest runs were 454M blocks of Arbitrum history for a two-contract nest and 200,000
-blocks of BSC for a single busy ERC-20.
+**The previously published ~$1,192 full-history Uniswap V3 extrapolation is withdrawn.** It was
+derived from an estimated ~3.6M CU over 674k blocks, which cannot be right at 20 CU/header: a BSC
+row on the same table claimed ~3.0M CU total for ~180k event-bearing blocks, and `180,000 × 20 =
+3.60M` CU for headers *alone*. No committed method breakdown supports either the 3.6M input or the
+$1,192. #765's live `uniswap-v3` Arbitrum catch-up (61,709 headers / 171,509 blocks) is a *different*
+workload class - post-factory-flip, topic0-only, inflated by headers of logs later discarded - and
+must not be silently substituted.
 
-For scale: a whole month of this project's development traffic came to **67.5M CU = $30.39**. Indexing
-is cheap; the interesting question is what fraction of it is *necessary*, which is the next section.
-
-| Run | Estimated CU | Shape |
-|---|---:|---|
-| `graph-allocations`, 454M blocks | ~4.4M | ~5,500 `getLogs` + a header per event-bearing block |
-| BSC, 200k blocks, 1.67M events | ~3.0M | dense contract, ~180k event-bearing blocks |
-| Uniswap V3, 674k blocks, 196k events | ~3.6M | plus retries |
-| Chain sweep + diffs + DOUDOCHAIN | ~0.4M | all bounded |
+Price a backfill from a counted run (`nuthatch_rpc_methods_total` × the schedule above), not from
+this page. Steady-state **tip-following** on Arbitrum is computed in operators.md at **~$134/month**
+at those same rates, of which ~$93 is header fetches.
 
 ### The finding: our own default is the cost, not the indexing
 
-**Roughly 80% of that is `eth_getBlockByNumber`, not `eth_getLogs`.** The provider's method breakdown
-put the header call *above* the log call. The cause is `block_timestamps = true`, which nuthatch
-defaults on: one header fetch for every block that carries an event.
+**Headers dominate.** #765 measured 99.5% of CU on `eth_getBlockByNumber` for a factory catch-up:
+61,709 headers vs 110 `eth_getLogs` vs 24 `eth_call`. The cause is `block_timestamps = true` (the
+default): one header fetch per block that still has a kept row, plus retries when a provider returns
+a partial batch (`block_timestamps: N/M block(s) missing - refusing a partial map`).
 
-It is worse than the raw count suggests. A busy range provokes partial responses - the Uniswap run
-logged two dozen warnings of the form `block_timestamps: 882/1548 block(s) missing from the RPC
-response`, and each one is a re-ask of the same range.
+A topic0-only factory fetch used to stamp **every** topic0 match on the chain, including other
+protocols that share the event shape, then discard those rows. That nest kept 1,627 event-bearing
+blocks and bought ~200,000 headers. As of pragmatic-peregrine the stamp follows local filtering:
+only blocks that produced a kept row (plus `[[calls]]` sample blocks) are fetched.
 
-So against a metered endpoint, **nuthatch's default costs several times more than its actual indexing
-work**. That is a fact about our defaults rather than about any provider, and it is the sort of thing
-this project should publish about itself rather than have an operator discover on an invoice.
+`block_timestamps = false` (RFC-0029 §6b) removes the header term entirely, at the cost of the
+column. A nest that never asks "when" should not be paying for it.
 
-At today's volumes that is $5 against $1, which nobody would optimise for. At a hundred nests it is
-the difference between a rounding error and a line item, and it is a claim nuthatch makes about
-itself - so it is worth stating the number rather than the adjective.
-
-`block_timestamps = false` (RFC-0029 §6b) removes it entirely, at the cost of the column. A nest that
-never asks "when" should not be paying for it.
-
-### Price a backfill before you start it
-
-A from-deployment backfill on a mature chain is not the same order of expense as a bounded one, and the
-difference is three figures rather than a rounding error. The arithmetic is simple enough that there is
-no excuse for skipping it:
-
-```
-cost ≈ (blocks / measured_blocks) × measured_CU × $0.00000045
-```
-
-Worked, from a run that was actually measured: Uniswap V3 on Arbitrum over 674,425 blocks cost ~3.6M CU
-(~$1.62). Its factory was deployed at block **175**, so the full history is **736 times** that range:
-
-| Range | Events | CU | Cost |
-|---|---:|---:|---:|
-| 674k blocks (measured) | 195,515 | 3.6M | **$1.62** |
-| Full factory history (extrapolated) | ~144M | ~2,650M | **~$1,192** |
-
-Early chain history is far sparser than the tip, so that is an upper bound - but a tenth of it is still
-three figures. **A full-history backfill on a busy factory gets priced and agreed before it is
-started, not after.** A day of bounded proof runs across six chains came to **$5.15**; one unpriced
-backfill would have been two hundred times that.
-
-Two guards worth having on the provider side rather than in a habit: a **spend limit** (the "Set limit"
-control beside each usage chart) turns an accident into a refusal, and a **custom throughput override**
-turns a concurrency spike into throttling rather than billing.
+**A full-history backfill on a busy factory gets priced and agreed before it is started, not after.**
+Two guards worth having on the provider side rather than in a habit: a **spend limit** (the "Set
+limit" control beside each usage chart) turns an accident into a refusal, and a **custom throughput
+override** turns a concurrency spike into throttling rather than billing.
 
 ### The other lever: concurrency, not volume
 
