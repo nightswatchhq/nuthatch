@@ -1,6 +1,6 @@
 //! RFC-0041 slice one: explicit authored incremental-entity declarations and conservative refusal.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use duckdb::Connection;
 use serde::Deserialize;
 use serde_json::Value;
@@ -85,12 +85,14 @@ struct EntityFile {
     entities: Vec<EntityDecl>,
 }
 
-#[derive(Debug, Deserialize)]
-struct EntityDecl {
-    name: String,
-    sql: String,
-    key: Vec<String>,
-    max_rows: usize,
+/// One author-declared maintained relation. Parsing is centralised here so startup, `check`, and a
+/// future serving surface all act on exactly the file whose bytes form the nest identity.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntityDecl {
+    pub name: String,
+    pub sql: String,
+    pub key: Vec<String>,
+    pub max_rows: usize,
 }
 
 /// Validation failures are collected so `nuthatch check` names every bad declaration at once.
@@ -112,6 +114,21 @@ pub fn has_declarations(dir: &Path) -> bool {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .any(|path| path.extension().and_then(|x| x.to_str()) == Some("sql"))
+}
+
+/// Load the authored entity declarations. An absent manifest means this nest has no incremental
+/// entities, which is the ordinary case. A present but malformed manifest is an error rather than an
+/// empty list: treating a typo as "no runtime needed" would make maintained state disappear.
+pub fn load(dir: &Path) -> Result<Vec<EntityDecl>> {
+    let path = dir.join(ENTITY_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let file: EntityFile =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    Ok(file.entities)
 }
 
 pub fn validate(dir: &Path) -> Vec<EntityIssue> {
@@ -618,6 +635,21 @@ mod tests {
         let issues = validate(dir.path());
         assert_eq!(issues.len(), 1);
         assert!(issues[0].error.contains("no entities.toml declaration"));
+    }
+
+    #[test]
+    fn load_is_empty_only_when_the_manifest_is_absent() {
+        let dir = nest();
+        assert!(load(dir.path()).unwrap().is_empty());
+        std::fs::write(
+            dir.path().join(ENTITY_FILE),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=10\n",
+        )
+        .unwrap();
+        let declarations = load(dir.path()).unwrap();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "totals");
+        assert_eq!(declarations[0].key, vec!["owner"]);
     }
 
     #[test]
