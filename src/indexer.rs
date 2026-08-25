@@ -2643,6 +2643,25 @@ pub async fn backfill_direct(
     });
     while next <= to {
         let chunk_to = (next + chunker.as_ref().map_or(window, AdaptiveWindow::window) - 1).min(to);
+        // **A window of zero blocks is not a window** (#853).
+        //
+        // `next` advances to `chunk_to + 1`, so a zero-width window leaves it exactly where it was
+        // and this loop spins forever, issuing an inverted range to the source on every pass. It
+        // cannot be interrupted from outside either: the fetch resolves immediately against a warm
+        // source, so the future never yields and no `tokio::time::timeout` around the caller ever
+        // gets polled - which is how three mutants of the window controller were recorded by the
+        // nightly sweep as Timeout rather than Caught, each burning 688 seconds of it.
+        //
+        // A pure invariant rather than a heuristic: there is no legitimate zero-width request, so
+        // this can never fire in correct operation and needs no tuning. The pipelined path already
+        // refuses the same state one line differently - `next.saturating_add(w - 1)` underflows on
+        // `u64` - so this brings the sequential path up to the behaviour its sibling already had.
+        if chunk_to < next {
+            anyhow::bail!(
+                "the window controller produced a zero-width range at block {next} - refusing to \
+                 loop without advancing. This is a bug in the controller, not a provider fault."
+            )
+        }
         // Nothing to decode means nothing to ask for. An empty address AND topic filter is not
         // "no logs" to a node - it is *every log on the chain*, which a blocks-only nest (OBIB case
         // 3: no contract at all) would otherwise request for every window and then discard, since
