@@ -1077,6 +1077,92 @@ mod tests {
         assert_eq!(total, 2);
     }
 
+    /// #842 - the RFC-0033 §11a shared-store arm had no test at all.
+    ///
+    /// Recovered from the 2026-08-24 nightly mutation artifact, which found `delete ! in
+    /// seal_range_with_snapshot` surviving and was then cancelled before it could report it. The
+    /// guard is `if !shared.exists()`; with the `!` removed a *new* shared segment is never written
+    /// and only an already-present one is rewritten. Every test passed, because nothing sealed into
+    /// a shared store and then looked for the file.
+    ///
+    /// This is the arm two mounts of one NID depend on, so the failure it admits is a manifest
+    /// listing a segment with no bytes behind it, on the dataset that by definition has more than
+    /// one nest reading it.
+    #[test]
+    fn a_shared_store_receives_the_segment_bytes() {
+        // `shared_store` is derived by convention: a dataset at `<root>/data/<nid>` shares
+        // `<root>/segments`. A solo nest is not under a `data/` parent and takes the other arm.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = shared_store(&dir).expect("a dataset under data/ has a shared store");
+        assert_eq!(store, root.path().join(SEGMENTS_DIR));
+        assert!(
+            !store.exists(),
+            "the store does not exist before the first seal"
+        );
+
+        seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+
+        // The manifest names one segment; its bytes must be in the shared store.
+        let manifest = load_manifest(&dir).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let shared = store.join(format!("{}.parquet", seg.hash));
+        assert!(
+            shared.is_file(),
+            "the shared store holds no {}.parquet - the Some(store) arm wrote nothing. \
+             Store contains: {:?}",
+            seg.hash,
+            std::fs::read_dir(&store)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert!(
+            std::fs::metadata(&shared).unwrap().len() > 0,
+            "the shared segment is empty"
+        );
+
+        // And it went there *instead* of beside the nest - the two arms are exclusive.
+        assert!(
+            !dir.join(SEGMENTS_DIR).join(&seg.file).exists(),
+            "a shared dataset must not also write the per-nest copy"
+        );
+
+        // The reader agrees with the writer about where the bytes are.
+        assert_eq!(segment_path(&dir, &seg.file, &seg.hash), shared);
+    }
+
+    /// The other half of the same guard: re-sealing identical rows must not disturb the stored copy.
+    /// This is what the `!` buys, and it is worth pinning separately so a fix for the test above
+    /// cannot simply drop the condition.
+    #[test]
+    fn re_sealing_identical_rows_leaves_the_shared_segment_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+
+        let manifest = load_manifest(&dir).unwrap();
+        let seg = manifest.tables["usdc__transfer"][0].clone();
+        let shared = shared_store(&dir)
+            .unwrap()
+            .join(format!("{}.parquet", seg.hash));
+        let before = std::fs::read(&shared).unwrap();
+
+        // Content-addressed idempotency: the same rows again are the same segment.
+        seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+
+        assert_eq!(
+            std::fs::read(&shared).unwrap(),
+            before,
+            "a re-seal changed the shared segment's bytes"
+        );
+        assert_eq!(
+            load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
+            1,
+            "a re-seal double-listed the segment in the manifest"
+        );
+    }
+
     #[test]
     fn empty_range_seals_nothing() {
         let dir = tempfile::tempdir().unwrap();
