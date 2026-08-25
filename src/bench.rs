@@ -97,6 +97,20 @@ fn choose_path(is_factory: bool, seal_direct: bool, concurrency: usize) -> Backf
 /// take it. `BenchReport.window_adaptive` is built from this, not from the flag directly, because
 /// echoing the flag is the exact mistake this issue replaces (`window_adaptive: args.seal_direct`
 /// echoed the storage flag rather than reporting what the run did).
+/// Should the operator be told that `--window-adaptive` changed nothing? (#847)
+///
+/// The condition here used to be `requested && !effective_window_adaptive(path, requested)` - "was
+/// adaptivity asked for and refused". [`effective_window_adaptive`] never does that: the only two
+/// paths that ignore the flag ignore it *upward*, so the guard was false in all eight rows of its
+/// truth table and the clause it gated had never printed once.
+///
+/// The situation worth naming is the opposite one, and it is real: the flag was passed, and the path
+/// would have adapted anyway. Saying so is the difference between a reproducible command line and a
+/// number nobody can account for - which is the whole reason #744 exists.
+fn flag_had_no_effect(path: BackfillPath, requested: bool) -> bool {
+    requested && matches!(path, BackfillPath::Factory | BackfillPath::Pipelined)
+}
+
 fn effective_window_adaptive(path: BackfillPath, requested: bool) -> bool {
     match path {
         BackfillPath::Factory | BackfillPath::Pipelined => true,
@@ -441,7 +455,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         } else {
             "fixed"
         },
-        if args.window_adaptive && !window_adaptive {
+        if flag_had_no_effect(path, args.window_adaptive) {
             " (--window-adaptive has no effect here: the pipelined/factory path always adapts, the \
              same as `nuthatch dev`)"
         } else {
@@ -1946,6 +1960,30 @@ abi = "abis/c.json"
     /// *different* flag regardless of what happened. `Direct` and `HotStore` take the request
     /// as-is, all four combinations reachable; `Pipelined` and `Factory` always adapt, the same as
     /// `nuthatch dev`, so a `--window-adaptive` absent there must still report `true`.
+    /// #847 - the notice must be able to print. The condition it replaces was false in all eight
+    /// rows, so this asserts both halves: it fires where the flag is inert, and stays quiet where
+    /// the flag did something.
+    #[test]
+    fn the_no_effect_notice_fires_exactly_where_the_flag_is_inert() {
+        // Passed, and the path would have adapted regardless - the operator should be told.
+        assert!(flag_had_no_effect(BackfillPath::Factory, true));
+        assert!(flag_had_no_effect(BackfillPath::Pipelined, true));
+        // Passed, and it changed the run - nothing to say.
+        assert!(!flag_had_no_effect(BackfillPath::Direct, true));
+        assert!(!flag_had_no_effect(BackfillPath::HotStore, true));
+        // Not passed - nothing to say on any path, including the ones that adapt anyway.
+        for path in [
+            BackfillPath::Factory,
+            BackfillPath::Pipelined,
+            BackfillPath::Direct,
+            BackfillPath::HotStore,
+        ] {
+            assert!(
+                !flag_had_no_effect(path, false),
+                "{path:?} with the flag unset"
+            );
+        }
+    }
     #[test]
     fn window_adaptive_reports_what_the_run_did_not_what_was_asked() {
         for requested in [false, true] {
