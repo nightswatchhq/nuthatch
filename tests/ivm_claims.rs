@@ -89,9 +89,12 @@ fn readme_names_the_three_circuits_and_query_time_views() {
 #[test]
 fn claude_md_parks_authored_incremental_entities_on_rfc_0041() {
     let text = fs::read_to_string(root().join("CLAUDE.md")).expect("CLAUDE.md");
+    // Asserts the property, not the vocabulary. The 2026-08-24 carve-out replaced "frozen" with an
+    // approved-but-unshipped status, which is a different sentence and the same guarantee: the
+    // standing brief must never read as though authored incremental entities already work.
     assert!(
-        text.contains("RFC-0041") && text.contains("frozen"),
-        "CLAUDE.md must name RFC-0041 as frozen, not as shipped general behaviour"
+        text.contains("RFC-0041") && text.contains("do not describe them as shipped"),
+        "CLAUDE.md must name RFC-0041 and say it is not shipped, whatever its approval status"
     );
     assert!(
         text.contains("views/*.sql") && text.contains("Not incremental"),
