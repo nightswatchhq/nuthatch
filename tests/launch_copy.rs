@@ -62,7 +62,11 @@ fn launch_copy_does_not_describe_2_5_0() {
     for path in &files {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let name = path.strip_prefix(&root).unwrap_or(path).display().to_string();
+        let name = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
         for phrase in STALE {
             if text.contains(phrase) {
                 offenders.push(format!("{name}: still contains `{phrase}`"));
