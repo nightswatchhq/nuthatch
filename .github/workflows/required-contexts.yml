@@ -1,0 +1,41 @@
+# Does GitHub still enforce the checks the repo says it enforces? (#715, wired up in #845)
+#
+# `.github/required-checks.txt` is the committed record of the contexts required on `main`. Nothing
+# compared it against the live API: `scripts/check-required-contexts.sh` existed and was invoked by
+# no workflow, no test and no documented command, and would have exited 0 without a token anyway.
+# Branch protection is edited in GitHub's settings UI, which leaves no trace in the repository - so a
+# context quietly removed there is invisible until the day a bad merge goes through unchecked.
+#
+# **Not a required context itself, deliberately.** It reads a setting rather than the tree, so it
+# cannot be satisfied by changing a PR, and a required check a PR author cannot fix is a trap. It
+# runs on a schedule and reports; a human decides whether the file or the settings are wrong.
+name: required contexts match protection
+
+on:
+  schedule:
+    - cron: "20 6 * * *"
+  workflow_dispatch:
+  # Also on any change to the committed list, since that is the other direction of the same drift.
+  pull_request:
+    paths: [".github/required-checks.txt"]
+  push:
+    branches: [main]
+    paths: [".github/required-checks.txt"]
+
+# Reading `branches/main/protection` is an admin-scoped read. The default GITHUB_TOKEN does not
+# carry it, and without it the script fails loudly rather than passing quietly (#845).
+permissions:
+  contents: read
+  administration: read
+
+jobs:
+  drift:
+    name: required contexts match protection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare the committed list against live protection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/check-required-contexts.sh | tee -a "$GITHUB_STEP_SUMMARY"
