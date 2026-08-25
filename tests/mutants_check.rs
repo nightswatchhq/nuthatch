@@ -32,6 +32,18 @@ fn check(dir: &Path, file: Option<&str>) -> (bool, String) {
     (out.status.success(), s)
 }
 
+/// As [`workspace`], plus a `timeout.txt`. cargo-mutants writes timed-out mutants there rather than
+/// to `missed.txt`, which is how three of them escaped the gate entirely (#853).
+fn workspace_with_timeouts(
+    outcomes: Option<&str>,
+    missed: Option<&str>,
+    timeouts: &str,
+) -> tempfile::TempDir {
+    let dir = workspace(outcomes, missed);
+    std::fs::write(dir.path().join("mutants.out/timeout.txt"), timeouts).unwrap();
+    dir
+}
+
 /// A workspace with a baseline naming one known survivor, and whatever `mutants.out` the test wants.
 fn workspace(outcomes: Option<&str>, missed: Option<&str>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -134,4 +146,56 @@ fn the_file_scope_keeps_a_matrix_job_from_judging_another_files_baseline() {
         !scoped.contains("no longer survives"),
         "scoped to seal.rs, the chunker baseline entry must not be judged:\n{scoped}"
     );
+}
+
+#[test]
+fn a_timed_out_mutant_is_reported_rather_than_silently_neither() {
+    // The 2026-08-24 run's three real timeouts. They appeared in neither the survivor list nor the
+    // baseline, so 3 of 39 scoped mutants - about 8% - were in a state the gate said nothing about.
+    let w = workspace_with_timeouts(
+        Some(COMPLETE),
+        Some(""),
+        "src/chunker.rs:84:9: replace AdaptiveWindow::window -> u64 with 0\n\
+         src/chunker.rs:107:53: replace == with != in AdaptiveWindow::observed\n",
+    );
+    let (ok, out) = check(w.path(), None);
+    assert!(!ok, "an unbaselined timeout must fail:\n{out}");
+    assert!(out.contains("TIMED OUT"), "{out}");
+    assert!(
+        out.contains("replace AdaptiveWindow::window -> u64 with 0"),
+        "it must name them, not just count them:\n{out}"
+    );
+    assert!(
+        !out.contains("No new survivors"),
+        "a timeout must not be reported as a clean sweep:\n{out}"
+    );
+}
+
+#[test]
+fn a_timeout_is_scoped_by_file_like_a_survivor() {
+    // A per-file matrix job must not fail on another file's timeout.
+    let w = workspace_with_timeouts(
+        Some(COMPLETE),
+        Some(""),
+        "src/chunker.rs:84:9: replace AdaptiveWindow::window -> u64 with 0\n",
+    );
+    let (ok, out) = check(w.path(), Some("src/seal.rs"));
+    assert!(
+        ok,
+        "seal.rs is not answerable for a chunker.rs timeout:\n{out}"
+    );
+    let (ok, _) = check(w.path(), Some("src/chunker.rs"));
+    assert!(!ok, "chunker.rs is");
+}
+
+#[test]
+fn a_baselined_timeout_is_accepted_like_a_baselined_survivor() {
+    // Same rule as a survivor: recorded with a reason is fine, silence is not.
+    let w = workspace_with_timeouts(
+        Some(COMPLETE),
+        Some(""),
+        "src/chunker.rs:134:14: replace < with <= in AdaptiveWindow::served_by_splitting\n",
+    );
+    let (ok, out) = check(w.path(), None);
+    assert!(ok, "a timeout already in the baseline is not new:\n{out}");
 }
