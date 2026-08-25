@@ -252,6 +252,14 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
+        // Not serde's `Deserialize` at all - this is rkyv's, required by `dbsp::DBData` so an entity
+        // circuit can archive its own row type (#870). Nothing here is ever read from a nest's TOML.
+        // The gate matches on the derive *name*, which cannot tell the two apart; classifying it is
+        // the intended way to say so.
+        "src/entity_row.rs",
+        "rkyv archival for DBSP row state, not nest config",
+    ),
+    (
         "src/blob.rs",
         "content-addressed bundle manifest, not nest config",
     ),
