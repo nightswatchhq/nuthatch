@@ -309,6 +309,107 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
     issues
 }
 
+/// The serialized AST for `sql`, parsed. Shared by the shape gate and the allowlist so both judge
+/// exactly the same parse.
+fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
+    let literal = format!("'{}'", sql.replace('\'', "''"));
+    let raw: String =
+        conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+            r.get(0)
+        })?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+/// Aggregates whose maintenance under insert **and retraction** the v1 lowerer can express.
+///
+/// Short by design and an **allowlist**, which is the whole point (#836). The refusal list used to
+/// enumerate what was forbidden - `MEDIAN`, `MODE`, `PERCENTILE_*` - over a vocabulary DuckDB owns
+/// and grows, and it was wrong in both the ways `analytics.rs` predicts a denylist is wrong. About
+/// **coverage**: this build knows 88 distinct aggregate names, of which the list named three, so
+/// `quantile_cont`, `arg_max`, `string_agg`, `list`, `first`, `histogram` and the rest were admitted
+/// as incrementally maintainable. And about **spelling**: `PERCENTILE_CONT` is the SQL-standard alias
+/// while `quantile_cont` is the name DuckDB actually uses, so the list blocked the alias and admitted
+/// the real thing.
+///
+/// `count_star` is DuckDB's internal name for `count(*)`.
+const INCREMENTAL_AGGREGATES: &[&str] = &["sum", "min", "max", "avg", "count", "count_star"];
+
+/// Every `function_name` the parsed statement mentions, at any depth.
+fn function_names(ast: &Value, out: &mut BTreeSet<String>) {
+    match ast {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("FUNCTION") {
+                if let Some(name) = map.get("function_name").and_then(Value::as_str) {
+                    out.insert(name.to_ascii_lowercase());
+                }
+            }
+            for child in map.values() {
+                function_names(child, out);
+            }
+        }
+        Value::Array(values) => values.iter().for_each(|v| function_names(v, out)),
+        _ => {}
+    }
+}
+
+/// Whether any node of `kind` appears, and whether any aggregate carries `DISTINCT`.
+/// An **expression** subquery: a scalar `(SELECT …)`, `IN (SELECT …)`, or `EXISTS (…)`.
+///
+/// Deliberately not "any node of type SUBQUERY". DuckDB gives a derived table in `FROM` the same
+/// node type, and a derived table is an ordinary relation the lowerer has no trouble with - refusing
+/// those would reject `FROM (VALUES …) t(k)` and most real authored SQL with it. The two are told
+/// apart by `class`: an expression subquery carries `class: "SUBQUERY"` and a `subquery_type`
+/// (`SCALAR`/`ANY`/`EXISTS`), a derived table carries neither.
+fn has_expression_subquery(ast: &Value) -> bool {
+    match ast {
+        Value::Object(map) => {
+            (map.get("class").and_then(Value::as_str) == Some("SUBQUERY")
+                && map.get("subquery_type").is_some())
+                || map.values().any(has_expression_subquery)
+        }
+        Value::Array(values) => values.iter().any(has_expression_subquery),
+        _ => false,
+    }
+}
+
+fn has_distinct_aggregate(ast: &Value) -> bool {
+    match ast {
+        Value::Object(map) => {
+            (map.get("type").and_then(Value::as_str) == Some("FUNCTION")
+                && map.get("distinct").and_then(Value::as_bool) == Some(true))
+                || map.values().any(has_distinct_aggregate)
+        }
+        Value::Array(values) => values.iter().any(has_distinct_aggregate),
+        _ => false,
+    }
+}
+
+/// Which of `names` DuckDB itself classifies as aggregates.
+///
+/// Asked of the engine rather than kept in a table here, so the set is whatever this build actually
+/// supports and cannot drift from it. `duckdb_functions()` is the same catalogue the binder uses.
+fn aggregates_among(conn: &Connection, names: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    if names.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let list = names
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT lower(function_name) FROM duckdb_functions() \
+         WHERE function_type = 'aggregate' AND lower(function_name) IN ({list})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
 fn validate_sql(sql: &str) -> Result<()> {
     let conn = Connection::open_in_memory()?;
     let literal = format!("'{}'", sql.replace('\'', "''"));
@@ -338,6 +439,49 @@ fn validate_sql(sql: &str) -> Result<()> {
     {
         bail!("volatile functions are not incremental v1 SQL; keep this as views/*.sql")
     }
+    // **The allowlist, and the control meant to outlive the token pass below** (#836).
+    //
+    // Asks DuckDB which of the functions this statement names are aggregates, then admits only the
+    // ones the v1 lowerer can maintain. A function the engine gains tomorrow is refused by default,
+    // which is the property the token list could never have - and the name comes from the parsed
+    // AST, so `"median"(x)` cannot spell its way past it either.
+    let ast = plan_ast(&conn, sql)?;
+    let mut named = BTreeSet::new();
+    function_names(&ast, &mut named);
+    for aggregate in aggregates_among(&conn, &named)? {
+        if !INCREMENTAL_AGGREGATES.contains(&aggregate.as_str()) {
+            bail!(
+                "`{aggregate}` is not an aggregate incremental v1 can maintain (only {}); \
+                 keep this as views/*.sql",
+                INCREMENTAL_AGGREGATES.join(", ")
+            )
+        }
+    }
+    if has_expression_subquery(&ast) {
+        bail!(
+            "correlated and scalar subqueries are not incremental v1 SQL; keep this as views/*.sql"
+        )
+    }
+    if has_distinct_aggregate(&ast) {
+        bail!("DISTINCT aggregates are not incremental v1 SQL; keep this as views/*.sql")
+    }
+    if ast
+        .pointer("/statements/0/node/sample")
+        .is_some_and(|v| !v.is_null())
+    {
+        bail!("USING SAMPLE is not incremental v1 SQL; keep this as views/*.sql")
+    }
+    if ast
+        .pointer("/statements/0/node/group_sets")
+        .and_then(Value::as_array)
+        .is_some_and(|sets| sets.len() > 1)
+    {
+        bail!("GROUPING SETS/ROLLUP/CUBE are not incremental v1 SQL; keep this as views/*.sql")
+    }
+
+    // Kept *beside* the allowlist rather than replaced by it: two independent controls that must both
+    // pass, so a gap in either is covered. These are syntax forms, not function names, so the
+    // catalogue above cannot see them.
     let tokens = sql_tokens(sql);
     for (needle, why) in [
         ("DISTINCT", "DISTINCT"),
@@ -379,6 +523,8 @@ fn sql_tokens(sql: &str) -> Vec<String> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Code,
+        /// Inside `"..."` - a name, so its characters accumulate into the current token.
+        Ident,
         Quote(char),
         LineComment,
         BlockComment,
@@ -409,9 +555,18 @@ fn sql_tokens(sql: &str) -> Vec<String> {
                 state = State::BlockComment;
                 at += 1;
             }
-            State::Code if matches!(ch, '\'' | '"') => {
+            // A single quote opens a string literal, whose contents are text and are discarded. A
+            // double quote opens a **quoted identifier**, whose contents are a *name* - discarding
+            // those is what let `"median"(v)` past the refusal list (#836). `analytics.rs` learned
+            // the same lesson from `"read_csv"('/etc/passwd')` and fixed it by stripping the quotes
+            // rather than the contents; this does the same.
+            State::Code if ch == '\'' => {
                 flush(&mut current, &mut tokens);
                 state = State::Quote(ch);
+            }
+            State::Code if ch == '"' => {
+                flush(&mut current, &mut tokens);
+                state = State::Ident;
             }
             State::Code if ch.is_ascii_alphanumeric() || ch == '_' => current.push(ch),
             State::Code if ch == '(' => {
@@ -419,6 +574,12 @@ fn sql_tokens(sql: &str) -> Vec<String> {
                 tokens.push("(".into());
             }
             State::Code => flush(&mut current, &mut tokens),
+            State::Ident if ch == '"' && next == Some('"') => {
+                current.push('"');
+                at += 1;
+            }
+            State::Ident if ch == '"' => state = State::Code,
+            State::Ident => current.push(ch),
             State::Quote(quote) if ch == quote && next == Some(quote) => at += 1,
             State::Quote(quote) if ch == quote => state = State::Code,
             State::Quote(_) => {}
@@ -440,13 +601,7 @@ fn sql_tokens(sql: &str) -> Vec<String> {
 /// resolves these names against fact tables and earlier entities to form the entity DAG.
 pub fn dependencies(sql: &str) -> Result<Vec<String>> {
     let conn = Connection::open_in_memory()?;
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let raw: String =
-        conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-            r.get(0)
-        })?;
-    let ast: Value = serde_json::from_str(&raw)?;
-    Ok(crate::graft::table_refs(&ast))
+    Ok(crate::graft::table_refs(&plan_ast(&conn, sql)?))
 }
 
 /// Return one named cycle among entity-to-entity dependencies. Fact tables are absent from `nodes`
@@ -616,12 +771,86 @@ mod tests {
         assert!(validate(dir.path()).is_empty());
     }
 
+    /// #836 corrected the second half of this. A single-quoted **string** is text and is rightly
+    /// discarded; a double-quoted **identifier** is a *name*, and discarding it is what let
+    /// `"median"(v)` past the refusal list. The identifier now survives tokenisation.
+    ///
+    /// The cost is over-refusal: an entity that quotes a reserved word as a column alias - `SELECT x
+    /// AS "limit"` - is now refused. That is the trade `analytics.rs` already makes explicitly for
+    /// the same reason, and it is the safe direction.
     #[test]
-    fn refusal_tokens_ignore_comments_and_quoted_text() {
+    fn a_quoted_identifier_is_a_name_and_survives_tokenisation() {
         assert_eq!(
             sql_tokens("SELECT 'ORDER BY', \"LIMIT\" -- DISTINCT\n/* RANDOM() */"),
-            vec!["SELECT"]
+            vec!["SELECT", "LIMIT"],
+            "the literal and the comments go; the identifier stays"
         );
+        assert_eq!(
+            sql_tokens("SELECT \"me\"\"dian\"(x)"),
+            vec!["SELECT", "ME\"DIAN", "(", "X"],
+            "an escaped inner quote is part of the name"
+        );
+    }
+
+    /// #836 - the refusal list must be **closed**: every construct v1 cannot maintain is refused,
+    /// and the check is that not one of them slips through.
+    ///
+    /// The list this replaces refused 1 of these 13. It named `MEDIAN`, `MODE` and `PERCENTILE_*`
+    /// over a vocabulary DuckDB owns and grows - this build knows 88 aggregate names - so the real
+    /// spellings (`quantile_cont`) were admitted while the SQL-standard alias was blocked, and any
+    /// of them could be hidden behind a double quote regardless.
+    #[test]
+    fn every_ineligible_construct_is_refused() {
+        let ineligible: &[(&str, &str)] = &[
+            ("median", "SELECT 1 AS k, median(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("quoted median", "SELECT 1 AS k, \"median\"(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("quantile_cont", "SELECT 1 AS k, quantile_cont(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("quantile_disc", "SELECT 1 AS k, quantile_disc(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("approx_quantile", "SELECT 1 AS k, approx_quantile(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("arg_max", "SELECT 1 AS k, arg_max(v, v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("first", "SELECT 1 AS k, first(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("string_agg", "SELECT 1 AS k, string_agg(v::VARCHAR, ',') AS m FROM (VALUES (1),(2)) t(v)"),
+            ("list", "SELECT 1 AS k, list(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("histogram", "SELECT 1 AS k, histogram(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("any_value", "SELECT 1 AS k, any_value(v) AS m FROM (VALUES (1),(2)) t(v)"),
+            ("in-subquery", "SELECT v AS k FROM (VALUES (1),(2)) t(v) WHERE v IN (SELECT 1)"),
+            ("scalar subquery", "SELECT v AS k, (SELECT max(w) FROM (VALUES (9)) u(w)) AS m FROM (VALUES (1)) t(v)"),
+            // A *single* grouping set is deliberately absent: `GROUP BY GROUPING SETS ((v))`
+            // serialises byte-identically to `GROUP BY v` because it is the same query. The
+            // NULL-padding forms are the ones v1 cannot maintain.
+            ("two grouping sets", "SELECT a AS k, sum(b) AS m FROM (VALUES (1,2)) t(a,b) GROUP BY GROUPING SETS ((a),(b))"),
+            ("rollup", "SELECT a AS k, sum(b) AS m FROM (VALUES (1,2)) t(a,b) GROUP BY ROLLUP (a,b)"),
+            ("cube", "SELECT a AS k, sum(b) AS m FROM (VALUES (1,2)) t(a,b) GROUP BY CUBE (a,b)"),
+            ("using sample", "SELECT v AS k FROM (VALUES (1),(2)) t(v) USING SAMPLE 1"),
+            ("distinct aggregate", "SELECT 1 AS k, count(DISTINCT v) AS m FROM (VALUES (1),(2)) t(v)"),
+        ];
+        let admitted: Vec<&str> = ineligible
+            .iter()
+            .filter(|(_, sql)| validate_sql(sql).is_ok())
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            admitted.is_empty(),
+            "admitted as incrementally maintainable: {admitted:?}"
+        );
+    }
+
+    /// The other side of the same gate: the allowlist must not refuse what v1 *can* maintain, or
+    /// authors route around it. A closed list that refuses everything is not a win.
+    #[test]
+    fn the_maintainable_aggregates_are_still_admitted() {
+        for sql in [
+            "SELECT k, sum(v) AS s FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+            "SELECT k, count(*) AS n FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+            "SELECT k, min(v) AS a, max(v) AS b, avg(v) AS c FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+            "SELECT lower(s) AS k FROM (VALUES ('A')) t(s)",
+        ] {
+            assert!(
+                validate_sql(sql).is_ok(),
+                "wrongly refused: {sql} -> {:?}",
+                validate_sql(sql)
+            );
+        }
     }
 
     #[test]
