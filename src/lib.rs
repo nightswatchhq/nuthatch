@@ -31,6 +31,7 @@ pub mod distribution;
 pub mod doctor;
 pub mod effectful;
 pub mod entities;
+pub mod entity_expr;
 pub mod entity_row;
 pub mod exposure;
 pub mod factory;
