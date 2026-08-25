@@ -15,6 +15,12 @@ ran, died, or was killed at the job timeout reported a clean bill of health. Eve
 between 2026-08-23 and 2026-08-25 was cancelled at `timeout-minutes: 300`, and this script is the
 reason nobody found out from the job itself. "I could not tell" must never render as "nothing found".
 
+**A timeout is neither caught nor missed, and used to be reported as neither (#853).** cargo-mutants
+writes survivors to `missed.txt` and timed-out mutants to `timeout.txt`; this script read only the
+first, so a mutant could escape the gate by being slow. On the 2026-08-24 run that was 3 of 39 - and
+all three turned out to be genuine: each sends a loop in the adaptive window controller into a spin,
+so a named test never terminates. They are now their own category, and an unbaselined one fails.
+
 Usage:
     mutants-check.py [--file src/foo.rs]
 
@@ -29,6 +35,7 @@ from pathlib import Path
 
 OUT = Path("mutants.out")
 MISSED = OUT / "missed.txt"
+TIMEOUT = OUT / "timeout.txt"
 OUTCOMES = OUT / "outcomes.json"
 BASELINE = Path(".github/mutants-baseline.toml")
 
@@ -106,16 +113,34 @@ def main():
 
     known = baseline_entries(BASELINE.read_text()) if BASELINE.is_file() else []
     found = survivors(MISSED.read_text())
+    timed_out = survivors(TIMEOUT.read_text()) if TIMEOUT.is_file() else []
     if args.file:
         known = [k for k in known if k[0] == args.file]
         found = [s for s in found if s[0] == args.file]
+        timed_out = [t for t in timed_out if t[0] == args.file]
         print(f"scope: {args.file}")
 
     new = [s for s in found if s not in known]
-    gone = [k for k in known if k not in found]
+    # A timeout is judged against the same baseline: it is an outcome the suite failed to produce a
+    # verdict for, which is the same thing a survivor is, arrived at more slowly.
+    new_timeouts = [t for t in timed_out if t not in known]
+    gone = [k for k in known if k not in found and k not in timed_out]
 
     for f, m in gone:
         print(f"note: baseline entry no longer survives, remove it: {f}: {m}")
+
+    if new_timeouts:
+        print()
+        print(f"{len(new_timeouts)} mutation(s) TIMED OUT and are not in {BASELINE}:")
+        for f, m in new_timeouts:
+            print(f"  {f}: {m}")
+        print()
+        print("A timeout is not a caught mutant. The test process did not finish, so the suite")
+        print("produced no verdict on this mutation at all - and a test that hangs rather than fails")
+        print("cannot say what went wrong, in CI or in production. Check the per-mutant log in")
+        print("mutants.out/log/ for a test reported as 'has been running for over 60 seconds': that")
+        print("names the loop that stopped advancing. See #853.")
+        return 1
 
     if not new:
         print(f"No new survivors. {len(found)} survivor(s), all in the baseline with a reason.")

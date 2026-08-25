@@ -20,3 +20,46 @@ whose first act is to demand unrelated work is a gate people learn to route arou
 this is the window controller #672 took five attempts to get right, and its boundary conditions are
 exactly where that went wrong.
 """
+
+# --- Timeouts (#853). ---------------------------------------------------------------------------
+#
+# These three are not slow builds. Each inverts a signal the adaptive window controller steers by,
+# the controller then stops advancing, and a **named test waits for it forever** rather than failing.
+# Recovered from the per-mutant logs of the 2026-08-24 run, each of which reports its test as "has
+# been running for over 60 seconds" before the sweep is killed.
+#
+# They are recorded rather than chased because the fix is a judgement call the board should make:
+# bounding the five affected tests is a ten-site test-only change, while a no-progress guard in the
+# backfill loop itself is one change that also closes the production hazard #672 describes ("a window
+# 10x over a cap fails whole and retries forever"). The second is a behaviour change under the
+# freeze. Removing these entries is the good direction and needs no ceremony.
+#
+# They also cost the sweep 688 seconds each - about half the reason #841 had to split the job.
+
+[[survivor]]
+file = "src/chunker.rs"
+mutation = "replace AdaptiveWindow::window -> u64 with 0"
+reason = """
+A window of zero blocks means a loop that advances by `window` never advances. Three tests hang:
+`indexer::tests::a_contract_free_nest_issues_no_getlogs_on_any_backfill_path`,
+`a_timestamp_free_nest_backfills_without_a_single_timestamp_call`, and
+`both_tip_loops_still_fetch_logs_for_a_nest_with_contracts`.
+"""
+
+[[survivor]]
+file = "src/chunker.rs"
+mutation = "replace == with != in AdaptiveWindow::observed"
+reason = """
+Inverts the controller's growth signal, so the request count never converges.
+`indexer::tests::the_cost_of_a_first_run_behind_a_capped_provider_is_a_fixed_number` hangs - which is
+the test whose whole point is that the number is fixed.
+"""
+
+[[survivor]]
+file = "src/chunker.rs"
+mutation = "replace is_result_too_large -> bool with false"
+reason = """
+A provider cap is never recognised, so the narrowing retry never narrows and re-asks at the same
+width forever. `indexer::tests::pass_two_shrinks_the_window_on_a_provider_cap` hangs. Note the
+sibling mutation `-> true` is caught in 137s, so the tests do bound the other direction.
+"""
