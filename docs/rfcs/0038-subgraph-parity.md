@@ -189,8 +189,13 @@ keeps a credential out of the nest's content address by construction. `--seal-di
 calls is refused, because tier 3 is wired into `process_window` only and a seal-direct run would have
 sealed the range with the table silently absent - #262's own shape, guarded before shipping it.
 
-**Slice 2 - parameterised calls. DONE.** `on`/`signature`/`args`/`contract_column`, literals beside
-column references, dedupe by `CallKey` **before** the RPC, and the volume bound as a loud refusal.
+**Slice 2 - parameterised calls. PARTIAL.** `on`/`signature`/`args`/`contract_column`, literals beside
+column references, and dedupe by `CallKey` **before** the RPC. The volume bound §3 calls for - a
+`max_calls` field with an `--i-mean-it`-style opt-in - **was never built**; this entry claimed it as
+delivered until 2026-08-25. Nothing between a row-driven declaration on a busy table and a large
+metered bill except the author noticing, and `CallKey` dedupe does not help, because `balanceOf(to)`
+differs per row by construction. Tracked as #760, which stays frozen for the guard itself: building
+it is new capability, correcting this sentence was not.
 
 Two things the build changed about the design. The reserved band had to widen from 1,000 slots to
 **500,000**, because a row-driven declaration fires once per source row and one dense block can want
