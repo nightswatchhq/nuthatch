@@ -31,6 +31,7 @@ pub mod distribution;
 pub mod doctor;
 pub mod effectful;
 pub mod entities;
+pub mod entity_view;
 pub mod exposure;
 pub mod factory;
 pub mod flags;
