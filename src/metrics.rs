@@ -55,6 +55,11 @@ pub struct NestMetrics {
     seal_direct_origin: AtomicU64,
     seal_direct_completed: AtomicU64,
     seal_direct_target: AtomicU64,
+    /// When the seal-direct watermark last actually moved (#846). `seal_direct_completed` is a block
+    /// number and says nothing about time, so without this a pass that has died and a pass that is
+    /// legitimately slow are the same observation - and `/ready` suppresses every other stall term
+    /// while a pass is active, so it had nothing left to judge by.
+    last_seal_progress: AtomicU64,
     /// Hot-store file and sealed-segment directory, for #812 footprint gauges. `None` until the
     /// nest is built.
     storage: Mutex<Option<(PathBuf, PathBuf)>>,
@@ -170,11 +175,26 @@ impl NestMetrics {
         self.seal_direct_completed
             .store(origin.saturating_sub(1), Relaxed);
         self.seal_direct_target.store(target, Relaxed);
+        self.last_seal_progress.store(now_unix(), Relaxed);
         METRICS.begin_seal_direct(origin, target);
     }
+    /// Stamps `last_seal_progress` only when `block` actually advances the watermark, mirroring
+    /// [`NestMetrics::set_last_block`]. A pass that keeps reporting the same block is not making
+    /// progress and must not refresh its own clock by saying so (#846).
     pub fn set_seal_direct_completed(&self, block: u64) {
-        self.seal_direct_completed.store(block, Relaxed);
+        if block > self.seal_direct_completed.swap(block, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
         METRICS.set_seal_direct_completed(block);
+    }
+    pub fn last_seal_progress(&self) -> u64 {
+        self.last_seal_progress.load(Relaxed)
+    }
+    /// Test seam, mirroring the other clock seams: pin the seal clock so a test can simulate "sealed
+    /// once, then froze" without waiting out a real threshold.
+    #[cfg(test)]
+    pub fn set_last_seal_progress_for_test(&self, t: u64) {
+        self.last_seal_progress.store(t, Relaxed);
     }
     /// Handoff to tip-following: inactive, but the completed target stays (#807).
     pub fn end_seal_direct(&self) {
@@ -253,6 +273,8 @@ pub struct Metrics {
     seal_direct_origin: AtomicU64,
     seal_direct_completed: AtomicU64,
     seal_direct_target: AtomicU64,
+    /// #846, the solo-runtime copy of the seal clock. See `NestMetrics::last_seal_progress`.
+    last_seal_progress: AtomicU64,
     /// #812: per-endpoint RPC health. Keyed by a host[:port] label, never a URL.
     rpc_endpoints: Mutex<BTreeMap<String, EndpointStats>>,
     /// Per-nest handles, keyed by nest name (SEC-9). `BTreeMap` so `/metrics` renders in a stable
@@ -299,6 +321,7 @@ impl Metrics {
             seal_direct_origin: AtomicU64::new(0),
             seal_direct_completed: AtomicU64::new(0),
             seal_direct_target: AtomicU64::new(0),
+            last_seal_progress: AtomicU64::new(0),
             rpc_endpoints: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
         }
@@ -422,9 +445,19 @@ impl Metrics {
         self.seal_direct_completed
             .store(origin.saturating_sub(1), Relaxed);
         self.seal_direct_target.store(target, Relaxed);
+        self.last_seal_progress.store(now_unix(), Relaxed);
     }
     pub fn set_seal_direct_completed(&self, block: u64) {
-        self.seal_direct_completed.store(block, Relaxed);
+        if block > self.seal_direct_completed.swap(block, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
+    }
+    pub fn last_seal_progress(&self) -> u64 {
+        self.last_seal_progress.load(Relaxed)
+    }
+    #[cfg(test)]
+    pub fn set_last_seal_progress_for_test(&self, t: u64) {
+        self.last_seal_progress.store(t, Relaxed);
     }
     pub fn end_seal_direct(&self) {
         self.seal_direct_active.store(false, Relaxed);
