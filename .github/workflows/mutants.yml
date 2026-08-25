@@ -1,11 +1,10 @@
-# Mutation coverage on the delightful core (#768).
+# Mutation coverage on the delightful core (#768), split per file so it finishes (#841).
 #
 # **Nightly, not per-PR, and the reason is measured rather than assumed.** On an 18-core box:
 #
 #   - unmutated baseline: 114s build + 154s test (all targets), or 122s + 28s with `--lib`
 #   - each mutant needs its own rebuild, so ~150s apiece even with the test phase scoped
 #   - at `-j 6` the box hit **load 70** and individual builds stretched to 802s
-#   - `src/chunker.rs` alone is 26 mutants; the scoped set below is ~300
 #
 # A per-PR gate at those numbers is one people learn to skip, which is the exact disease this is
 # meant to cure. #768's own "honest risk" section said so before any of it was measured, and the
@@ -15,6 +14,27 @@
 # criterion 2 and the sequence #593 spent a whole sprint getting right: prove it can go red, let it
 # run red-capable on `main`, *then* decide whether it becomes required. A context that cannot fail is
 # worse than no context, and this repo has installed one of those before.
+#
+# ## Why this is a matrix (#841)
+#
+# It was one job over all three files with `timeout-minutes: 300`. It ran three times and was
+# cancelled at exactly 300 minutes three times, having produced a complete set of outcomes and then
+# died before the step that reports them. Nobody found out, because `mutants-check.py` read the
+# absent `missed.txt` as "no survivors" and exited 0. Both halves are fixed: the checker now fails on
+# a truncated run, and the sweep is split so it fits.
+#
+# Sizing is from the artifact of the 2026-08-24 run, not from a guess - summed phase durations at
+# `-j 2` on a GitHub runner:
+#
+#   | file             | mutants | measured  | + baseline | timeout here |
+#   |------------------|--------:|----------:|-----------:|-------------:|
+#   | src/chunker.rs   |     ~26 |  ~222 min |   ~138 min |      240 min |
+#   | src/seal.rs      |     ~10 |   ~77 min |    ~66 min |      150 min |
+#   | src/registry.rs  |       3 |   ~13 min |    ~34 min |      120 min |
+#
+# The unmutated baseline is 26.6 min and each job pays it once; they run in parallel, so wall clock
+# is the chunker column. Three chunker mutants are pathological (16-40 min each) - those are the
+# cargo-mutants test timeouts, tracked in #842.
 name: mutants (delightful core)
 
 on:
@@ -24,46 +44,59 @@ on:
 
 jobs:
   mutants:
-    name: mutation coverage (nightly, advisory)
+    name: mutation coverage (nightly, advisory) - ${{ matrix.file }}
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # Every file reports independently. One file blowing its budget must not hide the other two,
+      # which is the shape the single-job version had.
+      fail-fast: false
+      matrix:
+        include:
+          # Scoped deliberately. Not the whole crate: 4,503 mutants crate-wide against 39 here, and a
+          # signal nobody reads is not a signal. These are the paths that feed stored state or decide
+          # what gets fetched - where a decorative test is most expensive.
+          - file: src/chunker.rs
+            timeout: 240
+          - file: src/seal.rs
+            timeout: 150
+          # Only 3 mutants because #581 moved decode into its own crate, so the decode path is
+          # covered by the `decode` entry rather than by the file it used to live in.
+          - file: src/registry.rs
+            timeout: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          # One shared cache across the three jobs - they build the identical baseline.
+          shared-key: mutants
       - name: install cargo-mutants
         run: cargo install cargo-mutants --locked
 
-      # Scoped deliberately. Not the whole crate: 4,503 mutants crate-wide against ~300 here, and a
-      # signal nobody reads is not a signal. These are the paths that feed stored state or decide what
-      # gets fetched - where a decorative test is most expensive.
-      #
-      # `src/registry.rs` carries only 3 mutants because #581 moved decode into its own crate, so the
-      # decode path is covered by the `decode` entry rather than by the file it used to live in.
       - name: run mutants
-        id: mutants
-        run: |
-          set +e
-          cargo mutants --no-shuffle -j 2 \
-            --file src/chunker.rs \
-            --file src/seal.rs \
-            --file src/registry.rs \
-            -- --lib
-          echo "status=$?" >> "$GITHUB_OUTPUT"
+        # `continue-on-error` rather than `set +e`: cargo-mutants exits non-zero when mutants survive,
+        # which is an ordinary outcome this job must not treat as breakage. The previous version
+        # swallowed the status into a `$GITHUB_OUTPUT` that nothing ever read, so a *crashed* run and
+        # a run with survivors were equally invisible. The verdict now comes from the artifact, which
+        # can tell those two apart; the raw status stays visible in this step's log.
+        continue-on-error: true
+        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} -- --lib
 
       # **This step can go red, and that is the point** (#768 acceptance criterion 1). A survivor not
-      # in the baseline fails the job and names the mutation and the file. The job going red is not
-      # the same as the build going red: this workflow is required on no branch, per criterion 2 and
-      # the sequence #593 established.
+      # in the baseline fails the job and names the mutation and the file. So does a run that did not
+      # finish, or one that enumerated no mutants at all. The job going red is not the same as the
+      # build going red: this workflow is required on no branch, per criterion 2 and the sequence
+      # #593 established.
       - name: new survivors fail this job
         if: always()
-        run: |
-          python3 scripts/mutants-check.py | tee -a "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/mutants-check.py --file ${{ matrix.file }} | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: keep the output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-out
+          # Per file, or the three jobs race for one artifact name.
+          name: mutants-out-${{ strategy.job-index }}
           path: mutants.out/
           retention-days: 14
