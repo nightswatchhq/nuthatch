@@ -645,6 +645,34 @@ fn initial_poll_failed(last_poll: u64, poll_failed: bool) -> bool {
 /// far more often than this on any chain with sub-minute blocks.
 const READINESS_PROGRESS_STALL_SECS: u64 = 90;
 
+/// How long a `--seal-direct` pass may go without its watermark moving before `/ready` calls it
+/// wedged (#846).
+///
+/// **Deliberately an order of magnitude looser than the tip thresholds above**, and for a reason
+/// that is not timidity: seal-direct fetches, decodes and writes a whole window of history per step,
+/// against whatever archive endpoint the operator has, and a single wide window on a slow provider
+/// legitimately takes minutes. The tip cursor's 90s says "a poll should have returned by now"; this
+/// says "no window has completed in a quarter of an hour, which is not slowness".
+///
+/// It is a threshold on *progress*, not on duration - a pass may run for six hours and stay ready
+/// throughout, as long as it keeps sealing.
+const READINESS_SEAL_STALL_SECS: u64 = 900;
+
+/// Has an active seal-direct pass stopped sealing?
+///
+/// Mirrors [`progress_stalled`] but takes no `lag` guard, and the difference is the point. A tip
+/// cursor that is caught up has legitimately nothing to do, which is why `lag == 0` exempts it. An
+/// *active* seal-direct pass by definition has not reached its target yet - `end_seal_direct` is
+/// what marks arrival - so there is no such thing as a legitimately idle one.
+fn seal_direct_stalled(last_seal_progress: u64, started_at: u64, now: u64, threshold: u64) -> bool {
+    let since = if last_seal_progress != 0 {
+        last_seal_progress
+    } else {
+        started_at
+    };
+    since != 0 && now.saturating_sub(since) > threshold
+}
+
 /// Wedged = the cursor is behind tip (`lag > 0`) and `last_block` moved at least once
 /// (`last_progress != 0`) but not within `threshold` seconds, even while [`poll_stalled`] says the
 /// source is still reachable. This is the case `poll_stalled` can't see: a source poll (tip fetch)
@@ -731,6 +759,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                     m.seal_direct_origin(),
                     m.seal_direct_completed(),
                     m.seal_direct_target(),
+                    m.last_seal_progress(),
                 ),
             ),
             None => (
@@ -746,11 +775,17 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                     METRICS.seal_direct_origin(),
                     METRICS.seal_direct_completed(),
                     METRICS.seal_direct_target(),
+                    METRICS.last_seal_progress(),
                 ),
             ),
         };
-    let (seal_direct_active, seal_direct_origin, seal_direct_completed, seal_direct_target) =
-        seal_direct;
+    let (
+        seal_direct_active,
+        seal_direct_origin,
+        seal_direct_completed,
+        seal_direct_target,
+        last_seal_progress,
+    ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
     let lag = tip.saturating_sub(last);
@@ -763,10 +798,22 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             lag,
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
-    let stalled = !seal_direct_active
-        && (initial_failure
-            || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
-            || wedged);
+    // #846: `seal_direct_active` used to suppress every term above with nothing put in its place, so
+    // a pass that had died reported ready indefinitely. Suppressing the *tip* thresholds during a
+    // bulk seal is still right - #807 was correct that a working history pass is not a stalled
+    // cursor - but the pass now has to answer for its own progress instead of being exempt.
+    let seal_stalled = seal_direct_active
+        && seal_direct_stalled(
+            last_seal_progress,
+            started_at,
+            now,
+            READINESS_SEAL_STALL_SECS,
+        );
+    let stalled = seal_stalled
+        || (!seal_direct_active
+            && (initial_failure
+                || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
+                || wedged));
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
@@ -782,6 +829,9 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "seal_direct_origin": seal_direct_origin,
         "seal_direct_completed": seal_direct_completed,
         "seal_direct_target": seal_direct_target,
+        "seal_direct_stalled": seal_stalled,
+        "seconds_since_seal_progress": (seal_direct_active && last_seal_progress != 0)
+            .then(|| now.saturating_sub(last_seal_progress)),
     });
     let code = if stalled {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2056,6 +2106,123 @@ mod tests {
         assert_eq!(json["seal_direct_completed"], json!(1500));
         assert_eq!(json["seal_direct_target"], json!(2000));
         handle.end_seal_direct();
+    }
+
+    /// #846: a seal-direct pass that has stopped sealing must stop reporting ready.
+    ///
+    /// Before this, `seal_direct_active` gated every stall term and nothing replaced them, so the
+    /// measured answer after ten hours frozen was `HTTP 200 {"ready":true,"stalled":false}`. An
+    /// orchestrator believes that endpoint.
+    #[tokio::test]
+    async fn a_seal_direct_that_stopped_sealing_reports_unready() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "frozen-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        handle.set_started_at_for_test(now.saturating_sub(36_000));
+        handle.begin_seal_direct(1_000, 2_000);
+        handle.set_seal_direct_completed(1_500);
+        // Sealed once, then froze ten hours ago - well past READINESS_SEAL_STALL_SECS.
+        handle.set_last_seal_progress_for_test(now.saturating_sub(36_000));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a seal-direct frozen for 10h must not read ready: {json}"
+        );
+        assert_eq!(json["ready"], json!(false));
+        assert_eq!(json["stalled"], json!(true));
+        assert_eq!(json["seal_direct_stalled"], json!(true));
+        // The operator can tell slow from dead without a second tool.
+        assert_eq!(json["seconds_since_seal_progress"], json!(36_000));
+        handle.end_seal_direct();
+    }
+
+    /// The control, and the half that must not regress: a pass that is still sealing stays ready
+    /// however long it has been running. #807's whole point was that a working history pass is not a
+    /// stalled cursor, and #846 must not undo it by turning duration into a failure.
+    #[tokio::test]
+    async fn a_seal_direct_still_sealing_stays_ready_however_long_it_has_run() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "slow-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        // Six hours in, and no successful *poll* for six hours either - the tip thresholds would
+        // both fire, and are correctly suppressed while a history pass is the thing running.
+        handle.set_started_at_for_test(now.saturating_sub(21_600));
+        handle.set_last_poll_ok_for_test(now.saturating_sub(21_600));
+        handle.set_last_progress_for_test(now.saturating_sub(21_600));
+        handle.begin_seal_direct(1_000, 2_000);
+        handle.set_seal_direct_completed(1_500);
+        // ...but it sealed a window a minute ago.
+        handle.set_last_seal_progress_for_test(now.saturating_sub(60));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "a pass that is still sealing is ready: {json}"
+        );
+        assert_eq!(json["ready"], json!(true));
+        assert_eq!(json["seal_direct_stalled"], json!(false));
+        assert_eq!(json["seconds_since_seal_progress"], json!(60));
+        handle.end_seal_direct();
+    }
+
+    /// The watermark is a block number and carries no clock of its own, so the stamp must move only
+    /// when the number does. A pass that keeps re-reporting the same block is not making progress
+    /// and must not refresh its own deadline by saying so.
+    #[test]
+    fn re_reporting_the_same_block_does_not_refresh_the_seal_clock() {
+        use crate::metrics::METRICS;
+        let handle = METRICS.nest("stamp-check");
+        handle.begin_seal_direct(1_000, 2_000);
+        handle.set_seal_direct_completed(1_500);
+        handle.set_last_seal_progress_for_test(1_000);
+
+        handle.set_seal_direct_completed(1_500);
+        assert_eq!(
+            handle.last_seal_progress(),
+            1_000,
+            "the same block again is not progress"
+        );
+
+        handle.set_seal_direct_completed(1_501);
+        assert!(
+            handle.last_seal_progress() > 1_000,
+            "an advancing block must stamp the clock"
+        );
+        handle.end_seal_direct();
+    }
+
+    #[test]
+    fn seal_stall_logic() {
+        let now = 100_000u64;
+        // No stamp yet: fall back to start time, same as progress_stalled.
+        assert!(seal_direct_stalled(0, now - 1_000, now, 900));
+        assert!(!seal_direct_stalled(0, now - 100, now, 900));
+        // Stamped: judge on the stamp, not on how long the pass has run.
+        assert!(!seal_direct_stalled(now - 100, now - 86_400, now, 900));
+        assert!(seal_direct_stalled(now - 1_000, now - 86_400, now, 900));
+        // Nothing known at all is not a stall - a just-started pass gets grace.
+        assert!(!seal_direct_stalled(0, 0, now, 900));
     }
 
     /// A two-nest mounts composition, built the same way `run_runtime` builds one.
