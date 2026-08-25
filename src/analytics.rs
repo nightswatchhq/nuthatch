@@ -55,10 +55,26 @@ struct DuckCache {
     conn: Connection,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DuckInputStamp {
-    len: u64,
-    modified_ns: u128,
+/// A content hash of one cache input, hex sha256 (#840).
+///
+/// **This was `(len, modified_ns)` and could not see a same-length rewrite.** Measured on the Linux
+/// dev box, 500 trials of "write 27 bytes, stat, rewrite 27 different bytes, stat": 497 collisions
+/// on btrfs, 499 on tmpfs. The cause is the mtime clock, not the filesystem - 2,000 consecutive
+/// writes produced **nine** distinguishable timestamps, a granularity of ~3.3 ms. So on the platform
+/// this deploys to, a `>` changed to a `<` in a view did not merely *risk* going unnoticed by the
+/// cache, it went unnoticed essentially always, and the cached connection served the previous
+/// definition with no error anywhere. On macOS APFS the same probe gives 0/500 at ~37 us resolution,
+/// which is why it looked fine in local development.
+///
+/// The cost is reading these files rather than stat-ing them. They are `nuthatch.toml`, `views/*.sql`
+/// and `labels/*.json` - and `attempt()` already stats every one of them on every query, so this is
+/// a read where there was a stat, over files that are small by construction.
+type DuckInputStamp = String;
+
+fn content_stamp(path: &Path) -> Option<DuckInputStamp> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
 }
 
 static DUCK_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, DuckCache>>> = OnceLock::new();
@@ -109,20 +125,8 @@ fn duck_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, DuckInputStamp
     paths
         .into_iter()
         .filter_map(|path| {
-            let meta = std::fs::metadata(&path).ok()?;
-            let modified_ns = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_nanos();
-            Some((
-                path,
-                DuckInputStamp {
-                    len: meta.len(),
-                    modified_ns,
-                },
-            ))
+            let stamp = content_stamp(&path)?;
+            Some((path, stamp))
         })
         .collect()
 }
@@ -3236,6 +3240,82 @@ template="pool"
     /// #825: a cached connection is valid only for the authored inputs it was built from. Both an
     /// added view and its deletion must force a fresh catalogue; otherwise the old view stays
     /// queryable until process restart.
+    /// #840 - a view rewritten to the same length inside one mtime tick must still invalidate.
+    ///
+    /// The cache keyed on `(len, modified_ns)`. On the Linux dev box that stamp misses a same-length
+    /// rewrite **497 times in 500** (btrfs) because the mtime clock resolves to ~3.3 ms - 2,000
+    /// writes produced nine distinguishable timestamps.
+    ///
+    /// **What that does and does not cost, measured rather than assumed.** The answer stays correct:
+    /// `attempt()` re-runs `define_views`, `define_nest_views`, `define_labels_view` and
+    /// `define_children_views` on every query, cached connection or fresh, and all of them are
+    /// `CREATE OR REPLACE` - so the catalogue is rebuilt from the current files each time and the
+    /// rows are right whatever the stamp says. Run this test against the old `(len, modified_ns)`
+    /// implementation and the value assertion below still passes; it is the *invalidation* assertion
+    /// that goes red. So the defect is a cache that fails to notice it is stale, not a query that
+    /// lies - and the reason to fix it is that a stamp which cannot see a change is wrong
+    /// independently of which code path happens to compensate for it today.
+    ///
+    /// **The collision here is forced rather than raced.** A test that just wrote the file twice
+    /// quickly would pass on this laptop whatever the implementation does - APFS resolves to ~37 us
+    /// and gives 0/500 collisions - and would only ever be red on Linux. Restoring the mtime
+    /// explicitly makes the two stamps provably identical on every platform, so the test is red
+    /// against the old implementation everywhere, which is the only way it is worth having.
+    #[test]
+    fn a_same_length_view_rewrite_in_one_mtime_tick_still_invalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let views = dir.path().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let view = views.join("one.sql");
+
+        // Two definitions of identical length that disagree about every row they produce.
+        let before = "CREATE VIEW one AS SELECT 1 AS n";
+        let after = "CREATE VIEW one AS SELECT 2 AS n";
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the rewrite must not change length"
+        );
+
+        std::fs::write(&view, before).unwrap();
+        let rows = query(dir.path(), "SELECT n FROM one").unwrap();
+        assert_eq!(rows[0]["n"], serde_json::json!(1));
+        let opens = duck_opens_for(dir.path());
+        let stamped = std::fs::metadata(&view).unwrap();
+        let (len, mtime) = (stamped.len(), stamped.modified().unwrap());
+
+        std::fs::write(&view, after).unwrap();
+        // Put the clock back, so the old `(len, modified_ns)` stamp is *provably* unchanged rather
+        // than merely likely to be.
+        std::fs::File::options()
+            .write(true)
+            .open(&view)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let restamped = std::fs::metadata(&view).unwrap();
+        assert_eq!(restamped.len(), len, "the rewrite changed length");
+        assert_eq!(
+            restamped.modified().unwrap(),
+            mtime,
+            "the mtime was not restored - this test would prove nothing"
+        );
+
+        let rows = query(dir.path(), "SELECT n FROM one").unwrap();
+        // Correct either way, because the views are redefined per query - asserted so that a future
+        // change to that arrangement is caught here rather than in production.
+        assert_eq!(
+            rows[0]["n"],
+            serde_json::json!(2),
+            "the rows must be current"
+        );
+        // This is the load-bearing one, and the one that is red against `(len, modified_ns)`.
+        assert!(
+            duck_opens_for(dir.path()) > opens,
+            "the connection was reused across a changed view - the stamp did not see the rewrite"
+        );
+    }
+
     #[test]
     fn changing_or_removing_an_authored_view_invalidates_the_duckdb_cache() {
         let dir = tempfile::tempdir().unwrap();
