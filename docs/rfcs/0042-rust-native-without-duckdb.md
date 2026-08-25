@@ -1,6 +1,11 @@
 # RFC-0042: Can Nuthatch remove DuckDB and become Rust-native without sacrificing anything?
 
-- Status: **Draft**
+- Status: **Draft.** Unfrozen by board decision 2026-08-25 - the second and last carve-out from the
+  2026 feature freeze, after RFC-0041. **Sequenced behind RFC-0041**: no slice of this RFC starts
+  until the authored-incremental-entity work is done, because §9 gives DuckDB four roles inside
+  RFC-0041 (parser, incremental reference, restart seed, entity serving) and moving the engine under
+  a slice programme that is still assigning those roles would make both unattributable. Tracked as
+  #849.
 - Author: Pete
 - Date: 2026-08-24
 - Depends on: RFC-0004 (measurement discipline and benchmark harness), RFC-0013 (historical storage/query-engine investigation), RFC-0034 (bounded query surface), RFC-0041 (authored incremental entities and the current DuckDB reference/parser role).

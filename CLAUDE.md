@@ -89,7 +89,12 @@ change requires mutating sealed segments, the design is wrong - go back.
 - Authored SQL (shipped, RFC-0018 §1): `views/*.sql` are named queries evaluated at request
   time over hot ∪ sealed. Not incremental.
 - Authored incremental entities: [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
-  frozen for 2026. Do not start. Do not describe them as shipped.
+  **approved for implementation 2026-08-24**, off the back of GraphOps feedback that a view
+  recomputed on every query gives the caller a name but no query-performance benefit. The 2026
+  feature freeze is lifted for this work specifically and for nothing else. It proceeds only
+  through the ordered issue sequence in §9 - #818 compiler and budget gate, then #820 authoring
+  and validation, then #821 lifecycle and reorg, then #822 serving - and #818 must produce an
+  explicit go decision before any later slice starts. Not shipped: do not describe them as shipped.
 - Imperative (escape hatch): WASM component handlers, per the transform layer below.
 
 ## The transform layer: lessons from liminal (nightswatchhq/liminal)
@@ -160,6 +165,17 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > class. Slice 6 (ExEx, scaled mode) and the parked RFC work are **not cancelled** and not to be
 > started. Treat a proposal for new capability the way the out-of-scope list below is treated: say
 > so, rather than quietly building it. The list survives as the record of how the product was built.
+>
+> **Two carve-outs, and only these two.** A carve-out is a decision Chief makes explicitly and
+> records here. It is not a precedent for the next proposal, and an approved RFC is not a carve-out
+> until it appears in this list.
+>
+> 1. **RFC-0041, authored incremental entities (2026-08-24).** After GraphOps identified query-time
+>    view recomputation as a product gap. Conditions in the entity-derivation section above.
+> 2. **RFC-0042, the Rust-native/no-DuckDB investigation (2026-08-25).** **Sequenced behind
+>    RFC-0041** - no slice starts until the entity work is done, because RFC-0042 §9 hands DuckDB
+>    four roles inside RFC-0041 (parser, incremental reference, restart seed, entity serving) and
+>    moving the engine while those roles are still being assigned would make both unattributable.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
