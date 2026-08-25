@@ -858,11 +858,42 @@ fn process_cpu_seconds() -> f64 {
             }
         }
     }
+    // No /proc on macOS/BSD. Same fallback shape as rss_bytes(): shell out to `ps`, whose `time`
+    // keyword reports cumulative user+system CPU time for the pid as `[[dd-]hh:]mm:ss[.cc]`.
+    let pid = std::process::id().to_string();
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid])
+        .output()
+    {
+        if let Some(seconds) = parse_ps_cpu_time(String::from_utf8_lossy(&out.stdout).trim()) {
+            return seconds;
+        }
+    }
     0.0
 }
 
 fn ticks_per_sec() -> f64 {
     100.0
+}
+
+/// Parses BSD `ps`'s `time`/`cputime` keyword: `[[dd-]hh:]mm:ss[.cc]`, e.g. `0:00.12`,
+/// `1:02:03`, or `2-01:02:03` for a process that has run past a day.
+fn parse_ps_cpu_time(value: &str) -> Option<f64> {
+    let (days, rest) = match value.split_once('-') {
+        Some((days, rest)) => (days.parse::<f64>().ok()?, rest),
+        None => (0.0, value),
+    };
+    let fields: Vec<&str> = rest.split(':').collect();
+    let seconds = match fields.as_slice() {
+        [minutes, seconds] => minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?,
+        [hours, minutes, seconds] => {
+            hours.parse::<f64>().ok()? * 3600.0
+                + minutes.parse::<f64>().ok()? * 60.0
+                + seconds.parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    Some(days * 86_400.0 + seconds)
 }
 
 #[cfg(test)]
@@ -1077,6 +1108,52 @@ mod tests {
         assert!(
             !out.contains("://"),
             "an RPC URL must not appear in the scrape: {out}"
+        );
+    }
+
+    #[test]
+    fn parses_ps_cpu_time_seconds_only_forms() {
+        assert_eq!(parse_ps_cpu_time("0:00.12"), Some(0.12));
+        assert_eq!(parse_ps_cpu_time("1:02.50"), Some(62.50));
+    }
+
+    #[test]
+    fn parses_ps_cpu_time_with_hours() {
+        assert_eq!(parse_ps_cpu_time("1:02:03"), Some(3723.0));
+    }
+
+    #[test]
+    fn parses_ps_cpu_time_with_days() {
+        assert_eq!(
+            parse_ps_cpu_time("2-01:02:03"),
+            Some(2.0 * 86_400.0 + 3723.0)
+        );
+    }
+
+    #[test]
+    fn parses_ps_cpu_time_rejects_garbage() {
+        assert_eq!(parse_ps_cpu_time(""), None);
+        assert_eq!(parse_ps_cpu_time("not-a-time"), None);
+    }
+
+    /// The real fallback path, run for real: on a host with no `/proc`, `process_cpu_seconds()`
+    /// must advance as the process burns CPU, not sit pinned at 0.0 forever (the exact bug this
+    /// change fixes). Linux never reaches the `ps` fallback, so this is gated off it.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn process_cpu_seconds_advances_via_the_ps_fallback_off_linux() {
+        let before = process_cpu_seconds();
+        let start = std::time::Instant::now();
+        let mut sink = 0u64;
+        while start.elapsed() < Duration::from_millis(300) {
+            sink = sink.wrapping_add(std::hint::black_box(1));
+        }
+        std::hint::black_box(sink);
+        let after = process_cpu_seconds();
+        assert!(
+            after > before,
+            "expected process_cpu_seconds() to advance after burning CPU (before={before}, after={after}) \
+             - a flat reading is the macOS/BSD bug this fallback exists to fix"
         );
     }
 
