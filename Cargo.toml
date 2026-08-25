@@ -46,6 +46,11 @@ arrow = { version = "58", features = ["ipc"] }
 parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
 duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
 dbsp = "0.320"
+# RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
+# satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
+# dbsp itself - these pin the same versions as direct dependencies so the derives are reachable.
+size-of = { package = "feldera-size-of", version = "0.1.7" }
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
 wasmtime = { version = "46", features = ["component-model"] }
 wasmtime-wasi = "46"
 sha2 = "0.10"
