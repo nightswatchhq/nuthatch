@@ -377,6 +377,245 @@ pub fn record_horizon_tape(segments_dir: &Path, dir: &Path, batch_rows: usize) -
         .ok_or_else(|| anyhow!("Horizon tape write did not produce a content address"))
 }
 
+/// The captured corpus as **raw weighted facts**, plus an independently-computed answer (#835).
+///
+/// [`load_horizon_fixture`] hands the circuit one pre-aggregated, pre-joined, pre-filtered row per
+/// group and then compares the result against the rows it was given. Four operators, four ways each
+/// is a no-op, and an oracle that is the input re-keyed: a circuit that did nothing but copy would
+/// pass. This is the other shape.
+///
+/// - **Raw deltas.** One row per event, signed - `+tokens` delegated, `-tokens` withdrawn - so a
+///   group has many rows and `SUM` has something to add.
+/// - **An independent right side.** Indexers come from the *allocation* tables, not from the
+///   delegation rows, so the equijoin can actually drop something. `active` is "has an allocation
+///   that was created and not closed", which is a real predicate over the data rather than a
+///   synthesised `true`.
+/// - **An oracle computed separately.** DuckDB evaluates the authored SQL over those same two
+///   relations. The circuit has to arrive at it, not be handed it.
+///
+/// The relation is one the nest actually has - `graph-staking-nest`'s own views are counts and sums
+/// grouped by indexer - rather than the `(indexer, delegator)` net balance slice zero invented, which
+/// [does not hold over this data](https://github.com/nightswatchhq/nuthatch/issues/835): 149 of 348
+/// pairs come out negative because the withdrawals belong to delegations made before the indexed
+/// range.
+pub struct HorizonRaw {
+    /// `delegations` rows, in the plan's own column order.
+    pub delegations: Vec<crate::entity_row::Row>,
+    /// `indexers` rows, in the plan's own column order.
+    pub indexers: Vec<crate::entity_row::Row>,
+    /// What DuckDB says the answer is.
+    pub expected: crate::entity_plan::Relation,
+    /// For each operator in the plan, whether **removing it changes the answer on this corpus**.
+    ///
+    /// This is the check #835 is actually about. "The input has more rows than the answer has
+    /// groups" sounds like it proves `SUM` has something to add, and does not: it compares rows
+    /// *before* the filter and join against groups *after* them. Both were true of the old fixture,
+    /// on which every operator was a no-op.
+    ///
+    /// Asked of DuckDB rather than of the circuit, because the question is about the corpus.
+    pub discriminates: Vec<(&'static str, bool)>,
+}
+
+/// The authored entity #835's parity now runs: per-indexer delegation counts and totals.
+///
+/// Shaped after `graph-staking-nest`'s `indexer_delegation_activity`, and inside the §3.3 subset -
+/// no `HAVING`, which is what the old relation needed and could not have.
+pub const INDEXER_DELEGATION_SQL: &str = "SELECT d.indexer, COUNT(*), SUM(d.amount) \
+FROM delegations d JOIN indexers i ON d.indexer = i.indexer \
+WHERE d.amount > 0 AND i.active = true GROUP BY d.indexer";
+
+pub fn load_horizon_raw(segments_dir: &Path) -> Result<HorizonRaw> {
+    use crate::entity_row::{Row, Scalar};
+
+    let manifest_path = segments_dir.join("manifest.json");
+    let manifest: SegmentManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .with_context(|| format!("read Horizon manifest {}", manifest_path.display()))?,
+    )
+    .context("parse Horizon segment manifest")?;
+    let delegated = manifest_paths(&manifest, segments_dir, "staking__tokens_delegated")?;
+    let withdrawn = manifest_paths(
+        &manifest,
+        segments_dir,
+        "staking__delegated_tokens_withdrawn",
+    )?;
+    let created = manifest_paths(&manifest, segments_dir, "service__allocation_created")?;
+    let resized = manifest_paths(&manifest, segments_dir, "service__allocation_resized")?;
+
+    let conn = Connection::open_in_memory().context("open DuckDB for the Horizon corpus")?;
+    // The closed-allocation set first: `indexers` reads it, and DuckDB resolves a view's references
+    // when the view is created, not when it is queried.
+    // `active` is "this indexer has resized an allocation", chosen by measurement rather than
+    // taste. The first attempt was "has an allocation that was not closed", which leaves **zero
+    // groups** on this corpus - and an empty answer matches an empty answer, so every operator
+    // stopped discriminating and the parity went green while testing nothing. That is the same trap
+    // #835 is about, met a second time while fixing it.
+    conn.execute_batch(&format!(
+        "CREATE VIEW resized_allocations AS SELECT DISTINCT lower(indexer) AS indexer \
+         FROM read_parquet([{}], union_by_name=true);",
+        parquet_list(&resized),
+    ))
+    .context("define the resized-allocation set")?;
+    // Two views, and nothing aggregated in either: this is the *input*, not the answer.
+    conn.execute_batch(&format!(
+        "CREATE VIEW delegations AS \
+           SELECT lower(\"serviceProvider\") AS indexer, lower(delegator) AS delegator, \
+                  TRY_CAST(tokens AS DECIMAL(38, 0)) AS amount \
+           FROM read_parquet([{}], union_by_name=true) WHERE tokens IS NOT NULL \
+         UNION ALL \
+           SELECT lower(\"serviceProvider\"), lower(delegator), \
+                  -TRY_CAST(tokens AS DECIMAL(38, 0)) \
+           FROM read_parquet([{}], union_by_name=true) WHERE tokens IS NOT NULL; \
+         CREATE VIEW indexers AS \
+           SELECT c.indexer, \
+                  (c.indexer IN (SELECT indexer FROM resized_allocations)) AS active \
+           FROM (SELECT DISTINCT lower(indexer) AS indexer \
+                 FROM read_parquet([{}], union_by_name=true)) c;",
+        parquet_list(&delegated),
+        parquet_list(&withdrawn),
+        parquet_list(&created),
+    ))
+    .context("define the raw Horizon input relations")?;
+
+    let plan = crate::entity_lower::lower(INDEXER_DELEGATION_SQL)?;
+    let left_cols = plan.left.columns.clone();
+    let right_cols = plan
+        .join
+        .as_ref()
+        .map(|j| j.right.columns.clone())
+        .unwrap_or_default();
+
+    // Rows in the *plan's* column order, which is what a binder produces and what the circuit
+    // indexes. Reading them in the order the SQL happened to list them is how a positional row goes
+    // quietly wrong.
+    let mut delegations = Vec::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM delegations",
+        left_cols
+            .iter()
+            .map(|c| format!("CAST({c} AS VARCHAR)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let mut cols = Vec::with_capacity(left_cols.len());
+        for (i, name) in left_cols.iter().enumerate() {
+            let v: Option<String> = r.get(i)?;
+            let v = v.ok_or_else(|| anyhow!("null {name} in the delegation corpus"))?;
+            cols.push(if name == "amount" {
+                Scalar::Int(v.parse().context("delegation amount")?)
+            } else {
+                Scalar::Str(v)
+            });
+        }
+        delegations.push(Row(cols));
+    }
+
+    let mut indexers = Vec::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM indexers",
+        right_cols
+            .iter()
+            .map(|c| format!("CAST({c} AS VARCHAR)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let mut cols = Vec::with_capacity(right_cols.len());
+        for (i, name) in right_cols.iter().enumerate() {
+            let v: Option<String> = r.get(i)?;
+            let v = v.ok_or_else(|| anyhow!("null {name} in the indexer corpus"))?;
+            cols.push(if name == "active" {
+                Scalar::Bool(v == "true")
+            } else {
+                Scalar::Str(v)
+            });
+        }
+        indexers.push(Row(cols));
+    }
+
+    // What each operator is worth on this corpus. Each variant removes exactly one clause; if the
+    // answer does not move, the corpus cannot tell a circuit that implements it from one that does
+    // not, and the parity below is decoration for that operator.
+    let answer = |sql: &str| -> Result<Vec<(String, i64, String)>> {
+        // Wrapped so the sum comes back as text whatever DuckDB widened it to. `SUM` over
+        // `DECIMAL(38,0)` is a `HUGEINT`, which the driver will not hand over as a string, and
+        // putting the cast inside the authored SQL is not an option - a cast of an aggregate is not
+        // in the §3.3 subset, and this same constant is what gets lowered.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT k, n, CAST(v AS VARCHAR) FROM ({sql}) t(k, n, v)"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ));
+        }
+        Ok(out)
+    };
+    let full = answer(INDEXER_DELEGATION_SQL)?;
+    let discriminates = vec![
+        (
+            "the amount filter",
+            answer(
+                "SELECT d.indexer, COUNT(*), SUM(d.amount) FROM delegations d \
+                 JOIN indexers i ON d.indexer = i.indexer \
+                 WHERE i.active = true GROUP BY d.indexer",
+            )? != full,
+        ),
+        (
+            "the active filter",
+            answer(
+                "SELECT d.indexer, COUNT(*), SUM(d.amount) FROM delegations d \
+                 JOIN indexers i ON d.indexer = i.indexer \
+                 WHERE d.amount > 0 GROUP BY d.indexer",
+            )? != full,
+        ),
+        (
+            "the join",
+            answer(
+                "SELECT d.indexer, COUNT(*), SUM(d.amount) FROM delegations d \
+                 WHERE d.amount > 0 GROUP BY d.indexer",
+            )? != full,
+        ),
+        (
+            "count over more than one row per group",
+            full.iter().any(|(_, n, _)| *n > 1),
+        ),
+    ];
+
+    // The oracle: the same SQL, evaluated by DuckDB over the same two relations.
+    let mut expected = crate::entity_plan::Relation::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT k, n, CAST(v AS VARCHAR) FROM ({INDEXER_DELEGATION_SQL}) t(k, n, v)"
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let indexer: String = r.get(0)?;
+        let count: i64 = r.get(1)?;
+        let total: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+        expected.insert(
+            Row(vec![Scalar::Str(indexer)]),
+            Row(vec![
+                Scalar::Int(i128::from(count)),
+                Scalar::Int(total.parse().context("expected delegation total")?),
+            ]),
+        );
+    }
+
+    Ok(HorizonRaw {
+        delegations,
+        indexers,
+        expected,
+        discriminates,
+    })
+}
+
 /// Load and apply the captured relation once, sampling RSS through the whole DuckDB-normalise plus
 /// DBSP-apply path. `max_rows` is part of the measurement input, not an after-the-fact warning.
 pub fn measure_horizon_fixture(segments_dir: &Path, max_rows: usize) -> Result<HorizonMeasurement> {
@@ -1298,6 +1537,56 @@ mod tests {
         );
         // A fold too fast to time is not an infinite rate, and must not divide by zero.
         assert_eq!(rows_per_second(876, 0), 876_000);
+    }
+
+    /// **#835, answered.** The captured-corpus parity, on a relation and an input where the operators
+    /// can actually be wrong.
+    ///
+    /// The old parity ran a hand-built circuit against a fixture that had already aggregated, joined
+    /// and filtered - and built its oracle from the same rows it fed in. This runs the **plan-derived**
+    /// circuit (#870) over **raw signed deltas**, against an oracle DuckDB computed separately, with
+    /// an indexer set drawn from the allocation tables rather than from the delegations.
+    ///
+    /// Every operator now has something to do: `SUM` has many rows per group, the filter has negative
+    /// deltas to drop, and the join has indexers that never delegated and delegations to indexers
+    /// with no allocation.
+    #[test]
+    #[ignore = "requires the sealed Horizon capture outside Git"]
+    fn the_plan_derived_circuit_matches_duckdb_on_raw_deltas() {
+        let segments = std::env::var("NUTHATCH_HORIZON_FIXTURE")
+            .expect("set NUTHATCH_HORIZON_FIXTURE to the captured Horizon segments directory");
+        let raw = load_horizon_raw(Path::new(&segments)).unwrap();
+        let plan = crate::entity_lower::lower(INDEXER_DELEGATION_SQL).unwrap();
+
+        // **The check #835 exists for.** Every operator must change the answer on this corpus. If
+        // one does not, the parity cannot tell a circuit that implements it from one that does not,
+        // and saying so loudly beats a green run - which is precisely what the old fixture gave for
+        // four operators at once.
+        //
+        // The assertions this replaces were "more input rows than output groups" and "some delta is
+        // negative". Both were true, both sounded like they proved something, and both left the
+        // filter and the count untestable: they compare rows *before* the join against groups
+        // *after* it, and a mutation deleting the filter survived them.
+        for (what, discriminates) in &raw.discriminates {
+            assert!(
+                *discriminates,
+                "{what} does not change the answer on this corpus, so this parity cannot test it. \
+                 Widen the corpus or change the relation; do not leave it passing. {:?}",
+                raw.discriminates
+            );
+        }
+
+        let got =
+            crate::entity_circuit::evaluate_incrementally(&plan, &raw.delegations, &raw.indexers)
+                .unwrap();
+        assert_eq!(got, raw.expected, "the circuit must agree with DuckDB");
+
+        // And the batch oracle - §8's third opinion, and RFC-0042's route to retiring DuckDB here.
+        assert_eq!(
+            plan.evaluate(&raw.delegations, &raw.indexers).unwrap(),
+            raw.expected,
+            "the batch evaluator must agree with DuckDB too"
+        );
     }
 
     #[test]
