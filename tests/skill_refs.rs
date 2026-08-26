@@ -260,6 +260,12 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "rkyv archival for DBSP row state, not nest config",
     ),
     (
+        // Same story as `entity_row.rs`: rkyv's `Deserialize`, not serde's, because the linear
+        // aggregate accumulator is a DBSP value and has to archive itself (#870).
+        "src/entity_circuit.rs",
+        "rkyv archival for DBSP aggregate state, not nest config",
+    ),
+    (
         "src/blob.rs",
         "content-addressed bundle manifest, not nest config",
     ),
