@@ -60,19 +60,44 @@ Lodestar VPS was modified. The host compiler defaults to C23, so the build used
 `CFLAGS=-std=gnu17` for the pinned `mimalloc-rust-sys 1.7.2` dependency, which still uses the
 removed `ATOMIC_VAR_INIT` macro.
 
+**Re-measured 2026-08-26 with the corrected instrument (#837, #881).** The figures first published
+here measured a window that included work they claimed not to include, and are kept below the new
+ones because the size of the correction is the point.
+
 | measure | value |
 | --- | ---: |
-| declared maximum rows | 1,000 |
-| accepted input rows | 876 |
-| result rows | 876 |
-| elapsed time | 284 ms |
-| fixed RSS | 77,064 KB |
-| peak RSS | 234,372 KB |
-| approximate incremental RSS per input row | 183,885 bytes |
+| declared maximum rows | 1,000,000 |
+| accepted input rows | 889 |
+| result rows | 889 |
+| setup (compile + circuit build) | 9 ms |
+| apply | 2 ms |
+| empty-circuit RSS | 77,452 KB |
+| circuit peak RSS | 80,164 KB |
+| **normalise scan peak RSS** | **247,556 KB** |
+| **RSS per input row** | **3,123 bytes** |
+| input rows/sec (apply window) | 444,500 |
 
-The circuit result contained all 876 expected rows. This is comfortably below the 2 GB cursor
-budget for the captured corpus, but it is a single cold-process measurement, not a throughput
-claim or a release gate.
+`(80,164 - 77,452) x 1024 / 889 = 3,123`. The scan's peak is now its own field, and it is **3.1x the
+circuit's own peak** - which is what the original figure was charging to the entity.
+
+### What was published before, and why it was wrong
+
+| measure | published | corrected |
+| --- | ---: | ---: |
+| RSS per input row | 183,885 bytes | **3,123 bytes** |
+| input rows/sec | 15,927 | **444,500** |
+
+The old per-row figure was `peak - fixed` where one sampler spanned the DuckDB normalise scan and the
+baseline was taken after that scan released, so it was to a first approximation the scan's transient
+divided by the entity's row count. The old rate divided by setup-plus-apply, and setup - a fresh
+in-memory DuckDB opened to parse one constant string - was most of it.
+
+**The difference is not academic.** At 183,885 bytes/row the 2 GB per-cursor budget holds about
+11,700 entity rows and RFC-0041 should have parked. At 3,123 it holds about 688,000.
+`runtime::ENTITY_RSS_BYTES_PER_ROW` is set from this measurement, rounded up to 3,200.
+
+Both runs are single cold-process measurements on one machine, not a release gate. §7 criterion 12's
+artifact is a *cursor* measurement and is separate from this.
 
 ## Recorded entity-input replay
 
@@ -98,8 +123,13 @@ nuthatch bench authored-entity --replay /path/to/tape --max-rows 1000 --out repl
 On the ThinkPad Linux x86_64 release build, the manifest-verified Horizon capture produced a tape
 with SHA-256 `00edced52ed7b676eff86c65cf043169c9285e9cc158ae20090599893925aa09`: one indexer-dimension
 batch plus four 256-row delegation batches. Five standalone tape-only processes all reproduced the
-876 expected entity rows. Their median was 55 ms, 15,927 delegation input rows/sec, 41,888 KB fixed
-RSS and 44,028 KB peak RSS.
+876 expected entity rows. Their median was 55 ms, 41,888 KB fixed RSS and 44,028 KB peak RSS.
+
+The 15,927 rows/sec this paragraph used to quote came from dividing by a window that included process
+start, `compile`, and circuit construction (#837). On the corrected instrument the same boundary
+measures 444,500 rows/sec over the apply window, with setup reported separately - and neither number
+should be compared against the >=10K events/sec ingest floor in either direction, for the reason the
+paragraph below already gives.
 
 Those are circuit-ingestion figures, not a claim about Nuthatch's existing RPC/decode/store
 throughput. The product lifecycle does not yet feed authored entities from `indexer.rs`; that is
