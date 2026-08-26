@@ -2218,6 +2218,7 @@ async fn build_nest(
         balances,
         exposure,
         velocity,
+        entities,
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
