@@ -298,9 +298,16 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 /// entity. The difference is not academic: at 183,885 bytes/row the 2 GB cursor budget holds ~11,700
 /// entity rows, and at 3,123 it holds ~688,000.
 ///
-/// Still an estimate rather than a promise. It is data-size driven over a fixed corpus rather than
-/// core-count driven, which is the property that made the multi-nest regression figure agree across
-/// machines - but criterion 12's artifact is a *cursor* measurement, not this one.
+/// Still an estimate rather than a promise, and **conservative by construction**: at 889 rows the
+/// fixed allocations - arena blocks, batch buffers, the trace's own bookkeeping - are a large share
+/// of the 2,712 KB delta, so dividing them by 889 charges each row for a cost that does not repeat.
+/// A larger corpus would amortise them and report *fewer* bytes per row. For an admission bound that
+/// is the safe direction: it refuses a mount that would have fitted rather than admitting one that
+/// then breaches the budget.
+///
+/// It is data-size driven over a fixed corpus rather than core-count driven, which is the property
+/// that made the multi-nest regression figure agree across machines - but criterion 12's artifact is
+/// a *cursor* measurement, not this one.
 const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 
 /// The most authored entities one cursor will admit, across every nest on that chain.
