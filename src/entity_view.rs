@@ -73,6 +73,14 @@ struct Published {
     /// The dataset head this entity has **actually folded**, which is not the nest's head while it
     /// is catching up. Advanced only after the batch carrying it has been applied.
     through: u64,
+    /// When `through` last actually moved, in unix seconds.
+    ///
+    /// **Progress, not duration** - the lesson #846 paid for one layer down, where `/ready`
+    /// suppressed every stall term during a bulk seal and put nothing in its place, so a pass frozen
+    /// for ten hours answered `200 {"ready":true}`. An entity catching up is the same shape:
+    /// legitimately behind, indefinitely, and indistinguishable from dead unless something watches
+    /// it advance. Zero until the first batch lands, which is "no progress yet" rather than 1970.
+    progress_at: u64,
 }
 
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
@@ -156,9 +164,19 @@ impl EntityView {
                                 }
                                 Ok(()) => {
                                     // The rows and the head they account for, published together.
-                                    *shared.write().unwrap() = Published {
+                                    let mut published = shared.write().unwrap();
+                                    let moved = through > published.through;
+                                    *published = Published {
                                         relation: circuit.relation().clone(),
                                         through,
+                                        // Stamped only when the watermark actually moves. A window
+                                        // that carries the entity no further is not progress, and
+                                        // counting it as such is how a wedged entity looks busy.
+                                        progress_at: if moved {
+                                            crate::metrics::now_unix()
+                                        } else {
+                                            published.progress_at
+                                        },
                                     };
                                 }
                             }
@@ -261,6 +279,11 @@ impl EntityView {
     /// this one's rows is how a partial relation gets stamped current.
     pub fn applied_through(&self) -> u64 {
         self.state.read().map(|s| s.through).unwrap_or(0)
+    }
+
+    /// When the applied-through watermark last moved, in unix seconds; `0` before the first batch.
+    pub fn last_progress(&self) -> u64 {
+        self.state.read().map(|s| s.progress_at).unwrap_or(0)
     }
 
     /// Is this entity current for a dataset advertising `head`?
