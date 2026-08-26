@@ -183,3 +183,66 @@ async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
         "a reorged entity must equal a clean replay over the post-reorg chain"
     );
 }
+
+/// #866 criterion 13: `--seal-direct` either rebuilds entities from the sealed corpus before serving,
+/// or refuses the combination clearly. It refuses - and the refusal is the point.
+///
+/// Seal-direct writes finalized history straight to Parquet without passing it through the ingest
+/// path, so an entity fed from decoded windows would see none of it. Left to run, the nest would
+/// complete, serve, and answer with an empty relation: *"a completed run with an empty entity is the
+/// failure this criterion exists for."*
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seal_direct_refuses_a_nest_that_declares_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+
+    let err = indexer::spawn_nest(
+        tape,
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        true, // --seal-direct
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .err()
+    .expect("seal-direct plus a declared entity must not start");
+
+    let err = format!("{err:#}");
+    assert!(err.contains("--seal-direct cannot be combined"), "{err}");
+    assert!(
+        err.contains("`received`"),
+        "the refusal must name the entity: {err}"
+    );
+    assert!(
+        err.contains("served empty"),
+        "and say what would otherwise happen: {err}"
+    );
+}
+
+/// The same nest without `--seal-direct` starts and folds - so the refusal above is about the
+/// combination and not about entities being unable to start at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_nest_without_seal_direct_starts_and_folds() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    let rows = relation(&rt);
+    shutdown(rt);
+    assert!(!rows.is_empty(), "the entity folded the chain");
+}
