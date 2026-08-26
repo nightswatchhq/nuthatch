@@ -283,10 +283,83 @@ pub const RUNTIME_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand
 const NEST_BASE_RSS_MB: u64 = 5; // fitted: ~1 MB/nest observed, 5x margin (see comment above)
 const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity view, or child registry
 
+/// Bytes per admitted input row for an authored incremental entity (RFC-0041 §7, criterion 9).
+///
+/// **2,500 and not the 183,885 the slice-zero document publishes.** That figure is `peak - fixed`
+/// over a window that spans a 371 MB DuckDB Parquet scan, with the baseline sampled after the scan
+/// released, so it is mostly the scan's transient divided by the entity's row count (#837). The same
+/// document's tape path - which performs no scan - reports ~2,500 bytes/row for the same 876 rows,
+/// and that is the entity's own cost.
+///
+/// It is an estimate for **admission**, not a measurement, and the difference matters in one
+/// direction: too low admits a mount that then breaches the budget at runtime. #837's instrument fix
+/// has to be re-run on the enforcing hardware before this constant is anything but a defensible
+/// starting point, which is criterion 12 and is not this change.
+const ENTITY_RSS_BYTES_PER_ROW: u64 = 2_500;
+
+/// The most authored entities one cursor will admit, across every nest on that chain.
+///
+/// A count ceiling on top of the MB budget, because the two bound different things. An entity costs
+/// a DBSP circuit **and an OS thread**, and the MB projection prices the state rather than the
+/// thread - so a hundred entities each declaring a hundred rows projects as almost nothing and is a
+/// hundred threads on one cursor. §7 asks for an explicit ceiling; this is it, and it is deliberately
+/// generous rather than fitted, since the MB budget is what should bind first on any realistic nest.
+const MAX_ENTITIES_PER_CURSOR: usize = 32;
+
 /// Rough projected RSS (MB) for one nest: base + a chunk per active IVM view / factory child registry.
 /// `has_labels` gates the exposure view (only spun up when the nest has labeled addresses).
-pub fn estimate_nest_rss_mb(config: &Config, has_labels: bool) -> u64 {
+/// RFC-0041 §7 criterion 11: the explicit per-cursor ceiling on authored entities.
+///
+/// Its own function so the arithmetic in the message is testable. A refusal whose numbers are wrong
+/// is worse than no message: it sends an operator to change the thing it names.
+fn refuse_over_entity_ceiling(
+    on_cursor: usize,
+    nests: usize,
+    mounts: &str,
+    chain: &str,
+) -> Result<()> {
+    if on_cursor <= MAX_ENTITIES_PER_CURSOR {
+        return Ok(());
+    }
+    bail!(
+        "mounts '{mounts}' cursor on {chain} declares {on_cursor} authored entities across {nests} \
+         nest(s), over the ceiling of {MAX_ENTITIES_PER_CURSOR} per cursor. Each entity is a circuit \
+         on its own thread; nests sharing a chain share the cursor and are counted together \
+         (RFC-0041 §7). Move some to another chain's runtime, or drop {} of them.",
+        on_cursor - MAX_ENTITIES_PER_CURSOR,
+    )
+}
+
+/// What a nest's declared entities cost the admission calculation: how many there are, and the sum
+/// of their declared `max_rows`.
+///
+/// A nest that declares none, or whose manifest will not parse, contributes nothing here. The
+/// manifest is *validated* at startup by `entities::load`, which refuses a malformed one loudly;
+/// admission is not the place to raise that a second time, and treating a typo as "no entities" for
+/// budgeting only would let a nest be admitted on a projection it does not match.
+pub fn declared_entities(dir: &Path) -> (usize, u64) {
+    let declared = crate::entities::load(dir).unwrap_or_default();
+    (
+        declared.len(),
+        declared.iter().map(|e| e.max_rows as u64).sum(),
+    )
+}
+
+/// `entity_rows` is the sum of every authored entity's declared `max_rows` for this nest, and
+/// `entity_count` how many there are (RFC-0041 §7). Passed in rather than read from disk here so
+/// this stays a pure function of what the mount declares - the same reason `has_labels` is a bool.
+pub fn estimate_nest_rss_mb(
+    config: &Config,
+    has_labels: bool,
+    entity_count: usize,
+    entity_rows: u64,
+) -> u64 {
     let mut mb = NEST_BASE_RSS_MB;
+    // Each entity is a DBSP circuit on its own thread, exactly like the built-in views, so it is
+    // priced the same way - plus its declared state, which the built-in views do not let an author
+    // choose.
+    mb += NEST_VIEW_RSS_MB * entity_count as u64;
+    mb += entity_rows.saturating_mul(ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024);
     if has_labels {
         mb += NEST_VIEW_RSS_MB; // exposure view (RFC-0008 C1)
     }
@@ -1418,9 +1491,22 @@ pub async fn dev(
 
         // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
         let mut cursor_mb = 0u64;
+        // RFC-0041 §7, criterion 11: nests on the same chain are accounted **together**, so the
+        // ceiling is the cursor's rather than each nest's.
+        //
+        // Summed rather than accumulated in the loop below. A `+=` written as `=` counts the last
+        // nest instead of the cursor, which is the whole of what this criterion is about, and it
+        // survives every unit test because the loop lives inside an async function no unit test
+        // reaches. There is no assignment here to get wrong.
+        let entities_on_cursor: usize = group
+            .nests
+            .iter()
+            .map(|(_, path, _)| declared_entities(path).0)
+            .sum();
         for (name, path, config) in &group.nests {
             let has_labels = !crate::labels::load(path).is_empty();
-            let mb = estimate_nest_rss_mb(config, has_labels);
+            let (entity_count, entity_rows) = declared_entities(path);
+            let mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
             estimates.insert(name.clone(), mb);
             cursor_mb += mb;
         }
@@ -1430,6 +1516,12 @@ pub async fn dev(
             group.endpoint.chain_id,
             group.nests.len(),
         );
+        refuse_over_entity_ceiling(
+            entities_on_cursor,
+            group.nests.len(),
+            &meta.name,
+            &group.endpoint.chain,
+        )?;
         if cursor_mb > max_rss {
             bail!(
                 "mounts '{}' cursor on {} projects ~{cursor_mb} MB but max_rss is {max_rss} MB/cursor - \
@@ -2031,7 +2123,8 @@ impl RuntimeHandles {
         // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
         // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
         let has_labels = !crate::labels::load(&dir).is_empty();
-        let incoming = estimate_nest_rss_mb(&config, has_labels);
+        let (entity_count, entity_rows) = declared_entities(&dir);
+        let incoming = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows);
         let existing: u64 = self
             .states
             .iter()
@@ -3213,23 +3306,26 @@ mod tests {
             toml::from_str(&toml).unwrap()
         }
         // Plain static nest, no labels: just the per-nest base.
-        assert_eq!(estimate_nest_rss_mb(&cfg(""), false), NEST_BASE_RSS_MB);
+        assert_eq!(
+            estimate_nest_rss_mb(&cfg(""), false, 0, 0),
+            NEST_BASE_RSS_MB
+        );
         // Labels present → the exposure view adds a chunk.
         assert_eq!(
-            estimate_nest_rss_mb(&cfg(""), true),
+            estimate_nest_rss_mb(&cfg(""), true, 0, 0),
             NEST_BASE_RSS_MB + NEST_VIEW_RSS_MB
         );
         // A velocity flag → the velocity view.
         let vel = cfg("\n[flags]\nvelocity_amount = \"1000\"\n");
         assert_eq!(
-            estimate_nest_rss_mb(&vel, false),
+            estimate_nest_rss_mb(&vel, false, 0, 0),
             NEST_BASE_RSS_MB + NEST_VIEW_RSS_MB
         );
         // A factory → the discovered-child registry.
         let fac = cfg("\n[[templates]]\nname = \"p\"\nabi = \"p.json\"\n\n\
              [[factories]]\nwatch = \"t\"\nevent = \"E\"\nchild_param = \"c\"\ntemplate = \"p\"\n");
         assert_eq!(
-            estimate_nest_rss_mb(&fac, false),
+            estimate_nest_rss_mb(&fac, false, 0, 0),
             NEST_BASE_RSS_MB + NEST_VIEW_RSS_MB
         );
         // All three loads stack on top of the base.
@@ -3238,8 +3334,103 @@ mod tests {
              [[factories]]\nwatch = \"t\"\nevent = \"E\"\nchild_param = \"c\"\ntemplate = \"p\"\n",
         );
         assert_eq!(
-            estimate_nest_rss_mb(&all, true),
+            estimate_nest_rss_mb(&all, true, 0, 0),
             NEST_BASE_RSS_MB + 3 * NEST_VIEW_RSS_MB
+        );
+    }
+
+    /// RFC-0041 §7 criterion 9: an entity's declared `max_rows` reaches the admission calculation.
+    ///
+    /// The two terms are priced separately on purpose. A circuit and its thread cost the same as any
+    /// built-in view, and the declared state costs whatever the author declared - which is the term
+    /// the built-in views do not let anyone choose, and therefore the one that can surprise a budget.
+    #[test]
+    fn a_declared_entity_costs_its_circuit_and_its_declared_rows() {
+        fn cfg(extra: &str) -> Config {
+            let toml = format!(
+                "[nest]\nname = \"n\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n{extra}"
+            );
+            toml::from_str(&toml).expect("fixture config")
+        }
+
+        let base = estimate_nest_rss_mb(&cfg(""), false, 0, 0);
+
+        assert_eq!(
+            estimate_nest_rss_mb(&cfg(""), false, 1, 0),
+            base + NEST_VIEW_RSS_MB,
+            "a circuit and a thread, priced as any other view"
+        );
+
+        // A million rows at the per-row estimate is a term nobody would have guessed from the nest's
+        // config alone, which is exactly why it has to be in the projection.
+        let million = 1_000_000u64;
+        assert_eq!(
+            estimate_nest_rss_mb(&cfg(""), false, 1, million),
+            base + NEST_VIEW_RSS_MB + (million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
+        );
+
+        // Two entities are two circuits, and their rows add - nests on a cursor are accounted
+        // together, so entities within a nest must be too.
+        assert_eq!(
+            estimate_nest_rss_mb(&cfg(""), false, 2, 2 * million),
+            base + 2 * NEST_VIEW_RSS_MB + (2 * million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
+        );
+    }
+
+    /// Criterion 11: nests on one chain share a cursor and are counted **together**, and the refusal
+    /// carries the arithmetic an operator needs to act on it.
+    #[test]
+    fn the_entity_ceiling_is_per_cursor_and_says_how_far_over_it_is() {
+        assert!(refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR, 1, "m", "c").is_ok());
+        assert!(
+            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR, 8, "m", "c").is_ok(),
+            "spread across eight nests is still exactly at the ceiling, not over it"
+        );
+        assert!(
+            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR + 1, 1, "m", "c").is_err(),
+            "one over is over - the boundary, which a wildly-over case cannot see"
+        );
+
+        let err = format!(
+            "{:#}",
+            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR + 3, 4, "prod", "arbitrum-one")
+                .expect_err("three over the ceiling is over the ceiling")
+        );
+        assert!(err.contains("cursor on arbitrum-one"), "{err}");
+        assert!(err.contains("across 4 nest(s)"), "{err}");
+        assert!(
+            err.contains("drop 3 of them"),
+            "the overage must be the real number, not a restatement of the ceiling: {err}"
+        );
+    }
+
+    /// A `max_rows` large enough to overflow the multiplication must not wrap into a small
+    /// projection and be admitted. Saturating is the safe direction: an absurd declaration projects
+    /// as absurd and is refused, rather than as nothing and let in.
+    #[test]
+    fn an_absurd_max_rows_saturates_rather_than_wrapping_into_admission() {
+        fn cfg(extra: &str) -> Config {
+            let toml = format!(
+                "[nest]\nname = \"n\"\nchain = \"c\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n{extra}"
+            );
+            toml::from_str(&toml).expect("fixture config")
+        }
+
+        // Not `u64::MAX`: that wraps to a number still large enough to be refused, so it passes
+        // whether the multiplication saturates or not. This value is chosen so the wrapped product
+        // is 884 bytes - which rounds to **0 MB** and would be admitted free.
+        let rows = 7_378_697_629_483_821u64;
+        assert_eq!(
+            rows.wrapping_mul(ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
+            0,
+            "the premise: wrapping this one projects as nothing at all"
+        );
+        let projected = estimate_nest_rss_mb(&cfg(""), false, 1, rows);
+        assert!(
+            projected > DEFAULT_MAX_RSS_MB,
+            "an absurd max_rows must project past any budget, not wrap to nothing: {projected} MB"
         );
     }
 
@@ -3253,7 +3444,7 @@ mod tests {
              \n[[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n",
         )
         .unwrap();
-        let per_nest = estimate_nest_rss_mb(&cfg, false);
+        let per_nest = estimate_nest_rss_mb(&cfg, false, 0, 0);
         let cursor_mb = RUNTIME_BASE_RSS_MB + 400 * per_nest;
         assert!(
             cursor_mb > DEFAULT_MAX_RSS_MB,
