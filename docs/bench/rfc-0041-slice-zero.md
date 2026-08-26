@@ -60,19 +60,51 @@ Lodestar VPS was modified. The host compiler defaults to C23, so the build used
 `CFLAGS=-std=gnu17` for the pinned `mimalloc-rust-sys 1.7.2` dependency, which still uses the
 removed `ATOMIC_VAR_INIT` macro.
 
+**Re-measured 2026-08-26 with the corrected instrument (#837, #881).** The figures first published
+here measured a window that included work they claimed not to include, and are kept below the new
+ones because the size of the correction is the point.
+
+**Not a like-for-like rerun of the same bytes.** The capture was re-copied from the live Horizon nest
+on the day, so it carries **889 input rows where the original run saw 876** - the nest has gone on
+indexing. Both the instrument and the corpus therefore differ between the two tables. Thirteen extra
+rows do not explain a 59x change in bytes-per-row, and the corrected figure's arithmetic is shown
+below so it can be checked rather than trusted, but the two rows of the comparison table are not the
+same experiment run twice and should not be read as one.
+
 | measure | value |
 | --- | ---: |
-| declared maximum rows | 1,000 |
-| accepted input rows | 876 |
-| result rows | 876 |
-| elapsed time | 284 ms |
-| fixed RSS | 77,064 KB |
-| peak RSS | 234,372 KB |
-| approximate incremental RSS per input row | 183,885 bytes |
+| declared maximum rows | 1,000,000 |
+| accepted input rows | 889 |
+| result rows | 889 |
+| setup (compile + circuit build) | 9 ms |
+| apply | 2 ms |
+| empty-circuit RSS | 77,452 KB |
+| circuit peak RSS | 80,164 KB |
+| **normalise scan peak RSS** | **247,556 KB** |
+| **RSS per input row** | **3,123 bytes** |
+| input rows/sec (apply window) | 444,500 |
 
-The circuit result contained all 876 expected rows. This is comfortably below the 2 GB cursor
-budget for the captured corpus, but it is a single cold-process measurement, not a throughput
-claim or a release gate.
+`(80,164 - 77,452) x 1024 / 889 = 3,123`. The scan's peak is now its own field, and it is **3.1x the
+circuit's own peak** - which is what the original figure was charging to the entity.
+
+### What was published before, and why it was wrong
+
+| measure | published | corrected |
+| --- | ---: | ---: |
+| RSS per input row | 183,885 bytes | **3,123 bytes** |
+| input rows/sec | 15,927 | **444,500** |
+
+The old per-row figure was `peak - fixed` where one sampler spanned the DuckDB normalise scan and the
+baseline was taken after that scan released, so it was to a first approximation the scan's transient
+divided by the entity's row count. The old rate divided by setup-plus-apply, and setup - a fresh
+in-memory DuckDB opened to parse one constant string - was most of it.
+
+**The difference is not academic.** At 183,885 bytes/row the 2 GB per-cursor budget holds about
+11,700 entity rows and RFC-0041 should have parked. At 3,123 it holds about 688,000.
+`runtime::ENTITY_RSS_BYTES_PER_ROW` is set from this measurement, rounded up to 3,200.
+
+Both runs are single cold-process measurements on one machine, not a release gate. §7 criterion 12's
+artifact is a *cursor* measurement and is separate from this.
 
 ## Recorded entity-input replay
 
@@ -98,8 +130,13 @@ nuthatch bench authored-entity --replay /path/to/tape --max-rows 1000 --out repl
 On the ThinkPad Linux x86_64 release build, the manifest-verified Horizon capture produced a tape
 with SHA-256 `00edced52ed7b676eff86c65cf043169c9285e9cc158ae20090599893925aa09`: one indexer-dimension
 batch plus four 256-row delegation batches. Five standalone tape-only processes all reproduced the
-876 expected entity rows. Their median was 55 ms, 15,927 delegation input rows/sec, 41,888 KB fixed
-RSS and 44,028 KB peak RSS.
+876 expected entity rows. Their median was 55 ms, 41,888 KB fixed RSS and 44,028 KB peak RSS.
+
+The 15,927 rows/sec this paragraph used to quote came from dividing by a window that included process
+start, `compile`, and circuit construction (#837). On the corrected instrument the same boundary
+measures 444,500 rows/sec over the apply window, with setup reported separately - and neither number
+should be compared against the >=10K events/sec ingest floor in either direction, for the reason the
+paragraph below already gives.
 
 Those are circuit-ingestion figures, not a claim about Nuthatch's existing RPC/decode/store
 throughput. The product lifecycle does not yet feed authored entities from `indexer.rs`; that is
@@ -183,3 +220,34 @@ asked for rather than a quiet edit.
 
 Neither reassignment makes the measurements optional. They are owed by the slices named, and #821 is
 not complete without 4.
+
+## Per-cursor footprint with authored entities (§7 criterion 12)
+
+Measured 2026-08-26 on a 32-core Debian box, release build, commit `b627eb3`. The scenario is the one
+the per-cursor budget is stated in terms of and the one CI's `per-cursor RAM budget` job enforces:
+**20 nests on ONE cursor**, the 10-event ABI, 200 blocks of live tip-following after a 1,000-block
+backfill, 240,200 rows.
+
+Run twice. A single figure would say the cursor fitted; the pair says what the entities cost.
+
+| | peak RSS | at tip | margin under 2,048 MB |
+| --- | ---: | ---: | ---: |
+| control, no entities | 138 MB | 137 MB | 1,910 MB |
+| **one entity per nest** | **209 MB** | 205 MB | **1,839 MB** |
+
+**71 MB for twenty entity circuits - 3.5 MB each.** Criterion 12 is met with 90% of the budget unused.
+
+The entities were confirmed live mid-run rather than assumed: `/n1/ready` reported `"rows": 790`,
+`"current": true`, `"seconds_since_progress": 1`. Twenty declarations that were never fed would have
+produced an RSS delta meaning nothing.
+
+### What the measurement changed
+
+`runtime::ENTITY_CIRCUIT_RSS_MB` was `NEST_VIEW_RSS_MB` (40) - the built-in views' allowance, reused
+because an entity is a DBSP circuit on a thread exactly as they are. It is **11x the measured cost**.
+At 40 MB, twenty entities consume 43% of a cursor's 2 GB before a single row and thirty-two consume
+70%; the first run of this measurement was **refused at admission** for that reason, at a declaration
+the hardware went on to handle with 1.8 GB to spare.
+
+It is now 8 MB - the measured 3.5 with a deliberate margin, because this is one run on one machine and
+an admission figure set too low admits a mount that then breaches the budget at runtime.

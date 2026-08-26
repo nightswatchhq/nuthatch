@@ -510,7 +510,23 @@ impl<'a> Columns<'a> {
                     ),
                 };
                 let child = e.get("child").ok_or_else(|| anyhow!("a cast of nothing"))?;
-                Ok(Expr::Cast(self.expr(child, scope)?.into(), ty))
+                let inner = self.expr(child, scope)?;
+                // **`true` is a cast, in this parser.** DuckDB serialises the boolean literals as
+                // `CAST('t' AS BOOLEAN)` and `CAST('f' AS BOOLEAN)`, so `WHERE i.active = true` -
+                // about as ordinary as SQL gets - arrives here as a VARCHAR-to-BOOLEAN cast, which
+                // the evaluator refuses at the row. Found on the captured Horizon corpus (#835); no
+                // test in this module had a boolean literal in it.
+                //
+                // Folded at load rather than admitted at runtime: the refusal is still right for a
+                // VARCHAR *column*, and folding a literal costs nothing per row.
+                if let (Expr::Literal(Scalar::Str(text)), Type::Bool) = (&inner, ty) {
+                    return match text.as_str() {
+                        "t" | "true" => Ok(Expr::Literal(Scalar::Bool(true))),
+                        "f" | "false" => Ok(Expr::Literal(Scalar::Bool(false))),
+                        other => bail!("`{other}` is not a boolean literal"),
+                    };
+                }
+                Ok(Expr::Cast(inner.into(), ty))
             }
             "FUNCTION" => {
                 let name = e
@@ -1076,6 +1092,48 @@ mod tests {
                 "{expected} missing from {filter}"
             );
         }
+    }
+
+    /// `WHERE flag = true` is ordinary SQL and did not lower until #835's corpus met it: DuckDB
+    /// serialises the boolean literals as `CAST('t' AS BOOLEAN)`, and a VARCHAR-to-BOOLEAN cast is
+    /// refused at evaluation. Folded at load instead, so the refusal still stands for a real column.
+    #[test]
+    fn a_boolean_literal_folds_rather_than_arriving_as_a_varchar_cast() {
+        for (sql, want) in [
+            (
+                "SELECT t.a, count(*) FROM t WHERE t.flag = true GROUP BY t.a",
+                true,
+            ),
+            (
+                "SELECT t.a, count(*) FROM t WHERE t.flag = false GROUP BY t.a",
+                false,
+            ),
+        ] {
+            let filter = lower(sql).unwrap().left_filter.expect("the WHERE lowered");
+            assert_eq!(
+                filter,
+                Expr::Compare(
+                    Cmp::Eq,
+                    Expr::Column(0).into(),
+                    Expr::Literal(Scalar::Bool(want)).into()
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The fold is for the parser's own spelling of a boolean, not a licence to cast text generally:
+    /// a cast of a *column* must stay a cast, so the evaluator still refuses it at the row.
+    #[test]
+    fn casting_a_column_to_boolean_stays_a_cast() {
+        let filter = lower("SELECT t.a, count(*) FROM t WHERE CAST(t.b AS BOOLEAN) GROUP BY t.a")
+            .unwrap()
+            .left_filter
+            .unwrap();
+        assert!(
+            matches!(filter, Expr::Cast(_, Type::Bool)),
+            "a column cast must stay a cast: {filter:?}"
+        );
     }
 
     #[test]
