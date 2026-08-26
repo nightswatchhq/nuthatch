@@ -142,7 +142,8 @@ the kernel to enforce the 2 GB limit with its customary lack of ceremony.
 The initial subset is chosen for soundness and the Lodestar workload, not language completeness:
 
 - deterministic projection and filtering;
-- exact integer and decimal arithmetic;
+- exact integer and decimal arithmetic, where **exact means an operation that cannot be represented
+  refuses** - see 3.3.1;
 - `GROUP BY` over declared keys;
 - `count`, `sum`, `min`, `max`, and `avg` represented as sum plus count;
 - inner equijoins where both inputs are indexed facts or earlier entities and the join keys are named;
@@ -161,6 +162,44 @@ Refused in v1:
 Refusal means “leave this as an ordinary view”, not “the nest cannot express this question”. The
 general query surface remains the escape valve, which lets the compiler be conservative without
 making the product brittle.
+
+### 3.3.1 Overflow is a fault, not a wrap
+
+An arithmetic result that does not fit its type **faults the nest**. It does not wrap, saturate, or
+become NULL. This applies to accumulation inside an aggregate as much as to a scalar expression: a
+`sum` whose running total leaves `i128` is a fault at the row that carried it past, not a total that
+silently starts again from the other end of the number line.
+
+This is stated as a **contract on the entity, not on the engine**, and it is written down before any
+entity exists because it is the one property that cannot be retrofitted. Once nests have authored
+entities and their history has been sealed, changing what an overflow does re-litigates the meaning
+of every one of them.
+
+Three reasons it is worth a section of its own.
+
+**The engines disagree, and one of them disagrees quietly.** DuckDB and Postgres error. DataFusion, a
+candidate replacement under RFC-0042, **wraps by default** - `SELECT 10000000000 * 10000000000`
+returns a wrapped `Int64` where Postgres errors (arrow-datafusion#17539, open). RFC-0042's Tier 1
+research ranks this its number one gate risk. Pinning the contract here means a future engine change
+is a parity check against a stated rule rather than a rediscovery of what the old engine happened to
+do.
+
+**A wrapped token balance is worse than a missing one.** These are `uint256` amounts narrowed to
+`i128`. A wrap does not produce an obviously broken answer; it produces a plausible one with the wrong
+sign or magnitude, stored, sealed, and served as canonical. Absent data announces itself. Wrapped
+data does not, and this project has spent enough of 2026 on results that looked healthy without being
+measured.
+
+**It is cheap now and expensive later.** `i128::checked_add` costs a branch the optimiser mostly
+removes. Retrofitting it costs a re-derivation of every sealed entity.
+
+The runtime consequence is [`§7`](#7---resource-accounting-and-isolation)'s: the nest faults and
+quarantines under RFC-0026, exactly as a dead circuit thread does. A quarantined nest with a stated
+cause is a supportable outcome; a served wrap is not.
+
+Narrowing casts follow the same rule. A cast that cannot represent its input refuses rather than
+truncating, and `TRY_CAST`-style silent-NULL behaviour is not in the v1 subset - an author who wants
+it can say so in an ordinary view, where the semantics are DuckDB's and the result is not stored.
 
 ## §4 - Compilation without smuggling in a platform
 
