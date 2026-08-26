@@ -1,6 +1,6 @@
 # RFC-0044: The subgraph port skill - one subgraph, one nest
 
-- **Status: Proposed - design only.** Needs a freeze decision before any slice starts (§8).
+- Status: **Proposed - design only.** Needs a freeze decision before any slice starts (§8).
 - Author: Pete (cargopete)
 - Date: 2026-08-26
 - Provenance: the GraphOps 1:1 with Chris Wessels. His words, from the transcript summary:
