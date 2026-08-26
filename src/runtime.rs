@@ -285,17 +285,23 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 
 /// Bytes per admitted input row for an authored incremental entity (RFC-0041 §7, criterion 9).
 ///
-/// **2,500 and not the 183,885 the slice-zero document publishes.** That figure is `peak - fixed`
-/// over a window that spans a 371 MB DuckDB Parquet scan, with the baseline sampled after the scan
-/// released, so it is mostly the scan's transient divided by the entity's row count (#837). The same
-/// document's tape path - which performs no scan - reports ~2,500 bytes/row for the same 876 rows,
-/// and that is the entity's own cost.
+/// **Measured, 2026-08-26**, with #837's corrected instrument against the captured Horizon corpus on
+/// a 32-core Debian box: 889 input rows, empty-circuit RSS 77,452 KB, circuit peak 80,164 KB, so
+/// `(80,164 - 77,452) x 1024 / 889 = 3,123` bytes/row. Rounded up, because an admission estimate that
+/// is too low admits a mount which then breaches the budget at runtime, and too high merely refuses
+/// one that would have fitted.
 ///
-/// It is an estimate for **admission**, not a measurement, and the difference matters in one
-/// direction: too low admits a mount that then breaches the budget at runtime. #837's instrument fix
-/// has to be re-run on the enforcing hardware before this constant is anything but a defensible
-/// starting point, which is criterion 12 and is not this change.
-const ENTITY_RSS_BYTES_PER_ROW: u64 = 2_500;
+/// **Not the 183,885 the slice-zero document published.** That was `peak - fixed` across a window
+/// spanning the DuckDB normalise scan, with the baseline sampled after the scan released - so it was
+/// mostly the scan's transient divided by the entity's row count. The same run now reports that scan
+/// separately at 247,556 KB, **3.1x the circuit's own peak**, which is what was being charged to the
+/// entity. The difference is not academic: at 183,885 bytes/row the 2 GB cursor budget holds ~11,700
+/// entity rows, and at 3,123 it holds ~688,000.
+///
+/// Still an estimate rather than a promise. It is data-size driven over a fixed corpus rather than
+/// core-count driven, which is the property that made the multi-nest regression figure agree across
+/// machines - but criterion 12's artifact is a *cursor* measurement, not this one.
+const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 
 /// The most authored entities one cursor will admit, across every nest on that chain.
 ///
@@ -3419,9 +3425,15 @@ mod tests {
         }
 
         // Not `u64::MAX`: that wraps to a number still large enough to be refused, so it passes
-        // whether the multiplication saturates or not. This value is chosen so the wrapped product
-        // is 884 bytes - which rounds to **0 MB** and would be admitted free.
-        let rows = 7_378_697_629_483_821u64;
+        // whether the multiplication saturates or not. This is the smallest row count whose product
+        // exceeds `u64::MAX` - so wrapping leaves a remainder below the per-row constant itself,
+        // which rounds to **0 MB** and would be admitted free.
+        //
+        // Derived rather than written down: the first version hardcoded a value tuned to a
+        // `ENTITY_RSS_BYTES_PER_ROW` of 2,500 and broke the moment that constant was replaced by a
+        // measurement. A test that only works for one value of the thing it is testing is a trap
+        // laid for whoever changes it next.
+        let rows = u64::MAX / ENTITY_RSS_BYTES_PER_ROW + 1;
         assert_eq!(
             rows.wrapping_mul(ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
             0,
