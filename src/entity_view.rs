@@ -56,8 +56,14 @@ impl Batch {
 }
 
 enum Msg {
-    /// A weighted batch, and the block it carries the entity through once folded.
-    Batch(Box<Batch>, u64),
+    /// A weighted batch, the block it carries the entity through once folded, and whether to
+    /// publish the relation after folding it.
+    ///
+    /// A seed sets `publish: false`. Publishing copies the whole relation, so doing it per chunk
+    /// makes a chunked seed quadratic in the number of chunks - and a half-seeded relation is not
+    /// something any reader should see anyway. `Flush` publishes what a deferred batch left
+    /// pending, which is what `EntityView::seed_end` waits on.
+    Batch(Box<Batch>, u64, bool),
     Flush(SyncSender<()>),
 }
 
@@ -182,9 +188,28 @@ impl EntityView {
                 // watched the delegations and admitted fifty thousand indexer facts at a declared
                 // bound of one.
                 let mut live: i64 = 0;
+                // The watermark of a folded-but-unpublished batch, i.e. a seed in progress.
+                let mut pending: Option<u64> = None;
+                let publish = |through: u64, circuit: &EntityCircuit| {
+                    // The rows and the head they account for, published together.
+                    let mut published = shared.write().unwrap();
+                    let moved = through > published.through;
+                    *published = Published {
+                        relation: circuit.relation().clone(),
+                        through,
+                        // Stamped only when the watermark actually moves. A window that carries
+                        // the entity no further is not progress, and counting it as such is how a
+                        // wedged entity looks busy.
+                        progress_at: if moved {
+                            crate::metrics::now_unix()
+                        } else {
+                            published.progress_at
+                        },
+                    };
+                };
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        Msg::Batch(batch, through) => {
+                        Msg::Batch(batch, through, should_publish) => {
                             match step(&mut circuit, &batch, &mut live, max_rows) {
                                 Err(e) => {
                                     // Includes crossing the declared `max_rows`, which is a fault
@@ -196,27 +221,21 @@ impl EntityView {
                                     break;
                                 }
                                 Ok(()) => {
-                                    // The rows and the head they account for, published together.
-                                    let mut published = shared.write().unwrap();
-                                    let moved = through > published.through;
-                                    *published = Published {
-                                        relation: circuit.relation().clone(),
-                                        through,
-                                        // Stamped only when the watermark actually moves. A window
-                                        // that carries the entity no further is not progress, and
-                                        // counting it as such is how a wedged entity looks busy.
-                                        progress_at: if moved {
-                                            crate::metrics::now_unix()
-                                        } else {
-                                            published.progress_at
-                                        },
-                                    };
+                                    if should_publish {
+                                        pending = None;
+                                        publish(through, &circuit);
+                                    } else {
+                                        pending = Some(through);
+                                    }
                                 }
                             }
                         }
                         // Messages are processed in order, so by the time the barrier is seen every
                         // prior batch is folded - the ack unblocks the waiter.
                         Msg::Flush(ack) => {
+                            if let Some(through) = pending.take() {
+                                publish(through, &circuit);
+                            }
                             let _ = ack.send(());
                         }
                     }
@@ -305,9 +324,33 @@ impl EntityView {
     /// so an entity whose history does not fit its declared bound cannot be restarted - which is the
     /// correct answer, since it could not have been running in the first place.
     pub fn seed(&mut self, rows: &[DecodedRow], through: u64) -> Result<()> {
+        self.seed_begin();
+        self.seed_chunk(rows, through)?;
+        self.seed_end()
+    }
+
+    /// Open a seed. Split from [`Self::seed`] so a caller holding a very large history can feed it
+    /// in pieces rather than materialising all of it - see
+    /// [`crate::seal::read_table_rows_by_segment`] for why that matters and what it was measured
+    /// to cost. The three calls are the same seed: `begin`, then one or more `chunk`s at `+1`,
+    /// then `end`.
+    pub fn seed_begin(&mut self) {
         self.unavailable = None;
-        self.apply_window(rows, 1, through)
-            .with_context(|| format!("seeding entity `{}` from stored history", self.name))?;
+    }
+
+    /// Feed one piece of stored history at `+1`. Ordering across chunks does not matter and
+    /// neither does the split: DBSP folds a window, and a seed is windows.
+    pub fn seed_chunk(&self, rows: &[DecodedRow], through: u64) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.apply_window_inner(rows, 1, through, false)
+            .with_context(|| format!("seeding entity `{}` from stored history", self.name))
+    }
+
+    /// Close a seed: wait for every chunk to be folded, and refuse a relation that faulted while
+    /// folding one. A fault here is terminal exactly as it is at tip.
+    pub fn seed_end(&self) -> Result<()> {
         self.flush();
         if let Some(why) = self.fault() {
             return Err(anyhow!("seeding entity `{}` faulted: {why}", self.name));
@@ -331,6 +374,16 @@ impl EntityView {
     /// A window carrying nothing for this entity is still progress and still advances the watermark:
     /// the entity is current through that block, having correctly folded no facts.
     pub fn apply_window(&self, rows: &[DecodedRow], weight: ZWeight, through: u64) -> Result<()> {
+        self.apply_window_inner(rows, weight, through, true)
+    }
+
+    fn apply_window_inner(
+        &self,
+        rows: &[DecodedRow],
+        weight: ZWeight,
+        through: u64,
+        publish: bool,
+    ) -> Result<()> {
         // An unavailable entity is fed nothing at all. Half an answer is the failure mode; none is
         // merely an absence, and `unavailable()` is what says so.
         if self.unavailable.is_some() {
@@ -340,20 +393,28 @@ impl EntityView {
             .binding
             .window(rows)
             .with_context(|| format!("converting a window for entity `{}`", self.name))?;
-        self.apply(
-            Batch {
-                left: left.into_iter().map(|r| (r, weight)).collect(),
-                right: right.into_iter().map(|r| (r, weight)).collect(),
-            },
-            through,
-        );
+        let batch = Batch {
+            left: left.into_iter().map(|r| (r, weight)).collect(),
+            right: right.into_iter().map(|r| (r, weight)).collect(),
+        };
+        if publish {
+            self.apply(batch, through);
+        } else {
+            self.apply_deferred(batch, through);
+        }
         Ok(())
     }
 
     /// Enqueue an already-bound batch. Non-blocking, and drops silently if the thread has died -
     /// which `is_healthy` is what reports, not this.
     pub fn apply(&self, batch: Batch, through: u64) {
-        let _ = self.tx.send(Msg::Batch(Box::new(batch), through));
+        let _ = self.tx.send(Msg::Batch(Box::new(batch), through, true));
+    }
+
+    /// Enqueue a batch **without** publishing the relation afterwards. See [`Msg::Batch`]; the next
+    /// [`Self::flush`] publishes it.
+    fn apply_deferred(&self, batch: Batch, through: u64) {
+        let _ = self.tx.send(Msg::Batch(Box::new(batch), through, false));
     }
 
     /// Block until every batch enqueued so far has been folded. Used after a restart rebuild so the

@@ -262,11 +262,44 @@ pub fn read_table_rows(
     dir: &Path,
     schema: &crate::registry::TableSchema,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    let mut out = Vec::new();
+    read_table_rows_by_segment(dir, schema, &mut |mut rows| {
+        out.append(&mut rows);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The same read, handed to `sink` **one sealed segment at a time** instead of accumulated.
+///
+/// The whole-history `Vec` is a large transient of a restart seed, and it is one nothing else
+/// bounds: mount admission prices an entity's *maintained* relation, not the historical facts it
+/// folds to build one. Measured against a real Horizon nest (2026-08-26, `tests/seed_scale.rs`,
+/// 346,288 sealed rows across 2,985 segments):
+///
+/// | seed             | peak RSS | wall |
+/// |------------------|----------|------|
+/// | one window       | 993 MB   | 1.2s |
+/// | per segment      | 694 MB   | 2.4s |
+/// | one window, join | 790 MB   | 1.9s |
+/// | per segment, join| 368 MB   | 2.8s |
+///
+/// Half the per-cursor budget for one entity over one table, against a third of it, at twice the
+/// wall clock on a path that runs once per restart. Worth it.
+///
+/// Chunking is sound because a seed is `+1`-only: no retraction is fed, so the maintained relation
+/// grows monotonically and no chunk can trip `max_rows` earlier than the whole-history window
+/// would have. A seed that fits still fits.
+pub fn read_table_rows_by_segment(
+    dir: &Path,
+    schema: &crate::registry::TableSchema,
+    sink: &mut dyn FnMut(Vec<crate::registry::DecodedRow>) -> Result<()>,
+) -> Result<()> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let manifest = load_manifest(dir)?;
     let Some(segments) = manifest.tables.get(&schema.table) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     // Block order, and by content address within a block range so a re-seal cannot reorder rows.
     let mut ordered: Vec<&Segment> = segments.iter().collect();
@@ -274,8 +307,8 @@ pub fn read_table_rows(
         (a.from_block, a.to_block, &a.hash).cmp(&(b.from_block, b.to_block, &b.hash))
     });
 
-    let mut out = Vec::new();
     for segment in ordered {
+        let mut out = Vec::new();
         let path = segment_path(dir, &segment.file, &segment.hash);
         let file = std::fs::File::open(&path)
             .with_context(|| format!("opening sealed segment {}", path.display()))?;
@@ -326,8 +359,9 @@ pub fn read_table_rows(
                 );
             }
         }
+        sink(out)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Load the segment catalogue (empty if none yet).

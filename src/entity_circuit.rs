@@ -339,25 +339,51 @@ impl EntityCircuit {
         // Past this point the rows are inside the circuit. If the transaction fails, the circuit's
         // state and this struct's are no longer the same story, so the entity stops here rather
         // than carrying on over a disagreement it cannot see.
-        if let Err(e) = self.handle.transaction() {
+        //
+        // **A transaction is a sequence of steps, not one step.** DBSP splits a large input across
+        // several internal steps of its own choosing, and each step writes to the output handle
+        // independently: reading `out` once, after the transaction, sees only the final step's
+        // output and silently discards every earlier one. `DBSPHandle::transaction()` and
+        // `commit_transaction()` both hide that loop, so the loop is driven here instead and the
+        // output drained after **every** step.
+        //
+        // The failure this prevents is not subtle in its effect and is invisible in its symptoms.
+        // Measured against a real Horizon nest (2026-08-26): a `GROUP BY delegator` over 346,288
+        // sealed rows with 309,549 distinct delegators produced exactly `309,549 mod 10,000` =
+        // 9,549 groups when fed as one window - dbsp's internal step is 10,000 rows, so all but the
+        // last step's worth of the relation was thrown away. Nothing faulted, nothing logged, and
+        // the relation looked like a smaller but perfectly well-formed answer. The reproducer is
+        // `one_large_window_folds_every_group`, which fails without this loop.
+        if let Err(e) = self.step_to_commit() {
             let why = format!("the entity circuit faulted: {e}");
             self.faulted = Some(why.clone());
             return Err(anyhow!(why));
         }
 
-        // The output is the change to the derived relation, so integrating it here is what keeps
-        // `relation()` a point-read rather than a recomputation.
-        self.out.consolidate().iter().for_each(
-            |(Tup2(key, value), (), weight): (Tup2<Row, Row>, (), ZWeight)| {
-                if weight > 0 {
-                    self.relation.insert(key, value);
-                } else if self.relation.get(&key) == Some(&value) {
-                    self.relation.remove(&key);
-                }
-            },
-        );
-
         Ok(())
+    }
+
+    /// Run one transaction to completion, integrating the output after each of its steps.
+    fn step_to_commit(&mut self) -> Result<()> {
+        self.handle.start_transaction()?;
+        self.handle.start_commit_transaction()?;
+        loop {
+            let complete = self.handle.step()?;
+            // The output is the change to the derived relation, so integrating it here is what
+            // keeps `relation()` a point-read rather than a recomputation.
+            self.out.consolidate().iter().for_each(
+                |(Tup2(key, value), (), weight): (Tup2<Row, Row>, (), ZWeight)| {
+                    if weight > 0 {
+                        self.relation.insert(key, value);
+                    } else if self.relation.get(&key) == Some(&value) {
+                        self.relation.remove(&key);
+                    }
+                },
+            );
+            if complete {
+                return Ok(());
+            }
+        }
     }
 
     /// The derived relation as it stands. After a fault this is the last value that was consistent,
@@ -529,6 +555,57 @@ mod tests {
     }
     fn minus(rows: &[Row]) -> Vec<(Row, ZWeight)> {
         rows.iter().map(|r| (r.clone(), -1)).collect()
+    }
+
+    /// **One window, many groups.** A restart seed feeds a nest's whole sealed history as a single
+    /// window, and that is the one shape no fixture here exercised: every other test feeds a
+    /// handful of rows.
+    ///
+    /// Found against a real Horizon nest (2026-08-26): a `GROUP BY delegator` over 346,288 sealed
+    /// rows with 309,549 distinct delegators returned 309,549 groups when fed in 1,000-row windows
+    /// and 9,549 - three percent - when the whole history went in at once. Nothing faulted and
+    /// nothing logged. The batch evaluator is the oracle, so it says which of the two is right.
+    #[test]
+    fn one_large_window_folds_every_group() {
+        let plan = delegation_plan();
+        // Across dbsp's internal step boundary, which was 10,000 rows when this was written. The
+        // sizes either side of it are the point: 4,096 always passed, 16,384 returned 6,384.
+        for n in [4usize, 4_096, 16_384, 50_000] {
+            let left: Vec<Row> = (0..n)
+                .map(|i| d("i1", &format!("d{i:06}"), 1 + (i as i128 % 7)))
+                .collect();
+            let right = [i_row("i1", true)];
+
+            let got = evaluate_incrementally(&plan, &left, &right).unwrap();
+            assert_eq!(
+                got.len(),
+                n,
+                "one window of {n} distinct groups must fold to {n} groups"
+            );
+            assert_eq!(
+                got,
+                plan.evaluate(&left, &right).unwrap(),
+                "§8: the circuit and the batch oracle are the same relation, at {n} rows"
+            );
+        }
+    }
+
+    /// A window that carries the same fact twice carries it twice. Two identical delegations are
+    /// one `Row` at weight 2, and the aggregate must see both - a window is a Z-set, not a set.
+    #[test]
+    fn a_repeated_row_in_one_window_counts_twice() {
+        let plan = delegation_plan();
+        let left = [d("i1", "a", 5), d("i1", "a", 5)];
+        let right = [i_row("i1", true)];
+
+        let got = evaluate_incrementally(&plan, &left, &right).unwrap();
+
+        assert_eq!(
+            got.get(&Row(vec![s("i1"), s("a")])),
+            Some(&Row(vec![Scalar::Int(10)])),
+            "the same delegation twice sums to 10, not 5"
+        );
+        assert_eq!(got, plan.evaluate(&left, &right).unwrap());
     }
 
     /// **§4 step 4, end to end.** A plan goes in, a circuit comes out, and the answer is the one the
