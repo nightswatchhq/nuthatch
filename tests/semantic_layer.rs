@@ -53,7 +53,7 @@ fn composed_schema_teaches_footguns_and_the_coverage_seam() {
         sealed_through: 7,
         tip: 10,
     };
-    let doc = nuthatch::semantic::compose(&schema, Some(&sem), Some(&coverage));
+    let doc = nuthatch::semantic::compose(&schema, Some(&sem), Some(&coverage), &[]);
 
     // Coverage seam, stated as numbers.
     assert!(

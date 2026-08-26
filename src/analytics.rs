@@ -234,6 +234,15 @@ pub struct QueryOutput {
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
     pub tip_unavailable: bool,
+    /// The base tables this statement referenced, lowercased, or `None` where the parse was
+    /// unavailable and the answer is therefore not known.
+    ///
+    /// Comes from the same security walk that `reject_unknown_table_refs` already performs - one
+    /// parse, one answer about what a query reaches, so the control and the provenance can never
+    /// disagree. `/sql` uses it to name which **maintained relations** answered (#822 criterion 9);
+    /// `None` leaves that block off the response entirely rather than reporting an empty set, since
+    /// "we did not parse it" and "it touched no entity" are different facts.
+    pub referenced_tables: Option<std::collections::BTreeSet<String>>,
 }
 
 impl QueryOutput {
@@ -636,6 +645,7 @@ fn attempt(
         truncated,
         degraded_tables,
         tip_unavailable: false,
+        referenced_tables: referenced,
     }))
 }
 

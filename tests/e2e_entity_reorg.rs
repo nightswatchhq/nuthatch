@@ -617,6 +617,137 @@ async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
 /// output map. What this test can check from outside is that the answer is *right*, that it carries
 /// the provenance criterion 9 asks for, and that its applied-through is the **entity's** watermark
 /// rather than the nest's head - which is the difference between reporting and pretending.
+/// Drive one GET through the nest's **real router**, not a hand-built handler call.
+///
+/// The distinction is the point. The keyed-read test below this one used to read
+/// `entity.relation()` directly and assert on the values, which proves the circuit holds the right
+/// answer and says nothing about whether the route returns it, stamps provenance, or refuses when
+/// it should. Two of #822's criteria are statements about a *response*.
+async fn get_json(
+    rt: &indexer::NestRuntime,
+    path: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let router = nuthatch::serve::router(nuthatch::serve::SharedNest::new(rt.state.clone()));
+    let req = axum::http::Request::builder()
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    (status, value)
+}
+
+/// **#822 criterion 9, through the routes rather than beside them**, plus the `/sql` exposure that
+/// shipped without a test of its own.
+///
+/// A maintained relation is queryable by its declared name, and the answer says so: which entity
+/// answered, that it is incremental, how far it is applied, and whether that is current. A query
+/// that touches no entity gets no such claim, because an empty array would assert something about
+/// maintained state that a plain fact query has no business asserting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sql_route_serves_the_relation_by_name_and_says_where_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    // The relation, by the name its author declared, through the analytical surface.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/sql over the entity: {body}"
+    );
+    let rows = body["rows"].as_array().expect("rows").clone();
+    assert_eq!(
+        rows.len(),
+        rt.state.entities[0].relation().len(),
+        "/sql must serve every maintained row: {body}"
+    );
+    assert!(
+        rows.iter().all(|r| r.get("to").is_some()),
+        "the author's own column names, not positional ones: {rows:?}"
+    );
+
+    // Criterion 9. `source: hot+sealed` describes the fact tables and says nothing about a relation
+    // a circuit maintains, which is the gap this closes.
+    let entities = body["provenance"]["entities"]
+        .as_array()
+        .unwrap_or_else(|| panic!("provenance.entities missing: {body}"));
+    assert_eq!(entities.len(), 1, "one entity answered: {entities:?}");
+    assert_eq!(entities[0]["entity"], "received");
+    assert_eq!(entities[0]["incremental"], true);
+    assert_eq!(entities[0]["applied_through"], CHAIN_LEN);
+    assert_eq!(entities[0]["current"], true);
+
+    // A query over raw facts touches no maintained state and must not claim to.
+    let (status, body) = get_json(
+        &rt,
+        "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20usdc__transfer",
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/sql over facts: {body}"
+    );
+    assert!(
+        body["provenance"]["entities"].is_null(),
+        "a fact query must not carry an entity provenance block: {body}"
+    );
+
+    // The surface bullet's other half: `/schema` - which the MCP `schema` tool relays verbatim - must
+    // say the relation exists, that it is incremental, and how far it is applied. Without this an
+    // agent can query `received` from `/sql` but has no way to discover that it is there.
+    let (status, body) = get_json(&rt, "/schema").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "/schema");
+    let doc = body["raw"].as_str().expect("/schema is plain text");
+    assert!(
+        doc.contains("MAINTAINED RELATIONS"),
+        "/schema must have a maintained-relations section:\n{doc}"
+    );
+    assert!(
+        doc.contains("received - applied through block 8"),
+        "/schema must name the relation and its applied-through block:\n{doc}"
+    );
+    assert!(
+        doc.contains("NOT recomputed per query"),
+        "/schema must distinguish a maintained relation from an authored view:\n{doc}"
+    );
+    assert!(
+        doc.contains("columns: to, "),
+        "/schema must name the author's columns:\n{doc}"
+    );
+
+    // Criterion 2, through the route this time: the keyed read answers with provenance.
+    let (status, body) = get_json(&rt, &format!("/derived/received/{}", account(2))).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/derived keyed read: {body}"
+    );
+    let want: i128 = (1..=CHAIN_LEN).map(|b| (100 * b) as i128).sum();
+    assert_eq!(body["row"][0], want.to_string(), "the keyed row: {body}");
+    let p = &body["provenance"];
+    assert_eq!(p["entity"], "received");
+    assert_eq!(p["incremental"], true);
+    assert_eq!(p["from_maintained_state"], true);
+    assert_eq!(p["applied_through"], CHAIN_LEN);
+    assert_eq!(p["current"], true);
+
+    shutdown_and_settle(rt).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
     let dir = tempfile::tempdir().unwrap();

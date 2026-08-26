@@ -1033,7 +1033,23 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
     };
-    let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage));
+    // #822's surface bullet: `/schema` (which the MCP `schema` tool relays verbatim) must say that
+    // a relation is incremental and name its applied-through block.
+    let head = dataset_head(&s);
+    let maintained: Vec<crate::semantic::MaintainedRelation> = s
+        .entities
+        .iter()
+        .map(|e| crate::semantic::MaintainedRelation {
+            name: e.name().to_string(),
+            columns: e.columns().to_vec(),
+            applied_through: e.applied_through(),
+            current: e.is_current(head),
+            unavailable: e.unavailable().map(str::to_string),
+            fault: e.fault(),
+            rows: e.len(),
+        })
+        .collect();
+    let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage), &maintained);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1407,6 +1423,13 @@ async fn run_sql_query(
                 "source": "hot+sealed",
                 "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
                 "nid": s.nid.as_deref(),
+                // **#822 criterion 9, on the analytical route.** `source: hot+sealed` describes the
+                // fact tables; it says nothing about a maintained relation, whose rows came from a
+                // circuit rather than from a scan and are current only as far as its own watermark.
+                // A caller citing this answer needs to know both. Absent when the statement
+                // referenced no entity, and absent when the parse was unavailable - see
+                // `QueryOutput::referenced_tables`, which is why this is not an empty array.
+                "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref()),
             },
         }))
         .into_response(),
@@ -1572,13 +1595,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
 /// `/entities` keeps its existing meaning - decoded event rows - so maintained relations live under
 /// `/derived`. Two names for two different things beats one name that quietly changed.
 async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
-    let head = s
-        .store
-        .get_meta("last_block")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    let head = dataset_head(&s);
     let items: Vec<Value> = s
         .entities
         .iter()
@@ -1642,6 +1659,53 @@ fn find_entity<'a>(
 
 /// Provenance for a derived answer (criterion 9): which entity, how far it has folded, and that the
 /// answer came from maintained state rather than a scan.
+/// The dataset's head block, as the hot store records it. `0` where it has none yet, which reads
+/// correctly through `EntityView::is_current`: an entity applied through nothing is current with a
+/// dataset that holds nothing.
+fn dataset_head(s: &AppState) -> u64 {
+    s.store
+        .get_meta("last_block")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// **#822 criterion 9 for `/sql`.** Which maintained relations answered this statement, how far each
+/// is applied, and whether that is current.
+///
+/// Built from the referenced-table set the security walk already produced rather than by matching
+/// entity names against the SQL text, so the provenance and the control that admits the query agree
+/// by construction. Returns `Value::Null` when no entity was referenced or when the set is unknown:
+/// an empty array would assert "this query touched no maintained state", which is a claim the `None`
+/// case has no basis to make.
+fn sql_entity_provenance(
+    s: &AppState,
+    referenced: Option<&std::collections::BTreeSet<String>>,
+) -> Value {
+    let Some(referenced) = referenced else {
+        return Value::Null;
+    };
+    let head = dataset_head(s);
+    let used: Vec<Value> = s
+        .entities
+        .iter()
+        .filter(|e| referenced.contains(&e.name().to_ascii_lowercase()))
+        .map(|e| {
+            json!({
+                "entity": e.name(),
+                "incremental": true,
+                "applied_through": e.applied_through(),
+                "current": e.is_current(head),
+            })
+        })
+        .collect();
+    if used.is_empty() {
+        return Value::Null;
+    }
+    Value::Array(used)
+}
+
 fn derived_provenance(s: &AppState, entity: &crate::entity_view::EntityView, head: u64) -> Value {
     json!({
         "nid": s.nid,
@@ -1670,13 +1734,7 @@ async fn derived_key(
     if let Some((code, body)) = derived_refusal(entity) {
         return (code, Json(body)).into_response();
     }
-    let head = s
-        .store
-        .get_meta("last_block")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    let head = dataset_head(&s);
 
     // The key is a single column here. A composite key arrives as its parts joined by the unit
     // separator, the same character the built-in views use, so a key containing a comma or a slash
@@ -1723,13 +1781,7 @@ async fn derived_all(
     if let Some((code, body)) = derived_refusal(entity) {
         return (code, Json(body)).into_response();
     }
-    let head = s
-        .store
-        .get_meta("last_block")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    let head = dataset_head(&s);
     let limit = q.limit.unwrap_or(100).min(1000);
     let relation = entity.relation();
     let items: Vec<Value> = relation
