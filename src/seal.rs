@@ -26,7 +26,7 @@
 //! ever becomes worth the coupling to a parquet-rs internal; it is deliberately not pinned today.
 
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -241,6 +241,93 @@ fn write_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
     writer.write(batch).context("failed to write batch")?;
     writer.close().context("failed to finalise parquet")?;
     Ok(buf)
+}
+
+/// Read a table's sealed rows back as [`DecodedRow`]s, in block order (RFC-0041 §5.3, nuthatch#865).
+///
+/// **The one conversion, not a second one.** Every cell goes through
+/// [`DecodedRow::from_stored`], which is what the reorg path uses on the hot store's JSON. A reader
+/// that parsed Parquet into typed values on its own would be a second opinion about what a stored
+/// row means, and the two would agree until the day they did not - at which point a retraction stops
+/// cancelling its insertion and the entity keeps a fact forever. See nuthatch#864.
+///
+/// `rows_to_batch` writes `block_number`, `log_index`, `_seq` and `block_timestamp` as `UInt64` and
+/// everything else as `Utf8`, so those are the only two column types this has to understand. A
+/// segment carrying anything else was not written by this project.
+///
+/// **This loads the table into memory.** That is what a warm-restart seed is - §5.3 pays the
+/// historical fold once per restart rather than once per request - but it is not a streaming reader
+/// and should not be mistaken for one.
+pub fn read_table_rows(
+    dir: &Path,
+    schema: &crate::registry::TableSchema,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let manifest = load_manifest(dir)?;
+    let Some(segments) = manifest.tables.get(&schema.table) else {
+        return Ok(Vec::new());
+    };
+    // Block order, and by content address within a block range so a re-seal cannot reorder rows.
+    let mut ordered: Vec<&Segment> = segments.iter().collect();
+    ordered.sort_by(|a, b| {
+        (a.from_block, a.to_block, &a.hash).cmp(&(b.from_block, b.to_block, &b.hash))
+    });
+
+    let mut out = Vec::new();
+    for segment in ordered {
+        let path = segment_path(dir, &segment.file, &segment.hash);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("opening sealed segment {}", path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading sealed segment {}", path.display()))?
+            .build()
+            .with_context(|| format!("reading sealed segment {}", path.display()))?;
+        for batch in reader {
+            let batch =
+                batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
+            for row in 0..batch.num_rows() {
+                let mut stored = serde_json::Map::new();
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    let column = batch.column(i);
+                    let value = match field.data_type() {
+                        DataType::UInt64 => {
+                            let a = column
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .context("a UInt64 column that is not one")?;
+                            Value::from(a.value(row))
+                        }
+                        DataType::Utf8 => {
+                            let a = column
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .context("a Utf8 column that is not one")?;
+                            if a.is_null(row) {
+                                Value::Null
+                            } else {
+                                Value::from(a.value(row))
+                            }
+                        }
+                        other => anyhow::bail!(
+                            "sealed segment {} column {} has type {other}, which this project does \
+                             not write",
+                            path.display(),
+                            field.name()
+                        ),
+                    };
+                    stored.insert(field.name().clone(), value);
+                }
+                out.push(
+                    crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
+                        .with_context(|| {
+                            format!("row {row} of sealed segment {}", path.display())
+                        })?,
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Load the segment catalogue (empty if none yet).
@@ -731,6 +818,158 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
 
 fn manifest_path(dir: &Path) -> PathBuf {
     dir.join(SEGMENTS_DIR).join(MANIFEST_FILE)
+}
+
+#[cfg(test)]
+mod sealed_rows {
+    use super::*;
+    use crate::registry::{
+        ColumnSchema, DecodedRow, TableKind, TableSchema, Value as DecodedValue,
+    };
+
+    fn schema() -> TableSchema {
+        let mut columns = crate::registry::implicit_columns(true);
+        columns.extend(
+            [
+                ("from", "address", "address"),
+                ("to", "address", "address"),
+                ("value", "uint256", "word32"),
+                ("ok", "bool", "bool"),
+                ("memo", "string", "string"),
+            ]
+            .iter()
+            .map(|(name, sol, storage)| ColumnSchema {
+                name: (*name).to_string(),
+                sol_type: (*sol).to_string(),
+                storage: (*storage).to_string(),
+                indexed: false,
+            }),
+        );
+        TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: TableKind::Event,
+            event: String::new(),
+            topic0: String::new(),
+            function: String::new(),
+            selector: String::new(),
+            columns,
+        }
+    }
+
+    fn row(block: u64, log_index: u64, value: alloy_primitives::U256) -> DecodedRow {
+        DecodedRow {
+            table: "usdc__transfer".into(),
+            params: vec![
+                ("from".into(), DecodedValue::Address([0x11; 20])),
+                ("to".into(), DecodedValue::Address([0x22; 20])),
+                (
+                    "value".into(),
+                    DecodedValue::Word32(value.to_be_bytes::<32>()),
+                ),
+                ("ok".into(), DecodedValue::Bool(true)),
+                // A string that looks exactly like the uint256 beside it. Only the schema separates
+                // them, and a reader that lost the distinction would still round-trip through JSON.
+                ("memo".into(), DecodedValue::Str("7".into())),
+            ],
+            block_number: block,
+            block_hash: "0xbh".into(),
+            block_timestamp: 1_700_000_000 + block,
+            timestamps: true,
+            log_index,
+            tx_hash: "0xtx".into(),
+            address: "0xaa".into(),
+        }
+    }
+
+    /// **The property the warm-restart seed rests on** (RFC-0041 §5.3, nuthatch#864): a row that has
+    /// been sealed to Parquet and read back is the *same row* the ingest path produced.
+    ///
+    /// It matters because the two representations genuinely differ - `rows_to_batch` writes a
+    /// `uint256` as a decimal string and a `bool` as the text `"true"` - so equality here is a claim
+    /// about the conversion, not a tautology. If it did not hold, a seeded entity and a live one
+    /// would key on different rows, and a retraction would stop cancelling its insertion.
+    #[test]
+    fn a_sealed_row_reads_back_as_the_row_that_was_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = schema();
+        let original: Vec<DecodedRow> = vec![
+            row(10, 0, alloy_primitives::U256::from(7u64)),
+            row(10, 1, alloy_primitives::U256::MAX),
+            row(11, 0, alloy_primitives::U256::ZERO),
+        ];
+
+        let json: Vec<String> = original.iter().map(|r| r.to_json().to_string()).collect();
+        seal_range(dir.path(), &json, 10, 11)
+            .unwrap()
+            .expect("something sealed");
+
+        let back = read_table_rows(dir.path(), &schema).unwrap();
+        assert_eq!(back, original, "sealed and live must be the same rows");
+    }
+
+    /// Segments are read in block order however the manifest happens to list them. An entity folds a
+    /// commutative relation, so order does not change its answer - but a seed that also replays a
+    /// hot tail has to know where the sealed part ended, and "the last row read" is only that if the
+    /// rows came back in order.
+    #[test]
+    fn segments_come_back_in_block_order_not_manifest_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = schema();
+        // Three, not two: with two, reversing the manifest happens to produce the sorted order, so
+        // a reader that reversed instead of sorting would pass. Sealed 20, then 10, then 30.
+        for (from, to, block) in [(20u64, 20u64, 20u64), (10, 10, 10), (30, 30, 30)] {
+            let json = vec![row(block, 0, alloy_primitives::U256::from(block))
+                .to_json()
+                .to_string()];
+            seal_range(dir.path(), &json, from, to).unwrap();
+        }
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(
+            manifest.tables["usdc__transfer"]
+                .iter()
+                .map(|s| s.from_block)
+                .collect::<Vec<_>>(),
+            vec![20, 10, 30],
+            "the premise: the manifest lists them out of order, and not merely reversed"
+        );
+
+        let back = read_table_rows(dir.path(), &schema).unwrap();
+        assert_eq!(
+            back.iter().map(|r| r.block_number).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+    }
+
+    /// A sealed row missing a column the schema declares must be refused, not read as an empty
+    /// string. `rows_to_batch` writes a missing key as a Parquet null, and an empty string would go
+    /// on to decode as a zero-length address - a silently wrong row rather than a loud one.
+    #[test]
+    fn a_null_column_in_a_sealed_row_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let complete = row(10, 0, alloy_primitives::U256::from(7u64)).to_json();
+        let mut partial = complete.as_object().unwrap().clone();
+        partial.remove("memo");
+        // Two rows so the column exists in the batch and is null for one of them.
+        let json = vec![complete.to_string(), Value::Object(partial).to_string()];
+        seal_range(dir.path(), &json, 10, 10).unwrap().unwrap();
+
+        let err = format!(
+            "{:#}",
+            read_table_rows(dir.path(), &schema()).expect_err("a null column is not a value")
+        );
+        assert!(err.contains("null"), "{err}");
+    }
+
+    /// A table with no sealed segments is an empty read, not an error. A nest that has sealed nothing
+    /// yet is the ordinary case on a young nest, and treating it as a failure would make the seed
+    /// refuse exactly the nests it costs least to build.
+    #[test]
+    fn a_table_with_nothing_sealed_reads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        assert!(read_table_rows(dir.path(), &schema()).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
