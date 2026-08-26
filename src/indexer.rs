@@ -1209,11 +1209,24 @@ fn start_entities(
     }
     let mut views = Vec::with_capacity(declared.len());
     for decl in declared {
-        let plan = crate::entity_lower::lower(&decl.sql)
+        let (plan, columns) = crate::entity_lower::lower_with_columns(&decl.sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
+        // An entity that shadows a decoded table would silently take that table's name on the
+        // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
+        // relation instead of the facts. Refused at load, where it is a typo, rather than at the
+        // first query, where it is a mystery.
+        if let Some(t) = registry.schema().iter().find(|t| t.table == decl.name) {
+            anyhow::bail!(
+                "entity `{}` has the same name as the decoded table `{}`. Rename the entity: on the \
+                 SQL surface one would shadow the other",
+                decl.name,
+                t.table
+            )
+        }
         views.push(EntityView::start(
             &decl.name,
             &plan,
+            &columns,
             registry,
             decl.max_rows,
             warm,

@@ -86,6 +86,11 @@ struct Published {
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
 pub struct EntityView {
     name: String,
+    /// The output columns' names, in the order the relation's key then aggregates appear.
+    ///
+    /// Carried here rather than on [`Plan`] because a circuit and a batch evaluator are positional
+    /// and have no use for a name; only the serving surface does (#822).
+    columns: Vec<String>,
     tx: Sender<Msg>,
     binding: Binding,
     state: Arc<RwLock<Published>>,
@@ -126,6 +131,7 @@ impl EntityView {
     pub fn start(
         name: &str,
         plan: &Plan,
+        columns: &[String],
         registry: &DecodeRegistry,
         max_rows: usize,
         warm: bool,
@@ -220,6 +226,7 @@ impl EntityView {
 
         Ok(Self {
             name: label,
+            columns: columns.to_vec(),
             tx,
             binding,
             state,
@@ -230,6 +237,35 @@ impl EntityView {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The output columns' names - key columns first, then aggregates.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The relation as JSON objects keyed by column name, which is the shape `/sql` needs.
+    ///
+    /// **This copies every maintained row, per call** - #822 criterion 7's separate term, and it is
+    /// what the analytical seam is: `/sql` builds a `HashMap<String, Vec<Value>>` of hot rows and
+    /// defines a view over it. Recorded rather than optimised away by instinct; the criterion says to
+    /// measure it first and only act if it is material.
+    pub fn rows_as_json(&self) -> Vec<serde_json::Value> {
+        let state = match self.state.read() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        state
+            .relation
+            .iter()
+            .map(|(k, v)| {
+                let mut obj = serde_json::Map::new();
+                for (name, cell) in self.columns.iter().zip(k.0.iter().chain(v.0.iter())) {
+                    obj.insert(name.clone(), serde_json::Value::String(cell.to_string()));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect()
     }
 
     /// Whether the circuit thread is alive and folding. `false` means it died - on start, on a step,
@@ -463,6 +499,11 @@ mod tests {
     }
 
     /// `SELECT to, SUM(value) FROM usdc__transfer WHERE value > 0 GROUP BY to`
+    /// Column names for the fixtures below. The serving surface needs them; a circuit does not.
+    fn cols() -> Vec<String> {
+        vec!["to".into(), "sum_value".into()]
+    }
+
     fn received() -> Plan {
         Plan {
             left: src("usdc__transfer", &["to", "value"]),
@@ -496,7 +537,7 @@ mod tests {
     #[test]
     fn a_decoded_window_is_folded_and_carries_the_watermark_with_it() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
         assert_eq!(v.applied_through(), 0, "nothing folded yet");
 
         let rows = decode(
@@ -524,7 +565,7 @@ mod tests {
     fn a_reorg_retracts_at_minus_one_and_converges_on_the_replacement() {
         // §5.2: removed rows are fed at -1 before deletion, replacements arrive at +1.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
 
         let orphaned = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]);
         let replacement = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "9", 100, 0)]);
@@ -545,7 +586,8 @@ mod tests {
     #[test]
     fn max_rows_counts_both_input_relations() {
         let reg = registry();
-        let v = EntityView::start("received", &received_by_approved(), &reg, 3, false).unwrap();
+        let v = EntityView::start("received", &received_by_approved(), &cols(), &reg, 3, false)
+            .unwrap();
 
         // One left row, and four right rows. The left side alone never crosses three.
         let window = decode(
@@ -575,7 +617,7 @@ mod tests {
     fn crossing_max_rows_faults_the_circuit_rather_than_warning() {
         // Criterion 10: neither warns-and-continues nor OOMs the cursor.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1, false).unwrap();
         let rows = decode(
             &reg,
             &[
@@ -603,7 +645,7 @@ mod tests {
     #[test]
     fn the_bound_is_on_what_the_entity_holds_not_on_one_windows_size() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 2, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 2, false).unwrap();
         for (i, to) in [BOB, ALICE, TOKEN].iter().enumerate() {
             let block = 100 + i as u64;
             v.apply_window(
@@ -628,7 +670,7 @@ mod tests {
     #[test]
     fn a_retraction_returns_the_footprint_it_took() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 2, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 2, false).unwrap();
         let first = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]);
         let second = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, ALICE, "5", 101, 0)]);
         let third = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, TOKEN, "3", 102, 0)]);
@@ -652,7 +694,7 @@ mod tests {
         // The stale-serving guard criterion 2 asks for: an entity that stopped folding at 100 must
         // not answer for 200 merely because a later batch was enqueued.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]),
             1,
@@ -679,7 +721,7 @@ mod tests {
         // A window with no facts for this entity is progress: the entity is current through it. The
         // built-in views can skip an empty batch because they have no watermark to move.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
         v.apply_window(&[], 1, 500).unwrap();
         v.flush();
         assert!(v.is_healthy());
@@ -692,7 +734,7 @@ mod tests {
     #[test]
     fn a_window_of_other_tables_is_progress_not_a_fault() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(APPROVAL_TOPIC0, ALICE, BOB, "1", 300, 0)]),
             1,
@@ -710,7 +752,7 @@ mod tests {
     #[test]
     fn retracting_more_rows_than_were_applied_is_a_fault() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]),
             -1,
@@ -739,7 +781,7 @@ mod tests {
         };
         let err = format!(
             "{:#}",
-            EntityView::start("received", &plan, &reg, 1_000, false)
+            EntityView::start("received", &plan, &cols(), &reg, 1_000, false)
                 .err()
                 .expect("an unbindable entity must not start")
         );
@@ -751,7 +793,7 @@ mod tests {
         let reg = registry();
         let err = format!(
             "{:#}",
-            EntityView::start("received", &received(), &reg, 0, false)
+            EntityView::start("received", &received(), &cols(), &reg, 0, false)
                 .err()
                 .expect("a bound of zero must not start")
         );
@@ -770,8 +812,8 @@ mod tests {
             let reg = registry();
             let who = [ALICE, BOB, TOKEN];
 
-            let live = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
-            let replay = EntityView::start("replay", &received(), &reg, 1_000, false).unwrap();
+            let live = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
+            let replay = EntityView::start("replay", &received(), &cols(), &reg, 1_000, false).unwrap();
 
             let mut survivors: Vec<DecodedRow> = Vec::new();
             for (i, (to, value, orphaned)) in facts.iter().enumerate() {

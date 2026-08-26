@@ -1317,6 +1317,7 @@ async fn run_sql_query(
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
     let tables = s.tables.clone();
+    let declared_entities = s.entities.clone();
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
@@ -1336,6 +1337,23 @@ async fn run_sql_query(
                 (Default::default(), true)
             }
         };
+        // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
+        // tables. **This copies every entity row into the connection, per request** - #822 criterion
+        // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
+        // its views from. Recorded rather than optimised on instinct; the criterion says measure it
+        // and act only if it is material, and turning this into a persistent catalogue by reflex is
+        // the rewrite it warns against.
+        //
+        // An entity holding no answer contributes no table at all rather than an empty one. An empty
+        // relation and an unavailable one are different facts, and a query cannot tell them apart
+        // from zero rows - `/derived` is where the reason lives.
+        let mut hot = hot;
+        for entity in declared_entities.iter() {
+            if entity.unavailable().is_some() || entity.fault().is_some() {
+                continue;
+            }
+            hot.insert(entity.name().to_string(), entity.rows_as_json());
+        }
         let sealed_through = store.sealed_through();
         let mut out = analytics::query_hot_cold(
             &dir,
@@ -2074,6 +2092,10 @@ mod tests {
     /// it were the truth.
     #[test]
     fn a_derived_route_refuses_an_entity_that_holds_no_answer() {
+        fn cols() -> Vec<String> {
+            vec!["to".into(), "sum_value".into()]
+        }
+
         use crate::entity_expr::Expr;
         use crate::entity_plan::{Agg, Plan, Source};
 
@@ -2106,7 +2128,7 @@ mod tests {
 
         // Warm-started: no state, and no way to rebuild it until the seed runs.
         let unavailable =
-            crate::entity_view::EntityView::start("e", &plan, &reg, 1_000, true).unwrap();
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1_000, true).unwrap();
         let (code, body) = derived_refusal(&unavailable).expect("an unavailable entity is refused");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "entity unavailable");
@@ -2117,7 +2139,7 @@ mod tests {
 
         // Cold-started: nothing folded yet, but nothing wrong either.
         let healthy =
-            crate::entity_view::EntityView::start("e", &plan, &reg, 1_000, false).unwrap();
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1_000, false).unwrap();
         assert!(
             derived_refusal(&healthy).is_none(),
             "an empty-but-healthy entity answers; being behind is not an error"
@@ -2126,7 +2148,8 @@ mod tests {
         // Faulted: a *different* refusal, and it has to be reached through its own branch. Testing
         // only the unavailable case left a mutation that stops refusing faulted entities alive - a
         // dead circuit would have gone on serving whatever it held when it died.
-        let dead = crate::entity_view::EntityView::start("e", &plan, &reg, 1, false).unwrap();
+        let dead =
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1, false).unwrap();
         let row = |to: &str, v: i128| {
             crate::entity_row::Row(vec![
                 crate::entity_row::Scalar::Str(to.into()),
