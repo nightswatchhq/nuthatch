@@ -77,6 +77,14 @@ pub struct AppState {
     pub exposure: ExposureView,
     /// Windowed per-address velocity view (RFC-0008 C3) - served at `/flags?kind=velocity`.
     pub velocity: VelocityView,
+    /// The nest's authored incremental entities (RFC-0041), the same handles the ingest loop feeds.
+    ///
+    /// Shared rather than cloned: an `EntityView` owns a thread and a channel, and a second handle
+    /// would be a second writer to one circuit. Serving reads each entity's own applied-through
+    /// watermark rather than the nest's head - an entity behind the dataset is an ordinary state
+    /// during backfill, and answering for the nest's head while holding this one's rows is exactly
+    /// how a partial relation gets stamped current (§5.1, #866).
+    pub entities: Arc<Vec<crate::entity_view::EntityView>>,
     /// Single-transfer threshold in base units, if configured (RFC-0008 C3) - for `/`'s flag summary.
     pub threshold: Option<i128>,
     /// Velocity flag threshold in base units, if configured - the cutoff `/flags?kind=velocity` uses.
@@ -1773,6 +1781,7 @@ mod tests {
             balances: BalanceView::start().unwrap(),
             exposure: ExposureView::start(true).unwrap(),
             velocity: VelocityView::start(true).unwrap(),
+            entities: Arc::new(Vec::new()),
             threshold: None,
             velocity_threshold: None,
             tables: Arc::new(vec![]),
