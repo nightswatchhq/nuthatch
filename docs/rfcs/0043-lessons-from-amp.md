@@ -226,15 +226,16 @@ Candidate issues, each justifiable under the freeze on its own terms and none of
 
 1. **Check our sealed-segment file-count and planning behaviour** on a long-running nest, and confirm
    whether compaction and any Parquet Bloom/statistics options are on by default and effective.
-   Maintenance and performance. (§7.1)
+   Maintenance and performance. (§7.1) - filed as **#889**.
 2. **Add the canonical-chain provenance limitation to `verification.md`** as a stated non-claim, so
-   the verified-by-us table stays honest. Documentation. (§7.3)
+   the verified-by-us table stays honest. Documentation. (§7.3) - filed as **#890**.
 3. **A single competitive line for the site**: nuthatch's embedded mode requires no external database;
    the nearest comparable system requires PostgreSQL for metadata and coordination. Fits the honest
-   comparison table rather than the feature list. Marketing. (§6)
+   comparison table rather than the feature list. Marketing. (§6) - not filed here; it belongs to
+   `nuthatch-frontend`, and the honest comparison table is edited there.
 4. **Feed §4's difference table and §5's role table into RFC-0042 slice zero** as input, so the
    inventory does not have to rediscover which DuckDB roles a DataFusion port would and would not
-   address. (RFC-0042 §4)
+   address. (RFC-0042 §4) - filed as **#891**, blocked by design.
 
 Not proposed, and listed so nobody proposes them as though they were free: Arrow Flight serving,
 Postgres wire serving, query-time decode UDFs, and a distributed worker split behind PostgreSQL. The
