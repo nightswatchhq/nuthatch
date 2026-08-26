@@ -312,3 +312,119 @@ max_rows = 1
         "and the cause, not merely that something stopped: {err}"
     );
 }
+
+/// #866 criterion 8, the other half: *"It cannot freeze quietly while sibling nests continue to
+/// report it healthy."*
+///
+/// Two nests on one cursor. One declares an entity with a bound its first window breaks; the other
+/// declares none. The faulted nest must be quarantined **by name**, and the healthy one must keep
+/// indexing - the blast radius is the nest, not the cursor.
+///
+/// Both nests sit on the same chain deliberately: that is what puts them on one cursor, and a blast
+/// radius that widened to the cursor is precisely what this is watching for. `fail_fast` is `false`,
+/// production's default - it is the one setting under which a quarantined nest is *expected* to take
+/// its cursor with it, so passing this test under it would mean nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_faulted_entity_quarantines_its_own_nest_and_leaves_its_neighbour_indexing() {
+    use nuthatch::health::RuntimeHealth;
+
+    let doomed_dir = tempfile::tempdir().unwrap();
+    let healthy_dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    // Distinct nest names, and not merely for readability: `NestIngest` takes its name from
+    // `config.nest.name`, which is what `RuntimeHealth` keys a quarantine by. Scaffolding both as
+    // `usdc` registers both under one identity, and the isolation this test is about becomes
+    // unobservable - the first version did exactly that and reported no quarantine at all.
+    //
+    // The contract alias moves with the name, so the doomed nest's table is `doomed__transfer`.
+    let doomed_cfg = scaffold_nest(doomed_dir.path(), "doomed", USDC);
+    std::fs::write(
+        doomed_dir.path().join("entities.toml"),
+        r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, SUM(t.value) FROM doomed__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 1
+"#,
+    )
+    .unwrap();
+    // The neighbour declares no entity at all, so nothing about it can fault for this reason.
+    let healthy_cfg = scaffold_nest(healthy_dir.path(), "healthy", USDC);
+
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("doomed", &doomed_cfg.nest.chain);
+    health.register("healthy", &healthy_cfg.nest.chain);
+
+    let cursor = indexer::spawn_runtime(
+        tape,
+        vec![
+            (
+                "doomed".to_string(),
+                doomed_dir.path().to_path_buf(),
+                doomed_cfg,
+            ),
+            (
+                "healthy".to_string(),
+                healthy_dir.path().to_path_buf(),
+                healthy_cfg,
+            ),
+        ],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    // The faulted nest is quarantined, and the reason names the entity rather than saying only that
+    // something stopped.
+    let quarantined = wait_until(POLL_TIMEOUT, || health.status("doomed").is_some()).await;
+    assert!(
+        quarantined,
+        "the nest whose entity died must be quarantined, not left quietly frozen"
+    );
+    let reason = health.status("doomed").unwrap().reason;
+    assert!(
+        reason.contains("entity `received`"),
+        "the quarantine must say which entity: {reason}"
+    );
+
+    // The neighbour reaches the tip - after its sibling died, not before it started.
+    let want = CHAIN_LEN.to_string();
+    let neighbour = cursor
+        .states
+        .iter()
+        .find(|(n, _)| n == "healthy")
+        .expect("the healthy nest is on this cursor");
+    let landed = wait_until(POLL_TIMEOUT, || {
+        neighbour
+            .1
+            .store
+            .get_meta("last_block")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(want.as_str())
+    })
+    .await;
+    assert!(
+        landed,
+        "the healthy nest must keep indexing - the blast radius is the nest, not the cursor"
+    );
+    assert!(
+        health.status("healthy").is_none(),
+        "and it must not be quarantined by its neighbour's fault"
+    );
+
+    cursor.ingest.abort();
+}
