@@ -80,11 +80,50 @@ pub struct HorizonMeasurement {
     pub input_batches: usize,
     pub input_rows: usize,
     pub result_rows: usize,
+    /// Compiling the SQL and building the circuit. A once-per-nest-load cost, and on a corpus this
+    /// size it was **76% of the window the published rate divided by** (#837), so it is reported
+    /// rather than folded in.
+    pub setup_ms: u128,
+    /// Folding the batches, and nothing else. This is what `input_rows_per_second` divides by.
+    pub apply_ms: u128,
+    /// Setup plus apply. Kept because a cold-start figure is worth having; it is simply not a
+    /// throughput figure.
     pub elapsed_ms: u128,
     pub input_rows_per_second: u64,
-    pub fixed_rss_kb: Option<u64>,
-    pub peak_rss_kb: Option<u64>,
-    pub approximate_rss_per_input_row_bytes: Option<u64>,
+    /// RSS with the circuit built and no rows applied - §9 criterion 3's "empty-circuit RSS".
+    pub empty_circuit_rss_kb: Option<u64>,
+    /// The high-water mark across the **apply phase alone**. It used to be the maximum across a
+    /// window that also spanned the DuckDB normalise scan, which is why the published per-row cost
+    /// was 74x the tape path's for the same relation (#837).
+    pub circuit_peak_rss_kb: Option<u64>,
+    /// The normalise scan's high-water mark, fixture path only, `None` on the tape path because no
+    /// such scan happens there. **This is one-off scan headroom, not entity cost**, and it is a
+    /// separate field so it cannot be subtracted across phases by accident again.
+    pub normalise_peak_rss_kb: Option<u64>,
+    pub rss_per_input_row: PerRowRss,
+}
+
+/// The per-row RSS estimate, or why there isn't one.
+///
+/// Deliberately not an `Option<u64>`. The previous shape produced a **missing JSON field** when
+/// `peak.checked_sub(fixed)` underflowed - entirely possible when the sampler polls every 20 ms
+/// against a 55 ms run - so a failed measurement and an unmeasured platform rendered identically,
+/// and both rendered as nothing at all rather than as a problem.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PerRowRss {
+    Measured {
+        bytes: u64,
+    },
+    /// The apply phase's peak came in below the empty-circuit sample. On a short run that means the
+    /// sampler missed the peak, not that the circuit freed memory - either way it is not a figure.
+    PeakBelowEmptyCircuit {
+        empty_circuit_kb: u64,
+        peak_kb: u64,
+    },
+    Unavailable {
+        why: &'static str,
+    },
 }
 
 /// A recorded, manifest-bound sequence of weighted entity inputs. This is deliberately distinct
@@ -341,8 +380,13 @@ pub fn record_horizon_tape(segments_dir: &Path, dir: &Path, batch_rows: usize) -
 /// Load and apply the captured relation once, sampling RSS through the whole DuckDB-normalise plus
 /// DBSP-apply path. `max_rows` is part of the measurement input, not an after-the-fact warning.
 pub fn measure_horizon_fixture(segments_dir: &Path, max_rows: usize) -> Result<HorizonMeasurement> {
-    let whole_cursor_sampler = RssSampler::start();
+    // The normalise scan gets its own sampler, stopped before the circuit is built. It used to share
+    // one window with the apply phase, and since `fixed` was sampled *after* the scan released, the
+    // published "per input row" cost was to a first approximation the scan's transient high-water
+    // mark divided by the entity's row count (#837).
+    let normalise_sampler = RssSampler::start();
     let fixture = load_horizon_fixture(segments_dir)?;
+    let normalise_peak_rss_kb = normalise_sampler.stop();
     measure_horizon_batches(
         "fixture",
         None,
@@ -352,7 +396,7 @@ pub fn measure_horizon_fixture(segments_dir: &Path, max_rows: usize) -> Result<H
             indexers: fixture.indexers,
         }],
         max_rows,
-        whole_cursor_sampler,
+        normalise_peak_rss_kb,
     )
 }
 
@@ -367,7 +411,9 @@ pub fn measure_horizon_tape(dir: &Path, max_rows: usize) -> Result<HorizonMeasur
         tape.expected,
         tape.batches,
         max_rows,
-        RssSampler::start(),
+        // No DuckDB scan happens on this path, so there is no normalise peak to report. `None` says
+        // that; a zero would read as "measured, and it was nothing".
+        None,
     )
 }
 
@@ -377,31 +423,32 @@ fn measure_horizon_batches(
     expected: BTreeMap<String, i128>,
     batches: Vec<Batch>,
     max_rows: usize,
-    whole_cursor_sampler: RssSampler,
+    normalise_peak_rss_kb: Option<u64>,
 ) -> Result<HorizonMeasurement> {
     let started = Instant::now();
     let input_batches = batches.len();
     let input_rows = batches.iter().map(|b| b.delegations.len()).sum();
+    // Setup is timed separately rather than being inside the divisor. `compile` opens a fresh
+    // in-memory DuckDB to parse one constant string, which is a fixed cost paid once at nest load -
+    // expressing it as rows per second turns a cold-start latency into something that looks
+    // comparable to the ingest floor, in whichever direction the reader wants (#837).
     let plan = compile(DELEGATION_SQL)?;
     let mut spike = Spike::with_max_rows(&plan, max_rows)?;
-    let fixed_rss_kb = current_rss_kb();
+    let setup_ms = started.elapsed().as_millis();
+
+    // Sampled with the circuit built and nothing applied, which is what criterion 3 asks for.
+    let empty_circuit_rss_kb = current_rss_kb();
     let apply_sampler = RssSampler::start();
+    let apply_started = Instant::now();
     for batch in batches {
         spike.apply(batch)?;
     }
+    let apply_ms = apply_started.elapsed().as_millis();
     if spike.rows() != expected {
         bail!("Horizon entity replay diverged from DuckDB reference")
     }
-    let peak_rss_kb = whole_cursor_sampler
-        .stop()
-        .into_iter()
-        .chain(apply_sampler.stop())
-        .max();
-    let approximate_rss_per_input_row_bytes = fixed_rss_kb
-        .zip(peak_rss_kb)
-        .and_then(|(fixed, peak)| peak.checked_sub(fixed))
-        .and_then(|kb| kb.checked_mul(1024))
-        .and_then(|bytes| (input_rows > 0).then_some(bytes / input_rows as u64));
+    let circuit_peak_rss_kb = apply_sampler.stop();
+    let rss_per_input_row = per_row_rss(empty_circuit_rss_kb, circuit_peak_rss_kb, input_rows);
     Ok(HorizonMeasurement {
         source,
         tape_content_address,
@@ -409,15 +456,16 @@ fn measure_horizon_batches(
         input_batches,
         input_rows,
         result_rows: spike.rows().len(),
+        setup_ms,
+        apply_ms,
         elapsed_ms: started.elapsed().as_millis(),
-        input_rows_per_second: if started.elapsed().is_zero() {
-            0
-        } else {
-            (input_rows as u128 * 1_000 / started.elapsed().as_millis().max(1)) as u64
-        },
-        fixed_rss_kb,
-        peak_rss_kb,
-        approximate_rss_per_input_row_bytes,
+        // Divided by the apply window, not the whole run. The two differ by more than 4x on a corpus
+        // this size, and the published figure was the slower one.
+        input_rows_per_second: rows_per_second(input_rows, apply_ms),
+        empty_circuit_rss_kb,
+        circuit_peak_rss_kb,
+        normalise_peak_rss_kb,
+        rss_per_input_row,
     })
 }
 
@@ -434,11 +482,18 @@ impl RssSampler {
         let sampler_stop = Arc::clone(&stop);
         let sampler_peak = Arc::clone(&peak_kb);
         let thread = std::thread::spawn(move || {
-            while !sampler_stop.load(Ordering::Relaxed) {
+            loop {
                 if let Some(kb) = current_rss_kb() {
                     sampler_peak.fetch_max(kb, Ordering::Relaxed);
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                // Sample last, then check: the previous shape could stop without ever sampling the
+                // final state. And 20 ms against a 55 ms run left the peak resting on two or three
+                // samples (#837); reading `/proc/self/status` is cheap enough to do it far more
+                // often, and on any platform where it is not, `current_rss_kb` refuses outright.
+                if sampler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
         });
         Self {
@@ -456,23 +511,56 @@ impl RssSampler {
     }
 }
 
+/// This process's RSS in KB, or nothing.
+///
+/// **`/proc` only, deliberately.** The previous fallback forked `ps` once per sample, which at fifty
+/// samples a second perturbs the very thing being measured, and the RSS gate this feeds is a Linux
+/// gate anyway. Refusing to produce a figure on a platform where it cannot be sampled cheaply is the
+/// honest answer; producing a perturbed one and publishing it is how [[#837]] happened.
 fn current_rss_kb() -> Option<u64> {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        return status.lines().find_map(|line| {
-            line.strip_prefix("VmRSS:")?
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()
-        });
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+/// Rows per second over the **apply** window.
+///
+/// Its own function so the divisor is a thing a test can pin. The published figure divided by setup
+/// plus apply, and setup was 76% of it on the measured corpus (#837) - a cold-start latency wearing
+/// a throughput figure's units, which then invites comparison against the >=10K events/sec ingest
+/// floor in whichever direction the reader prefers.
+fn rows_per_second(input_rows: usize, apply_ms: u128) -> u64 {
+    (input_rows as u128 * 1_000 / apply_ms.max(1)) as u64
+}
+
+/// The per-row estimate, or a named reason there isn't one.
+fn per_row_rss(empty: Option<u64>, peak: Option<u64>, input_rows: usize) -> PerRowRss {
+    let (Some(empty_circuit_kb), Some(peak_kb)) = (empty, peak) else {
+        return PerRowRss::Unavailable {
+            why: "RSS sampling needs /proc/self/status; this platform cannot be sampled without \
+                  perturbing the measurement",
+        };
+    };
+    if input_rows == 0 {
+        return PerRowRss::Unavailable {
+            why: "no input rows to divide by",
+        };
     }
-    let pid = std::process::id().to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    match peak_kb.checked_sub(empty_circuit_kb) {
+        None => PerRowRss::PeakBelowEmptyCircuit {
+            empty_circuit_kb,
+            peak_kb,
+        },
+        Some(kb) => PerRowRss::Measured {
+            bytes: kb * 1024 / input_rows as u64,
+        },
+    }
 }
 
 fn manifest_paths(
@@ -1078,6 +1166,132 @@ mod tests {
         }
     }
 
+    /// **The failure that used to render as nothing.** `peak.checked_sub(fixed)` returned `None` on
+    /// underflow and the field simply vanished from the JSON, so "the sampler missed the peak" and
+    /// "this platform cannot be sampled" and "here is your answer" were three states with two
+    /// renderings (#837).
+    #[test]
+    fn every_per_row_outcome_names_itself_in_the_json() {
+        let cases = [
+            (
+                per_row_rss(Some(1_000), Some(2_000), 500),
+                "measured",
+                PerRowRss::Measured { bytes: 2048 },
+            ),
+            (
+                // Peak below the empty-circuit sample: on a short run the sampler missed it.
+                per_row_rss(Some(2_000), Some(1_000), 500),
+                "peak_below_empty_circuit",
+                PerRowRss::PeakBelowEmptyCircuit {
+                    empty_circuit_kb: 2_000,
+                    peak_kb: 1_000,
+                },
+            ),
+            (
+                per_row_rss(None, Some(1_000), 500),
+                "unavailable",
+                PerRowRss::Unavailable {
+                    why: "RSS sampling needs /proc/self/status; this platform cannot be sampled \
+                          without perturbing the measurement",
+                },
+            ),
+            (
+                per_row_rss(Some(1_000), Some(2_000), 0),
+                "unavailable",
+                PerRowRss::Unavailable {
+                    why: "no input rows to divide by",
+                },
+            ),
+        ];
+
+        for (got, status, want) in cases {
+            assert_eq!(got, want);
+            let json: serde_json::Value = serde_json::to_value(&got).unwrap();
+            assert_eq!(
+                json.get("status").and_then(|v| v.as_str()),
+                Some(status),
+                "every outcome carries a status, so none of them can be an absent field: {json}"
+            );
+        }
+    }
+
+    /// **The defect #837 is actually about.** The normalise scan's high-water mark must not reach the
+    /// per-row figure. It used to, because one sampler spanned the scan and the apply, while the
+    /// baseline was taken after the scan had released - which is how the same relation got a
+    /// published per-row cost 74x the tape path's, and how a 2 GB budget that holds ~800,000 rows
+    /// read as one that exhausts at ~11,400.
+    ///
+    /// **Linux only, and absent rather than skipped elsewhere.** `current_rss_kb` reads
+    /// `/proc/self/status` and refuses on anything else, so on macOS both sides of the comparison
+    /// below are `Unavailable` and compare equal no matter what the code does. A test that passes
+    /// vacuously is worse than one that is not there: it was still green with the scan peak folded
+    /// straight back in. This is the gate's platform anyway.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_normalise_scan_peak_never_reaches_the_per_row_figure() {
+        let (delegations, indexers) = corpus();
+        let plan = compile(DELEGATION_SQL).unwrap();
+        let mut reference = Spike::with_max_rows(&plan, 1_000).unwrap();
+        reference
+            .apply(Batch {
+                delegations: delegations.clone(),
+                indexers: indexers.clone(),
+            })
+            .unwrap();
+        let expected = reference.rows();
+
+        let batch = || {
+            vec![Batch {
+                delegations: delegations.clone(),
+                indexers: indexers.clone(),
+            }]
+        };
+        // A scan peak of 4 GB - far beyond anything the circuit could account for.
+        let with_scan = measure_horizon_batches(
+            "fixture",
+            None,
+            expected.clone(),
+            batch(),
+            1_000,
+            Some(4 * 1024 * 1024),
+        )
+        .unwrap();
+        let without =
+            measure_horizon_batches("replay", None, expected, batch(), 1_000, None).unwrap();
+
+        // The comparison below is only worth anything if a figure was actually produced.
+        assert!(
+            matches!(without.rss_per_input_row, PerRowRss::Measured { .. }),
+            "no measurement, so nothing is being compared: {:?}",
+            without.rss_per_input_row
+        );
+        assert_eq!(
+            with_scan.normalise_peak_rss_kb,
+            Some(4 * 1024 * 1024),
+            "it is still reported, as its own field"
+        );
+        assert_eq!(
+            with_scan.rss_per_input_row, without.rss_per_input_row,
+            "but the per-row figure is the same with a 4 GB scan peak as with none at all"
+        );
+        assert_eq!(without.normalise_peak_rss_kb, None, "no scan, no scan peak");
+    }
+
+    /// The rate divides by the apply window. Dividing by setup-plus-apply is what turned a
+    /// 152,000 rows/sec fold into a published 37,000 (#837).
+    #[test]
+    fn the_rate_divides_by_the_apply_window_alone() {
+        // 876 rows folded in 6 ms, after 18 ms of compiling and circuit-building.
+        assert_eq!(rows_per_second(876, 6), 146_000);
+        assert_eq!(
+            rows_per_second(876, 24),
+            36_500,
+            "this is what including setup used to report for the same fold"
+        );
+        // A fold too fast to time is not an infinite rate, and must not divide by zero.
+        assert_eq!(rows_per_second(876, 0), 876_000);
+    }
+
     #[test]
     #[ignore = "requires the sealed Horizon capture outside Git"]
     fn captured_horizon_relation_matches_embedded_dbsp() {
@@ -1086,12 +1300,17 @@ mod tests {
         let measurement = measure_horizon_fixture(Path::new(&segments), 1_000).unwrap();
         assert!(measurement.input_rows > 0);
         eprintln!(
-            "Horizon fixture: {} input rows, {} results, {} ms, peak RSS {:?} KiB, ~{:?} bytes/input row",
+            "Horizon fixture: {} input rows, {} results, setup {} ms + apply {} ms, \
+             empty-circuit RSS {:?} KiB, circuit peak {:?} KiB, normalise peak {:?} KiB, \
+             per input row {:?}",
             measurement.input_rows,
             measurement.result_rows,
-            measurement.elapsed_ms,
-            measurement.peak_rss_kb,
-            measurement.approximate_rss_per_input_row_bytes,
+            measurement.setup_ms,
+            measurement.apply_ms,
+            measurement.empty_circuit_rss_kb,
+            measurement.circuit_peak_rss_kb,
+            measurement.normalise_peak_rss_kb,
+            measurement.rss_per_input_row,
         );
         assert_eq!(measurement.result_rows, measurement.input_rows);
     }
