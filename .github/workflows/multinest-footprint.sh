@@ -98,6 +98,15 @@ REPORT="${REPORT:-}"
 # complete (which it is - an incomplete run's peak is not comparable), so it must not be tripped by a
 # slow runner or the job becomes flaky and gets disabled.
 TIMEOUT_S="${TIMEOUT_S:-1800}"
+# RFC-0041 §7 criterion 12: give every nest an authored incremental entity, so the per-cursor budget
+# is measured with entity circuits in it.
+#
+# **Default off, deliberately.** The enforced gate's REGRESSION_MB was derived from fifteen runs of
+# the scenario *without* entities, and the comment beside it in ci.yml says in as many words that a
+# threshold picked from a single run is folklore. Changing the enforced scenario silently would
+# invalidate that ceiling while leaving the number in place, which is worse than not measuring at
+# all. This is an opt-in second measurement, not an edit to the first.
+ENTITY_MAX_ROWS="${ENTITY_MAX_ROWS:-0}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ABI="$HERE/multinest-abi.json"
 
@@ -170,6 +179,17 @@ alias = "pool_manager"
 address = "$(printf '0x%040x' "$i")"
 abi = "abis/pool_manager.json"
 TOML
+    # One entity per nest when asked: a grouped sum over the widest event this ABI has, which is the
+    # shape §3.3 admits and the one an author would actually write.
+    if [ "$ENTITY_MAX_ROWS" -gt 0 ]; then
+      cat > "$nest/entities.toml" <<TOML
+[[entities]]
+name = "approved"
+sql = "SELECT a.owner, SUM(a.amount) FROM pool_manager__approval a GROUP BY a.owner"
+key = ["owner"]
+max_rows = $ENTITY_MAX_ROWS
+TOML
+    fi
   done
 }
 
