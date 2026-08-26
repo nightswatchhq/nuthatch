@@ -438,6 +438,7 @@ pub async fn spawn_nest(
         None,
     )
     .await?;
+    refuse_seal_direct_with_entities(seal_direct, &nest)?;
     // Kick off the indexing loop in the background; serve the API on this task.
     let ingest = tokio::spawn(index_loop(
         source,
@@ -452,6 +453,41 @@ pub async fn spawn_nest(
         ingest,
         alert_worker,
     })
+}
+
+/// #866 criterion 13: `--seal-direct` either rebuilds entities from the finished sealed corpus before
+/// serving, or refuses the combination clearly. It refuses, **before anything is spawned**.
+///
+/// Seal-direct writes finalized history straight to Parquet and never puts those windows on the
+/// ingest path, so an authored entity would see none of them. Left to run, the nest would complete,
+/// serve, and answer with an empty relation - *"a completed run with a silently empty entity is the
+/// failure this criterion exists for."*
+///
+/// **Synchronous on purpose.** The first version of this guard sat inside `prepare`, which runs in
+/// the spawned ingest task, so `spawn_nest` returned `Ok` and the nest served for as long as it took
+/// the loop to reach the check. A refusal that arrives after the thing it refuses has started is a
+/// fault report, not a refusal.
+///
+/// Rebuilding from the sealed corpus instead is RFC-0041 §5.3's warm-restart seed, which is not
+/// built, and is unsound as written for any entity with a join: a finalized row joining a hot row is
+/// in neither half. Refusing is the honest half of the criterion until that is settled.
+fn refuse_seal_direct_with_entities(seal_direct: bool, nest: &NestIngest) -> Result<()> {
+    if !seal_direct || nest.entities.is_empty() {
+        return Ok(());
+    }
+    let named = nest
+        .entities
+        .iter()
+        .map(|e| format!("`{}`", e.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(TerminalFault(format!(
+        "--seal-direct cannot be combined with authored incremental entities ({named}). \
+         Seal-direct writes finalized history straight to Parquet without passing it through the \
+         ingest path, so the entit{} would be served empty. Start this nest without --seal-direct; \
+         rebuilding an entity from sealed history is RFC-0041 §5.3 and is not implemented.",
+        if nest.entities.len() == 1 { "y" } else { "ies" },
+    )))
 }
 
 /// Spawn a nest against an **externally owned hot store** - the writer-pool path (RFC-0022, issue
@@ -489,6 +525,7 @@ pub async fn spawn_nest_on_store(
         Some(store),
     )
     .await?;
+    refuse_seal_direct_with_entities(seal_direct, &nest)?;
     let ingest = tokio::spawn(index_loop(
         source,
         nest,
@@ -1640,6 +1677,12 @@ pub async fn spawn_runtime(
     let window = window.unwrap_or(DEFAULT_WINDOW);
     // The cursor's command channel. The control surface that *sends* on it is slice 4; the driver
     // holds the sender meanwhile so unmount can be driven programmatically and tested.
+    // Every nest on this cursor, not merely the first: a runtime hosts N nests and one of them
+    // declaring an entity is enough to make `--seal-direct` wrong for the whole cursor, which is the
+    // only granularity the flag has.
+    for nest in &ingests {
+        refuse_seal_direct_with_entities(seal_direct, nest)?;
+    }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ingest = tokio::spawn(runtime_index_loop(
         source,
