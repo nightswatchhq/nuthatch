@@ -1083,6 +1083,174 @@ fn parse_bytes(s: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod stored_roundtrip {
+    use super::*;
+
+    fn col(name: &str, sol: &str, kind: StorageKind) -> ColumnSchema {
+        ColumnSchema {
+            name: name.into(),
+            sol_type: sol.into(),
+            storage: kind.as_str().to_string(),
+            indexed: false,
+        }
+    }
+
+    /// The seal writer's spelling: `rows_to_batch` keeps JSON strings as-is and stringifies every
+    /// other JSON value into a `Utf8` column. Reconstruction has to accept both, because the reorg
+    /// path reads the JSON and the restart seed reads the text.
+    fn as_sealed_text(v: &Json) -> Json {
+        match v {
+            Json::String(s) => Json::String(s.clone()),
+            other => Json::String(other.to_string()),
+        }
+    }
+
+    /// **The property the reorg path depends on.** A retraction cancels an insertion only if the two
+    /// produce the same row, so `to_json` followed by `value_from_stored` must be the identity - in
+    /// both spellings. Anything less and a rolled-back fact stays in an entity forever, alongside a
+    /// phantom row at weight -1 that nothing will ever cancel (nuthatch#864).
+    #[test]
+    fn every_value_survives_the_round_trip_in_both_spellings() {
+        let cases: Vec<(Value, ColumnSchema)> = vec![
+            (
+                Value::Address([0x11; 20]),
+                col("who", "address", StorageKind::Address),
+            ),
+            (
+                Value::Hash32([0xab; 32]),
+                col("t", "string", StorageKind::Hash32),
+            ),
+            (Value::Bytes(vec![]), col("b", "bytes", StorageKind::Bytes)),
+            (
+                Value::Bytes(vec![1, 2, 3]),
+                col("b", "bytes", StorageKind::Bytes),
+            ),
+            (
+                Value::Bytes(vec![9; 32]),
+                col("b", "bytes32", StorageKind::FixedBytes),
+            ),
+            (Value::Bool(true), col("f", "bool", StorageKind::Bool)),
+            (Value::Bool(false), col("f", "bool", StorageKind::Bool)),
+            (Value::U64(0), col("n", "uint64", StorageKind::U64)),
+            (Value::U64(u64::MAX), col("n", "uint64", StorageKind::U64)),
+            (Value::I64(i64::MIN), col("n", "int64", StorageKind::I64)),
+            (Value::I64(-1), col("n", "int64", StorageKind::I64)),
+            (Value::I64(i64::MAX), col("n", "int64", StorageKind::I64)),
+            (
+                Value::Word16(0u128.to_be_bytes()),
+                col("v", "uint128", StorageKind::Word16),
+            ),
+            (
+                Value::Word16(u128::MAX.to_be_bytes()),
+                col("v", "uint128", StorageKind::Word16),
+            ),
+            (
+                Value::IWord16(i128::MIN.to_be_bytes()),
+                col("v", "int128", StorageKind::Word16),
+            ),
+            (
+                Value::IWord16((-1i128).to_be_bytes()),
+                col("v", "int128", StorageKind::Word16),
+            ),
+            (
+                Value::IWord16(i128::MAX.to_be_bytes()),
+                col("v", "int128", StorageKind::Word16),
+            ),
+            (
+                Value::Word32(U256::ZERO.to_be_bytes::<32>()),
+                col("v", "uint256", StorageKind::Word32),
+            ),
+            (
+                Value::Word32(U256::MAX.to_be_bytes::<32>()),
+                col("v", "uint256", StorageKind::Word32),
+            ),
+            (
+                Value::IWord32(I256::MIN.to_be_bytes::<32>()),
+                col("v", "int256", StorageKind::Word32),
+            ),
+            (
+                Value::IWord32(I256::MINUS_ONE.to_be_bytes::<32>()),
+                col("v", "int256", StorageKind::Word32),
+            ),
+            (
+                Value::IWord32(I256::MAX.to_be_bytes::<32>()),
+                col("v", "int256", StorageKind::Word32),
+            ),
+            (
+                Value::Str(String::new()),
+                col("s", "string", StorageKind::Str),
+            ),
+            (
+                Value::Str("hello".into()),
+                col("s", "string", StorageKind::Str),
+            ),
+        ];
+
+        for (value, schema) in cases {
+            let rendered = value.to_json();
+            let back = value_from_stored(&rendered, &schema)
+                .unwrap_or_else(|e| panic!("{value:?} as JSON: {e:#}"));
+            assert_eq!(back, value, "{value:?} did not survive the JSON spelling");
+
+            let sealed = as_sealed_text(&rendered);
+            let back = value_from_stored(&sealed, &schema)
+                .unwrap_or_else(|e| panic!("{value:?} as sealed text: {e:#}"));
+            assert_eq!(back, value, "{value:?} did not survive the sealed spelling");
+        }
+    }
+
+    /// `uint128` and `int128` share one storage kind, so `sol_type` is the only thing separating
+    /// them. Reading a negative `int128` as unsigned yields a colossal positive number rather than an
+    /// error, which is the failure that looks like data and not like a bug.
+    #[test]
+    fn the_sol_type_is_what_separates_signed_from_unsigned() {
+        let negative = Value::IWord16((-5i128).to_be_bytes());
+        let rendered = negative.to_json();
+        assert_eq!(rendered, Json::String("-5".into()));
+
+        let as_signed =
+            value_from_stored(&rendered, &col("v", "int128", StorageKind::Word16)).unwrap();
+        assert_eq!(as_signed, negative);
+
+        // Same bytes, same storage kind, told it is unsigned: refused rather than silently enormous.
+        let err = value_from_stored(&rendered, &col("v", "uint128", StorageKind::Word16))
+            .expect_err("a negative decimal is not a uint128");
+        assert!(format!("{err:#}").contains("unsigned"), "{err:#}");
+    }
+
+    /// A stored address that is not twenty bytes is a corrupt row, and the guard is what keeps it an
+    /// error. Without it the `try_into` below panics, which in the ingest path is not a refusal - it
+    /// is the cursor going down.
+    #[test]
+    fn a_wrong_length_address_is_refused_rather_than_panicking() {
+        let long = format!("0x{}", "11".repeat(21));
+        for bad in ["0x1122", "0x", long.as_str()] {
+            let err = value_from_stored(
+                &Json::String(bad.to_string()),
+                &col("who", "address", StorageKind::Address),
+            )
+            .expect_err("{bad} is not a 20-byte address");
+            assert!(format!("{err:#}").contains("expected 20"), "{bad}: {err:#}");
+        }
+    }
+
+    /// A null column has no `Value` variant to become. Handing back a zero would put a number where
+    /// the chain had nothing.
+    #[test]
+    fn a_null_column_is_refused_rather_than_defaulted() {
+        let err = value_from_stored(&Json::Null, &col("v", "uint256", StorageKind::Word32))
+            .expect_err("null is not a value");
+        // The guard's own words, not merely the substring "null" - a JSON null renders as `null`
+        // inside "column v is not text: null" too, so the looser assertion passed with this guard
+        // deleted.
+        assert!(
+            format!("{err:#}").contains("is null in the stored row"),
+            "{err:#}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1738,4 +1906,132 @@ mod tests {
             Value::Word32(expected)
         );
     }
+}
+
+/// Rebuild one [`Value`] from the text a stored row carries, given the column it belongs to.
+///
+/// **The inverse of [`Value::to_json`], and it exists because nothing else is** (nuthatch#864). An
+/// authored incremental entity's rows arrive from three places: the decode registry at `+1`, the hot
+/// store's JSON when a reorg feeds them back at `-1`, and sealed Parquet text when a restart seeds
+/// from finalized history. A retraction only cancels an insertion if the two produce the *same* row,
+/// so a second, separately-written converter for the `-1` path is not a duplication of effort - it is
+/// a way for the two to disagree and for a rolled-back fact to stay in an entity forever.
+///
+/// **The column is required, not a convenience.** The rendering is lossy about which variant a value
+/// came from: `"0x11…"` could be an address, fixed bytes or a topic hash, and `"7"` could be a
+/// `uint128`, an `int128` or a string. Worse, `storage` alone is not enough either - `word16` covers
+/// both `uint128` and `int128`, and only [`ColumnSchema::sol_type`] separates them, because
+/// [`value_from_dynsol`] chose the variant from the Solidity type in the first place.
+pub fn value_from_stored(v: &Json, col: &ColumnSchema) -> Result<Value> {
+    // A JSON null is an absent value, which no `Value` variant represents. Callers that can have one
+    // must decide what it means for their column rather than being handed a silent zero.
+    if v.is_null() {
+        bail!("column {} is null in the stored row", col.name)
+    }
+    let signed = col.sol_type.starts_with("int");
+    let text = || -> Result<&str> {
+        v.as_str()
+            .ok_or_else(|| anyhow!("column {} is not text: {v}", col.name))
+    };
+    let bytes = |want: Option<usize>| -> Result<Vec<u8>> {
+        let s = text()?;
+        let raw = hex::decode(s.trim_start_matches("0x"))
+            .with_context(|| format!("column {} is not hex: {s}", col.name))?;
+        if let Some(n) = want {
+            if raw.len() != n {
+                bail!("column {} is {} bytes, expected {n}", col.name, raw.len())
+            }
+        }
+        Ok(raw)
+    };
+    // Numbers survive `to_json` as JSON numbers and the seal writer's Utf8 columns as text, so both
+    // spellings have to work or the reorg path and the restart path disagree by construction.
+    //
+    // The four cases are spelled out rather than funnelled through one integer type on purpose: a
+    // signed 256-bit value does not fit `i128`, and parsing it through one is the kind of narrowing
+    // that works on every test amount and fails on the one that matters.
+    let word = |wide: bool| -> Result<Vec<u8>> {
+        let s = match v {
+            Json::Number(n) => n.to_string(),
+            _ => text()?.to_string(),
+        };
+        let bad = |what: &str| anyhow!("column {} is not {what}: {s}", col.name);
+        Ok(match (signed, wide) {
+            (false, false) => s
+                .parse::<u128>()
+                .map_err(|_| bad("a 128-bit unsigned integer"))?
+                .to_be_bytes()
+                .to_vec(),
+            (true, false) => s
+                .parse::<i128>()
+                .map_err(|_| bad("a 128-bit signed integer"))?
+                .to_be_bytes()
+                .to_vec(),
+            (false, true) => U256::from_str_radix(&s, 10)
+                .map_err(|_| bad("a 256-bit unsigned integer"))?
+                .to_be_bytes::<32>()
+                .to_vec(),
+            (true, true) => s
+                .parse::<I256>()
+                .map_err(|_| bad("a 256-bit signed integer"))?
+                .to_be_bytes::<32>()
+                .to_vec(),
+        })
+    };
+
+    Ok(match col.storage.as_str() {
+        "address" => {
+            let raw = bytes(Some(20))?;
+            Value::Address(raw.try_into().expect("checked to be 20 bytes"))
+        }
+        "hash32" => {
+            let raw = bytes(Some(32))?;
+            Value::Hash32(raw.try_into().expect("checked to be 32 bytes"))
+        }
+        "bytes" | "fixed_bytes" => Value::Bytes(bytes(None)?),
+        "bool" => Value::Bool(match v {
+            Json::Bool(b) => *b,
+            _ => text()?
+                .parse()
+                .with_context(|| format!("column {} is not a boolean", col.name))?,
+        }),
+        "u64" => Value::U64(match v {
+            Json::Number(n) => n
+                .as_u64()
+                .ok_or_else(|| anyhow!("column {} does not fit u64: {v}", col.name))?,
+            _ => text()?
+                .parse()
+                .with_context(|| format!("column {} is not a u64", col.name))?,
+        }),
+        "i64" => Value::I64(match v {
+            Json::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| anyhow!("column {} does not fit i64: {v}", col.name))?,
+            _ => text()?
+                .parse()
+                .with_context(|| format!("column {} is not an i64", col.name))?,
+        }),
+        "word16" => {
+            let w: [u8; 16] = word(false)?.try_into().expect("16 bytes");
+            if signed {
+                Value::IWord16(w)
+            } else {
+                Value::Word16(w)
+            }
+        }
+        "word32" => {
+            let w: [u8; 32] = word(true)?.try_into().expect("32 bytes");
+            if signed {
+                Value::IWord32(w)
+            } else {
+                Value::Word32(w)
+            }
+        }
+        "string" => Value::Str(text()?.to_string()),
+        "json" => Value::Json(match v {
+            Json::String(s) => s.clone(),
+            other => other.to_string(),
+        }),
+        other => bail!("column {} has unknown storage kind {other}", col.name),
+    })
 }
