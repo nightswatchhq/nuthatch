@@ -1501,6 +1501,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let tables = s.tables.clone();
+    let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
@@ -1519,6 +1520,24 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
                 (Default::default(), true)
             }
         };
+        // **The same relations `/sql` would see.** Without this, `/explain` answers a question about a
+        // different database than the one that runs the query, and the maintained relations are
+        // exactly where the two sets differ.
+        //
+        // It did not merely omit them, which would at least have been consistently wrong. DuckDB
+        // connections are pooled and `define_views` only refreshes tables in the *current* set, so a
+        // relation defined by an earlier `/sql` on that connection was still bound: the identical
+        // request returned `400 Table with name received does not exist` on a cold connection and
+        // `200 valid` once any `/sql` had warmed one. An agent validating its query before running
+        // it was told a good query was invalid, or told it was valid for the wrong reason, depending
+        // on which of the pool it landed on.
+        let mut hot = hot;
+        for entity in declared_entities.iter() {
+            if entity.unavailable().is_some() || entity.fault().is_some() {
+                continue;
+            }
+            hot.insert(entity.name().to_string(), entity.rows_as_json());
+        }
         let sealed_through = store.sealed_through();
         let mut out = analytics::query_hot_cold(
             &dir,

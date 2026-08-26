@@ -652,6 +652,53 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     );
 }
 
+/// **`/explain` must answer for the database `/sql` runs.** A maintained relation is queryable by
+/// name, so the endpoint whose entire job is "would this query bind?" has to know it exists.
+///
+/// The failure this pins was worse than a plain omission, and it is why the first assertion here is
+/// the load-bearing one: DuckDB connections are pooled and `define_views` refreshes only the tables
+/// in the *current* set, so a relation defined by an earlier `/sql` on that connection stayed bound.
+/// The identical request returned `400 Table with name received does not exist` on a cold connection
+/// and `200 valid` once any `/sql` had warmed one - the same question, two answers, decided by what
+/// some other caller happened to run first.
+///
+/// So: explain **before** any `/sql` touches the entity. A test that queried in the other order
+/// passed against the broken code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_binds_a_maintained_relation_on_a_cold_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    // First request of the test, before anything can have defined the view as a side effect.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20*%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/explain must bind a maintained relation on a cold connection: {body}"
+    );
+    assert_eq!(body["valid"], true, "{body}");
+
+    // And it binds the relation's real columns, rather than anything that merely accepts the name.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20bogus_col%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "a column the relation does not have must not bind: {body}"
+    );
+
+    // The two surfaces agree in both directions.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20*%20FROM%20no_such_relation").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+
+    shutdown_and_settle(rt).await;
+}
+
 /// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
 /// and remains bounded by existing guards. Documentation does not imply IVM repeals I/O."*
 ///
