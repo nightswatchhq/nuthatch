@@ -1,8 +1,12 @@
 # RFC-0041 slice-zero measurements
 
-Status: preliminary. This is evidence about the embedded compiler boundary and one captured
-Linux cursor-budget run, not the go/park decision. Sustained ingest and a supported-release binary
-comparison are still required.
+Status: **the decision was taken. GO, 2026-08-24, on #818**, and CLAUDE.md carries the resulting
+carve-out from the 2026 feature freeze. This document is the evidence that decision rests on, not a
+record of a decision still pending - it said the latter for a day after the former was true (#839),
+which is why the header now says so first.
+
+Read the caveats. Two of the measurements below have open defects filed against them, #835 and #837,
+and neither is resolved by the GO.
 
 ## Captured Horizon corpus
 
@@ -147,14 +151,35 @@ This is a local development binary, not the published Linux artefact. It establi
 the AST-gated circuit does not accidentally pull in a second runtime. The release gate must repeat
 the comparison on the supported Linux build before publication.
 
-## Still required for the decision
+## What the gate asked for, and where each part now lives
+
+The original list had five items. Three were the entry gate and were run; two were never entry
+criteria in practice and have been reassigned to the slices that own them, which is the ruling #839
+asked for rather than a quiet edit.
+
+**The entry gate (run, with the caveats named):**
 
 1. Select the Lodestar delegation relation by captured raw-history scan cost and save its finalized
-   corpus plus its tape content address.
-2. Run DuckDB parity over that corpus and the embedded circuit, with canonical key ordering.
-3. At the declared `max_rows`, record empty-circuit RSS, peak cursor RSS and the approximate
-   per-row cost. The whole cursor, not merely DBSP, must remain below 2 GB.
-4. Replay the same tape through the normal ingest path, recording sustained throughput against the
-   existing floor.
-5. Repeat the binary measurement on the Linux release artefact and make the explicit go/park
-   decision. Until then, slices #820 through #822 remain blocked.
+   corpus plus its tape content address. Done - the corpus and manifest are recorded above.
+2. Run DuckDB parity over that corpus and the embedded circuit, with canonical key ordering. Run,
+   **and #835 is open against it**: the captured corpus pre-aggregates, so the circuit's join, filter
+   and aggregate are inert on it and the parity cannot fail. It gets sharper now that the circuit is
+   derived from the plan (#870) rather than hand-built, and it needs re-pointing at raw weighted
+   deltas before it proves what its name claims.
+3. At the declared `max_rows`, record empty-circuit RSS, peak cursor RSS and the approximate per-row
+   cost. Run, **and #837 is open against it**: the published RSS-per-row and rows/sec figures measure
+   the wrong window. #838 is open against the bound itself, which counted one of two input relations.
+
+**Reassigned:**
+
+4. Sustained throughput through the **normal ingest path** belongs to #821, not to the entry gate.
+   It cannot be measured until an authored entity is actually fed from `indexer.rs`, which is what
+   #864 is building; measuring a circuit fed from a fixture would answer a different question. The
+   GO comment says as much in its own words: the figure it published is "deliberately a
+   circuit-ingestion measurement, not a claim that `indexer.rs` already maintains authored entities".
+5. Repeating the binary measurement on the **Linux release artefact** belongs to the release gate.
+   The figure above is a local development binary and says so; the release comparison is a
+   publication precondition rather than an implementation one.
+
+Neither reassignment makes the measurements optional. They are owed by the slices named, and #821 is
+not complete without 4.
