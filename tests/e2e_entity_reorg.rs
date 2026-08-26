@@ -143,6 +143,52 @@ fn relation(rt: &indexer::NestRuntime) -> Vec<(String, String)> {
     out
 }
 
+/// Run a query through the nest's `/sql` route and return its rows as sorted `(k, v)` text pairs.
+///
+/// Text rather than numbers on purpose: the entity serves exact i128 as a decimal string and DuckDB
+/// serves its own type, so comparing the rendered values is the comparison that would catch a
+/// precision loss on either side rather than papering over it with a float cast.
+async fn sql_pairs(rt: &indexer::NestRuntime, sql: &str) -> Vec<(String, String)> {
+    let path = format!("/sql?q={}", urlencoding_lite(sql));
+    let (status, body) = get_json(rt, &path).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{sql} -> {body}");
+    let mut out: Vec<(String, String)> = body["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no rows for {sql}: {body}"))
+        .iter()
+        .map(|r| {
+            let k = r["k"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| r["k"].to_string());
+            let v = r["v"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| r["v"].to_string());
+            (k, v)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Percent-encode the handful of characters a SQL string puts in a query parameter. Not a general
+/// encoder; the test corpus is fixed and this keeps a dependency out of the test suite.
+fn urlencoding_lite(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ' ' => "%20".to_string(),
+            '"' => "%22".to_string(),
+            '*' => "%2A".to_string(),
+            '(' => "%28".to_string(),
+            ')' => "%29".to_string(),
+            ',' => "%2C".to_string(),
+            '+' => "%2B".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 async fn entity_converges_after_reorg(fork: u64) {
     assert!((1..CHAIN_LEN).contains(&fork));
     // Reorged nest: index the canonical chain, then rewrite everything above the fork.
@@ -180,6 +226,27 @@ async fn entity_converges_after_reorg(fork: u64) {
     assert!(converged, "the reorg did not reconverge in time");
     let after = relation(&rt);
     let health = rt.state.entities[0].fault();
+
+    // **#822 criterion 12.** *"A randomized reorg run converges to the old SQL reference result."*
+    // The clean-replay comparison below asks whether the circuit agrees with itself; this asks
+    // whether it agrees with the authored SQL it replaces, computed fresh over hot∪sealed by DuckDB
+    // after the reorg. Two independent routes to the same number, and the entity is only worth
+    // having if they match.
+    let maintained = sql_pairs(&rt, "SELECT \"to\" AS k, sum_value AS v FROM received").await;
+    let reference = sql_pairs(
+        &rt,
+        "SELECT t.\"to\" AS k, SUM(t.value_dec) AS v FROM usdc__transfer t GROUP BY t.\"to\"",
+    )
+    .await;
+    assert!(
+        !reference.is_empty(),
+        "the reference query returned nothing, so it proves nothing"
+    );
+    assert_eq!(
+        maintained, reference,
+        "after a reorg at {fork}, the maintained relation must equal the authored SQL it replaces"
+    );
+
     shutdown(rt);
     assert_eq!(health, None, "the entity must still be running");
 
@@ -583,6 +650,64 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
         after, before,
         "a seeded entity must carry the sealed range, which only Parquet still holds"
     );
+}
+
+/// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
+/// and remains bounded by existing guards. Documentation does not imply IVM repeals I/O."*
+///
+/// A maintained relation is cheaper to **derive** and not cheaper to **return**, so the row cap
+/// binds it exactly as it binds a fact table. The trap is a route that reads "incremental" as a
+/// reason to skip the guards.
+///
+/// Grouped by block rather than by recipient because the shared fixture sends every transfer to the
+/// same address: one group, and a cap of one would bind nothing and pass regardless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capped_query_over_a_maintained_relation_is_still_capped() {
+    const PER_BLOCK: &str = r#"[[entities]]
+name = "per_block"
+sql = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
+key = ["block_number"]
+max_rows = 10000
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, PER_BLOCK).await;
+    rt.state.entities[0].flush();
+
+    let all = rt.state.entities[0].relation().len();
+    assert_eq!(
+        all as u64, CHAIN_LEN,
+        "one group per block, or the cap below binds nothing"
+    );
+
+    // Uncapped: every maintained row comes back, and is not silently truncated.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20per_block").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "uncapped: {body}");
+    assert_eq!(
+        body["rows"].as_array().map(Vec::len),
+        Some(all),
+        "uncapped: {body}"
+    );
+    assert_eq!(body["truncated"], false, "uncapped: {body}");
+
+    // Capped: the existing guard binds a maintained relation like any other table.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20per_block&max_rows=3").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "capped: {body}");
+    assert_eq!(
+        body["rows"].as_array().map(Vec::len),
+        Some(3),
+        "the cap must bind: {body}"
+    );
+    assert_eq!(
+        body["truncated"], true,
+        "and a capped result must say so rather than looking complete: {body}"
+    );
+
+    shutdown_and_settle(rt).await;
 }
 
 /// **#822 criterion 10, the local half.** An edited definition rebuilds from the facts already on
