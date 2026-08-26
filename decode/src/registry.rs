@@ -483,7 +483,11 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
 }
 
 /// One decoded log row.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` so a reconstruction can be compared to the original **field by field, with its values
+/// still typed**. Comparing `to_json` output would not do: `Value::Str("7")` and `Value::Word16(7)`
+/// render identically, and telling those two apart is the entire job of `from_stored`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedRow {
     pub table: String,
     pub params: Vec<(String, Value)>,
@@ -534,6 +538,109 @@ impl DecodedRow {
             obj.insert(name.clone(), v.to_json());
         }
         Json::Object(obj)
+    }
+
+    /// Rebuild a row from the form it was stored in, against the table's schema.
+    ///
+    /// The counterpart to [`DecodedRow::to_json`], which was one-way until now, so every consumer
+    /// that needed typed values back out of the hot store hand-rolled its own (nuthatch#864). The
+    /// reorg path is the one that cannot afford a second opinion: it feeds rolled-back rows to a
+    /// circuit at weight `-1`, and DBSP cancels by key, so a retraction built by a different
+    /// converter than the insertion does not cancel it - it lands beside it and stays forever.
+    ///
+    /// **The schema decides the column order, not the JSON.** A stored row is a map, and a plan
+    /// indexes its columns by position; taking the order from the map would make it depend on
+    /// whatever the serialiser felt like, which for `serde_json` is insertion order and for a
+    /// Parquet reader is the file's.
+    pub fn from_stored(stored: &Json, schema: &TableSchema) -> Result<DecodedRow> {
+        let obj = stored
+            .as_object()
+            .ok_or_else(|| anyhow!("a stored row is an object, not {stored}"))?;
+        let get = |key: &str| -> Result<&Json> {
+            obj.get(key)
+                .ok_or_else(|| anyhow!("stored row of {} has no {key}", schema.table))
+        };
+        let text = |key: &str| -> Result<String> {
+            Ok(get(key)?
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| get(key).map(ToString::to_string).unwrap_or_default()))
+        };
+        // Numbers arrive as JSON numbers from the hot store and as text from a sealed segment's
+        // `Utf8` column, so both have to parse or the reorg path and the restart path disagree.
+        let number = |key: &str| -> Result<u64> {
+            let v = get(key)?;
+            match v {
+                Json::Number(n) => n
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("{key} does not fit u64: {v}")),
+                Json::String(s) => s
+                    .parse()
+                    .with_context(|| format!("{key} is not a number: {s}")),
+                other => bail!("{key} is not a number: {other}"),
+            }
+        };
+
+        if let Some(table) = obj.get("table").and_then(Json::as_str) {
+            if table != schema.table {
+                bail!(
+                    "stored row says table {table}, schema says {}; reconstructing it against the \
+                     wrong schema would read its columns as the wrong types",
+                    schema.table
+                )
+            }
+        }
+
+        let timestamps = schema.columns.iter().any(|c| c.name == "block_timestamp");
+        let block_number = number("block_number")?;
+        let log_index = number("log_index")?;
+
+        let mut params = Vec::new();
+        for column in schema.columns.iter().filter(|c| c.sol_type != "implicit") {
+            let v = obj.get(&column.name).ok_or_else(|| {
+                anyhow!(
+                    "stored row of {} has no {} - the schema and the stored row disagree about this \
+                     table's shape",
+                    schema.table,
+                    column.name
+                )
+            })?;
+            params.push((column.name.clone(), value_from_stored(v, column)?));
+        }
+
+        let row = DecodedRow {
+            table: schema.table.clone(),
+            params,
+            block_number,
+            block_hash: text("block_hash")?,
+            block_timestamp: if timestamps {
+                number("block_timestamp")?
+            } else {
+                0
+            },
+            timestamps,
+            log_index,
+            tx_hash: text("tx_hash")?,
+            address: text("address")?,
+        };
+
+        // `_seq` is derived rather than stored authoritatively, so it is a checksum on the two fields
+        // it is derived from. A row whose `_seq` disagrees with its own block and log index has been
+        // rewritten by something, and ordering built on it would be wrong in a way nothing else here
+        // would notice.
+        if let Some(stored_seq) = obj.get("_seq") {
+            let stored_seq = number("_seq").with_context(|| format!("{stored_seq}"))?;
+            if stored_seq != row.seq() {
+                bail!(
+                    "stored row of {} carries _seq {stored_seq} but block {} log {} derives {}",
+                    schema.table,
+                    row.block_number,
+                    row.log_index,
+                    row.seq()
+                )
+            }
+        }
+        Ok(row)
     }
 
     /// True if this row looks like an ERC-20/721 `Transfer(address, address, uint)` - the shape the
@@ -1216,6 +1323,193 @@ mod stored_roundtrip {
         let err = value_from_stored(&rendered, &col("v", "uint128", StorageKind::Word16))
             .expect_err("a negative decimal is not a uint128");
         assert!(format!("{err:#}").contains("unsigned"), "{err:#}");
+    }
+
+    fn schema(timestamps: bool, params: &[(&str, &str, StorageKind)]) -> TableSchema {
+        let mut columns = implicit_columns(timestamps);
+        columns.extend(params.iter().map(|(name, sol, kind)| ColumnSchema {
+            name: (*name).to_string(),
+            sol_type: (*sol).to_string(),
+            storage: kind.as_str().to_string(),
+            indexed: false,
+        }));
+        TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: TableKind::Event,
+            event: String::new(),
+            topic0: String::new(),
+            function: String::new(),
+            selector: String::new(),
+            columns,
+        }
+    }
+
+    fn a_row(timestamps: bool) -> DecodedRow {
+        DecodedRow {
+            table: "usdc__transfer".into(),
+            params: vec![
+                ("from".into(), Value::Address([0x11; 20])),
+                ("to".into(), Value::Address([0x22; 20])),
+                ("value".into(), Value::Word32(U256::MAX.to_be_bytes::<32>())),
+                ("ok".into(), Value::Bool(true)),
+                ("memo".into(), Value::Str("7".into())),
+            ],
+            block_number: 4_000_000,
+            block_hash: "0xbh".into(),
+            block_timestamp: if timestamps { 1_700_000_000 } else { 0 },
+            timestamps,
+            log_index: 12,
+            tx_hash: "0xtx".into(),
+            address: "0xaa".into(),
+        }
+    }
+
+    fn transfer_schema(timestamps: bool) -> TableSchema {
+        schema(
+            timestamps,
+            &[
+                ("from", "address", StorageKind::Address),
+                ("to", "address", StorageKind::Address),
+                ("value", "uint256", StorageKind::Word32),
+                ("ok", "bool", StorageKind::Bool),
+                ("memo", "string", StorageKind::Str),
+            ],
+        )
+    }
+
+    /// **The whole point.** A row that goes to the store and comes back must be the *same row*, with
+    /// its values still typed. `memo` is the string `"7"` and `value` is a `uint256`; both render as
+    /// text and only the schema tells them apart, so comparing `to_json` output would pass on a
+    /// reconstruction that confused them - and a `Scalar::Str("7")` retraction does not cancel a
+    /// `Scalar::Int(7)` insertion.
+    #[test]
+    fn a_row_survives_the_store_and_comes_back_typed() {
+        for timestamps in [true, false] {
+            let original = a_row(timestamps);
+            let schema = transfer_schema(timestamps);
+
+            let back = DecodedRow::from_stored(&original.to_json(), &schema)
+                .unwrap_or_else(|e| panic!("timestamps={timestamps}: {e:#}"));
+            assert_eq!(back, original, "timestamps={timestamps}");
+
+            // And in the sealed spelling, where everything but the four numeric implicit columns is
+            // `Utf8` (`seal.rs::rows_to_batch`).
+            let sealed = Json::Object(
+                original
+                    .to_json()
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| {
+                        let numeric = matches!(
+                            k.as_str(),
+                            "block_number" | "log_index" | "_seq" | "block_timestamp"
+                        );
+                        let v = match v {
+                            _ if numeric => v.clone(),
+                            Json::String(s) => Json::String(s.clone()),
+                            other => Json::String(other.to_string()),
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            );
+            let back = DecodedRow::from_stored(&sealed, &schema)
+                .unwrap_or_else(|e| panic!("sealed, timestamps={timestamps}: {e:#}"));
+            assert_eq!(back, original, "sealed spelling, timestamps={timestamps}");
+        }
+    }
+
+    /// The column order comes from the schema, never from the stored map. A plan indexes columns by
+    /// position, so taking the order from a JSON object would make an entity's answer depend on the
+    /// serialiser's insertion order.
+    #[test]
+    fn the_schema_decides_the_column_order_not_the_stored_map() {
+        let original = a_row(true);
+        let mut shuffled: serde_json::Map<String, Json> = serde_json::Map::new();
+        // Reverse the params relative to the schema, keeping the implicit columns where they are.
+        let stored = original.to_json();
+        let obj = stored.as_object().unwrap();
+        for key in ["memo", "ok", "value", "to", "from"] {
+            shuffled.insert(key.into(), obj[key].clone());
+        }
+        for (k, v) in obj {
+            shuffled.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        let back =
+            DecodedRow::from_stored(&Json::Object(shuffled), &transfer_schema(true)).unwrap();
+        assert_eq!(
+            back.params
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["from", "to", "value", "ok", "memo"]
+        );
+        assert_eq!(back, original);
+    }
+
+    /// A schema column the stored row does not carry means the two disagree about the table's shape.
+    /// Treating it as absent would put a hole in a positional row, and every column after it would
+    /// shift by one.
+    #[test]
+    fn a_column_the_stored_row_lacks_is_refused_and_named() {
+        let original = a_row(true);
+        let mut obj = original.to_json().as_object().unwrap().clone();
+        obj.remove("value");
+
+        let err = DecodedRow::from_stored(&Json::Object(obj), &transfer_schema(true))
+            .expect_err("the schema declares `value` and the row has none");
+        let err = format!("{err:#}");
+        assert!(err.contains("has no value"), "{err}");
+        assert!(err.contains("disagree about this table"), "{err}");
+    }
+
+    /// The implicit numeric columns are `UInt64` in a sealed segment and JSON numbers in the hot
+    /// store, and the comment on `number` claims both spellings work. This is that claim, asserted
+    /// rather than assumed - a reader that hands them back as text would otherwise silently produce
+    /// block 0, and `_seq` would then be the only thing that noticed.
+    #[test]
+    fn the_implicit_numeric_columns_parse_from_text_as_well_as_numbers() {
+        let original = a_row(true);
+        let mut obj = original.to_json().as_object().unwrap().clone();
+        for key in ["block_number", "log_index", "_seq", "block_timestamp"] {
+            let as_text = obj[key].to_string();
+            obj.insert(key.into(), Json::String(as_text));
+        }
+
+        let back = DecodedRow::from_stored(&Json::Object(obj), &transfer_schema(true))
+            .expect("text spellings of the numeric columns must parse");
+        assert_eq!(back, original);
+        assert_eq!(back.block_number, 4_000_000);
+    }
+
+    /// `_seq` is derived from block and log index, so it is a checksum on them. A row whose `_seq`
+    /// disagrees has been rewritten by something, and ordering built on it would be wrong in a way
+    /// nothing else here would notice.
+    #[test]
+    fn a_seq_that_disagrees_with_its_own_block_and_log_index_is_refused() {
+        let original = a_row(true);
+        let mut obj = original.to_json().as_object().unwrap().clone();
+        obj.insert("_seq".into(), json!(1));
+
+        let err = DecodedRow::from_stored(&Json::Object(obj), &transfer_schema(true))
+            .expect_err("a rewritten _seq is a corrupt row");
+        assert!(format!("{err:#}").contains("_seq 1"), "{err:#}");
+    }
+
+    /// Reconstructing against another table's schema would read the columns as the wrong types and
+    /// succeed at it, which is worse than failing.
+    #[test]
+    fn a_row_from_another_table_is_refused() {
+        let original = a_row(true);
+        let mut schema = transfer_schema(true);
+        schema.table = "usdc__approval".into();
+
+        let err = DecodedRow::from_stored(&original.to_json(), &schema)
+            .expect_err("the row says transfer and the schema says approval");
+        assert!(format!("{err:#}").contains("wrong schema"), "{err:#}");
     }
 
     /// A stored address that is not twenty bytes is a corrupt row, and the guard is what keeps it an
