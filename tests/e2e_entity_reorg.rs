@@ -51,17 +51,19 @@ fn replacement_block(b: u64) -> BlockFixture {
 ///
 /// No filter and no join on purpose: this test is about the retraction path, and every operator it
 /// does not use is one that cannot mask a divergence by discarding the row that carries it.
-fn declare_entity(dir: &std::path::Path) {
-    std::fs::write(
-        dir.join("entities.toml"),
-        r#"[[entities]]
+const RECEIVED: &str = r#"[[entities]]
 name = "received"
 sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
-"#,
-    )
-    .expect("write entities.toml");
+"#;
+
+fn declare_entity(dir: &std::path::Path) {
+    declare(dir, RECEIVED);
+}
+
+fn declare(dir: &std::path::Path, toml: &str) {
+    std::fs::write(dir.join("entities.toml"), toml).expect("write entities.toml");
 }
 
 const CHAIN_LEN: u64 = 8;
@@ -71,8 +73,19 @@ async fn spawn_with_entity(
     tape: Arc<TapeSource>,
     tip: u64,
 ) -> indexer::NestRuntime {
+    spawn_declared(dir, tape, tip, RECEIVED).await
+}
+
+/// The same, for a caller that supplies its own `entities.toml`. Written **after** the scaffold so
+/// the declaration is the one under test and not whatever the scaffold would leave behind.
+async fn spawn_declared(
+    dir: &std::path::Path,
+    tape: Arc<TapeSource>,
+    tip: u64,
+    decl: &str,
+) -> indexer::NestRuntime {
     let cfg = scaffold_nest(dir, "usdc", USDC);
-    declare_entity(dir);
+    declare(dir, decl);
     let rt = indexer::spawn_nest(
         tape,
         dir.to_path_buf(),
@@ -569,6 +582,202 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     assert_eq!(
         after, before,
         "a seeded entity must carry the sealed range, which only Parquet still holds"
+    );
+}
+
+/// **#822 criterion 10, the local half.** An edited definition rebuilds from the facts already on
+/// disk, and does not re-fetch them.
+///
+/// The *adoption* half - that an entity edit moves the package NID without moving the fact identity,
+/// so a freshly-installed edited nest inherits the old dataset instead of re-indexing - is
+/// `e2e_early_cutoff::declaring_an_entity_adopts_the_facts_instead_of_re_indexing_them`, and it has
+/// to be, because this suite spawns a nest straight into a directory and never consults a data
+/// identity. Removing `entities.toml` from `blob::NON_DATA_INPUTS` leaves every assertion here
+/// passing, which is exactly how much this test knows about that mechanism: nothing.
+///
+/// What it does hold is the other failure: the edited definition is a **different relation over a
+/// different column**, not a tweak, so a rebuild that quietly resumed the old circuit would still be
+/// holding `to`-keyed rows and the assertion on the new keys would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn editing_an_entity_rebuilds_from_stored_facts_without_refetching_them() {
+    const SENT: &str = r#"[[entities]]
+name = "sent"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let first = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
+    assert!(
+        !relation(&first).is_empty(),
+        "the first run must actually fill it"
+    );
+    shutdown_and_settle(first).await;
+
+    // Edit the definition. Nothing new to index, so any `logs` call is a historical re-fetch.
+    let calls_before = tape.logs_call_count();
+    let second = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, SENT).await;
+    second.state.entities[0].flush();
+    let name = second.state.entities[0].name().to_string();
+    let rebuilt = relation(&second);
+    let unavailable = second.state.entities[0].unavailable().map(str::to_string);
+    let applied = second.state.entities[0].applied_through();
+    shutdown_and_settle(second).await;
+
+    assert_eq!(
+        name, "sent",
+        "the edited definition is the one that came up"
+    );
+    assert_eq!(
+        unavailable, None,
+        "the edited entity rebuilt rather than staying unavailable"
+    );
+    assert_eq!(
+        applied, CHAIN_LEN,
+        "and it answers for the head it was rebuilt through"
+    );
+
+    // Every block sends one transfer from the same sender in this fixture, so the new relation is
+    // one group counting the whole chain. Asserted against the fixture rather than against the old
+    // relation, which is the point: this is a *different* derivation over the same facts.
+    assert_eq!(
+        rebuilt,
+        vec![(
+            format!("Row([Str({:?})])", account(1)),
+            format!("Row([Int({CHAIN_LEN})])"),
+        )],
+        "the edited entity must be the new derivation over the adopted facts"
+    );
+
+    let historical = tape.logs_call_count() - calls_before;
+    assert!(
+        historical < (CHAIN_LEN / 2) as usize,
+        "editing a definition must adopt the decoded facts, not re-fetch them: {historical} logs \
+         calls across a {CHAIN_LEN}-block chain"
+    );
+}
+
+/// **#822 criterion 11, at the bar this slice actually sets.** *"An unrelated incremental entity
+/// remains available while the changed one rebuilds, unless a shared dependency changed."*
+///
+/// RFC-0041 is explicit that v1 does not graft: *"The first implementation may rebuild all entities
+/// locally after an NID change. The acceptance bar still requires zero historical RPC."* Per-entity
+/// grafting is listed under "Post-v1, not a v1 slice" and is not testable until entity output is
+/// persisted, because until then there is nothing durable to graft.
+///
+/// So the honest v1 statement is this: editing one entity does not cost the other one its answer or
+/// its currency, and neither rebuild reaches for the network. A test asserting that the untouched
+/// entity was *not recomputed* would be asserting something v1 does not claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn editing_one_entity_leaves_its_neighbour_answering() {
+    const BOTH: &str = r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+
+[[entities]]
+name = "senders"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+    // Only `received` changes: SUM becomes COUNT. `senders` is byte-identical.
+    const EDITED: &str = r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+
+[[entities]]
+name = "senders"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let first = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, BOTH).await;
+    for e in first.state.entities.iter() {
+        e.flush();
+    }
+    let neighbour_before: Vec<_> = first.state.entities[1]
+        .relation()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    assert!(
+        !neighbour_before.is_empty(),
+        "the neighbour must actually hold something"
+    );
+    shutdown_and_settle(first).await;
+
+    let calls_before = tape.logs_call_count();
+    let second = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, EDITED).await;
+    for e in second.state.entities.iter() {
+        e.flush();
+    }
+    let names: Vec<String> = second
+        .state
+        .entities
+        .iter()
+        .map(|e| e.name().to_string())
+        .collect();
+    let states: Vec<(Option<String>, Option<String>, u64)> = second
+        .state
+        .entities
+        .iter()
+        .map(|e| {
+            (
+                e.unavailable().map(str::to_string),
+                e.fault(),
+                e.applied_through(),
+            )
+        })
+        .collect();
+    let neighbour_after: Vec<_> = second.state.entities[1]
+        .relation()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    shutdown_and_settle(second).await;
+
+    assert_eq!(names, vec!["received", "senders"]);
+    for (i, (unavailable, fault, applied)) in states.iter().enumerate() {
+        assert_eq!(
+            *unavailable, None,
+            "entity {} is unavailable after the edit",
+            names[i]
+        );
+        assert_eq!(*fault, None, "entity {} faulted after the edit", names[i]);
+        assert_eq!(
+            *applied, CHAIN_LEN,
+            "entity {} did not come back current",
+            names[i]
+        );
+    }
+    assert_eq!(
+        neighbour_after, neighbour_before,
+        "the untouched entity must answer with exactly what it answered with before"
+    );
+
+    let historical = tape.logs_call_count() - calls_before;
+    assert!(
+        historical < (CHAIN_LEN / 2) as usize,
+        "neither rebuild may re-fetch history: {historical} logs calls"
     );
 }
 
