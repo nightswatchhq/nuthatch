@@ -13,6 +13,7 @@ use crate::chains::{
 use crate::chunker::{self, AdaptiveWindow};
 use crate::cli::DevArgs;
 use crate::config::{Config, DB_FILE};
+use crate::entity_view::EntityView;
 use crate::exposure::{self, ExposureView};
 use crate::factory::{ChildRegistry, FactorySet};
 use crate::labels::{self, LabelSet};
@@ -1066,6 +1067,40 @@ impl Supervisor {
 /// `Supervisor::live()` in the same breath - so every index derived from the live set is present.
 /// Panicking here would mean those two fell out of step, which is a logic error rather than a
 /// condition to handle: silently skipping would make a nest stop indexing with no diagnosis.
+/// Start one circuit per authored entity the nest declares (RFC-0041 §5.1).
+///
+/// Every failure here is fatal, and that is the point of doing it at startup. An entity whose SQL
+/// will not lower, or which names a column this nest's ABI does not have, is a nest that would
+/// otherwise start cleanly and then serve an empty relation for as long as nobody looked - §5.1's
+/// "it never serves a plausible partial relation as current", applied to the case where the relation
+/// was never going to exist at all.
+fn start_entities(
+    dir: &std::path::Path,
+    registry: &Arc<DecodeRegistry>,
+) -> Result<Vec<EntityView>> {
+    let declared = crate::entities::load(dir)?;
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut views = Vec::with_capacity(declared.len());
+    for decl in declared {
+        let plan = crate::entity_lower::lower(&decl.sql)
+            .with_context(|| format!("lowering entity `{}`", decl.name))?;
+        views.push(EntityView::start(
+            &decl.name,
+            &plan,
+            registry,
+            decl.max_rows,
+        )?);
+        tracing::info!(
+            "entity `{}` maintained incrementally, bound to max_rows {}",
+            decl.name,
+            decl.max_rows
+        );
+    }
+    Ok(views)
+}
+
 fn live_nest(nests: &mut [Option<NestIngest>], i: usize) -> &mut NestIngest {
     nests[i]
         .as_mut()
@@ -1897,6 +1932,9 @@ async fn build_nest(
     let velocity_cfg = config.flags.velocity();
     // Only fed when a velocity flag is configured - skip its circuit + thread otherwise (L10).
     let velocity = VelocityView::start(velocity_cfg.is_some())?;
+    // Authored incremental entities (RFC-0041). A declaration that will not lower or will not bind
+    // stops the nest here rather than at the first block that would have used it - `?`, deliberately.
+    let entities = Arc::new(start_entities(&dir, &registry)?);
     if threshold.is_some() || velocity_cfg.is_some() {
         tracing::info!("flags enabled: threshold={threshold:?}, velocity={velocity_cfg:?}");
     }
@@ -2110,6 +2148,7 @@ async fn build_nest(
         balances: balances.clone(),
         exposure: exposure.clone(),
         velocity: velocity.clone(),
+        entities: entities.clone(),
         labels: labels.clone(),
         screener: screener.clone(),
         threshold,
@@ -3607,6 +3646,12 @@ pub struct NestIngest {
     balances: BalanceView,
     exposure: ExposureView,
     velocity: VelocityView,
+    /// The nest's authored incremental entities (RFC-0041 §5.1), one circuit each.
+    ///
+    /// `Arc` rather than `Clone` because an `EntityView` owns a thread and a channel: two copies of
+    /// the handle would be two writers to one circuit, and the whole design is one cursor, one
+    /// writer, one observable failure boundary. Empty for the ordinary nest that declares none.
+    entities: Arc<Vec<EntityView>>,
     labels: Arc<LabelSet>,
     screener: Arc<Option<LiveScreener>>,
     threshold: Option<i128>,
@@ -3944,6 +3989,64 @@ impl NestIngest {
         if !self.velocity.is_healthy() {
             anyhow::bail!(TerminalFault("the velocity IVM circuit thread has died - refusing to serve frozen compliance data".into()));
         }
+        // §5.2: "Serving frozen derived state as healthy is not graceful degradation; it is a lie
+        // with a pleasant HTTP status." The entity carries *why* it stopped, so the quarantine
+        // reason names the cause rather than sending whoever is on call to the logs of a process
+        // that may since have restarted.
+        for entity in self.entities.iter() {
+            if let Some(why) = entity.fault() {
+                anyhow::bail!(TerminalFault(format!(
+                    "the circuit for entity `{}` has stopped: {why}",
+                    entity.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Feed rolled-back rows to every authored entity at weight `-1`.
+    ///
+    /// A row belonging to a table no entity reads is skipped, not an error: a nest decodes many
+    /// tables and an entity reads one or two. A row this nest's registry has no schema for *is* an
+    /// error - it means the stored history and the live registry disagree about what was indexed,
+    /// and retracting it against a guessed shape would produce rows that cancel nothing.
+    fn retract_entities(&self, doomed: &[String], ancestor: u64) -> Result<()> {
+        if self.entities.is_empty() || doomed.is_empty() {
+            return Ok(());
+        }
+        let schema = self.registry.schema();
+        let mut rows = Vec::with_capacity(doomed.len());
+        for stored in doomed {
+            let value: serde_json::Value = match serde_json::from_str(stored) {
+                Ok(v) => v,
+                // Annotations (sanction hits, threshold flags) share the rows' block keys and are
+                // not decoded rows. They were never fed to an entity, so they are not retracted from
+                // one either.
+                Err(_) => continue,
+            };
+            let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
+                anyhow::bail!(TerminalFault(format!(
+                    "reorg: the hot store holds a row of `{table}`, which this nest's registry does \
+                     not describe. Retracting it against a guessed shape would leave rows that \
+                     cancel nothing"
+                )));
+            };
+            rows.push(crate::registry::DecodedRow::from_stored(
+                &value,
+                table_schema,
+            )?);
+        }
+        for entity in self.entities.iter() {
+            entity.apply_window(&rows, -1, ancestor).with_context(|| {
+                format!(
+                    "retracting rolled-back rows from entity `{}`",
+                    entity.name()
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -3979,6 +4082,14 @@ impl NestIngest {
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
+        // §5.2, for the authored entities: the same rows, at weight -1, *before* they are dropped
+        // from the hot store. There is no rollback interface because there is nothing to roll back.
+        //
+        // These are reconstructed through `DecodedRow::from_stored` rather than parsed here, and
+        // that is the whole point: DBSP cancels by key, so a retraction built by a different
+        // converter than the insertion does not cancel it - it lands beside it and stays forever.
+        // One conversion, both directions.
+        self.retract_entities(&doomed, ancestor)?;
         self.balances.apply(retraction_batch(&doomed));
         self.exposure.apply(exposure_retraction_batch(
             &doomed,
@@ -4178,6 +4289,18 @@ impl NestIngest {
         self.balances.apply(deltas);
         self.exposure.apply(exp_deltas);
         self.velocity.apply(vel_deltas);
+        // §5.1: the same decoded window, at weight +1, to every authored entity. Backfill and tip
+        // are the same call - they differ in how many rows `rows` holds, which is the whole of what
+        // "backfill uses larger batches, but not different semantics" means.
+        //
+        // `to` and not the nest's head: an entity carries its own applied-through watermark, and
+        // stamping it with a block it has not folded is how a partial relation gets served as
+        // current (criterion 2).
+        for entity in self.entities.iter() {
+            entity
+                .apply_window(&rows, 1, to)
+                .with_context(|| format!("feeding this window to entity `{}`", entity.name()))?;
+        }
         // A derived-view circuit thread that has died silently drops those applies and freezes
         // `/balances` + the compliance flags while ingest keeps committing - stale data served as
         // healthy. Surface it as fatal here (the dead-task-must-surface rule, extended to the IVM
