@@ -77,6 +77,14 @@ pub struct AppState {
     pub exposure: ExposureView,
     /// Windowed per-address velocity view (RFC-0008 C3) - served at `/flags?kind=velocity`.
     pub velocity: VelocityView,
+    /// The nest's authored incremental entities (RFC-0041), the same handles the ingest loop feeds.
+    ///
+    /// Shared rather than cloned: an `EntityView` owns a thread and a channel, and a second handle
+    /// would be a second writer to one circuit. Serving reads each entity's own applied-through
+    /// watermark rather than the nest's head - an entity behind the dataset is an ordinary state
+    /// during backfill, and answering for the nest's head while holding this one's rows is exactly
+    /// how a partial relation gets stamped current (§5.1, #866).
+    pub entities: Arc<Vec<crate::entity_view::EntityView>>,
     /// Single-transfer threshold in base units, if configured (RFC-0008 C3) - for `/`'s flag summary.
     pub threshold: Option<i128>,
     /// Velocity flag threshold in base units, if configured - the cutoff `/flags?kind=velocity` uses.
@@ -711,6 +719,68 @@ fn progress_stalled(
 /// progress**: **200** with a status body when fresh, **503** when the source has stopped answering
 /// ([`poll_stalled`]) or the cursor has stopped advancing while the source answers fine
 /// ([`progress_stalled`], #578). A just-started node that has done neither yet is *not* stalled (grace).
+/// Whether an entity that is behind has stopped advancing.
+///
+/// Its own function because the ways this is wrong are all off-by-one-ish and all silent: an entity
+/// that has never folded a batch is waiting rather than wedged, and one level with the head is not
+/// behind at all. Either, read wrong, produces a permanently-unready nest that is working fine.
+///
+/// A nest that has indexed nothing needs no guard of its own: its head is zero, and `applied < 0` is
+/// unreachable for a `u64`. An explicit `head > 0` here survived every mutation because nothing could
+/// reach it - armour that cannot be hit, in front of a case that cannot happen, is a third thing for
+/// a reader to reason about and a place for a wrong belief to live.
+fn entity_wedged(applied: u64, head: u64, progress: u64, now: u64) -> bool {
+    applied < head && progress != 0 && now.saturating_sub(progress) > READINESS_PROGRESS_STALL_SECS
+}
+
+/// How each authored entity is doing, and whether any of them makes this nest unready (#866).
+///
+/// §5.1: *"A catching-up entity is reported as such; it never serves a plausible partial relation as
+/// current."* Being behind is therefore **not** unready - it is the ordinary state during backfill
+/// and after a definition change, and it can last hours. What is unready is an entity that has
+/// stopped: faulted outright, or behind and no longer advancing.
+///
+/// Judged on **progress**, exactly as the seal pass is since #846. A duration threshold on a
+/// legitimately-slow catch-up either fires on healthy nests or never fires at all, and the version
+/// that never fires is the one that ships.
+fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
+    let mut stalled = false;
+    let entities: Vec<Value> = s
+        .entities
+        .iter()
+        .map(|e| {
+            let applied = e.applied_through();
+            let fault = e.fault();
+            let unavailable = e.unavailable();
+            let behind = applied < head;
+            let progress = e.last_progress();
+            // A nest that has indexed nothing yet has no head to be behind, so an entity at zero is
+            // waiting rather than wedged.
+            let wedged = entity_wedged(applied, head, progress, now);
+            // Unavailable is unready too. It is not a fault - nothing died - but an entity holding
+            // no answer must not be reachable behind a 200, which is the whole of §5.1's "never
+            // serves a plausible partial relation as current" applied to the case where there is no
+            // relation at all.
+            if fault.is_some() || wedged || unavailable.is_some() {
+                stalled = true;
+            }
+            json!({
+                "name": e.name(),
+                "applied_through": applied,
+                "current": !behind,
+                "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
+                "rows": e.len(),
+                "faulted": fault.is_some(),
+                "fault": fault,
+                "wedged": wedged,
+                "unavailable": unavailable,
+                "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
+            })
+        })
+        .collect();
+    (Value::Array(entities), stalled)
+}
+
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     use crate::metrics::{now_unix, METRICS};
     // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
@@ -809,7 +879,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             now,
             READINESS_SEAL_STALL_SECS,
         );
+    // An entity that has stopped makes the nest unready whatever the cursor is doing: §5.2 calls
+    // serving frozen derived state as healthy "a lie with a pleasant HTTP status", and a cursor
+    // polling happily while an entity is dead is exactly that lie.
+    let (entities, entities_stalled) = entity_readiness(&s, last, now);
     let stalled = seal_stalled
+        || entities_stalled
         || (!seal_direct_active
             && (initial_failure
                 || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
@@ -832,6 +907,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "seal_direct_stalled": seal_stalled,
         "seconds_since_seal_progress": (seal_direct_active && last_seal_progress != 0)
             .then(|| now.saturating_sub(last_seal_progress)),
+        "entities": entities,
+        "entities_stalled": entities_stalled,
     });
     let code = if stalled {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1764,6 +1841,39 @@ mod tests {
 
     /// A minimal but real `AppState` - enough to drive the analytical handlers directly (no HTTP
     /// harness). `permits` seeds the admission gate so a test can saturate it.
+    /// #866's readiness rule, at its edges. Every one of these reading wrong gives a nest that is
+    /// working fine and permanently unready, which is the failure operators learn to ignore.
+    #[test]
+    fn an_entity_is_wedged_only_when_it_is_behind_and_has_stopped_moving() {
+        let stall = READINESS_PROGRESS_STALL_SECS;
+        let now = 10_000;
+
+        assert!(
+            entity_wedged(5, 100, now - stall - 1, now),
+            "behind, and no progress for longer than the threshold"
+        );
+        assert!(
+            !entity_wedged(5, 100, now - stall + 1, now),
+            "behind but still advancing is catching up, not wedged - and it may be for hours"
+        );
+        assert!(
+            !entity_wedged(100, 100, now - stall - 1, now),
+            "level with the head is not behind, however long ago that happened"
+        );
+        assert!(
+            !entity_wedged(101, 100, now - stall - 1, now),
+            "ahead of the head is not behind either"
+        );
+        assert!(
+            !entity_wedged(0, 0, now - stall - 1, now),
+            "a nest that has indexed nothing has no head to be behind"
+        );
+        assert!(
+            !entity_wedged(0, 100, 0, now),
+            "an entity that has never folded a batch is waiting, not wedged"
+        );
+    }
+
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {
         AppState {
             store: std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap()),
@@ -1773,6 +1883,7 @@ mod tests {
             balances: BalanceView::start().unwrap(),
             exposure: ExposureView::start(true).unwrap(),
             velocity: VelocityView::start(true).unwrap(),
+            entities: Arc::new(Vec::new()),
             threshold: None,
             velocity_threshold: None,
             tables: Arc::new(vec![]),

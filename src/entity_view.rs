@@ -73,6 +73,14 @@ struct Published {
     /// The dataset head this entity has **actually folded**, which is not the nest's head while it
     /// is catching up. Advanced only after the batch carrying it has been applied.
     through: u64,
+    /// When `through` last actually moved, in unix seconds.
+    ///
+    /// **Progress, not duration** - the lesson #846 paid for one layer down, where `/ready`
+    /// suppressed every stall term during a bulk seal and put nothing in its place, so a pass frozen
+    /// for ten hours answered `200 {"ready":true}`. An entity catching up is the same shape:
+    /// legitimately behind, indefinitely, and indistinguishable from dead unless something watches
+    /// it advance. Zero until the first batch lands, which is "no progress yet" rather than 1970.
+    progress_at: u64,
 }
 
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
@@ -81,6 +89,12 @@ pub struct EntityView {
     tx: Sender<Msg>,
     binding: Binding,
     state: Arc<RwLock<Published>>,
+    /// Why this entity holds no answer despite the nest being fine - today, only a warm restart.
+    ///
+    /// Kept apart from `fault` on purpose. A faulted entity had a circuit that died; an unavailable
+    /// one never had state to lose. Reporting them as the same thing would make #866's fault
+    /// reporting say something untrue about a nest that is working.
+    unavailable: Option<String>,
     /// Why the circuit thread stopped, if it has - on start, on a step, or on the declared bound.
     /// §5.2: "Serving frozen derived state as healthy is not graceful degradation; it is a lie with
     /// a pleasant HTTP status."
@@ -97,11 +111,24 @@ impl EntityView {
     ///
     /// The plan is bound against `registry` here, so an entity naming a column this nest's ABI does
     /// not have is refused now rather than at the first block that would have used it.
+    /// `warm` says this nest already has indexed history behind it.
+    ///
+    /// **A warm start makes the entity unavailable, deliberately.** Entity state is derived and not
+    /// persisted, and it cannot be rebuilt yet: sealing *prunes* the sealed rows from the hot store,
+    /// so replaying what is left would cover only the unsealed tail and produce a relation that is
+    /// missing all of history while looking perfectly populated. Rebuilding from sealed Parquet is
+    /// §5.3's warm-restart seed, which is not built.
+    ///
+    /// Feeding it from the cursor onward would be worse than leaving it empty: a relation holding
+    /// *some* of the answer is the "plausible partial relation served as current" §5.1 forbids,
+    /// where an empty one at least cannot be mistaken for the truth. So it is fed nothing and says
+    /// why.
     pub fn start(
         name: &str,
         plan: &Plan,
         registry: &DecodeRegistry,
         max_rows: usize,
+        warm: bool,
     ) -> Result<Self> {
         if max_rows == 0 {
             return Err(anyhow!(
@@ -111,6 +138,14 @@ impl EntityView {
         }
         let binding = Binding::bind(plan, registry)
             .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
+        let unavailable = warm.then(|| {
+            format!(
+                "entity `{name}` cannot be rebuilt after a restart: its state is derived and not \
+                 persisted, and sealing prunes sealed rows from the hot store, so replaying what \
+                 remains would cover only the unsealed tail. RFC-0041 §5.3's warm-restart seed is \
+                 not implemented. Re-index this nest from its start block to repopulate it."
+            )
+        });
 
         let (tx, rx) = channel::<Msg>();
         let state = Arc::new(RwLock::new(Published::default()));
@@ -156,9 +191,19 @@ impl EntityView {
                                 }
                                 Ok(()) => {
                                     // The rows and the head they account for, published together.
-                                    *shared.write().unwrap() = Published {
+                                    let mut published = shared.write().unwrap();
+                                    let moved = through > published.through;
+                                    *published = Published {
                                         relation: circuit.relation().clone(),
                                         through,
+                                        // Stamped only when the watermark actually moves. A window
+                                        // that carries the entity no further is not progress, and
+                                        // counting it as such is how a wedged entity looks busy.
+                                        progress_at: if moved {
+                                            crate::metrics::now_unix()
+                                        } else {
+                                            published.progress_at
+                                        },
                                     };
                                 }
                             }
@@ -178,6 +223,7 @@ impl EntityView {
             tx,
             binding,
             state,
+            unavailable,
             fault,
         })
     }
@@ -191,6 +237,11 @@ impl EntityView {
     /// frozen relation. A clean shutdown drops the sender and exits without flipping this.
     pub fn is_healthy(&self) -> bool {
         self.fault.read().map(|f| f.is_none()).unwrap_or(false)
+    }
+
+    /// Why this entity holds no answer, if it does not. `None` means it is maintaining normally.
+    pub fn unavailable(&self) -> Option<&str> {
+        self.unavailable.as_deref()
     }
 
     /// Why this entity stopped, if it has. `None` is a live entity.
@@ -209,6 +260,11 @@ impl EntityView {
     /// A window carrying nothing for this entity is still progress and still advances the watermark:
     /// the entity is current through that block, having correctly folded no facts.
     pub fn apply_window(&self, rows: &[DecodedRow], weight: ZWeight, through: u64) -> Result<()> {
+        // An unavailable entity is fed nothing at all. Half an answer is the failure mode; none is
+        // merely an absence, and `unavailable()` is what says so.
+        if self.unavailable.is_some() {
+            return Ok(());
+        }
         let (left, right) = self
             .binding
             .window(rows)
@@ -261,6 +317,11 @@ impl EntityView {
     /// this one's rows is how a partial relation gets stamped current.
     pub fn applied_through(&self) -> u64 {
         self.state.read().map(|s| s.through).unwrap_or(0)
+    }
+
+    /// When the applied-through watermark last moved, in unix seconds; `0` before the first batch.
+    pub fn last_progress(&self) -> u64 {
+        self.state.read().map(|s| s.progress_at).unwrap_or(0)
     }
 
     /// Is this entity current for a dataset advertising `head`?
@@ -400,7 +461,7 @@ mod tests {
     #[test]
     fn a_decoded_window_is_folded_and_carries_the_watermark_with_it() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
         assert_eq!(v.applied_through(), 0, "nothing folded yet");
 
         let rows = decode(
@@ -428,7 +489,7 @@ mod tests {
     fn a_reorg_retracts_at_minus_one_and_converges_on_the_replacement() {
         // §5.2: removed rows are fed at -1 before deletion, replacements arrive at +1.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
 
         let orphaned = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]);
         let replacement = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "9", 100, 0)]);
@@ -449,7 +510,7 @@ mod tests {
     #[test]
     fn max_rows_counts_both_input_relations() {
         let reg = registry();
-        let v = EntityView::start("received", &received_by_approved(), &reg, 3).unwrap();
+        let v = EntityView::start("received", &received_by_approved(), &reg, 3, false).unwrap();
 
         // One left row, and four right rows. The left side alone never crosses three.
         let window = decode(
@@ -479,7 +540,7 @@ mod tests {
     fn crossing_max_rows_faults_the_circuit_rather_than_warning() {
         // Criterion 10: neither warns-and-continues nor OOMs the cursor.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1, false).unwrap();
         let rows = decode(
             &reg,
             &[
@@ -507,7 +568,7 @@ mod tests {
     #[test]
     fn the_bound_is_on_what_the_entity_holds_not_on_one_windows_size() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 2).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 2, false).unwrap();
         for (i, to) in [BOB, ALICE, TOKEN].iter().enumerate() {
             let block = 100 + i as u64;
             v.apply_window(
@@ -532,7 +593,7 @@ mod tests {
     #[test]
     fn a_retraction_returns_the_footprint_it_took() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 2).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 2, false).unwrap();
         let first = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]);
         let second = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, ALICE, "5", 101, 0)]);
         let third = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, TOKEN, "3", 102, 0)]);
@@ -556,7 +617,7 @@ mod tests {
         // The stale-serving guard criterion 2 asks for: an entity that stopped folding at 100 must
         // not answer for 200 merely because a later batch was enqueued.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]),
             1,
@@ -583,7 +644,7 @@ mod tests {
         // A window with no facts for this entity is progress: the entity is current through it. The
         // built-in views can skip an empty batch because they have no watermark to move.
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
         v.apply_window(&[], 1, 500).unwrap();
         v.flush();
         assert!(v.is_healthy());
@@ -596,7 +657,7 @@ mod tests {
     #[test]
     fn a_window_of_other_tables_is_progress_not_a_fault() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(APPROVAL_TOPIC0, ALICE, BOB, "1", 300, 0)]),
             1,
@@ -614,7 +675,7 @@ mod tests {
     #[test]
     fn retracting_more_rows_than_were_applied_is_a_fault() {
         let reg = registry();
-        let v = EntityView::start("received", &received(), &reg, 1_000).unwrap();
+        let v = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
         v.apply_window(
             &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]),
             -1,
@@ -643,7 +704,7 @@ mod tests {
         };
         let err = format!(
             "{:#}",
-            EntityView::start("received", &plan, &reg, 1_000)
+            EntityView::start("received", &plan, &reg, 1_000, false)
                 .err()
                 .expect("an unbindable entity must not start")
         );
@@ -655,7 +716,7 @@ mod tests {
         let reg = registry();
         let err = format!(
             "{:#}",
-            EntityView::start("received", &received(), &reg, 0)
+            EntityView::start("received", &received(), &reg, 0, false)
                 .err()
                 .expect("a bound of zero must not start")
         );
@@ -674,8 +735,8 @@ mod tests {
             let reg = registry();
             let who = [ALICE, BOB, TOKEN];
 
-            let live = EntityView::start("received", &received(), &reg, 1_000).unwrap();
-            let replay = EntityView::start("replay", &received(), &reg, 1_000).unwrap();
+            let live = EntityView::start("received", &received(), &reg, 1_000, false).unwrap();
+            let replay = EntityView::start("replay", &received(), &reg, 1_000, false).unwrap();
 
             let mut survivors: Vec<DecodedRow> = Vec::new();
             for (i, (to, value, orphaned)) in facts.iter().enumerate() {
