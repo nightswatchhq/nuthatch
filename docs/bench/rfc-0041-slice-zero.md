@@ -64,6 +64,13 @@ removed `ATOMIC_VAR_INIT` macro.
 here measured a window that included work they claimed not to include, and are kept below the new
 ones because the size of the correction is the point.
 
+**Not a like-for-like rerun of the same bytes.** The capture was re-copied from the live Horizon nest
+on the day, so it carries **889 input rows where the original run saw 876** - the nest has gone on
+indexing. Both the instrument and the corpus therefore differ between the two tables. Thirteen extra
+rows do not explain a 59x change in bytes-per-row, and the corrected figure's arithmetic is shown
+below so it can be checked rather than trusted, but the two rows of the comparison table are not the
+same experiment run twice and should not be read as one.
+
 | measure | value |
 | --- | ---: |
 | declared maximum rows | 1,000,000 |
