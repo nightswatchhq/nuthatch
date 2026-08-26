@@ -12,6 +12,8 @@
 
 mod common;
 
+use proptest::prelude::*;
+
 use std::sync::Arc;
 
 use nuthatch::indexer;
@@ -128,10 +130,8 @@ fn relation(rt: &indexer::NestRuntime) -> Vec<(String, String)> {
     out
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
-    let fork = 4;
-
+async fn entity_converges_after_reorg(fork: u64) {
+    assert!((1..CHAIN_LEN).contains(&fork));
     // Reorged nest: index the canonical chain, then rewrite everything above the fork.
     let reorged_dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
@@ -496,4 +496,43 @@ async fn a_restarted_entity_is_unavailable_rather_than_partially_filled() {
         relation(&second)
     );
     shutdown(second);
+}
+
+/// **RFC-0041 §8 / #864 criterion 4, as a property.** *"Randomized apply/retract/replacement
+/// sequences converge byte-for-byte to a clean replay."*
+///
+/// The fixed-fork case above is the readable one; this is the one that covers the depth. Both run
+/// through `spawn_nest`, so the `+1` side comes from the decode registry and the `-1` side is
+/// reconstructed from the hot store's JSON - two representations that must produce the same `Row` or
+/// nothing cancels. `entity_view`'s own property test builds both sides itself and cannot see that.
+///
+/// Depth rather than fork position, and stratified, for the reason #291 records: a uniform fork over
+/// a fixed chain is not a uniform depth, and a generator that never produces the deep case passes
+/// forever while proving nothing. Case count is low because every case drives two full nests.
+fn entity_reorg_depth() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        1u64..=2,                       // the everyday tip flutter
+        3u64..=(CHAIN_LEN / 2),         // mid
+        (CHAIN_LEN / 2 + 1)..CHAIN_LEN, // deep: unwinds most of the chain
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(6))]
+    #[test]
+    fn an_entity_converges_at_any_reorg_depth(depth in entity_reorg_depth()) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(entity_converges_after_reorg(CHAIN_LEN - depth));
+    }
+}
+
+/// The fixed case, kept as the readable one and as a guard on the generator's own reachability: a
+/// deep fork here would be a different test from a shallow one, and this pins the mid case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
+    entity_converges_after_reorg(4).await;
 }
