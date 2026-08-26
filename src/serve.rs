@@ -751,23 +751,29 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
         .map(|e| {
             let applied = e.applied_through();
             let fault = e.fault();
+            let unavailable = e.unavailable();
             let behind = applied < head;
             let progress = e.last_progress();
             // A nest that has indexed nothing yet has no head to be behind, so an entity at zero is
             // waiting rather than wedged.
             let wedged = entity_wedged(applied, head, progress, now);
-            if fault.is_some() || wedged {
+            // Unavailable is unready too. It is not a fault - nothing died - but an entity holding
+            // no answer must not be reachable behind a 200, which is the whole of §5.1's "never
+            // serves a plausible partial relation as current" applied to the case where there is no
+            // relation at all.
+            if fault.is_some() || wedged || unavailable.is_some() {
                 stalled = true;
             }
             json!({
                 "name": e.name(),
                 "applied_through": applied,
                 "current": !behind,
-                "catching_up": behind && fault.is_none() && !wedged,
+                "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
                 "rows": e.len(),
                 "faulted": fault.is_some(),
                 "fault": fault,
                 "wedged": wedged,
+                "unavailable": unavailable,
                 "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
             })
         })

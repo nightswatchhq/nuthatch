@@ -94,6 +94,16 @@ async fn spawn_with_entity(
     rt
 }
 
+/// Abort a nest **and wait for it to have stopped**, so its redb lock is released.
+async fn shutdown_and_settle(rt: indexer::NestRuntime) {
+    rt.ingest.abort();
+    let _ = (&mut { rt.ingest }).await;
+    if let Some(w) = rt.alert_worker {
+        w.abort();
+        let _ = w.await;
+    }
+}
+
 fn shutdown(rt: indexer::NestRuntime) {
     rt.ingest.abort();
     if let Some(w) = rt.alert_worker {
@@ -427,4 +437,63 @@ max_rows = 1
     );
 
     cursor.ingest.abort();
+}
+
+/// A restarted nest must not serve a **partial** entity.
+///
+/// Entity state is derived and not persisted, and it cannot be rebuilt from the hot store: sealing
+/// prunes sealed rows out of it, so replaying what remains covers only the unsealed tail. Feeding a
+/// restarted entity from the cursor onward would build a relation missing all of history that looks
+/// perfectly populated - the "plausible partial relation served as current" §5.1 forbids.
+///
+/// So it comes back **unavailable and empty**, and says why. Empty cannot be mistaken for an answer;
+/// half-full can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_entity_is_unavailable_rather_than_partially_filled() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    // First run: index the chain, and the entity fills.
+    let first = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
+    let filled = relation(&first);
+    assert!(!filled.is_empty(), "the first run must actually fill it");
+    assert!(
+        first.state.entities[0].unavailable().is_none(),
+        "a cold start is not unavailable"
+    );
+    // **Await the abort, do not merely request it.** redb takes its exclusive lock in
+    // `Database::open`, so the second nest cannot open the file until the first task has actually
+    // stopped and dropped its store handle. Aborting and pressing on gives "failed to open redb",
+    // which reads as a broken test rather than as a race.
+    shutdown_and_settle(first).await;
+
+    // Restart over the same directory, with more chain to index than the entity ever saw.
+    for b in (CHAIN_LEN + 1)..=(CHAIN_LEN + 4) {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN + 4);
+    let second = spawn_with_entity(dir.path(), tape, CHAIN_LEN + 4).await;
+
+    let why = second.state.entities[0]
+        .unavailable()
+        .expect("a warm start cannot rebuild the entity, and must say so")
+        .to_string();
+    assert!(why.contains("cannot be rebuilt after a restart"), "{why}");
+    assert!(
+        why.contains("prunes sealed rows"),
+        "the reason, not just the fact: {why}"
+    );
+
+    // The nest indexed four more blocks. The entity must have taken none of them: a relation built
+    // from block 9 onward is exactly the plausible partial answer this guards against.
+    assert!(
+        relation(&second).is_empty(),
+        "an unavailable entity is fed nothing, so it cannot look partly right: {:?}",
+        relation(&second)
+    );
+    shutdown(second);
 }

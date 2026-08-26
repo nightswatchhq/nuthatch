@@ -1114,6 +1114,7 @@ impl Supervisor {
 fn start_entities(
     dir: &std::path::Path,
     registry: &Arc<DecodeRegistry>,
+    warm: bool,
 ) -> Result<Vec<EntityView>> {
     let declared = crate::entities::load(dir)?;
     if declared.is_empty() {
@@ -1128,6 +1129,7 @@ fn start_entities(
             &plan,
             registry,
             decl.max_rows,
+            warm,
         )?);
         tracing::info!(
             "entity `{}` maintained incrementally, bound to max_rows {}",
@@ -1977,7 +1979,10 @@ async fn build_nest(
     let velocity = VelocityView::start(velocity_cfg.is_some())?;
     // Authored incremental entities (RFC-0041). A declaration that will not lower or will not bind
     // stops the nest here rather than at the first block that would have used it - `?`, deliberately.
-    let entities = Arc::new(start_entities(&dir, &registry)?);
+    // A nest with indexed history behind it starts its entities *unavailable* rather than empty and
+    // filling: see `EntityView::start`. Read before the rebuild below, which uses the same key.
+    let warm = store.get_meta(LAST_BLOCK_KEY)?.is_some();
+    let entities = Arc::new(start_entities(&dir, &registry, warm)?);
     if threshold.is_some() || velocity_cfg.is_some() {
         tracing::info!("flags enabled: threshold={threshold:?}, velocity={velocity_cfg:?}");
     }
