@@ -1216,19 +1216,26 @@ mod tests {
     }
 
     /// **The defect #837 is actually about.** The normalise scan's high-water mark must not reach the
-    /// per-row figure. It used to, because one sampler spanned the scan and the apply, while the
+    /// per-row figure. It used to, because one sampler spanned the scan and the apply while the
     /// baseline was taken after the scan had released - which is how the same relation got a
     /// published per-row cost 74x the tape path's, and how a 2 GB budget that holds ~800,000 rows
     /// read as one that exhausts at ~11,400.
     ///
+    /// **The property is which fields the figure derives from, not that two runs agree.** The first
+    /// version of this test compared a run carrying a scan peak against one without, and failed on
+    /// Linux CI for a reason that had nothing to do with the scan: RSS is process-global, so the
+    /// second measurement starts from the first's raised baseline and reports a smaller delta. Two
+    /// sequential in-process measurements can never be equal, and a test that needs them to be is
+    /// testing the allocator.
+    ///
     /// **Linux only, and absent rather than skipped elsewhere.** `current_rss_kb` reads
-    /// `/proc/self/status` and refuses on anything else, so on macOS both sides of the comparison
-    /// below are `Unavailable` and compare equal no matter what the code does. A test that passes
-    /// vacuously is worse than one that is not there: it was still green with the scan peak folded
-    /// straight back in. This is the gate's platform anyway.
+    /// `/proc/self/status` and refuses on anything else, so on macOS the figure is `Unavailable`
+    /// however the arithmetic is written. A test that passes vacuously is worse than one that is not
+    /// there: it was still green with the scan peak folded straight back in. This is the gate's
+    /// platform anyway.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_normalise_scan_peak_never_reaches_the_per_row_figure() {
+    fn the_per_row_figure_derives_from_the_circuit_fields_alone() {
         let (delegations, indexers) = corpus();
         let plan = compile(DELEGATION_SQL).unwrap();
         let mut reference = Spike::with_max_rows(&plan, 1_000).unwrap();
@@ -1240,41 +1247,42 @@ mod tests {
             .unwrap();
         let expected = reference.rows();
 
-        let batch = || {
-            vec![Batch {
-                delegations: delegations.clone(),
-                indexers: indexers.clone(),
-            }]
-        };
         // A scan peak of 4 GB - far beyond anything the circuit could account for.
-        let with_scan = measure_horizon_batches(
+        let scan_peak = 4 * 1024 * 1024;
+        let m = measure_horizon_batches(
             "fixture",
             None,
-            expected.clone(),
-            batch(),
+            expected,
+            vec![Batch {
+                delegations,
+                indexers,
+            }],
             1_000,
-            Some(4 * 1024 * 1024),
+            Some(scan_peak),
         )
         .unwrap();
-        let without =
-            measure_horizon_batches("replay", None, expected, batch(), 1_000, None).unwrap();
 
-        // The comparison below is only worth anything if a figure was actually produced.
-        assert!(
-            matches!(without.rss_per_input_row, PerRowRss::Measured { .. }),
-            "no measurement, so nothing is being compared: {:?}",
-            without.rss_per_input_row
-        );
         assert_eq!(
-            with_scan.normalise_peak_rss_kb,
-            Some(4 * 1024 * 1024),
+            m.normalise_peak_rss_kb,
+            Some(scan_peak),
             "it is still reported, as its own field"
         );
-        assert_eq!(
-            with_scan.rss_per_input_row, without.rss_per_input_row,
-            "but the per-row figure is the same with a 4 GB scan peak as with none at all"
+        assert!(
+            matches!(m.rss_per_input_row, PerRowRss::Measured { .. }),
+            "nothing is being asserted without a measurement: {:?}",
+            m.rss_per_input_row
         );
-        assert_eq!(without.normalise_peak_rss_kb, None, "no scan, no scan peak");
+        assert_eq!(
+            m.rss_per_input_row,
+            per_row_rss(m.empty_circuit_rss_kb, m.circuit_peak_rss_kb, m.input_rows),
+            "the published figure must be exactly what the two circuit fields give, with the 4 GB \
+             scan peak playing no part in it"
+        );
+        assert!(
+            m.circuit_peak_rss_kb.is_some_and(|kb| kb < scan_peak),
+            "the circuit peak must be the circuit's, not the scan's: {:?}",
+            m.circuit_peak_rss_kb
+        );
     }
 
     /// The rate divides by the apply window. Dividing by setup-plus-apply is what turned a
