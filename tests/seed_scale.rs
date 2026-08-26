@@ -13,7 +13,7 @@
 //!
 //! `NUTHATCH_SEED_COUNT_COL` counts the distinct values of the group column **off the reader**,
 //! never through the circuit, which is what makes the group count an assertion rather than a
-//! reading of itself. That is how #895 was found: 309,549 distinct delegators went in and 9,549
+//! reading of itself. That is how #894 was found: 309,549 distinct delegators went in and 9,549
 //! groups came out. `NUTHATCH_SEED_CHUNK` sets how many rows go in per window (0, the default,
 //! feeds one sealed segment at a time, as `indexer::seed_entities` does).
 use std::time::Instant;
@@ -119,7 +119,7 @@ fn seed_cost_against_a_real_nest() {
 
     // The ground truth, and the whole point of the probe: the reader counted the distinct group
     // values without the circuit's help, so the two numbers disagreeing is a defect and not a
-    // reading. #895 was exactly this disagreement.
+    // reading. #894 was exactly this disagreement.
     if count_col.is_some() {
         assert_eq!(
             out.len(),
