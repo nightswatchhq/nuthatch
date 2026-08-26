@@ -310,6 +310,23 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 /// a *cursor* measurement, not this one.
 const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 
+/// What one authored entity's circuit and thread cost, before any of its declared rows.
+///
+/// **Measured 2026-08-26** on a 32-core Debian box, the same dense scenario the per-cursor budget is
+/// stated in terms of: 20 nests on one cursor peaked at **138 MB with no entities and 209 MB with
+/// one per nest** - 71 MB for twenty circuits, **3.5 MB each**.
+///
+/// Charged at 8, not 3.5. The margin is deliberate and it is doing real work: this is one run on one
+/// machine, and an admission figure set too low admits a mount that then breaches the budget at
+/// runtime, which is the only direction that actually hurts.
+///
+/// **It was `NEST_VIEW_RSS_MB` (40) until that measurement.** Reusing the built-in views' allowance
+/// looked reasonable - an entity is a DBSP circuit on a thread exactly as they are - and it was 11x
+/// the real cost. At 40 MB, twenty entities eat 43% of a cursor's 2 GB before a single row and
+/// thirty-two eat 70%, so a realistic multi-nest runtime met refusals the hardware would have
+/// handled comfortably. The first entity footprint run was refused for precisely that reason.
+const ENTITY_CIRCUIT_RSS_MB: u64 = 8;
+
 /// The most authored entities one cursor will admit, across every nest on that chain.
 ///
 /// A count ceiling on top of the MB budget, because the two bound different things. An entity costs
@@ -368,10 +385,9 @@ pub fn estimate_nest_rss_mb(
     entity_rows: u64,
 ) -> u64 {
     let mut mb = NEST_BASE_RSS_MB;
-    // Each entity is a DBSP circuit on its own thread, exactly like the built-in views, so it is
-    // priced the same way - plus its declared state, which the built-in views do not let an author
-    // choose.
-    mb += NEST_VIEW_RSS_MB * entity_count as u64;
+    // Each entity is a DBSP circuit on its own thread, plus its declared state - the term the
+    // built-in views do not let an author choose, and therefore the one that can surprise a budget.
+    mb += ENTITY_CIRCUIT_RSS_MB * entity_count as u64;
     mb += entity_rows.saturating_mul(ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024);
     if has_labels {
         mb += NEST_VIEW_RSS_MB; // exposure view (RFC-0008 C1)
@@ -3371,8 +3387,8 @@ mod tests {
 
         assert_eq!(
             estimate_nest_rss_mb(&cfg(""), false, 1, 0),
-            base + NEST_VIEW_RSS_MB,
-            "a circuit and a thread, priced as any other view"
+            base + ENTITY_CIRCUIT_RSS_MB,
+            "a circuit and a thread, at the measured price"
         );
 
         // A million rows at the per-row estimate is a term nobody would have guessed from the nest's
@@ -3380,14 +3396,15 @@ mod tests {
         let million = 1_000_000u64;
         assert_eq!(
             estimate_nest_rss_mb(&cfg(""), false, 1, million),
-            base + NEST_VIEW_RSS_MB + (million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
+            base + ENTITY_CIRCUIT_RSS_MB + (million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
         );
 
         // Two entities are two circuits, and their rows add - nests on a cursor are accounted
         // together, so entities within a nest must be too.
         assert_eq!(
             estimate_nest_rss_mb(&cfg(""), false, 2, 2 * million),
-            base + 2 * NEST_VIEW_RSS_MB + (2 * million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
+            base + 2 * ENTITY_CIRCUIT_RSS_MB
+                + (2 * million * ENTITY_RSS_BYTES_PER_ROW) / (1024 * 1024),
         );
     }
 

@@ -220,3 +220,34 @@ asked for rather than a quiet edit.
 
 Neither reassignment makes the measurements optional. They are owed by the slices named, and #821 is
 not complete without 4.
+
+## Per-cursor footprint with authored entities (§7 criterion 12)
+
+Measured 2026-08-26 on a 32-core Debian box, release build, commit `b627eb3`. The scenario is the one
+the per-cursor budget is stated in terms of and the one CI's `per-cursor RAM budget` job enforces:
+**20 nests on ONE cursor**, the 10-event ABI, 200 blocks of live tip-following after a 1,000-block
+backfill, 240,200 rows.
+
+Run twice. A single figure would say the cursor fitted; the pair says what the entities cost.
+
+| | peak RSS | at tip | margin under 2,048 MB |
+| --- | ---: | ---: | ---: |
+| control, no entities | 138 MB | 137 MB | 1,910 MB |
+| **one entity per nest** | **209 MB** | 205 MB | **1,839 MB** |
+
+**71 MB for twenty entity circuits - 3.5 MB each.** Criterion 12 is met with 90% of the budget unused.
+
+The entities were confirmed live mid-run rather than assumed: `/n1/ready` reported `"rows": 790`,
+`"current": true`, `"seconds_since_progress": 1`. Twenty declarations that were never fed would have
+produced an RSS delta meaning nothing.
+
+### What the measurement changed
+
+`runtime::ENTITY_CIRCUIT_RSS_MB` was `NEST_VIEW_RSS_MB` (40) - the built-in views' allowance, reused
+because an entity is a DBSP circuit on a thread exactly as they are. It is **11x the measured cost**.
+At 40 MB, twenty entities consume 43% of a cursor's 2 GB before a single row and thirty-two consume
+70%; the first run of this measurement was **refused at admission** for that reason, at a declaration
+the hardware went on to handle with 1.8 GB to spare.
+
+It is now 8 MB - the measured 3.5 with a deliberate margin, because this is one run on one machine and
+an admission figure set too low admits a mount that then breaches the budget at runtime.
