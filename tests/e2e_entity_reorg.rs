@@ -610,3 +610,47 @@ proptest! {
 async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
     entity_converges_after_reorg(4).await;
 }
+
+/// **#822 criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
+///
+/// Asserted by construction rather than by inspecting a plan: `derived_key` reads the circuit's own
+/// output map. What this test can check from outside is that the answer is *right*, that it carries
+/// the provenance criterion 9 asks for, and that its applied-through is the **entity's** watermark
+/// rather than the nest's head - which is the difference between reporting and pretending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    let entity = &rt.state.entities[0];
+    let want: i128 = (1..=CHAIN_LEN).map(|b| (100 * b) as i128).sum();
+    let got = entity
+        .relation()
+        .get(&nuthatch::entity_row::Row(vec![
+            nuthatch::entity_row::Scalar::Str(account(2)),
+        ]))
+        .cloned();
+    assert_eq!(
+        got,
+        Some(nuthatch::entity_row::Row(vec![
+            nuthatch::entity_row::Scalar::Int(want)
+        ])),
+        "the maintained relation must hold the answer a keyed read would return"
+    );
+
+    // Criterion 9's provenance, and the part that matters: the entity answers for the head it has
+    // folded. Serving the nest's head here is exactly how a partial relation gets stamped current.
+    assert_eq!(entity.applied_through(), CHAIN_LEN);
+    assert!(entity.is_current(CHAIN_LEN));
+    assert!(!entity.is_current(CHAIN_LEN + 1));
+    assert_eq!(entity.unavailable(), None);
+    assert_eq!(entity.fault(), None);
+
+    shutdown_and_settle(rt).await;
+}
