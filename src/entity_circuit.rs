@@ -172,6 +172,23 @@ pub struct EntityCircuit {
     /// The integrated result. DBSP emits the *change* to the derived relation each transaction;
     /// holding the relation here is what makes a point-read possible without re-running anything.
     relation: Relation,
+    /// Why this entity stopped, if it has.
+    ///
+    /// The slice-zero spike does not have this, and #864 names the consequence: when a transaction
+    /// errors after the rows have been appended, the rows are inside the circuit, the bookkeeping
+    /// outside it says they are not, and the next window is applied on top of that disagreement.
+    /// Once the two can disagree, every later answer is a guess.
+    ///
+    /// So a fault is terminal and sticky. The relation keeps its last consistent value - it was
+    /// correct for the windows that did apply - and no further window is accepted, which is the
+    /// signal #866 turns into a visibly dead entity rather than a silently current one.
+    ///
+    /// **Not redundant with DBSP's own refusal.** A worker panic terminates the runtime, so a later
+    /// `transaction()` fails anyway - with *"circuit has been terminated"*, which says nothing about
+    /// why the entity stopped. And that only holds for faults that panic. A transaction failing for
+    /// any other reason leaves the circuit alive and holding rows this struct does not know about,
+    /// which is exactly the divergence #864 describes and the one nothing else here would catch.
+    faulted: Option<String>,
 }
 
 type Built = (
@@ -197,6 +214,7 @@ impl EntityCircuit {
             right,
             out,
             relation: Relation::new(),
+            faulted: None,
         })
     }
 
@@ -296,6 +314,11 @@ impl EntityCircuit {
     /// (§5.2): the same rows fed back with their weights negated. There is no rollback interface
     /// because there is nothing to roll back.
     pub fn apply(&mut self, left: &[(Row, ZWeight)], right: &[(Row, ZWeight)]) -> Result<()> {
+        if let Some(why) = &self.faulted {
+            return Err(anyhow!(
+                "this entity faulted and does not accept further windows: {why}"
+            ));
+        }
         if !right.is_empty() && self.right.is_none() {
             return Err(anyhow!(
                 "the plan has no right input, but {} right-hand facts were supplied",
@@ -313,9 +336,14 @@ impl EntityCircuit {
             handle.append(&mut batch);
         }
 
-        self.handle
-            .transaction()
-            .map_err(|e| anyhow!("the entity circuit faulted: {e}"))?;
+        // Past this point the rows are inside the circuit. If the transaction fails, the circuit's
+        // state and this struct's are no longer the same story, so the entity stops here rather
+        // than carrying on over a disagreement it cannot see.
+        if let Err(e) = self.handle.transaction() {
+            let why = format!("the entity circuit faulted: {e}");
+            self.faulted = Some(why.clone());
+            return Err(anyhow!(why));
+        }
 
         // The output is the change to the derived relation, so integrating it here is what keeps
         // `relation()` a point-read rather than a recomputation.
@@ -332,9 +360,15 @@ impl EntityCircuit {
         Ok(())
     }
 
-    /// The derived relation as it stands.
+    /// The derived relation as it stands. After a fault this is the last value that was consistent,
+    /// which is what a caller needs in order to say *how far* the entity got before it stopped.
     pub fn relation(&self) -> &Relation {
         &self.relation
+    }
+
+    /// Why this entity stopped, if it has. `None` is a live entity.
+    pub fn fault(&self) -> Option<&str> {
+        self.faulted.as_deref()
     }
 
     /// The plan this circuit was built from.
@@ -775,6 +809,61 @@ mod tests {
         assert!(
             msg.contains("faulted"),
             "the fault must reach the caller as an error, not a wrapped number: {msg}"
+        );
+    }
+
+    /// **A fault is terminal, and the last good answer survives it.**
+    ///
+    /// #864 names the shape this avoids: the spike appends its rows, the transaction errors, and the
+    /// rows are then inside the circuit while the bookkeeping outside says they are not. The next
+    /// window lands on top of that disagreement and every answer after it is a guess. Refusing
+    /// further windows is what makes the entity *stopped* rather than *wrong*.
+    #[test]
+    fn a_faulted_entity_refuses_later_windows_and_keeps_its_last_good_answer() {
+        let plan = Plan {
+            left: src("amounts", &["who", "amount"]),
+            left_filter: None,
+            join: None,
+            key: vec![col(0)],
+            aggregates: vec![Agg::Sum(col(1))],
+        };
+        let row = |a: i128| Row(vec![s("a"), Scalar::Int(a)]);
+
+        let mut circuit = EntityCircuit::build(plan).unwrap();
+        circuit.apply(&plus(&[row(3), row(4)]), &[]).unwrap();
+        let good = circuit.relation().clone();
+        assert_eq!(
+            good.get(&Row(vec![s("a")])),
+            Some(&Row(vec![Scalar::Int(7)]))
+        );
+        assert!(circuit.fault().is_none(), "still live");
+
+        circuit
+            .apply(&plus(&[row(i128::MAX)]), &[])
+            .expect_err("that total cannot be represented");
+
+        assert!(
+            circuit.fault().is_some_and(|w| w.contains("faulted")),
+            "the entity must know it stopped: {:?}",
+            circuit.fault()
+        );
+        assert_eq!(
+            circuit.relation(),
+            &good,
+            "the relation keeps the value it had when it was last consistent"
+        );
+
+        let err = circuit
+            .apply(&plus(&[row(1)]), &[])
+            .expect_err("a stopped entity accepts nothing further");
+        assert!(
+            format!("{err:#}").contains("does not accept further windows"),
+            "{err:#}"
+        );
+        assert_eq!(
+            circuit.relation(),
+            &good,
+            "and a refused window does not move it either"
         );
     }
 
