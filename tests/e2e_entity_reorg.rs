@@ -246,3 +246,69 @@ async fn the_same_nest_without_seal_direct_starts_and_folds() {
     shutdown(rt);
     assert!(!rows.is_empty(), "the entity folded the chain");
 }
+
+/// #866 criterion 8: a dead entity circuit is a **terminal fault for the nest**, not a quiet freeze.
+///
+/// §5.2: *"A circuit thread dying is a terminal fault for that nest under RFC-0026. Serving frozen
+/// derived state as healthy is not graceful degradation; it is a lie with a pleasant HTTP status."*
+///
+/// The fault is induced through the declared bound rather than by reaching into the view, so the
+/// path under test is the real one: the bound bites inside the circuit thread, the thread stops, and
+/// the ingest loop's health check has to notice and escalate. A test that killed the thread directly
+/// would prove the check and not the escalation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_entity_circuit_ends_the_nest_rather_than_freezing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    // One row admitted, and the first window carries two.
+    std::fs::write(
+        dir.path().join("entities.toml"),
+        r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 1
+"#,
+    )
+    .unwrap();
+
+    let rt = indexer::spawn_nest(
+        tape,
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("the nest starts - the bound is a runtime fault, not a load-time refusal");
+
+    // The loop must *end*. Freezing here - the entity dead, the cursor still polling, `/ready` still
+    // 200 - is the failure this criterion is named for, and it would show up as a timeout.
+    let outcome = tokio::time::timeout(POLL_TIMEOUT, rt.ingest)
+        .await
+        .expect("the ingest loop must terminate, not carry on with a dead entity")
+        .expect("the task itself should not panic");
+
+    let err = format!(
+        "{:#}",
+        outcome.expect_err("a dead entity circuit is a terminal fault")
+    );
+    assert!(
+        err.contains("entity `received`"),
+        "the fault must name the entity: {err}"
+    );
+    assert!(
+        err.contains("max_rows"),
+        "and the cause, not merely that something stopped: {err}"
+    );
+}
