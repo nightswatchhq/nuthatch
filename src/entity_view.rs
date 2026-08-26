@@ -244,6 +244,41 @@ impl EntityView {
         self.unavailable.as_deref()
     }
 
+    /// The decoded tables this entity reads - one, or two when it joins.
+    pub fn tables(&self) -> Vec<&str> {
+        std::iter::once(self.binding.left.table.as_str())
+            .chain(self.binding.right.as_ref().map(|r| r.table.as_str()))
+            .collect()
+    }
+
+    /// Bring a warm-started entity to life with the history it missed (RFC-0041 §5.3).
+    ///
+    /// Called once, at startup, with **every** fact the nest holds - sealed and hot. It clears the
+    /// `unavailable` state on the way in, because until this lands the entity is deliberately fed
+    /// nothing at all.
+    ///
+    /// §5.1 says backfill and tip are one path differing only in batch size, and this is that taken
+    /// literally: **the seed is a backfill batch**. There is no separate seed relation to combine,
+    /// no per-aggregate combine rule, and no question about a finalized row joining a hot one -
+    /// which is where §5.3's base-plus-delta wording comes apart, since such a pair is in neither
+    /// half of it. Criterion 5's "matches uninterrupted execution" holds by construction rather than
+    /// by an argument about algebra that has to be re-checked for every aggregate anyone adds.
+    ///
+    /// The cost is the one §5.3 already accepts: *"This pays the historical computation once per
+    /// restart rather than once per request."* `max_rows` applies to the seed like any other window,
+    /// so an entity whose history does not fit its declared bound cannot be restarted - which is the
+    /// correct answer, since it could not have been running in the first place.
+    pub fn seed(&mut self, rows: &[DecodedRow], through: u64) -> Result<()> {
+        self.unavailable = None;
+        self.apply_window(rows, 1, through)
+            .with_context(|| format!("seeding entity `{}` from stored history", self.name))?;
+        self.flush();
+        if let Some(why) = self.fault() {
+            return Err(anyhow!("seeding entity `{}` faulted: {why}", self.name));
+        }
+        Ok(())
+    }
+
     /// Why this entity stopped, if it has. `None` is a live entity.
     pub fn fault(&self) -> Option<String> {
         self.fault.read().ok().and_then(|f| f.clone())

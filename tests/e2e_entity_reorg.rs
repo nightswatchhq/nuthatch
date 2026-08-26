@@ -439,17 +439,19 @@ max_rows = 1
     cursor.ingest.abort();
 }
 
-/// A restarted nest must not serve a **partial** entity.
+/// **RFC-0041 §5.3 and #865.** A restarted entity comes back complete, from this nest's own stored
+/// history, **without a single historical RPC call**.
 ///
-/// Entity state is derived and not persisted, and it cannot be rebuilt from the hot store: sealing
-/// prunes sealed rows out of it, so replaying what remains covers only the unsealed tail. Feeding a
-/// restarted entity from the cursor onward would build a relation missing all of history that looks
-/// perfectly populated - the "plausible partial relation served as current" §5.1 forbids.
+/// The seed is sealed segments plus the unsealed hot tail, fed through the same circuit as any
+/// window - §5.1's "backfill uses larger batches, but not different semantics" taken literally. It
+/// is not a separate seed relation combined with a delta, which is what §5.3's wording describes and
+/// what comes apart for any entity with a join: a finalized row joining a hot one is in neither half.
 ///
-/// So it comes back **unavailable and empty**, and says why. Empty cannot be mistaken for an answer;
-/// half-full can.
+/// Two things make this more than "it is not empty": the restarted nest is compared against a **cold
+/// nest indexed over the whole chain**, which is criterion 5's "matches uninterrupted execution"; and
+/// the tape's `logs` call count is read across the restart, which is #865's claim stated as a number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restarted_entity_is_unavailable_rather_than_partially_filled() {
+async fn a_restarted_entity_is_rebuilt_from_stored_history_with_no_rpc() {
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     for b in 1..=CHAIN_LEN {
@@ -457,45 +459,117 @@ async fn a_restarted_entity_is_unavailable_rather_than_partially_filled() {
     }
     tape.advance_tip_to(CHAIN_LEN);
 
-    // First run: index the chain, and the entity fills.
     let first = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
-    let filled = relation(&first);
-    assert!(!filled.is_empty(), "the first run must actually fill it");
-    assert!(
-        first.state.entities[0].unavailable().is_none(),
-        "a cold start is not unavailable"
-    );
-    // **Await the abort, do not merely request it.** redb takes its exclusive lock in
-    // `Database::open`, so the second nest cannot open the file until the first task has actually
-    // stopped and dropped its store handle. Aborting and pressing on gives "failed to open redb",
-    // which reads as a broken test rather than as a race.
+    let before = relation(&first);
+    assert!(!before.is_empty(), "the first run must actually fill it");
     shutdown_and_settle(first).await;
 
-    // Restart over the same directory, with more chain to index than the entity ever saw.
-    for b in (CHAIN_LEN + 1)..=(CHAIN_LEN + 4) {
+    // Restart over the same directory. Nothing new to index, so any `logs` call the restart makes is
+    // a historical one - which is exactly what #865 forbids.
+    let calls_before = tape.logs_call_count();
+    let second = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
+    let after = relation(&second);
+    let unavailable = second.state.entities[0].unavailable().map(str::to_string);
+    let applied = second.state.entities[0].applied_through();
+    shutdown_and_settle(second).await;
+
+    assert_eq!(
+        unavailable, None,
+        "a seeded entity is available, not waiting for a rebuild it already had"
+    );
+    assert_eq!(
+        after, before,
+        "the rebuilt relation must be the one the entity had before the restart"
+    );
+    assert_eq!(
+        applied, CHAIN_LEN,
+        "and it must answer for the head it was seeded through, not block 0"
+    );
+
+    // The tip-follower polls, so this is not zero calls - it is zero calls *per historical block*.
+    // Re-indexing eight blocks through a two-block window would take four or more `logs` calls on its
+    // own, before the poll loop adds any.
+    let historical = tape.logs_call_count() - calls_before;
+    assert!(
+        historical < (CHAIN_LEN / 2) as usize,
+        "the seed must read stored history, not re-fetch it: {historical} logs calls across a \
+         restart of a {CHAIN_LEN}-block chain"
+    );
+
+    // And the whole thing must match a nest that never restarted.
+    let cold_dir = tempfile::tempdir().unwrap();
+    let cold = spawn_with_entity(cold_dir.path(), tape, CHAIN_LEN).await;
+    let clean = relation(&cold);
+    shutdown_and_settle(cold).await;
+    assert_eq!(
+        after, clean,
+        "criterion 5: a seeded entity matches uninterrupted execution"
+    );
+}
+
+/// **The half of the seed that the hot store cannot answer.**
+///
+/// Sealing *prunes* the sealed rows out of hot (`prune_and_set_meta`), so once a range is finalized
+/// the only copy of it is Parquet. A seed that reads the hot store alone therefore rebuilds a
+/// relation covering the unsealed tail and nothing else - populated, plausible, and missing all of
+/// history.
+///
+/// The previous restart test could not see that: an eight-block chain seals nothing, so skipping
+/// sealed segments entirely left it green. This one finalizes through block 8 first, and the
+/// assertion below can only hold if the sealed rows were read back from Parquet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=10u64 {
         tape.insert_block(b, canonical_block(b));
     }
-    tape.advance_tip_to(CHAIN_LEN + 4);
-    let second = spawn_with_entity(dir.path(), tape, CHAIN_LEN + 4).await;
+    tape.advance_tip_to(10);
+    let first = spawn_with_entity(dir.path(), tape.clone(), 10).await;
 
-    let why = second.state.entities[0]
-        .unavailable()
-        .expect("a warm start cannot rebuild the entity, and must say so")
-        .to_string();
-    assert!(why.contains("cannot be rebuilt after a restart"), "{why}");
+    // Finalize through 8 so [1,8] seals and leaves the hot store, then index past it.
+    tape.advance_finalized_to(8);
+    for b in 11..=14u64 {
+        tape.insert_block(b, empty_block(b, 0, 1_700_000_100 + b));
+    }
+    tape.advance_tip_to(14);
+    let store = first.state.store.clone();
     assert!(
-        why.contains("prunes sealed rows"),
-        "the reason, not just the fact: {why}"
+        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 8).await,
+        "range [1,8] did not seal in time - without it this test is about nothing"
+    );
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            store.get_meta("last_block").ok().flatten().as_deref() == Some("14")
+        })
+        .await,
+        "nest did not index to block 14"
     );
 
-    // The nest indexed four more blocks. The entity must have taken none of them: a relation built
-    // from block 9 onward is exactly the plausible partial answer this guards against.
+    // The premise, asserted rather than assumed: the sealed rows are gone from hot.
+    let hot_rows = store.entities_in_range(1, 8).unwrap();
     assert!(
-        relation(&second).is_empty(),
-        "an unavailable entity is fed nothing, so it cannot look partly right: {:?}",
-        relation(&second)
+        hot_rows.is_empty(),
+        "the sealed range is still in the hot store, so reading hot alone would be enough and this \
+         test would prove nothing: {} row(s)",
+        hot_rows.len()
     );
-    shutdown(second);
+
+    let before = relation(&first);
+    assert!(!before.is_empty());
+    drop(store);
+    shutdown_and_settle(first).await;
+
+    let second = spawn_with_entity(dir.path(), tape.clone(), 14).await;
+    let after = relation(&second);
+    let unavailable = second.state.entities[0].unavailable().map(str::to_string);
+    shutdown_and_settle(second).await;
+
+    assert_eq!(unavailable, None, "the seed must have succeeded");
+    assert_eq!(
+        after, before,
+        "a seeded entity must carry the sealed range, which only Parquet still holds"
+    );
 }
 
 /// **RFC-0041 §8 / #864 criterion 4, as a property.** *"Randomized apply/retract/replacement

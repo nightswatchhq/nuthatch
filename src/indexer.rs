@@ -455,6 +455,93 @@ pub async fn spawn_nest(
     })
 }
 
+/// Seed every warm-started entity from the nest's own stored history (RFC-0041 §5.3, #865).
+///
+/// **Zero historical RPC calls, by construction** - criterion #865's claim, and it is a claim about
+/// the *arguments*: this function is handed a directory, a store and a registry, and has no source
+/// to call. Sealed Parquet plus the unsealed hot tail is the whole of a nest's canonical history,
+/// which is the point of §5.3's "canonical facts remain the durable source of truth".
+///
+/// The two halves are read separately because they are stored separately - sealing prunes sealed
+/// rows out of hot (`prune_and_set_meta`), so neither layer holds the answer alone. They are then
+/// fed as **one batch**: §5.1's "backfill uses larger batches, but not different semantics", and the
+/// reason a finalized row joining a hot row is not a problem here the way it is for a base-plus-delta
+/// seed, where such a pair is in neither half.
+///
+/// A failure leaves the entity `unavailable` rather than partly filled, and says so: `seed` clears
+/// that state only on the way in, so an entity that faulted mid-seed is not left looking maintained.
+fn seed_entities(
+    dir: &std::path::Path,
+    store: &dyn crate::store::HotStore,
+    registry: &DecodeRegistry,
+    entities: &mut [EntityView],
+    through: u64,
+) -> Result<()> {
+    if entities.is_empty() {
+        return Ok(());
+    }
+    let schema = registry.schema();
+
+    // The hot tail, read once and shared. Every entity on this nest sees the same window at `+1`
+    // during normal ingest, and a seed is a window like any other.
+    let hot = decode_stored_rows(&schema, &store.entities_in_range(0, through)?)?;
+
+    for entity in entities.iter_mut() {
+        let mut rows = Vec::new();
+        for table in entity.tables() {
+            let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
+                anyhow::bail!(TerminalFault(format!(
+                    "entity `{}` reads `{table}`, which this nest's registry does not describe",
+                    entity.name()
+                )))
+            };
+            rows.extend(crate::seal::read_table_rows(dir, table_schema)?);
+        }
+        rows.extend(hot.iter().cloned());
+        let sealed = rows.len() - hot.len();
+        tracing::info!(
+            "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
+            entity.name(),
+            hot.len(),
+        );
+        entity.seed(&rows, through)?;
+    }
+    Ok(())
+}
+
+/// Stored JSON rows to decoded rows, against a nest's table schemas.
+///
+/// One conversion, and every caller uses it - the reorg path, the restart seed, and whatever needs it
+/// next. A second one written separately is how a retraction stops cancelling its insertion (#864).
+fn decode_stored_rows(
+    schema: &[crate::registry::TableSchema],
+    stored: &[String],
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    let mut rows = Vec::with_capacity(stored.len());
+    for raw in stored {
+        let value: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            // Annotations (sanction hits, threshold flags) share the rows' block keys and are not
+            // decoded rows. They were never fed to an entity, so they are not read back as one.
+            Err(_) => continue,
+        };
+        let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
+            anyhow::bail!(TerminalFault(format!(
+                "the hot store holds a row of `{table}`, which this nest's registry does not \
+                 describe. Reading it against a guessed shape would produce rows that cancel nothing"
+            )));
+        };
+        rows.push(crate::registry::DecodedRow::from_stored(
+            &value,
+            table_schema,
+        )?);
+    }
+    Ok(rows)
+}
+
 /// #866 criterion 13: `--seal-direct` either rebuilds entities from the finished sealed corpus before
 /// serving, or refuses the combination clearly. It refuses, **before anything is spawned**.
 ///
@@ -1982,7 +2069,23 @@ async fn build_nest(
     // A nest with indexed history behind it starts its entities *unavailable* rather than empty and
     // filling: see `EntityView::start`. Read before the rebuild below, which uses the same key.
     let warm = store.get_meta(LAST_BLOCK_KEY)?.is_some();
-    let entities = Arc::new(start_entities(&dir, &registry, warm)?);
+    let mut started = start_entities(&dir, &registry, warm)?;
+    // §5.3: seed a warm-started entity from this nest's own stored history - sealed segments plus the
+    // unsealed hot tail - before it serves or ingests anything. No source is in scope here, which is
+    // #865's "zero historical RPC calls" as a property of the signature rather than of the code.
+    //
+    // A failed seed leaves the entity `unavailable` and the nest unready, which is what it already
+    // was: this can improve on that state or leave it alone, never make it worse.
+    if warm && !started.is_empty() {
+        let through = store
+            .get_meta(LAST_BLOCK_KEY)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if let Err(e) = seed_entities(&dir, store.as_ref(), &registry, &mut started, through) {
+            tracing::error!("entity seeding failed, entities stay unavailable: {e:#}");
+        }
+    }
+    let entities = Arc::new(started);
     if threshold.is_some() || velocity_cfg.is_some() {
         tracing::info!("flags enabled: threshold={threshold:?}, velocity={velocity_cfg:?}");
     }
@@ -4053,6 +4156,14 @@ impl NestIngest {
         Ok(())
     }
 
+    /// Stored JSON rows to decoded rows, against this nest's registry.
+    ///
+    /// One conversion, three callers - the reorg path, the restart seed, and whatever needs it next.
+    /// A second one written separately is how a retraction stops cancelling its insertion (#864).
+    fn decode_stored(&self, stored: &[String]) -> Result<Vec<crate::registry::DecodedRow>> {
+        decode_stored_rows(&self.registry.schema(), stored)
+    }
+
     /// Feed rolled-back rows to every authored entity at weight `-1`.
     ///
     /// A row belonging to a table no entity reads is skipped, not an error: a nest decodes many
@@ -4063,31 +4174,7 @@ impl NestIngest {
         if self.entities.is_empty() || doomed.is_empty() {
             return Ok(());
         }
-        let schema = self.registry.schema();
-        let mut rows = Vec::with_capacity(doomed.len());
-        for stored in doomed {
-            let value: serde_json::Value = match serde_json::from_str(stored) {
-                Ok(v) => v,
-                // Annotations (sanction hits, threshold flags) share the rows' block keys and are
-                // not decoded rows. They were never fed to an entity, so they are not retracted from
-                // one either.
-                Err(_) => continue,
-            };
-            let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-                anyhow::bail!(TerminalFault(format!(
-                    "reorg: the hot store holds a row of `{table}`, which this nest's registry does \
-                     not describe. Retracting it against a guessed shape would leave rows that \
-                     cancel nothing"
-                )));
-            };
-            rows.push(crate::registry::DecodedRow::from_stored(
-                &value,
-                table_schema,
-            )?);
-        }
+        let rows = self.decode_stored(doomed)?;
         for entity in self.entities.iter() {
             entity.apply_window(&rows, -1, ancestor).with_context(|| {
                 format!(
