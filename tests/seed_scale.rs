@@ -205,7 +205,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
             view.seed_chunk(&chunk, u64::MAX)
         })
         .unwrap();
-        for f in segment_files(&dir, &table) {
+        for f in segment_files(&dir, table) {
             source_bytes += std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
         }
     }
@@ -224,7 +224,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let before = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap(&reference),
-        guard.clone(),
+        guard,
         &empty,
         u64::MAX,
         &schema,
@@ -237,7 +237,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let after = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap("SELECT * FROM probe"),
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
@@ -251,7 +251,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let _ = nuthatch::analytics::query_hot_cold(
         &dir,
         "SELECT 1 AS one",
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
@@ -307,7 +307,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let blind = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap("SELECT * FROM probe"),
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
