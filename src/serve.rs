@@ -1356,9 +1356,16 @@ async fn run_sql_query(
         // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
         // tables. **This copies every entity row into the connection, per request** - #822 criterion
         // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
-        // its views from. Recorded rather than optimised on instinct; the criterion says measure it
-        // and act only if it is material, and turning this into a persistent catalogue by reflex is
-        // the rewrite it warns against.
+        // its views from.
+        //
+        // **Measured, and it is not the term that matters** (2026-08-27, `tests/seed_scale.rs`
+        // against a 38,428-segment Horizon nest). A top-20 over a relation of 309,549 maintained
+        // rows took 2,487 ms; `SELECT 1`, which reads nothing at all, took 2,465 ms on the same
+        // nest. The copy is the 22 ms difference. What the request actually pays for is
+        // `define_views` rebuilding a view for every table in the manifest, at roughly 62 µs per
+        // sealed segment, whether or not the query names it - #896. Optimising this copy would
+        // have bought a one-percent improvement and cost the persistent-catalogue rewrite the
+        // criterion warns against, which is exactly why it says measure first.
         //
         // An entity holding no answer contributes no table at all rather than an empty one. An empty
         // relation and an unavailable one are different facts, and a query cannot tell them apart
