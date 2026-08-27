@@ -117,7 +117,12 @@ fn the_lodestar_panel_before_and_after() {
     let mut from_view: Vec<(String, String)> = authored
         .rows
         .iter()
-        .map(|r| (r["indexer"].as_str().unwrap().to_string(), r["rewards"].to_string()))
+        .map(|r| {
+            (
+                r["indexer"].as_str().unwrap().to_string(),
+                r["rewards"].to_string(),
+            )
+        })
         .collect();
     from_view.sort();
 
