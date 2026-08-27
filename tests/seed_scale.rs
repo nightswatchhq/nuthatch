@@ -382,3 +382,130 @@ fn restore_segments(moved: &[(std::path::PathBuf, std::path::PathBuf)]) {
         let _ = std::fs::rename(from, to);
     }
 }
+
+/// **#822 criterion 5, against a real nest.** *"After one new block, update work is proportional to
+/// affected rows in that block rather than historical source cardinality. Record it."*
+///
+/// **It is not, and this is how far off it is** (`graph-allocations-nest`, 2026-08-27). The same
+/// one-row window, fed to circuits that differ only in how much history they folded first:
+///
+/// | groups maintained | ThinkPad (Linux, idle) | MacBook |
+/// |---|---|---|
+/// | 1 | 206 µs | 73 µs |
+/// | 61 | 86 µs | 60 µs |
+/// | 75,733 | 14,654 µs | 5,212 µs |
+/// | 309,548 | **72,070 µs** | 26,468 µs |
+///
+/// Flat to a hundred groups or so, then linear: 4.09x the groups costs 4.92x the update. Steady, not
+/// a one-off settling after the seed - five consecutive windows all cost the same. See #897.
+///
+/// It is not the publish clone (a fold with publication deferred costs the same), not the step loop
+/// (one window is one `step()`), and not the circuit failing to be incremental - the output delta
+/// for a one-row window against 309,548 groups is **2 rows**. The cost is inside DBSP's transaction
+/// commit over a large trace.
+///
+/// Two circuits, the same plan, the same window fed to both. The window is **real rows off the
+/// corpus** (the newest sealed segment), not synthetic ones, so the key distribution is the nest's
+/// own: a block whose keys are all new is a different amount of work from one that updates existing
+/// groups, and inventing the rows would let me pick the easy case.
+#[test]
+fn update_cost_tracks_the_block_not_the_history() {
+    let Ok(dir) = std::env::var("NUTHATCH_SEED_NEST") else {
+        eprintln!("set NUTHATCH_SEED_NEST to a nest directory to run this");
+        return;
+    };
+    let sql = std::env::var("NUTHATCH_SEED_SQL").expect("set NUTHATCH_SEED_SQL");
+    let dir = std::path::PathBuf::from(shellexpand(&dir));
+
+    let config = nuthatch::config::Config::load(&dir).unwrap();
+    let registry = nuthatch::registry::from_nest(&dir, &config).unwrap();
+    let schema = registry.schema();
+    let (plan, columns) = nuthatch::entity_lower::lower_with_columns(&sql).unwrap();
+
+    // Every segment's rows, kept in reading order so "the last segment" is the newest.
+    let mut chunks: Vec<Vec<nuthatch::registry::DecodedRow>> = Vec::new();
+    for table in {
+        let v = nuthatch::entity_view::EntityView::start(
+            "shape", &plan, &columns, &registry, 5_000_000, true,
+        )
+        .unwrap();
+        v.tables().iter().map(|t| t.to_string()).collect::<Vec<_>>()
+    } {
+        let ts = schema.iter().find(|t| t.table == table).unwrap();
+        nuthatch::seal::read_table_rows_by_segment(&dir, ts, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert!(
+        chunks.len() > 2,
+        "need several segments; got {}",
+        chunks.len()
+    );
+    let window = chunks.pop().expect("the newest segment, as the new block");
+    let total: usize = chunks.iter().map(Vec::len).sum();
+
+    let seed_and_time = |history: &[Vec<nuthatch::registry::DecodedRow>], label: &str| -> u128 {
+        let mut v = nuthatch::entity_view::EntityView::start(
+            "probe", &plan, &columns, &registry, 5_000_000, true,
+        )
+        .unwrap();
+        v.seed_begin();
+        for c in history {
+            v.seed_chunk(c, u64::MAX).unwrap();
+        }
+        v.seed_end().unwrap();
+        let groups = v.relation().len();
+        let rows: usize = history.iter().map(Vec::len).sum();
+
+        // Five consecutive windows. A cost that appears only on the first is a one-off settling of
+        // whatever the seed left behind; a cost on every one is what criterion 5 forbids.
+        let mut each = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            v.apply_window(&window, 1, u64::MAX).unwrap();
+            v.flush();
+            each.push(t.elapsed().as_micros());
+        }
+        let steady = each[2..].iter().sum::<u128>() / 3;
+        println!(
+            "  {label:<8} history {rows:>8} rows / {groups:>7} groups -> one {}-row window: {each:?} µs (steady {steady})",
+            window.len()
+        );
+        let ms = steady;
+        assert!(v.fault().is_none(), "faulted: {:?}", v.fault());
+        ms
+    };
+
+    println!("\n=== #822 criterion 5, against {}", dir.display());
+    println!("sql: {sql}");
+    println!(
+        "window: {} row(s) from the newest sealed segment",
+        window.len()
+    );
+    // A curve, not two points: the question is not "is it slower" but "what shape".
+    let mut curve = Vec::new();
+    let mut depth = 1usize;
+    while depth < chunks.len() {
+        curve.push(seed_and_time(&chunks[..depth], &format!("{depth} seg")));
+        depth *= 8;
+    }
+    curve.push(seed_and_time(&chunks, "all"));
+
+    // The claim, asserted rather than merely printed. `shallow` is the flat region; `deep` is the
+    // whole history. An entity exists so that this ratio stays near one.
+    let shallow = *curve.iter().take(3).min().unwrap();
+    let deep = *curve.last().unwrap();
+    let ratio = deep as f64 / shallow.max(1) as f64;
+    println!(
+        "\nhistory {} rows / {} groups: update cost {ratio:.0}x the flat-region cost",
+        total,
+        chunks.len()
+    );
+    assert!(
+        ratio < 10.0,
+        "one block's update cost scaled {ratio:.0}x with history ({shallow} µs -> {deep} µs), \
+         which is the thing an entity exists not to do - #897"
+    );
+}
