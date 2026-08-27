@@ -15,8 +15,27 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The status lifecycle from the index's own preamble: Draft → Accepted → Implemented →
-/// (Superseded / Parked).
-const LIFECYCLE: [&str; 5] = ["Draft", "Accepted", "Implemented", "Superseded", "Parked"];
+/// (Superseded / Parked), plus the two words the corpus actually uses that the preamble does not.
+///
+/// **`Proposed` and `Approved` were missing, and the gate could not see five RFCs because of it.**
+/// `lifecycle_keyword` returns `None` for a status naming no word on this list, and the comparison
+/// below is `index_kw != doc_kw` - so two statuses that both use vocabulary from outside the list
+/// compare `None == None` and pass, however plainly they contradict each other. The doc comment on
+/// `lifecycle_keyword` already says `None` "is itself a finding"; nothing acted on it.
+///
+/// Of the five it could not see, four happened to agree anyway. The fifth was RFC-0041, whose index
+/// row said *"Proposed - design only"* while its own header said *"Approved for implementation"* -
+/// on the RFC that was about to ship. Adding the two words catches exactly that disagreement and
+/// nothing else across all 44 rows.
+const LIFECYCLE: [&str; 7] = [
+    "Draft",
+    "Proposed",
+    "Accepted",
+    "Approved",
+    "Implemented",
+    "Superseded",
+    "Parked",
+];
 
 fn rfc_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/rfcs")
