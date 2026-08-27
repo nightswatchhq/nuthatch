@@ -1237,11 +1237,43 @@ fn expand_through_views(
 /// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
 fn view_body(create_view_sql: &str) -> Option<&str> {
     let lower = create_view_sql.to_ascii_lowercase();
-    let view = lower.find(" view ")?;
-    // The first ` as ` past the name. A view *name* cannot be bare `as`, and one containing it - say
-    // `as_of` - does not match, because the match needs a space on both sides.
-    let as_at = lower[view..].find(" as ")? + view;
-    Some(create_view_sql[as_at + 4..].trim())
+    let (view, view_end) = find_keyword(&lower, "view", 0)?;
+    let _ = view;
+    let (_, as_end) = find_keyword(&lower, "as", view_end)?;
+    Some(create_view_sql[as_end..].trim())
+}
+
+/// Where `word` appears in `haystack` as a whole token at or after `from`, as `(start, end)`.
+///
+/// **Bounded by any whitespace, not by spaces.** This was `find(" as ")`, which needs a literal
+/// space on both sides - and a real authored view puts a newline after the keyword:
+///
+/// ```sql
+/// CREATE VIEW indexer_rewards AS
+/// SELECT "indexer", SUM("tokensRewards_dec")::VARCHAR AS rewards
+/// FROM "service__indexing_rewards_collected" GROUP BY "indexer";
+/// ```
+///
+/// That is Lodestar's `views/40-indexers.sql`, and the space-bounded search simply did not find the
+/// keyword. Harmless while the only caller was `expand_through_views`, which merely *widens* the
+/// integrity sweep's bound and is allowed to be imprecise. It stopped being harmless when #896 made
+/// the same parse decide which views get defined at all: the view's source table was never defined,
+/// and a view that plainly exists came back as `Catalog Error: Table with name indexer_rewards does
+/// not exist`.
+fn find_keyword(haystack: &str, word: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = haystack.as_bytes();
+    let mut at = from;
+    while let Some(i) = haystack[at..].find(word) {
+        let start = at + i;
+        let end = start + word.len();
+        let before_ok = start > 0 && bytes[start - 1].is_ascii_whitespace();
+        let after_ok = end < bytes.len() && bytes[end].is_ascii_whitespace();
+        if before_ok && after_ok {
+            return Some((start, end));
+        }
+        at = end;
+    }
+    None
 }
 
 /// The name a `CREATE [OR REPLACE] VIEW <name> AS …` declares, lowercased. The mirror of
@@ -1249,9 +1281,9 @@ fn view_body(create_view_sql: &str) -> Option<&str> {
 /// past it.
 fn view_name(create_view_sql: &str) -> Option<String> {
     let lower = create_view_sql.to_ascii_lowercase();
-    let view = lower.find(" view ")?;
-    let as_at = lower[view..].find(" as ")? + view;
-    let name = lower[view + 6..as_at].trim().trim_matches('"').trim();
+    let (_, view_end) = find_keyword(&lower, "view", 0)?;
+    let (as_at, _) = find_keyword(&lower, "as", view_end)?;
+    let name = lower[view_end..as_at].trim().trim_matches('"').trim();
     (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .then(|| name.to_string())
 }
@@ -5103,6 +5135,47 @@ template="pool"
 
     /// The input to that bound: what the security walk reports a statement reaches. One parse feeds
     /// both controls, so this pins the half `reject_unknown_table_refs` did not used to have.
+    /// **#896, found against the real Lodestar nest.** A real authored view breaks the line after
+    /// `AS`; the keyword search wanted a literal space on both sides and did not find it. The view
+    /// then never entered the map `reachable_tables` builds, its source table was never defined, and
+    /// a view that plainly exists came back as `Catalog Error: Table with name … does not exist`.
+    ///
+    /// Every fixture in this file wrote its view on one line, which is why none of them saw it -
+    /// and my first attempt at this test did too, and passed against the broken code.
+    #[test]
+    fn a_view_that_breaks_the_line_after_as_still_yields_its_source_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        // The shape of `40-indexers.sql`: prose, then a view whose body starts on the next line.
+        std::fs::write(
+            dir.path().join("views/10-senders.sql"),
+            "-- Per-sender rollup. The count comes from the folded `senders` view (\u{a7}10).\n\
+             CREATE VIEW senders AS\n\
+             SELECT \"from\", block_number\n\
+             FROM t__transfer;",
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xa","block_number":1,"tx_hash":"0xt","log_index":0}"#
+                .to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+
+        let rows = query(dir.path(), r#"SELECT "from" FROM senders"#)
+            .expect("a view whose body starts on the next line still resolves");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
     #[test]
     fn the_table_refs_walk_reports_what_the_statement_reached() {
         let conn = Connection::open_in_memory().unwrap();
