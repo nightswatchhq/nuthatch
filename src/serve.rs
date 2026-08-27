@@ -617,6 +617,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     if let Some((_, health)) = &s.runtime_health {
         body.push_str(&health.render_metrics());
     }
+    body.push_str(&entity_metrics(&s));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -624,6 +625,109 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         )],
         body,
     )
+}
+
+/// The authored-entity series (RFC-0041). Everything here is already computed for `/ready`; this is
+/// the same answers where a scrape can reach them.
+///
+/// **There were none until now**, which is why a two-day live run had to poll `/ready` and parse
+/// JSON to find out whether the entity was keeping up. The four questions an operator has about a
+/// maintained relation - is it current, how big is it, is it stuck, is it dead - had no series
+/// between them, so neither alerting nor a dashboard could ask.
+///
+/// Labelled by entity name and emitted per nest, so a runtime hosting several says which is which.
+/// Empty when the nest declares no entities, rather than a block of zeroes for a feature not in use.
+fn entity_metrics(s: &AppState) -> String {
+    if s.entities.is_empty() {
+        return String::new();
+    }
+    let nest = s
+        .nest_info
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let head = dataset_head(s);
+    let now = crate::metrics::now_unix();
+
+    let mut out = String::new();
+    out.push_str(
+        "# HELP nuthatch_entity_applied_through Last block folded into this maintained relation.\n\
+         # TYPE nuthatch_entity_applied_through gauge\n",
+    );
+    for e in s.entities.iter() {
+        out.push_str(&format!(
+            "nuthatch_entity_applied_through{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            e.applied_through()
+        ));
+    }
+    out.push_str(
+        "# HELP nuthatch_entity_current 1 when the relation has caught up with the dataset head.\n\
+         # TYPE nuthatch_entity_current gauge\n",
+    );
+    for e in s.entities.iter() {
+        out.push_str(&format!(
+            "nuthatch_entity_current{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            u8::from(e.is_current(head))
+        ));
+    }
+    out.push_str(
+        "# HELP nuthatch_entity_rows Rows the maintained relation currently holds.\n\
+         # TYPE nuthatch_entity_rows gauge\n",
+    );
+    for e in s.entities.iter() {
+        out.push_str(&format!(
+            "nuthatch_entity_rows{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            e.len()
+        ));
+    }
+    // Faulted and unavailable are different failures and an operator responds to them differently:
+    // a fault is terminal and the nest is quarantined behind it, while unavailable means the
+    // relation holds no answer and is not being served. Two series, not one `healthy`.
+    out.push_str(
+        "# HELP nuthatch_entity_faulted 1 when the circuit has stopped. Terminal.\n\
+         # TYPE nuthatch_entity_faulted gauge\n",
+    );
+    for e in s.entities.iter() {
+        out.push_str(&format!(
+            "nuthatch_entity_faulted{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            u8::from(e.fault().is_some())
+        ));
+    }
+    out.push_str(
+        "# HELP nuthatch_entity_unavailable 1 when the relation holds no answer and is not served.\n\
+         # TYPE nuthatch_entity_unavailable gauge\n",
+    );
+    for e in s.entities.iter() {
+        out.push_str(&format!(
+            "nuthatch_entity_unavailable{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            u8::from(e.unavailable().is_some())
+        ));
+    }
+    // Seconds since the watermark last moved, which is what `entity_wedged` judges on. A duration
+    // threshold on a legitimately-slow catch-up either fires on healthy nests or never fires, so the
+    // series an operator alerts on is progress, not lag.
+    out.push_str(
+        "# HELP nuthatch_entity_seconds_since_progress Seconds since this relation's watermark last moved.\n\
+         # TYPE nuthatch_entity_seconds_since_progress gauge\n",
+    );
+    for e in s.entities.iter() {
+        let progress = e.last_progress();
+        out.push_str(&format!(
+            "nuthatch_entity_seconds_since_progress{{nest=\"{nest}\",entity=\"{}\"}} {}\n",
+            e.name(),
+            if progress == 0 {
+                0
+            } else {
+                now.saturating_sub(progress)
+            }
+        ));
+    }
+    out
 }
 
 /// No successful source poll within this many seconds ⇒ stalled. The tip loop polls every ~2-3 s even
