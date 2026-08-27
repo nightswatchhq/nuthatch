@@ -257,6 +257,37 @@ impl QueryOutput {
 /// Passed to the query path so the live tip is `UNION ALL`'d into each table's view (RFC-0013).
 pub type HotRows = std::collections::HashMap<String, Vec<Value>>;
 
+/// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
+/// not bind, whether or not anybody has asked about them.
+///
+/// This used to be a side effect of every query: `define_views` bound *every* table in the manifest
+/// on every request, so a query about one table happened to discover corruption in another. That was
+/// issue #477's contract and it was paid for at ~62 µs per sealed segment per request - 2.5 seconds
+/// on a 38,428-segment nest, before the query read a row (#896).
+///
+/// So the discovery moved here, where it can run on a cadence and be reported by `/ready` without a
+/// caller having to stumble into it. A query still degrades correctly on a table *it* reads; what it
+/// no longer does is survey the rest of the nest on the caller's time.
+///
+/// Deliberately opens its own connection rather than borrowing the cached one: this defines every
+/// view, which is exactly what the cached connection is now avoiding, and leaving that behind on a
+/// pooled connection would hand the next query a catalogue full of definitions it did not ask for.
+pub fn degraded_tables(
+    dir: &Path,
+    declared: &[crate::registry::TableSchema],
+) -> Result<std::collections::BTreeSet<String>> {
+    let conn = open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    define_views(
+        &conn,
+        dir,
+        &HotRows::new(),
+        u64::MAX,
+        &Default::default(),
+        declared,
+        None,
+    )
+}
+
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
@@ -538,12 +569,23 @@ fn attempt(
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
     let (referenced, degraded_tables, interrupted, outcome, cap) = {
         let conn = &slot.conn;
-        let referenced = reject_unknown_table_refs(conn, sql)?;
+        let walked = reject_unknown_table_refs(conn, sql)?;
+        // No parse means no idea what the statement reaches, and the safe answer to that is "all of
+        // it" on both counts.
+        let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
+        let referenced = walked.map(|(r, _)| r);
         // Define views only for what this statement can reach (#896). `None` - an unparsed statement
         // or a shape `reachable_tables` will not vouch for - defines everything, as before.
-        let wanted = referenced
-            .as_ref()
-            .and_then(|r| reachable_tables(conn, dir, r));
+        // A statement that reaches into a catalogue schema, or calls one of DuckDB's own
+        // enumerating table functions, is asking *what tables exist* - so every view has to exist
+        // for it to answer. Those keep the old whole-nest definition; everything else is narrowed.
+        let wanted = if surveys {
+            None
+        } else {
+            referenced
+                .as_ref()
+                .and_then(|r| reachable_tables(conn, dir, r))
+        };
         let degraded_tables = define_views(
             conn,
             dir,
@@ -1071,7 +1113,7 @@ const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 fn reject_unknown_table_refs(
     conn: &Connection,
     sql: &str,
-) -> Result<Option<std::collections::BTreeSet<String>>> {
+) -> Result<Option<(std::collections::BTreeSet<String>, bool)>> {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
         r.get::<_, String>(0)
@@ -1086,6 +1128,10 @@ fn reject_unknown_table_refs(
         return Ok(None);
     }
     let mut referenced = std::collections::BTreeSet::new();
+    // Whether this statement reaches outside the nest's own tables - a catalogue schema, or a
+    // catalogue-listing table function. Such a statement needs **every** view defined, because what
+    // it is asking for is the list of them (#896).
+    let mut surveys = false;
     let mut bad: Option<String> = None;
     walk_table_refs(&v, &mut |kind, name| {
         if bad.is_some() {
@@ -1097,7 +1143,12 @@ fn reject_unknown_table_refs(
                 if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
                     bad = Some(format!("table function `{name}` is not permitted here"));
                 }
+                // `duckdb_views()`, `duckdb_tables()` and friends enumerate the catalogue.
+                if f.starts_with("duckdb_") {
+                    surveys = true;
+                }
             }
+            "QUALIFIED_SCHEMA" => surveys = true,
             // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose name is
             // the path, so the AST alone cannot tell it from a real table - the name has to be checked.
             "BASE_TABLE"
@@ -1116,7 +1167,7 @@ fn reject_unknown_table_refs(
     });
     match bad {
         Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
-        None => Ok(Some(referenced)),
+        None => Ok(Some((referenced, surveys))),
     }
 }
 
@@ -1301,6 +1352,18 @@ fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
                 } else if t == "BASE_TABLE" {
                     if let Some(name) = map.get("table_name").and_then(Value::as_str) {
                         f("BASE_TABLE", name);
+                        // The schema qualifier, reported separately so the security walk keeps
+                        // seeing bare names - it rejects anything that is not `[A-Za-z0-9_]`, which
+                        // is what stops a quoted path in table position reading a file, and a name
+                        // carrying a `.` must not slip through that. #896 needs the qualifier for a
+                        // different reason: `information_schema.tables` cannot be told apart from a
+                        // nest table called `tables` without it, and a catalogue query needs every
+                        // view defined in order to list them.
+                        if let Some(schema) = map.get("schema_name").and_then(Value::as_str) {
+                            if !schema.is_empty() && schema != "main" {
+                                f("QUALIFIED_SCHEMA", schema);
+                            }
+                        }
                     }
                 }
             }
@@ -4538,17 +4601,27 @@ template="pool"
             ],
             "the healthy table's own segments are both intact - nothing about its answer is short"
         );
+        // **The contract changed with #896, deliberately.** A query used to survey the whole nest,
+        // because `define_views` bound every table in the manifest on every request - which is where
+        // 2.5 seconds of a 38,428-segment nest's request time went. A query now reports what *it*
+        // reached, and this one reached nothing damaged.
+        assert!(
+            out.degraded_tables.is_empty(),
+            "a query that read only healthy segments has nothing to caveat: {:?}",
+            out.degraded_tables
+        );
+
+        // The nest-wide fact has not been lost, only moved somewhere it can be reported without a
+        // caller stumbling into it. `/ready` surfaces this; the sweep is what finds it.
+        let swept = degraded_tables(dir.path(), &[]).unwrap();
         assert_eq!(
-            out.degraded_tables,
+            swept,
             ["t__transfer".to_string()]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
-            "the flag must name the table that is actually short, not the one just queried"
+            "the sweep must name the table that is actually short"
         );
-        assert!(
-            !out.degraded_tables.contains("t__approval"),
-            "the queried table is healthy and must never appear in its own indictment"
-        );
+        assert!(!swept.contains("t__approval"), "and never the healthy one");
     }
 
     /// **Issue #477, case 2.** `SELECT 1` and `.tables` (`information_schema.tables`, the query the
@@ -4568,13 +4641,20 @@ template="pool"
         let degraded: std::collections::BTreeSet<String> =
             ["t__transfer".to_string()].into_iter().collect();
 
+        // **`SELECT 1` used to survey the nest, and that was the cost** - it bound every table in
+        // the manifest to find out, which is 2.5 seconds on a real one (#896). It draws from no
+        // table, so it now reports on no table.
         let one = cold(dir.path(), "SELECT 1 AS one");
         assert_eq!(one.rows, vec![serde_json::json!({"one": 1})]);
-        assert_eq!(
-            one.degraded_tables, degraded,
-            "SELECT 1 draws from no table and still learns the nest is short"
+        assert!(
+            one.degraded_tables.is_empty(),
+            "a query that reads nothing caveats nothing: {:?}",
+            one.degraded_tables
         );
 
+        // `.tables` is the one shape that still surveys, and has to: listing the catalogue means
+        // every view must exist to be listed. `reachable_tables` refuses to narrow a statement it
+        // cannot vouch for, and this is one - so the flag it carries is the old one.
         let tables = cold(
             dir.path(),
             "SELECT table_name FROM information_schema.tables \
@@ -4582,8 +4662,11 @@ template="pool"
         );
         assert_eq!(
             tables.degraded_tables, degraded,
-            ".tables draws no rows from any table either, and still carries the flag"
+            ".tables lists the catalogue, so it defines the catalogue, so it still learns"
         );
+
+        // And the sweep knows regardless of what anybody queried.
+        assert_eq!(degraded_tables(dir.path(), &[]).unwrap(), degraded);
     }
 
     /// **Issue #477, case 3 (#434's shape).** A view that fails for a reason no segment probe would
@@ -4848,7 +4931,7 @@ template="pool"
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let referenced = reject_unknown_table_refs(&conn, r#"SELECT "from" FROM "t__transfer""#)
             .unwrap()
-            .map(|names| expand_through_views(&conn, &names))
+            .map(|(names, _)| expand_through_views(&conn, &names))
             .expect("the query names a table");
         assert_eq!(
             crate::seal::segments_failing_verification(dir.path(), &referenced, None),
@@ -5023,7 +5106,8 @@ template="pool"
     #[test]
     fn the_table_refs_walk_reports_what_the_statement_reached() {
         let conn = Connection::open_in_memory().unwrap();
-        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap();
+        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap().0;
+        let surveys = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap().1;
 
         assert!(
             refs("SELECT CAST('x' AS INTEGER)").is_empty(),
@@ -5049,6 +5133,25 @@ template="pool"
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
             "a table reached from a subquery is still reached"
+        );
+
+        // #896: a statement that reaches a catalogue schema or calls one of DuckDB's enumerating
+        // table functions is asking *what tables exist*, so every view has to be defined for it to
+        // answer. The bare-name set cannot express that - `information_schema.tables` arrives as
+        // `tables` with the qualifier dropped, indistinguishable from a nest table of that name.
+        assert!(!surveys(r#"SELECT * FROM "t__transfer""#));
+        assert!(!surveys("SELECT (SELECT max(a) FROM u) FROM t"));
+        assert!(
+            surveys("SELECT table_name FROM information_schema.tables"),
+            "a catalogue schema must be recognised through the dropped qualifier"
+        );
+        // DuckDB's own enumerating table functions are refused outright by `ALLOWED_TABLE_FNS`, so
+        // the `duckdb_` branch in the walk is unreachable today. It stays because the failure it
+        // guards is silent: admit `duckdb_tables` to that allowlist without thinking about #896 and
+        // the catalogue listing comes back empty rather than erroring.
+        assert!(
+            reject_unknown_table_refs(&conn, "SELECT * FROM duckdb_views()").is_err(),
+            "an enumerating table function is refused before the survey question arises"
         );
     }
 
