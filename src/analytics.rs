@@ -539,7 +539,20 @@ fn attempt(
     let (referenced, degraded_tables, interrupted, outcome, cap) = {
         let conn = &slot.conn;
         let referenced = reject_unknown_table_refs(conn, sql)?;
-        let degraded_tables = define_views(conn, dir, hot, sealed_through, excluded, declared)?;
+        // Define views only for what this statement can reach (#896). `None` - an unparsed statement
+        // or a shape `reachable_tables` will not vouch for - defines everything, as before.
+        let wanted = referenced
+            .as_ref()
+            .and_then(|r| reachable_tables(conn, dir, r));
+        let degraded_tables = define_views(
+            conn,
+            dir,
+            hot,
+            sealed_through,
+            excluded,
+            declared,
+            wanted.as_ref(),
+        )?;
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
@@ -1180,6 +1193,75 @@ fn view_body(create_view_sql: &str) -> Option<&str> {
     Some(create_view_sql[as_at + 4..].trim())
 }
 
+/// The name a `CREATE [OR REPLACE] VIEW <name> AS …` declares, lowercased. The mirror of
+/// [`view_body`], and parsed the same coarse way: the text between ` view ` and the first ` as `
+/// past it.
+fn view_name(create_view_sql: &str) -> Option<String> {
+    let lower = create_view_sql.to_ascii_lowercase();
+    let view = lower.find(" view ")?;
+    let as_at = lower[view..].find(" as ")? + view;
+    let name = lower[view + 6..as_at].trim().trim_matches('"').trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| name.to_string())
+}
+
+/// Which tables a statement can actually reach - the names it uses in table position, widened
+/// through any **authored view** among them to the base tables that view reads.
+///
+/// This is what lets `define_views` skip the rest. Defining a view costs DuckDB a parse of SQL text
+/// carrying every one of that table's sealed segment paths, and it was being paid for all 34 tables
+/// of a nest on every request: `SELECT 1` cost 2,465 ms on a 38,428-segment nest against 263 ms on a
+/// 2,985-segment one, about 62 µs per segment, for tables the query never named (#896).
+///
+/// Read from `views/*.sql` **on disk** rather than from `duckdb_views()`, unlike
+/// [`expand_through_views`], for two reasons: `define_nest_views` has not run yet at this point in
+/// `run`, and on a pooled connection the catalogue may still hold a *previous* request's
+/// definitions. The files are the authored truth; the catalogue is a cache of it.
+///
+/// `None` means "could not work it out", and every caller must then define everything. Returned for
+/// a view body that will not parse, and for any `…__children` name: those views are built by
+/// `define_children_views` after this point, out of factory tables enumerated from the config, and
+/// working out which ones here would be a second copy of that logic to keep in step.
+fn reachable_tables(
+    conn: &Connection,
+    dir: &Path,
+    referenced: &std::collections::BTreeSet<String>,
+) -> Option<std::collections::BTreeSet<String>> {
+    if referenced.iter().any(|n| n.ends_with("__children")) {
+        return None;
+    }
+    let mut bodies: std::collections::BTreeMap<String, String> = Default::default();
+    for f in nest_view_files(dir) {
+        for stmt in split_sql_statements(&f.sql) {
+            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
+                bodies.insert(name, body.to_string());
+            }
+        }
+    }
+
+    let mut out = referenced.clone();
+    let mut frontier: Vec<String> = referenced.iter().cloned().collect();
+    // A view on a view on a view: follow the chain, bounded, exactly as `expand_through_views` is.
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(body) = bodies.get(&name) else {
+                continue;
+            };
+            for t in base_tables_in(conn, body)? {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Some(out)
+}
+
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
 /// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
 fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
@@ -1559,6 +1641,10 @@ fn define_views(
     // live registry handy (most tests, and the handful of internal callers this fix deliberately
     // leaves on the disk-only path) - identical to today's behaviour in that case.
     declared: &[crate::registry::TableSchema],
+    // Only define views for these tables, lowercased. `None` defines every table the nest has, which
+    // is what every caller outside `run` wants and what `run` falls back to when it cannot work out
+    // what a statement reaches. See `reachable_tables` for why this matters (#896).
+    wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
@@ -1619,6 +1705,11 @@ fn define_views(
         schema.iter().map(|(t, _)| t.clone()).collect();
     tables.extend(manifest.tables.keys().cloned());
     tables.extend(hot.keys().cloned());
+    // #896: a view's DDL carries every one of that table's sealed segment paths, so defining the
+    // ones a statement cannot reach is the dominant per-request cost on a mature nest.
+    if let Some(wanted) = wanted {
+        tables.retain(|t| wanted.contains(&t.to_ascii_lowercase()));
+    }
 
     for table in &tables {
         let cols = cols_of(table);
@@ -2055,6 +2146,7 @@ fn view_build_failure_at(
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -2169,6 +2261,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -2235,6 +2328,7 @@ pub fn entity_output_columns(
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -4512,6 +4606,7 @@ template="pool"
             u64::MAX,
             &std::collections::BTreeSet::new(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4588,6 +4683,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
 
@@ -4998,6 +5094,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5038,6 +5135,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5133,7 +5231,16 @@ template="pool"
         // both tables - fails to bind. Pinning the bug this issue reports, not just the fix.
         {
             let conn = Connection::open_in_memory().unwrap();
-            define_views(&conn, dir.path(), &hot, u64::MAX, &Default::default(), &[]).unwrap();
+            define_views(
+                &conn,
+                dir.path(),
+                &hot,
+                u64::MAX,
+                &Default::default(),
+                &[],
+                None,
+            )
+            .unwrap();
             define_nest_views(&conn, dir.path());
             assert!(
                 conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
@@ -5155,6 +5262,7 @@ template="pool"
                 u64::MAX,
                 &Default::default(),
                 &declared,
+                None,
             )
             .unwrap();
             define_nest_views(&conn, dir.path());
@@ -5296,6 +5404,7 @@ events = ["Minted", "Withdrawn"]
             u64::MAX,
             &Default::default(),
             &declared,
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5518,6 +5627,7 @@ events = ["Transfer"]
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
