@@ -257,6 +257,37 @@ impl QueryOutput {
 /// Passed to the query path so the live tip is `UNION ALL`'d into each table's view (RFC-0013).
 pub type HotRows = std::collections::HashMap<String, Vec<Value>>;
 
+/// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
+/// not bind, whether or not anybody has asked about them.
+///
+/// This used to be a side effect of every query: `define_views` bound *every* table in the manifest
+/// on every request, so a query about one table happened to discover corruption in another. That was
+/// issue #477's contract and it was paid for at ~62 µs per sealed segment per request - 2.5 seconds
+/// on a 38,428-segment nest, before the query read a row (#896).
+///
+/// So the discovery moved here, where it can run on a cadence and be reported by `/ready` without a
+/// caller having to stumble into it. A query still degrades correctly on a table *it* reads; what it
+/// no longer does is survey the rest of the nest on the caller's time.
+///
+/// Deliberately opens its own connection rather than borrowing the cached one: this defines every
+/// view, which is exactly what the cached connection is now avoiding, and leaving that behind on a
+/// pooled connection would hand the next query a catalogue full of definitions it did not ask for.
+pub fn degraded_tables(
+    dir: &Path,
+    declared: &[crate::registry::TableSchema],
+) -> Result<std::collections::BTreeSet<String>> {
+    let conn = open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    define_views(
+        &conn,
+        dir,
+        &HotRows::new(),
+        u64::MAX,
+        &Default::default(),
+        declared,
+        None,
+    )
+}
+
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
@@ -538,8 +569,32 @@ fn attempt(
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
     let (referenced, degraded_tables, interrupted, outcome, cap) = {
         let conn = &slot.conn;
-        let referenced = reject_unknown_table_refs(conn, sql)?;
-        let degraded_tables = define_views(conn, dir, hot, sealed_through, excluded, declared)?;
+        let walked = reject_unknown_table_refs(conn, sql)?;
+        // No parse means no idea what the statement reaches, and the safe answer to that is "all of
+        // it" on both counts.
+        let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
+        let referenced = walked.map(|(r, _)| r);
+        // Define views only for what this statement can reach (#896). `None` - an unparsed statement
+        // or a shape `reachable_tables` will not vouch for - defines everything, as before.
+        // A statement that reaches into a catalogue schema, or calls one of DuckDB's own
+        // enumerating table functions, is asking *what tables exist* - so every view has to exist
+        // for it to answer. Those keep the old whole-nest definition; everything else is narrowed.
+        let wanted = if surveys {
+            None
+        } else {
+            referenced
+                .as_ref()
+                .and_then(|r| reachable_tables(conn, dir, r))
+        };
+        let degraded_tables = define_views(
+            conn,
+            dir,
+            hot,
+            sealed_through,
+            excluded,
+            declared,
+            wanted.as_ref(),
+        )?;
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
@@ -1058,7 +1113,7 @@ const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 fn reject_unknown_table_refs(
     conn: &Connection,
     sql: &str,
-) -> Result<Option<std::collections::BTreeSet<String>>> {
+) -> Result<Option<(std::collections::BTreeSet<String>, bool)>> {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
         r.get::<_, String>(0)
@@ -1073,6 +1128,10 @@ fn reject_unknown_table_refs(
         return Ok(None);
     }
     let mut referenced = std::collections::BTreeSet::new();
+    // Whether this statement reaches outside the nest's own tables - a catalogue schema, or a
+    // catalogue-listing table function. Such a statement needs **every** view defined, because what
+    // it is asking for is the list of them (#896).
+    let mut surveys = false;
     let mut bad: Option<String> = None;
     walk_table_refs(&v, &mut |kind, name| {
         if bad.is_some() {
@@ -1084,7 +1143,12 @@ fn reject_unknown_table_refs(
                 if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
                     bad = Some(format!("table function `{name}` is not permitted here"));
                 }
+                // `duckdb_views()`, `duckdb_tables()` and friends enumerate the catalogue.
+                if f.starts_with("duckdb_") {
+                    surveys = true;
+                }
             }
+            "QUALIFIED_SCHEMA" => surveys = true,
             // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose name is
             // the path, so the AST alone cannot tell it from a real table - the name has to be checked.
             "BASE_TABLE"
@@ -1103,7 +1167,7 @@ fn reject_unknown_table_refs(
     });
     match bad {
         Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
-        None => Ok(Some(referenced)),
+        None => Ok(Some((referenced, surveys))),
     }
 }
 
@@ -1173,11 +1237,112 @@ fn expand_through_views(
 /// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
 fn view_body(create_view_sql: &str) -> Option<&str> {
     let lower = create_view_sql.to_ascii_lowercase();
-    let view = lower.find(" view ")?;
-    // The first ` as ` past the name. A view *name* cannot be bare `as`, and one containing it - say
-    // `as_of` - does not match, because the match needs a space on both sides.
-    let as_at = lower[view..].find(" as ")? + view;
-    Some(create_view_sql[as_at + 4..].trim())
+    let (view, view_end) = find_keyword(&lower, "view", 0)?;
+    let _ = view;
+    let (_, as_end) = find_keyword(&lower, "as", view_end)?;
+    Some(create_view_sql[as_end..].trim())
+}
+
+/// Where `word` appears in `haystack` as a whole token at or after `from`, as `(start, end)`.
+///
+/// **Bounded by any whitespace, not by spaces.** This was `find(" as ")`, which needs a literal
+/// space on both sides - and a real authored view puts a newline after the keyword:
+///
+/// ```sql
+/// CREATE VIEW indexer_rewards AS
+/// SELECT "indexer", SUM("tokensRewards_dec")::VARCHAR AS rewards
+/// FROM "service__indexing_rewards_collected" GROUP BY "indexer";
+/// ```
+///
+/// That is Lodestar's `views/40-indexers.sql`, and the space-bounded search simply did not find the
+/// keyword. Harmless while the only caller was `expand_through_views`, which merely *widens* the
+/// integrity sweep's bound and is allowed to be imprecise. It stopped being harmless when #896 made
+/// the same parse decide which views get defined at all: the view's source table was never defined,
+/// and a view that plainly exists came back as `Catalog Error: Table with name indexer_rewards does
+/// not exist`.
+fn find_keyword(haystack: &str, word: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = haystack.as_bytes();
+    let mut at = from;
+    while let Some(i) = haystack[at..].find(word) {
+        let start = at + i;
+        let end = start + word.len();
+        let before_ok = start > 0 && bytes[start - 1].is_ascii_whitespace();
+        let after_ok = end < bytes.len() && bytes[end].is_ascii_whitespace();
+        if before_ok && after_ok {
+            return Some((start, end));
+        }
+        at = end;
+    }
+    None
+}
+
+/// The name a `CREATE [OR REPLACE] VIEW <name> AS …` declares, lowercased. The mirror of
+/// [`view_body`], and parsed the same coarse way: the text between ` view ` and the first ` as `
+/// past it.
+fn view_name(create_view_sql: &str) -> Option<String> {
+    let lower = create_view_sql.to_ascii_lowercase();
+    let (_, view_end) = find_keyword(&lower, "view", 0)?;
+    let (as_at, _) = find_keyword(&lower, "as", view_end)?;
+    let name = lower[view_end..as_at].trim().trim_matches('"').trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| name.to_string())
+}
+
+/// Which tables a statement can actually reach - the names it uses in table position, widened
+/// through any **authored view** among them to the base tables that view reads.
+///
+/// This is what lets `define_views` skip the rest. Defining a view costs DuckDB a parse of SQL text
+/// carrying every one of that table's sealed segment paths, and it was being paid for all 34 tables
+/// of a nest on every request: `SELECT 1` cost 2,465 ms on a 38,428-segment nest against 263 ms on a
+/// 2,985-segment one, about 62 µs per segment, for tables the query never named (#896).
+///
+/// Read from `views/*.sql` **on disk** rather than from `duckdb_views()`, unlike
+/// [`expand_through_views`], for two reasons: `define_nest_views` has not run yet at this point in
+/// `run`, and on a pooled connection the catalogue may still hold a *previous* request's
+/// definitions. The files are the authored truth; the catalogue is a cache of it.
+///
+/// `None` means "could not work it out", and every caller must then define everything. Returned for
+/// a view body that will not parse, and for any `…__children` name: those views are built by
+/// `define_children_views` after this point, out of factory tables enumerated from the config, and
+/// working out which ones here would be a second copy of that logic to keep in step.
+fn reachable_tables(
+    conn: &Connection,
+    dir: &Path,
+    referenced: &std::collections::BTreeSet<String>,
+) -> Option<std::collections::BTreeSet<String>> {
+    if referenced.iter().any(|n| n.ends_with("__children")) {
+        return None;
+    }
+    let mut bodies: std::collections::BTreeMap<String, String> = Default::default();
+    for f in nest_view_files(dir) {
+        for stmt in split_sql_statements(&f.sql) {
+            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
+                bodies.insert(name, body.to_string());
+            }
+        }
+    }
+
+    let mut out = referenced.clone();
+    let mut frontier: Vec<String> = referenced.iter().cloned().collect();
+    // A view on a view on a view: follow the chain, bounded, exactly as `expand_through_views` is.
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(body) = bodies.get(&name) else {
+                continue;
+            };
+            for t in base_tables_in(conn, body)? {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Some(out)
 }
 
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
@@ -1219,6 +1384,18 @@ fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
                 } else if t == "BASE_TABLE" {
                     if let Some(name) = map.get("table_name").and_then(Value::as_str) {
                         f("BASE_TABLE", name);
+                        // The schema qualifier, reported separately so the security walk keeps
+                        // seeing bare names - it rejects anything that is not `[A-Za-z0-9_]`, which
+                        // is what stops a quoted path in table position reading a file, and a name
+                        // carrying a `.` must not slip through that. #896 needs the qualifier for a
+                        // different reason: `information_schema.tables` cannot be told apart from a
+                        // nest table called `tables` without it, and a catalogue query needs every
+                        // view defined in order to list them.
+                        if let Some(schema) = map.get("schema_name").and_then(Value::as_str) {
+                            if !schema.is_empty() && schema != "main" {
+                                f("QUALIFIED_SCHEMA", schema);
+                            }
+                        }
                     }
                 }
             }
@@ -1559,6 +1736,10 @@ fn define_views(
     // live registry handy (most tests, and the handful of internal callers this fix deliberately
     // leaves on the disk-only path) - identical to today's behaviour in that case.
     declared: &[crate::registry::TableSchema],
+    // Only define views for these tables, lowercased. `None` defines every table the nest has, which
+    // is what every caller outside `run` wants and what `run` falls back to when it cannot work out
+    // what a statement reaches. See `reachable_tables` for why this matters (#896).
+    wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let manifest = crate::seal::load_manifest(dir)?;
@@ -1619,6 +1800,11 @@ fn define_views(
         schema.iter().map(|(t, _)| t.clone()).collect();
     tables.extend(manifest.tables.keys().cloned());
     tables.extend(hot.keys().cloned());
+    // #896: a view's DDL carries every one of that table's sealed segment paths, so defining the
+    // ones a statement cannot reach is the dominant per-request cost on a mature nest.
+    if let Some(wanted) = wanted {
+        tables.retain(|t| wanted.contains(&t.to_ascii_lowercase()));
+    }
 
     for table in &tables {
         let cols = cols_of(table);
@@ -2055,6 +2241,7 @@ fn view_build_failure_at(
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -2169,6 +2356,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -2235,6 +2423,7 @@ pub fn entity_output_columns(
         u64::MAX,
         &Default::default(),
         schema,
+        None,
     );
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
@@ -4444,17 +4633,27 @@ template="pool"
             ],
             "the healthy table's own segments are both intact - nothing about its answer is short"
         );
+        // **The contract changed with #896, deliberately.** A query used to survey the whole nest,
+        // because `define_views` bound every table in the manifest on every request - which is where
+        // 2.5 seconds of a 38,428-segment nest's request time went. A query now reports what *it*
+        // reached, and this one reached nothing damaged.
+        assert!(
+            out.degraded_tables.is_empty(),
+            "a query that read only healthy segments has nothing to caveat: {:?}",
+            out.degraded_tables
+        );
+
+        // The nest-wide fact has not been lost, only moved somewhere it can be reported without a
+        // caller stumbling into it. `/ready` surfaces this; the sweep is what finds it.
+        let swept = degraded_tables(dir.path(), &[]).unwrap();
         assert_eq!(
-            out.degraded_tables,
+            swept,
             ["t__transfer".to_string()]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
-            "the flag must name the table that is actually short, not the one just queried"
+            "the sweep must name the table that is actually short"
         );
-        assert!(
-            !out.degraded_tables.contains("t__approval"),
-            "the queried table is healthy and must never appear in its own indictment"
-        );
+        assert!(!swept.contains("t__approval"), "and never the healthy one");
     }
 
     /// **Issue #477, case 2.** `SELECT 1` and `.tables` (`information_schema.tables`, the query the
@@ -4474,13 +4673,20 @@ template="pool"
         let degraded: std::collections::BTreeSet<String> =
             ["t__transfer".to_string()].into_iter().collect();
 
+        // **`SELECT 1` used to survey the nest, and that was the cost** - it bound every table in
+        // the manifest to find out, which is 2.5 seconds on a real one (#896). It draws from no
+        // table, so it now reports on no table.
         let one = cold(dir.path(), "SELECT 1 AS one");
         assert_eq!(one.rows, vec![serde_json::json!({"one": 1})]);
-        assert_eq!(
-            one.degraded_tables, degraded,
-            "SELECT 1 draws from no table and still learns the nest is short"
+        assert!(
+            one.degraded_tables.is_empty(),
+            "a query that reads nothing caveats nothing: {:?}",
+            one.degraded_tables
         );
 
+        // `.tables` is the one shape that still surveys, and has to: listing the catalogue means
+        // every view must exist to be listed. `reachable_tables` refuses to narrow a statement it
+        // cannot vouch for, and this is one - so the flag it carries is the old one.
         let tables = cold(
             dir.path(),
             "SELECT table_name FROM information_schema.tables \
@@ -4488,8 +4694,11 @@ template="pool"
         );
         assert_eq!(
             tables.degraded_tables, degraded,
-            ".tables draws no rows from any table either, and still carries the flag"
+            ".tables lists the catalogue, so it defines the catalogue, so it still learns"
         );
+
+        // And the sweep knows regardless of what anybody queried.
+        assert_eq!(degraded_tables(dir.path(), &[]).unwrap(), degraded);
     }
 
     /// **Issue #477, case 3 (#434's shape).** A view that fails for a reason no segment probe would
@@ -4512,6 +4721,7 @@ template="pool"
             u64::MAX,
             &std::collections::BTreeSet::new(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4588,6 +4798,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
 
@@ -4752,7 +4963,7 @@ template="pool"
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let referenced = reject_unknown_table_refs(&conn, r#"SELECT "from" FROM "t__transfer""#)
             .unwrap()
-            .map(|names| expand_through_views(&conn, &names))
+            .map(|(names, _)| expand_through_views(&conn, &names))
             .expect("the query names a table");
         assert_eq!(
             crate::seal::segments_failing_verification(dir.path(), &referenced, None),
@@ -4924,10 +5135,52 @@ template="pool"
 
     /// The input to that bound: what the security walk reports a statement reaches. One parse feeds
     /// both controls, so this pins the half `reject_unknown_table_refs` did not used to have.
+    /// **#896, found against the real Lodestar nest.** A real authored view breaks the line after
+    /// `AS`; the keyword search wanted a literal space on both sides and did not find it. The view
+    /// then never entered the map `reachable_tables` builds, its source table was never defined, and
+    /// a view that plainly exists came back as `Catalog Error: Table with name … does not exist`.
+    ///
+    /// Every fixture in this file wrote its view on one line, which is why none of them saw it -
+    /// and my first attempt at this test did too, and passed against the broken code.
+    #[test]
+    fn a_view_that_breaks_the_line_after_as_still_yields_its_source_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        // The shape of `40-indexers.sql`: prose, then a view whose body starts on the next line.
+        std::fs::write(
+            dir.path().join("views/10-senders.sql"),
+            "-- Per-sender rollup. The count comes from the folded `senders` view (\u{a7}10).\n\
+             CREATE VIEW senders AS\n\
+             SELECT \"from\", block_number\n\
+             FROM t__transfer;",
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"t__transfer","from":"0xa","block_number":1,"tx_hash":"0xt","log_index":0}"#
+                .to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+
+        let rows = query(dir.path(), r#"SELECT "from" FROM senders"#)
+            .expect("a view whose body starts on the next line still resolves");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
     #[test]
     fn the_table_refs_walk_reports_what_the_statement_reached() {
         let conn = Connection::open_in_memory().unwrap();
-        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap();
+        let refs = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap().0;
+        let surveys = |sql: &str| reject_unknown_table_refs(&conn, sql).unwrap().unwrap().1;
 
         assert!(
             refs("SELECT CAST('x' AS INTEGER)").is_empty(),
@@ -4953,6 +5206,25 @@ template="pool"
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
             "a table reached from a subquery is still reached"
+        );
+
+        // #896: a statement that reaches a catalogue schema or calls one of DuckDB's enumerating
+        // table functions is asking *what tables exist*, so every view has to be defined for it to
+        // answer. The bare-name set cannot express that - `information_schema.tables` arrives as
+        // `tables` with the qualifier dropped, indistinguishable from a nest table of that name.
+        assert!(!surveys(r#"SELECT * FROM "t__transfer""#));
+        assert!(!surveys("SELECT (SELECT max(a) FROM u) FROM t"));
+        assert!(
+            surveys("SELECT table_name FROM information_schema.tables"),
+            "a catalogue schema must be recognised through the dropped qualifier"
+        );
+        // DuckDB's own enumerating table functions are refused outright by `ALLOWED_TABLE_FNS`, so
+        // the `duckdb_` branch in the walk is unreachable today. It stays because the failure it
+        // guards is silent: admit `duckdb_tables` to that allowlist without thinking about #896 and
+        // the catalogue listing comes back empty rather than erroring.
+        assert!(
+            reject_unknown_table_refs(&conn, "SELECT * FROM duckdb_views()").is_err(),
+            "an enumerating table function is refused before the survey question arises"
         );
     }
 
@@ -4998,6 +5270,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5038,6 +5311,7 @@ template="pool"
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5133,7 +5407,16 @@ template="pool"
         // both tables - fails to bind. Pinning the bug this issue reports, not just the fix.
         {
             let conn = Connection::open_in_memory().unwrap();
-            define_views(&conn, dir.path(), &hot, u64::MAX, &Default::default(), &[]).unwrap();
+            define_views(
+                &conn,
+                dir.path(),
+                &hot,
+                u64::MAX,
+                &Default::default(),
+                &[],
+                None,
+            )
+            .unwrap();
             define_nest_views(&conn, dir.path());
             assert!(
                 conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
@@ -5155,6 +5438,7 @@ template="pool"
                 u64::MAX,
                 &Default::default(),
                 &declared,
+                None,
             )
             .unwrap();
             define_nest_views(&conn, dir.path());
@@ -5296,6 +5580,7 @@ events = ["Minted", "Withdrawn"]
             u64::MAX,
             &Default::default(),
             &declared,
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
@@ -5518,6 +5803,7 @@ events = ["Transfer"]
             u64::MAX,
             &Default::default(),
             &[],
+            None,
         )
         .unwrap();
         define_nest_views(&conn, dir.path());
