@@ -109,10 +109,19 @@ fn seed_cost_against_a_real_nest() {
     let out = view.rows_as_json();
     println!("groups: {}", out.len());
     match (base, after) {
-        (Some(b), Some(a)) => println!(
-            "rss   : base {b} kB -> after seed {a} kB (+{} kB)",
-            a.saturating_sub(b)
-        ),
+        (Some(b), Some(a)) => {
+            let delta_kb = a.saturating_sub(b);
+            println!("rss   : base {b} kB -> after seed {a} kB (+{delta_kb} kB)");
+            // Per **maintained** row, which is what `runtime::ENTITY_RSS_BYTES_PER_ROW` charges
+            // against a mount's declared `max_rows`. The per-input-row figure is the other one and
+            // is not what admission prices.
+            println!(
+                "        {} bytes per maintained row ({} groups), {} bytes per input row ({rows} rows)",
+                delta_kb * 1024 / out.len().max(1) as u64,
+                out.len(),
+                delta_kb * 1024 / rows.max(1) as u64,
+            );
+        }
         _ => println!("rss   : no /proc here; peak comes from the harness (`/usr/bin/time -l`)"),
     }
     assert!(view.fault().is_none(), "faulted: {:?}", view.fault());
