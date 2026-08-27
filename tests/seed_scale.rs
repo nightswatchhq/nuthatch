@@ -205,7 +205,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
             view.seed_chunk(&chunk, u64::MAX)
         })
         .unwrap();
-        for f in segment_files(&dir, &table) {
+        for f in segment_files(&dir, table) {
             source_bytes += std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
         }
     }
@@ -224,7 +224,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let before = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap(&reference),
-        guard.clone(),
+        guard,
         &empty,
         u64::MAX,
         &schema,
@@ -237,7 +237,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let after = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap("SELECT * FROM probe"),
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
@@ -251,7 +251,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let _ = nuthatch::analytics::query_hot_cold(
         &dir,
         "SELECT 1 AS one",
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
@@ -307,7 +307,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let blind = nuthatch::analytics::query_hot_cold(
         &dir,
         &wrap("SELECT * FROM probe"),
-        guard.clone(),
+        guard,
         &maintained,
         u64::MAX,
         &schema,
@@ -452,8 +452,15 @@ fn update_cost_tracks_the_block_not_the_history() {
         )
         .unwrap();
         v.seed_begin();
-        for c in history {
-            v.seed_chunk(c, u64::MAX).unwrap();
+        if std::env::var("NUTHATCH_SEED_ONE_WINDOW").is_ok() {
+            // The same rows, one window rather than one per segment - so the variable is how many
+            // transactions the seed used, not how much history it carried.
+            let all: Vec<_> = history.iter().flatten().cloned().collect();
+            v.seed_chunk(&all, u64::MAX).unwrap();
+        } else {
+            for c in history {
+                v.seed_chunk(c, u64::MAX).unwrap();
+            }
         }
         v.seed_end().unwrap();
         let groups = v.relation().len();
@@ -461,6 +468,17 @@ fn update_cost_tracks_the_block_not_the_history() {
 
         // Five consecutive windows. A cost that appears only on the first is a one-off settling of
         // whatever the seed left behind; a cost on every one is what criterion 5 forbids.
+        // Time the published-relation clone on its own. `EntityView::relation()` is exactly the
+        // `BTreeMap<Row, Row>` clone the circuit thread performs on every published batch.
+        let t = Instant::now();
+        let snapshot = v.relation();
+        let clone_us = t.elapsed().as_micros();
+        println!(
+            "  {label:<8} relation().clone() of {} groups: {clone_us} µs",
+            snapshot.len()
+        );
+        drop(snapshot);
+
         let mut each = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();

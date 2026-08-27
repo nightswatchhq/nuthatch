@@ -190,27 +190,36 @@ impl EntityView {
                 let mut live: i64 = 0;
                 // The watermark of a folded-but-unpublished batch, i.e. a seed in progress.
                 let mut pending: Option<u64> = None;
-                let publish = |through: u64, circuit: &EntityCircuit| {
-                    // The rows and the head they account for, published together.
-                    let mut published = shared.write().unwrap();
+                // Stamp the watermark onto the already-updated relation. **The relation is not
+                // copied here.** `circuit.apply` folds its deltas straight into `published.relation`
+                // under this same lock, so a batch costs what the batch changed rather than what the
+                // relation holds - see `EntityCircuit::apply` and #897. One lock still, and the rows
+                // and the head they account for still become visible together, which is the whole
+                // reason `Published` is one value.
+                let stamp = |through: u64, published: &mut Published| {
                     let moved = through > published.through;
-                    *published = Published {
-                        relation: circuit.relation().clone(),
-                        through,
-                        // Stamped only when the watermark actually moves. A window that carries
-                        // the entity no further is not progress, and counting it as such is how a
-                        // wedged entity looks busy.
-                        progress_at: if moved {
-                            crate::metrics::now_unix()
-                        } else {
-                            published.progress_at
-                        },
-                    };
+                    published.through = through;
+                    // Stamped only when the watermark actually moves. A window that carries the
+                    // entity no further is not progress, and counting it as such is how a wedged
+                    // entity looks busy.
+                    if moved {
+                        published.progress_at = crate::metrics::now_unix();
+                    }
                 };
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         Msg::Batch(batch, through, should_publish) => {
-                            match step(&mut circuit, &batch, &mut live, max_rows) {
+                            // The write lock is held across the fold, so no reader ever sees the
+                            // relation mid-transaction. A fold is microseconds; the clone it
+                            // replaces was tens of milliseconds (#897).
+                            let mut published = shared.write().unwrap();
+                            match step(
+                                &mut circuit,
+                                &batch,
+                                &mut live,
+                                max_rows,
+                                &mut published.relation,
+                            ) {
                                 Err(e) => {
                                     // Includes crossing the declared `max_rows`, which is a fault
                                     // and not a warning (criterion 10). The watermark deliberately
@@ -223,7 +232,7 @@ impl EntityView {
                                 Ok(()) => {
                                     if should_publish {
                                         pending = None;
-                                        publish(through, &circuit);
+                                        stamp(through, &mut published);
                                     } else {
                                         pending = Some(through);
                                     }
@@ -234,7 +243,7 @@ impl EntityView {
                         // prior batch is folded - the ack unblocks the waiter.
                         Msg::Flush(ack) => {
                             if let Some(through) = pending.take() {
-                                publish(through, &circuit);
+                                stamp(through, &mut shared.write().unwrap());
                             }
                             let _ = ack.send(());
                         }
@@ -434,6 +443,32 @@ impl EntityView {
             .unwrap_or_default()
     }
 
+    /// One key's row, read under the lock.
+    ///
+    /// **Not `relation().get(k)`.** That copies the whole relation to answer one key, which on a
+    /// real nest is 49 ms for 309,548 groups (#897) - on the very route whose claim is that a keyed
+    /// read is a map lookup and not a scan.
+    pub fn get(&self, key: &Row) -> Option<Row> {
+        self.state.read().ok()?.relation.get(key).cloned()
+    }
+
+    /// The first `limit` rows and the total count, read under the lock. Same reason as
+    /// [`Self::get`]: the listing route returns at most a hundred rows and was copying every one
+    /// the entity holds to do it.
+    pub fn head_rows(&self, limit: usize) -> (usize, Vec<(Row, Row)>) {
+        match self.state.read() {
+            Ok(s) => (
+                s.relation.len(),
+                s.relation
+                    .iter()
+                    .take(limit)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            Err(_) => (0, Vec::new()),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.state.read().map(|s| s.relation.len()).unwrap_or(0)
     }
@@ -469,7 +504,13 @@ impl EntityView {
 /// prevents an over-budget cursor and one that reports it. Worth saying plainly that the tests below
 /// cannot tell the two orders apart - they prove the fault, not the allocation - so this ordering is
 /// a design choice held by this comment and not by a red test.
-fn step(circuit: &mut EntityCircuit, batch: &Batch, live: &mut i64, max_rows: usize) -> Result<()> {
+fn step(
+    circuit: &mut EntityCircuit,
+    batch: &Batch,
+    live: &mut i64,
+    max_rows: usize,
+    into: &mut Relation,
+) -> Result<()> {
     let next = live
         .checked_add(batch.weight())
         .ok_or_else(|| anyhow!("the entity's live input row count overflowed i64"))?;
@@ -486,7 +527,7 @@ fn step(circuit: &mut EntityCircuit, batch: &Batch, live: &mut i64, max_rows: us
              bound {max_rows}"
         ));
     }
-    circuit.apply(&batch.left, &batch.right)?;
+    circuit.apply(&batch.left, &batch.right, into)?;
     *live = next;
     Ok(())
 }

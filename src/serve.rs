@@ -1770,7 +1770,7 @@ async fn derived_key(
             .map(|p| crate::entity_row::Scalar::Str(p.to_string()))
             .collect(),
     );
-    match entity.relation().get(&wanted) {
+    match entity.get(&wanted) {
         Some(row) => Json(json!({
             "key": key,
             "row": row.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
@@ -1809,10 +1809,9 @@ async fn derived_all(
     }
     let head = dataset_head(&s);
     let limit = q.limit.unwrap_or(100).min(1000);
-    let relation = entity.relation();
-    let items: Vec<Value> = relation
+    let (rows, first) = entity.head_rows(limit);
+    let items: Vec<Value> = first
         .iter()
-        .take(limit)
         .map(|(k, v)| {
             json!({
                 "key": k.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
@@ -1822,7 +1821,7 @@ async fn derived_all(
         .collect();
     Json(json!({
         "entity": name,
-        "rows": relation.len(),
+        "rows": rows,
         "returned": items.len(),
         "items": items,
         "provenance": derived_provenance(&s, entity, head),

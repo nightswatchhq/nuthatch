@@ -465,27 +465,27 @@ mod tests {
         assert_eq!(left.len(), 4, "the approval is not this entity's table");
 
         let mut circuit = EntityCircuit::build(plan.clone()).unwrap();
+        let mut relation = crate::entity_plan::Relation::new();
         circuit
             .apply(
                 &left.iter().map(|r| (r.clone(), 1)).collect::<Vec<_>>(),
                 &[],
+                &mut relation,
             )
             .unwrap();
 
         assert_eq!(
-            circuit.relation().get(&Row(vec![Scalar::Str(BOB.into())])),
+            relation.get(&Row(vec![Scalar::Str(BOB.into())])),
             Some(&Row(vec![Scalar::Int(101)])),
             "0x64 + 0x1, with the zero-value transfer filtered out"
         );
         assert_eq!(
-            circuit
-                .relation()
-                .get(&Row(vec![Scalar::Str(ALICE.into())])),
+            relation.get(&Row(vec![Scalar::Str(ALICE.into())])),
             Some(&Row(vec![Scalar::Int(5)]))
         );
         assert_eq!(
-            circuit.relation(),
-            &plan.evaluate(&left, &[]).unwrap(),
+            relation,
+            plan.evaluate(&left, &[]).unwrap(),
             "§8 still holds on rows that came from a real decode"
         );
     }
