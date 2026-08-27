@@ -440,10 +440,29 @@ pub struct Coverage {
 /// **meaning** (semantic.toml), **derived footguns**, and - when a running nest supplies it -
 /// **coverage** (the hot/cold seam as numbers). Sample-row *evidence* is a later slice; this is the
 /// text an agent reads before writing SQL. Deterministic given its inputs, so it is Tier-A goldenable.
+/// One authored incremental entity, as `/schema` needs to describe it (RFC-0041, #822).
+///
+/// A plain struct rather than a borrow of `EntityView` so this module keeps knowing nothing about
+/// circuits, threads or dbsp: `serve` reads the live view and hands over the facts.
+pub struct MaintainedRelation {
+    pub name: String,
+    pub columns: Vec<String>,
+    /// The last block whose facts are folded into this relation.
+    pub applied_through: u64,
+    /// Whether `applied_through` has caught up with the dataset's head.
+    pub current: bool,
+    /// Why the relation holds no answer, if it holds none. Distinct from `fault`: nothing died.
+    pub unavailable: Option<String>,
+    /// Why the relation stopped, if it has. Terminal.
+    pub fault: Option<String>,
+    pub rows: usize,
+}
+
 pub fn compose(
     schema: &[TableSchema],
     sem: Option<&Semantic>,
     coverage: Option<&Coverage>,
+    maintained: &[MaintainedRelation],
 ) -> String {
     let mut out = String::new();
     out.push_str("nuthatch data model\n\n");
@@ -524,6 +543,40 @@ pub fn compose(
                     &v.description
                 };
                 out.push_str(&format!("  {name} - {desc}\n"));
+            }
+        }
+    }
+
+    // Authored **incremental** entities (RFC-0041). Deliberately rendered next to the authored views
+    // above, because the difference between them is the entire point: a view is recomputed on every
+    // query, a maintained relation is not, and an agent choosing between two names that both answer
+    // the same question needs to be told which is which. Each carries its own applied-through block:
+    // unlike a view, a relation can legitimately be *behind* the dataset, and a caller that cannot
+    // see that has no way to know it is reading a lagging answer.
+    if !maintained.is_empty() {
+        out.push_str(
+            "\nMAINTAINED RELATIONS (incrementally maintained - query by name; NOT recomputed per \
+             query, and reorgs retract automatically)\n",
+        );
+        for r in maintained {
+            out.push_str(&format!(
+                "\n  {} - applied through block {}",
+                r.name, r.applied_through
+            ));
+            if !r.current {
+                out.push_str(" (BEHIND the dataset head - catching up)");
+            }
+            out.push_str(&format!("; {} row(s)\n", r.rows));
+            out.push_str(&format!("    columns: {}\n", r.columns.join(", ")));
+            if let Some(why) = &r.unavailable {
+                out.push_str(&format!(
+                    "    ⚠ unavailable, and NOT queryable from `sql`: {why}\n"
+                ));
+            }
+            if let Some(why) = &r.fault {
+                out.push_str(&format!(
+                    "    ⚠ faulted, and NOT queryable from `sql`. This is terminal: {why}\n"
+                ));
             }
         }
     }
@@ -938,7 +991,7 @@ mod tests {
                 description: "The addresses that received the most transfers.".into(),
             },
         );
-        let doc = compose(&schema, Some(&sem), None);
+        let doc = compose(&schema, Some(&sem), None, &[]);
         assert!(doc.contains("AUTHORED VIEWS"));
         assert!(doc.contains("top_recipients - The addresses that received the most transfers."));
     }

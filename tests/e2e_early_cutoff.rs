@@ -553,6 +553,86 @@ async fn a_live_candidate_is_not_copied_out_from_under_its_cursor() {
     );
 }
 
+/// **#822 criterion 10.** *"Editing the entity definition adopts the existing canonical facts and
+/// rebuilds locally with zero historical RPC calls."*
+///
+/// The mechanism is `blob::NON_DATA_INPUTS`, which excludes `entities.toml` and `entities/**` on the
+/// grounds that the indexing path never reads them: an entity edit moves the **package** NID without
+/// moving the **fact** identity, so `runtime::adoptable` still nominates the old dataset and the
+/// decoded facts come across instead of being re-fetched. RFC-0041 §6 puts it plainly - *"Editing an
+/// entity definition must therefore reuse all decoded facts and rebuild locally."*
+///
+/// This lives beside the `views/**` case rather than in the entity suite because that is where the
+/// mechanism lives. The entity suite spawns a nest straight into a directory and never consults a
+/// data identity at all, so the same assertions written there pass whether or not `entities.toml` is
+/// excluded - which is to say they prove the seed and not the adoption.
+///
+/// The run-2 provider **cannot serve the early history**, so every early row present afterwards
+/// arrived by adoption. That is what makes this an assertion rather than a hope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declaring_an_entity_adopts_the_facts_instead_of_re_indexing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (alpha_nid, _beta_nid) = two_nest_runtime(root);
+
+    bring_up(root, full_history(), 6, 4).await;
+    let before = transfers(&MountTable::data_dir(root, &alpha_nid), "alpha");
+    assert_eq!(
+        before.len(),
+        4,
+        "the fixture must seal four transfers, or the comparison below is vacuous: {before:?}"
+    );
+
+    // The edit: declare an incremental entity over the facts this nest already holds.
+    let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
+        std::fs::write(
+            dir.join("entities.toml"),
+            "[[entities]]\nname = \"received\"\n\
+             sql = \"SELECT t.to, SUM(t.value) FROM alpha__transfer t GROUP BY t.to\"\n\
+             key = [\"to\"]\nmax_rows = 10000\n",
+        )
+        .unwrap();
+    });
+
+    let dest = MountTable::data_dir(root, &new_nid);
+    assert!(
+        dest.join("nuthatch.toml").is_file(),
+        "the edited inputs must be installed"
+    );
+    assert!(
+        !dest.join("nuthatch.redb").exists(),
+        "the fixture must start with no store, or it is not reproducing a re-index"
+    );
+
+    // Run 2, with the early history no longer available from the provider.
+    let heights = bring_up(root, pruned_history(), 8, 6).await;
+    assert_eq!(
+        heights
+            .iter()
+            .find(|(n, _)| n == "alpha")
+            .and_then(|(_, h)| h.clone())
+            .as_deref(),
+        Some("9"),
+        "the adopted store must carry on to the new tip, not restart: {heights:?}"
+    );
+
+    let after = transfers(&dest, "alpha");
+    assert_eq!(
+        after
+            .iter()
+            .map(|r| r["block_number"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (1..=6).collect::<Vec<u64>>(),
+        "declaring an entity must adopt the decoded facts - the provider cannot serve them any \
+         more, so a missing row means it re-indexed and lost the chain"
+    );
+    assert_eq!(
+        after[..before.len()],
+        before[..],
+        "the sealed rows must come across byte for byte, not be re-derived"
+    );
+}
+
 /// The dangerous direction. A nest whose inputs genuinely change the data it will store must **not**
 /// adopt, however similar the rest of it looks - `migrate::a_substantive_edit_does_not_adopt` holds
 /// this line for the migration path, and the mount path needs its own.

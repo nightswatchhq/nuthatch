@@ -487,7 +487,11 @@ fn seed_entities(
     let hot = decode_stored_rows(&schema, &store.entities_in_range(0, through)?)?;
 
     for entity in entities.iter_mut() {
-        let mut rows = Vec::new();
+        entity.seed_begin();
+        // One sealed segment at a time, never the whole history at once - see
+        // `seal::read_table_rows_by_segment` for what that is worth in peak RSS. The hot tail is
+        // fed by reference for the same reason: it used to be cloned once per entity on the nest.
+        let mut sealed = 0usize;
         for table in entity.tables() {
             let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
                 anyhow::bail!(TerminalFault(format!(
@@ -495,16 +499,18 @@ fn seed_entities(
                     entity.name()
                 )))
             };
-            rows.extend(crate::seal::read_table_rows(dir, table_schema)?);
+            crate::seal::read_table_rows_by_segment(dir, table_schema, &mut |rows| {
+                sealed += rows.len();
+                entity.seed_chunk(&rows, through)
+            })?;
         }
-        rows.extend(hot.iter().cloned());
-        let sealed = rows.len() - hot.len();
+        entity.seed_chunk(&hot, through)?;
         tracing::info!(
             "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
             entity.name(),
             hot.len(),
         );
-        entity.seed(&rows, through)?;
+        entity.seed_end()?;
     }
     Ok(())
 }
@@ -1209,11 +1215,24 @@ fn start_entities(
     }
     let mut views = Vec::with_capacity(declared.len());
     for decl in declared {
-        let plan = crate::entity_lower::lower(&decl.sql)
+        let (plan, columns) = crate::entity_lower::lower_with_columns(&decl.sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
+        // An entity that shadows a decoded table would silently take that table's name on the
+        // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
+        // relation instead of the facts. Refused at load, where it is a typo, rather than at the
+        // first query, where it is a mystery.
+        if let Some(t) = registry.schema().iter().find(|t| t.table == decl.name) {
+            anyhow::bail!(
+                "entity `{}` has the same name as the decoded table `{}`. Rename the entity: on the \
+                 SQL surface one would shadow the other",
+                decl.name,
+                t.table
+            )
+        }
         views.push(EntityView::start(
             &decl.name,
             &plan,
+            &columns,
             registry,
             decl.max_rows,
             warm,

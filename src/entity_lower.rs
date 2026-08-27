@@ -30,8 +30,26 @@ use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
 use serde_json::Value;
 
-/// Parse and lower one authored entity `SELECT`.
+/// Parse and lower one authored entity `SELECT`, discarding its output column names.
+///
+/// Most callers want only the relational shape: a circuit and a batch evaluator index by position and
+/// have no use for a name. [`lower_with_columns`] is for the serving surface, which does.
 pub fn lower(sql: &str) -> Result<Plan> {
+    lower_with_columns(sql).map(|(plan, _)| plan)
+}
+
+/// Lower, and keep the names the author gave the output columns (#822).
+///
+/// **`Plan` deliberately does not carry these.** It is positional because the circuit and the oracle
+/// are positional, and 57 hand-built `Plan` literals across the tree would have had to gain a field
+/// they never read. The names belong to the *served* entity, which is the only thing that needs them.
+///
+/// Each output column takes the author's `AS` alias when there is one. Without an alias: a bare column
+/// reference keeps its own name, and an aggregate is named after what it does to which column -
+/// `count`, `sum_amount`, `avg_tokens`. **Duplicates are refused at load**, because a SQL view with
+/// two columns of one name is not a thing, and finding that out at first query rather than at nest
+/// start is the failure mode this whole slice keeps removing.
+pub fn lower_with_columns(sql: &str) -> Result<(Plan, Vec<String>)> {
     let conn = Connection::open_in_memory()?;
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let raw: String = conn
@@ -40,7 +58,80 @@ pub fn lower(sql: &str) -> Result<Plan> {
         })
         .context("parsing the entity SQL")?;
     let ast: Value = serde_json::from_str(&raw)?;
-    lower_ast(&ast)
+    let plan = lower_ast(&ast)?;
+    let columns = output_columns(&ast)?;
+    // A consistency check between two traversals of one select list, not a validation of input:
+    // `output_columns` names every item and `split_select` divides the same items into key and
+    // aggregates, so this cannot fire today and **no test reaches it**. It is here because the two
+    // walks are independent and an edit to either could desync them, at which point every column's
+    // name would shift by one - silently, and only in the serving surface.
+    if columns.len() != plan.key.len() + plan.aggregates.len() {
+        bail!(
+            "lowered {} key + {} aggregate columns but named {} of them; this is a lowering bug",
+            plan.key.len(),
+            plan.aggregates.len(),
+            columns.len()
+        )
+    }
+    Ok((plan, columns))
+}
+
+/// The name each select item carries, or the one it earns.
+fn output_columns(ast: &Value) -> Result<Vec<String>> {
+    let select = ast
+        .pointer("/statements/0/node/select_list")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("an entity must select something"))?;
+
+    let mut names = Vec::with_capacity(select.len());
+    for (i, item) in select.iter().enumerate() {
+        let alias = item
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = if !alias.is_empty() {
+            alias.to_string()
+        } else if item.get("class").and_then(Value::as_str) == Some("COLUMN_REF") {
+            item.get("column_names")
+                .and_then(Value::as_array)
+                .and_then(|p| p.last())
+                .and_then(Value::as_str)
+                .unwrap_or("column")
+                .to_string()
+        } else if item.get("class").and_then(Value::as_str) == Some("FUNCTION") {
+            let f = item
+                .get("function_name")
+                .and_then(Value::as_str)
+                .unwrap_or("agg")
+                .to_ascii_lowercase();
+            // `count(*)` has no argument to name after, and DuckDB calls it `count_star`.
+            let arg = children(item)
+                .next()
+                .filter(|c| c.get("class").and_then(Value::as_str) == Some("COLUMN_REF"))
+                .and_then(|c| c.get("column_names").and_then(Value::as_array))
+                .and_then(|p| p.last())
+                .and_then(Value::as_str);
+            match (f.as_str(), arg) {
+                ("count_star", _) | ("count", None) => "count".to_string(),
+                (f, Some(col)) => format!("{f}_{col}"),
+                (f, None) => f.to_string(),
+            }
+        } else {
+            format!("column_{}", i + 1)
+        };
+        names.push(name);
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for n in &names {
+        if !seen.insert(n.clone()) {
+            bail!(
+                "two output columns are both named `{n}`. A view cannot have that, so name them with \
+                 `AS` - refused here rather than at the first query against the entity"
+            )
+        }
+    }
+    Ok(names)
 }
 
 /// Lower an already-parsed statement. Split out so tests and the validator can share one parse.
@@ -1134,6 +1225,58 @@ mod tests {
             matches!(filter, Expr::Cast(_, Type::Bool)),
             "a column cast must stay a cast: {filter:?}"
         );
+    }
+
+    /// #822: the serving surface needs column names, and the author already wrote them. The old
+    /// lowering threw every `AS` away, so `SELECT * FROM <entity>` had no honest answer.
+    #[test]
+    fn output_columns_take_the_authors_aliases() {
+        let (_, cols) = lower_with_columns(
+            "SELECT d.indexer AS who, COUNT(*) AS n, SUM(d.amount) AS total \
+             FROM delegations d GROUP BY d.indexer",
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["who", "n", "total"]);
+    }
+
+    /// Without an alias a column keeps its own name, and an aggregate is named after what it does to
+    /// which column. `agg0, agg1` would have worked and would have been the wrong kind of decision -
+    /// the sort that becomes the public shape of `/sql` because nobody chose it.
+    #[test]
+    fn an_unaliased_column_earns_a_name_that_says_what_it_is() {
+        let (_, cols) = lower_with_columns(
+            "SELECT d.indexer, COUNT(*), SUM(d.amount), MAX(d.amount) \
+             FROM delegations d GROUP BY d.indexer",
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["indexer", "count", "sum_amount", "max_amount"]);
+    }
+
+    /// A view cannot have two columns of one name. Refused at load, not at the first query against
+    /// the entity - which is the failure this slice keeps removing.
+    #[test]
+    fn two_columns_of_one_name_are_refused_at_load() {
+        let err = format!(
+            "{:#}",
+            lower_with_columns(
+                "SELECT d.indexer AS x, COUNT(*) AS x FROM delegations d GROUP BY d.indexer"
+            )
+            .expect_err("a view cannot have two columns named x")
+        );
+        assert!(err.contains("both named `x`"), "{err}");
+        assert!(err.contains("AS"), "the refusal must say what to do: {err}");
+    }
+
+    /// One name per output column, always - the count is what the serving surface zips against, and a
+    /// mismatch would silently shift every column's name by one.
+    #[test]
+    fn there_is_exactly_one_name_per_output_column() {
+        let (plan, cols) = lower_with_columns(
+            "SELECT d.a, d.b, COUNT(*), SUM(d.v) FROM delegations d GROUP BY d.a, d.b",
+        )
+        .unwrap();
+        assert_eq!(cols.len(), plan.key.len() + plan.aggregates.len());
+        assert_eq!(cols, vec!["a", "b", "count", "sum_v"]);
     }
 
     #[test]

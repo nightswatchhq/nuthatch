@@ -169,9 +169,9 @@ pub struct EntityCircuit {
     left: ZSetHandle<Row>,
     right: Option<ZSetHandle<Row>>,
     out: OutputHandle<OrdZSet<Tup2<Row, Row>>>,
-    /// The integrated result. DBSP emits the *change* to the derived relation each transaction;
-    /// holding the relation here is what makes a point-read possible without re-running anything.
-    relation: Relation,
+    /// How many rows the derived relation currently holds. The relation itself belongs to the
+    /// caller (see [`Self::apply`]); only its size is kept here, for the fault message.
+    len: usize,
     /// Why this entity stopped, if it has.
     ///
     /// The slice-zero spike does not have this, and #864 names the consequence: when a transaction
@@ -213,7 +213,7 @@ impl EntityCircuit {
             left,
             right,
             out,
-            relation: Relation::new(),
+            len: 0,
             faulted: None,
         })
     }
@@ -313,7 +313,20 @@ impl EntityCircuit {
     /// `+1` is an inserted fact and `-1` a retracted one, which is all a reorg is at this layer
     /// (§5.2): the same rows fed back with their weights negated. There is no rollback interface
     /// because there is nothing to roll back.
-    pub fn apply(&mut self, left: &[(Row, ZWeight)], right: &[(Row, ZWeight)]) -> Result<()> {
+    /// `into` is the derived relation, and it belongs to the caller.
+    ///
+    /// **It used to belong to this struct, and the view thread published a full clone of it after
+    /// every batch.** That clone is `O(relation)` where an incremental update is `O(delta)`, and on
+    /// a real nest it was the whole cost: `relation().clone()` of 309,548 groups measured 27,255 µs
+    /// on the ThinkPad, against a fold whose actual output delta was two rows (#897). Freeing the
+    /// previous snapshot cost about as much again. Handing the relation in means the deltas land
+    /// where readers already look, and nothing is copied per block.
+    pub fn apply(
+        &mut self,
+        left: &[(Row, ZWeight)],
+        right: &[(Row, ZWeight)],
+        into: &mut Relation,
+    ) -> Result<()> {
         if let Some(why) = &self.faulted {
             return Err(anyhow!(
                 "this entity faulted and does not accept further windows: {why}"
@@ -339,31 +352,65 @@ impl EntityCircuit {
         // Past this point the rows are inside the circuit. If the transaction fails, the circuit's
         // state and this struct's are no longer the same story, so the entity stops here rather
         // than carrying on over a disagreement it cannot see.
-        if let Err(e) = self.handle.transaction() {
+        //
+        // **A transaction is a sequence of steps, not one step.** DBSP splits a large input across
+        // several internal steps of its own choosing, and each step writes to the output handle
+        // independently: reading `out` once, after the transaction, sees only the final step's
+        // output and silently discards every earlier one. `DBSPHandle::transaction()` and
+        // `commit_transaction()` both hide that loop, so the loop is driven here instead and the
+        // output drained after **every** step.
+        //
+        // The failure this prevents is not subtle in its effect and is invisible in its symptoms.
+        // Measured against a real Horizon nest (2026-08-26): a `GROUP BY delegator` over 346,288
+        // sealed rows with 309,549 distinct delegators produced exactly `309,549 mod 10,000` =
+        // 9,549 groups when fed as one window - dbsp's internal step is 10,000 rows, so all but the
+        // last step's worth of the relation was thrown away. Nothing faulted, nothing logged, and
+        // the relation looked like a smaller but perfectly well-formed answer. The reproducer is
+        // `one_large_window_folds_every_group`, which fails without this loop.
+        if let Err(e) = self.step_to_commit(into) {
             let why = format!("the entity circuit faulted: {e}");
             self.faulted = Some(why.clone());
             return Err(anyhow!(why));
         }
 
-        // The output is the change to the derived relation, so integrating it here is what keeps
-        // `relation()` a point-read rather than a recomputation.
-        self.out.consolidate().iter().for_each(
-            |(Tup2(key, value), (), weight): (Tup2<Row, Row>, (), ZWeight)| {
-                if weight > 0 {
-                    self.relation.insert(key, value);
-                } else if self.relation.get(&key) == Some(&value) {
-                    self.relation.remove(&key);
-                }
-            },
-        );
-
         Ok(())
     }
 
-    /// The derived relation as it stands. After a fault this is the last value that was consistent,
-    /// which is what a caller needs in order to say *how far* the entity got before it stopped.
-    pub fn relation(&self) -> &Relation {
-        &self.relation
+    /// Run one transaction to completion, integrating the output after each of its steps.
+    fn step_to_commit(&mut self, into: &mut Relation) -> Result<()> {
+        self.handle.start_transaction()?;
+        self.handle.start_commit_transaction()?;
+        loop {
+            let complete = self.handle.step()?;
+            // The output is the change to the derived relation, so integrating it here is what
+            // keeps `relation()` a point-read rather than a recomputation.
+            self.out.consolidate().iter().for_each(
+                |(Tup2(key, value), (), weight): (Tup2<Row, Row>, (), ZWeight)| {
+                    if weight > 0 {
+                        into.insert(key, value);
+                    } else if into.get(&key) == Some(&value) {
+                        into.remove(&key);
+                    }
+                },
+            );
+            if complete {
+                self.len = into.len();
+                return Ok(());
+            }
+        }
+    }
+
+    /// How many rows the derived relation held after the last completed transaction.
+    ///
+    /// Clippy wants an `is_empty` beside a `len`; there is deliberately none. This is a *recorded
+    /// count*, not a container, and "the relation is empty" is a question for whoever owns it.
+    ///
+    /// The relation itself is the caller's - see [`Self::apply`]. A fault leaves it holding whatever
+    /// the transaction had integrated before the failing step, which is *not* necessarily a
+    /// consistent value; `fault()` being `Some` is what says so, and a faulted entity is terminal.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     /// Why this entity stopped, if it has. `None` is a live entity.
@@ -467,8 +514,9 @@ pub fn evaluate_incrementally(plan: &Plan, left: &[Row], right: &[Row]) -> Resul
     let mut circuit = EntityCircuit::build(plan.clone())?;
     let l: Vec<(Row, ZWeight)> = left.iter().map(|r| (r.clone(), 1)).collect();
     let r: Vec<(Row, ZWeight)> = right.iter().map(|r| (r.clone(), 1)).collect();
-    circuit.apply(&l, &r)?;
-    Ok(circuit.relation().clone())
+    let mut relation = Relation::new();
+    circuit.apply(&l, &r, &mut relation)?;
+    Ok(relation)
 }
 
 /// The relation as a sorted vector, for assertions that want an order.
@@ -485,6 +533,32 @@ mod tests {
     use crate::entity_expr::Cmp;
     use crate::entity_plan::{Join, Source};
     use proptest::prelude::*;
+
+    /// A circuit and the relation it folds into, which is the pairing every caller keeps now that
+    /// the relation belongs to the caller (see [`EntityCircuit::apply`]) - in production it is what
+    /// `EntityView` holds under its published lock.
+    struct Folding {
+        circuit: EntityCircuit,
+        relation: Relation,
+    }
+
+    impl Folding {
+        fn build(plan: Plan) -> Result<Self> {
+            Ok(Folding {
+                circuit: EntityCircuit::build(plan)?,
+                relation: Relation::new(),
+            })
+        }
+        fn apply(&mut self, left: &[(Row, ZWeight)], right: &[(Row, ZWeight)]) -> Result<()> {
+            self.circuit.apply(left, right, &mut self.relation)
+        }
+        fn relation(&self) -> &Relation {
+            &self.relation
+        }
+        fn fault(&self) -> Option<&str> {
+            self.circuit.fault()
+        }
+    }
 
     fn col(i: usize) -> Expr {
         Expr::Column(i)
@@ -529,6 +603,57 @@ mod tests {
     }
     fn minus(rows: &[Row]) -> Vec<(Row, ZWeight)> {
         rows.iter().map(|r| (r.clone(), -1)).collect()
+    }
+
+    /// **One window, many groups.** A restart seed feeds a nest's whole sealed history as a single
+    /// window, and that is the one shape no fixture here exercised: every other test feeds a
+    /// handful of rows.
+    ///
+    /// Found against a real Horizon nest (2026-08-26): a `GROUP BY delegator` over 346,288 sealed
+    /// rows with 309,549 distinct delegators returned 309,549 groups when fed in 1,000-row windows
+    /// and 9,549 - three percent - when the whole history went in at once. Nothing faulted and
+    /// nothing logged. The batch evaluator is the oracle, so it says which of the two is right.
+    #[test]
+    fn one_large_window_folds_every_group() {
+        let plan = delegation_plan();
+        // Across dbsp's internal step boundary, which was 10,000 rows when this was written. The
+        // sizes either side of it are the point: 4,096 always passed, 16,384 returned 6,384.
+        for n in [4usize, 4_096, 16_384, 50_000] {
+            let left: Vec<Row> = (0..n)
+                .map(|i| d("i1", &format!("d{i:06}"), 1 + (i as i128 % 7)))
+                .collect();
+            let right = [i_row("i1", true)];
+
+            let got = evaluate_incrementally(&plan, &left, &right).unwrap();
+            assert_eq!(
+                got.len(),
+                n,
+                "one window of {n} distinct groups must fold to {n} groups"
+            );
+            assert_eq!(
+                got,
+                plan.evaluate(&left, &right).unwrap(),
+                "§8: the circuit and the batch oracle are the same relation, at {n} rows"
+            );
+        }
+    }
+
+    /// A window that carries the same fact twice carries it twice. Two identical delegations are
+    /// one `Row` at weight 2, and the aggregate must see both - a window is a Z-set, not a set.
+    #[test]
+    fn a_repeated_row_in_one_window_counts_twice() {
+        let plan = delegation_plan();
+        let left = [d("i1", "a", 5), d("i1", "a", 5)];
+        let right = [i_row("i1", true)];
+
+        let got = evaluate_incrementally(&plan, &left, &right).unwrap();
+
+        assert_eq!(
+            got.get(&Row(vec![s("i1"), s("a")])),
+            Some(&Row(vec![Scalar::Int(10)])),
+            "the same delegation twice sums to 10, not 5"
+        );
+        assert_eq!(got, plan.evaluate(&left, &right).unwrap());
     }
 
     /// **§4 step 4, end to end.** A plan goes in, a circuit comes out, and the answer is the one the
@@ -577,7 +702,7 @@ mod tests {
                 .collect()
         };
 
-        let mut circuit = EntityCircuit::build(plan.clone()).unwrap();
+        let mut circuit = Folding::build(plan.clone()).unwrap();
         circuit.apply(&plus(&rows(&[5, 9, 7])), &[]).unwrap();
         assert_eq!(
             circuit.relation().get(&Row(vec![s("a")])),
@@ -771,7 +896,7 @@ mod tests {
         };
         let row = |a: i128| Row(vec![s("a"), Scalar::Int(a)]);
 
-        let mut split = EntityCircuit::build(plan.clone()).unwrap();
+        let mut split = Folding::build(plan.clone()).unwrap();
         split.apply(&plus(&[row(1), row(2)]), &[]).unwrap();
         split.apply(&plus(&[row(10)]), &[]).unwrap();
 
@@ -800,7 +925,7 @@ mod tests {
         };
         let huge = Row(vec![s("a"), Scalar::Int(i128::MAX)]);
 
-        let mut circuit = EntityCircuit::build(plan).unwrap();
+        let mut circuit = Folding::build(plan).unwrap();
         let err = circuit
             .apply(&plus(&[huge.clone(), huge]), &[])
             .expect_err("two i128::MAX rows cannot sum");
@@ -829,7 +954,7 @@ mod tests {
         };
         let row = |a: i128| Row(vec![s("a"), Scalar::Int(a)]);
 
-        let mut circuit = EntityCircuit::build(plan).unwrap();
+        let mut circuit = Folding::build(plan).unwrap();
         circuit.apply(&plus(&[row(3), row(4)]), &[]).unwrap();
         let good = circuit.relation().clone();
         assert_eq!(
@@ -905,7 +1030,7 @@ mod tests {
             key: vec![col(0)],
             aggregates: vec![Agg::Count],
         };
-        let mut circuit = EntityCircuit::build(plan).unwrap();
+        let mut circuit = Folding::build(plan).unwrap();
         let err = circuit
             .apply(&[], &plus(&[Row(vec![s("x")])]))
             .expect_err("there is nowhere for these to go");
@@ -955,7 +1080,7 @@ mod tests {
                 .map(|(_, row)| row.clone())
                 .collect();
 
-            let mut circuit = EntityCircuit::build(plan.clone()).unwrap();
+            let mut circuit = Folding::build(plan.clone()).unwrap();
             circuit.apply(&plus(&inserted), &plus(&right)).unwrap();
             circuit.apply(&minus(&retracted), &[]).unwrap();
 

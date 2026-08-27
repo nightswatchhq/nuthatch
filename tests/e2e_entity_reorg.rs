@@ -51,17 +51,19 @@ fn replacement_block(b: u64) -> BlockFixture {
 ///
 /// No filter and no join on purpose: this test is about the retraction path, and every operator it
 /// does not use is one that cannot mask a divergence by discarding the row that carries it.
-fn declare_entity(dir: &std::path::Path) {
-    std::fs::write(
-        dir.join("entities.toml"),
-        r#"[[entities]]
+const RECEIVED: &str = r#"[[entities]]
 name = "received"
 sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
-"#,
-    )
-    .expect("write entities.toml");
+"#;
+
+fn declare_entity(dir: &std::path::Path) {
+    declare(dir, RECEIVED);
+}
+
+fn declare(dir: &std::path::Path, toml: &str) {
+    std::fs::write(dir.join("entities.toml"), toml).expect("write entities.toml");
 }
 
 const CHAIN_LEN: u64 = 8;
@@ -71,8 +73,19 @@ async fn spawn_with_entity(
     tape: Arc<TapeSource>,
     tip: u64,
 ) -> indexer::NestRuntime {
+    spawn_declared(dir, tape, tip, RECEIVED).await
+}
+
+/// The same, for a caller that supplies its own `entities.toml`. Written **after** the scaffold so
+/// the declaration is the one under test and not whatever the scaffold would leave behind.
+async fn spawn_declared(
+    dir: &std::path::Path,
+    tape: Arc<TapeSource>,
+    tip: u64,
+    decl: &str,
+) -> indexer::NestRuntime {
     let cfg = scaffold_nest(dir, "usdc", USDC);
-    declare_entity(dir);
+    declare(dir, decl);
     let rt = indexer::spawn_nest(
         tape,
         dir.to_path_buf(),
@@ -130,6 +143,52 @@ fn relation(rt: &indexer::NestRuntime) -> Vec<(String, String)> {
     out
 }
 
+/// Run a query through the nest's `/sql` route and return its rows as sorted `(k, v)` text pairs.
+///
+/// Text rather than numbers on purpose: the entity serves exact i128 as a decimal string and DuckDB
+/// serves its own type, so comparing the rendered values is the comparison that would catch a
+/// precision loss on either side rather than papering over it with a float cast.
+async fn sql_pairs(rt: &indexer::NestRuntime, sql: &str) -> Vec<(String, String)> {
+    let path = format!("/sql?q={}", urlencoding_lite(sql));
+    let (status, body) = get_json(rt, &path).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{sql} -> {body}");
+    let mut out: Vec<(String, String)> = body["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no rows for {sql}: {body}"))
+        .iter()
+        .map(|r| {
+            let k = r["k"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| r["k"].to_string());
+            let v = r["v"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| r["v"].to_string());
+            (k, v)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Percent-encode the handful of characters a SQL string puts in a query parameter. Not a general
+/// encoder; the test corpus is fixed and this keeps a dependency out of the test suite.
+fn urlencoding_lite(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ' ' => "%20".to_string(),
+            '"' => "%22".to_string(),
+            '*' => "%2A".to_string(),
+            '(' => "%28".to_string(),
+            ')' => "%29".to_string(),
+            ',' => "%2C".to_string(),
+            '+' => "%2B".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 async fn entity_converges_after_reorg(fork: u64) {
     assert!((1..CHAIN_LEN).contains(&fork));
     // Reorged nest: index the canonical chain, then rewrite everything above the fork.
@@ -167,6 +226,27 @@ async fn entity_converges_after_reorg(fork: u64) {
     assert!(converged, "the reorg did not reconverge in time");
     let after = relation(&rt);
     let health = rt.state.entities[0].fault();
+
+    // **#822 criterion 12.** *"A randomized reorg run converges to the old SQL reference result."*
+    // The clean-replay comparison below asks whether the circuit agrees with itself; this asks
+    // whether it agrees with the authored SQL it replaces, computed fresh over hot∪sealed by DuckDB
+    // after the reorg. Two independent routes to the same number, and the entity is only worth
+    // having if they match.
+    let maintained = sql_pairs(&rt, "SELECT \"to\" AS k, sum_value AS v FROM received").await;
+    let reference = sql_pairs(
+        &rt,
+        "SELECT t.\"to\" AS k, SUM(t.value_dec) AS v FROM usdc__transfer t GROUP BY t.\"to\"",
+    )
+    .await;
+    assert!(
+        !reference.is_empty(),
+        "the reference query returned nothing, so it proves nothing"
+    );
+    assert_eq!(
+        maintained, reference,
+        "after a reorg at {fork}, the maintained relation must equal the authored SQL it replaces"
+    );
+
     shutdown(rt);
     assert_eq!(health, None, "the entity must still be running");
 
@@ -572,6 +652,307 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     );
 }
 
+/// **`/explain` must answer for the database `/sql` runs.** A maintained relation is queryable by
+/// name, so the endpoint whose entire job is "would this query bind?" has to know it exists.
+///
+/// The failure this pins was worse than a plain omission, and it is why the first assertion here is
+/// the load-bearing one: DuckDB connections are pooled and `define_views` refreshes only the tables
+/// in the *current* set, so a relation defined by an earlier `/sql` on that connection stayed bound.
+/// The identical request returned `400 Table with name received does not exist` on a cold connection
+/// and `200 valid` once any `/sql` had warmed one - the same question, two answers, decided by what
+/// some other caller happened to run first.
+///
+/// So: explain **before** any `/sql` touches the entity. A test that queried in the other order
+/// passed against the broken code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_binds_a_maintained_relation_on_a_cold_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    // First request of the test, before anything can have defined the view as a side effect.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20*%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/explain must bind a maintained relation on a cold connection: {body}"
+    );
+    assert_eq!(body["valid"], true, "{body}");
+
+    // And it binds the relation's real columns, rather than anything that merely accepts the name.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20bogus_col%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "a column the relation does not have must not bind: {body}"
+    );
+
+    // The two surfaces agree in both directions.
+    let (status, body) = get_json(&rt, "/explain?q=SELECT%20*%20FROM%20no_such_relation").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+
+    shutdown_and_settle(rt).await;
+}
+
+/// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
+/// and remains bounded by existing guards. Documentation does not imply IVM repeals I/O."*
+///
+/// A maintained relation is cheaper to **derive** and not cheaper to **return**, so the row cap
+/// binds it exactly as it binds a fact table. The trap is a route that reads "incremental" as a
+/// reason to skip the guards.
+///
+/// Grouped by block rather than by recipient because the shared fixture sends every transfer to the
+/// same address: one group, and a cap of one would bind nothing and pass regardless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capped_query_over_a_maintained_relation_is_still_capped() {
+    const PER_BLOCK: &str = r#"[[entities]]
+name = "per_block"
+sql = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
+key = ["block_number"]
+max_rows = 10000
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, PER_BLOCK).await;
+    rt.state.entities[0].flush();
+
+    let all = rt.state.entities[0].relation().len();
+    assert_eq!(
+        all as u64, CHAIN_LEN,
+        "one group per block, or the cap below binds nothing"
+    );
+
+    // Uncapped: every maintained row comes back, and is not silently truncated.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20per_block").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "uncapped: {body}");
+    assert_eq!(
+        body["rows"].as_array().map(Vec::len),
+        Some(all),
+        "uncapped: {body}"
+    );
+    assert_eq!(body["truncated"], false, "uncapped: {body}");
+
+    // Capped: the existing guard binds a maintained relation like any other table.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20per_block&max_rows=3").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "capped: {body}");
+    assert_eq!(
+        body["rows"].as_array().map(Vec::len),
+        Some(3),
+        "the cap must bind: {body}"
+    );
+    assert_eq!(
+        body["truncated"], true,
+        "and a capped result must say so rather than looking complete: {body}"
+    );
+
+    shutdown_and_settle(rt).await;
+}
+
+/// **#822 criterion 10, the local half.** An edited definition rebuilds from the facts already on
+/// disk, and does not re-fetch them.
+///
+/// The *adoption* half - that an entity edit moves the package NID without moving the fact identity,
+/// so a freshly-installed edited nest inherits the old dataset instead of re-indexing - is
+/// `e2e_early_cutoff::declaring_an_entity_adopts_the_facts_instead_of_re_indexing_them`, and it has
+/// to be, because this suite spawns a nest straight into a directory and never consults a data
+/// identity. Removing `entities.toml` from `blob::NON_DATA_INPUTS` leaves every assertion here
+/// passing, which is exactly how much this test knows about that mechanism: nothing.
+///
+/// What it does hold is the other failure: the edited definition is a **different relation over a
+/// different column**, not a tweak, so a rebuild that quietly resumed the old circuit would still be
+/// holding `to`-keyed rows and the assertion on the new keys would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn editing_an_entity_rebuilds_from_stored_facts_without_refetching_them() {
+    const SENT: &str = r#"[[entities]]
+name = "sent"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let first = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
+    assert!(
+        !relation(&first).is_empty(),
+        "the first run must actually fill it"
+    );
+    shutdown_and_settle(first).await;
+
+    // Edit the definition. Nothing new to index, so any `logs` call is a historical re-fetch.
+    let calls_before = tape.logs_call_count();
+    let second = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, SENT).await;
+    second.state.entities[0].flush();
+    let name = second.state.entities[0].name().to_string();
+    let rebuilt = relation(&second);
+    let unavailable = second.state.entities[0].unavailable().map(str::to_string);
+    let applied = second.state.entities[0].applied_through();
+    shutdown_and_settle(second).await;
+
+    assert_eq!(
+        name, "sent",
+        "the edited definition is the one that came up"
+    );
+    assert_eq!(
+        unavailable, None,
+        "the edited entity rebuilt rather than staying unavailable"
+    );
+    assert_eq!(
+        applied, CHAIN_LEN,
+        "and it answers for the head it was rebuilt through"
+    );
+
+    // Every block sends one transfer from the same sender in this fixture, so the new relation is
+    // one group counting the whole chain. Asserted against the fixture rather than against the old
+    // relation, which is the point: this is a *different* derivation over the same facts.
+    assert_eq!(
+        rebuilt,
+        vec![(
+            format!("Row([Str({:?})])", account(1)),
+            format!("Row([Int({CHAIN_LEN})])"),
+        )],
+        "the edited entity must be the new derivation over the adopted facts"
+    );
+
+    let historical = tape.logs_call_count() - calls_before;
+    assert!(
+        historical < (CHAIN_LEN / 2) as usize,
+        "editing a definition must adopt the decoded facts, not re-fetch them: {historical} logs \
+         calls across a {CHAIN_LEN}-block chain"
+    );
+}
+
+/// **#822 criterion 11, at the bar this slice actually sets.** *"An unrelated incremental entity
+/// remains available while the changed one rebuilds, unless a shared dependency changed."*
+///
+/// RFC-0041 is explicit that v1 does not graft: *"The first implementation may rebuild all entities
+/// locally after an NID change. The acceptance bar still requires zero historical RPC."* Per-entity
+/// grafting is listed under "Post-v1, not a v1 slice" and is not testable until entity output is
+/// persisted, because until then there is nothing durable to graft.
+///
+/// So the honest v1 statement is this: editing one entity does not cost the other one its answer or
+/// its currency, and neither rebuild reaches for the network. A test asserting that the untouched
+/// entity was *not recomputed* would be asserting something v1 does not claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn editing_one_entity_leaves_its_neighbour_answering() {
+    const BOTH: &str = r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+
+[[entities]]
+name = "senders"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+    // Only `received` changes: SUM becomes COUNT. `senders` is byte-identical.
+    const EDITED: &str = r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+
+[[entities]]
+name = "senders"
+sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+key = ["from"]
+max_rows = 10000
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let first = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, BOTH).await;
+    for e in first.state.entities.iter() {
+        e.flush();
+    }
+    let neighbour_before: Vec<_> = first.state.entities[1]
+        .relation()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    assert!(
+        !neighbour_before.is_empty(),
+        "the neighbour must actually hold something"
+    );
+    shutdown_and_settle(first).await;
+
+    let calls_before = tape.logs_call_count();
+    let second = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, EDITED).await;
+    for e in second.state.entities.iter() {
+        e.flush();
+    }
+    let names: Vec<String> = second
+        .state
+        .entities
+        .iter()
+        .map(|e| e.name().to_string())
+        .collect();
+    let states: Vec<(Option<String>, Option<String>, u64)> = second
+        .state
+        .entities
+        .iter()
+        .map(|e| {
+            (
+                e.unavailable().map(str::to_string),
+                e.fault(),
+                e.applied_through(),
+            )
+        })
+        .collect();
+    let neighbour_after: Vec<_> = second.state.entities[1]
+        .relation()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    shutdown_and_settle(second).await;
+
+    assert_eq!(names, vec!["received", "senders"]);
+    for (i, (unavailable, fault, applied)) in states.iter().enumerate() {
+        assert_eq!(
+            *unavailable, None,
+            "entity {} is unavailable after the edit",
+            names[i]
+        );
+        assert_eq!(*fault, None, "entity {} faulted after the edit", names[i]);
+        assert_eq!(
+            *applied, CHAIN_LEN,
+            "entity {} did not come back current",
+            names[i]
+        );
+    }
+    assert_eq!(
+        neighbour_after, neighbour_before,
+        "the untouched entity must answer with exactly what it answered with before"
+    );
+
+    let historical = tape.logs_call_count() - calls_before;
+    assert!(
+        historical < (CHAIN_LEN / 2) as usize,
+        "neither rebuild may re-fetch history: {historical} logs calls"
+    );
+}
+
 /// **RFC-0041 §8 / #864 criterion 4, as a property.** *"Randomized apply/retract/replacement
 /// sequences converge byte-for-byte to a clean replay."*
 ///
@@ -609,4 +990,179 @@ proptest! {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
     entity_converges_after_reorg(4).await;
+}
+
+/// **#822 criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
+///
+/// Asserted by construction rather than by inspecting a plan: `derived_key` reads the circuit's own
+/// output map. What this test can check from outside is that the answer is *right*, that it carries
+/// the provenance criterion 9 asks for, and that its applied-through is the **entity's** watermark
+/// rather than the nest's head - which is the difference between reporting and pretending.
+/// Drive one GET through the nest's **real router**, not a hand-built handler call.
+///
+/// The distinction is the point. The keyed-read test below this one used to read
+/// `entity.relation()` directly and assert on the values, which proves the circuit holds the right
+/// answer and says nothing about whether the route returns it, stamps provenance, or refuses when
+/// it should. Two of #822's criteria are statements about a *response*.
+async fn get_json(
+    rt: &indexer::NestRuntime,
+    path: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let router = nuthatch::serve::router(nuthatch::serve::SharedNest::new(rt.state.clone()));
+    let req = axum::http::Request::builder()
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    (status, value)
+}
+
+/// **#822 criterion 9, through the routes rather than beside them**, plus the `/sql` exposure that
+/// shipped without a test of its own.
+///
+/// A maintained relation is queryable by its declared name, and the answer says so: which entity
+/// answered, that it is incremental, how far it is applied, and whether that is current. A query
+/// that touches no entity gets no such claim, because an empty array would assert something about
+/// maintained state that a plain fact query has no business asserting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sql_route_serves_the_relation_by_name_and_says_where_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    // The relation, by the name its author declared, through the analytical surface.
+    let (status, body) = get_json(&rt, "/sql?q=SELECT%20*%20FROM%20received").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/sql over the entity: {body}"
+    );
+    let rows = body["rows"].as_array().expect("rows").clone();
+    assert_eq!(
+        rows.len(),
+        rt.state.entities[0].relation().len(),
+        "/sql must serve every maintained row: {body}"
+    );
+    assert!(
+        rows.iter().all(|r| r.get("to").is_some()),
+        "the author's own column names, not positional ones: {rows:?}"
+    );
+
+    // Criterion 9. `source: hot+sealed` describes the fact tables and says nothing about a relation
+    // a circuit maintains, which is the gap this closes.
+    let entities = body["provenance"]["entities"]
+        .as_array()
+        .unwrap_or_else(|| panic!("provenance.entities missing: {body}"));
+    assert_eq!(entities.len(), 1, "one entity answered: {entities:?}");
+    assert_eq!(entities[0]["entity"], "received");
+    assert_eq!(entities[0]["incremental"], true);
+    assert_eq!(entities[0]["applied_through"], CHAIN_LEN);
+    assert_eq!(entities[0]["current"], true);
+
+    // A query over raw facts touches no maintained state and must not claim to.
+    let (status, body) = get_json(
+        &rt,
+        "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20usdc__transfer",
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/sql over facts: {body}"
+    );
+    assert!(
+        body["provenance"]["entities"].is_null(),
+        "a fact query must not carry an entity provenance block: {body}"
+    );
+
+    // The surface bullet's other half: `/schema` - which the MCP `schema` tool relays verbatim - must
+    // say the relation exists, that it is incremental, and how far it is applied. Without this an
+    // agent can query `received` from `/sql` but has no way to discover that it is there.
+    let (status, body) = get_json(&rt, "/schema").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "/schema");
+    let doc = body["raw"].as_str().expect("/schema is plain text");
+    assert!(
+        doc.contains("MAINTAINED RELATIONS"),
+        "/schema must have a maintained-relations section:\n{doc}"
+    );
+    assert!(
+        doc.contains("received - applied through block 8"),
+        "/schema must name the relation and its applied-through block:\n{doc}"
+    );
+    assert!(
+        doc.contains("NOT recomputed per query"),
+        "/schema must distinguish a maintained relation from an authored view:\n{doc}"
+    );
+    assert!(
+        doc.contains("columns: to, "),
+        "/schema must name the author's columns:\n{doc}"
+    );
+
+    // Criterion 2, through the route this time: the keyed read answers with provenance.
+    let (status, body) = get_json(&rt, &format!("/derived/received/{}", account(2))).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "/derived keyed read: {body}"
+    );
+    let want: i128 = (1..=CHAIN_LEN).map(|b| (100 * b) as i128).sum();
+    assert_eq!(body["row"][0], want.to_string(), "the keyed row: {body}");
+    let p = &body["provenance"];
+    assert_eq!(p["entity"], "received");
+    assert_eq!(p["incremental"], true);
+    assert_eq!(p["from_maintained_state"], true);
+    assert_eq!(p["applied_through"], CHAIN_LEN);
+    assert_eq!(p["current"], true);
+
+    shutdown_and_settle(rt).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    let entity = &rt.state.entities[0];
+    let want: i128 = (1..=CHAIN_LEN).map(|b| (100 * b) as i128).sum();
+    let got = entity
+        .relation()
+        .get(&nuthatch::entity_row::Row(vec![
+            nuthatch::entity_row::Scalar::Str(account(2)),
+        ]))
+        .cloned();
+    assert_eq!(
+        got,
+        Some(nuthatch::entity_row::Row(vec![
+            nuthatch::entity_row::Scalar::Int(want)
+        ])),
+        "the maintained relation must hold the answer a keyed read would return"
+    );
+
+    // Criterion 9's provenance, and the part that matters: the entity answers for the head it has
+    // folded. Serving the nest's head here is exactly how a partial relation gets stamped current.
+    assert_eq!(entity.applied_through(), CHAIN_LEN);
+    assert!(entity.is_current(CHAIN_LEN));
+    assert!(!entity.is_current(CHAIN_LEN + 1));
+    assert_eq!(entity.unavailable(), None);
+    assert_eq!(entity.fault(), None);
+
+    shutdown_and_settle(rt).await;
 }

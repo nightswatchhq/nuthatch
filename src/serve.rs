@@ -197,6 +197,9 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/explain", get(explain))
             .route("/queries", get(queries))
             .route("/q/{name}", get(named_query))
+            .route("/derived", get(derived_index))
+            .route("/derived/{entity}", get(derived_all))
+            .route("/derived/{entity}/{key}", get(derived_key))
             .route("/balances", get(balances))
             .route("/balance/{address}", get(balance))
             .route("/exposure/{address}", get(exposure))
@@ -1030,7 +1033,23 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
     };
-    let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage));
+    // #822's surface bullet: `/schema` (which the MCP `schema` tool relays verbatim) must say that
+    // a relation is incremental and name its applied-through block.
+    let head = dataset_head(&s);
+    let maintained: Vec<crate::semantic::MaintainedRelation> = s
+        .entities
+        .iter()
+        .map(|e| crate::semantic::MaintainedRelation {
+            name: e.name().to_string(),
+            columns: e.columns().to_vec(),
+            applied_through: e.applied_through(),
+            current: e.is_current(head),
+            unavailable: e.unavailable().map(str::to_string),
+            fault: e.fault(),
+            rows: e.len(),
+        })
+        .collect();
+    let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage), &maintained);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1314,6 +1333,7 @@ async fn run_sql_query(
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
     let tables = s.tables.clone();
+    let declared_entities = s.entities.clone();
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
@@ -1333,6 +1353,30 @@ async fn run_sql_query(
                 (Default::default(), true)
             }
         };
+        // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
+        // tables. **This copies every entity row into the connection, per request** - #822 criterion
+        // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
+        // its views from.
+        //
+        // **Measured, and it is not the term that matters** (2026-08-27, `tests/seed_scale.rs`
+        // against a 38,428-segment Horizon nest). A top-20 over a relation of 309,549 maintained
+        // rows took 2,487 ms; `SELECT 1`, which reads nothing at all, took 2,465 ms on the same
+        // nest. The copy is the 22 ms difference. What the request actually pays for is
+        // `define_views` rebuilding a view for every table in the manifest, at roughly 62 µs per
+        // sealed segment, whether or not the query names it - #896. Optimising this copy would
+        // have bought a one-percent improvement and cost the persistent-catalogue rewrite the
+        // criterion warns against, which is exactly why it says measure first.
+        //
+        // An entity holding no answer contributes no table at all rather than an empty one. An empty
+        // relation and an unavailable one are different facts, and a query cannot tell them apart
+        // from zero rows - `/derived` is where the reason lives.
+        let mut hot = hot;
+        for entity in declared_entities.iter() {
+            if entity.unavailable().is_some() || entity.fault().is_some() {
+                continue;
+            }
+            hot.insert(entity.name().to_string(), entity.rows_as_json());
+        }
         let sealed_through = store.sealed_through();
         let mut out = analytics::query_hot_cold(
             &dir,
@@ -1386,6 +1430,13 @@ async fn run_sql_query(
                 "source": "hot+sealed",
                 "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
                 "nid": s.nid.as_deref(),
+                // **#822 criterion 9, on the analytical route.** `source: hot+sealed` describes the
+                // fact tables; it says nothing about a maintained relation, whose rows came from a
+                // circuit rather than from a scan and are current only as far as its own watermark.
+                // A caller citing this answer needs to know both. Absent when the statement
+                // referenced no entity, and absent when the parse was unavailable - see
+                // `QueryOutput::referenced_tables`, which is why this is not an empty array.
+                "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref()),
             },
         }))
         .into_response(),
@@ -1457,6 +1508,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let tables = s.tables.clone();
+    let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
@@ -1475,6 +1527,24 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
                 (Default::default(), true)
             }
         };
+        // **The same relations `/sql` would see.** Without this, `/explain` answers a question about a
+        // different database than the one that runs the query, and the maintained relations are
+        // exactly where the two sets differ.
+        //
+        // It did not merely omit them, which would at least have been consistently wrong. DuckDB
+        // connections are pooled and `define_views` only refreshes tables in the *current* set, so a
+        // relation defined by an earlier `/sql` on that connection was still bound: the identical
+        // request returned `400 Table with name received does not exist` on a cold connection and
+        // `200 valid` once any `/sql` had warmed one. An agent validating its query before running
+        // it was told a good query was invalid, or told it was valid for the wrong reason, depending
+        // on which of the pool it landed on.
+        let mut hot = hot;
+        for entity in declared_entities.iter() {
+            if entity.unavailable().is_some() || entity.fault().is_some() {
+                continue;
+            }
+            hot.insert(entity.name().to_string(), entity.rows_as_json());
+        }
         let sealed_through = store.sealed_through();
         let mut out = analytics::query_hot_cold(
             &dir,
@@ -1544,6 +1614,219 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
     Json(json!({ "holders": s.balances.holders(), "count": items.len(), "items": items }))
+}
+
+/// The nest's authored incremental entities, and how current each one is (RFC-0041 §5.4, #822).
+///
+/// `/entities` keeps its existing meaning - decoded event rows - so maintained relations live under
+/// `/derived`. Two names for two different things beats one name that quietly changed.
+async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
+    let head = dataset_head(&s);
+    let items: Vec<Value> = s
+        .entities
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name(),
+                "rows": e.len(),
+                "incremental": true,
+                "applied_through": e.applied_through(),
+                "current": e.is_current(head),
+                "available": e.unavailable().is_none() && e.fault().is_none(),
+            })
+        })
+        .collect();
+    Json(json!({ "count": items.len(), "head": head, "entities": items }))
+}
+
+/// Why an entity cannot answer right now, if it cannot.
+///
+/// **§5.1: "A catching-up entity is reported as such; it never serves a plausible partial relation as
+/// current."** Criterion 8 asks the keyed and SQL routes to refuse or report not-current
+/// *consistently*, so the decision lives in one function rather than being made twice and drifting.
+///
+/// A faulted or unavailable entity is a **503**: it holds no answer and will not without operator
+/// action. A catching-up one is **not** an error - it is the ordinary state during backfill - but it
+/// is served with `current: false` and its own watermark, never stamped with the nest's head.
+fn derived_refusal(entity: &crate::entity_view::EntityView) -> Option<(StatusCode, Value)> {
+    if let Some(why) = entity.unavailable() {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "entity unavailable", "entity": entity.name(), "reason": why }),
+        ));
+    }
+    if let Some(why) = entity.fault() {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "entity faulted", "entity": entity.name(), "reason": why }),
+        ));
+    }
+    None
+}
+
+fn find_entity<'a>(
+    s: &'a AppState,
+    name: &str,
+) -> Result<&'a crate::entity_view::EntityView, Box<axum::response::Response>> {
+    s.entities.iter().find(|e| e.name() == name).ok_or_else(|| {
+        let known: Vec<&str> = s.entities.iter().map(|e| e.name()).collect();
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no such entity",
+                "entity": name,
+                "entities": known,
+            })),
+        )
+            .into_response()
+            .into()
+    })
+}
+
+/// Provenance for a derived answer (criterion 9): which entity, how far it has folded, and that the
+/// answer came from maintained state rather than a scan.
+/// The dataset's head block, as the hot store records it. `0` where it has none yet, which reads
+/// correctly through `EntityView::is_current`: an entity applied through nothing is current with a
+/// dataset that holds nothing.
+fn dataset_head(s: &AppState) -> u64 {
+    s.store
+        .get_meta("last_block")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// **#822 criterion 9 for `/sql`.** Which maintained relations answered this statement, how far each
+/// is applied, and whether that is current.
+///
+/// Built from the referenced-table set the security walk already produced rather than by matching
+/// entity names against the SQL text, so the provenance and the control that admits the query agree
+/// by construction. Returns `Value::Null` when no entity was referenced or when the set is unknown:
+/// an empty array would assert "this query touched no maintained state", which is a claim the `None`
+/// case has no basis to make.
+fn sql_entity_provenance(
+    s: &AppState,
+    referenced: Option<&std::collections::BTreeSet<String>>,
+) -> Value {
+    let Some(referenced) = referenced else {
+        return Value::Null;
+    };
+    let head = dataset_head(s);
+    let used: Vec<Value> = s
+        .entities
+        .iter()
+        .filter(|e| referenced.contains(&e.name().to_ascii_lowercase()))
+        .map(|e| {
+            json!({
+                "entity": e.name(),
+                "incremental": true,
+                "applied_through": e.applied_through(),
+                "current": e.is_current(head),
+            })
+        })
+        .collect();
+    if used.is_empty() {
+        return Value::Null;
+    }
+    Value::Array(used)
+}
+
+fn derived_provenance(s: &AppState, entity: &crate::entity_view::EntityView, head: u64) -> Value {
+    json!({
+        "nid": s.nid,
+        "entity": entity.name(),
+        "incremental": true,
+        "from_maintained_state": true,
+        "applied_through": entity.applied_through(),
+        "dataset_head": head,
+        "current": entity.is_current(head),
+    })
+}
+
+/// **Criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
+///
+/// It is a `BTreeMap` lookup against the circuit's own output. There is no connection, no
+/// `read_parquet`, and no hot-store scan on this path - which is the whole claim RFC-0041 makes, and
+/// the reason this route exists rather than routing keyed reads through `/sql`.
+async fn derived_key(
+    State(s): State<AppState>,
+    Path((name, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let entity = match find_entity(&s, &name) {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    if let Some((code, body)) = derived_refusal(entity) {
+        return (code, Json(body)).into_response();
+    }
+    let head = dataset_head(&s);
+
+    // The key is a single column here. A composite key arrives as its parts joined by the unit
+    // separator, the same character the built-in views use, so a key containing a comma or a slash
+    // cannot be mistaken for a delimiter.
+    let wanted = crate::entity_row::Row(
+        key.split('\u{1f}')
+            .map(|p| crate::entity_row::Scalar::Str(p.to_string()))
+            .collect(),
+    );
+    match entity.get(&wanted) {
+        Some(row) => Json(json!({
+            "key": key,
+            "row": row.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            "provenance": derived_provenance(&s, entity, head),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no such key",
+                "entity": name,
+                "key": key,
+                "provenance": derived_provenance(&s, entity, head),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// The whole maintained relation, bounded.
+///
+/// **Criterion 6 lives here**: returning every maintained row still pays for those rows. The limit is
+/// the same shape the other listing routes use, and the response says how many rows the relation
+/// holds so a caller can tell "all of it" from "the first page of it".
+async fn derived_all(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<EntitiesQuery>,
+) -> impl IntoResponse {
+    let entity = match find_entity(&s, &name) {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    if let Some((code, body)) = derived_refusal(entity) {
+        return (code, Json(body)).into_response();
+    }
+    let head = dataset_head(&s);
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let (rows, first) = entity.head_rows(limit);
+    let items: Vec<Value> = first
+        .iter()
+        .map(|(k, v)| {
+            json!({
+                "key": k.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                "row": v.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "entity": name,
+        "rows": rows,
+        "returned": items.len(),
+        "items": items,
+        "provenance": derived_provenance(&s, entity, head),
+    }))
+    .into_response()
 }
 
 /// Point-read a single address's derived balance.
@@ -1871,6 +2154,101 @@ mod tests {
         assert!(
             !entity_wedged(0, 100, 0, now),
             "an entity that has never folded a batch is waiting, not wedged"
+        );
+    }
+
+    /// **#822 criterion 8**, at the one place both routes consult.
+    ///
+    /// The keyed route and the listing route must refuse *consistently*, which they can only do by
+    /// sharing the decision. This asserts the decision itself: an entity holding no answer is a 503
+    /// with a reason, and a healthy one is not refused at all.
+    ///
+    /// Being *behind* is deliberately not a refusal - that is the ordinary state during backfill and
+    /// can last hours - so it is served with `current: false` and the entity's own watermark. The
+    /// failure this guards is the other one: refusing nothing and serving an empty relation as though
+    /// it were the truth.
+    #[test]
+    fn a_derived_route_refuses_an_entity_that_holds_no_answer() {
+        fn cols() -> Vec<String> {
+            vec!["to".into(), "sum_value".into()]
+        }
+
+        use crate::entity_expr::Expr;
+        use crate::entity_plan::{Agg, Plan, Source};
+
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Transfer","inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let reg = crate::registry::DecodeRegistry::build(vec![crate::registry::ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let plan = Plan {
+            left: Source {
+                table: "usdc__transfer".into(),
+                columns: vec!["to".into(), "value".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+
+        // Warm-started: no state, and no way to rebuild it until the seed runs.
+        let unavailable =
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1_000, true).unwrap();
+        let (code, body) = derived_refusal(&unavailable).expect("an unavailable entity is refused");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "entity unavailable");
+        assert!(
+            body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "the refusal must carry why, not merely that: {body}"
+        );
+
+        // Cold-started: nothing folded yet, but nothing wrong either.
+        let healthy =
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1_000, false).unwrap();
+        assert!(
+            derived_refusal(&healthy).is_none(),
+            "an empty-but-healthy entity answers; being behind is not an error"
+        );
+
+        // Faulted: a *different* refusal, and it has to be reached through its own branch. Testing
+        // only the unavailable case left a mutation that stops refusing faulted entities alive - a
+        // dead circuit would have gone on serving whatever it held when it died.
+        let dead =
+            crate::entity_view::EntityView::start("e", &plan, &cols(), &reg, 1, false).unwrap();
+        let row = |to: &str, v: i128| {
+            crate::entity_row::Row(vec![
+                crate::entity_row::Scalar::Str(to.into()),
+                crate::entity_row::Scalar::Int(v),
+            ])
+        };
+        dead.apply(
+            crate::entity_view::Batch {
+                left: vec![(row("0xa", 1), 1), (row("0xb", 2), 1)],
+                right: Vec::new(),
+            },
+            10,
+        );
+        dead.flush();
+        let (code, body) = derived_refusal(&dead).expect("a faulted entity is refused");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "entity faulted");
+        assert!(
+            body["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("max_rows")),
+            "the refusal must name the cause: {body}"
         );
     }
 

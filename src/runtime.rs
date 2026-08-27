@@ -308,6 +308,25 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 /// It is data-size driven over a fixed corpus rather than core-count driven, which is the property
 /// that made the multi-nest regression figure agree across machines - but criterion 12's artifact is
 /// a *cursor* measurement, not this one.
+///
+/// **Corroborated 2026-08-27 at real scale** (`tests/seed_scale.rs` against a Horizon nest on the
+/// ThinkPad), which is what the 889-row caveat above was asking for. Two shapes, same 346,288
+/// sealed source rows:
+///
+/// | relation | maintained rows | bytes/row |
+/// |---|---|---|
+/// | one key column, one aggregate | 309,549 | **940** |
+/// | two key columns, three aggregates | 322,357 | **1,482** |
+///
+/// So the amortised figure is 940-1,482 rather than 3,123, and the constant is between 2.2x and 3.4x
+/// it. Shape matters, as the per-row charge cannot see: a wider relation costs more per row, and
+/// 1,482 is the widest measured rather than the widest possible.
+///
+/// **Deliberately not lowered.** The margin costs an operator headroom - at 3,200 a cursor's 2 GB
+/// admits ~688,000 rows where the widest measured shape would fit ~1.48M - and that trade is worth
+/// making explicitly rather than as a side effect of one afternoon's measurement on one machine.
+/// Note also that half the old figure was two copies of the relation, one in the circuit and one in
+/// `Published`; #897 removed the second, so these numbers are not comparable to any taken before it.
 const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 
 /// What one authored entity's circuit and thread cost, before any of its declared rows.
