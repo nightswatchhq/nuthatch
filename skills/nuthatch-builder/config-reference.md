@@ -65,6 +65,12 @@ secret = "…"                  # optional HMAC signing secret
 [[alerts]]                    # optional (RFC-0008 C5)
 kinds = ["threshold_flag", "sanction_hit"]   # the only two valid kinds (match the emitted annotations)
 url = "https://…"
+format = "raw"                # optional, default "raw". "discord" for a Discord webhook, which will
+                              # not accept the raw payload: it answers 400 "Cannot send an empty
+                              # message" and the delivery worker retries a non-success forever, so a
+                              # raw sink there is an outbox that never drains. "discord" sends
+                              # {"content": "…"} instead. An unrecognised value is a load error, not
+                              # a silent fallback.
 
 [[calls]]                     # optional (RFC-0023 tier 3) - a pinned `eth_call`, stored as a table.
                               # Needs `--state-rpc <archive endpoint>`; the endpoint is NEVER a config
