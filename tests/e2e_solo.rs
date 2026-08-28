@@ -1396,13 +1396,23 @@ async fn a_hot_scan_failure_does_not_claim_bindable_completeness_over_http() {
     server.abort();
 }
 
-/// **#472 + #477, as one piece.** Every #472 fixture above scaffolds a single table, so
-/// `tip_unavailable` (nest-wide by construction - one hot-store scan covers every table at once) was
-/// never exercised on a nest that also had a *per-table* `degraded_tables` opinion to disagree with.
-/// Two contracts, `usdc` cold-corrupted and `arb` left intact; the hot tip fails to scan on top of
-/// that. Querying the healthy table has to come back naming only `usdc` as degraded while still
-/// carrying `tip_unavailable: true` for the tip loss that touches both tables equally - the fixture
-/// #477 called for, doing #472's job.
+/// **#472 + #477, as one piece - and #896 sharpened what "told apart" means.** Every #472 fixture
+/// above scaffolds a single table, so `tip_unavailable` was never exercised on a nest that also had
+/// a per-table `degraded_tables` opinion. Two contracts, `usdc` cold-corrupted and `arb` left
+/// intact; the hot tip fails to scan on top of that.
+///
+/// The two signals now differ in **scope**, which is the distinction worth holding:
+///
+/// - `tip_unavailable` is nest-wide by construction - one hot-store scan covers every table at once
+///   - so a query against the untouched table still carries it.
+/// - `degraded_tables` names what **this query** reached. It reached `arb`, and `arb` is healthy,
+///   so it names nothing.
+///
+/// Before #896 both were nest-wide and "told apart" was a statement about their contents. A query
+/// surveyed every table in the manifest to produce that second answer, which cost ~62 µs per sealed
+/// segment - 2.5 seconds on a real nest, before reading a row. `analytics::degraded_tables` is where
+/// the nest-wide question is asked now, and it is still asked here, because the corruption has not
+/// stopped mattering - only stopped being every caller's problem to discover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -1523,12 +1533,24 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
     );
     assert_eq!(
         resp["degraded_tables"],
-        serde_json::json!([usdc_table]),
-        "the flag names the table that is actually short - never the healthy one just queried: {resp}"
+        serde_json::json!([]),
+        "the query read only the healthy table, so it has nothing to caveat: {resp}"
     );
     assert!(
-        resp["degraded"].as_bool().unwrap_or(false),
-        "degraded_tables is non-empty, so the nest-wide flag must agree: {resp}"
+        !resp["degraded"].as_bool().unwrap_or(true),
+        "`degraded` is the one-bit form of `degraded_tables`, so the two must still agree: {resp}"
+    );
+
+    // And the corruption has not gone unnoticed - only stopped being this caller's problem. The
+    // nest-wide sweep is where the question is asked now, and it still answers.
+    let swept = nuthatch::analytics::degraded_tables(dir.path(), &[]).unwrap();
+    assert!(
+        swept.contains(&usdc_table),
+        "the sweep must still name the corrupted table: {swept:?}"
+    );
+    assert!(
+        !swept.contains(&arb_table),
+        "and never the healthy one: {swept:?}"
     );
     // Cold-only (the tip failed to scan), and the arb segment sealed [1,3] intact - the only rows this
     // query can honestly return; nothing invented from the tip it never read.
