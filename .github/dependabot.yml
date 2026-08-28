@@ -1,0 +1,16 @@
+# Pins are immutable SHAs (#829), which is the point: a retagged action cannot run with our release
+# credentials. The cost of immutability is that a pin never advances on its own, so an action with a
+# fixed vulnerability sits at the vulnerable commit indefinitely. Dependabot is what pays that cost -
+# it opens a PR raising the SHA, with the release notes, and CI decides.
+#
+# Without this, #829 trades a supply-chain risk for a staleness one and calls it a win.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - security

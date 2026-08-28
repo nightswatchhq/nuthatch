@@ -84,7 +84,7 @@ jobs:
       # survives to report elapsed time even when the job never reaches its last step normally.
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # #634. `release.yml` hard-fails when `docs/releases/<tag>.md` is missing, which is right, but
       # it discovers that *after the tag is pushed* - the most expensive moment to find out, and the
       # one where the fix means deleting a tag. The version bump is the moment the notes are owed, so
@@ -110,10 +110,10 @@ jobs:
             exit 1
           fi
           echo "$notes present, $(wc -c < "$notes") bytes"
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
           # on success() by default, so a job killed by an expired timeout seeds nothing and the next
@@ -223,11 +223,11 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           key: check-exex
@@ -282,9 +282,9 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
           # on success() by default, so a job killed by an expired timeout seeds nothing and the next
@@ -358,9 +358,9 @@ jobs:
     # `build-release` and `pg-parity` above rather than banking on that margin holding again.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
           # on success() by default, so a job killed by an expired timeout seeds nothing and the next
@@ -478,7 +478,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Dependency vulnerability scan (RUSTSEC) + permissive-only licence gate + banned-crate check.
       # Config + the honest ignore-list rationale live in deny.toml.
       #
@@ -491,7 +491,7 @@ jobs:
       # The lesson for whoever touches this next: the advisory DB is a live external input whose schema
       # moves. A scanner that hard-fails on an unknown CVSS version is one upstream change away from
       # blocking every release - so keep this current rather than pinned-and-forgotten.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories licenses bans sources
 
@@ -506,9 +506,9 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
           # on success() by default, so a job killed by an expired timeout seeds nothing and the next
@@ -519,7 +519,7 @@ jobs:
       - name: build
         run: cargo build --release --locked
       - name: upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nuthatch-release
           path: target/release/nuthatch
@@ -544,9 +544,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuthatch-release
           path: bin
@@ -578,9 +578,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuthatch-release
           path: bin
@@ -647,7 +647,7 @@ jobs:
       - name: upload report
         # Always: a run that failed the gate is the report you most want to read.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: point-read-report
           path: point-read-report.json
@@ -663,9 +663,9 @@ jobs:
     # can never hold a runner for GitHub's 6-hour job default (#449).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuthatch-release
           path: bin
@@ -748,7 +748,7 @@ jobs:
         # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
         # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: multinest-footprint-report
           path: |
@@ -775,8 +775,8 @@ jobs:
     # in the decode path - it must be fixed before merging.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
       # #586 applies here more sharply than anywhere else in this file. This job carries
       # `timeout-minutes: 45` and observed 40m26s on PR #592 - four and a half minutes of headroom,
       # nearly all of it `cargo install cargo-fuzz --locked` plus three nightly targets built from
@@ -785,7 +785,7 @@ jobs:
       # the next run starts cold too and is killed again. `continue-on-error` hides that entirely: a
       # job killed by its timeout still reports **success** to the checks API, so the deadlock would
       # tighten with nothing on screen to say so.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           cache-on-failure: true
