@@ -84,7 +84,7 @@ jobs:
       # survives to report elapsed time even when the job never reaches its last step normally.
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # #634. `release.yml` hard-fails when `docs/releases/<tag>.md` is missing, which is right, but
       # it discovers that *after the tag is pushed* - the most expensive moment to find out, and the
       # one where the fix means deleting a tag. The version bump is the moment the notes are owed, so
@@ -223,7 +223,7 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
@@ -282,7 +282,7 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -358,7 +358,7 @@ jobs:
     # `build-release` and `pg-parity` above rather than banking on that margin holding again.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -478,7 +478,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Dependency vulnerability scan (RUSTSEC) + permissive-only licence gate + banned-crate check.
       # Config + the honest ignore-list rationale live in deny.toml.
       #
@@ -506,7 +506,7 @@ jobs:
     steps:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -544,7 +544,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: download binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -578,7 +578,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: download binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -663,7 +663,7 @@ jobs:
     # can never hold a runner for GitHub's 6-hour job default (#449).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: download binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -775,7 +775,7 @@ jobs:
     # in the decode path - it must be fixed before merging.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
       # #586 applies here more sharply than anywhere else in this file. This job carries
       # `timeout-minutes: 45` and observed 40m26s on PR #592 - four and a half minutes of headroom,
