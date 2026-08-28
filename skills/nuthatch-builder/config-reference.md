@@ -63,7 +63,12 @@ since = "registration"        # optional: "genesis" | "registration" | a block n
 secret = "…"                  # optional HMAC signing secret
 
 [[alerts]]                    # optional (RFC-0008 C5)
-kinds = ["threshold_flag", "sanction_hit"]   # the only two valid kinds (match the emitted annotations)
+kinds = ["threshold_flag", "sanction_hit", "entity_fault"]
+                              # what to deliver. The first two are compliance annotations (RFC-0008
+                              # C5) and must match the emitted annotation's kind. `entity_fault` is
+                              # operational: an authored incremental entity's circuit has stopped,
+                              # which is terminal and quarantines the nest. Nothing validates this
+                              # list, so a typo is a sink that silently never fires.
 url = "https://…"
 format = "raw"                # optional, default "raw". "discord" for a Discord webhook, which will
                               # not accept the raw payload: it answers 400 "Cannot send an empty

@@ -403,6 +403,106 @@ max_rows = 1
     );
 }
 
+/// **The alert arrives before the nest stops.** A faulted entity quarantines the nest, so an
+/// operator finds out from `/ready` - if they happen to be looking. This is the one that goes out
+/// unasked.
+///
+/// Driven through a real nest against a real local webhook, asserting on **what arrived**, because
+/// the emit and the delivery are two different things and testing either alone proves neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_faulted_entity_pushes_an_alert_to_a_configured_sink() {
+    use axum::{routing::post, Json, Router};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let received = StdArc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let sink = received.clone();
+    let app = Router::new().route(
+        "/hook",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(body);
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let mut cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    cfg.alerts = vec![nuthatch::config::Alert {
+        kinds: vec!["entity_fault".into()],
+        url: format!("http://{addr}/hook"),
+        format: nuthatch::config::AlertFormat::Raw,
+    }];
+    // One row admitted, and the first window carries two - the same fault the test above uses.
+    std::fs::write(
+        dir.path().join("entities.toml"),
+        r#"[[entities]]
+name = "received"
+sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 1
+"#,
+    )
+    .unwrap();
+
+    let rt = indexer::spawn_nest(
+        tape,
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("the nest starts");
+    let store = rt.state.store.clone();
+
+    let _ = tokio::time::timeout(POLL_TIMEOUT, rt.ingest).await;
+
+    // The alert is enqueued to a durable outbox by the ingest loop; the delivery worker drains it.
+    // Drain it here rather than waiting on the worker's cadence.
+    let client = reqwest::Client::new();
+    let _ = nuthatch::alerts::deliver_pending(
+        store.as_ref(),
+        &client,
+        &std::collections::HashMap::new(),
+    )
+    .await;
+
+    let got = received.lock().unwrap().clone();
+    let alert = got
+        .iter()
+        .find(|a| a["kind"] == "entity_fault")
+        .unwrap_or_else(|| panic!("no entity_fault alert arrived: {got:?}"));
+    assert!(
+        alert["event"].as_str().unwrap_or("").contains("received"),
+        "the alert names the entity: {alert}"
+    );
+    assert_eq!(alert["annotation"]["entity"], "received");
+    assert!(
+        alert["annotation"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("max_rows"),
+        "and why it stopped, not merely that it did: {alert}"
+    );
+}
+
 /// #866 criterion 8, the other half: *"It cannot freeze quietly while sibling nests continue to
 /// report it healthy."*
 ///
