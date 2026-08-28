@@ -776,7 +776,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # nightly
       # #586 applies here more sharply than anywhere else in this file. This job carries
       # `timeout-minutes: 45` and observed 40m26s on PR #592 - four and a half minutes of headroom,
       # nearly all of it `cargo install cargo-fuzz --locked` plus three nightly targets built from
