@@ -276,6 +276,37 @@ mod tests {
         assert_eq!(w.window(), 1_000);
     }
 
+    /// **#903, found by a nest dying at 3.6 hours.** A tip race is not a cap.
+    ///
+    /// Alchemy answers a request that runs past its served head with
+    /// `-32602 "block range extends beyond current head block"`. The cap marker list contains the
+    /// bare string `"block range"` - which it needs, see the assertion below - so the message was
+    /// classified as a result cap. The chunker narrowed the window, which cannot help when the blocks
+    /// do not exist yet, reached a single block, and the tip loop exited with
+    /// `block N alone exceeds the provider's getLogs result cap`. A diagnosis that was never true,
+    /// on a nest that only needed to wait for head to catch up.
+    ///
+    /// Both directions are asserted, and the second one is the point: the obvious fix is to delete
+    /// the bare `"block range"` marker, and that would break cap detection on Alchemy's *real* cap
+    /// message, which contains `block range` and none of the more specific markers. A dead backfill
+    /// instead of a dead nest is not an improvement.
+    #[test]
+    fn a_tip_race_is_not_a_provider_cap() {
+        let beyond = "rpc error: {\"code\":-32602,\"message\":\"block range extends beyond current head block\"}";
+        assert!(
+            !is_result_too_large(&anyhow!("{beyond}")),
+            "asking past head is a race to retry, not a range to narrow"
+        );
+
+        // The marker that made it ambiguous is still load-bearing for the genuine article.
+        assert!(
+            is_result_too_large(&anyhow!(
+                "Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range"
+            )),
+            "Alchemy's real cap message carries `block range` and none of the narrower markers"
+        );
+    }
+
     #[test]
     fn detects_provider_cap_errors() {
         assert!(is_result_too_large(&anyhow!(

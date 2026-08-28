@@ -253,6 +253,26 @@ fn class_label(class: Option<&FailureClass>) -> &'static str {
 /// classifiers to prevent.
 pub(crate) fn looks_like_cap(body: &str) -> bool {
     let s = body.to_ascii_lowercase();
+    // **Not a cap, whatever else the message contains** (#903). A nest at tip asking for a block the
+    // provider has not served yet is a normal race, not a refusal to serve a range - narrowing the
+    // window cannot help, because the blocks do not exist.
+    //
+    // It is checked first because the cap list below matches it: Alchemy answers
+    // `-32602 "block range extends beyond current head block"`, and the bare `"block range"` marker
+    // catches it. The chunker then narrows to a single block, still fails, and the tip loop exits
+    // with `block N alone exceeds the provider's getLogs result cap` - a diagnosis that was never
+    // true, on a nest that only needed to wait. That killed a nest 3.6 hours into an overnight run.
+    //
+    // Returning `false` is the whole fix: `classify_status` sends a 400 that is not a cap to
+    // `Transient`, which the existing retry handles.
+    const NOT_CAP: &[&str] = &[
+        "beyond current head",
+        "beyond the current head",
+        "beyond head",
+    ];
+    if NOT_CAP.iter().any(|m| s.contains(m)) {
+        return false;
+    }
     const CAP: &[&str] = &[
         "response size",
         "too many results",
