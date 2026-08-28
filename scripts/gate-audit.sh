@@ -51,6 +51,10 @@ CASES=(
 # tape_clean guards exactly one thing: no recorded error in the CLEAN tape. Mutating anything else
 # in that file is not a mutation of what it claims - the gate is narrow on purpose and says so.
 "tape_clean|tape_clean|docs/bench/tapes/usdc-120-fixed-clean/entries.jsonl|\"outcome\":\"ok\"|\"outcome\":\"err\""
+# actions_are_pinned guards two things: that no action runs by a mutable tag, and (#928) that the two
+# dtolnay/rust-toolchain pins stay distinct, since that action takes its toolchain from the ref name.
+"actions_pinned_tag|actions_are_pinned|.github/workflows/ci.yml|actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4|actions/checkout@v4"
+"actions_pinned_toolchain|actions_are_pinned|.github/workflows/ci.yml|rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb|rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b"
 )
 
 

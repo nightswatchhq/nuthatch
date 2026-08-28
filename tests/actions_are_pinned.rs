@@ -135,3 +135,52 @@ fn dependabot_can_advance_the_pins() {
          repo just took on will never be raised:\n{s}"
     );
 }
+
+/// **#928.** `dtolnay/rust-toolchain` is the one action here whose *ref* is the configuration: the
+/// `1.95.0` branch bakes the version into its own script and declares no `toolchain` input, while the
+/// `nightly` branch defaults to `nightly`. Two branches of one repository, two different compilers.
+///
+/// Pinning both to SHAs (#829) removed the only signal that says which is which, and Dependabot walked
+/// straight into it: its first run proposed rewriting the **nightly** pin to the **1.95.0** SHA with
+/// the comment still reading `# nightly`. The fuzz job would have installed stable, `cargo-fuzz`
+/// needs nightly, and nothing in the diff looked wrong.
+///
+/// `dependabot.yml` now ignores that dependency, but an ignore rule is a request rather than a
+/// mechanism - somebody can still make this edit by hand. This is the mechanism: two distinct
+/// toolchains must keep two distinct SHAs, checked offline, no network.
+#[test]
+fn the_two_rust_toolchain_pins_stay_distinct() {
+    let mut by_comment: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    for (file, line, r) in every_uses() {
+        let Some(rest) = r.strip_prefix("dtolnay/rust-toolchain@") else {
+            continue;
+        };
+        let (sha, comment) = rest.split_once('#').unwrap_or_else(|| {
+            panic!("{file}:{line}: a rust-toolchain pin with no version comment is unreadable: {r}")
+        });
+        by_comment
+            .entry(comment.trim().to_string())
+            .or_default()
+            .insert(sha.trim().to_string());
+    }
+    assert!(
+        by_comment.len() >= 2,
+        "expected at least two distinct rust-toolchain lines (a pinned release and nightly); found \
+         {by_comment:?}. If the fuzz job stopped using nightly, that is the bug this guards."
+    );
+    for (comment, shas) in &by_comment {
+        assert_eq!(
+            shas.len(),
+            1,
+            "`# {comment}` is pinned to more than one SHA: {shas:?}"
+        );
+    }
+    let all: std::collections::BTreeSet<&String> = by_comment.values().flatten().collect();
+    assert_eq!(
+        all.len(),
+        by_comment.len(),
+        "two rust-toolchain comments share a SHA, so two different toolchains resolve to the same \
+         action branch - one of them is not the compiler its comment claims (#928):\n{by_comment:?}"
+    );
+}

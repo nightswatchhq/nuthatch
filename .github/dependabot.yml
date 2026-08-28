@@ -12,5 +12,19 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
-    labels:
-      - security
+    # Deliberately no blanket label. The first run labelled five routine version bumps `security`,
+    # which is how a label stops meaning anything: if every Dependabot PR is a security PR, none is.
+    # A real advisory arrives with GitHub's own security-update flag on it.
+    ignore:
+      # **`dtolnay/rust-toolchain` must not be bumped automatically** (#928). It encodes the toolchain
+      # in the *ref name* rather than an input: `@1.95.0` and `@nightly` are two branches of one
+      # repository whose `action.yml` files differ - the former bakes the version into its script and
+      # declares no `toolchain` input at all, the latter defaults to `nightly`.
+      #
+      # Dependabot sees one repository with two pinned SHAs and cannot know they mean different
+      # compilers. Its first run proposed rewriting the **nightly** pin to the **1.95.0** SHA, comment
+      # still reading `# nightly`, which would have run the fuzz job on stable while looking correct.
+      # `cargo-fuzz` requires nightly.
+      #
+      # Raising these two pins is a hand job, and a rare one: the action changes about twice a year.
+      - dependency-name: dtolnay/rust-toolchain
