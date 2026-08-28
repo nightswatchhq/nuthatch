@@ -1,0 +1,115 @@
+# An outside reader on every pull request.
+#
+# Eleven required contexts on `main` and a `reviewed-by signature` gate, and every one of those
+# signatures comes from the same firm that wrote the change. Twice now a double-dispatched run has
+# approved a PR and armed auto-merge while missing a real defect (#421, #412). A second opinion from
+# the same agents is not a second opinion. This job is one from outside: a different vendor, a
+# different model, no stake in the sprint, no knowledge of who wrote what.
+#
+# **Advisory on purpose.** It is not in `.github/required-checks.txt` and it blocks nothing. A
+# reviewer nobody has read yet is not a control, and a required check that fails on prose judgement
+# is a trap for the author. Promote it only if its comments turn out to be worth reading - the test
+# being whether it ever finds something the firm's own review missed.
+#
+# **The diff comes from the API, never from a checkout of the head.** We check out the default
+# branch for the script and for `CLAUDE.md`, then ask `gh` for the diff. Fork code is read as text
+# and sent to a model; it is never placed on the runner where a build could execute it.
+#
+# **Who may spend our tokens.** `pull_request` from a fork gets no secrets, so an outsider's PR is
+# skipped rather than reviewed - that is GitHub's rule, not ours, and the job says so instead of
+# failing. `issue_comment` *does* carry secrets, which is why `/re-review` is gated on write access:
+# without that check any passer-by could run the model as often as they liked on our account.
+name: outside review
+
+on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "pull request number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One review at a time per PR. A `/re-review` fired twice in quick succession should cost one
+# review, not two, and the later comment is the one anybody wants.
+concurrency:
+  group: outside-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: outside review
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/re-review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: which pull request
+        id: pr
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request)   n='${{ github.event.pull_request.number }}' ;;
+            issue_comment)  n='${{ github.event.issue.number }}' ;;
+            workflow_dispatch) n='${{ inputs.pr }}' ;;
+          esac
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          echo "Reviewing #$n" >> "$GITHUB_STEP_SUMMARY"
+
+      # Warn and skip, in the one case where a missing key is expected rather than broken: a PR from
+      # a fork, which GitHub deliberately runs without secrets. Anything else with no key is a
+      # misconfiguration and should be loud, so it is reported as a skip with its reason named.
+      - name: is the key here
+        id: key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "have=no" >> "$GITHUB_OUTPUT"
+            echo "No \`OPENAI_API_KEY\` in this context - skipped, not reviewed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "have=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: fetch the diff
+        if: steps.key.outputs.have == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr diff "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" > pr.diff
+          gh pr view "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
+            --json title,body --jq '.title' > pr.title
+          gh pr view "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
+            --json title,body --jq '.body' > pr.body
+          wc -c pr.diff
+
+      - name: review
+        if: steps.key.outputs.have == 'yes'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 scripts/pr-review.py \
+            --diff pr.diff \
+            --title "$(cat pr.title)" \
+            --body-file pr.body > review.md
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: post it
+        if: steps.key.outputs.have == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
+            --body-file review.md
