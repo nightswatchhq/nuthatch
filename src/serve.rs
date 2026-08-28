@@ -637,6 +637,40 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
 ///
 /// Labelled by entity name and emitted per nest, so a runtime hosting several says which is which.
 /// Empty when the nest declares no entities, rather than a block of zeroes for a feature not in use.
+/// The entity series, as `(name, help)`, in the order they are emitted.
+///
+/// **A table rather than six literals, because a gate reads it.**
+/// `skill_refs::authored_files_only_mention_real_metrics` builds its canonical set from
+/// `Metrics::render()`, which is where every series lived until these were appended alongside it -
+/// so a name documented in the builder skill was reported as not existing. The emitter below and
+/// that gate now read the same list, which is the only arrangement in which they cannot drift.
+pub const ENTITY_SERIES: &[(&str, &str)] = &[
+    (
+        "nuthatch_entity_applied_through",
+        "Last block folded into this maintained relation.",
+    ),
+    (
+        "nuthatch_entity_current",
+        "1 when the relation has caught up with the dataset head.",
+    ),
+    (
+        "nuthatch_entity_rows",
+        "Rows the maintained relation currently holds.",
+    ),
+    (
+        "nuthatch_entity_faulted",
+        "1 when the circuit has stopped. Terminal.",
+    ),
+    (
+        "nuthatch_entity_unavailable",
+        "1 when the relation holds no answer and is not served.",
+    ),
+    (
+        "nuthatch_entity_seconds_since_progress",
+        "Seconds since this relation's watermark last moved.",
+    ),
+];
+
 fn entity_metrics(s: &AppState) -> String {
     if s.entities.is_empty() {
         return String::new();
