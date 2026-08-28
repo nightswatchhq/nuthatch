@@ -87,14 +87,26 @@ fn readme_names_the_three_circuits_and_query_time_views() {
 }
 
 #[test]
-fn claude_md_parks_authored_incremental_entities_on_rfc_0041() {
+fn claude_md_keeps_the_two_speeds_distinct_now_that_rfc_0041_has_shipped() {
     let text = fs::read_to_string(root().join("CLAUDE.md")).expect("CLAUDE.md");
-    // Asserts the property, not the vocabulary. The 2026-08-24 carve-out replaced "frozen" with an
-    // approved-but-unshipped status, which is a different sentence and the same guarantee: the
-    // standing brief must never read as though authored incremental entities already work.
+    // **This assertion was inverted on 2026-08-28, and the inversion is the honest change.** It read
+    // `do not describe them as shipped`, guarding a claim that was false while RFC-0041 was
+    // unbuilt. It is built: #818, #820, #821 and #822 are closed and slice 3's criteria were
+    // measured against a copy of the real Lodestar nest. A gate asserting a fact that has stopped
+    // being true is not protecting anything - it is holding the docs at a version of the product
+    // that no longer exists.
+    //
+    // What it must *not* become is a deletion. The guard's real subject is #819's overclaim, and
+    // that survives: the `BROAD` scan above is untouched, because "incremental-view blockchain
+    // indexing" is still false however much of RFC-0041 shipped. So the shipped/unshipped clause
+    // flips and the two-speeds clause below does not.
     assert!(
-        text.contains("RFC-0041") && text.contains("do not describe them as shipped"),
-        "CLAUDE.md must name RFC-0041 and say it is not shipped, whatever its approval status"
+        text.contains("RFC-0041") && text.contains("shipped 2026-08-28"),
+        "CLAUDE.md must name RFC-0041 and say when it shipped"
+    );
+    assert!(
+        !text.contains("do not describe them as shipped"),
+        "the standing brief still carries the pre-3.0.0 line saying entities are unshipped"
     );
     assert!(
         text.contains("views/*.sql") && text.contains("Not incremental"),
