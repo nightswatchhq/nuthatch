@@ -1,6 +1,6 @@
 # An outside reader on every pull request.
 #
-# Eleven required contexts on `main` and a `reviewed-by signature` gate, and every one of those
+# Ten required contexts on `main` and a `reviewed-by signature` gate, and every one of those
 # signatures comes from the same firm that wrote the change. Twice now a double-dispatched run has
 # approved a PR and armed auto-merge while missing a real defect (#421, #412). A second opinion from
 # the same agents is not a second opinion. This job is one from outside: a different vendor, a
