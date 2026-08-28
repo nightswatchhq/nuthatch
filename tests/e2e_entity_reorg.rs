@@ -699,6 +699,79 @@ async fn explain_binds_a_maintained_relation_on_a_cold_connection() {
     shutdown_and_settle(rt).await;
 }
 
+/// **The series an operator alerts on.** There were none until the alpha: a maintained relation had
+/// no `/metrics` presence at all, so the only way to ask "is it keeping up" was to poll `/ready` and
+/// parse JSON - which is exactly what the first live tip-following run had to do, with a bespoke
+/// shell script.
+///
+/// Asserted through the real router on a real nest, and asserted on the **values**, not just the
+/// names: a series that exists and always reads zero is worse than no series, because a dashboard
+/// built on it looks healthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_metrics_endpoint_carries_the_entity_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    let (status, body) = get_json(&rt, "/metrics").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let text = body["raw"]
+        .as_str()
+        .expect("/metrics is plain text")
+        .to_string();
+
+    // Applied through the head it actually folded, not zero and not the head it was asked for.
+    assert!(
+        text.contains(&format!(
+            "nuthatch_entity_applied_through{{nest=\"usdc\",entity=\"received\"}} {CHAIN_LEN}"
+        )),
+        "applied_through must carry the block it folded:\n{text}"
+    );
+    assert!(
+        text.contains("nuthatch_entity_current{nest=\"usdc\",entity=\"received\"} 1"),
+        "a caught-up relation reads current:\n{text}"
+    );
+    // The relation has one group in this fixture - every transfer goes to the same recipient - so a
+    // `rows` series reading 0 would mean it is reporting the wrong thing, not that it is empty.
+    assert!(
+        text.contains("nuthatch_entity_rows{nest=\"usdc\",entity=\"received\"} 1"),
+        "rows must be the relation's size:\n{text}"
+    );
+    for dead in ["faulted", "unavailable"] {
+        assert!(
+            text.contains(&format!(
+                "nuthatch_entity_{dead}{{nest=\"usdc\",entity=\"received\"}} 0"
+            )),
+            "a healthy entity reads 0 for {dead}:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("nuthatch_entity_seconds_since_progress{nest=\"usdc\",entity=\"received\"}"),
+        "the wedged-detection series must be present:\n{text}"
+    );
+    // Every series carries HELP and TYPE, or Prometheus takes them as untyped.
+    for name in [
+        "applied_through",
+        "current",
+        "rows",
+        "faulted",
+        "unavailable",
+        "seconds_since_progress",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE nuthatch_entity_{name} gauge")),
+            "nuthatch_entity_{name} needs a TYPE line:\n{text}"
+        );
+    }
+
+    shutdown_and_settle(rt).await;
+}
+
 /// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
 /// and remains bounded by existing guards. Documentation does not imply IVM repeals I/O."*
 ///
