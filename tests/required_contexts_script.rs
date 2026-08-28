@@ -61,11 +61,19 @@ fn no_token_is_a_failure_not_a_pass() {
 #[test]
 fn the_failure_names_a_recovery_path_that_exists_in_the_failing_state() {
     // A required-check failure message that says "see the docs" is unreachable advice at the moment
-    // it is needed. This one has to name the Actions permission, because the default GITHUB_TOKEN
-    // cannot read branch protection and that is the non-obvious half.
+    // it is needed. This one has to name a credential that can actually do the job, because the
+    // default GITHUB_TOKEN cannot read branch protection and that is the non-obvious half.
+    //
+    // **It asserted `administration: read` until #909**, which is the very non-key that stopped this
+    // workflow validating - so the test enforced the one recovery path that does not exist, which is
+    // the failure it was written to prevent. The reachable path is the secret.
     let root = root_with(TEN);
     let (_, out) = run(root.path(), &[]);
-    assert!(out.contains("administration: read"), "{out}");
+    assert!(out.contains("PROTECTION_READ_TOKEN"), "{out}");
+    assert!(
+        out.contains("administration"),
+        "and it must still say why the obvious-looking permissions key is not the answer:\n{out}"
+    );
     assert!(out.contains("--offline"), "{out}");
     assert!(out.contains("gh auth token"), "{out}");
 }
