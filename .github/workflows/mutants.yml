@@ -65,9 +65,9 @@ jobs:
           - file: src/registry.rs
             timeout: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # One shared cache across the three jobs - they build the identical baseline.
           shared-key: mutants
@@ -103,7 +103,7 @@ jobs:
 
       - name: keep the output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Per file, or the three jobs race for one artifact name.
           name: mutants-out-${{ strategy.job-index }}
