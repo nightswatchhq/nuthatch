@@ -10,6 +10,13 @@ on:
 permissions:
   contents: write
   packages: write
+  # #830. `attest-build-provenance` mints a Sigstore bundle signed with a short-lived certificate
+  # obtained from GitHub's OIDC provider, so what is attested is the *workflow run on this
+  # repository*, not a key somebody holds. `id-token: write` lets the job request that token;
+  # `attestations: write` lets it store the result. Neither grants anything a release job that can
+  # already write releases and packages did not effectively have.
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -141,6 +148,29 @@ jobs:
             nuthatch-scaled-${{ matrix.target }}.tar.gz
             nuthatch-scaled-${{ matrix.target }}.tar.gz.sha256
           fail_on_unmatched_files: true
+
+      # **#830: a checksum from the same release proves nothing.** A `.sha256` sidecar downloaded
+      # beside the tarball it describes says only that the file did not corrupt in transit. Anyone
+      # able to replace the tarball can replace the sidecar in the same breath, and a compromised
+      # release credential or a retagged action (#829) leaves both perfectly consistent.
+      #
+      # An attestation is signed by GitHub's OIDC identity for this workflow run and recorded in a
+      # public transparency log, so it answers what the sidecar cannot: who built this, from which
+      # commit, in which workflow. There is no key for us to hold, rotate, or leak.
+      #
+      # Attested **here**, on the machine that produced the file, not in `publish`: attesting a file
+      # downloaded back from the release would certify only that we successfully downloaded whatever
+      # is sitting there.
+      - name: attest the built artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: nuthatch-${{ matrix.target }}.tar.gz
+
+      - name: attest the scaled artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: nuthatch-scaled-${{ matrix.target }}.tar.gz
       - name: keep the scaled binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -242,6 +272,33 @@ jobs:
     needs: container
     runs-on: ubuntu-latest
     steps:
+      # #830 asks the workflow to verify artifact identity **before publishing**, which is the half
+      # that makes an attestation load-bearing rather than decorative. This downloads the release's
+      # own assets and verifies each against the transparency log - the same command a user runs, run
+      # once by us first - so a release whose provenance does not verify never becomes public.
+      #
+      # `--repo` is what binds it. Without that flag `gh attestation verify` will accept an
+      # attestation from *any* repository, which is most of the property we are trying to establish.
+      - name: verify provenance before publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p verify && cd verify
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz' --clobber
+          shopt -s nullglob
+          files=(*.tar.gz)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no tarballs on the release to verify - the build matrix attached nothing"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "--- $f ---"
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+          done
+          echo "provenance verified for ${#files[@]} artifact(s)"
+
       - name: undraft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

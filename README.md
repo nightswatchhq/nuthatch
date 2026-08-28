@@ -58,6 +58,22 @@ Silicon and Linux x86_64 (dynamically linked; needs glibc 2.35 or newer - Debian
 RHEL 9 and Amazon Linux 2023 all clear that floor) and are attached to every release with their
 checksums, if you would rather fetch one by hand.
 
+**Verify who built it.** The SHA-256 sidecar beside each tarball tells you the file did not corrupt in
+transit, and nothing more: whoever could replace the tarball could replace the sidecar in the same
+breath. Every release binary therefore carries a **build provenance attestation**, signed by GitHub's
+identity for the workflow run that produced it and recorded in a public transparency log. One command,
+and it needs no key from us:
+
+```sh
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nightswatchhq/nuthatch
+```
+
+That answers what a checksum cannot: which repository, which commit and which workflow built this
+file. `--repo` is the load-bearing part - without it, an attestation from *any* repository is accepted,
+which is most of the property you are checking for. The release workflow runs the same verification
+against its own assets before it publishes, so a release whose provenance does not verify never becomes
+public in the first place.
+
 **From source**, which is the only route on a platform we do not publish a binary for:
 
 ```sh
