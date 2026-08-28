@@ -89,12 +89,15 @@ change requires mutating sealed segments, the design is wrong - go back.
 - Authored SQL (shipped, RFC-0018 §1): `views/*.sql` are named queries evaluated at request
   time over hot ∪ sealed. Not incremental.
 - Authored incremental entities: [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
-  **approved for implementation 2026-08-24**, off the back of GraphOps feedback that a view
-  recomputed on every query gives the caller a name but no query-performance benefit. The 2026
-  feature freeze is lifted for this work specifically and for nothing else. It proceeds only
-  through the ordered issue sequence in §9 - #818 compiler and budget gate, then #820 authoring
-  and validation, then #821 lifecycle and reorg, then #822 serving - and #818 must produce an
-  explicit go decision before any later slice starts. Not shipped: do not describe them as shipped.
+  **shipped 2026-08-28** in 3.0.0-alpha, off the back of GraphOps feedback that a view recomputed on
+  every query gives the caller a name but no query-performance benefit. The 2026 feature freeze was
+  lifted for this work specifically and for nothing else, and that carve-out is now spent: the
+  ordered sequence in §9 is complete (#818, #820, #821, #822) and the freeze applies again in full.
+  An entity is declared in `entities.toml`, maintained by DBSP as blocks arrive, served from
+  `/derived` and by name from `/sql`. Slice 3's criteria were measured against a copy of the real
+  Lodestar nest: the panel it replaces went p50 2.15 s to 87.7 ms, and one block's update is flat at
+  ~285 µs against 309,548 groups. RFC-0033's durable grafting (#357) is **not** in v1 - per-entity
+  reuse across an NID change is still a whole-nest local rebuild.
 - Imperative (escape hatch): WASM component handlers, per the transform layer below.
 
 ## The transform layer: lessons from liminal (nightswatchhq/liminal)

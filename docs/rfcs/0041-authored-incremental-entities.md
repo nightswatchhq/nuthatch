@@ -1,7 +1,14 @@
 # RFC-0041: Authored incremental entities - make predefined computation pay at indexing time
 
-- Status: **Approved for implementation (2026-08-24).** The work proceeds only through the
-  ordered issue sequence in §9. RFC-0033's durable grafting follow-up (#357) is not part of v1.
+- Status: **Implemented (2026-08-28).** The ordered issue sequence in §9 is complete: #818, #820,
+  #821 and #822 are all closed, and slice 3's twelve acceptance criteria were measured against a copy
+  of the real Lodestar nest rather than a fixture. RFC-0033's durable grafting follow-up (#357) is
+  not part of v1 and remains open.
+
+  Three defects surfaced by those measurements are fixed and merged with the work: a restart keeping
+  only `groups mod 10,000` of a relation (#894), an update cost that grew with history rather than
+  with the block (#897), and `/explain` answering differently depending on connection state (#895).
+  None was visible from the test suite; each needed a real nest. Shipping in 3.0.0-alpha.
 - Author: Jenny
 - Date: 2026-08-24
 - Depends on: RFC-0018 §1/§3 (authored SQL and the deferred hot-view promise), RFC-0013 §3
