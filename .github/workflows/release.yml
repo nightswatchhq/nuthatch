@@ -26,7 +26,7 @@ jobs:
     name: release notes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: resolve release notes
         id: notes
         run: |
@@ -53,7 +53,7 @@ jobs:
       # the same reason `draft` is: the attach steps below issue *updates*, and an unset input on
       # update is not a thing to bet a public release on.
       - name: create draft release with notes
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           body_path: ${{ steps.notes.outputs.path }}
           draft: true
@@ -84,11 +84,11 @@ jobs:
           # and Intel Macs are a shrinking minority; those users build from source (cargo install)
           # or run under a future addition. The installer routes them to the build-from-source path.
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
           # on success() by default, so a job killed by an expired timeout seeds nothing and the next
@@ -106,7 +106,7 @@ jobs:
           shasum -a 256 "$tarball" > "$tarball.sha256"
           ls -lh "$tarball"
       - name: attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -133,7 +133,7 @@ jobs:
           ls -lh "$tarball"
       - name: attach scaled build to release
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -143,7 +143,7 @@ jobs:
           fail_on_unmatched_files: true
       - name: keep the scaled binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nuthatch-scaled-binary
           path: target/${{ matrix.target }}/release/nuthatch
@@ -156,7 +156,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: keep the linux binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nuthatch-linux-binary
           path: target/${{ matrix.target }}/release/nuthatch
@@ -169,12 +169,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuthatch-linux-binary
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -205,7 +205,7 @@ jobs:
       # `latest`: the default image stays the one you get by not thinking about it, because embedded
       # mode is the primary deliverable and the scaled one carries a database driver.
       - name: fetch the scaled binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuthatch-scaled-binary
           path: scaled
