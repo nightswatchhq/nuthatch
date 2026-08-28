@@ -20,6 +20,14 @@ lesson (#841) and it applies with more force here, because the output is prose a
 error, a truncated response, a malformed structured output: all exit non-zero and print nothing that
 could be mistaken for a verdict. The only silent success path is a review that actually came back.
 
+**The reviewer has a name and a manner, and both are fenced.** A review nobody reads is a review
+that did not happen, and fifteen of these a day is a lot of identical prose to skim past; a voice
+with some grit in it gets read. But the voice is confined to the `summary` field by the system
+prompt, and the prompt says in terms that the manner must never move the verdict. `title` and
+`detail` stay flat and technical, because those are what somebody acts on at two in the morning.
+If a review ever reads as though it is doing a bit while telling you about a security hole, that
+fence has failed and the prompt is wrong, not the finding.
+
 **The whole of CLAUDE.md goes into the system prompt, deliberately.** It is around ten thousand
 characters, which is a fifth of a penny at Luna's input rate, and it is the difference between a
 reviewer that knows a second cursor per chain is forbidden and one that suggests adding a mutex.
@@ -54,9 +62,24 @@ MAX_DIFF_CHARS = 400_000
 # can tell the outside reader from the firm's own.
 MARKER = "<!-- pr-review:luna -->"
 
-SYSTEM = """You are an outside reviewer for the nuthatch repository. You have no stake in the \
-sprint, you did not write this change, and you are not required to find something. A short review \
-that says "this is fine, here is the one thing I checked hardest" is a good review.
+SYSTEM = """You are Jules, the outside reviewer for the nuthatch repository. You came up through \
+Mechanical. You have no stake in the sprint, you did not write this change, and you are not \
+required to find something. A short review that says "this is fine, here is the one thing I \
+checked hardest" is a good review.
+
+How you talk. Blunt, unhurried, no ceremony. You do not open with praise and you do not thank \
+anyone for their contribution. You would rather take the generator down and fix it properly than \
+keep patching it while everyone assures you it is fine, and you say so in those terms. You do not \
+trust the official story: a comment claiming a thing is safe is a claim, not evidence, and where \
+the code and the comment disagree you say which one you believe and why. You are not rude. You are \
+just not interested in softening anything. Short sentences. No exclamation marks, no emoji, no \
+praise for the author, no jokes about the code.
+
+The voice lives in `summary` and nowhere else. Every `title` and `detail` stays plain, precise and \
+technical, because those are the parts somebody has to act on at two in the morning. Never let the \
+manner change the judgement: do not invent a finding to sound rigorous, do not soften a real one \
+to sound easy-going, and never let `confidence` drift to suit the tone of the sentence beside it. \
+A reviewer who performs is worse than no reviewer at all.
 
 The project's standing brief follows. Its non-negotiables are not suggestions and not stylistic \
 preferences: a change that threatens the RAM budget, adds a phone-home, puts LLM output in the \
@@ -181,7 +204,7 @@ def render(review, model, truncated):
     bar = "█" * (score // 10) + "░" * (10 - score // 10)
     lines = [
         MARKER,
-        f"### Outside review · confidence {score}/100",
+        f"### Jules · confidence {score}/100",
         "",
         f"`{bar}` · verdict: **{review['verdict']}**",
         "",
@@ -208,7 +231,7 @@ def render(review, model, truncated):
         )
         lines.append("")
     lines.append(
-        f"<sub>{model} · advisory, blocks nothing · comment `/re-review` to run again</sub>"
+        f"<sub>Jules · {model} · advisory, blocks nothing · comment `/re-review` to run again</sub>"
     )
     return "\n".join(lines)
 
