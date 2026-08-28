@@ -11,9 +11,10 @@
 # is a trap for the author. Promote it only if its comments turn out to be worth reading - the test
 # being whether it ever finds something the firm's own review missed.
 #
-# **The diff comes from the API, never from a checkout of the head.** We check out the default
-# branch for the script and for `CLAUDE.md`, then ask `gh` for the diff. Fork code is read as text
-# and sent to a model; it is never placed on the runner where a build could execute it.
+# **The diff comes from the API, never from a checkout of the head.** The checkout is pinned to the
+# default branch - see the note on the step, which is load-bearing rather than decorative - and the
+# diff arrives through `gh`. PR code is read as text and sent to a model; it is never placed on the
+# runner, and never executed with a secret in scope.
 #
 # **Who may spend our tokens.** `pull_request` from a fork gets no secrets, so an outsider's PR is
 # skipped rather than reviewed - that is GitHub's rule, not ours, and the job says so instead of
@@ -23,7 +24,7 @@ name: outside review
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, reopened]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -55,7 +56,21 @@ jobs:
        contains(github.event.comment.body, '/re-review') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
+      # `ref` is not optional here, and the reason cost us a live finding on PR #908. The default
+      # for `actions/checkout` on a `pull_request` event is the PR's own merge ref - so without
+      # this, the `pr-review.py` executed below with `OPENAI_API_KEY` in scope is the version the
+      # PR author wrote, and any collaborator could edit it to post the key elsewhere. The
+      # fork-gets-no-secrets rule does not help: a same-repo PR carries the secret, and this repo
+      # takes fifteen same-repo PRs a day. Pin to the default branch; the PR reaches this job as
+      # data through `gh pr diff` and never as code.
+      #
+      # The consequence is deliberate: a PR that edits this script or `CLAUDE.md` is reviewed by
+      # `main`'s copy of both, not its own. That is the correct direction - a change cannot vouch
+      # for itself.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: which pull request
         id: pr
