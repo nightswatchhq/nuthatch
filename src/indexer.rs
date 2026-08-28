@@ -4166,6 +4166,29 @@ impl NestIngest {
         // that may since have restarted.
         for entity in self.entities.iter() {
             if let Some(why) = entity.fault() {
+                // Push it before bailing. A fault here is terminal and quarantines the nest, so the
+                // operator finds out from `/ready` - if they are looking. `nuthatch_entity_faulted`
+                // is the series to build a dashboard on; this is the one that arrives unasked.
+                //
+                // Best-effort on purpose: a webhook that will not enqueue must not change what
+                // happens to the nest, and what happens to the nest is that it stops either way.
+                if self.router.watches("entity_fault") {
+                    let ann = serde_json::json!({
+                        "nest": self.name,
+                        "entity": entity.name(),
+                        "reason": why,
+                        "applied_through": entity.applied_through(),
+                    });
+                    if let Err(e) = alerts::enqueue(
+                        &self.store,
+                        &self.router,
+                        &format!("entity `{}` stopped", entity.name()),
+                        "entity_fault",
+                        &ann,
+                    ) {
+                        tracing::warn!("could not enqueue the entity_fault alert: {e:#}");
+                    }
+                }
                 anyhow::bail!(TerminalFault(format!(
                     "the circuit for entity `{}` has stopped: {why}",
                     entity.name()
