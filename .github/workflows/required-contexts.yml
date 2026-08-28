@@ -22,11 +22,21 @@ on:
     branches: [main]
     paths: [".github/required-checks.txt"]
 
-# Reading `branches/main/protection` is an admin-scoped read. The default GITHUB_TOKEN does not
-# carry it, and without it the script fails loudly rather than passing quietly (#845).
+# Reading `branches/main/protection` is an admin-scoped read, and **`GITHUB_TOKEN` cannot be given
+# it** (#909). It needs a PAT or App token, supplied here as `secrets.PROTECTION_READ_TOKEN`.
+#
+# This block used to read `administration: read`, which is not a key `permissions:` accepts - it is
+# an App/PAT scope, not a workflow one. GitHub rejected the whole file at validation, so **every run
+# of this workflow died before its first job**: the last hundred were all `failure` with zero jobs,
+# no logs, and a 404 from the jobs API, firing on branches the `on:` filters above exclude because
+# those filters were never evaluated either. Not one scheduled run in that window. The job that
+# exists to notice branch protection drifting had never once made the comparison.
+#
+# The tell was there to be read and nobody read it, because a workflow that fails before it starts
+# looks exactly like a workflow nobody is looking at. If this file ever produces a run with zero
+# jobs again, that is what it means - go and check the syntax, do not go looking at the script.
 permissions:
   contents: read
-  administration: read
 
 jobs:
   drift:
@@ -35,7 +45,20 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # `shell: bash` is load-bearing and is not the same as omitting it. The default for a `run:`
+      # step is `bash -e {0}` with **no `pipefail`** - this repo's own logs say so, every step
+      # printing `shell: /usr/bin/bash -e {0}`. The previous form here was
+      #
+      #     run: bash scripts/check-required-contexts.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      #
+      # whose exit status is `tee`'s, and `tee` always succeeds. #845 built the script to treat a
+      # missing token as a failure rather than a pass, and this line threw that away one step later:
+      # even with the permission fixed, the check could not have gone red. `shell: bash` supplies
+      # `-o pipefail`, so the script's exit status is the step's again (#909).
       - name: compare the committed list against live protection
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PROTECTION_READ_TOKEN }}
         run: bash scripts/check-required-contexts.sh | tee -a "$GITHUB_STEP_SUMMARY"

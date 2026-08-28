@@ -11,9 +11,15 @@
 # So: no token is a **failure**, and `--offline` is how a caller says it knows and wants the
 # file-only check anyway. "I could not compare" must never render as "they match".
 #
-# The token needs read access to branch protection, which on a GitHub Actions `GITHUB_TOKEN` means
-# `permissions: administration: read` - the default token does not carry it. That is why the failure
-# text below names the permission rather than just saying "no token".
+# The token needs read access to branch protection, and **`GITHUB_TOKEN` cannot be given it at all**
+# (#909). `administration` is an App/PAT scope; it is not a key the workflow `permissions:` block
+# accepts, and a file that names it is rejected at validation, so the workflow never starts. This
+# comment used to say the opposite, and so did the FAIL text below - which meant the recovery path
+# offered to a reader at the moment they needed it could not be taken. A failure message naming an
+# impossible fix is worse than one that says nothing.
+#
+# The reachable path is a PAT or App token with repo admin read, held as the repository secret
+# `PROTECTION_READ_TOKEN` and passed in as `GH_TOKEN`.
 set -euo pipefail
 
 offline=0
@@ -50,9 +56,11 @@ against what GitHub actually enforces; without a token it has compared nothing, 
 success would mean "the check that watches the checks" is itself scenery.
 
   - Locally:     GH_TOKEN=$(gh auth token) scripts/check-required-contexts.sh
-  - In Actions:  the job needs `permissions: { administration: read }` - reading
-                 branches/main/protection is an admin-scoped read and the default GITHUB_TOKEN
-                 does not carry it.
+  - In Actions:  set the repository secret PROTECTION_READ_TOKEN to a PAT (or App token) with
+                 admin read on this repo, and pass it as GH_TOKEN. GITHUB_TOKEN cannot do this
+                 job: reading branches/main/protection is an admin-scoped read, and there is no
+                 `permissions:` key that grants it (#909 - naming `administration` there is not
+                 merely useless, it invalidates the workflow file and stops it running at all).
   - Deliberately without a token: pass --offline, which checks the file alone and says so.
 MSG
   exit 1
