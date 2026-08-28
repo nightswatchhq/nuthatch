@@ -361,11 +361,14 @@ who need more - none of it in the way of the happy path:
   honouring it would let whoever emitted the event choose what your indexer connects to.
 - **Factory / dynamic contracts** (RFC-0009). Watch a factory (e.g. a pool factory); children are
   discovered at runtime and indexed into shared `{template}__*` tables - no redeploy per child.
-- **Derivation, two speeds.** Decoded events are tables, sealed as they index. Three built-in
+- **Derivation, three speeds.** Decoded events are tables, sealed as they index. Three built-in
   relations - balances, exposure, velocity - are incremental DBSP circuits; a reorg is a
   retraction. Nest-authored `views/*.sql` are named SQL evaluated at query time over hot ∪ sealed,
-  not IVM. General authored incremental entities are [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
-  frozen for the rest of 2026. A WASM transform layer remains the imperative escape hatch.
+  not IVM. And a nest can declare its own **authored incremental entities** in `entities.toml`
+  ([RFC-0041](docs/rfcs/0041-authored-incremental-entities.md)): a `SELECT` that DBSP maintains as
+  blocks arrive, served from `/derived` and queryable by name from `/sql`, with reorgs handled as
+  retractions like the built-ins. On a real nest that took a panel from 2.15 s to 88 ms. A WASM
+  transform layer remains the imperative escape hatch.
 - **Compliance pack** (RFC-0008). Address labels, sanctions/watch-list screening, threshold & velocity
   flags, counterparty-exposure views, and a signed, replayable audit manifest.
 - **Alerts & webhooks** (RFC-0010). HMAC-signed egress with a durable at-least-once outbox; a slow

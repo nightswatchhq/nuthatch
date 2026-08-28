@@ -21,6 +21,42 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// One readable line for a chat sink.
+///
+/// Deliberately plain text rather than an embed: an embed is a richer object with its own failure
+/// modes, and the thing an operator needs at 3am is the nest, the kind, and what happened, in the
+/// notification preview. `event` leads because that is what distinguishes two alerts of the same
+/// kind from the same nest.
+pub fn discord_line(payload: &Value) -> String {
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("alert");
+    let event = payload.get("event").and_then(Value::as_str).unwrap_or("");
+    let annotation = payload.get("annotation");
+    let nest = annotation
+        .and_then(|a| a.get("nest"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let detail = annotation
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    // Discord rejects an empty body and truncates a long one; 1,800 leaves room for the wrapper
+    // inside the 2,000-character limit.
+    let mut line = format!(
+        "**{kind}**{} {event}\n```{detail}```",
+        if nest.is_empty() {
+            String::new()
+        } else {
+            format!(" [{nest}]")
+        }
+    );
+    if line.chars().count() > 1_800 {
+        line = line.chars().take(1_797).collect::<String>() + "```";
+    }
+    line
+}
+
 /// Bound on the durable outbox. A dead webhook can't grow it without limit; past this the oldest
 /// undelivered alerts are shed (loudly). Generous - a transient outage of minutes is absorbed.
 pub const OUTBOX_MAX: u64 = 10_000;
@@ -50,11 +86,11 @@ impl AlertRouter {
     }
 
     /// The URLs that want annotations of `kind`.
-    fn urls_for(&self, kind: &str) -> Vec<&str> {
+    fn urls_for(&self, kind: &str) -> Vec<(&str, crate::config::AlertFormat)> {
         self.sinks
             .iter()
             .filter(|s| s.kinds.iter().any(|k| k == kind))
-            .map(|s| s.url.as_str())
+            .map(|s| (s.url.as_str(), s.format))
             .collect()
     }
 
@@ -77,11 +113,15 @@ pub fn enqueue(
         return Ok(());
     }
     let mut pushed = false;
-    for url in router.urls_for(kind) {
+    for (url, format) in router.urls_for(kind) {
+        // The format rides in the payload rather than being looked up at delivery: the outbox is
+        // durable, so an entry may outlive an edit to `[[alerts]]`, and a queued alert should be
+        // delivered the way it was queued.
         let payload = json!({
             "event": event,
             "kind": kind,
             "url": url,
+            "format": format,
             "annotation": annotation,
         });
         store.outbox_push(&payload.to_string())?;
@@ -122,18 +162,26 @@ pub async fn deliver_pending(
                     return (seq, Outcome::Shed); // corrupt entry - drop it
                 };
                 let url = payload.get("url").and_then(Value::as_str).unwrap_or("");
-                // Send the stored bytes verbatim so a signature matches; sign if the webhook has a secret.
+                // Send the stored bytes verbatim so a signature matches - except where the sink will
+                // not accept them. A Discord webhook answers our own payload `400 Cannot send an
+                // empty message` and `{"content": …}` with `204`, and a non-success is retried
+                // forever, so a raw body there is an outbox that never drains. The signature is
+                // computed over whatever is actually sent, which is the only thing a receiver can
+                // verify.
+                let body = match payload.get("format").and_then(Value::as_str) {
+                    Some("discord") => json!({ "content": discord_line(&payload) }).to_string(),
+                    _ => payload_str.clone(),
+                };
                 let mut req = client
                     .post(url)
                     .header("content-type", "application/json")
-                    .body(payload_str.clone());
+                    .body(body.clone());
                 if let Some(secret) = payload
                     .get("webhook")
                     .and_then(Value::as_str)
                     .and_then(|n| secrets.get(n))
                 {
-                    let sig =
-                        crate::webhooks::hmac_sha256_hex(secret.as_bytes(), payload_str.as_bytes());
+                    let sig = crate::webhooks::hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
                     req = req.header("X-Nuthatch-Signature", format!("sha256={sig}"));
                 }
                 match req.send().await {
@@ -215,6 +263,51 @@ pub async fn run_delivery_worker(
 
 #[cfg(test)]
 mod tests {
+    /// **The shape a chat sink will actually accept.** Measured against a real Discord webhook, not
+    /// inferred: our own outbox payload is answered
+    /// `400 {"message": "Cannot send an empty message", "code": 50006}`, and `{"content": "…"}` is
+    /// answered `204`.
+    ///
+    /// That matters more than it looks. `deliver_pending` retries a non-success forever, so pointing
+    /// a Discord webhook at the raw format gives an outbox that never drains and alerts that never
+    /// arrive - an alerting system failing silently, which is worse than having none.
+    #[test]
+    fn a_discord_sink_gets_a_body_discord_accepts() {
+        let payload = serde_json::json!({
+            "event": "entity `received` faulted: the entity circuit faulted",
+            "kind": "entity_fault",
+            "url": "https://discord.com/api/webhooks/x/y",
+            "format": "discord",
+            "annotation": {"nest": "usdc-arb", "entity": "received"},
+        });
+        let line = discord_line(&payload);
+        assert!(line.contains("entity_fault"), "the kind leads: {line}");
+        assert!(
+            line.contains("usdc-arb"),
+            "the nest is in the preview: {line}"
+        );
+        assert!(
+            line.contains("the entity circuit faulted"),
+            "and what happened: {line}"
+        );
+        // Discord refuses an empty body and truncates past 2,000 characters.
+        assert!(!line.is_empty());
+        assert!(line.chars().count() <= 1_800, "{}", line.chars().count());
+    }
+
+    /// A long annotation is truncated rather than rejected. Discord's limit is 2,000 characters and
+    /// a body over it is a 400, which the worker would retry forever.
+    #[test]
+    fn a_huge_annotation_is_cut_to_fit() {
+        let payload = serde_json::json!({
+            "event": "e",
+            "kind": "k",
+            "annotation": {"nest": "n", "blob": "x".repeat(9_000)},
+        });
+        let line = discord_line(&payload);
+        assert!(line.chars().count() <= 1_800, "{}", line.chars().count());
+    }
+
     use super::*;
     use crate::store::Store;
 
@@ -224,14 +317,18 @@ mod tests {
             Alert {
                 kinds: vec!["sanction_hit".into()],
                 url: "https://a".into(),
+                format: crate::config::AlertFormat::Raw,
             },
             Alert {
                 kinds: vec!["sanction_hit".into(), "threshold_flag".into()],
                 url: "https://b".into(),
+                format: crate::config::AlertFormat::Raw,
             },
         ]);
-        assert_eq!(r.urls_for("sanction_hit"), vec!["https://a", "https://b"]);
-        assert_eq!(r.urls_for("threshold_flag"), vec!["https://b"]);
+        let urls =
+            |kind: &str| -> Vec<&str> { r.urls_for(kind).into_iter().map(|(u, _)| u).collect() };
+        assert_eq!(urls("sanction_hit"), vec!["https://a", "https://b"]);
+        assert_eq!(urls("threshold_flag"), vec!["https://b"]);
         assert!(r.watches("sanction_hit"));
         assert!(!r.watches("nope"));
     }
@@ -263,6 +360,110 @@ mod tests {
         assert_eq!(pending.len(), 3);
         // The survivors are the 3 newest (n = 2, 3, 4), oldest-first.
         assert!(pending[0].1.contains("\"n\":2"));
+    }
+
+    /// **The seam, not the piece.** `discord_line` having the right shape proves nothing about the
+    /// body that leaves the process - my first pass at this tested the renderer alone, and removing
+    /// the rendering from `deliver_pending` entirely left every test green.
+    ///
+    /// So this drives real delivery against a real local server and asserts on **what arrived**: a
+    /// `discord` sink gets `{"content": …}` and nothing else, and a `raw` sink on the same run gets
+    /// the outbox payload byte for byte, because every existing sink must be unaffected.
+    #[tokio::test]
+    async fn a_discord_sink_receives_content_and_a_raw_sink_is_unchanged() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let received = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let sink = received.clone();
+        let app = Router::new()
+            .route(
+                "/discord",
+                post({
+                    let sink = sink.clone();
+                    move |Json(body): Json<Value>| {
+                        let sink = sink.clone();
+                        async move {
+                            sink.lock().unwrap().push(("discord".into(), body));
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/raw",
+                post({
+                    let sink = sink.clone();
+                    move |Json(body): Json<Value>| {
+                        let sink = sink.clone();
+                        async move {
+                            sink.lock().unwrap().push(("raw".into(), body));
+                            "ok"
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let router = AlertRouter::new(vec![
+            Alert {
+                kinds: vec!["entity_fault".into()],
+                url: format!("http://{addr}/discord"),
+                format: crate::config::AlertFormat::Discord,
+            },
+            Alert {
+                kinds: vec!["entity_fault".into()],
+                url: format!("http://{addr}/raw"),
+                format: crate::config::AlertFormat::Raw,
+            },
+        ]);
+        enqueue(
+            &store,
+            &router,
+            "entity `received` faulted",
+            "entity_fault",
+            &json!({"nest": "usdc-arb", "entity": "received"}),
+        )
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let delivered = deliver_pending(&store, &client, &std::collections::HashMap::new()).await;
+        assert_eq!(delivered, 2, "both sinks");
+
+        let got = received.lock().unwrap().clone();
+        let discord = got
+            .iter()
+            .find(|(w, _)| w == "discord")
+            .expect("discord sink");
+        let raw = got.iter().find(|(w, _)| w == "raw").expect("raw sink");
+
+        // Discord takes `{"content": …}` and refuses anything else with a 400 the worker would
+        // retry forever. One key, and it carries the detail.
+        assert_eq!(
+            discord.1.as_object().map(|o| o.len()),
+            Some(1),
+            "a discord body is exactly {{content}}: {:?}",
+            discord.1
+        );
+        let content = discord.1["content"].as_str().expect("content is a string");
+        assert!(content.contains("entity_fault"), "{content}");
+        assert!(content.contains("usdc-arb"), "{content}");
+
+        // The raw sink is untouched by any of this.
+        assert_eq!(raw.1["event"], "entity `received` faulted");
+        assert_eq!(raw.1["kind"], "entity_fault");
+        assert_eq!(raw.1["annotation"]["nest"], "usdc-arb");
+        assert!(
+            raw.1.get("content").is_none(),
+            "a raw sink must not get a discord body: {:?}",
+            raw.1
+        );
     }
 
     /// The C5 gate: a real local webhook server receives a `flag` on a raised annotation and a
@@ -297,6 +498,7 @@ mod tests {
         let router = AlertRouter::new(vec![Alert {
             kinds: vec!["sanction_hit".into()],
             url: url.clone(),
+            format: crate::config::AlertFormat::Raw,
         }]);
 
         // A hit is raised, then a reorg retracts it.
@@ -403,6 +605,7 @@ mod tests {
         let router = AlertRouter::new(vec![Alert {
             kinds: vec!["sanction_hit".into()],
             url: "http://127.0.0.1:9/hook".into(),
+            format: crate::config::AlertFormat::Raw,
         }]);
         enqueue(
             &store,
