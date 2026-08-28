@@ -83,7 +83,16 @@ pub(crate) enum FailureClass {
     /// range that would have worked, which beats halving blindly toward it.
     ///
     /// Slice 1 classifies this; acting on it is slice 3.
-    Narrowable { suggested: Option<(u64, u64)> },
+    Narrowable {
+        suggested: Option<(u64, u64)>,
+        /// True when this verdict came **only** from a pool-wide 429 escalated by
+        /// [`escalate_pool_wide_rate_limit`], not from a provider saying the result was too large.
+        ///
+        /// The two must part company at the point where there is no narrower range left. A real size
+        /// refusal is a fact about one block and no amount of waiting changes it. A throttle is a fact
+        /// about our pacing, and waiting is exactly what fixes it. See #916.
+        escalated_from_rate_limit: bool,
+    },
     /// A rate limit. Transient in effect - fail over and retry at the same width, because "you asked
     /// too often" is not "you asked for too much". Tracked as its own variant only so that a
     /// **pool-wide** 429 on the *same* window can escalate to [`FailureClass::Narrowable`]: when every
@@ -125,8 +134,19 @@ impl std::error::Error for ClassifiedError {}
 ///
 /// One endpoint returning 429 says we asked too often. *Every* endpoint returning 429 for the same
 /// request says something about the request. Narrowing is the right response either way - a smaller
-/// window is both a smaller result set and less load - so this escalation cannot make a genuine pacing
-/// problem worse.
+/// window is both a smaller result set and less load.
+///
+/// **That last argument has a floor, and the original wording of this comment did not** (#916). It
+/// said the escalation "cannot make a genuine pacing problem worse". It can: narrowing is only
+/// costless while there is range left to narrow. At a single block there is none, and the escalated
+/// verdict then walks a throttle into `block N alone exceeds the provider's getLogs result cap` - a
+/// diagnosis that was never true, on a nest that only needed to wait. Measured on two free endpoints:
+/// a nest crash-looping about twice an hour under `Restart=always`.
+///
+/// The escalation is kept, because the reasoning above holds everywhere it can be acted on. It now
+/// carries `escalated_from_rate_limit: true` so the one caller that knows the range has run out can
+/// tell this apart from a provider actually refusing a result size, and fall through to the
+/// warn-back-off-retry that a throttle wants. See `indexer::narrowing_can_help`.
 ///
 /// Requires at least two attempts: with a single-endpoint pool "every endpoint" is one endpoint, and a
 /// lone 429 is much more likely to be pacing.
@@ -137,13 +157,30 @@ fn escalate_pool_wide_rate_limit(
 ) -> anyhow::Error {
     if attempts >= 2 && rate_limited == attempts {
         return anyhow::Error::new(ClassifiedError {
-            class: FailureClass::Narrowable { suggested: None },
+            class: FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: true,
+            },
             detail: format!(
                 "every endpoint ({attempts}) rate-limited this request; treating it as too large: {err}"
             ),
         });
     }
     err
+}
+
+/// Did this failure's "narrowable" verdict come only from a **pool-wide 429**?
+///
+/// The caller that needs this is the one holding a range it can no longer narrow. See
+/// [`FailureClass::Narrowable::escalated_from_rate_limit`] and #916.
+pub(crate) fn escalated_from_rate_limit(err: &anyhow::Error) -> bool {
+    matches!(
+        class_of(err),
+        Some(FailureClass::Narrowable {
+            escalated_from_rate_limit: true,
+            ..
+        })
+    )
 }
 
 /// The classification carried by `err`, if it came from the RPC client.
@@ -176,6 +213,7 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
         401 | 403 => FailureClass::Terminal,
         413 => FailureClass::Narrowable {
             suggested: suggested_range(body),
+            escalated_from_rate_limit: false,
         },
         // The `Retry-After` header is not visible here; `send_classified` fills it in.
         429 => FailureClass::RateLimited { retry_after: None },
@@ -190,6 +228,7 @@ pub(crate) fn classify_status(status: u16, body: &str) -> FailureClass {
         400 if suggested_range(body).is_some() || looks_like_cap(body) => {
             FailureClass::Narrowable {
                 suggested: suggested_range(body),
+                escalated_from_rate_limit: false,
             }
         }
         _ => FailureClass::Transient,
@@ -389,6 +428,7 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
+            escalated_from_rate_limit: false,
             suggested: suggested_range(
                 err.get("message")
                     .and_then(|m| m.as_str())
@@ -849,7 +889,10 @@ impl RpcClient {
             // A *syntax* error stays transient: garbage from a load balancer is no smaller in halves,
             // and calling it narrowable would split a dead endpoint down to single blocks.
             let class = if e.is_timeout() {
-                FailureClass::Narrowable { suggested: None }
+                FailureClass::Narrowable {
+                    suggested: None,
+                    escalated_from_rate_limit: false,
+                }
             } else {
                 FailureClass::Transient
             };
@@ -1792,7 +1835,8 @@ mod tests {
         assert_eq!(
             super::classify_rpc_error(&err),
             super::FailureClass::Narrowable {
-                suggested: Some((0x1000000, 0x1007fff))
+                suggested: Some((0x1000000, 0x1007fff)),
+                escalated_from_rate_limit: false,
             }
         );
     }
@@ -1838,7 +1882,8 @@ mod tests {
         assert_eq!(
             super::classify_status(400, ALCHEMY_400_BODY),
             super::FailureClass::Narrowable {
-                suggested: Some((0x1000000, 0x1007fff))
+                suggested: Some((0x1000000, 0x1007fff)),
+                escalated_from_rate_limit: false,
             }
         );
     }

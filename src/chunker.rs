@@ -324,7 +324,10 @@ mod tests {
         let logged = "HTTP 400 Bad Request: {\"message\":\"ranges over 10000 blocks are not supported on free plan\"}";
         for class in [
             crate::rpc::FailureClass::Transient,
-            crate::rpc::FailureClass::Narrowable { suggested: None },
+            crate::rpc::FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: false,
+            },
         ] {
             let err = anyhow::Error::new(crate::rpc::ClassifiedError {
                 class: class.clone(),
@@ -375,7 +378,10 @@ mod tests {
     fn the_structured_classification_wins_over_text_matching() {
         // Narrowable by structure, with wording that matches no marker at all.
         let structured = anyhow::Error::new(crate::rpc::ClassifiedError {
-            class: crate::rpc::FailureClass::Narrowable { suggested: None },
+            class: crate::rpc::FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: false,
+            },
             detail: "every endpoint rate-limited this request".into(),
         });
         assert!(
