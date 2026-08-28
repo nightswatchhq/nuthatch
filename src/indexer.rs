@@ -3209,6 +3209,23 @@ fn fetch_logs_splitting_tracking<'a>(
 /// attempt - plausible and unremarkable under concurrency (a momentary rate-limit), and exactly the
 /// same shape as the first failure mode: an outer ceiling shorter than the time an endpoint needs to
 /// come back. Removing the ceiling here fixes both from one cause, with no change needed in `rpc.rs`.
+/// **#863.** Consecutive attempts a window loop may spend without advancing its cursor before it stops
+/// calling that normal.
+///
+/// The hazard is #672's own recorded failure: a request that fails whole and is retried forever at the
+/// same width. The loop looks perfectly healthy - well-formed requests, orderly retry logs - and will
+/// never finish. Two mutants reach that state cheaply (`is_result_too_large -> false` makes a provider
+/// cap unrecognisable, so the narrowing retry never narrows), which is why they cost the nightly sweep
+/// about 23 minutes each in timeouts instead of dying.
+///
+/// **Why 64.** It has to clear a legitimate narrowing descent, which halves from the window ceiling to
+/// a single block: `log2(1_000_000)` is roughly 20 attempts, each possibly retrying internally with
+/// backoff first. 64 is a shade over three times that, so a slow provider working its way down is never
+/// mistaken for a stall, while a loop that genuinely cannot progress is named in seconds rather than
+/// never. Deliberately not tight: a guard that fires on healthy behaviour gets raised until it means
+/// nothing, which is exactly how the gates in #913 became decorative.
+const NO_PROGRESS_LIMIT: usize = 64;
+
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -4974,6 +4991,10 @@ async fn index_loop(
     // only ever announces catch-up once, and after that this is the only text an operator watching
     // logs (rather than Prometheus) gets.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
+    // #863. Counts attempts that reached a fetch and came back without moving `next`. Any window that
+    // actually commits resets it, so a narrowing descent - which fails repeatedly on the way down and
+    // then succeeds - never trips it.
+    let mut no_progress = 0usize;
     loop {
         let tip = match source.tip().await {
             Ok(t) => {
@@ -5041,12 +5062,22 @@ async fn index_loop(
                     // Window processed and committed - advance the cursor past it.
                     Some(_stored) => {
                         next = to + 1;
+                        no_progress = 0;
                         if let Some(p) = progress.as_mut() {
                             p.tick(to, n);
                         }
                     }
                     // Timestamps were unavailable; the cursor stayed put, retry the same window.
-                    None => continue,
+                    None => {
+                        no_progress_tick(
+                            &mut no_progress,
+                            next,
+                            to,
+                            caught_up,
+                            "timestamps unavailable",
+                        )?;
+                        continue;
+                    }
                 }
             }
             Err(e) if narrowing_can_help(&e, next, to) => {
@@ -5055,6 +5086,7 @@ async fn index_loop(
                 }
                 // Provider capped the response - shrink and retry the same range immediately.
                 chunker.too_large();
+                no_progress_tick(&mut no_progress, next, to, caught_up, "narrowing")?;
                 tracing::debug!("range {next}..={to} refused; shrinking and retrying");
             }
             Err(e) => {
@@ -5062,10 +5094,57 @@ async fn index_loop(
                 // right: endpoint failover happens beneath this, and the growth that used to walk into an
                 // unserveable width is bounded by evidence in the chunker now (#672).
                 tracing::warn!("get_logs {next}..={to} failed: {e:#}; retrying");
+                no_progress_tick(&mut no_progress, next, to, caught_up, "fetch failing")?;
                 sleep_secs(3).await;
             }
         }
     }
+}
+
+/// One attempt's worth of [`NO_PROGRESS_LIMIT`] bookkeeping (#863).
+///
+/// **What it does depends on where it is, and that is the decision the issue asked for.**
+///
+/// During the initial backfill it bails. A backfill has a defined end, so one that has stopped
+/// advancing will never reach it: failing by name beats running until somebody notices the log has
+/// been repeating itself for a week.
+///
+/// Once at tip it warns and keeps going. A tip loop has no end, and the ordinary reason it cannot
+/// fetch is that somebody else's provider is having an afternoon - a condition that resolves itself.
+/// Faulting there would turn a transient outage into a dead nest, and RFC-0026 is explicit that
+/// quarantining a nest is the last escalation rather than the first. The same reasoning is why
+/// `runtime_index_loop` is not given a bailing form of this: its cursor drives every co-tenant, so one
+/// nest's bad provider would stop all of them.
+fn no_progress_tick(
+    count: &mut usize,
+    from: u64,
+    to: u64,
+    caught_up: bool,
+    why: &str,
+) -> Result<()> {
+    *count += 1;
+    if *count < NO_PROGRESS_LIMIT {
+        return Ok(());
+    }
+    if !caught_up {
+        anyhow::bail!(
+            "backfill made no progress across {NO_PROGRESS_LIMIT} consecutive attempts at blocks \
+             {from}..={to} ({why}). The window is not narrowing and the cursor is not advancing, so \
+             this will not finish on its own. Probe the endpoint's getLogs limits with `nuthatch \
+             doctor <rpc-url>`, or start with a smaller `--window`."
+        );
+    }
+    // At tip: say so loudly, then let the counter keep running so the warning repeats at a bounded
+    // rate rather than once and never again.
+    if (*count).is_multiple_of(NO_PROGRESS_LIMIT) {
+        tracing::warn!(
+            "no progress at blocks {from}..={to} across {} consecutive attempts ({why}) - this nest \
+             is at tip and still trying, which is right if the provider is having an outage. If it \
+             persists, it is not an outage.",
+            *count
+        );
+    }
+    Ok(())
 }
 
 /// If the checkpoint at `last` is no longer canonical, return the deepest checkpoint that still
@@ -7514,6 +7593,74 @@ template = "pool"
             topic0_only_culprits([(0usize, &stat), (1usize, &blocks)].into_iter()).is_empty(),
             "and with the union still address-filtered, nobody is to blame - which is consistent \
              only because the union stayed narrow. The two ends agree again."
+        );
+    }
+
+    /// **#863.** A backfill that stops advancing must fail by name rather than run forever.
+    ///
+    /// The recorded failure this guards is #672's: a request that fails whole and is retried at the
+    /// same width indefinitely. Nothing about that loop looks wrong from outside - well-formed
+    /// requests, orderly retry logs - which is why it went unnoticed and why two mutants sit in the
+    /// baseline costing the nightly sweep ~23 minutes each in timeouts.
+    #[test]
+    fn a_backfill_that_stops_advancing_fails_by_name() {
+        let mut n = 0usize;
+        for i in 1..NO_PROGRESS_LIMIT {
+            assert!(
+                no_progress_tick(&mut n, 100, 200, false, "narrowing").is_ok(),
+                "attempt {i} must not fault - a narrowing descent legitimately fails on the way down"
+            );
+        }
+        let err = no_progress_tick(&mut n, 100, 200, false, "narrowing")
+            .expect_err("attempt 64 must fault: nothing is advancing and nothing is narrowing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no progress") && msg.contains("100..=200"),
+            "the operator needs the range named: {msg}"
+        );
+        assert!(
+            msg.contains("nuthatch doctor") || msg.contains("--window"),
+            "a failure that names no recovery path is the shape #913 is about: {msg}"
+        );
+    }
+
+    /// The limit must clear a real narrowing descent with room to spare, or the guard converts a slow
+    /// provider into a fault. Halving a 1,000,000-block ceiling to a single block is ~20 attempts.
+    #[test]
+    fn a_full_narrowing_descent_fits_inside_the_limit() {
+        let descent = (1_000_000f64).log2().ceil() as usize;
+        assert!(
+            descent < NO_PROGRESS_LIMIT,
+            "a legitimate descent takes {descent} attempts and the limit is {NO_PROGRESS_LIMIT}"
+        );
+        let mut n = 0usize;
+        for _ in 0..descent {
+            no_progress_tick(&mut n, 0, 1_000_000, false, "narrowing")
+                .expect("a descent must never fault");
+        }
+        // And the window committing resets it, which is what makes the guard about *stalls* rather
+        // than about slowness.
+        n = 0;
+        assert!(no_progress_tick(&mut n, 0, 1, false, "narrowing").is_ok());
+    }
+
+    /// At tip the same condition must **not** fault. A tip loop has no end and the usual cause is
+    /// somebody else's provider having an afternoon; faulting would turn a transient outage into a
+    /// dead nest, which RFC-0026 reserves for last.
+    #[test]
+    fn at_tip_a_stall_warns_but_never_faults() {
+        let mut n = 0usize;
+        for _ in 0..(NO_PROGRESS_LIMIT * 4) {
+            assert!(
+                no_progress_tick(&mut n, 100, 200, true, "fetch failing").is_ok(),
+                "a nest at tip must keep trying through a provider outage"
+            );
+        }
+        assert_eq!(
+            n,
+            NO_PROGRESS_LIMIT * 4,
+            "the counter must keep running so the warning repeats at a bounded rate rather than \
+             firing once and never again"
         );
     }
 
