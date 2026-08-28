@@ -88,8 +88,17 @@ jobs:
       # finish, or one that enumerated no mutants at all. The job going red is not the same as the
       # build going red: this workflow is required on no branch, per criterion 2 and the sequence
       # #593 established.
+      #
+      # `shell: bash` is load-bearing (#911). Without it a `run:` step is `bash -e {0}` with no
+      # `pipefail`, so this pipeline exits with `tee`'s status and `tee` always succeeds. The claim
+      # directly above was false from the day it was written: on run 33076912079 this step printed
+      # "FAIL: ... cargo-mutants was killed before it finished ... This is a failure and not a pass"
+      # and reported `success`. #841 and #853 hardened the script to refuse a truncated run; this
+      # line threw the refusal away. `shell: bash` supplies `-o pipefail` and gives the script's
+      # exit status back to the step.
       - name: new survivors fail this job
         if: always()
+        shell: bash
         run: python3 scripts/mutants-check.py --file ${{ matrix.file }} | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: keep the output
