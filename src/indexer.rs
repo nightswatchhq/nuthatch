@@ -1687,7 +1687,7 @@ async fn runtime_index_loop(
                 )
                 .await?;
             }
-            Err(e) if chunker::is_result_too_large(&e) => {
+            Err(e) if narrowing_can_help(&e, global_next, to) => {
                 if global_next >= to {
                     // COR-5. One block is over the provider's cap and there is no narrower range to
                     // ask for, so this fetch cannot succeed as issued.
@@ -2892,7 +2892,7 @@ pub async fn backfill_direct(
                 // Only reachable in adaptive mode: fixed mode has no chunker to shrink, so a cap
                 // falls through to the plain `Err(e)` arm below and the run fails loudly rather than
                 // silently changing the width `--window-adaptive` was asked not to change.
-                Err(e) if chunker.is_some() && chunker::is_result_too_large(&e) => {
+                Err(e) if chunker.is_some() && narrowing_can_help(&e, next, chunk_to) => {
                     if next >= chunk_to {
                         return Err(e).with_context(|| single_block_over_cap(next));
                         // H3: can't shrink a block
@@ -3003,6 +3003,30 @@ pub async fn backfill_direct(
     Ok(total)
 }
 
+/// Whether narrowing is the right response to `err` **for the range still on the table**.
+///
+/// [`chunker::is_result_too_large`] answers "is this narrowable at all". This answers the question the
+/// call sites actually have, which includes `from..=to`, and the two differ in exactly one case.
+///
+/// A **pool-wide 429** is escalated to `Narrowable` by RFC-0028 §3d, on the argument that narrowing is
+/// also less load and so the escalation is benign even when the cause was really pacing. That argument
+/// is sound while there is range left to narrow, and **spent the moment there is not**: a single block
+/// cannot be split, the provider never said the result was too large, and no width we can ask for will
+/// change the answer.
+///
+/// Returning `false` there is the whole fix (#916). It does not need new retry machinery, because each
+/// of these call sites already has the correct handler sitting in its next arm - warn, back off, retry
+/// the same width - written for exactly this case and commented "a 429 or a 403". The escalation was
+/// routing a throttle *past* its own handler and into
+/// `block N alone exceeds the provider's getLogs result cap`, which was never true, and which sends the
+/// reader off to buy a bigger provider when the remedy is to slow down.
+///
+/// Measured: `nuthatch-dips` on the Lodestar box, two free endpoints, `NRestarts` climbing about twice
+/// an hour under `Restart=always`.
+fn narrowing_can_help(err: &anyhow::Error, from: u64, to: u64) -> bool {
+    chunker::is_result_too_large(err) && !(from >= to && crate::rpc::escalated_from_rate_limit(err))
+}
+
 /// The error context when a single block's logs exceed a provider's `getLogs` result cap - it can't be
 /// split or shrunk further, so the backfill/tip loop stops loudly instead of retrying forever (H3).
 fn single_block_over_cap(block: u64) -> String {
@@ -3031,6 +3055,7 @@ fn single_block_over_cap(block: u64) -> String {
 fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64> {
     let crate::rpc::FailureClass::Narrowable {
         suggested: Some((s_from, s_to)),
+        ..
     } = crate::rpc::class_of(err)?
     else {
         return None;
@@ -3113,7 +3138,7 @@ fn fetch_logs_splitting_tracking<'a>(
                 widest.fetch_max(to - from + 1, std::sync::atomic::Ordering::SeqCst);
                 Ok(logs)
             }
-            Err(e) if chunker::is_result_too_large(&e) => {
+            Err(e) if narrowing_can_help(&e, from, to) => {
                 if from >= to {
                     return Err(e).with_context(|| single_block_over_cap(from));
                 }
@@ -3272,8 +3297,10 @@ async fn logs_with_retry(
     loop {
         match source.logs(filter, from, to).await {
             Ok(l) => return Ok(l),
-            // A result cap is not transient - hand it back so the caller shrinks the window.
-            Err(e) if chunker::is_result_too_large(&e) => return Err(e),
+            // A result cap is not transient - hand it back so the caller shrinks the window. A
+            // pool-wide 429 at a single block is not one of those (#916): there is nothing for the
+            // caller to shrink, so it belongs in the backoff arm below like any other throttle.
+            Err(e) if narrowing_can_help(&e, from, to) => return Err(e),
             Err(e) => {
                 let backoff = backfill_backoff(base, attempt);
                 log_backfill_retry(
@@ -3621,7 +3648,7 @@ pub async fn backfill_direct_factory(
                             chunker.observed(l.len() as u64);
                             l
                         }
-                        Err(e) if chunker::is_result_too_large(&e) => {
+                        Err(e) if narrowing_can_help(&e, next, chunk_to) => {
                             if next >= chunk_to {
                                 return Err(e).with_context(|| single_block_over_cap(next));
                             }
@@ -3657,7 +3684,7 @@ pub async fn backfill_direct_factory(
                             chunker.observed(l.len() as u64);
                             l
                         }
-                        Err(e) if chunker::is_result_too_large(&e) => {
+                        Err(e) if narrowing_can_help(&e, next, chunk_to) => {
                             if next >= chunk_to {
                                 return Err(e).with_context(|| single_block_over_cap(next));
                             }
@@ -3714,7 +3741,7 @@ pub async fn backfill_direct_factory(
                     // rebuilt per iteration, and a child already registered by pass 1's decode stays
                     // registered. A child cannot emit before the block that created it, so carrying
                     // it into a narrower window that ends before its creation costs nothing.
-                    Err(e) if chunker::is_result_too_large(&e) => {
+                    Err(e) if narrowing_can_help(&e, next, chunk_to) => {
                         if next >= chunk_to {
                             return Err(e).with_context(|| single_block_over_cap(next));
                         }
@@ -5022,7 +5049,7 @@ async fn index_loop(
                     None => continue,
                 }
             }
-            Err(e) if chunker::is_result_too_large(&e) => {
+            Err(e) if narrowing_can_help(&e, next, to) => {
                 if next >= to {
                     return Err(e).with_context(|| single_block_over_cap(next)); // H3: can't shrink a block
                 }
@@ -7487,6 +7514,101 @@ template = "pool"
             topic0_only_culprits([(0usize, &stat), (1usize, &blocks)].into_iter()).is_empty(),
             "and with the union still address-filtered, nobody is to blame - which is consistent \
              only because the union stayed narrow. The two ends agree again."
+        );
+    }
+
+    /// A pool-wide 429 error, shaped exactly as `escalate_pool_wide_rate_limit` shapes it.
+    fn pool_wide_429() -> anyhow::Error {
+        anyhow::Error::new(crate::rpc::ClassifiedError {
+            class: crate::rpc::FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: true,
+            },
+            detail: "every endpoint (2) rate-limited this request; treating it as too large: \
+                     HTTP 429 Too Many Requests"
+                .into(),
+        })
+    }
+
+    /// A provider genuinely refusing the *result size*.
+    fn real_cap() -> anyhow::Error {
+        anyhow::Error::new(crate::rpc::ClassifiedError {
+            class: crate::rpc::FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: false,
+            },
+            detail: "query returned more than 10000 results".into(),
+        })
+    }
+
+    /// **#916.** At the floor - one block, nothing left to narrow - a throttle and a size cap must
+    /// part company. Anywhere above the floor they must not, or the fix has quietly repealed
+    /// RFC-0028 §3d instead of bounding it.
+    ///
+    /// The third assertion is the one that stops this being a disable-the-feature patch: with range
+    /// still available, a pool-wide 429 is *still* narrowable, exactly as the RFC intends.
+    #[test]
+    fn a_throttle_stops_being_narrowable_only_at_the_floor() {
+        assert!(
+            narrowing_can_help(&real_cap(), 100, 100),
+            "a real size cap at a single block is still a cap - the block genuinely will not fit"
+        );
+        assert!(
+            !narrowing_can_help(&pool_wide_429(), 100, 100),
+            "a pool-wide 429 at a single block has nothing left to narrow: calling it a cap is the \
+             false diagnosis that killed nuthatch-dips"
+        );
+        assert!(
+            narrowing_can_help(&pool_wide_429(), 100, 200),
+            "with range still to spend, RFC-0028 §3d stands: narrowing is also less load"
+        );
+        assert!(
+            narrowing_can_help(&real_cap(), 100, 200),
+            "and a real cap over a range is unchanged"
+        );
+    }
+
+    /// The message an operator is left with. `use a provider with a higher/no cap` is not merely
+    /// imprecise for a throttle, it names a **recovery path that does not exist**: buying a bigger
+    /// provider does not stop a free endpoint rate-limiting you.
+    #[tokio::test]
+    async fn a_throttled_single_block_is_not_reported_as_a_cap() {
+        struct Throttled;
+        #[async_trait::async_trait]
+        impl Source for Throttled {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Err(pool_wide_429())
+            }
+            async fn block_timestamps(
+                &self,
+                b: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(b.iter().map(|&x| (x, x * 1000)).collect())
+            }
+        }
+        let filter = crate::source::LogFilter::new(&[], &["0xdead".into()]).unwrap();
+        let err = fetch_logs_splitting(&Throttled, &filter, 100, 100)
+            .await
+            .expect_err("a throttled fetch must still fail");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("alone exceeds"),
+            "a throttle must not be reported as a result cap: {msg}"
+        );
+        assert!(
+            msg.contains("rate-limited"),
+            "and the true cause must survive to the operator: {msg}"
         );
     }
 

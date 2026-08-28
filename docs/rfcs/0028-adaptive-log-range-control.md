@@ -90,6 +90,19 @@ transient - but if *every* endpoint 429s on the *same* window, that is evidence 
 own production logs show `arb1.arbitrum.io` returning 429 on `getLogs` while the livepeer nest ran, so
 this path is real rather than hypothetical.
 
+> **Amended 2026-08-28 (#916): the escalation stops at a single block.** As shipped, this had no floor,
+> and the escalated verdict survived all the way down the chunker's descent. At one block there is
+> nothing left to narrow, so the nest exited with `block N alone exceeds the provider's getLogs result
+> cap` - a diagnosis that was never true, and one whose stated remedy (a provider with a higher cap)
+> does nothing about throttling. Measured on the Lodestar box: a nest on two free endpoints
+> crash-looping roughly twice an hour under `Restart=always`.
+>
+> The reasoning above is kept, because it holds everywhere it can be acted on. What was missing is that
+> "narrowing is also less load" is an argument *about narrowing*, and it expires the moment narrowing is
+> no longer available. The escalated class now carries its provenance so the caller holding the range
+> can tell an escalated 429 from a provider actually refusing a result size, and fall through to the
+> back-off-and-retry that every one of those call sites already had waiting in its next arm.
+
 **(e) Consolidate the two classifiers.** Slice 1 (merged, #165) added `rpc.rs::classify_rpc_error`
 alongside the existing `chunker::is_result_too_large`. Two independent error classifiers is worse than
 one; `is_result_too_large` should become a thin interface onto the richer classification.
