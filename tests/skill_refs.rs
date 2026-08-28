@@ -157,8 +157,19 @@ fn authored_files_only_mention_real_metrics() {
     // The canonical set: every `nuthatch_*` name the exposition can emit. Register a nest first so the
     // per-nest `nuthatch_nest_*` series are present in the render too.
     nuthatch::metrics::METRICS.nest("__drift_probe__");
-    let real = metric_names_in(&nuthatch::metrics::METRICS.render());
+    let mut real = metric_names_in(&nuthatch::metrics::METRICS.render());
+    // **`Metrics::render()` stopped being the whole exposition.** `/metrics` appends the entity
+    // series from `serve::ENTITY_SERIES` after it, so a name documented in the builder skill was
+    // reported as not existing while being emitted on every scrape. The gate reads the emitter's own
+    // table rather than a second list, because two lists is how this drifts back.
+    for (name, _) in nuthatch::serve::ENTITY_SERIES {
+        real.insert((*name).to_string());
+    }
     assert!(real.contains("nuthatch_tip_height") && real.contains("nuthatch_rss_bytes"));
+    assert!(
+        real.contains("nuthatch_entity_current"),
+        "the entity series must be in the canonical set, or the skill cannot document them"
+    );
 
     let mut offenders = Vec::new();
     for entry in std::fs::read_dir(skill_dir()).unwrap() {

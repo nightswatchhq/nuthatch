@@ -42,6 +42,9 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer"
   nest (bundle/load), run several nests in one runtime, wire an AI client.
 - **[views.md](views.md)** - a nest's logic layer: authoring `views/*.sql` derivations, describing them
   in `semantic.toml`, and the reserved-word / big-int / hot∪cold footguns.
+- **[entities.md](entities.md)** - `entities.toml`: a relation the indexer *maintains* as blocks
+  arrive rather than recomputing per query (RFC-0041, 3.0.0). Read it with `views.md` - the two look
+  almost identical in the file and are completely different at runtime.
 - **[compliance.md](compliance.md)** - labels, sanctions lists, screening, flags, exposure, the signed
   audit pack (only relevant if the user asks for compliance features).
 - **[troubleshooting.md](troubleshooting.md)** - symptom → `/metrics` series → remedy for tip lag, RPC

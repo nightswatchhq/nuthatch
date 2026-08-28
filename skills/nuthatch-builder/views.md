@@ -9,9 +9,11 @@ is visible, diffable, and agent-legible instead of living in ad-hoc REPL queries
 - A view is a read-only `CREATE VIEW …` over the nest's tables. It's **recomputed per query** over the
   live tip ∪ sealed history (one surface) - never materialised, never written back, never in the
   ingest/decode/seal path. Adding a view can't corrupt data or slow indexing.
-- It is **not** an incrementally-maintained entity. The shipped IVM relations are the three built-in
-  circuits (`balances`, `exposure`, `velocity`). Authored incremental entities are RFC-0041, frozen
-  for 2026. A view is just SQL that runs when you query it.
+- It is **not** an incrementally-maintained entity. A view is just SQL that runs when you query it.
+  The shipped IVM relations are the three built-in circuits (`balances`, `exposure`, `velocity`) and,
+  since 3.0.0, whatever a nest declares in `entities.toml` - see [entities.md](entities.md). Choose a
+  view unless the query is both asked often and expensive; a view is free until someone asks, an
+  entity costs memory continuously.
 
 ## Adding one
 
