@@ -68,14 +68,14 @@ pub fn identity(
     key: Vec<String>,
     output_schema: Vec<String>,
 ) -> Result<EntityIdentity> {
-    let conn = crate::graft::parser_connection()?;
+    let parser = crate::graft::Parser::new()?;
     Ok(EntityIdentity {
-        plan: crate::graft::canonical_plan(&conn, sql),
+        plan: parser.canonical_plan(sql),
         input_entity_keys,
         sources,
         key,
         output_schema,
-        engine: crate::graft::engine_version(&conn),
+        engine: parser.engine_version(),
     })
 }
 
