@@ -54,9 +54,20 @@ curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
 and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
 involved**, so whichever rustc you happen to have is irrelevant. Prebuilt binaries cover macOS Apple
-Silicon and Linux x86_64 (dynamically linked; needs glibc 2.35 or newer - Debian 12, Ubuntu 22.04,
-RHEL 9 and Amazon Linux 2023 all clear that floor) and are attached to every release with their
-checksums, if you would rather fetch one by hand.
+Silicon and Linux x86_64 and are attached to every release with their checksums, if you would rather
+fetch one by hand.
+
+**The Linux binary is dynamically linked and needs two things**, both measured off the published
+artifact with `objdump -T` rather than inferred:
+
+- **glibc 2.35 or newer.** The measured floor is 2.34; 2.35 is what the release is built against, so it
+  is the number to trust.
+- **libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`). This one has a cause worth
+  knowing: the binary embeds DuckDB, which is C++, so it links `libstdc++.so.6` alongside `libc`,
+  `libm` and `libgcc`.
+
+Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both. A system with new glibc and an old
+libstdc++ would not, which is why both are stated rather than only the first.
 
 **Verify who built it.** The SHA-256 sidecar beside each tarball tells you the file did not corrupt in
 transit, and nothing more: whoever could replace the tarball could replace the sidecar in the same

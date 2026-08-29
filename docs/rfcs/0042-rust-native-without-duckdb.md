@@ -222,7 +222,18 @@ The final amendment contains measurements like this, then says either **Remove D
 
 No appeal to a previous RFC, Rust purity, reputation, roadmap or “probably”. The question is empirical: can Nuthatch remove DuckDB, then the native tail, while remaining the same or better Nuthatch?
 
-## §13 - What must be true before slice 2 starts
+## §13 - Readiness before slice 2 (was: what must be true before it starts)
+
+**Amended 2026-08-29. The board unfroze RFC-0042 in full**, so these five stop being a permission gate
+and become a readiness checklist. Condition 5 is discharged by that decision. The other four still
+matter, because they are what stops slice 2 producing a number nobody should act on - and the point
+below about momentum is now *more* live rather than less, since nothing external is holding the brake
+any more.
+
+**Status:** 1, 2 and 3 met. **4 outstanding** - the parity corpus covers 7 of §6's shapes (#945), and
+hot+cold is among the missing, which is where COR-1's disjointness invariant lives. A spike measured
+against a corpus that cannot see a chunk-seam defect is a spike measuring the wrong thing.
+
 
 Added 2026-08-29, when the carve-out was taken. Slices 0 and 1 are covered by it; **slices 2 and
 beyond are not**, and this section exists so that continuing is a decision somebody makes rather than
@@ -233,7 +244,8 @@ takes in practice is momentum. Slice 1 ends with a working boundary and a parity
 thing to do is obviously to plug something into it; and nobody ever decides to migrate a query engine,
 they simply find that they have.
 
-**Slice 2 may start when all five are true, and not otherwise:**
+**Slice 2 is ready when the first four are true.** Starting before then is permitted now and still
+unwise:
 
 1. **The role inventory is complete and every role has a named owner.** Not §9's four - the six found
    in the call sites, including `graft.rs` writing the engine string into grafting identity and
@@ -247,9 +259,10 @@ they simply find that they have.
    against an unmeasured floor cannot support the word "regression".
 4. **The parity corpus reproduces today's results byte-identically** through the new boundary. If the
    apparatus changes an answer before any engine is swapped, it is measuring itself.
-5. **The board records the decision**, in the CLAUDE.md carve-out list, naming which slices are
-   covered. An approved RFC is not a carve-out until it appears in that list, and slice 1 finishing is
-   not an approval.
+5. ~~**The board records the decision**~~ - **done 2026-08-29**: RFC-0042 unfrozen in full, recorded
+   in the CLAUDE.md carve-out list. Kept struck through rather than deleted, because the rule it
+   states ("an approved RFC is not a carve-out until it appears in that list") is what made the
+   decision necessary, and deleting it would erase why.
 
 **What a "no" looks like, and why it is a result.** If the BOM shows DuckDB is a modest share of build
 cost, or the role inventory shows the parser and function-vocabulary roles are expensive to replace

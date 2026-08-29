@@ -69,6 +69,44 @@ Two documentation findings fall out:
 
 Final binary: **102,359,456 bytes** (97.6 MB), unstripped.
 
+## 3a. The second target: aarch64-apple-darwin (#948)
+
+Measured 2026-08-29, same commit, same pinned 1.95.0, on Apple Silicon. Not a translation of the Linux
+run: the C++ evidence there is `libstdc++.so.6` in `ldd`, here it is `otool -L`, and the whole toolchain
+differs (`stat -f%z`, no `find -printf`).
+
+| | Linux x86_64 | macOS aarch64 |
+| --- | ---: | ---: |
+| clean release build | 223 s | **154 s** |
+| duckdb share of build | 10.6% | **8.0%** |
+| wasmtime + cranelift | 21.3% | **16.6%** |
+| `libduckdb-sys` objects | 352 | 352 |
+| `libduckdb-sys` bytes | 245 MB | **149 MB** |
+| final binary | 102.4 MB | **87.7 MB** |
+
+**The conclusion holds on both targets, and the ratio holds more tightly than the absolutes.** DuckDB
+is not the largest build-time consumer on either; wasmtime and cranelift cost roughly twice as much on
+both. §1's premise fails the same way in both places.
+
+### The C++ dependency is real on macOS too - and cheaper
+
+```
+/usr/lib/libc++.1.dylib
+/usr/lib/libSystem.B.dylib
+/System/Library/Frameworks/{Security,CoreFoundation}.framework/...
+```
+
+So Tier 2's definition is target-independent: the binary links a C++ runtime on both.
+
+**But its cost is not.** On Linux, `libstdc++` brings a real constraint - `GLIBCXX_3.4.29`, an ABI floor
+that had to be documented (#946) and excludes a system with new glibc and old libstdc++. On macOS,
+`libc++` lives in `/usr/lib` and is always present at a version the OS guarantees. There is no floor to
+state and nothing for a user to install.
+
+**Therefore the portability half of §1's argument is a Linux argument.** Removing DuckDB would delete an
+ABI floor on one target and change nothing a user can observe on the other. Worth knowing before
+"cross-compilation and portability complexity" is weighed as though it applied evenly.
+
 ## 4. The DuckDB role inventory: six sites, not §9's four
 
 The deletion checklist. §9 named four roles; walking the call sites finds six, and two are
@@ -135,7 +173,7 @@ Per the RFC's method amendment:
 ## 6. What slice 0 does not answer
 
 - **Why** a native crate costs what it does. Compile, link and codegen are not separated.
-- Any target but Linux x86_64. The aarch64-apple-darwin BOM is not run.
+- ~~Any target but Linux x86_64.~~ **Both release targets are now measured** - see §3a (#948).
 - Whether removing DuckDB reaches Tier 2 in practice. It is *plausible* from the linkage evidence and
   unproven until something builds without it.
 
