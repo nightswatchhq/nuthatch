@@ -172,3 +172,152 @@ fn the_corpus_actually_crosses_the_boundary() {
          not about size in general"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// RFC-0042 §6's shape list, every case above the vector boundary.
+//
+// §6 enumerates: point lookups; narrow and wide scans; groups; exact signed large integers;
+// multi-column groups; joins; authored and nested views; bounded ordering; row caps; and refused SQL.
+// Each below is that shape at a size that crosses the seam, with an expectation derived arithmetically
+// rather than from a run - the corpus is the reference a candidate engine is measured against, so an
+// expectation copied from today's output would only prove the candidate reproduces today's bugs.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn rows_out(dir: &std::path::Path, n: usize, sql: &str) -> Vec<Value> {
+    nuthatch::analytics::query_hot_cold(
+        dir,
+        sql,
+        nuthatch::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(60),
+            max_rows: 1_000_000,
+        },
+        &hot(n),
+        0,
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("{sql} over {n} rows: {e:#}"))
+    .rows
+}
+
+/// **Point lookup** past the boundary. A single row from beyond the first vector must be findable;
+/// a chunk-seam bug that drops the tail makes this return nothing rather than a wrong number, which
+/// is the failure an aggregate can mask.
+#[test]
+fn a_point_lookup_past_the_boundary_finds_its_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = GROUPED_SIZE;
+    let target = (DUCKDB_VECTOR + 500) as u64; // comfortably inside the second vector
+    let got = rows_out(
+        dir.path(),
+        n,
+        &format!("SELECT value FROM tok__transfer WHERE block_number = {target}"),
+    );
+    assert_eq!(got.len(), 1, "exactly one row has block_number {target}");
+    let v = got[0].as_object().unwrap().values().next().unwrap();
+    let v: i128 = v
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .expect("numeric");
+    // rows() sets value = i + 1 and block_number = i + 1, so they are equal by construction.
+    assert_eq!(
+        v, target as i128,
+        "the row past the seam must carry its own value"
+    );
+}
+
+/// **Multi-column grouping** past the boundary. Grouping on two columns exercises a different
+/// accumulator path from the single-column case, and #894's defect lived in exactly that machinery.
+#[test]
+fn multi_column_grouping_is_exact_across_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = GROUPED_SIZE;
+    let got = rows_out(
+        dir.path(),
+        n,
+        "SELECT COUNT(*) AS g FROM (SELECT \"to\", address FROM tok__transfer GROUP BY \"to\", address)",
+    );
+    let g = got[0]["g"].as_i64().unwrap();
+    // Three recipients, one address: three pairs, by construction.
+    assert_eq!(g, 3, "three (to, address) pairs over {n} rows");
+}
+
+/// **Exact large-integer arithmetic** past the boundary. The sum of 1..=n at these sizes exceeds
+/// nothing dramatic, so this multiplies into i128 territory deliberately: a silent narrowing to i64
+/// would survive the plain SUM case and die here.
+#[test]
+fn large_integer_sums_do_not_narrow_across_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = DUCKDB_VECTOR + 1;
+    // 1e18 per row: n * 1e18 overflows i64 (max ~9.2e18) at n >= 10, so any narrowing shows.
+    let got = rows_out(
+        dir.path(),
+        n,
+        "SELECT SUM(CAST(value AS HUGEINT) * 1000000000000000000) AS s FROM tok__transfer",
+    );
+    let cell = got[0]["s"].clone();
+    let s: i128 = cell
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| cell.as_str().and_then(|x| x.parse().ok()))
+        .unwrap_or_else(|| panic!("not numeric: {cell:?}"));
+    let want = (n as i128) * (n as i128 + 1) / 2 * 1_000_000_000_000_000_000i128;
+    assert_eq!(
+        s, want,
+        "SUM(value * 1e18) over {n} rows narrowed or lost precision: got {s}, want {want}"
+    );
+}
+
+/// **Bounded ordering and a row cap** past the boundary. `ORDER BY ... LIMIT` is where an engine may
+/// take a top-k shortcut per chunk and merge wrongly at the seam.
+#[test]
+fn bounded_ordering_returns_the_true_top_across_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = GROUPED_SIZE;
+    let got = rows_out(
+        dir.path(),
+        n,
+        "SELECT value FROM tok__transfer ORDER BY CAST(value AS HUGEINT) DESC LIMIT 3",
+    );
+    assert_eq!(got.len(), 3, "LIMIT 3 returns three rows");
+    let vals: Vec<i128> = got
+        .iter()
+        .map(|r| {
+            let c = r.as_object().unwrap().values().next().unwrap();
+            c.as_i64()
+                .map(i128::from)
+                .or_else(|| c.as_str().and_then(|s| s.parse().ok()))
+                .expect("numeric")
+        })
+        .collect();
+    // values are 1..=n, so the true top three are n, n-1, n-2 - all in the LAST chunk.
+    assert_eq!(
+        vals,
+        vec![n as i128, n as i128 - 1, n as i128 - 2],
+        "the top three must come from the final chunk, not from the first one an engine happened to \
+         finish"
+    );
+}
+
+/// **Refused SQL** stays refused at scale. A guard that only holds on small inputs is not a guard, and
+/// the query surface is bounded by RFC-0034 rather than by the engine's own opinion.
+#[test]
+fn refused_sql_is_still_refused_past_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = DUCKDB_VECTOR + 1;
+    let err = nuthatch::analytics::query_hot_cold(
+        dir.path(),
+        "DROP TABLE tok__transfer",
+        nuthatch::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(60),
+            max_rows: 1_000_000,
+        },
+        &hot(n),
+        0,
+        &[],
+    );
+    assert!(
+        err.is_err(),
+        "a mutating statement must be refused whatever the dataset size"
+    );
+}
