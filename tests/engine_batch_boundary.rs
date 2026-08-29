@@ -321,3 +321,136 @@ fn refused_sql_is_still_refused_past_the_boundary() {
         "a mutating statement must be refused whatever the dataset size"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// hot + cold (#945). The shape §6 lists that the corpus most needed, because it is where COR-1's
+// disjointness invariant lives: rows at or below `sealed_through` are cold, rows above are hot, and
+// the union must contain every row exactly once. Get it wrong in one direction and rows are counted
+// twice; wrong in the other and they vanish.
+//
+// Every case below puts the seam **and** an engine chunk boundary in the same fixture, because a
+// defect at a seam that never coincides with a chunk boundary is a different defect from one that
+// does, and only the second is cheap to miss.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One sealed-row JSON blob per block, matching the shape `rows()` produces for the hot side, so a
+/// row is identical whichever layer it ends up in. If the two shapes differed, a union bug and a
+/// schema bug would look the same.
+fn sealed_json(i: usize) -> String {
+    serde_json::json!({
+        "table": "tok__transfer",
+        "block_number": (i as u64) + 1,
+        "log_index": 0u64,
+        "tx_hash": format!("0x{i:064x}"),
+        "address": "0xabc",
+        "to": format!("0x{:040x}", i % 3),
+        "value": (i as u64) + 1,
+    })
+    .to_string()
+}
+
+/// Seal blocks `1..=cold` into real Parquet on disk, and return the hot rows for `cold+1..=total`.
+fn hot_and_cold(dir: &std::path::Path, cold: usize, total: usize) -> nuthatch::analytics::HotRows {
+    let sealed: Vec<String> = (0..cold).map(sealed_json).collect();
+    nuthatch::seal::seal_range(dir, &sealed, 1, cold as u64).expect("seal the cold half");
+    // `rows(i + 1)[i]` would rebuild the whole prefix per row - O(n squared), and it cost 18 seconds
+    // before anyone noticed. Build the full set once and take the tail.
+    let all = rows(total);
+    let mut h = nuthatch::analytics::HotRows::new();
+    h.insert("tok__transfer".to_string(), all[cold..].to_vec());
+    h
+}
+
+fn union_scalar(
+    dir: &std::path::Path,
+    hot: &nuthatch::analytics::HotRows,
+    cold: u64,
+    sql: &str,
+) -> i128 {
+    let out = nuthatch::analytics::query_hot_cold(
+        dir,
+        sql,
+        nuthatch::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(60),
+            max_rows: 1_000_000,
+        },
+        hot,
+        cold,
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+    let c = out.rows[0].as_object().unwrap().values().next().unwrap();
+    c.as_i64()
+        .map(i128::from)
+        .or_else(|| c.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("not numeric: {c:?}"))
+}
+
+/// **The disjointness invariant, with the seam inside the second vector.**
+///
+/// `cold` is deliberately larger than one DuckDB vector, so the cold side alone spans a chunk boundary
+/// *and* the hot tail begins mid-way through the second. A union that double-counts the seam or drops
+/// it fails on the closed form; nothing here is copied from a run.
+#[test]
+fn the_hot_cold_union_counts_every_row_exactly_once() {
+    for (cold, total) in [
+        (DUCKDB_VECTOR - 1, DUCKDB_VECTOR + 500), // seam just before the boundary
+        (DUCKDB_VECTOR, DUCKDB_VECTOR + 500),     // seam exactly on it
+        (DUCKDB_VECTOR + 1, GROUPED_SIZE),        // seam just past it, hot tail into a third vector
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = hot_and_cold(dir.path(), cold, total);
+        let n = union_scalar(
+            dir.path(),
+            &hot,
+            cold as u64,
+            "SELECT COUNT(*) AS n FROM tok__transfer",
+        );
+        assert_eq!(
+            n as usize, total,
+            "COUNT over hot+cold with the seam at {cold} of {total}: a union that double-counts or \
+             drops the seam is COR-1's failure, and it is silent"
+        );
+        let s = union_scalar(
+            dir.path(),
+            &hot,
+            cold as u64,
+            "SELECT SUM(CAST(value AS HUGEINT)) AS s FROM tok__transfer",
+        );
+        assert_eq!(
+            s,
+            (total as i128) * (total as i128 + 1) / 2,
+            "SUM over hot+cold with the seam at {cold} of {total} must equal the closed form"
+        );
+    }
+}
+
+/// Grouping across the seam. A count can be right while a group's accumulator is reset at the layer
+/// change - the same shape as #894, one layer up.
+#[test]
+fn grouping_across_the_hot_cold_seam_is_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cold, total) = (DUCKDB_VECTOR + 1, GROUPED_SIZE);
+    let hot = hot_and_cold(dir.path(), cold, total);
+    let groups = union_scalar(
+        dir.path(),
+        &hot,
+        cold as u64,
+        "SELECT COUNT(*) AS g FROM (SELECT \"to\" FROM tok__transfer GROUP BY \"to\")",
+    );
+    assert_eq!(
+        groups, 3,
+        "three recipients by construction, on both sides of the seam"
+    );
+    let regrouped = union_scalar(
+        dir.path(),
+        &hot,
+        cold as u64,
+        "SELECT SUM(s) AS t FROM (SELECT SUM(CAST(value AS HUGEINT)) AS s FROM tok__transfer GROUP BY \"to\")",
+    );
+    assert_eq!(
+        regrouped,
+        (total as i128) * (total as i128 + 1) / 2,
+        "grouped sums across the seam must total the closed form"
+    );
+}
