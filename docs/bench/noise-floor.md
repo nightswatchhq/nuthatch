@@ -58,3 +58,49 @@ floor still has to be measured separately. Ingest throughput. Peak RSS, which ne
 treatment recorded in RFC-0042 §6's amendment rather than a latency method.
 
 `scripts/noise-floor.sh` reproduces this against any running nest.
+
+---
+
+# The concurrent floor (RFC-0042 Appendix A)
+
+Measured 2026-08-29, same nest, same release. Two runs, 6 to 8 seconds per level, `SELECT 1` so what is
+measured is the serving path rather than the data.
+
+Appendix A calls the concurrent small-query API workload *"the dimension where public single-query
+ClickBench numbers are least representative"*. Every figure above it is one client at a time, so this
+is the half that was missing.
+
+| concurrency | req/s | median | p95 | max |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 11.2 | 78 ms | 109 ms | 128 ms |
+| 2 | 21.3 | 79 ms | 115 ms | 153 ms |
+| 4 | 94.2 | **12 ms** | 92 ms | 141 ms |
+| 8 | 113.5 | 29 ms | 136 ms | 244 ms |
+| 16 | 127.5 | 63 ms | 170 ms | 326 ms |
+
+Reproducible: two independent runs agree to within a few percent at every level, including the odd one.
+
+## Two findings, and the second contradicts the section above
+
+**Throughput saturates at roughly 115 to 128 req/s** from concurrency 8. Beyond that, added clients buy
+latency rather than work: p95 goes 109 ms to 170 ms and max 128 ms to 326 ms while req/s moves 11%.
+
+**The median is the wrong statistic under concurrency, and it is the right one for a single client.**
+At concurrency 4 the median *falls* to 12 ms while p95 stays at 92 ms. That is not an improvement, it
+is a **bimodal distribution**: most requests served fast, a tail an order of magnitude slower, and the
+median tracking the fast mode while hiding the tail.
+
+So the rule is split, and stating it once here is cheaper than arguing about it during slice 2:
+
+- **Single client: compare medians of >= 15 runs.** Reproducible to 3%.
+- **Concurrent: compare p95, and report req/s alongside.** A median that improves under load is a
+  distribution changing shape, not a system getting faster.
+
+## Cause not established
+
+**A ratio without a cause is not an architectural conclusion** (§5.1), so: the bimodality is
+*consistent with* a small pool of DuckDB connections - requests landing on a warm one return in ~12 ms
+while others pay setup - but that is a hypothesis, untested here. Separating it needs the serving path
+instrumented, not more sampling. Recorded as an observation with a shape, not a diagnosis.
+
+`scripts/concurrent-floor.sh` reproduces it against any running nest.
