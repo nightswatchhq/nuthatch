@@ -1,4 +1,7 @@
 /target
+# Any nested build directory, not just the root one. `tools/df-gate` builds DataFusion - 4 GB - and
+# a root-anchored pattern let `git add tools/df-gate` try to stage the lot.
+**/target/
 **/*.rs.bk
 .env
 .DS_Store

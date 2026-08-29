@@ -1,0 +1,22 @@
+{
+  "bench": "rfc-0042-slice2-gate",
+  "label": "RFC-0042 slice 2: DataFusion 55 vs DuckDB on net_balances, re-running RFC-0013 §4",
+  "date": "2026-08-29",
+  "query": "net_balances - the i128 signed fold over a string-typed uint256 value column",
+  "duckdb": "1.10501.0 (bundled)",
+  "datafusion": "55.0.0",
+  "arrow_datafusion": "59.2.0",
+  "arrow_fixture": "58.4.0",
+  "hardware": "Apple Silicon (darwin arm64)",
+  "note": "Every size run in both engine orders; the fixture is written with Arrow 58, what nuthatch actually seals. Parity is the acceptance criterion and passed at every size before any timing was recorded.",
+  "prior": { "artifact": "docs/bench/rfc-0013-datafusion-gate.json", "date": "2026-08-02", "datafusion": "54.1.0" },
+  "results": [
+    { "rows": 2000000,  "duckdb_ms": 31,  "datafusion_ms": 26,  "ratio": 0.84, "prior_ratio": 1.85, "parity": "identical", "addresses": 509 },
+    { "rows": 8000000,  "duckdb_ms": 41,  "datafusion_ms": 114, "ratio": 2.78, "prior_ratio": 2.57, "parity": "identical", "addresses": 506 },
+    { "rows": 8000000,  "duckdb_ms": 42,  "datafusion_ms": 100, "ratio": 2.38, "prior_ratio": 2.57, "parity": "identical", "addresses": 506, "order": "df_first" },
+    { "rows": 20000000, "duckdb_ms": 103, "datafusion_ms": 268, "ratio": 2.60, "prior_ratio": 2.65, "parity": "identical", "addresses": 508 },
+    { "rows": 20000000, "duckdb_ms": 106, "datafusion_ms": 271, "ratio": 2.56, "prior_ratio": 2.65, "parity": "identical", "addresses": 508, "order": "df_first" }
+  ],
+  "repeats_2m_duck_first": [0.94, 0.84, 0.84, 0.84, 0.81],
+  "conclusion": "RFC-0013's core finding survives: the gap widens with size and DataFusion remains ~2.6x slower at 20M. What changed is the small end - at 2M DataFusion is now faster (0.84x, was 1.85x). Both engines got ~2.2-2.3x faster in absolute terms since 2026-08-02, so neither pulled ahead. The dominant untested variable is segment layout: this fixture is one segment, a real nest has 10,923 with a 6.3 KB median (#889)."
+}
