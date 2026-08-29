@@ -2335,6 +2335,23 @@ async fn build_nest(
                 crate::seal::shared_store(&dir)
                     .unwrap_or_else(|| dir.join(crate::seal::SEGMENTS_DIR)),
             );
+            // **#918: seed the sealed watermark from the store, not from the next seal.**
+            //
+            // The watermark is durable - `SEALED_THROUGH_KEY` in the store's meta - and the query path
+            // has always read it correctly, which is why `/sql` provenance reported the true value
+            // while `/metrics` reported 0. The gauge was only ever written by `seal_finalized`, so a
+            // freshly restarted nest advertised `nuthatch_sealed_through 0` until its first seal.
+            //
+            // Measured on the Lodestar box: two units restarted 28 minutes apart, one on 2.7.1 and one
+            // on 3.0.0-alpha.1, both reporting 0 on `/metrics` and 499300218 in query provenance,
+            // while two units untouched since Aug 24 reported it correctly. Not a regression - it has
+            // always done this - but two surfaces disagreeing about one fact, and the wrong one is
+            // where Prometheus looks.
+            //
+            // It matters more now that 3.0.0 ships six `nuthatch_entity_*` series inviting alerts on
+            // this surface: "sealed_through has not advanced" or "went backwards" fires after every
+            // restart of a perfectly healthy nest, and an alert that cries wolf gets muted.
+            m.set_sealed_through(shared_store.sealed_through());
             m
         },
         addresses,

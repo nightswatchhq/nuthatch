@@ -252,3 +252,88 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
          watermark and re-counted the sealed-but-still-hot range [1,5] (which sums to 1500)"
     );
 }
+
+/// **#918: a restarted nest must not advertise `sealed_through 0` while its query path knows better.**
+///
+/// The watermark is durable in the store's meta and `/sql` provenance has always read it correctly.
+/// The Prometheus gauge, though, was only ever written by `seal_finalized` - so between a restart and
+/// the next seal, `/metrics` said 0 and the query path said the truth. Two surfaces disagreeing about
+/// one fact, and the wrong one is where Prometheus looks.
+///
+/// Found on the Lodestar box: two units restarted 28 minutes apart, one on 2.7.1 and one on
+/// 3.0.0-alpha.1, both reporting 0 on `/metrics` and 499300218 in provenance, while two units
+/// untouched for days reported it correctly. The version column is the control - it is not a
+/// regression, it has always done this.
+///
+/// **The assertion is deliberately made before anything seals in the new process.** Checking after a
+/// seal would pass with the fix reverted, which is presumably why nothing caught this: the gauge is
+/// correct within a second or two of a restart on a busy nest, and wrong exactly when an operator's
+/// alert evaluates it.
+#[tokio::test]
+async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = tape_with_ten_transfers();
+    let rt = spawn(dir.path(), tape.clone()).await;
+    let store = rt.state.store.clone();
+    assert!(
+        wait_indexed(&store).await,
+        "first run did not reach the tip"
+    );
+
+    tape.advance_finalized_to(5);
+    tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
+    tape.advance_tip_to(12);
+    assert!(
+        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await,
+        "range [1,5] did not seal in time"
+    );
+    // **Pin a watermark no seal in this fixture could produce.**
+    //
+    // Reading the gauge "immediately after respawn" is a race I cannot win: the respawned nest
+    // re-seals within milliseconds and writes the gauge itself, so the fix and its absence look the
+    // same. Proved it - with the seeding reverted the test still passed, twice, for two different
+    // reasons. A sentinel far above anything the tape can seal removes the ambiguity: if the gauge
+    // holds it, it was seeded from the store, because nothing else in the process could have put it
+    // there.
+    const SENTINEL: u64 = 999;
+    store
+        .set_meta("sealed_through", &SENTINEL.to_string())
+        .expect("pin the sentinel watermark");
+    let durable = store.sealed_through();
+    assert_eq!(
+        durable, SENTINEL,
+        "the sentinel must be what the store holds"
+    );
+
+    shutdown(rt).await;
+    drop(store);
+
+    // **Zero the gauge to simulate what a real restart gives you: a fresh process.**
+    //
+    // Without this the test is inert, and I proved it: with the fix reverted it still passed, because
+    // `METRICS` is a process-global atomic and this test never restarts the process. The gauge still
+    // held the value the *first* nest wrote when it sealed, which is exactly the number being asserted.
+    // A test that cannot fail is not a test - #913's shape, produced here by me in the act of fixing
+    // an instance of it.
+    //
+    // In production the atomic starts at 0 on every process start. This restores that condition, so
+    // the assertion below is about the seeding and nothing else.
+    nuthatch::metrics::METRICS.set_sealed_through(0);
+
+    // Respawn and read the gauge immediately. No waiting for a seal - that is the whole point.
+    let restarted = spawn(dir.path(), tape.clone()).await;
+    let gauge = nuthatch::metrics::METRICS.render();
+    let reported: u64 = gauge
+        .lines()
+        .find_map(|l| l.strip_prefix("nuthatch_sealed_through "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("nuthatch_sealed_through must appear in /metrics");
+
+    assert_eq!(
+        reported, durable,
+        "a restarted nest reported sealed_through={reported} on /metrics while its store holds \
+         {durable}. An alert on this surface fires after every restart of a healthy nest, and an \
+         alert that cries wolf gets muted (#918).\n\n{gauge}"
+    );
+    shutdown(restarted).await;
+}
