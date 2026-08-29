@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "database", "cryptography::cryptocurrenc
 # Keep the published crate lean: the 1.2 MB example WASM component and its guest source aren't
 # needed to build the host (only a skipped test loads it), the scratch/docs aren't either, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
-exclude = ["/components", "/scratchpad", "/fuzz", "/decode"]
+exclude = ["/components", "/scratchpad", "/fuzz", "/decode", "/tools"]
 
 [[bin]]
 name = "nuthatch"

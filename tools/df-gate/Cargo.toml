@@ -1,0 +1,24 @@
+[package]
+name = "df-gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# **Deliberately outside the workspace and outside nuthatch's dependency graph.**
+#
+# RFC-0042 slice 2 is a measurement, not a migration. Adding DataFusion to `Cargo.toml` would put it in
+# the release graph, in `deny.toml`'s licence and ban checks, and in every clean-build timing this RFC
+# is trying to measure - contaminating the very numbers slice 0 established. A standalone crate depends
+# on nuthatch by path and ships nowhere.
+[dependencies]
+nuthatch = { path = "../.." }
+# **55.0.0, not 54.** RFC-0013 measured 54.1.0 on 2026-08-02; resolving "54" would pin the same
+# version and re-running would measure nothing about the engine having moved - which is the entire
+# premise of §0. If 55 is slower, that is a result too.
+datafusion = "55"
+arrow = "58"
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+duckdb = { version = "1", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+tempfile = "3"
