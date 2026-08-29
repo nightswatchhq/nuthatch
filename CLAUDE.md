@@ -186,11 +186,21 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    `docs/sprint-exacting-egret.md`. **The product is byte-identical when those two close; nothing
 >    is replaced.**
 >
->    **Slices 2 and beyond need their own decision and are not covered by this carve-out.** The
->    DataFusion spike, the Turso spike and the composed Rust path all follow from slice 0's evidence,
->    and RFC-0042 §13 states what must be true before slice 2 may start. Taking them by momentum is
->    the failure this list exists to prevent: *"There is no preferred answer. If evidence says DuckDB
->    remains best, it stays."*
+>    **Amended 2026-08-29: RFC-0042 is unfrozen in full**, board decision, taken with slices 0 and 1
+>    complete and their findings on the table. It is the work that follows sprint `exacting-egret`.
+>    Slices 2 to 6 - the DataFusion spike, the Turso spike, the composed path, the decision and the
+>    native tail - no longer need a further carve-out.
+>
+>    **What does not change is the decision rule.** §0: *"There is no preferred answer. If evidence
+>    says DuckDB remains best, it stays."* Unfreezing the work is not a decision to remove DuckDB, and
+>    §7's no-sacrifice gate stands unaltered. **"Keep DuckDB, with these measured regressions" remains
+>    a successful outcome**, and slice 0 already found evidence pointing that way: DuckDB is 10.6% of
+>    clean build time while wasmtime and cranelift are 21.3%, so §1's premise that it *dominates* build
+>    time is measured false, even though it is 93% of native artefact bytes.
+>
+>    §13's five conditions stop being a permission gate and become a **readiness checklist**. Four are
+>    met; the outstanding one is the parity corpus (#945), which covers 7 of §6's shapes. A spike run
+>    against a corpus that cannot see a chunk-seam defect would produce a number nobody should act on.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
