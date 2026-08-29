@@ -44,7 +44,24 @@ fn tape_with_ten_transfers() -> Arc<TapeSource> {
 }
 
 async fn spawn(dir: &std::path::Path, tape: Arc<TapeSource>) -> indexer::NestRuntime {
-    let cfg = scaffold_nest(dir, "usdc", USDC);
+    spawn_named(dir, tape, "usdc").await
+}
+
+/// `spawn` with the nest's **name** under the caller's control.
+///
+/// `METRICS` is process-global and cargo runs the tests in this file in parallel, so two nests sharing
+/// a name share `METRICS.nest(name)` and the process-wide aggregate behind it. A test asserting on a
+/// gauge therefore reads whatever a sibling wrote - which is precisely how
+/// `a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again` came to report
+/// `sealed_through=5` in CI while its own store held 999: the neighbour had sealed block 5.
+///
+/// Sequential local runs never collide, which is why it passed here and failed there.
+async fn spawn_named(
+    dir: &std::path::Path,
+    tape: Arc<TapeSource>,
+    name: &str,
+) -> indexer::NestRuntime {
+    let cfg = scaffold_nest(dir, name, USDC);
     indexer::spawn_nest(
         tape,
         dir.to_path_buf(),
@@ -271,9 +288,13 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
 /// alert evaluates it.
 #[tokio::test]
 async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
+    // A nest name nobody else in this file uses, so the labelled gauge below is this test's alone.
+    // `METRICS` is process-global and cargo runs these tests in parallel; sharing the name "usdc"
+    // with the neighbours is what made this report `sealed_through=5` in CI while its store held 999.
+    const NEST: &str = "w918";
     let dir = tempfile::tempdir().unwrap();
     let tape = tape_with_ten_transfers();
-    let rt = spawn(dir.path(), tape.clone()).await;
+    let rt = spawn_named(dir.path(), tape.clone(), NEST).await;
     let store = rt.state.store.clone();
     assert!(
         wait_indexed(&store).await,
@@ -321,13 +342,16 @@ async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
     nuthatch::metrics::METRICS.set_sealed_through(0);
 
     // Respawn and read the gauge immediately. No waiting for a seal - that is the whole point.
-    let restarted = spawn(dir.path(), tape.clone()).await;
+    let restarted = spawn_named(dir.path(), tape.clone(), NEST).await;
     let gauge = nuthatch::metrics::METRICS.render();
+    // **The per-nest series, not the process-wide one.** The aggregate is written by every nest in the
+    // process, so asserting on it makes this test a race against its own neighbours.
+    let needle = format!("nuthatch_nest_sealed_through{{nest=\"{NEST}\"}} ");
     let reported: u64 = gauge
         .lines()
-        .find_map(|l| l.strip_prefix("nuthatch_sealed_through "))
+        .find_map(|l| l.strip_prefix(needle.as_str()))
         .and_then(|v| v.trim().parse().ok())
-        .expect("nuthatch_sealed_through must appear in /metrics");
+        .unwrap_or_else(|| panic!("{needle} must appear in /metrics:\n{gauge}"));
 
     assert_eq!(
         reported, durable,
