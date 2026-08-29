@@ -95,22 +95,27 @@ fn the_engine_does_not_spread_beyond_the_known_sites() {
 #[test]
 fn the_analytical_surface_keeps_duckdb_types_internal() {
     let files = src_files();
-    let analytics = &files
-        .iter()
-        .find(|(n, _)| n == "analytics.rs")
-        .expect("analytics.rs")
-        .1;
-
-    let leaks: Vec<&str> = analytics
-        .lines()
-        .filter(|l| {
-            l.trim_start().starts_with("pub fn") || l.trim_start().starts_with("pub struct")
-        })
-        .filter(|l| l.contains("Connection") || l.contains("DuckValue") || l.contains("ValueRef"))
-        .collect();
-    assert!(
-        leaks.is_empty(),
-        "analytics.rs exposes a DuckDB type in a public signature. It is the one module that must \
-         not, because it is the analytical surface RFC-0042 §6 wants a boundary at:\n{leaks:#?}"
-    );
+    for name in ["analytics.rs", "graft.rs"] {
+        let body = &files
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} not found"))
+            .1;
+        let leaks: Vec<&str> = body
+            .lines()
+            .filter(|l| {
+                l.trim_start().starts_with("pub fn") || l.trim_start().starts_with("pub struct")
+            })
+            .filter(|l| {
+                l.contains("Connection") || l.contains("DuckValue") || l.contains("ValueRef")
+            })
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "{name} exposes a DuckDB type in a public signature. Both modules must keep the engine \
+             internal - `analytics.rs` because it is the analytical surface RFC-0042 §6 wants a \
+             boundary at, `graft.rs` because it writes the engine string into grafting identity and \
+             a caller holding a `Connection` makes the engine part of that contract (#944):\n{leaks:#?}"
+        );
+    }
 }

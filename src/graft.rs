@@ -128,7 +128,7 @@ impl CanonicalPlan {
 /// Everything else in §3's unsafe list stays significant, and needs no work to stay so: the AST is
 /// already type-aware (`5/2` carries `INTEGER` where `5/2.0` carries `DECIMAL`), already ordered, and
 /// already distinguishes `DISTINCT`.
-pub fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
+pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(raw) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
         r.get::<_, String>(0)
@@ -260,7 +260,7 @@ fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<String, Value
 /// way at 12. Same SQL, different version, different evaluation and potentially different results. A
 /// key without this is unsound across our *own* upgrades, which is the worst place to be unsound
 /// because it is discovered in production rather than in CI.
-pub fn engine_version(conn: &Connection) -> String {
+pub(crate) fn engine_version(conn: &Connection) -> String {
     conn.query_row("SELECT version()", [], |r| r.get::<_, String>(0))
         .unwrap_or_else(|_| "duckdb-unknown".to_string())
 }
@@ -384,8 +384,43 @@ pub fn report(nest_dir: &std::path::Path) -> GraftReport {
 }
 
 /// Open a connection suitable for canonicalisation. No data is attached: parsing needs no catalogue.
-pub fn parser_connection() -> Result<Connection> {
+///
+/// **Prefer [`Parser`].** This stays `pub(crate)` so the engine type does not leave the module (#944).
+pub(crate) fn parser_connection() -> Result<Connection> {
     Connection::open_in_memory().context("opening DuckDB to canonicalise a derivation")
+}
+
+/// The canonicalisation surface, **owning** its engine rather than handing one out (#944).
+///
+/// `graft.rs` used to expose `duckdb::Connection` in six public signatures, and it is the same module
+/// that writes the engine string into grafting identity - so the module carrying the migration
+/// consequence also carried the API leak, and `engine_version(conn)` is *how* the string gets recorded.
+/// A caller had to open a connection and hand it back, which made the engine part of the contract.
+///
+/// It is not a plugin seam and does not pretend to be one: RFC-0042 slice 2 measured DataFusion at
+/// **2.6x DuckDB's latency at 20 M rows**, so nothing is being swapped. This is encapsulation on its
+/// own merits - a public function returning a third-party connection type is wrong whether or not the
+/// third party ever changes.
+pub struct Parser {
+    conn: Connection,
+}
+
+impl Parser {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            conn: parser_connection()?,
+        })
+    }
+
+    /// See [`canonical_plan`].
+    pub fn canonical_plan(&self, sql: &str) -> CanonicalPlan {
+        canonical_plan(&self.conn, sql)
+    }
+
+    /// See [`engine_version`]. This is the value written into grafting identity.
+    pub fn engine_version(&self) -> String {
+        engine_version(&self.conn)
+    }
 }
 
 #[cfg(test)]
@@ -1114,7 +1149,7 @@ impl Dag {
     /// Build the graph from a nest's `views/*.sql`.
     ///
     /// Statements that are not `CREATE VIEW` are ignored rather than guessed at.
-    pub fn build(conn: &Connection, files: &[(String, String)]) -> Dag {
+    pub(crate) fn build(conn: &Connection, files: &[(String, String)]) -> Dag {
         let mut raw: Vec<(String, String, String)> = Vec::new(); // (name, file, select body)
         for (file, sql) in files {
             for stmt in crate::analytics::split_sql_statements(sql) {
@@ -1438,7 +1473,12 @@ pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
 ///
 /// Returns `Ok(())` when the two runs agree. `conn` must already have the derivation's inputs
 /// defined; this runs the statement, it does not build a nest.
-pub fn determinism_gate(conn: &Connection, sql: &str) -> Result<()> {
+///
+/// **No production caller (#961).** Its own tests exercise it and nothing else does, while the comment
+/// above calls it "the backstop, and the stronger one". Surfaced by #944: it was `pub`, so the compiler
+/// could not tell it was unreachable; narrowing the visibility made the silence audible.
+#[allow(dead_code)]
+pub(crate) fn determinism_gate(conn: &Connection, sql: &str) -> Result<()> {
     let digest = |attempt: usize| -> Result<String> {
         let mut stmt = conn
             .prepare(sql)
