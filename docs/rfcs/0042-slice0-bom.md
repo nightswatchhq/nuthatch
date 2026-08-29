@@ -87,6 +87,40 @@ The two product-visible ones are what make "remove DuckDB" more than an implemen
 function vocabulary decides what a user may write in `entities.toml`; the graft engine string is
 already written into artefacts on disk.
 
+## 4a. What a DataFusion port would and would not address (#891, from RFC-0043)
+
+Carried across as input rather than rediscovered, which is what #891 exists for. RFC-0043 §5 mapped
+Amp onto the four roles §9 knew about; slice 0 found six. Extending the mapping to all six:
+
+| role | would a DataFusion port address it? |
+| --- | --- |
+| general SQL, views, hot+cold federation (`analytics.rs`) | **yes** - a real existence proof, minus the incremental layer underneath |
+| admissible function vocabulary (`entities.rs`) | **no.** Amp has no authoring surface. Swapping engines swaps the vocabulary a nest may declare |
+| AST for lowering authored SQL (`entity_lower.rs`) | **no.** Amp has no incremental layer to lower into |
+| engine string in grafting identity (`graft.rs`) | **no.** Amp has no entity state to graft |
+| segment-binding oracle (`seal.rs`) | test-only; replaceable by anything that parses Parquet |
+| RFC-0041 spike (`authored_entity_spike.rs`) | measurement-only; follows whatever the reference becomes |
+
+RFC-0043 §5's summary was **one of four roles, partially**. Against slice 0's fuller inventory it is
+**one of six, partially, plus one that is only test-only anyway**. The honest size did not improve on
+closer inspection.
+
+### The baseline any re-run is measured against
+
+**RFC-0013 §4, run 2026-08-02: DataFusion at 1.6-2.7x DuckDB's latency, the gap widening as segments
+grow, at exact result parity.** That is the number a slice-2 spike is compared to, and RFC-0013 §2
+already named DataFusion the long-term destination on architectural grounds, so the destination was
+never in dispute - latency on our workload was.
+
+**None of the published Amp figures may stand in for it** (RFC-0043 §9). The vendor numbers are
+marketing; the fork's self-report is n=3 on a shared dev box and RPC-bound by its author's own
+statement. Four million events per second and one hundred and thirteen blocks per second appear in the
+same document and are not obviously the same system.
+
+One thing from that report *is* useful and cuts against engine work generally: **backfill is
+RPC-bound**, corroborated from outside by near-identical throughput between two systems sharing an
+`evm-rpc` client. Any engine migration justified by backfill numbers is measuring the wrong thing.
+
 ## 5. Noise floor and covariates
 
 Per the RFC's method amendment:
