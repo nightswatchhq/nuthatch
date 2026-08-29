@@ -34,6 +34,18 @@ const SIZES: [usize; 4] = [DUCKDB_VECTOR - 1, DUCKDB_VECTOR, DUCKDB_VECTOR + 1, 
 /// Two full vectors and a ragged tail, for the grouped case.
 const GROUPED_SIZE: usize = DUCKDB_VECTOR * 2 + 7;
 
+/// Enforced by the **compiler**, not a test. Clippy pointed out the runtime form was a constant
+/// assertion and was right: if the grouped case ever stops spanning more than two vectors, this file
+/// should fail to build rather than pass a test that no longer means anything. A bug at the *second*
+/// seam is a different bug from one at the first.
+///
+/// Verified: shrinking `GROUPED_SIZE` gives
+/// `error[E0080]: evaluation panicked: the grouped case must span more than two vectors`.
+const _: () = assert!(
+    GROUPED_SIZE > DUCKDB_VECTOR * 2,
+    "the grouped case must span more than two vectors"
+);
+
 /// One row per `i`, with values chosen so every aggregate below has an exact closed form. Exactness is
 /// the point: an approximate expectation cannot tell a chunk-seam bug from a rounding difference.
 fn rows(n: usize) -> Vec<Value> {
@@ -153,11 +165,6 @@ fn the_corpus_actually_crosses_the_boundary() {
         largest > DUCKDB_VECTOR,
         "the largest case is {largest} rows and DuckDB's vector is {DUCKDB_VECTOR}: every case fits \
          in one chunk, so this file proves nothing it was written to prove"
-    );
-    assert!(
-        GROUPED_SIZE > DUCKDB_VECTOR * 2,
-        "the grouped case must span more than two vectors, so a bug at the SECOND seam is reachable \
-         and not just the first"
     );
     assert!(
         SIZES.contains(&(DUCKDB_VECTOR + 1)),
