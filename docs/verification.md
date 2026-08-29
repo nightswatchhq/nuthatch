@@ -66,6 +66,33 @@ now names one.
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
 
+### What we do not claim
+
+A page whose purpose is being checkable owes the reader its limits as plainly as its results. Every row
+above says which release it was verified on; this section says what none of them establish.
+
+**We do not verify that the chain we indexed is the chain consensus agreed on.** Nuthatch follows an
+execution-layer RPC endpoint and hash-links the headers it is served. That proves the blocks it holds
+form an **internally consistent** chain, and it is what makes reorg convergence checkable. It does not
+prove that chain is the network's canonical one, because settling that needs consensus-layer data -
+attestations and finality from the beacon chain - which nuthatch does not read.
+
+In practice the gap is narrow: a single honest endpoint closes it, and disagreement between two
+endpoints surfaces as a reorg the hot store handles. But the failure it leaves open is real. **An
+endpoint that lies consistently is indistinguishable, to us, from one that tells the truth** - the
+headers hash-link, the reorg logic never fires, and every downstream check passes. Content-addressed
+segments and deterministic re-execution do not help here either: they prove we processed what we were
+given identically, not that what we were given was right.
+
+The honest mitigations are operational rather than cryptographic: use an endpoint you trust, and where
+it matters, run two nests on two providers and compare sealed segment hashes. RFC-0011 already does
+exactly that between the GraphOps host and the Hetzner shadow, and cross-operator segment-hash equality
+is the strongest independent check currently available to us.
+
+Stated because Edge & Node stated it publicly about their own system (RFC-0043 §7.3) and it applies to
+us in precisely the same way. A limitation that is true of the whole class is not a reason to stay
+quiet about ours.
+
 ---
 
 ## Level 0 — the artifact is what it claims
@@ -206,6 +233,9 @@ Our property tests drive random reorg depths against the hot store and assert co
 state. Reproducing that live requires catching a real reorg; if you want to verify it yourself, watch
 for `reorg` in the logs and confirm the affected block range's row count matches the canonical chain
 afterwards. *Proves* reorgs only ever touch the mutable hot store.
+
+**"Canonical" here means what the configured endpoint served**, and the section below says why that is
+not the same as what consensus agreed.
 
 ---
 
