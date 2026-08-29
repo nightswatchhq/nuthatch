@@ -890,7 +890,9 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
         .entities
         .iter()
         .map(|e| {
-            let applied = e.applied_through();
+            // #932: one acquisition for the pair, so `rows` and `applied_through` cannot describe
+            // two different moments.
+            let (row_count, applied) = e.len_and_watermark();
             let fault = e.fault();
             let unavailable = e.unavailable();
             let behind = applied < head;
@@ -910,7 +912,7 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
                 "applied_through": applied,
                 "current": !behind,
                 "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
-                "rows": e.len(),
+                "rows": row_count,
                 "faulted": fault.is_some(),
                 "fault": fault,
                 "wedged": wedged,
@@ -1177,14 +1179,19 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
     let maintained: Vec<crate::semantic::MaintainedRelation> = s
         .entities
         .iter()
-        .map(|e| crate::semantic::MaintainedRelation {
-            name: e.name().to_string(),
-            columns: e.columns().to_vec(),
-            applied_through: e.applied_through(),
-            current: e.is_current(head),
-            unavailable: e.unavailable().map(str::to_string),
-            fault: e.fault(),
-            rows: e.len(),
+        .map(|e| {
+            // #932: ONE acquisition. Calling the accessor per field would be three, which is the
+            // bug it exists to fix wearing a different hat.
+            let (rows, applied) = e.len_and_watermark();
+            crate::semantic::MaintainedRelation {
+                name: e.name().to_string(),
+                columns: e.columns().to_vec(),
+                applied_through: applied,
+                current: applied >= head,
+                unavailable: e.unavailable().map(str::to_string),
+                fault: e.fault(),
+                rows,
+            }
         })
         .collect();
     let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage), &maintained);
@@ -1509,11 +1516,18 @@ async fn run_sql_query(
         // relation and an unavailable one are different facts, and a query cannot tell them apart
         // from zero rows - `/derived` is where the reason lives.
         let mut hot = hot;
+        // #932: take the rows and the watermark that describes them in one acquisition, and carry
+        // that watermark into the provenance below. Re-reading `applied_through()` after the query
+        // ran is a race - measured at 1 in 12 on a 0.25s-block chain - and it reports an answer as
+        // more current than the rows it is made of.
+        let mut watermarks: std::collections::BTreeMap<String, u64> = Default::default();
         for entity in declared_entities.iter() {
             if entity.unavailable().is_some() || entity.fault().is_some() {
                 continue;
             }
-            hot.insert(entity.name().to_string(), entity.rows_as_json());
+            let (rows, through) = entity.rows_as_json_with_watermark();
+            watermarks.insert(entity.name().to_string(), through);
+            hot.insert(entity.name().to_string(), rows);
         }
         let sealed_through = store.sealed_through();
         let mut out = analytics::query_hot_cold(
@@ -1528,13 +1542,15 @@ async fn run_sql_query(
             &tables,
         )?;
         out.tip_unavailable = tip_unavailable;
-        Ok(out)
+        // The watermarks ride out with the result: they describe the rows this query was answered
+        // from, and re-reading them out here is the race #932 is about.
+        Ok((out, watermarks))
     })
     .await;
     match result {
         // Provenance stamp (RFC-0016 §4): an agent can cite its answer against content-addressed data -
         // as of which block, what's sealed, and the registry it decoded with.
-        Ok(Ok(out)) => Json(json!({
+        Ok(Ok((out, watermarks))) => Json(json!({
             "count": out.rows.len(),
             "truncated": out.truncated,
             // Cold data was incomplete when this answer was computed (#435): a sealed segment the
@@ -1574,7 +1590,7 @@ async fn run_sql_query(
                 // A caller citing this answer needs to know both. Absent when the statement
                 // referenced no entity, and absent when the parse was unavailable - see
                 // `QueryOutput::referenced_tables`, which is why this is not an empty array.
-                "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref()),
+                "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref(), &watermarks),
             },
         }))
         .into_response(),
@@ -1764,12 +1780,14 @@ async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
         .entities
         .iter()
         .map(|e| {
+            // #932: the pair under one lock.
+            let (row_count, applied) = e.len_and_watermark();
             json!({
                 "name": e.name(),
-                "rows": e.len(),
+                "rows": row_count,
                 "incremental": true,
-                "applied_through": e.applied_through(),
-                "current": e.is_current(head),
+                "applied_through": applied,
+                "current": applied >= head,
                 "available": e.unavailable().is_none() && e.fault().is_none(),
             })
         })
@@ -1846,6 +1864,7 @@ fn dataset_head(s: &AppState) -> u64 {
 fn sql_entity_provenance(
     s: &AppState,
     referenced: Option<&std::collections::BTreeSet<String>>,
+    watermarks: &std::collections::BTreeMap<String, u64>,
 ) -> Value {
     let Some(referenced) = referenced else {
         return Value::Null;
@@ -1857,10 +1876,20 @@ fn sql_entity_provenance(
         .filter(|e| referenced.contains(&e.name().to_ascii_lowercase()))
         .map(|e| {
             json!({
+                // #932: the watermark captured with the rows, never a fresh read. Falling back
+                // to a fresh read for an entity that was not registered (faulted or unavailable, so
+                // it contributed no rows) is correct - there are no rows for it to disagree with.
                 "entity": e.name(),
                 "incremental": true,
-                "applied_through": e.applied_through(),
-                "current": e.is_current(head),
+                "applied_through": watermarks
+                    .get(e.name())
+                    .copied()
+                    .unwrap_or_else(|| e.applied_through()),
+                "current": watermarks
+                    .get(e.name())
+                    .copied()
+                    .unwrap_or_else(|| e.applied_through())
+                    >= head,
             })
         })
         .collect();
@@ -1870,15 +1899,26 @@ fn sql_entity_provenance(
     Value::Array(used)
 }
 
-fn derived_provenance(s: &AppState, entity: &crate::entity_view::EntityView, head: u64) -> Value {
+/// #932: `applied_through` is a **parameter**, not a fresh read.
+///
+/// Every caller serves rows and then builds this block. Reading the watermark here would be a second
+/// acquisition after the rows were taken, which is exactly how an answer came to be labelled more
+/// current than the rows it was made of. Passing it in makes forgetting to capture it a compile
+/// error rather than a rare wrong number.
+fn derived_provenance(
+    s: &AppState,
+    entity: &crate::entity_view::EntityView,
+    head: u64,
+    applied_through: u64,
+) -> Value {
     json!({
         "nid": s.nid,
         "entity": entity.name(),
         "incremental": true,
         "from_maintained_state": true,
-        "applied_through": entity.applied_through(),
+        "applied_through": applied_through,
         "dataset_head": head,
-        "current": entity.is_current(head),
+        "current": applied_through >= head,
     })
 }
 
@@ -1908,11 +1948,12 @@ async fn derived_key(
             .map(|p| crate::entity_row::Scalar::Str(p.to_string()))
             .collect(),
     );
-    match entity.get(&wanted) {
+    let (found, applied) = entity.get_with_watermark(&wanted);
+    match found {
         Some(row) => Json(json!({
             "key": key,
             "row": row.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-            "provenance": derived_provenance(&s, entity, head),
+            "provenance": derived_provenance(&s, entity, head, applied),
         }))
         .into_response(),
         None => (
@@ -1921,7 +1962,7 @@ async fn derived_key(
                 "error": "no such key",
                 "entity": name,
                 "key": key,
-                "provenance": derived_provenance(&s, entity, head),
+                "provenance": derived_provenance(&s, entity, head, applied),
             })),
         )
             .into_response(),
@@ -1947,7 +1988,7 @@ async fn derived_all(
     }
     let head = dataset_head(&s);
     let limit = q.limit.unwrap_or(100).min(1000);
-    let (rows, first) = entity.head_rows(limit);
+    let (rows, first, applied) = entity.head_rows_with_watermark(limit);
     let items: Vec<Value> = first
         .iter()
         .map(|(k, v)| {
@@ -1962,7 +2003,7 @@ async fn derived_all(
         "rows": rows,
         "returned": items.len(),
         "items": items,
-        "provenance": derived_provenance(&s, entity, head),
+        "provenance": derived_provenance(&s, entity, head, applied),
     }))
     .into_response()
 }
