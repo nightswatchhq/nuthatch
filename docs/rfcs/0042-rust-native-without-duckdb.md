@@ -67,6 +67,29 @@ production/linux-x86_64
 
 Separately enumerate each DuckDB use as parser, binder, optimiser, execution engine, Parquet reader, hot/cold federation, view catalogue, reference oracle, test-only, migration utility or other. This is the deletion checklist. Until every item has an owner, replacement is too vague.
 
+> **Amended 2026-08-29, after RFC-0041 shipped.** Two corrections from walking the actual call sites,
+> because §9's list was written before the entity work finished and turns out to be an undercount.
+>
+> **Start the inventory from the call sites, not from §9.** DuckDB is reached from six files -
+> `analytics.rs`, `entities.rs`, `entity_lower.rs`, `graft.rs`, `seal.rs`, `authored_entity_spike.rs`.
+> Two of those roles are **product-visible** and appear nowhere in §9:
+>
+> - **`graft.rs` writes the engine string into grafting identity**, e.g. `engine: "duckdb-v1.4.0"`.
+>   Removing DuckDB therefore raises a compatibility question about grafts already recorded under that
+>   engine, which is a migration concern rather than an implementation one (RFC-0033).
+> - **`entities.rs` derives the admissible function vocabulary from `duckdb_functions()`** - its own
+>   comment says "the same catalogue the binder uses". **The SQL a nest is allowed to declare is
+>   DuckDB's function list.** A replacement changes what a user may write in `entities.toml`, so this
+>   is a public contract and not a detail. §9 files it vaguely under parsing.
+> - `seal.rs` uses a connection as a segment-binding oracle.
+>
+> **Baseline on post-#896 code, and record why.** Before #896, a `/sql` request defined a view for
+> every table in the manifest whether the statement named it or not, at roughly 62 µs per sealed
+> segment: `SELECT 1` cost **2,465 ms** on a 38,428-segment nest before reading a row. That was
+> Nuthatch's view management, not DuckDB. A baseline taken before that fix charges the engine 2.4
+> seconds and makes any replacement look brilliant for a reason that has nothing to do with engines.
+> Slice zero must state the commit it baselined at and confirm it is at or after #896.
+
 ## §5 - Candidate set: no preselected winner
 
 ### 5.1 DataFusion
@@ -108,6 +131,28 @@ Keep `net_balances`, but do not let it decide alone. The corpus includes point l
 
 Record cold/warm status, engine order and reversed order; control or expose page-cache effects; retain commit/compiler/engine/dataset hash/CPU/RAM/OS/features/parameters and plans for material differences. Continuously compare nulls, empty inputs, absent hot tails, i128 boundaries, signed values, overflow, decimal conversion, casts, duplicates, large values, reorgs, restarts, view ordering, refusal and cancellation. Nuthatch's public contract decides legitimate engine differences.
 
+> **Amended 2026-08-29. Three method requirements, each from something that has already cost us.**
+>
+> **The corpus must cross every engine's internal batch boundary.** DuckDB's vector is 2,048 rows and
+> DataFusion's default batch is 8,192; dbsp splits a transaction into 10,000-row steps. #894 is the
+> warning: **all 857 tests sat under dbsp's step size**, so the entire suite was blind to a defect that
+> silently kept `groups mod 10,000` of a relation, with nothing faulted and every surviving group
+> holding the right value. "Small, medium, large" does not express this. At least one dataset must
+> exceed the largest engine-internal boundary in play, and the corpus must say which boundary each
+> size was chosen to cross.
+>
+> **Peak RSS needs a stated window, not a slope.** A nest's RSS sawtooths - measured on 2026-08-28, a
+> ~120 MB swing unaided, with a process observed at 396 MB and 266 MB four minutes apart. A slope
+> across that window measures the allocator: the same data gave 40,861 bytes per row and 13,943 bytes
+> per row depending on where the window started, and a trough-to-trough reading made an entity's cost
+> come out *negative*. Report **peak over a stated window**, with the window named, and never a
+> per-unit figure derived from a window shorter than the sawtooth.
+>
+> **Segment layout is a covariate, not a footnote.** Small Parquet files degrade planning (RFC-0043
+> §7.1), so a DuckDB-versus-candidate comparison over many-small-segments is partly measuring file
+> layout. Either land #889 before slice zero or record file count, size distribution and row-group
+> size alongside every measurement. Without it a ratio has two causes and names one.
+
 ## §7 - No-sacrifice decision gate
 
 Replacement requires parity; no lost capability; matching hot+cold semantics and guards; no material regression to material query, concurrent throughput, indexing, peak memory, startup/restart or real-workload result; release builds for each supported target; one-binary/no-service intact; and no DuckDB in the release tree. Expected wins include several of clean/incremental build, disk, binary size, cross-compilation, containers, CI and native toolchain requirements. If these do not materialise, removal needs stronger justification.
@@ -121,6 +166,21 @@ After a DuckDB-free candidate, rerun the BOM. If no C++ remains, Tier 2 is prove
 ## §9 - Interaction with RFC-0041
 
 RFC-0041 assigns DuckDB parsing/canonicalisation, incremental-reference evaluation, finalised restart seeds and analytical entity serving roles. Keep these touchpoints behind boundaries. A winning Rust path uses its parser, frozen corpora or independent reference, production-engine seed and direct entity exposure. RFC-0041 semantics survive; the mechanism is not sacred.
+
+> **Amended 2026-08-29: RFC-0041 shipped, and its result is an input to this RFC rather than something
+> to rediscover.**
+>
+> §11 asks "whether RFC-0041 removes expensive general queries". It does, measured on a copy of the
+> real Lodestar nest: the `indexer_rewards` panel went **p50 2.15 s to 87.7 ms** and stopped scanning
+> the raw historical tables to derive that relation, and `/derived` keyed reads are a `BTreeMap` lookup
+> that does not open a DuckDB connection at all.
+>
+> That **shrinks the general-SQL surface a replacement has to be fast at**, and it shrinks it in the
+> direction that matters: the queries a maintained entity replaces were exactly the expensive scanning
+> ones. A candidate engine's weakness on wide historical aggregation is worth less than it was in
+> RFC-0013's day, and its behaviour on **many small concurrent reads** is worth more. Appendix A
+> already names that as the dimension public single-query benchmarks least represent; this is a second
+> reason to weight it.
 
 ## §10 - Proposed slices
 
