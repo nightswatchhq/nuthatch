@@ -454,3 +454,132 @@ fn grouping_across_the_hot_cold_seam_is_exact() {
         "grouped sums across the seam must total the closed form"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// The remainder of §6's list (#945): joins, authored and nested views, and cancellation. Every case
+// above the vector boundary, expectations arithmetic rather than captured.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// **Self-join across the boundary.** A join is the shape where an engine's decision to build or probe
+/// on the wrong side shows up as a wrong *count* rather than a wrong sum, so `COUNT(*)` is the
+/// assertion and the closed form is exact: each of the three recipient groups joins to itself.
+#[test]
+fn a_join_is_exact_across_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = DUCKDB_VECTOR + 1;
+    // Group first so the join is over three rows a side, not n squared - the point is the join, not
+    // the memory. Sizes per group: n/3 rounded, so the counts stay closed-form.
+    let got = scalar(
+        dir.path(),
+        n,
+        "SELECT COUNT(*) AS c FROM \
+         (SELECT \"to\", COUNT(*) AS n FROM tok__transfer GROUP BY \"to\") a \
+         JOIN (SELECT \"to\", COUNT(*) AS n FROM tok__transfer GROUP BY \"to\") b USING (\"to\")",
+    );
+    assert_eq!(got, 3, "three groups joined to themselves on {n} rows");
+
+    // And the join must not lose rows: summing one side through the join reproduces the whole sum.
+    let joined = scalar(
+        dir.path(),
+        n,
+        "SELECT SUM(a.s) AS t FROM \
+         (SELECT \"to\", SUM(CAST(value AS HUGEINT)) AS s FROM tok__transfer GROUP BY \"to\") a \
+         JOIN (SELECT DISTINCT \"to\" FROM tok__transfer) b USING (\"to\")",
+    );
+    assert_eq!(
+        joined,
+        (n as i128) * (n as i128 + 1) / 2,
+        "a join that drops a group loses its whole sum, silently"
+    );
+}
+
+/// **Authored views, including one nested on another** (`views/*.sql`). This is the RFC-0001 surface a
+/// nest actually ships, and it is defined through `define_nest_views` rather than inline SQL - so a
+/// candidate engine has to parse and resolve the same files, not just the same statements.
+#[test]
+fn authored_and_nested_views_resolve_across_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("views")).unwrap();
+    std::fs::write(
+        dir.path().join("views/10-per-recipient.sql"),
+        "CREATE VIEW per_recipient AS \
+         SELECT \"to\", SUM(CAST(value AS HUGEINT)) AS s FROM tok__transfer GROUP BY \"to\";",
+    )
+    .unwrap();
+    // Nested: a view over a view. An engine that resolves views in file order but not transitively
+    // fails here and passes the flat case.
+    std::fs::write(
+        dir.path().join("views/20-top-recipient.sql"),
+        "CREATE VIEW top_recipient AS SELECT MAX(s) AS biggest FROM per_recipient;",
+    )
+    .unwrap();
+
+    let n = GROUPED_SIZE;
+    let total = scalar(dir.path(), n, "SELECT SUM(s) AS t FROM per_recipient");
+    assert_eq!(
+        total,
+        (n as i128) * (n as i128 + 1) / 2,
+        "the authored view must see every row on both sides of the chunk boundary"
+    );
+    let biggest = scalar(dir.path(), n, "SELECT biggest FROM top_recipient");
+    assert!(
+        biggest > 0 && biggest < total,
+        "the nested view resolves and returns one group's sum ({biggest}), not the whole ({total})"
+    );
+}
+
+/// **Cancellation** under the guard. A timeout that only fires on small inputs is not a timeout, and
+/// the query surface is bounded by RFC-0034 rather than by how long an engine feels like running.
+///
+/// Two false starts worth recording, because both *looked* like a broken guard:
+///   - `SELECT COUNT(*) FROM t a, t b` is folded to a multiplication by the optimiser. It never
+///     materialises a pair, finishes in microseconds, and leaves the watchdog nothing to interrupt.
+///   - Adding an equality predicate turns it into a hash join, which over 4,103 rows is also fast.
+///
+/// The guard is enforced against an `Instant` deadline (`recv_timeout` + `interrupt_handle`), so it
+/// is sub-second capable; only the *message* rounds to whole seconds. A **one-sided inequality across
+/// three copies** is the shape the optimiser cannot reduce - ~69 billion triples over `GROUPED_SIZE`
+/// rows - so the query is bounded by the guard and by nothing else.
+///
+/// Mutation-checked: replacing the watchdog's `guard.zip(deadline)` with a `None` (never arming it)
+/// makes this test run past two minutes instead of returning in 1.02 s. The kill is by
+/// non-termination rather than a clean assertion, which is the honest consequence of a query the
+/// optimiser genuinely cannot shorten.
+#[test]
+fn the_timeout_guard_still_fires_past_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = GROUPED_SIZE;
+    let started = std::time::Instant::now();
+    let out = nuthatch::analytics::query_hot_cold(
+        dir.path(),
+        "SELECT COUNT(*) AS c FROM tok__transfer a, tok__transfer b, tok__transfer c \
+         WHERE a.tx_hash > b.tx_hash AND b.tx_hash > c.tx_hash",
+        nuthatch::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(1),
+            max_rows: 1_000_000,
+        },
+        &hot(n),
+        0,
+        &[],
+    );
+    let elapsed = started.elapsed();
+
+    let err = out.expect_err(&format!(
+        "a 1s budget must refuse an unreducible 3-way inequality join over {n} rows; a guard that \
+         only holds on small inputs is not a guard"
+    ));
+    // Not merely *an* error: the untrusted surface must say it ran out of budget, not leak DuckDB's
+    // internal "Interrupted!" text (#529). Asserting only `is_err()` passes on that regression.
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("exceeded the 1s time budget"),
+        "the refusal must name the budget, not leak an engine-internal error: {msg}"
+    );
+    // The guard must also *stop* the query, not merely relabel it once it finishes on its own. A
+    // generous ceiling: the point is that it did not run to completion, which takes far longer.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the query was refused after {elapsed:?}, which suggests it ran to completion and was \
+         relabelled rather than interrupted"
+    );
+}
