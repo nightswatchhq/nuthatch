@@ -175,10 +175,22 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >
 > 1. **RFC-0041, authored incremental entities (2026-08-24).** After GraphOps identified query-time
 >    view recomputation as a product gap. Conditions in the entity-derivation section above.
-> 2. **RFC-0042, the Rust-native/no-DuckDB investigation (2026-08-25).** **Sequenced behind
->    RFC-0041** - no slice starts until the entity work is done, because RFC-0042 §9 hands DuckDB
->    four roles inside RFC-0041 (parser, incremental reference, restart seed, entity serving) and
->    moving the engine while those roles are still being assigned would make both unattributable.
+> 2. **RFC-0042, the Rust-native/no-DuckDB investigation (2026-08-25).** Was **sequenced behind
+>    RFC-0041** - no slice until the entity work was done, because RFC-0042 §9 hands DuckDB four
+>    roles inside RFC-0041 (parser, incremental reference, restart seed, entity serving) and moving
+>    the engine while those roles were still being assigned would have made both unattributable.
+>
+>    **That condition is met: RFC-0041 shipped 2026-08-28.** The carve-out is **taken as of
+>    2026-08-29, for slices 0 and 1 only** - the native bill of materials and role inventory (#935),
+>    and the engine boundary plus parity corpus with DuckDB unchanged (#936). Sprint
+>    `docs/sprint-exacting-egret.md`. **The product is byte-identical when those two close; nothing
+>    is replaced.**
+>
+>    **Slices 2 and beyond need their own decision and are not covered by this carve-out.** The
+>    DataFusion spike, the Turso spike and the composed Rust path all follow from slice 0's evidence,
+>    and RFC-0042 §13 states what must be true before slice 2 may start. Taking them by momentum is
+>    the failure this list exists to prevent: *"There is no preferred answer. If evidence says DuckDB
+>    remains best, it stays."*
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
