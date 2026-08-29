@@ -279,11 +279,31 @@ impl EntityView {
     /// defines a view over it. Recorded rather than optimised away by instinct; the criterion says to
     /// measure it first and only act if it is material.
     pub fn rows_as_json(&self) -> Vec<serde_json::Value> {
+        self.rows_as_json_with_watermark().0
+    }
+
+    /// The rows **and the watermark that describes them**, under one lock acquisition (#932).
+    ///
+    /// Taking them separately is a race, and not a theoretical one: measured at **1 in 12** reads on
+    /// a 0.25s-block chain, 0 in 28 on a 12s one. `/sql` executed its query against the rows and then
+    /// built the response, whose `provenance.entities[].applied_through` called `applied_through()`
+    /// afresh - so a batch landing in between produced an answer whose rows were from block N while
+    /// its label said N+8.
+    ///
+    /// The relation was never wrong and the mismatch always self-corrected on the next read. The
+    /// *label* was wrong, and the label is the product claim: an agent citing `applied_through` is
+    /// citing how current the answer is. A citation that overstates its own currency is the one thing
+    /// this block must not do.
+    ///
+    /// The circuit thread was never the problem - `step` and `stamp` already share one write lock, so
+    /// no reader sees the relation mid-transaction. The gap was entirely on the reading side.
+    pub fn rows_as_json_with_watermark(&self) -> (Vec<serde_json::Value>, u64) {
         let state = match self.state.read() {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), 0),
         };
-        state
+        let through = state.through;
+        let rows = state
             .relation
             .iter()
             .map(|(k, v)| {
@@ -293,7 +313,8 @@ impl EntityView {
                 }
                 serde_json::Value::Object(obj)
             })
-            .collect()
+            .collect();
+        (rows, through)
     }
 
     /// Whether the circuit thread is alive and folding. `false` means it died - on start, on a step,
@@ -455,6 +476,33 @@ impl EntityView {
     /// The first `limit` rows and the total count, read under the lock. Same reason as
     /// [`Self::get`]: the listing route returns at most a hundred rows and was copying every one
     /// the entity holds to do it.
+    /// A keyed read **with** the watermark describing it, in **one** acquisition (#932).
+    ///
+    /// Serving a row and then reading `applied_through()` separately is the race this fixes; doing it
+    /// inside the accessor would only move the race, so both come off the same guard.
+    pub fn get_with_watermark(&self, key: &Row) -> (Option<Row>, u64) {
+        match self.state.read() {
+            Ok(s) => (s.relation.get(key).cloned(), s.through),
+            Err(_) => (None, 0),
+        }
+    }
+
+    /// [`Self::head_rows`] **with** the watermark describing those rows, one acquisition (#932).
+    pub fn head_rows_with_watermark(&self, limit: usize) -> (usize, Vec<(Row, Row)>, u64) {
+        match self.state.read() {
+            Ok(s) => (
+                s.relation.len(),
+                s.relation
+                    .iter()
+                    .take(limit)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                s.through,
+            ),
+            Err(_) => (0, Vec::new(), 0),
+        }
+    }
+
     pub fn head_rows(&self, limit: usize) -> (usize, Vec<(Row, Row)>) {
         match self.state.read() {
             Ok(s) => (
@@ -475,6 +523,19 @@ impl EntityView {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Row count **and** watermark under one lock (#932).
+    ///
+    /// Every surface reporting both - `/derived`, `/ready`, the semantic doc - was reading them
+    /// separately, so a batch landing between the two produced a count from block N labelled N+k.
+    /// Less consequential than the `/sql` case (nobody reconciles against a row count) but the same
+    /// defect, and cheaper to fix once than to explain twice.
+    pub fn len_and_watermark(&self) -> (usize, u64) {
+        self.state
+            .read()
+            .map(|s| (s.relation.len(), s.through))
+            .unwrap_or((0, 0))
     }
 
     /// The block this entity has folded through (criterion 2).
