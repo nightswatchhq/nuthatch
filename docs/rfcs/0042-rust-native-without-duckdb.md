@@ -222,6 +222,43 @@ The final amendment contains measurements like this, then says either **Remove D
 
 No appeal to a previous RFC, Rust purity, reputation, roadmap or “probably”. The question is empirical: can Nuthatch remove DuckDB, then the native tail, while remaining the same or better Nuthatch?
 
+## §13 - What must be true before slice 2 starts
+
+Added 2026-08-29, when the carve-out was taken. Slices 0 and 1 are covered by it; **slices 2 and
+beyond are not**, and this section exists so that continuing is a decision somebody makes rather than
+something that happens because the previous slice finished.
+
+The failure this guards against is named in §11 - *purity becoming the objective* - and the shape it
+takes in practice is momentum. Slice 1 ends with a working boundary and a parity corpus; the next
+thing to do is obviously to plug something into it; and nobody ever decides to migrate a query engine,
+they simply find that they have.
+
+**Slice 2 may start when all five are true, and not otherwise:**
+
+1. **The role inventory is complete and every role has a named owner.** Not §9's four - the six found
+   in the call sites, including `graft.rs` writing the engine string into grafting identity and
+   `entities.rs` deriving the admissible function vocabulary from `duckdb_functions()`. A role with no
+   owner is a role nobody has costed.
+2. **The BOM says what DuckDB actually costs**, per target: clean-build time, disk, output size,
+   cross-compilation consequences. If it turns out to be a small share, §1's premise weakens and the
+   board should hear that before anything else is spent.
+3. **The noise floor is measured and stated**, with the method: peak RSS over a named window, segment
+   layout recorded, and the corpus crossing every engine's internal batch boundary. A comparison
+   against an unmeasured floor cannot support the word "regression".
+4. **The parity corpus reproduces today's results byte-identically** through the new boundary. If the
+   apparatus changes an answer before any engine is swapped, it is measuring itself.
+5. **The board records the decision**, in the CLAUDE.md carve-out list, naming which slices are
+   covered. An approved RFC is not a carve-out until it appears in that list, and slice 1 finishing is
+   not an approval.
+
+**What a "no" looks like, and why it is a result.** If the BOM shows DuckDB is a modest share of build
+cost, or the role inventory shows the parser and function-vocabulary roles are expensive to replace
+and product-visible, or RFC-0041 has shrunk the general-SQL surface far enough that the remaining
+queries are cheap on any engine - then the honest outcome is **keep DuckDB, with the blockers
+quantified**, and §11 already lists that among the useful answers. Recording it closes the question
+for a year rather than leaving it to be reopened by the next person who reads a competitor's launch
+blog.
+
 ## §12 - Appendix A: Tier 1 research, 2026-08-25
 
 **Status: research input, not an RFC decision.** Commissioned to answer §5's candidate question for
