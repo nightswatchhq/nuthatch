@@ -207,3 +207,123 @@ async fn restart_to_ready_against_stored_size() {
          row names. Poll interval 1 ms, medians of 3.\n"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// #997 - the figure above is measured at 500 blocks and reads as if it generalises.
+//
+// It does not, and the reason is not block count. `horizon-nest` holds **10,923 sealed segments**
+// (#889), and both #964 and #987 found *segment count* dominating everything else at a realistic
+// layout - #964 saw the same rows go from 37 ms to 856 ms purely by splitting them across 10,000
+// files. A warm restart attaches those segments, so it is the variable most likely to matter and
+// the one the benchmark above cannot reach: its tape builds a small chain, not a large sealed
+// corpus, and 500 blocks of one transfer each seal almost nothing.
+//
+// So this varies segment count directly. `seal::seal_range` is public and writes a segment per
+// call, which reaches a realistic layout in seconds rather than requiring a tape of the size that
+// would produce one naturally.
+// -------------------------------------------------------------------------------------------
+
+/// Write `n` sealed segments into `dir`, one block-range each, the shape a tip-following nest
+/// accumulates: `seal_finalized` has no batch threshold, so it seals whatever finalised, which at
+/// tip is a few blocks carrying a few rows. `docs/bench/segment-layout.md` measured the result -
+/// median segment 6.3 KB, 80% under 20 KB.
+fn seal_many(dir: &std::path::Path, n: u64) {
+    for i in 0..n {
+        let b = 1_000_000 + i;
+        let rows: Vec<String> = (0..3)
+            .map(|k| {
+                serde_json::json!({
+                    "_table": "usdc__transfer",
+                    "block_number": b,
+                    "log_index": k,
+                    "block_timestamp": 1_700_000_000u64 + i,
+                    "from_dec": account(1),
+                    "to_dec": account(2),
+                    "value_dec": (100 + k).to_string(),
+                })
+                .to_string()
+            })
+            .collect();
+        nuthatch::seal::seal_range(dir, &rows, b, b)
+            .unwrap_or_else(|e| panic!("seal segment {i} at block {b}: {e}"));
+    }
+}
+
+fn count_segments(dir: &std::path::Path) -> usize {
+    fn walk(p: &std::path::Path, acc: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|x| x == "parquet") {
+                *acc += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(dir, &mut n);
+    n
+}
+
+/// The measurement #997 asks for: restart-to-ready against **segment count**, not block count.
+///
+/// Reported as its own row rather than folded into the table above, because it is a different
+/// independent variable and mixing them is how "74 ms" came to sound like a property of restarts
+/// rather than of a 500-block fixture.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing benchmark - run explicitly with --ignored"]
+async fn restart_to_ready_against_segment_count() {
+    const REPEATS: usize = 5;
+    println!(
+        "\n{:<12} {:>12} {:>18} {:>12}",
+        "segments", "on disk", "restart-to-ready", "vs 0 seg"
+    );
+    println!("{}", "-".repeat(58));
+
+    let mut baseline: Option<Duration> = None;
+    // 10,923 is `horizon-nest`'s real count (#889). Going past it is what turns "we measured a
+    // small case" into "we measured the shape".
+    for segments in [0u64, 100, 1_000, 5_000, 11_000] {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Populate the hot store first, so the restart has a view to rebuild as well as segments to
+        // attach - a restart over an empty store measures nothing.
+        let rt = spawn_named(dir.path(), tape_of(10), "bench").await;
+        assert!(wait_indexed(rt.state.store.as_ref(), 11).await, "must reach block 11");
+        let want = balances_of(&rt);
+        shutdown(rt).await;
+
+        // **Sealed once, then restarted REPEATS times.** Sealing inside the repeat loop would put
+        // minutes of segment-writing inside a measurement of restarts, and would re-create a corpus
+        // that must be identical across repeats to be comparable.
+        if segments > 0 {
+            seal_many(dir.path(), segments);
+        }
+        let on_disk = count_segments(dir.path());
+
+        let mut warm = Vec::new();
+        for _ in 0..REPEATS {
+            let t = Instant::now();
+            let rt = spawn_named(dir.path(), tape_of(10), "bench").await;
+            let _ = time_until_current(&rt, &want).await;
+            warm.push(t.elapsed());
+            shutdown(rt).await;
+        }
+
+        let w = median(warm);
+        let ratio = match baseline {
+            None => {
+                baseline = Some(w);
+                1.0
+            }
+            Some(b) => w.as_secs_f64() / b.as_secs_f64(),
+        };
+        println!("{segments:<12} {on_disk:>12} {:>16.1?} {ratio:>11.2}x", w);
+    }
+    println!(
+        "\nIn-process, `spawn_nest` to rebuilt view, medians of {REPEATS}. Segments written directly \
+         with `seal::seal_range`, one block-range each - the shape a tip-following nest accumulates. \
+         11,000 brackets `horizon-nest`'s real 10,923 (#889).\n"
+    );
+}
