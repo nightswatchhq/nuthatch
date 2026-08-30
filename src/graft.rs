@@ -974,7 +974,7 @@ mod tests {
     /// RFC-0033 §10. The gate is the backstop for everything the static list cannot prove - which is
     /// why it must actually catch a nondeterminism the list does *not* name.
     #[test]
-    fn the_determinism_gate_catches_what_the_static_list_cannot() {
+    fn the_determinism_gate_catches_volatility_empirically_not_by_name() {
         let conn = parser_connection().unwrap();
 
         // A deterministic derivation passes, twice over.
@@ -1477,6 +1477,29 @@ pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
 /// **No production caller (#961).** Its own tests exercise it and nothing else does, while the comment
 /// above calls it "the backstop, and the stronger one". Surfaced by #944: it was `pub`, so the compiler
 /// could not tell it was unreachable; narrowing the visibility made the silence audible.
+///
+/// ## What it can and cannot catch, measured (#961, 2026-08-30)
+///
+/// The claim above - "the backstop for everything [`static_refusals`] cannot prove, float
+/// non-associativity included" - **is not currently evidenced, and the float half looks unreachable by
+/// this design.** The gate re-runs the *same statement* on the *same connection*, which is
+/// deterministic almost by construction.
+///
+/// Attempted and could not be made to diverge, where `static_refusals` returned nothing: `sum` over
+/// `DOUBLE` grouped and ungrouped, `first`, `any_value`, `string_agg`, `list`, and `SELECT ... ORDER BY`
+/// on a non-unique key - each at 1, 2, 4, 8 and 16 threads. The only divergence found was `random()`,
+/// which the static list already refuses by name.
+///
+/// The float error is **real** but not order-*varying* here. Over 100,000 rows holding `1e16`, `-1e16`
+/// and 99,998 ones, DuckDB returns the exact `99998` at every thread count and across a two-file split,
+/// and `sum(d) = kahan_sum(d)`; forcing the order with `ORDER BY d DESC` returns **`0.0`**. So the
+/// hazard needs the *input order* to change - segment layout, parallelism, a different plan - and two
+/// identical runs never change it.
+///
+/// **Which is why this is neither wired in nor deleted.** Wiring in a gate never shown stronger than
+/// the check beside it buys cost and false confidence; deleting it removes the design's stated
+/// backstop. A version that is genuinely stronger would have to perturb the input order between runs.
+/// Recorded here rather than in a comment on the issue, because the next reader meets the claim here.
 #[allow(dead_code)]
 pub(crate) fn determinism_gate(conn: &Connection, sql: &str) -> Result<()> {
     let digest = |attempt: usize| -> Result<String> {
