@@ -290,7 +290,10 @@ async fn restart_to_ready_against_segment_count() {
         // Populate the hot store first, so the restart has a view to rebuild as well as segments to
         // attach - a restart over an empty store measures nothing.
         let rt = spawn_named(dir.path(), tape_of(10), "bench").await;
-        assert!(wait_indexed(rt.state.store.as_ref(), 11).await, "must reach block 11");
+        assert!(
+            wait_indexed(rt.state.store.as_ref(), 11).await,
+            "must reach block 11"
+        );
         let want = balances_of(&rt);
         shutdown(rt).await;
 
