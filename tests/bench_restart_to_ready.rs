@@ -150,8 +150,12 @@ async fn restart_to_ready_against_stored_size() {
             let dir = tempfile::tempdir().unwrap();
 
             // **Cold**: empty directory, index the whole tape, time to analytically current.
-            let rt = spawn_named(dir.path(), tape_of(blocks), "bench").await;
+            //
+            // The clock starts **before** `spawn_named`, matching the warm case (#999). It previously
+            // started after, so the ratio compared post-spawn cold *indexing* against warm *spawn plus
+            // reconstruction* - two different intervals, and the warm/cold column meant nothing.
             let t = Instant::now();
+            let rt = spawn_named(dir.path(), tape_of(blocks), "bench").await;
             assert!(
                 wait_indexed(rt.state.store.as_ref(), blocks + 1).await,
                 "the nest must reach block {}; a restart over an empty store measures nothing",

@@ -9,20 +9,32 @@ cargo test --test bench_restart_to_ready -- --ignored --nocapture
 
 ## Result
 
-| blocks stored | cold to analytically current | **restart-to-ready** | ratio |
+> **Correction, 2026-08-30 (#999, found by review).** The first table here started the **cold** clock
+> *after* `spawn_named` returned and the **warm** clock *before* it, so the ratio compared post-spawn
+> cold indexing against warm spawn-plus-reconstruction - two different intervals. The restart-to-ready
+> column was measured over the whole interval and is unchanged; the cold column and the ratio were
+> wrong, and the ratio implied warm restarts were *slower* when they are faster.
+
+| blocks stored | cold to analytically current | **restart-to-ready** | warm/cold |
 | ---: | ---: | ---: | ---: |
-| 10 | 27.2 ms | **67.7 ms** | 2.49 |
-| 100 | 27.1 ms | **70.0 ms** | 2.58 |
-| 500 | 54.3 ms | **74.4 ms** | 1.37 |
+| 10 | 112.3 ms | **68.2 ms** | **0.61** |
+| 100 | 113.2 ms | **67.3 ms** | **0.59** |
+| 500 | 169.2 ms | **74.0 ms** | **0.44** |
 
-**Restart-to-ready grows about 10% for 50x the stored data** - 67.7 ms to 74.4 ms. At this scale it is
-dominated by a constant, not by what is stored. Cold start doubles over the same range, as expected,
-because it is re-indexing rather than reconstructing.
+**Restart-to-ready grows about 8% for 50x the stored data** - 68.2 ms to 74.0 ms. At this scale it is
+dominated by a constant, not by what is stored.
 
-## Three measurements were taken before this one, and two were wrong
+**A warm restart is cheaper than a cold start**, 0.44-0.61x, and the gap widens with stored data - which
+is what reconstruction-from-state versus re-indexing-from-chain should look like. The superseded table
+said 1.37-2.58 and implied the reverse.
+
+## Four measurements were taken before this one, and three were wrong
 
 Recorded because each looked plausible and would have been reportable.
 
+0. **Starting the two clocks at different points** (#999, caught by review after publication) - cold
+   after `spawn_named`, warm before it. The ratio then compared unlike intervals, and the published
+   table read as though warm restarts cost more than cold starts.
 1. **Timing `spawn_nest` and subtracting the cold spawn** gave a reconstruction cost of **zero** - a
    warm spawn is *faster* than a cold one, because the cold path pays to create an empty store, and
    `saturating_sub` clamped the negative to nought. A tidy zero in a results table is exactly the shape

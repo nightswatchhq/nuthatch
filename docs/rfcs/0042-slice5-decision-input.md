@@ -21,7 +21,7 @@ the number quietly replaced.
 | concurrent throughput | **40.3 -> 39.6 qps, 1 -> 32 clients**; p50 24.1 -> 24.6 ms; **p99 29.5 -> 7066 ms** | 43 -> 107 qps, p99 944 ms | #986 |
 | peak RSS | ~60 MB, CI-gated at 256 MB | not measured for the candidate | `footprint` job |
 | ingest throughput | `bench backfill` events/sec | n/a - the candidate is not an ingest path | RFC-0004 |
-| restart-to-ready | **67.7 ms at 10 blocks, 74.4 ms at 500** | n/a | #992 |
+| restart-to-ready | **68.2 ms at 10 blocks, 74.0 ms at 500**; warm restart is **0.44-0.61x** a cold start | n/a | #992, corrected #999 |
 | high-cardinality aggregate | not measured for this comparison | - | - |
 | clean debug/release build | **DuckDB 10.6% of clean build (Linux), 8.0% (macOS)** | - | #935 |
 | final binary | **DuckDB is 93% of native artefact bytes** | - | #935 |
