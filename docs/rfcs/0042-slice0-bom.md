@@ -109,21 +109,56 @@ ABI floor on one target and change nothing a user can observe on the other. Wort
 
 ## 4. The DuckDB role inventory: six sites, not §9's four
 
-The deletion checklist. §9 named four roles; walking the call sites finds six, and two are
-**product-visible**.
+The deletion checklist. §9 named four roles; walking the call sites finds six. Two were originally
+classified **product-visible**; slice 3 found that to be **one** - see the correction below the table.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
 | `analytics.rs` | general SQL, views, hot+cold federation | production | 53 connection ops, the obvious one |
-| `entities.rs` | **admissible function vocabulary** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". The SQL a nest may declare *is* DuckDB's function list |
+| `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction |
 | `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role |
-| `graft.rs` | **writes the engine string into grafting identity** (`engine: "duckdb-v1.4.0"`) | **production, migration consequence** | grafts already recorded name the engine (RFC-0033) |
+| `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
 | `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
 | `authored_entity_spike.rs` | RFC-0041 slice-zero spike | **production, measurement-only** | `pub mod` in `lib.rs`, reachable via `nuthatch bench`. A naive read files this as test-only; it ships |
 
-The two product-visible ones are what make "remove DuckDB" more than an implementation change. The
-function vocabulary decides what a user may write in `entities.toml`; the graft engine string is
-already written into artefacts on disk.
+The function vocabulary is what makes "remove DuckDB" more than an implementation change: it decides
+what a user may write in `entities.toml`.
+
+> **Correction, 2026-08-30 (#966, RFC-0042 slice 3).** This section originally said the graft engine
+> string "is already written into artefacts on disk", and classified `graft.rs` as *production, with a
+> migration consequence*. **Both are false, and were not checked when written.**
+>
+> Neither `Derivation` nor `EntityIdentity` derives `Serialize`. No manifest field carries an engine
+> version, no reuse key is persisted, and `entities::identity` - the constructor that stamps the engine
+> version into an entity's key - is called only from its own test module. `graft.rs`'s module doc says
+> so directly: *"It does not reuse anything yet: slice 1 is the key alone, because a reuse mechanism
+> built on an unsound key is worse than no reuse at all."*
+>
+> The role is **latent, not absent.** It becomes load-bearing when RFC-0033 slice 4 (#357) wires reuse
+> in. Two consequences follow, and the second is a sequencing decision:
+>
+> 1. **There is nothing to migrate today.** An engine swap invalidates no artefact, because no artefact
+>    records an engine.
+> 2. **After #357, an engine change invalidates every reuse key by construction** - which is the
+>    *correct* behaviour, not a bug: the module is explicitly built around "a missed match costs a
+>    recompute, a false match ships wrong data silently". The cost is one full recompute per derivation,
+>    paid once. So the ordering matters: **swapping the engine before reuse is wired in costs nothing;
+>    after it, it costs a rebuild.**
+>
+> The count of six sites stands. What changes is the classification of one of them, and the claim that
+> two roles were product-visible - it is one.
+>
+> **The surviving product-visible role is also narrower than written.** The table originally said "the
+> SQL a nest may declare *is* DuckDB's function list". It is not. `duckdb_functions()` is a
+> **classifier**: `aggregates_among` asks which of the names a statement mentions are aggregates, and
+> anything so classified outside `INCREMENTAL_AGGREGATES` - six names - is refused. The catalogue never
+> admits anything; it decides what gets checked. A replacement needs one queryable aggregate
+> classification, not catalogue parity.
+>
+> It does need one more thing, which nothing stated: **an AST rendered in the same vocabulary that
+> classification uses.** `percentile_cont` has zero catalogue rows and is refused only because DuckDB's
+> parser rewrites it to `quantile_cont` before serialisation. Pinned by
+> `the_allowlist_depends_on_the_parser_canonicalising_aliases` (#969).
 
 ## 4a. What a DataFusion port would and would not address (#891, from RFC-0043)
 
