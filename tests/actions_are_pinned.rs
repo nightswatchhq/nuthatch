@@ -91,7 +91,7 @@ fn every_third_party_action_is_pinned_to_a_commit_sha() {
         "these actions are pinned to a mutable ref, so whoever can move that tag can run code with \
          this repository's release credentials (#829). Pin each to a full 40-character commit SHA \
          and keep the version as a trailing comment:\n\n\
-         \x20   uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n\n\
+         \x20   uses: <owner>/<action>@<40-char-commit-sha> # <version>\n\n\
          Resolve the SHA with:  gh api repos/<owner>/<repo>/commits/<tag> --jq .sha\n\n{}",
         unpinned.join("\n")
     );
