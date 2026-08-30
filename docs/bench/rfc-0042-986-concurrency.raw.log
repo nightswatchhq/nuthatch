@@ -1,0 +1,88 @@
+tree 59a54639817c51e76ccc168ce070ef08b5f886e1  host pepe-thinkpad  2026-08-30T12:59:44Z  cores 32
+ 15:59:44 up 4 days, 17:01,  7 users,  load average: 0.29, 0.45, 0.96
+build ok
+### segments=100 clients=1
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 312.36426ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 1 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=1	queries=10	qps=40.3	p50_ms=24.1	p95_ms=29.5	p99_ms=29.5
+CONC	rust-operator	clients=1	queries=10	qps=43.1	p50_ms=23.2	p95_ms=27.6	p99_ms=27.6
+### segments=100 clients=2
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 309.934942ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 2 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=2	queries=20	qps=39.9	p50_ms=24.0	p95_ms=35.5	p99_ms=286.9
+CONC	rust-operator	clients=2	queries=20	qps=62.9	p50_ms=32.1	p95_ms=40.6	p99_ms=40.6
+### segments=100 clients=4
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 314.672553ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 4 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=4	queries=40	qps=40.3	p50_ms=24.2	p95_ms=281.5	p99_ms=773.9
+CONC	rust-operator	clients=4	queries=40	qps=99.9	p50_ms=38.0	p95_ms=48.6	p99_ms=50.3
+### segments=100 clients=8
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 323.885225ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 8 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=8	queries=80	qps=41.5	p50_ms=23.7	p95_ms=750.3	p99_ms=1465.2
+CONC	rust-operator	clients=8	queries=80	qps=102.1	p50_ms=76.4	p95_ms=88.8	p99_ms=90.2
+### segments=100 clients=16
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 325.944339ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 16 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=16	queries=160	qps=40.8	p50_ms=23.8	p95_ms=1746.0	p99_ms=3215.0
+CONC	rust-operator	clients=16	queries=160	qps=108.5	p50_ms=146.5	p95_ms=162.2	p99_ms=167.0
+### segments=100 clients=32
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 326.70417ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 100 segments, 32 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=32	queries=320	qps=39.6	p50_ms=24.6	p95_ms=3705.6	p99_ms=7066.0
+CONC	rust-operator	clients=32	queries=320	qps=107.1	p50_ms=276.6	p95_ms=476.3	p99_ms=943.6
+### segments=10000 clients=1
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.700005104s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 1 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=1	queries=10	qps=2.7	p50_ms=366.8	p95_ms=503.3	p99_ms=503.3
+CONC	rust-operator	clients=1	queries=10	qps=4.4	p50_ms=225.2	p95_ms=279.2	p99_ms=279.2
+### segments=10000 clients=2
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.703159068s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 2 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=2	queries=20	qps=2.7	p50_ms=380.3	p95_ms=455.1	p99_ms=3966.0
+CONC	rust-operator	clients=2	queries=20	qps=6.2	p50_ms=322.5	p95_ms=329.3	p99_ms=332.4
+### segments=10000 clients=4
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.688552846s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 4 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=4	queries=40	qps=2.6	p50_ms=376.7	p95_ms=3906.1	p99_ms=11644.5
+CONC	rust-operator	clients=4	queries=40	qps=8.1	p50_ms=493.5	p95_ms=514.0	p99_ms=526.8
+### segments=10000 clients=8
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.70382013s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 8 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=8	queries=80	qps=2.5	p50_ms=392.8	p95_ms=12117.0	p99_ms=24228.4
+CONC	rust-operator	clients=8	queries=80	qps=9.2	p50_ms=868.1	p95_ms=895.1	p99_ms=912.5
+### segments=10000 clients=16
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.70195357s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 16 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=16	queries=160	qps=2.6	p50_ms=387.2	p95_ms=27049.5	p99_ms=50614.4
+CONC	rust-operator	clients=16	queries=160	qps=9.2	p50_ms=1736.3	p95_ms=1824.7	p99_ms=1845.6
+### segments=10000 clients=32
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.687901712s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+== concurrency: 2000000 rows, 10000 segments, 32 clients, 10 queries each ==
+CONC	duckdb-shared-conn	clients=32	queries=320	qps=2.5	p50_ms=392.4	p95_ms=59738.8	p99_ms=111370.2
+CONC	rust-operator	clients=32	queries=320	qps=8.9	p50_ms=3525.3	p95_ms=4081.0	p99_ms=4187.2
+CONC-COMPLETE
