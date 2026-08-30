@@ -3295,6 +3295,7 @@ dependencies = [
  "arrow 58.4.0",
  "datafusion",
  "duckdb",
+ "glob",
  "nuthatch",
  "parquet 58.4.0",
  "rayon",
