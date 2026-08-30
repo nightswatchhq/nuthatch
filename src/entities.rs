@@ -805,6 +805,12 @@ mod tests {
             ("median", "SELECT 1 AS k, median(v) AS m FROM (VALUES (1),(2)) t(v)"),
             ("quoted median", "SELECT 1 AS k, \"median\"(v) AS m FROM (VALUES (1),(2)) t(v)"),
             ("quantile_cont", "SELECT 1 AS k, quantile_cont(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
+            // The SQL-standard alias for the same aggregate. Present because the *old* denylist
+            // named `PERCENTILE_*` and missed `quantile_cont`; this list must not have the
+            // inverse hole. It is refused today only because DuckDB's parser rewrites the alias
+            // to `quantile_cont` before serialisation - see
+            // `the_allowlist_depends_on_the_parser_canonicalising_aliases`.
+            ("percentile_cont alias", "SELECT 1 AS k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m FROM (VALUES (1),(2)) t(v)"),
             ("quantile_disc", "SELECT 1 AS k, quantile_disc(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
             ("approx_quantile", "SELECT 1 AS k, approx_quantile(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
             ("arg_max", "SELECT 1 AS k, arg_max(v, v) AS m FROM (VALUES (1),(2)) t(v)"),
@@ -832,6 +838,66 @@ mod tests {
         assert!(
             admitted.is_empty(),
             "admitted as incrementally maintainable: {admitted:?}"
+        );
+    }
+
+    /// **The allowlist's closure rests on the parser, not on the catalogue** - pinned here because
+    /// nothing else states it and a replacement engine must reproduce it (RFC-0042 slice 3, #966).
+    ///
+    /// `percentile_cont` has **zero rows** in `duckdb_functions()`. The catalogue cannot classify it
+    /// as an aggregate, so `aggregates_among` would return an empty set and the refusal loop would
+    /// never fire. It is refused only because DuckDB's parser rewrites the alias to `quantile_cont`
+    /// before `json_serialize_sql` runs, and *that* name is in the catalogue.
+    ///
+    /// So the gate needs two properties from its engine, and only one of them is written down: a
+    /// queryable aggregate classification, **and** an AST rendered in the same vocabulary that
+    /// classification uses. An engine whose parser preserved the source spelling - a purely syntactic
+    /// parser, which is the common design - would admit a quantile into a DBSP circuit that cannot
+    /// maintain it, with every existing test still green.
+    #[test]
+    fn the_allowlist_depends_on_the_parser_canonicalising_aliases() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        let catalogued: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() WHERE lower(function_name) = 'percentile_cont'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            catalogued, 0,
+            "the premise of this test is that the catalogue does NOT know the alias; if DuckDB has \
+             started listing `percentile_cont`, the gate no longer depends on canonicalisation and \
+             this test should be re-read rather than adjusted"
+        );
+
+        let ast = plan_ast(
+            &conn,
+            "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m \
+             FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+        )
+        .unwrap();
+        let mut named = BTreeSet::new();
+        function_names(&ast, &mut named);
+        assert!(
+            named.contains("quantile_cont"),
+            "the parser must canonicalise the alias into catalogue vocabulary, got {named:?}"
+        );
+        assert!(
+            !named.contains("percentile_cont"),
+            "the source spelling must not survive into the AST, or the catalogue cannot classify it"
+        );
+
+        // And the consequence the two properties buy together.
+        let err = validate_sql(
+            "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m \
+             FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+        )
+        .expect_err("a quantile must not be admitted as incrementally maintainable");
+        assert!(
+            format!("{err:#}").contains("quantile_cont"),
+            "the refusal must come from the aggregate allowlist, not an unrelated gate: {err:#}"
         );
     }
 
