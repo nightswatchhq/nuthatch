@@ -1,7 +1,11 @@
 # RFC-0042: Can Nuthatch remove DuckDB and become Rust-native without sacrificing anything?
 
-- Status: **Draft.** Unfrozen by board decision 2026-08-25 - the second and last carve-out from the
-  2026 feature freeze, after RFC-0041. **Sequenced behind RFC-0041**: no slice of this RFC starts
+- Status: **Decided and parked, 2026-08-30. KEEP DuckDB.** The decision, the regressions it rests on
+  and the conditions that reopen it are in **§14**, which is the amendment §11 requires. The carve-out
+  from the 2026 feature freeze is spent and the freeze applies again in full; no further slice of this
+  RFC is to be started before a §14 reopen condition is recorded.
+- Status history: **Draft.** Unfrozen by board decision 2026-08-25 - the second and last carve-out from
+  the 2026 feature freeze, after RFC-0041. **Sequenced behind RFC-0041**: no slice of this RFC starts
   until the authored-incremental-entity work is done, because §9 gives DuckDB four roles inside
   RFC-0041 (parser, incremental reference, restart seed, entity serving) and moving the engine under
   a slice programme that is still assigning those roles would make both unattributable. Tracked as
@@ -251,6 +255,90 @@ The final amendment contains measurements like this, then says either **Remove D
 
 No appeal to a previous RFC, Rust purity, reputation, roadmap or “probably”. The question is empirical: can Nuthatch remove DuckDB, then the native tail, while remaining the same or better Nuthatch?
 
+## §14 - The decision, 2026-08-30
+
+**KEEP DuckDB.** Board decision, taken on the evidence assembled in
+`0042-slice5-decision-input.md` and the two independent slice 6 runs recorded in
+`0042-slice6-report-20260830T182428Z-ec26929f.md` and `0042-slice6-report-20260830T194831Z-994c939b.md`.
+This is the amendment §11 requires, and per §0 it is one of the two admissible answers rather than a
+failure to reach the other.
+
+The RFC is **parked**, not withdrawn. Its question was worth asking, the investigation answered it, and
+§1's premise did not survive contact with measurement: DuckDB is **10.6%** of clean build time on Linux
+while wasmtime and cranelift are **21.3%**, so the dependency that was said to dominate build cost does
+not.
+
+### Keep DuckDB, because these measured regressions remain
+
+1. **Five of DuckDB's six inventoried roles have no implementation at all** (slice 0 §4; slice 5 known
+   cost 3). Parser/canonicalisation, the aggregate-classification vocabulary, the incremental reference
+   oracle, the restart seed and entity serving are unbuilt. Two of them - the `duckdb_functions()`
+   classifier and the parser's alias canonicalisation - are **public contracts**: they decide what a
+   user may write in `entities.toml` and what the allowlist refuses.
+2. **`HUGEINT` requires a compatibility layer that does not exist.** 4 of 5 real authored views needed
+   rewriting to `DECIMAL(38,0)` (#996). §3 is explicit: *"Requiring users to rewrite valid Nuthatch SQL
+   is a regression without a compatibility layer."*
+3. **A valid authored view stops binding.** `port_queue` - DataFusion's ambiguity rules are stricter
+   than DuckDB's (#996). One view, one lost capability, unresolved.
+4. **Exact-arithmetic semantics are the number-one ranked gate risk and remain unmitigated.**
+   DataFusion's default arithmetic wraps where DuckDB errors (arrow-datafusion #17539, open). The first
+   specialised Rust operator built for this RFC realised that risk in its own code: **#998** needed
+   checked arithmetic at three sites, and a 24/24 "parity exact" corpus could not see it.
+5. **General SQL over a realistic layout is 2.53-2.80x slower** (#964, re-run #981). §5.3 routes around
+   it with a specialised operator, but that operator is one of the dozen not yet written.
+6. **§7's expected wins do not materialise.** Two of seven - disk and binary size. Build time is 10.6%
+   with a larger consumer left in place, and cross-compilation has **no named beneficiary** across 347
+   tracker issues, one discussion, eight grant milestones and the partnership record (A2, both runs,
+   independently: zero names).
+
+### What is struck from the ledger, because it was never a regression
+
+**The §11 concurrent-throughput row does not belong on this list.** It measured a mutex the benchmark
+harness built, not one nuthatch holds. `analytics.rs` takes its cache mutex twice for a map operation
+and releases it before the query runs; the same engine on the same code path measured 14.7 qps flat
+with a held mutex and up to 81.5 qps without one. Slice 5's known cost 4 is struck, and
+`docs/bench/rfc-0042-986-concurrency.md` is corrected. See §14's *what must happen anyway* below.
+
+### What the evidence does not support either way
+
+- **A3 (static libstdc++) is inconclusive, not negative.** The build produced **102,449,024 bytes**,
+  byte-identical to the ordinary release binary, while `ldd` still lists `libstdc++.so.6`. Statically
+  absorbing libstdc++ would change the size. The build log records no flag. So the run cannot
+  distinguish *"static linking does not remove the tail"* from *"the flags never took effect"*, and it
+  moves confidence in neither direction.
+- **High-cardinality aggregate** has no DuckDB-versus-candidate figure at all.
+- **Peak RSS for the candidate** was never measured.
+- **Restart-to-ready does not extrapolate** past the 500-block fixture it was taken on (#997).
+
+**Confidence: 78%**, as recorded by the slice 6 run that reached a decision, and unmoved by A3.
+
+### Reopen conditions - a date, or any one trigger
+
+Reopen RFC-0042 **on or after 2027-09-01**, or earlier if **any one** of these is recorded:
+
+- **a named user or funder deliverable** requires a musl, static or unlisted-platform build that the
+  C++ tail blocks. Both slice 6 runs searched independently and found zero; **one is enough**;
+- **all five unbuilt roles pass their parity corpus inside a two-day box each**, at which point
+  *"nothing has been built"* stops being an argument - it is doing most of the work in regression 1;
+- **DataFusion ships checked, erroring integer/decimal overflow by default** (arrow-datafusion #17539
+  closed), removing the number-one gate risk without a custom UDAF per aggregate;
+- **RFC-0033 slice 4 (#357) is scheduled.** The ordering is asymmetric: swapping the engine *before*
+  durable grafting wires in costs nothing, and *after* it costs one full recompute per derivation. **If
+  #357 is going to land, reopen this question before it, not after.**
+
+### What must happen anyway, whatever the engine
+
+Neither item is blocked by this decision, and neither is a slice of this RFC.
+
+- **Strike the false serialisation claim** wherever it was published, and fix the `DuckCache` doc
+  comment in `src/analytics.rs` that caused it. *"queries take the mutex"* is true only of two map
+  operations; two subsequent pieces of work read it as "queries serialise" and published that as a
+  measured engine property.
+- **Revisit `SQL_MAX_CONCURRENCY = 2`.** The knee measured on a 32-core box is nearer 8, worth roughly
+  4.8x throughput, and the constraint that binds is the **per-cursor RAM budget** rather than the
+  engine: unbounded at 32 clients reached 1,313 MB, 64% of one cursor's entire 2 GB. That is
+  non-negotiable 2 territory and needs measuring on the surface that enforces it, not on a dev box.
+
 ## §13 - Readiness before slice 2 (was: what must be true before it starts)
 
 **Amended 2026-08-29. The board unfroze RFC-0042 in full**, so these five stop being a permission gate
@@ -259,14 +347,22 @@ matter, because they are what stops slice 2 producing a number nobody should act
 below about momentum is now *more* live rather than less, since nothing external is holding the brake
 any more.
 
-**Status:** 1, 2 and 3 met. **4 outstanding** - the parity corpus covers 7 of §6's shapes (#945), and
-hot+cold is among the missing, which is where COR-1's disjointness invariant lives. A spike measured
-against a corpus that cannot see a chunk-seam defect is a spike measuring the wrong thing.
+**Status, closed 2026-08-30 by §14.** 1, 2 and 3 were met. **4 was never discharged** - the parity
+corpus covers 7 of §6's shapes (#945), and hot+cold is among the missing, which is where COR-1's
+disjointness invariant lives. A spike measured against a corpus that cannot see a chunk-seam defect is
+a spike measuring the wrong thing. That gap is now part of the record rather than a task: §14 keeps
+DuckDB, so no spike is pending, and the outstanding corpus work is stated in §14 as one of the reasons
+the removal case rests on unbuilt things. **This checklist is closed.** It reopens only with the RFC,
+on a §14 condition.
 
-
-Added 2026-08-29, when the carve-out was taken. Slices 0 and 1 are covered by it; **slices 2 and
+~~Added 2026-08-29, when the carve-out was taken. Slices 0 and 1 are covered by it; **slices 2 and
 beyond are not**, and this section exists so that continuing is a decision somebody makes rather than
-something that happens because the previous slice finished.
+something that happens because the previous slice finished.~~ **Struck 2026-08-30 (#979).** This
+paragraph predates the same day's full-unfreeze amendment at the head of this section and contradicted
+it for a day: one sentence said slices 2 and beyond needed their own decision, the other said the board
+had already taken it. It is struck rather than deleted because the thing it guarded against - momentum,
+where *nobody ever decides to migrate a query engine, they simply find that they have* - is real, and
+§14 is the decision it was asking somebody to make.
 
 The failure this guards against is named in §11 - *purity becoming the objective* - and the shape it
 takes in practice is momentum. Slice 1 ends with a working boundary and a parity corpus; the next

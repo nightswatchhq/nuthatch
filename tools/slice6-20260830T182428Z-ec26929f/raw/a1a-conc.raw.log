@@ -1,0 +1,189 @@
+# A1a raw log
+# host: pepe-thinkpad  kernel: 6.12.94+deb13-amd64  glibc: ldd (Debian GLIBC 2.41-12+deb13u3) 2.41
+# nest: horizon-nest  segments: 10480  bytes: 375170014
+# commit: 4731e84d57788e6b1ecb1a0a2c0783ca4ed95fab
+# started: 2026-08-30T18:57:41Z
+# --- 2026-08-30T18:57:41Z load=1.01 7.62 8.34 freeMB=58722 q=small clients=1 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=83.1	peak_rss_mb=86	order=fwd
+CONC	arm=mutex	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=15.11	p50_ms=65.8	p95_ms=67.5	p99_ms=70.5	wall_s=1.0	peak_rss_mb=86	order=fwd
+# --- 2026-08-30T18:57:43Z load=1.01 7.62 8.34 freeMB=58720 q=small clients=1 arm=gate2 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=87.7	peak_rss_mb=87	order=fwd
+CONC	arm=gate2	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=15.00	p50_ms=66.4	p95_ms=67.5	p99_ms=72.3	wall_s=1.0	peak_rss_mb=87	order=fwd
+# --- 2026-08-30T18:57:46Z load=1.01 7.62 8.34 freeMB=58710 q=small clients=1 arm=gate4 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=95.6	peak_rss_mb=90	order=fwd
+CONC	arm=gate4	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=15.02	p50_ms=65.9	p95_ms=69.0	p99_ms=74.9	wall_s=1.0	peak_rss_mb=90	order=fwd
+# --- 2026-08-30T18:57:48Z load=1.01 7.51 8.30 freeMB=58691 q=small clients=1 arm=gate8 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=98.5	peak_rss_mb=88	order=fwd
+CONC	arm=gate8	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.68	p50_ms=67.7	p95_ms=69.0	p99_ms=80.8	wall_s=1.0	peak_rss_mb=88	order=fwd
+# --- 2026-08-30T18:57:50Z load=1.01 7.51 8.30 freeMB=58683 q=small clients=1 arm=gate16 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=97.1	peak_rss_mb=90	order=fwd
+CONC	arm=gate16	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.53	p50_ms=66.4	p95_ms=77.3	p99_ms=81.9	wall_s=1.0	peak_rss_mb=90	order=fwd
+# --- 2026-08-30T18:57:52Z load=1.25 7.45 8.28 freeMB=58690 q=small clients=1 arm=unbounded order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=99.0	peak_rss_mb=87	order=fwd
+CONC	arm=unbounded	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.80	p50_ms=67.3	p95_ms=68.1	p99_ms=73.7	wall_s=1.0	peak_rss_mb=87	order=fwd
+# --- 2026-08-30T18:57:54Z load=1.25 7.45 8.28 freeMB=58647 q=small clients=1 arm=unbounded order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=89.3	peak_rss_mb=87	order=rev
+CONC	arm=unbounded	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.72	p50_ms=67.6	p95_ms=69.3	p99_ms=72.9	wall_s=1.0	peak_rss_mb=87	order=rev
+# --- 2026-08-30T18:57:56Z load=1.25 7.45 8.28 freeMB=58636 q=small clients=1 arm=gate16 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=87.4	peak_rss_mb=86	order=rev
+CONC	arm=gate16	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.92	p50_ms=66.5	p95_ms=68.6	p99_ms=73.1	wall_s=1.0	peak_rss_mb=86	order=rev
+# --- 2026-08-30T18:57:58Z load=1.23 7.35 8.24 freeMB=58645 q=small clients=1 arm=gate8 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=101.5	peak_rss_mb=91	order=rev
+CONC	arm=gate8	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.64	p50_ms=67.7	p95_ms=68.4	p99_ms=78.7	wall_s=1.0	peak_rss_mb=91	order=rev
+# --- 2026-08-30T18:58:00Z load=1.23 7.35 8.24 freeMB=58654 q=small clients=1 arm=gate4 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=93.8	peak_rss_mb=86	order=rev
+CONC	arm=gate4	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.79	p50_ms=67.7	p95_ms=69.0	p99_ms=73.4	wall_s=1.0	peak_rss_mb=86	order=rev
+# --- 2026-08-30T18:58:02Z load=1.29 7.26 8.20 freeMB=58661 q=small clients=1 arm=gate2 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=90.8	peak_rss_mb=87	order=rev
+CONC	arm=gate2	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.71	p50_ms=67.3	p95_ms=68.1	p99_ms=78.8	wall_s=1.0	peak_rss_mb=87	order=rev
+# --- 2026-08-30T18:58:04Z load=1.29 7.26 8.20 freeMB=58637 q=small clients=1 arm=mutex order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=89.3	peak_rss_mb=87	order=rev
+CONC	arm=mutex	sql=small	clients=1	repeats=15	served=15	refused=0	errors=0	qps=14.88	p50_ms=66.4	p95_ms=68.2	p99_ms=77.7	wall_s=1.0	peak_rss_mb=87	order=rev
+# --- 2026-08-30T18:58:06Z load=1.19 7.14 8.16 freeMB=58654 q=small clients=8 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=93.1	peak_rss_mb=211	order=fwd
+CONC	arm=mutex	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=14.75	p50_ms=66.8	p95_ms=77.1	p99_ms=87.0	wall_s=8.1	peak_rss_mb=211	order=fwd
+# --- 2026-08-30T18:58:15Z load=1.17 7.04 8.12 freeMB=58669 q=small clients=8 arm=gate2 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=90.1	peak_rss_mb=132	order=fwd
+CONC	arm=gate2	sql=small	clients=8	repeats=15	served=30	refused=90	errors=0	qps=27.10	p50_ms=71.1	p95_ms=82.7	p99_ms=94.8	wall_s=1.1	peak_rss_mb=132	order=fwd
+# --- 2026-08-30T18:58:17Z load=1.32 6.97 8.09 freeMB=58612 q=small clients=8 arm=gate4 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=94.1	peak_rss_mb=229	order=fwd
+CONC	arm=gate4	sql=small	clients=8	repeats=15	served=60	refused=60	errors=0	qps=49.59	p50_ms=74.6	p95_ms=94.2	p99_ms=111.2	wall_s=1.2	peak_rss_mb=229	order=fwd
+# --- 2026-08-30T18:58:19Z load=1.32 6.97 8.09 freeMB=58588 q=small clients=8 arm=gate8 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=91.4	peak_rss_mb=339	order=fwd
+CONC	arm=gate8	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=72.55	p50_ms=95.7	p95_ms=141.7	p99_ms=158.5	wall_s=1.7	peak_rss_mb=339	order=fwd
+# --- 2026-08-30T18:58:21Z load=1.61 6.94 8.08 freeMB=58382 q=small clients=8 arm=gate16 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=88.2	peak_rss_mb=405	order=fwd
+CONC	arm=gate16	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=67.98	p50_ms=101.4	p95_ms=156.8	p99_ms=189.2	wall_s=1.8	peak_rss_mb=405	order=fwd
+# --- 2026-08-30T18:58:23Z load=1.61 6.94 8.08 freeMB=58094 q=small clients=8 arm=unbounded order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=94.4	peak_rss_mb=401	order=fwd
+CONC	arm=unbounded	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=69.30	p50_ms=86.5	p95_ms=133.0	p99_ms=159.2	wall_s=1.7	peak_rss_mb=401	order=fwd
+# --- 2026-08-30T18:58:25Z load=1.61 6.94 8.08 freeMB=58127 q=small clients=8 arm=unbounded order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=83.6	peak_rss_mb=350	order=rev
+CONC	arm=unbounded	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=70.38	p50_ms=96.8	p95_ms=157.1	p99_ms=175.9	wall_s=1.7	peak_rss_mb=350	order=rev
+# --- 2026-08-30T18:58:27Z load=2.45 7.02 8.10 freeMB=58170 q=small clients=8 arm=gate16 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=90.2	peak_rss_mb=353	order=rev
+CONC	arm=gate16	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=68.53	p50_ms=100.2	p95_ms=142.9	p99_ms=173.4	wall_s=1.8	peak_rss_mb=353	order=rev
+# --- 2026-08-30T18:58:29Z load=2.45 7.02 8.10 freeMB=57895 q=small clients=8 arm=gate8 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=90.3	peak_rss_mb=386	order=rev
+CONC	arm=gate8	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=72.30	p50_ms=100.6	p95_ms=142.5	p99_ms=166.7	wall_s=1.7	peak_rss_mb=386	order=rev
+# --- 2026-08-30T18:58:31Z load=3.29 7.12 8.12 freeMB=57685 q=small clients=8 arm=gate4 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=92.2	peak_rss_mb=222	order=rev
+CONC	arm=gate4	sql=small	clients=8	repeats=15	served=60	refused=60	errors=0	qps=49.48	p50_ms=74.2	p95_ms=96.0	p99_ms=98.6	wall_s=1.2	peak_rss_mb=222	order=rev
+# --- 2026-08-30T18:58:34Z load=3.29 7.12 8.12 freeMB=57638 q=small clients=8 arm=gate2 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=88.6	peak_rss_mb=131	order=rev
+CONC	arm=gate2	sql=small	clients=8	repeats=15	served=30	refused=90	errors=0	qps=27.47	p50_ms=70.6	p95_ms=79.6	p99_ms=94.5	wall_s=1.1	peak_rss_mb=131	order=rev
+# --- 2026-08-30T18:58:36Z load=3.29 7.12 8.12 freeMB=57628 q=small clients=8 arm=mutex order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=88.1	peak_rss_mb=212	order=rev
+CONC	arm=mutex	sql=small	clients=8	repeats=15	served=120	refused=0	errors=0	qps=14.75	p50_ms=67.1	p95_ms=74.4	p99_ms=81.4	wall_s=8.1	peak_rss_mb=212	order=rev
+# --- 2026-08-30T18:58:45Z load=2.94 6.92 8.05 freeMB=58220 q=small clients=32 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=95.3	peak_rss_mb=558	order=fwd
+CONC	arm=mutex	sql=small	clients=32	repeats=15	served=480	refused=0	errors=0	qps=14.73	p50_ms=67.1	p95_ms=72.9	p99_ms=84.8	wall_s=32.6	peak_rss_mb=558	order=fwd
+# --- 2026-08-30T18:59:18Z load=2.19 6.29 7.80 freeMB=58669 q=small clients=32 arm=gate2 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=96.8	peak_rss_mb=137	order=fwd
+CONC	arm=gate2	sql=small	clients=32	repeats=15	served=30	refused=450	errors=0	qps=26.94	p50_ms=71.2	p95_ms=83.4	p99_ms=87.7	wall_s=1.1	peak_rss_mb=137	order=fwd
+# --- 2026-08-30T18:59:20Z load=2.19 6.29 7.80 freeMB=58673 q=small clients=32 arm=gate4 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=89.0	peak_rss_mb=224	order=fwd
+CONC	arm=gate4	sql=small	clients=32	repeats=15	served=60	refused=420	errors=0	qps=50.07	p50_ms=75.1	p95_ms=90.9	p99_ms=111.3	wall_s=1.2	peak_rss_mb=224	order=fwd
+# --- 2026-08-30T18:59:22Z load=2.57 6.30 7.79 freeMB=58570 q=small clients=32 arm=gate8 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=94.1	peak_rss_mb=371	order=fwd
+CONC	arm=gate8	sql=small	clients=32	repeats=15	served=120	refused=360	errors=0	qps=67.38	p50_ms=104.8	p95_ms=146.5	p99_ms=153.6	wall_s=1.8	peak_rss_mb=371	order=fwd
+# --- 2026-08-30T18:59:24Z load=2.57 6.30 7.79 freeMB=58311 q=small clients=32 arm=gate16 order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=85.8	peak_rss_mb=718	order=fwd
+CONC	arm=gate16	sql=small	clients=32	repeats=15	served=240	refused=240	errors=0	qps=79.41	p50_ms=166.4	p95_ms=313.8	p99_ms=346.6	wall_s=3.0	peak_rss_mb=718	order=fwd
+# --- 2026-08-30T18:59:28Z load=3.81 6.50 7.85 freeMB=57807 q=small clients=32 arm=unbounded order=fwd
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=92.0	peak_rss_mb=1323	order=fwd
+CONC	arm=unbounded	sql=small	clients=32	repeats=15	served=480	refused=0	errors=0	qps=65.95	p50_ms=488.0	p95_ms=632.2	p99_ms=685.7	wall_s=7.3	peak_rss_mb=1323	order=fwd
+# --- 2026-08-30T18:59:37Z load=3.29 6.30 7.77 freeMB=57356 q=small clients=32 arm=unbounded order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=89.0	peak_rss_mb=1302	order=rev
+CONC	arm=unbounded	sql=small	clients=32	repeats=15	served=480	refused=0	errors=0	qps=66.17	p50_ms=485.8	p95_ms=615.4	p99_ms=660.0	wall_s=7.3	peak_rss_mb=1302	order=rev
+# --- 2026-08-30T18:59:45Z load=3.43 6.28 7.75 freeMB=57186 q=small clients=32 arm=gate16 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=102.1	peak_rss_mb=632	order=rev
+CONC	arm=gate16	sql=small	clients=32	repeats=15	served=240	refused=240	errors=0	qps=83.49	p50_ms=167.4	p95_ms=260.2	p99_ms=298.3	wall_s=2.9	peak_rss_mb=632	order=rev
+# --- 2026-08-30T18:59:48Z load=4.44 6.44 7.80 freeMB=56400 q=small clients=32 arm=gate8 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=90.1	peak_rss_mb=403	order=rev
+CONC	arm=gate8	sql=small	clients=32	repeats=15	served=120	refused=360	errors=0	qps=75.03	p50_ms=87.7	p95_ms=135.5	p99_ms=177.9	wall_s=1.6	peak_rss_mb=403	order=rev
+# --- 2026-08-30T18:59:50Z load=4.44 6.44 7.80 freeMB=56510 q=small clients=32 arm=gate4 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=91.5	peak_rss_mb=215	order=rev
+CONC	arm=gate4	sql=small	clients=32	repeats=15	served=60	refused=420	errors=0	qps=50.38	p50_ms=74.7	p95_ms=94.2	p99_ms=104.8	wall_s=1.2	peak_rss_mb=215	order=rev
+# --- 2026-08-30T18:59:52Z load=4.56 6.43 7.79 freeMB=56513 q=small clients=32 arm=gate2 order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=91.5	peak_rss_mb=132	order=rev
+CONC	arm=gate2	sql=small	clients=32	repeats=15	served=30	refused=450	errors=0	qps=27.56	p50_ms=70.4	p95_ms=82.3	p99_ms=89.6	wall_s=1.1	peak_rss_mb=132	order=rev
+# --- 2026-08-30T18:59:54Z load=4.56 6.43 7.79 freeMB=56726 q=small clients=32 arm=mutex order=rev
+WARMUP	nest=horizon-nest	sql=small	rows=1	ms=95.2	peak_rss_mb=587	order=rev
+CONC	arm=mutex	sql=small	clients=32	repeats=15	served=480	refused=0	errors=0	qps=14.79	p50_ms=67.0	p95_ms=72.5	p99_ms=83.7	wall_s=32.5	peak_rss_mb=587	order=rev
+# --- 2026-08-30T19:00:27Z load=3.46 5.95 7.58 freeMB=58369 q=heavy clients=1 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2248.0	peak_rss_mb=150	order=fwd
+CONC	arm=mutex	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2164.4	p95_ms=2219.3	p99_ms=2220.2	wall_s=32.6	peak_rss_mb=150	order=fwd
+# --- 2026-08-30T19:01:03Z load=2.87 5.53 7.37 freeMB=58649 q=heavy clients=1 arm=gate2 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2188.7	peak_rss_mb=149	order=fwd
+CONC	arm=gate2	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2165.3	p95_ms=2219.4	p99_ms=2219.9	wall_s=32.6	peak_rss_mb=149	order=fwd
+# --- 2026-08-30T19:01:38Z load=2.54 5.15 7.18 freeMB=58706 q=heavy clients=1 arm=gate4 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2194.9	peak_rss_mb=153	order=fwd
+CONC	arm=gate4	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2164.4	p95_ms=2221.5	p99_ms=2223.0	wall_s=32.7	peak_rss_mb=153	order=fwd
+# --- 2026-08-30T19:02:14Z load=2.30 4.80 6.99 freeMB=58734 q=heavy clients=1 arm=gate8 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2252.2	peak_rss_mb=149	order=fwd
+CONC	arm=gate8	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2164.3	p95_ms=2215.7	p99_ms=2250.3	wall_s=32.6	peak_rss_mb=149	order=fwd
+# --- 2026-08-30T19:02:49Z load=2.33 4.52 6.81 freeMB=58724 q=heavy clients=1 arm=gate16 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2194.1	peak_rss_mb=151	order=fwd
+CONC	arm=gate16	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2160.0	p95_ms=2217.7	p99_ms=2218.9	wall_s=32.6	peak_rss_mb=151	order=fwd
+# --- 2026-08-30T19:03:25Z load=2.18 4.24 6.63 freeMB=58724 q=heavy clients=1 arm=unbounded order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2190.5	peak_rss_mb=154	order=fwd
+CONC	arm=unbounded	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2165.7	p95_ms=2217.8	p99_ms=2230.0	wall_s=32.7	peak_rss_mb=154	order=fwd
+# --- 2026-08-30T19:04:00Z load=2.15 4.01 6.46 freeMB=58729 q=heavy clients=1 arm=unbounded order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2183.8	peak_rss_mb=152	order=rev
+CONC	arm=unbounded	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2158.3	p95_ms=2206.2	p99_ms=2210.7	wall_s=32.5	peak_rss_mb=152	order=rev
+# --- 2026-08-30T19:04:36Z load=2.08 3.79 6.30 freeMB=58720 q=heavy clients=1 arm=gate16 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2197.9	peak_rss_mb=152	order=rev
+CONC	arm=gate16	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2157.1	p95_ms=2210.1	p99_ms=2212.9	wall_s=32.5	peak_rss_mb=152	order=rev
+# --- 2026-08-30T19:05:11Z load=1.98 3.56 6.11 freeMB=58737 q=heavy clients=1 arm=gate8 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2249.2	peak_rss_mb=151	order=rev
+CONC	arm=gate8	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2163.8	p95_ms=2215.2	p99_ms=2221.9	wall_s=32.6	peak_rss_mb=151	order=rev
+# --- 2026-08-30T19:05:47Z load=1.83 3.35 5.95 freeMB=58729 q=heavy clients=1 arm=gate4 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2190.8	peak_rss_mb=151	order=rev
+CONC	arm=gate4	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2161.1	p95_ms=2217.5	p99_ms=2217.9	wall_s=32.6	peak_rss_mb=151	order=rev
+# --- 2026-08-30T19:06:22Z load=1.91 3.20 5.80 freeMB=58737 q=heavy clients=1 arm=gate2 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2185.5	peak_rss_mb=151	order=rev
+CONC	arm=gate2	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2163.9	p95_ms=2218.5	p99_ms=2233.9	wall_s=32.6	peak_rss_mb=151	order=rev
+# --- 2026-08-30T19:06:58Z load=2.25 3.16 5.69 freeMB=58671 q=heavy clients=1 arm=mutex order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2242.9	peak_rss_mb=151	order=rev
+CONC	arm=mutex	sql=heavy	clients=1	repeats=15	served=15	refused=0	errors=0	qps=0.46	p50_ms=2160.8	p95_ms=2215.4	p99_ms=2219.5	wall_s=32.6	peak_rss_mb=151	order=rev
+# --- 2026-08-30T19:07:33Z load=2.14 3.03 5.55 freeMB=58719 q=heavy clients=8 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2185.7	peak_rss_mb=399	order=fwd
+CONC	arm=mutex	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=0.46	p50_ms=2162.8	p95_ms=2225.2	p99_ms=2243.4	wall_s=260.9	peak_rss_mb=399	order=fwd
+# --- 2026-08-30T19:11:57Z load=2.01 2.59 4.75 freeMB=58728 q=heavy clients=8 arm=gate2 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2184.2	peak_rss_mb=225	order=fwd
+CONC	arm=gate2	sql=heavy	clients=8	repeats=15	served=30	refused=90	errors=0	qps=0.91	p50_ms=2178.5	p95_ms=2232.3	p99_ms=2235.7	wall_s=32.8	peak_rss_mb=225	order=fwd
+# --- 2026-08-30T19:12:32Z load=2.83 2.73 4.72 freeMB=58674 q=heavy clients=8 arm=gate4 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2246.1	peak_rss_mb=412	order=fwd
+CONC	arm=gate4	sql=heavy	clients=8	repeats=15	served=60	refused=60	errors=0	qps=1.68	p50_ms=2381.7	p95_ms=2452.9	p99_ms=2493.2	wall_s=35.7	peak_rss_mb=412	order=fwd
+# --- 2026-08-30T19:13:11Z load=5.16 3.32 4.84 freeMB=58783 q=heavy clients=8 arm=gate8 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2196.5	peak_rss_mb=842	order=fwd
+CONC	arm=gate8	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.40	p50_ms=3157.6	p95_ms=3976.4	p99_ms=4032.6	wall_s=50.0	peak_rss_mb=842	order=fwd
+# --- 2026-08-30T19:14:04Z load=11.54 5.51 5.51 freeMB=58777 q=heavy clients=8 arm=gate16 order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2188.1	peak_rss_mb=830	order=fwd
+CONC	arm=gate16	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.26	p50_ms=3131.4	p95_ms=4046.8	p99_ms=4104.7	wall_s=53.1	peak_rss_mb=830	order=fwd
+# --- 2026-08-30T19:15:00Z load=12.76 6.96 6.01 freeMB=58749 q=heavy clients=8 arm=unbounded order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2188.3	peak_rss_mb=825	order=fwd
+CONC	arm=unbounded	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.19	p50_ms=3173.9	p95_ms=4066.4	p99_ms=4104.6	wall_s=54.7	peak_rss_mb=825	order=fwd
+# --- 2026-08-30T19:15:57Z load=13.13 8.07 6.45 freeMB=58801 q=heavy clients=8 arm=unbounded order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2209.7	peak_rss_mb=832	order=rev
+CONC	arm=unbounded	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.37	p50_ms=3249.2	p95_ms=3987.5	p99_ms=4059.0	wall_s=50.7	peak_rss_mb=832	order=rev
+# --- 2026-08-30T19:16:50Z load=13.95 9.14 6.90 freeMB=58776 q=heavy clients=8 arm=gate16 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2293.1	peak_rss_mb=826	order=rev
+CONC	arm=gate16	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.29	p50_ms=3264.3	p95_ms=4052.1	p99_ms=4199.4	wall_s=52.3	peak_rss_mb=826	order=rev
+# --- 2026-08-30T19:17:45Z load=13.95 9.96 7.31 freeMB=58787 q=heavy clients=8 arm=gate8 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2191.2	peak_rss_mb=824	order=rev
+CONC	arm=gate8	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=2.08	p50_ms=3282.6	p95_ms=4640.0	p99_ms=5270.9	wall_s=57.7	peak_rss_mb=824	order=rev
+# --- 2026-08-30T19:18:45Z load=13.48 10.60 7.70 freeMB=58667 q=heavy clients=8 arm=gate4 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2191.8	peak_rss_mb=411	order=rev
+CONC	arm=gate4	sql=heavy	clients=8	repeats=15	served=60	refused=60	errors=0	qps=1.58	p50_ms=2469.9	p95_ms=2947.7	p99_ms=3075.4	wall_s=37.9	peak_rss_mb=411	order=rev
+# --- 2026-08-30T19:19:26Z load=10.93 10.30 7.73 freeMB=58816 q=heavy clients=8 arm=gate2 order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2185.4	peak_rss_mb=221	order=rev
+CONC	arm=gate2	sql=heavy	clients=8	repeats=15	served=30	refused=90	errors=0	qps=0.90	p50_ms=2204.9	p95_ms=2375.9	p99_ms=2383.6	wall_s=33.3	peak_rss_mb=221	order=rev
+# --- 2026-08-30T19:20:01Z load=9.47 10.08 7.75 freeMB=58711 q=heavy clients=8 arm=mutex order=rev
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2231.4	peak_rss_mb=401	order=rev
+CONC	arm=mutex	sql=heavy	clients=8	repeats=15	served=120	refused=0	errors=0	qps=0.46	p50_ms=2161.3	p95_ms=2222.7	p99_ms=2224.9	wall_s=260.7	peak_rss_mb=401	order=rev
+# --- 2026-08-30T19:24:25Z load=2.13 5.62 6.47 freeMB=58725 q=heavy clients=32 arm=mutex order=fwd
+WARMUP	nest=horizon-nest	sql=heavy	rows=82	ms=2249.6	peak_rss_mb=1263	order=fwd
+CONC	arm=mutex	sql=heavy	clients=32	repeats=15	served=480	refused=0	errors=0	qps=0.46	p50_ms=2163.4	p95_ms=2220.6	p99_ms=2230.4	wall_s=1043.6	peak_rss_mb=1263	order=fwd
+# --- 2026-08-30T19:41:52Z load=2.13 2.35 3.68 freeMB=58712 q=heavy clients=32 arm=gate2 order=fwd

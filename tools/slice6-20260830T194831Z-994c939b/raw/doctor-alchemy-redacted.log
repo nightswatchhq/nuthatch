@@ -1,0 +1,11 @@
+2026-08-30T19:57:28Z
+ 22:57:28 up 4 days, 23:59,  7 users,  load average: 14.57, 11.88, 6.55
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       8.1Gi        23Gi       2.9Gi        34Gi        54Gi
+Swap:          8.0Gi       877Mi       7.1Gi
+arb-mainnet.g.alchemy.com
+  getLogs window   up to 163840 blocks (recommend --window 320)
+  JSON-RPC batch   200+ (fine)
+  archive depth    yes - deep backfills and pinned eth_call work
+  · window measured RANGE-ONLY - capped at 320 because a range-only probe cannot see the result-count limit; your real window is very likely much larger. Re-probe with --address <contract> before backfilling to get a number that reflects both limits
+

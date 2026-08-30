@@ -1,0 +1,18 @@
+[package]
+name = "slice6-conc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# **Deliberately outside the workspace and outside nuthatch's dependency graph**, for the same reason
+# `tools/df-gate` is: RFC-0042 slice 6 is a measurement, not a migration. Nothing here may reach the
+# release graph, `deny.toml` or a clean-build timing.
+[dependencies]
+nuthatch = { path = "../.." }
+anyhow = "1"
+serde_json = "1"
+# **Pinned to the exact version the workspace lock carries** (1.10504.0), not `"1"`.
+# A bare `"1"` resolved to 1.10505.0 here while the shipped binary links 1.10504.0, which would have
+# meant explaining plans on one engine build and attributing them to another. A plan is an
+# engine-version artefact; RFC-0042 §6 asks for the engine recorded with every measurement.
+duckdb = { version = "=1.10504.0", features = ["bundled"] }

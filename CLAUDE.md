@@ -201,6 +201,20 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    §13's five conditions stop being a permission gate and become a **readiness checklist**. Four are
 >    met; the outstanding one is the parity corpus (#945), which covers 7 of §6's shapes. A spike run
 >    against a corpus that cannot see a chunk-seam defect would produce a number nobody should act on.
+>
+>    **CLOSED 2026-08-30. The decision is KEEP DuckDB, and this carve-out is spent.** Written as
+>    **RFC-0042 §14**, on the six measured regressions listed there, at 78% confidence. Per §0 that is
+>    one of the two admissible answers, not a failure to reach the other. The RFC is **parked, not
+>    withdrawn**: §14 carries a reopen date of **2027-09-01** and four triggers, any one of which
+>    reopens it earlier. Note the fourth especially - **if RFC-0033 slice 4 (#357) is ever scheduled,
+>    reopen RFC-0042 before it, not after**, because swapping the engine before durable grafting wires
+>    in costs nothing and after it costs a full recompute per derivation.
+>
+>    **Both carve-outs are now spent, and the 2026 feature freeze applies again in full.** There is no
+>    third. A proposal to resume RFC-0042 work is a proposal for a new carve-out and needs a §14 reopen
+>    condition recorded first. Two items escaped the park because they are corrections and performance
+>    rather than capability, and §14 names them: the false-serialisation correction, and revisiting
+>    `SQL_MAX_CONCURRENCY`.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
