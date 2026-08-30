@@ -3299,6 +3299,7 @@ dependencies = [
  "parquet 58.4.0",
  "rayon",
  "rustc-hash",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
