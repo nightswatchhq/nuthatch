@@ -971,8 +971,20 @@ mod tests {
         }
     }
 
-    /// RFC-0033 §10. The gate is the backstop for everything the static list cannot prove - which is
-    /// why it must actually catch a nondeterminism the list does *not* name.
+    /// RFC-0033 §10. **What this proves is that the gate is empirical, not that it is stronger than
+    /// the list** (#983).
+    ///
+    /// The fixture is `random()`, which `static_refusals` already refuses **by name**. So this
+    /// demonstrates the gate catching volatility by *running the statement twice and comparing*,
+    /// rather than by recognising a spelling - which is the property that would let it see something
+    /// the list has not been taught. It does not demonstrate that such a thing exists.
+    ///
+    /// The earlier wording here claimed the gate "must actually catch a nondeterminism the list does
+    /// not name", which contradicted both this fixture and [`determinism_gate`]'s own documentation:
+    /// no divergent case outside the list could be constructed - `sum` over `DOUBLE`, `first`,
+    /// `any_value`, `string_agg`, `list` and an unstable `ORDER BY`, each at 1, 2, 4, 8 and 16
+    /// threads, all agreed. Two identical runs on one connection cannot see order-dependence, which
+    /// is the shape the float hazard actually has.
     #[test]
     fn the_determinism_gate_catches_volatility_empirically_not_by_name() {
         let conn = parser_connection().unwrap();

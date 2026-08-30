@@ -467,30 +467,53 @@ fn grouping_across_the_hot_cold_seam_is_exact() {
 fn a_join_is_exact_across_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let n = DUCKDB_VECTOR + 1;
-    // Group first so the join is over three rows a side, not n squared - the point is the join, not
-    // the memory. Sizes per group: n/3 rounded, so the counts stay closed-form.
-    let got = scalar(
+    const _: () = assert!(
+        DUCKDB_VECTOR + 1 > DUCKDB_VECTOR,
+        "the join inputs must exceed one vector or this test cannot see a seam"
+    );
+
+    // **Both join inputs materialise `n` rows** (#982). The first version of this test grouped each
+    // side down to three rows before joining - "the point is the join, not the memory" - which meant
+    // the *materialised* join input never crossed the vector boundary at all. An engine that loses
+    // build-side rows between vectors passed it. The reduction was the defect.
+    //
+    // `tx_hash` is unique per row (`0x{i:064x}`), so a self-join on it keeps both sides at `n` and
+    // emits exactly `n` - a boundary-crossing join with a closed-form answer.
+    let joined = scalar(
+        dir.path(),
+        n,
+        "SELECT COUNT(*) AS c FROM tok__transfer a JOIN tok__transfer b USING (tx_hash)",
+    );
+    assert_eq!(
+        joined, n as i128,
+        "a join over {n} rows a side must emit exactly {n}; fewer means the build side lost rows \
+         across a vector seam, more means it duplicated them"
+    );
+
+    // And an exact aggregate through that join: dropping any build-side row silently removes its
+    // value from the total, which a cardinality check alone would catch only if the count moved.
+    let summed = scalar(
+        dir.path(),
+        n,
+        "SELECT SUM(CAST(a.value AS HUGEINT)) AS t \
+         FROM tok__transfer a JOIN tok__transfer b USING (tx_hash)",
+    );
+    assert_eq!(
+        summed,
+        (n as i128) * (n as i128 + 1) / 2,
+        "a join that drops a row loses its value, silently"
+    );
+
+    // The grouped shape is kept as well - it exercises grouping *through* a join rather than the
+    // join's own materialisation, which is a different property and was the only one tested before.
+    let grouped = scalar(
         dir.path(),
         n,
         "SELECT COUNT(*) AS c FROM \
          (SELECT \"to\", COUNT(*) AS n FROM tok__transfer GROUP BY \"to\") a \
          JOIN (SELECT \"to\", COUNT(*) AS n FROM tok__transfer GROUP BY \"to\") b USING (\"to\")",
     );
-    assert_eq!(got, 3, "three groups joined to themselves on {n} rows");
-
-    // And the join must not lose rows: summing one side through the join reproduces the whole sum.
-    let joined = scalar(
-        dir.path(),
-        n,
-        "SELECT SUM(a.s) AS t FROM \
-         (SELECT \"to\", SUM(CAST(value AS HUGEINT)) AS s FROM tok__transfer GROUP BY \"to\") a \
-         JOIN (SELECT DISTINCT \"to\" FROM tok__transfer) b USING (\"to\")",
-    );
-    assert_eq!(
-        joined,
-        (n as i128) * (n as i128 + 1) / 2,
-        "a join that drops a group loses its whole sum, silently"
-    );
+    assert_eq!(grouped, 3, "three groups joined to themselves on {n} rows");
 }
 
 /// **Authored views, including one nested on another** (`views/*.sql`). This is the RFC-0001 surface a
