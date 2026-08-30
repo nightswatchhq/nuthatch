@@ -13,35 +13,34 @@
 //! path's batching *safe* to copy - that the cut is a function of the data alone - because that is the
 //! thing any fix must preserve, and it is the thing a well-meaning change would break first.
 
-/// The cut must depend only on the rows, never on how they were fetched.
+/// The seal-boundary rule is now asserted **behaviourally**, and not here.
 ///
-/// Two operators with different `--window` and `--concurrency` see the same rows arrive in the same
-/// `(block, log_index)` order but in different batches. If the boundary moved with the batching,
-/// content addressing would be quietly conditional on RPC tuning - which is the bug RFC-0028 §4 fixed
-/// and the property any tip-side batching must keep.
-#[test]
-fn the_seal_boundary_is_a_function_of_the_data_not_the_fetch() {
-    // Deliberately not calling the private helper: this asserts the *documented rule*, so it still
-    // holds if the implementation is rewritten to batch at tip too.
-    let doc = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/indexer.rs"),
-    )
-    .expect("read indexer.rs");
-    let at = doc.find("fn take_sealable").expect(
-        "take_sealable has been renamed or removed - if the tip path now batches too, this \
-                 test should be updated to cover both, not deleted",
-    );
-    let window = &doc[at.saturating_sub(1400)..at];
-    for needed in ["from the **data**", "identical"] {
-        assert!(
-            window.contains(needed),
-            "the seal-boundary rule no longer states that the cut comes from the data and yields \
-             identical segments across operators. That property is what RFC-0019's bundles and \
-             RFC-0020's segment reuse rest on, and what any tip-side batching must preserve (#947).\
-             \n---\n{window}"
-        );
-    }
-}
+/// # What this test used to be (#980)
+///
+/// It read `src/indexer.rs` as a string, took the 1400 characters before `fn take_sealable`, and
+/// asserted that window contained the literals `"from the **data**"` and `"identical"`. It sealed
+/// nothing. The window it searched *was* the doc comment, so it was a gate matching its own
+/// documentation - an implementation could make segment cuts depend on fetch batching, keep the
+/// prose intact, and stay green.
+///
+/// **It was green, and the property was false.** Writing the real test found it: `take_sealable`
+/// was called once per fetched chunk (`if let`, not `while let`), so a chunk carrying several
+/// multiples of `SEAL_DIRECT_BATCH` sealed only one segment and left the rest for the final flush.
+/// On a 30,000-block corpus, `--window 320` produced **6 segments, largest 20,003 rows**, and
+/// `--window 163840` produced **2, largest 99,993** - the same chain, different content addresses,
+/// and no dedup between the two operators. Fixed in the same change.
+///
+/// The real assertions live in `src/indexer.rs`'s `mod tests`, because `take_sealable` is private -
+/// which is the constraint that pushed the original at the source text in the first place:
+///
+///   * `seal_boundaries_are_identical_across_fetch_windows` - five `--window` values from 1 to
+///     163,840 over one corpus, asserting identical segment counts, cut blocks, rows and remainder;
+///   * `a_block_is_never_split_across_two_segments` - the other half of the documented rule;
+///   * `the_observable_can_actually_see_a_boundary_move` - the control, so the two above cannot
+///     pass vacuously.
+///
+/// What remains here is the thing an integration test *can* check and the unit tests cannot: that
+/// the measurement motivating #947 keeps its numbers.
 
 /// The measurement that motivates #947 must stay in the tree with its numbers, because the argument
 /// is entirely quantitative: "many small files" is an impression, "80% under 20 KB with a 6.3 KB
