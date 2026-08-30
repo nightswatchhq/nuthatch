@@ -308,7 +308,13 @@ with a held mutex and up to 81.5 qps without one. Slice 5's known cost 4 is stru
   moves confidence in neither direction.
 - **High-cardinality aggregate** has no DuckDB-versus-candidate figure at all.
 - **Peak RSS for the candidate** was never measured.
-- **Restart-to-ready does not extrapolate** past the 500-block fixture it was taken on (#997).
+- **Restart-to-ready is a curve, and it was published as a scalar.** #992's **74 ms** is what a
+  500-block fixture does. Re-measured against **segment count** - the variable #964 and #987 both
+  found dominant - it is **49.6 ms at 0 segments, 196 ms at 1,000, 801 ms at 5,000 and 1.7 s at
+  11,000**, where `horizon-nest` holds 10,923 (#997). Roughly linear, no knee. This does not
+  change the decision: it means the DuckDB baseline for this row is a curve, and any future
+  candidate must be compared against the curve rather than against 74 ms.
+  `docs/bench/rfc-0042-997-restart-by-segment-count.md`.
 
 **Confidence: 78%**, as recorded by the slice 6 run that reached a decision, and unmoved by A3.
 

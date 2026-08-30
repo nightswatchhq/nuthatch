@@ -25,7 +25,7 @@ the number quietly replaced.
 | concurrent throughput | ~~40.3 -> 39.6 qps~~ **WITHDRAWN - harness mutex, not the product's.** 14.8 -> 81.5 qps, 1 -> 32 clients | not comparable: the Rust figure was measured against that harness | #986, **struck by §14** |
 | peak RSS | ~60 MB, CI-gated at 256 MB | not measured for the candidate | `footprint` job |
 | ingest throughput | `bench backfill` events/sec | n/a - the candidate is not an ingest path | RFC-0004 |
-| restart-to-ready | **68.2 ms at 10 blocks, 74.0 ms at 500**; warm restart is **0.44-0.61x** a cold start | n/a | #992, corrected #999 |
+| restart-to-ready | 68.2 ms at 10 blocks, 74.0 ms at 500 - **but block count is the wrong variable.** By segment count: **49.6 ms at 0, 196 ms at 1,000, 1.7 s at 11,000** | n/a | #992, corrected #999, **re-scoped #997** |
 | high-cardinality aggregate | not measured for this comparison | - | - |
 | clean debug/release build | **DuckDB 10.6% of clean build (Linux), 8.0% (macOS)** | - | #935 |
 | final binary | **DuckDB is 93% of native artefact bytes** | - | #935 |
@@ -70,8 +70,10 @@ segments**: parity exact, **0.81-1.64x**, faster on two of five including the la
 
 - **High-cardinality aggregate** has no DuckDB-versus-candidate figure at all.
 - **Peak RSS for the candidate** is unmeasured; only nuthatch's own footprint is gated.
-- **Restart-to-ready does not extrapolate.** 500 blocks against `horizon-nest`'s 10 923 segments, and
-  segment count dominated every other measurement here. See #997.
+- **Restart-to-ready was measured against the wrong variable, and is now measured against the right
+  one.** 500 blocks against `horizon-nest`'s 10,923 segments. Re-measured by segment count (#997):
+  **1.7 s at 11,000 segments, 34x the empty case**, roughly linear with no knee. The 74 ms figure was
+  never wrong; it was quoted for a property it does not have.
 - **#996 is five views, one nest, seven repeats.** `noise-floor.md` asks for >=15; treat sub-10%
   differences there as unresolved.
 - **Everything except #986 is single-client.**
