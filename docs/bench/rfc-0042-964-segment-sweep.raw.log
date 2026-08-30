@@ -1,0 +1,172 @@
+tree dbaf935dc9d34886d4dc9340ebb1c1c9f68d8938  host pepe-thinkpad  2026-08-30T08:44:07Z
+ 11:44:07 up 4 days, 12:46,  7 users,  load average: 0.35, 0.82, 0.72
+build ok
+### rows=2000000 segments=1 order=duck_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 398.901289ms (1 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=2000000	segments=1	repeats=15	duck_median_ms=68	df_median_ms=37	ratio=0.54	parity=identical	addrs=509
+duck_all=[62, 63, 64, 67, 67, 68, 68, 68, 68, 69, 70, 72, 73, 73, 76]
+df_all=[34, 36, 37, 37, 37, 37, 37, 37, 38, 38, 39, 40, 40, 40, 43]
+### rows=2000000 segments=1 order=df_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 372.600559ms (1 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=2000000	segments=1	repeats=15	duck_median_ms=65	df_median_ms=38	ratio=0.58	parity=identical	addrs=509
+duck_all=[62, 63, 63, 64, 64, 64, 64, 65, 67, 68, 69, 70, 70, 75, 78]
+df_all=[35, 36, 37, 37, 37, 37, 38, 38, 39, 39, 39, 40, 40, 42, 42]
+### rows=2000000 segments=100 order=duck_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 310.522991ms (100 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=2000000	segments=100	repeats=15	duck_median_ms=25	df_median_ms=47	ratio=1.88	parity=identical	addrs=509
+duck_all=[24, 24, 24, 24, 24, 24, 25, 25, 27, 28, 30, 30, 30, 32, 62]
+df_all=[41, 43, 43, 43, 44, 45, 46, 47, 47, 49, 49, 49, 50, 51, 57]
+### rows=2000000 segments=100 order=df_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 315.873079ms (100 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=2000000	segments=100	repeats=15	duck_median_ms=28	df_median_ms=48	ratio=1.71	parity=identical	addrs=509
+duck_all=[22, 22, 24, 24, 25, 26, 27, 28, 28, 28, 29, 29, 31, 31, 53]
+df_all=[43, 45, 47, 47, 47, 48, 48, 48, 49, 52, 54, 57, 62, 63, 67]
+### rows=2000000 segments=1000 order=duck_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 438.516699ms (1000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=2000000	segments=1000	repeats=15	duck_median_ms=70	df_median_ms=77	ratio=1.10	parity=identical	addrs=509
+duck_all=[48, 48, 49, 49, 52, 58, 66, 70, 70, 72, 75, 80, 87, 89, 99]
+df_all=[68, 69, 70, 70, 71, 72, 73, 77, 78, 80, 81, 81, 83, 86, 92]
+### rows=2000000 segments=1000 order=df_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 441.853478ms (1000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=2000000	segments=1000	repeats=15	duck_median_ms=54	df_median_ms=72	ratio=1.33	parity=identical	addrs=509
+duck_all=[46, 46, 48, 48, 48, 49, 52, 54, 54, 56, 73, 78, 100, 101, 112]
+df_all=[69, 69, 70, 70, 71, 72, 72, 72, 73, 73, 74, 76, 79, 93, 102]
+### rows=2000000 segments=10000 order=duck_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.705124908s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=2000000	segments=10000	repeats=15	duck_median_ms=310	df_median_ms=856	ratio=2.76	parity=identical	addrs=509
+duck_all=[300, 303, 307, 308, 308, 309, 309, 310, 311, 311, 312, 324, 352, 394, 411]
+df_all=[746, 767, 782, 816, 821, 838, 842, 856, 857, 874, 882, 884, 886, 907, 919]
+### rows=2000000 segments=10000 order=df_first reps=15
+== RFC-0013 gate: 2000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 1.71492973s (10000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=2000000	segments=10000	repeats=15	duck_median_ms=310	df_median_ms=894	ratio=2.88	parity=identical	addrs=509
+duck_all=[297, 305, 307, 307, 308, 308, 308, 310, 311, 312, 316, 316, 323, 333, 477]
+df_all=[808, 812, 831, 837, 839, 840, 893, 894, 896, 897, 901, 902, 921, 922, 931]
+### rows=8000000 segments=1 order=duck_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 1.484255059s (1 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=8000000	segments=1	repeats=7	duck_median_ms=108	df_median_ms=196	ratio=1.81	parity=identical	addrs=506
+duck_all=[99, 105, 107, 108, 109, 114, 118]
+df_all=[190, 192, 195, 196, 198, 215, 225]
+### rows=8000000 segments=1 order=df_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 1.470836125s (1 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=8000000	segments=1	repeats=7	duck_median_ms=102	df_median_ms=195	ratio=1.91	parity=identical	addrs=506
+duck_all=[95, 96, 99, 102, 108, 109, 120]
+df_all=[184, 190, 192, 195, 197, 198, 199]
+### rows=8000000 segments=100 order=duck_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 1.299983118s (100 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=8000000	segments=100	repeats=7	duck_median_ms=84	df_median_ms=160	ratio=1.90	parity=identical	addrs=506
+duck_all=[73, 79, 81, 84, 86, 87, 117]
+df_all=[152, 155, 159, 160, 160, 161, 164]
+### rows=8000000 segments=100 order=df_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 1.25515371s (100 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=8000000	segments=100	repeats=7	duck_median_ms=88	df_median_ms=163	ratio=1.85	parity=identical	addrs=506
+duck_all=[79, 80, 87, 88, 92, 95, 143]
+df_all=[145, 153, 156, 163, 167, 168, 198]
+### rows=8000000 segments=1000 order=duck_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 1.389958763s (1000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=8000000	segments=1000	repeats=7	duck_median_ms=88	df_median_ms=154	ratio=1.75	parity=identical	addrs=506
+duck_all=[82, 86, 87, 88, 91, 97, 131]
+df_all=[147, 152, 154, 154, 161, 161, 165]
+### rows=8000000 segments=1000 order=df_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 1.377605606s (1000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=8000000	segments=1000	repeats=7	duck_median_ms=87	df_median_ms=153	ratio=1.76	parity=identical	addrs=506
+duck_all=[81, 86, 87, 87, 91, 93, 191]
+df_all=[145, 150, 153, 153, 160, 161, 177]
+### rows=8000000 segments=10000 order=duck_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 2.675709065s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=8000000	segments=10000	repeats=7	duck_median_ms=352	df_median_ms=880	ratio=2.50	parity=identical	addrs=506
+duck_all=[336, 345, 347, 352, 354, 377, 432]
+df_all=[730, 856, 860, 880, 890, 891, 926]
+### rows=8000000 segments=10000 order=df_first reps=7
+== RFC-0013 gate: 8000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 2.622544954s (10000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=8000000	segments=10000	repeats=7	duck_median_ms=349	df_median_ms=881	ratio=2.52	parity=identical	addrs=506
+duck_all=[338, 341, 341, 349, 355, 355, 478]
+df_all=[840, 850, 858, 881, 882, 896, 911]
+### rows=20000000 segments=1 order=duck_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 3.595225243s (1 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=20000000	segments=1	repeats=7	duck_median_ms=191	df_median_ms=382	ratio=2.00	parity=identical	addrs=508
+duck_all=[183, 189, 189, 191, 202, 203, 231]
+df_all=[360, 372, 380, 382, 385, 389, 391]
+### rows=20000000 segments=1 order=df_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 1 sealed segment(s) ==
+fixture written in 3.575726407s (1 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=20000000	segments=1	repeats=7	duck_median_ms=192	df_median_ms=379	ratio=1.97	parity=identical	addrs=508
+duck_all=[185, 186, 189, 192, 204, 206, 227]
+df_all=[353, 366, 377, 379, 380, 412, 423]
+### rows=20000000 segments=100 order=duck_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 3.472795196s (100 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=20000000	segments=100	repeats=7	duck_median_ms=195	df_median_ms=381	ratio=1.95	parity=identical	addrs=508
+duck_all=[188, 189, 194, 195, 196, 196, 225]
+df_all=[359, 371, 377, 381, 385, 389, 391]
+### rows=20000000 segments=100 order=df_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 100 sealed segment(s) ==
+fixture written in 3.51544369s (100 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=20000000	segments=100	repeats=7	duck_median_ms=192	df_median_ms=382	ratio=1.99	parity=identical	addrs=508
+duck_all=[187, 189, 190, 192, 193, 196, 209]
+df_all=[351, 372, 376, 382, 383, 383, 386]
+### rows=20000000 segments=1000 order=duck_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 3.032717993s (1000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=20000000	segments=1000	repeats=7	duck_median_ms=182	df_median_ms=348	ratio=1.91	parity=identical	addrs=508
+duck_all=[174, 178, 178, 182, 184, 191, 215]
+df_all=[323, 336, 342, 348, 351, 368, 400]
+### rows=20000000 segments=1000 order=df_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 1000 sealed segment(s) ==
+fixture written in 3.043165296s (1000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=20000000	segments=1000	repeats=7	duck_median_ms=182	df_median_ms=340	ratio=1.87	parity=identical	addrs=508
+duck_all=[174, 178, 178, 182, 183, 185, 211]
+df_all=[315, 336, 337, 340, 342, 351, 361]
+### rows=20000000 segments=10000 order=duck_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 4.42180876s (10000 files, rss 0 MB)
+order: duckdb, then datafusion
+RESULT	rows=20000000	segments=10000	repeats=7	duck_median_ms=424	df_median_ms=1061	ratio=2.50	parity=identical	addrs=508
+duck_all=[420, 422, 423, 424, 427, 466, 536]
+df_all=[834, 1023, 1052, 1061, 1065, 1072, 1146]
+### rows=20000000 segments=10000 order=df_first reps=7
+== RFC-0013 gate: 20000000 transfer rows across 10000 sealed segment(s) ==
+fixture written in 4.351450396s (10000 files, rss 0 MB)
+order: datafusion, then duckdb
+RESULT	rows=20000000	segments=10000	repeats=7	duck_median_ms=424	df_median_ms=1049	ratio=2.47	parity=identical	addrs=508
+duck_all=[415, 417, 422, 424, 424, 427, 596]
+df_all=[879, 1030, 1044, 1049, 1074, 1076, 1078]
+SWEEP-COMPLETE
