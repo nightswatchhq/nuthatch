@@ -62,6 +62,45 @@ async fn main() -> anyhow::Result<()> {
     let df_first = std::env::var("DF_FIRST").is_ok();
     println!("order: {}", if df_first { "datafusion, then duckdb" } else { "duckdb, then datafusion" });
 
+    // **Repeats inside one process** (#964). Writing a 10,000-file fixture costs far more than the
+    // query, so a fresh process per repeat would measure the fixture writer. `REPEATS=n` writes once
+    // and times both engines n times; the reported figure is the median, per `docs/bench/noise-floor.md`.
+    let repeats: usize = std::env::var("REPEATS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    if repeats > 1 {
+        let mut d_all = Vec::new();
+        let mut f_all = Vec::new();
+        let mut last = None;
+        for _ in 0..repeats {
+            let (duck, d_ms, _) = duckdb_net_balances(&seg)?;
+            let (df, f_ms, _) = datafusion_net_balances(&seg).await?;
+            d_all.push(d_ms);
+            f_all.push(f_ms);
+            last = Some((duck, df));
+        }
+        d_all.sort_unstable();
+        f_all.sort_unstable();
+        let dm = d_all[d_all.len() / 2];
+        let fm = f_all[f_all.len() / 2];
+        let (duck, df) = last.unwrap();
+        let parity = duck == df;
+        println!(
+            "RESULT\trows={rows}\tsegments={segments}\trepeats={repeats}\tduck_median_ms={dm}\tdf_median_ms={fm}\tratio={:.2}\tparity={}\taddrs={}",
+            fm as f64 / dm.max(1) as f64,
+            if parity { "identical" } else { "DIFFER" },
+            duck.len()
+        );
+        println!("duck_all={d_all:?}");
+        println!("df_all={f_all:?}");
+        if !parity {
+            anyhow::bail!("parity failed at rows={rows} segments={segments}");
+        }
+        return Ok(());
+    }
+
     let (duck, d_ms, d_rss, df, f_ms, f_rss) = if df_first {
         let (df, f_ms, f_rss) = datafusion_net_balances(&seg).await?;
         let (duck, d_ms, d_rss) = duckdb_net_balances(&seg)?;
