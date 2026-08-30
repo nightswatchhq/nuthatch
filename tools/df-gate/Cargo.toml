@@ -22,3 +22,8 @@ duckdb = { version = "1", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"
+# #987: a specialised operator is allowed to be specialised. DuckDB hashes with a fast
+# non-cryptographic function and uses every core; a fold that does neither is not measuring §5.3's
+# arm, it is measuring std's DoS-resistant SipHash against a vectorised engine.
+rustc-hash = "2"
+rayon = "1"

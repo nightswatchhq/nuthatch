@@ -3297,6 +3297,8 @@ dependencies = [
  "duckdb",
  "nuthatch",
  "parquet 58.4.0",
+ "rayon",
+ "rustc-hash",
  "tempfile",
  "tokio",
 ]

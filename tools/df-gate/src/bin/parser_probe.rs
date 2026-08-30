@@ -69,18 +69,30 @@ async fn main() -> anyhow::Result<()> {
 
     // Alias pairs: the SQL-standard or short spelling, and the name DataFusion registers it under.
     let cases: &[(&str, &str)] = &[
-        ("stddev",              "SELECT k, stddev(v) AS m FROM t GROUP BY k"),
-        ("stddev_samp",         "SELECT k, stddev_samp(v) AS m FROM t GROUP BY k"),
-        ("var",                 "SELECT k, var(v) AS m FROM t GROUP BY k"),
-        ("var_samp",            "SELECT k, var_samp(v) AS m FROM t GROUP BY k"),
-        ("median",              "SELECT k, median(v) AS m FROM t GROUP BY k"),
-        ("approx_median",       "SELECT k, approx_median(v) AS m FROM t GROUP BY k"),
-        ("array_agg",           "SELECT k, array_agg(v) AS m FROM t GROUP BY k"),
-        ("percentile_cont",     "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m FROM t GROUP BY k"),
-        ("sum (control)",       "SELECT k, sum(v) AS m FROM t GROUP BY k"),
+        ("stddev", "SELECT k, stddev(v) AS m FROM t GROUP BY k"),
+        (
+            "stddev_samp",
+            "SELECT k, stddev_samp(v) AS m FROM t GROUP BY k",
+        ),
+        ("var", "SELECT k, var(v) AS m FROM t GROUP BY k"),
+        ("var_samp", "SELECT k, var_samp(v) AS m FROM t GROUP BY k"),
+        ("median", "SELECT k, median(v) AS m FROM t GROUP BY k"),
+        (
+            "approx_median",
+            "SELECT k, approx_median(v) AS m FROM t GROUP BY k",
+        ),
+        ("array_agg", "SELECT k, array_agg(v) AS m FROM t GROUP BY k"),
+        (
+            "percentile_cont",
+            "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m FROM t GROUP BY k",
+        ),
+        ("sum (control)", "SELECT k, sum(v) AS m FROM t GROUP BY k"),
     ];
 
-    println!("\n{:<18} {:<24} {:<10} {}", "case", "ast names", "in reg?", "planned expression");
+    println!(
+        "\n{:<18} {:<24} {:<10} {}",
+        "case", "ast names", "in reg?", "planned expression"
+    );
     println!("{}", "-".repeat(110));
     for (label, sql) in cases {
         let ast = ast_function_names(sql);
@@ -97,9 +109,18 @@ async fn main() -> anyhow::Result<()> {
                     .trim()
                     .to_string()
             }
-            Err(e) => format!("<plan error: {}>", e.to_string().lines().next().unwrap_or("")),
+            Err(e) => format!(
+                "<plan error: {}>",
+                e.to_string().lines().next().unwrap_or("")
+            ),
         };
-        println!("{:<18} {:<24} {:<10} {}", label, ast.join(","), in_reg.join(","), planned);
+        println!(
+            "{:<18} {:<24} {:<10} {}",
+            label,
+            ast.join(","),
+            in_reg.join(","),
+            planned
+        );
     }
     Ok(())
 }
