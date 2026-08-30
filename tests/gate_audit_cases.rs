@@ -12,6 +12,36 @@
 
 use std::process::Command;
 
+/// The complete case list in `scripts/gate-audit.sh`, pinned by name.
+///
+/// Pinned rather than counted (#974). Both directions are asserted: a missing case means coverage
+/// was deleted, an extra case means this list went stale. Either way it is one edit here in the same
+/// commit, which is the point - the audit's own coverage should not be able to change quietly.
+const EXPECTED_CASES: &[&str] = &[
+    "ivm_claims",
+    "ivm_claims_views",
+    "rfc_index_status",
+    "doc_command_check",
+    "required_checks",
+    "skill_refs_authored",
+    "skill_refs_stale",
+    "tape_clean",
+    "actions_pinned_tag",
+    "actions_pinned_toolchain",
+];
+
+/// `--check` prints `  <name>   target present in <file>` for each live case.
+trait LiveCaseLine {
+    fn strip_suffix_once_target(&self) -> Option<String>;
+}
+impl LiveCaseLine for str {
+    fn strip_suffix_once_target(&self) -> Option<String> {
+        let at = self.find("target present in")?;
+        let name = self[..at].trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+}
+
 #[test]
 fn every_gate_audit_case_still_has_a_target() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -34,12 +64,35 @@ fn every_gate_audit_case_still_has_a_target() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Guard against a vacuous pass: an empty case list would exit 0 and prove nothing.
-    let targets = text.matches("target present in").count();
+    // #974: this used to be `targets >= 6` against ten declared cases, which meant four could be
+    // deleted from `CASES` outright with this still green. A floor cannot see deletion; only the
+    // complete set can. Drift (a needle that stops matching) was already caught - it produces a SKIP
+    // and the script exits nonzero - so the floor was a weak backstop behind a check that worked,
+    // guarding the one direction that was actually open.
+    let expected: Vec<&str> = EXPECTED_CASES.to_vec();
+    let live: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix_once_target())
+        .collect();
+    let missing: Vec<&&str> = expected
+        .iter()
+        .filter(|e| !live.iter().any(|l| l == *e))
+        .collect();
     assert!(
-        targets >= 6,
-        "the audit only has {targets} live case(s), which is too few to be watching the gate set. \
-         Either cases were removed or the script stopped parsing them:\n{text}"
+        missing.is_empty(),
+        "these gate-audit cases are declared in the test but no longer live in the script: \
+         {missing:?}. A case that vanishes takes its gate's coverage with it, silently - which is \
+         #913 shape 1 inside the tool built to detect it. Do not delete a case; fix it.\n{text}"
+    );
+    let extra: Vec<&String> = live
+        .iter()
+        .filter(|l| !expected.contains(&l.as_str()))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "the script has gained cases this test does not know about: {extra:?}. Good - add them to \
+         `EXPECTED_CASES` in the same commit, so the set stays pinned rather than becoming a floor \
+         again.\n{text}"
     );
 
     assert!(
