@@ -3008,7 +3008,16 @@ pub async fn backfill_direct(
         next = chunk_to + 1;
 
         // Flush on a data-determined boundary (RFC-0028 §4), not on the fetch window's end.
-        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+        //
+        // `while`, not `if` (#980). A single fetched chunk can carry many multiples of
+        // `SEAL_DIRECT_BATCH`, and sealing only one of them per chunk made the *number* of segments
+        // a function of `--window`: measured on a 30,000-block corpus, window 320 produced 6
+        // segments with a largest of 20,003 rows, and window 163,840 produced 2 with a largest of
+        // 99,993. Same chain, same rows, different content addresses - which is exactly the
+        // operator-dependent segmentation RFC-0028 §4 exists to prevent and what RFC-0019 bundles
+        // and RFC-0020 segment reuse both rest on. Draining fully restores it: 6 segments at every
+        // window.
+        while let Some((rows, seal_to)) = take_sealable(&mut buf) {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
         }
@@ -3587,7 +3596,9 @@ pub async fn backfill_direct_pipelined(
         total += n;
         buf.extend(json);
         on_progress(w_to, n);
-        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+        // `while`, not `if` (#980) - see the note on the direct path: one seal per chunk makes
+        // segment identity depend on the operator's window.
+        while let Some((rows, seal_to)) = take_sealable(&mut buf) {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
             on_seal(seal_to)?;
@@ -3836,8 +3847,9 @@ pub async fn backfill_direct_factory(
         next = chunk_to + 1;
         on_progress(chunk_to, row_count as u64);
 
-        // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path.
-        if let Some((rows, seal_to)) = take_sealable(&mut buf) {
+        // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path - including
+        // `while` rather than `if` (#980), so segment identity does not depend on `--window`.
+        while let Some((rows, seal_to)) = take_sealable(&mut buf) {
             // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
             seal::seal_range_with_snapshot(
                 dir,
@@ -5843,6 +5855,175 @@ fn webhook_host(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // #980 - seal boundaries are a function of the data, not of the fetch batching.
+    //
+    // `tests/seal_batching_asymmetry.rs` used to assert this by reading `indexer.rs` as a string
+    // and checking the 1400 characters before `fn take_sealable` contained the words
+    // "from the **data**" and "identical". It sealed nothing. The window it searched *was* the doc
+    // comment, so it was a gate matching its own documentation: an implementation could make cuts
+    // depend on fetch batches, keep the prose intact, and stay green.
+    //
+    // These live here rather than in `tests/` because `take_sealable` is private, which is the
+    // constraint that pushed the original at the source text in the first place.
+    // ---------------------------------------------------------------------------------------
+
+    /// Drive `take_sealable` the way the backfill loop actually does: fetch a **window of blocks**,
+    /// append every row for those blocks, then seal whatever is sealable. Repeat.
+    ///
+    /// The unit is blocks, not rows, and that is load-bearing. `--window` and `--concurrency` size a
+    /// *block range*, and the loop appends all rows for the range before calling `take_sealable`, so
+    /// `buf` always ends on a whole block. A row-level partition would split a block mid-run, which
+    /// no operator configuration can produce - and it would fail, because `partition_point` can only
+    /// include the rows that are present. Modelling the wrong unit here would invent a defect.
+    ///
+    /// Returns one entry per sealed segment plus the unsealed remainder: together, the observable
+    /// output that a differently-tuned operator has to reproduce byte for byte.
+    /// One sealed segment: its rows, and the block it was cut at.
+    type Segment = (Vec<String>, u64);
+    /// Everything a run produces: the segments, and the unsealed remainder.
+    type SealRun = (Vec<Segment>, Vec<String>);
+
+    fn seal_through_windows(rows: &[(u64, String)], last_block: u64, window: u64) -> SealRun {
+        let mut buf: Vec<(u64, String)> = Vec::new();
+        let mut segments = Vec::new();
+        let mut from = 0u64;
+        while from <= last_block {
+            let to = (from + window - 1).min(last_block);
+            buf.extend(rows.iter().filter(|(b, _)| *b >= from && *b <= to).cloned());
+            from = to + 1;
+            // Mirrors the production loops exactly, `while` included (#980).
+            while let Some(seg) = take_sealable(&mut buf) {
+                segments.push(seg);
+            }
+        }
+        (segments, drain_sealable(&mut buf))
+    }
+
+    /// Rows in `(block, log_index)` order with an uneven number per block, so a cut cannot land on a
+    /// tidy multiple and a block genuinely straddles the seal threshold.
+    fn corpus(blocks: u64) -> Vec<(u64, String)> {
+        let mut rows = Vec::new();
+        for b in 0..blocks {
+            for i in 0..((b % 7) + 1) {
+                rows.push((b, format!("{{\"block\":{b},\"i\":{i}}}")));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn seal_boundaries_are_identical_across_fetch_windows() {
+        let blocks = 30_000u64;
+        let rows = corpus(blocks);
+        assert!(
+            rows.len() > SEAL_DIRECT_BATCH * 3,
+            "corpus too small to cross the seal threshold repeatedly: {} rows vs batch {}",
+            rows.len(),
+            SEAL_DIRECT_BATCH
+        );
+
+        // Five operators with wildly different RPC tuning against the same chain. `--window` is the
+        // knob; 320 is what `nuthatch doctor` recommends for a range-only provider, 163840 is the
+        // upper end it measured, and the ugly ones exist so no boundary can be an artefact of a
+        // round number.
+        let mut reference: Option<SealRun> = None;
+        for window in [1u64, 7, 320, 4_999, 163_840] {
+            let got = seal_through_windows(&rows, blocks - 1, window);
+            match &reference {
+                None => {
+                    assert!(
+                        !got.0.is_empty(),
+                        "the reference run sealed nothing, so every later comparison would be \
+                         vacuously equal - the corpus never crossed SEAL_DIRECT_BATCH"
+                    );
+                    reference = Some(got);
+                }
+                Some(want) => {
+                    assert_eq!(
+                        got.0.len(),
+                        want.0.len(),
+                        "window={window} produced a different NUMBER of segments ({} vs {}). \
+                         Segment identity would then depend on the operator's --window, which is \
+                         the bug RFC-0028 §4 fixed and the property RFC-0019 bundles and RFC-0020 \
+                         segment reuse both rest on (#947, #980)",
+                        got.0.len(),
+                        want.0.len()
+                    );
+                    for (i, (a, b)) in got.0.iter().zip(want.0.iter()).enumerate() {
+                        assert_eq!(
+                            a.1, b.1,
+                            "window={window}: segment {i} was cut at block {} instead of {}",
+                            a.1, b.1
+                        );
+                        assert_eq!(
+                            a.0, b.0,
+                            "window={window}: segment {i} carries different ROWS, so the two \
+                             operators' segments are not content-identical and will not dedup"
+                        );
+                    }
+                    assert_eq!(
+                        got.1, want.1,
+                        "window={window}: the unsealed remainder differs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_is_never_split_across_two_segments() {
+        // The other half of the documented rule, and what makes the cut data-derived: if one block
+        // carries the buffer past the threshold, the whole block goes into that segment.
+        let blocks = 30_000u64;
+        let (segments, _) = seal_through_windows(&corpus(blocks), blocks - 1, 512);
+        assert!(
+            !segments.is_empty(),
+            "nothing sealed - the corpus never crossed the threshold"
+        );
+        let mut home: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (i, (rows, _)) in segments.iter().enumerate() {
+            for r in rows {
+                let b: u64 = r
+                    .split(':')
+                    .nth(1)
+                    .and_then(|t| t.split(',').next())
+                    .and_then(|t| t.parse().ok())
+                    .expect("parse block out of the row json");
+                if let Some(prev) = home.insert(b, i) {
+                    assert_eq!(
+                        prev, i,
+                        "block {b} appears in segment {prev} and segment {i} - a block was split \
+                         across a seal boundary, so the segment's contents depend on where the \
+                         buffer happened to fill rather than on the data"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_observable_can_actually_see_a_boundary_move() {
+        // The control, and the reason the two tests above are not vacuous. If a change made the
+        // boundary depend on the fetch, this comparison has to be sensitive enough to notice - so
+        // prove it by changing the DATA and watching the first cut move.
+        let blocks = 30_000u64;
+        let base = seal_through_windows(&corpus(blocks), blocks - 1, 512);
+        let mut denser = corpus(blocks);
+        // 600 extra rows in block 0 shifts which block sits at index SEAL_DIRECT_BATCH - 1.
+        for i in 0..600 {
+            denser.insert(0, (0, format!("{{\"block\":0,\"i\":{}}}", 100 + i)));
+        }
+        let moved = seal_through_windows(&denser, blocks - 1, 512);
+        assert_ne!(
+            base.0.first().map(|s| s.1),
+            moved.0.first().map(|s| s.1),
+            "adding rows to the first block did not move the first seal boundary, so this \
+             observable cannot see a boundary change at all and the assertions above would pass \
+             against a broken implementation"
+        );
+    }
 
     #[tokio::test]
     async fn retry_transient_recovers_after_transient_failures() {
