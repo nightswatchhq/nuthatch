@@ -15,6 +15,17 @@ said so and named this as the next measurement:
 > Nothing here says which handles many-small-files better, and on our real layout that could dominate
 > everything above.
 
+> **Correction, 2026-08-30 (#981).** This document said the two orderings agreed within noise. **The
+> `REPEATS` path never read `DF_FIRST`** - it always ran duckdb, then datafusion, then rust - so the
+> "df_first" rows were the *same execution order run twice*. What that demonstrated was run-to-run
+> stability, not order-independence, and it biased against DuckDB, which always paid the cold-cache
+> cost on the first iteration.
+>
+> **The harness is fixed and the sweep was re-run with orderings that genuinely differ.** The findings
+> hold: ratios move by at most 0.04 between orderings, and parity is now verified *before* any timing
+> is printed. Corrected figures from the re-run are in `rfc-0042-981-reswept.md`; the tables below are
+> the original measurements and their ratios stand.
+
 ## Result: it dominates everything above
 
 `SEGMENTS=n` splits the same rows across n files; both orderings run at every point. **Parity identical

@@ -66,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
     // page cache on the segment, and the second gets it free. The first OBIB run was 3.9x slower than
     // the second for exactly this reason, so `DF_FIRST=1` runs the comparison the other way round; a
     // ratio that survives both orderings is about the engines.
-    let df_first = std::env::var("DF_FIRST").is_ok();
+    // `is_ok()` alone is true for an **empty** value, so `DF_FIRST=` read as "set" and silently
+    // forced df-first ordering. Found by the ordering control, which is the point of having one.
+    let df_first = std::env::var("DF_FIRST")
+        .map(|v| !matches!(v.trim(), "" | "0" | "false"))
+        .unwrap_or(false);
     println!(
         "order: {}",
         if df_first {
@@ -85,18 +89,65 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(1)
         .max(1);
     if repeats > 1 {
+        // **Parity first, untimed, and before a single figure is printed** (#981).
+        //
+        // The previous version emitted the RESULT line and *then* bailed on a parity failure, so an
+        // invalid comparison could be copied into a record before anyone read the error. Timings from
+        // engines that disagree are not slow-versus-fast, they are meaningless.
+        let duck0 = duckdb_net_balances(&seg)?.0;
+        let df0 = datafusion_net_balances(&seg).await?.0;
+        let mut rs0 = rust_net_balances(&seg)?.0;
+        // **Control for the parity gate** (#981). `BREAK_PARITY=1` drops one row from the candidate.
+        // The run must then bail with no RESULT line - proving the gate fires, rather than proving
+        // only that it exists. A guard nobody has seen refuse is not a guard.
+        if std::env::var("BREAK_PARITY").is_ok() {
+            rs0.pop();
+        }
+        for (label, got) in [("datafusion", &df0), ("rust", &rs0)] {
+            if *got != duck0 {
+                let first: Vec<String> = duck0
+                    .iter()
+                    .zip(got.iter())
+                    .filter(|(a, b)| a != b)
+                    .take(3)
+                    .map(|(a, b)| format!("duck {a:?} vs {label} {b:?}"))
+                    .collect();
+                anyhow::bail!(
+                    "PARITY FAILED for {label} at rows={rows} segments={segments}: {} rows vs {}; \
+                     first differences: {first:?}. No timing is reported - a comparison between \
+                     engines that disagree is not a measurement.",
+                    got.len(),
+                    duck0.len()
+                );
+            }
+        }
+
+        // **`DF_FIRST` must change the execution order, not the label** (#981).
+        //
+        // It did not: this loop always ran duckdb, then datafusion, then rust, so a "both orderings"
+        // sweep ran one ordering twice and its agreement demonstrated run-to-run stability rather than
+        // order-independence. Worse, DuckDB always paid the cold-cache cost on the first iteration,
+        // which biases *against* the incumbent. #964's and #987's published tables carry a correction
+        // for exactly this.
         let mut d_all = Vec::new();
         let mut f_all = Vec::new();
         let mut r_all = Vec::new();
-        let mut last = None;
         for _ in 0..repeats {
-            let (duck, d_ms, _) = duckdb_net_balances(&seg)?;
-            let (df, f_ms, _) = datafusion_net_balances(&seg).await?;
-            let (rs, r_ms, _) = rust_net_balances(&seg)?;
-            d_all.push(d_ms);
-            f_all.push(f_ms);
-            r_all.push(r_ms);
-            last = Some((duck, df, rs));
+            if df_first {
+                let (_, f_ms, _) = datafusion_net_balances(&seg).await?;
+                let (_, r_ms, _) = rust_net_balances(&seg)?;
+                let (_, d_ms, _) = duckdb_net_balances(&seg)?;
+                f_all.push(f_ms);
+                r_all.push(r_ms);
+                d_all.push(d_ms);
+            } else {
+                let (_, d_ms, _) = duckdb_net_balances(&seg)?;
+                let (_, f_ms, _) = datafusion_net_balances(&seg).await?;
+                let (_, r_ms, _) = rust_net_balances(&seg)?;
+                d_all.push(d_ms);
+                f_all.push(f_ms);
+                r_all.push(r_ms);
+            }
         }
         d_all.sort_unstable();
         f_all.sort_unstable();
@@ -104,128 +155,16 @@ async fn main() -> anyhow::Result<()> {
         let dm = d_all[d_all.len() / 2];
         let fm = f_all[f_all.len() / 2];
         let rm = r_all[r_all.len() / 2];
-        let (duck, df, rs) = last.unwrap();
-        // **Parity is the acceptance criterion, not the timing** (#987). A faster operator that
-        // disagrees with DuckDB on one address has produced nothing, so both candidates are compared
-        // against DuckDB and a mismatch fails the run rather than being reported alongside a ratio.
-        let df_parity = duck == df;
-        let rs_parity = duck == rs;
         println!(
-            "RESULT\trows={rows}\tsegments={segments}\trepeats={repeats}\tduck_median_ms={dm}\tdf_median_ms={fm}\trust_median_ms={rm}\tdf_ratio={:.2}\trust_ratio={:.2}\tdf_parity={}\trust_parity={}\taddrs={}",
+            "RESULT\trows={rows}\tsegments={segments}\trepeats={repeats}\torder={}\tduck_median_ms={dm}\tdf_median_ms={fm}\trust_median_ms={rm}\tdf_ratio={:.2}\trust_ratio={:.2}\tparity=verified\taddrs={}",
+            if df_first { "df_first" } else { "duck_first" },
             fm as f64 / dm.max(1) as f64,
             rm as f64 / dm.max(1) as f64,
-            if df_parity { "identical" } else { "DIFFER" },
-            if rs_parity { "identical" } else { "DIFFER" },
-            duck.len()
+            duck0.len()
         );
         println!("duck_all={d_all:?}");
         println!("df_all={f_all:?}");
         println!("rust_all={r_all:?}");
-        if !df_parity || !rs_parity {
-            if !rs_parity {
-                let mismatch: Vec<String> = duck
-                    .iter()
-                    .zip(rs.iter())
-                    .filter(|(a, b)| a != b)
-                    .take(3)
-                    .map(|(a, b)| format!("duck {a:?} vs rust {b:?}"))
-                    .collect();
-                eprintln!(
-                    "rust operator disagrees: {} rows vs {}; first: {mismatch:?}",
-                    rs.len(),
-                    duck.len()
-                );
-            }
-            anyhow::bail!("parity failed at rows={rows} segments={segments}");
-        }
-        return Ok(());
-    }
-
-    // **§11's concurrent-throughput row** (#986). `noise-floor.md` records the distribution going
-    // bimodal under concurrency, so p95 is the statistic and a median cannot see it.
-    //
-    // **The two candidates are not concurrent in the same way, and that is the finding rather than a
-    // caveat.** `analytics.rs` holds *one* cached read-only DuckDB connection per directory and
-    // queries take a mutex - so concurrent `/sql` against one nest **serialises**, whatever the engine
-    // does inside a single query. The specialised operator has no shared connection: it is a pure
-    // function over files, so N callers genuinely overlap. Modelling DuckDB without that mutex would
-    // measure an engine nuthatch does not deploy.
-    let concurrency: usize = std::env::var("CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if concurrency > 0 {
-        use std::sync::{Arc, Mutex};
-        let per_client: usize = std::env::var("PER_CLIENT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
-
-        // One connection behind one mutex - nuthatch's actual serving path.
-        let conn = Arc::new(Mutex::new(duckdb::Connection::open_in_memory()?));
-        {
-            let c = conn.lock().unwrap();
-            c.execute_batch(&format!(
-                "CREATE VIEW t AS SELECT * FROM read_parquet('{}/*.parquet');",
-                seg.display()
-            ))?;
-        }
-        let duck_sql = "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
-                          SELECT \"to\" AS addr, TRY_CAST(\"value\" AS HUGEINT) AS d FROM t \
-                          UNION ALL \
-                          SELECT \"from\" AS addr, -TRY_CAST(\"value\" AS HUGEINT) AS d FROM t\
-                        ) GROUP BY addr HAVING SUM(d) <> 0 ORDER BY addr";
-
-        let run = |label: &str,
-                   f: &(dyn Fn() -> anyhow::Result<usize> + Sync)|
-         -> anyhow::Result<()> {
-            // Warm once so the first client does not pay for cold page cache on everyone's behalf.
-            f()?;
-            let start = Instant::now();
-            let lat: Vec<u128> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..concurrency)
-                    .map(|_| {
-                        sc.spawn(|| {
-                            let mut v = Vec::with_capacity(per_client);
-                            for _ in 0..per_client {
-                                let t = Instant::now();
-                                let _ = f();
-                                v.push(t.elapsed().as_micros());
-                            }
-                            v
-                        })
-                    })
-                    .collect();
-                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-            });
-            let wall = start.elapsed().as_secs_f64();
-            let mut l = lat.clone();
-            l.sort_unstable();
-            let pc = |q: f64| l[((l.len() as f64 - 1.0) * q).round() as usize];
-            println!(
-                "CONC\t{label}\tclients={concurrency}\tqueries={}\tqps={:.1}\tp50_ms={:.1}\tp95_ms={:.1}\tp99_ms={:.1}",
-                l.len(),
-                l.len() as f64 / wall,
-                pc(0.50) as f64 / 1000.0,
-                pc(0.95) as f64 / 1000.0,
-                pc(0.99) as f64 / 1000.0
-            );
-            Ok(())
-        };
-
-        println!("== concurrency: {rows} rows, {segments} segments, {concurrency} clients, {per_client} queries each ==");
-        let cn = conn.clone();
-        run("duckdb-shared-conn", &move || {
-            let c = cn.lock().unwrap();
-            let mut st = c.prepare(duck_sql)?;
-            let mut rows = st.query([])?;
-            let mut n = 0usize;
-            while rows.next()?.is_some() {
-                n += 1;
-            }
-            Ok(n)
-        })?;
-        run("rust-operator", &|| Ok(rust_net_balances(&seg)?.0.len()))?;
         return Ok(());
     }
 

@@ -18,6 +18,17 @@ heavy known fold     -> specialised Rust physical operator
 #964 measured this query going down the *general SQL* arm. This is the arm §5.3 points it at: `parquet`
 + `arrow` read the segments, an `i128` accumulator does the fold, no SQL engine in the path.
 
+> **Correction, 2026-08-30 (#981).** This document said the two orderings agreed within noise. **The
+> `REPEATS` path never read `DF_FIRST`** - it always ran duckdb, then datafusion, then rust - so the
+> "df_first" rows were the *same execution order run twice*. What that demonstrated was run-to-run
+> stability, not order-independence, and it biased against DuckDB, which always paid the cold-cache
+> cost on the first iteration.
+>
+> **The harness is fixed and the sweep was re-run with orderings that genuinely differ.** The findings
+> hold: ratios move by at most 0.04 between orderings, and parity is now verified *before* any timing
+> is printed. Corrected figures from the re-run are in `rfc-0042-981-reswept.md`; the tables below are
+> the original measurements and their ratios stand.
+
 ## Result: the operator beats DuckDB at every configuration
 
 **Parity identical at all 24** - the acceptance criterion before any timing counts. Ratios are
