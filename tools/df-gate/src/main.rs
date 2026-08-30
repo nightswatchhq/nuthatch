@@ -141,6 +141,94 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // **§11's concurrent-throughput row** (#986). `noise-floor.md` records the distribution going
+    // bimodal under concurrency, so p95 is the statistic and a median cannot see it.
+    //
+    // **The two candidates are not concurrent in the same way, and that is the finding rather than a
+    // caveat.** `analytics.rs` holds *one* cached read-only DuckDB connection per directory and
+    // queries take a mutex - so concurrent `/sql` against one nest **serialises**, whatever the engine
+    // does inside a single query. The specialised operator has no shared connection: it is a pure
+    // function over files, so N callers genuinely overlap. Modelling DuckDB without that mutex would
+    // measure an engine nuthatch does not deploy.
+    let concurrency: usize = std::env::var("CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if concurrency > 0 {
+        use std::sync::{Arc, Mutex};
+        let per_client: usize = std::env::var("PER_CLIENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+
+        // One connection behind one mutex - nuthatch's actual serving path.
+        let conn = Arc::new(Mutex::new(duckdb::Connection::open_in_memory()?));
+        {
+            let c = conn.lock().unwrap();
+            c.execute_batch(&format!(
+                "CREATE VIEW t AS SELECT * FROM read_parquet('{}/*.parquet');",
+                seg.display()
+            ))?;
+        }
+        let duck_sql = "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
+                          SELECT \"to\" AS addr, TRY_CAST(\"value\" AS HUGEINT) AS d FROM t \
+                          UNION ALL \
+                          SELECT \"from\" AS addr, -TRY_CAST(\"value\" AS HUGEINT) AS d FROM t\
+                        ) GROUP BY addr HAVING SUM(d) <> 0 ORDER BY addr";
+
+        let run = |label: &str,
+                   f: &(dyn Fn() -> anyhow::Result<usize> + Sync)|
+         -> anyhow::Result<()> {
+            // Warm once so the first client does not pay for cold page cache on everyone's behalf.
+            f()?;
+            let start = Instant::now();
+            let lat: Vec<u128> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..concurrency)
+                    .map(|_| {
+                        sc.spawn(|| {
+                            let mut v = Vec::with_capacity(per_client);
+                            for _ in 0..per_client {
+                                let t = Instant::now();
+                                let _ = f();
+                                v.push(t.elapsed().as_micros());
+                            }
+                            v
+                        })
+                    })
+                    .collect();
+                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            let wall = start.elapsed().as_secs_f64();
+            let mut l = lat.clone();
+            l.sort_unstable();
+            let pc = |q: f64| l[((l.len() as f64 - 1.0) * q).round() as usize];
+            println!(
+                "CONC\t{label}\tclients={concurrency}\tqueries={}\tqps={:.1}\tp50_ms={:.1}\tp95_ms={:.1}\tp99_ms={:.1}",
+                l.len(),
+                l.len() as f64 / wall,
+                pc(0.50) as f64 / 1000.0,
+                pc(0.95) as f64 / 1000.0,
+                pc(0.99) as f64 / 1000.0
+            );
+            Ok(())
+        };
+
+        println!("== concurrency: {rows} rows, {segments} segments, {concurrency} clients, {per_client} queries each ==");
+        let cn = conn.clone();
+        run("duckdb-shared-conn", &move || {
+            let c = cn.lock().unwrap();
+            let mut st = c.prepare(duck_sql)?;
+            let mut rows = st.query([])?;
+            let mut n = 0usize;
+            while rows.next()?.is_some() {
+                n += 1;
+            }
+            Ok(n)
+        })?;
+        run("rust-operator", &|| Ok(rust_net_balances(&seg)?.0.len()))?;
+        return Ok(());
+    }
+
     let (duck, d_ms, d_rss, df, f_ms, f_rss) = if df_first {
         let (df, f_ms, f_rss) = datafusion_net_balances(&seg).await?;
         let (duck, d_ms, d_rss) = duckdb_net_balances(&seg)?;
