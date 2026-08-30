@@ -1,8 +1,12 @@
 # RFC-0042 slice 5: the decision input
 
+> **The verdict was taken on 2026-08-30: KEEP DuckDB. It is RFC-0042 §14, not this document.** This
+> file remains the evidence input, amended in place where it was later found wrong - see the struck
+> known cost 4 and the withdrawn concurrent-throughput row.
+
 **This document contains no verdict.** §10 makes slice 5 "the decision" and §11 requires it written as
 an RFC amendment saying either **Remove DuckDB** or **Keep DuckDB, because these measured regressions
-remain**. That is the board's to write. This assembles what has been measured, what has not, and what
+remain**. That was the board's to write. This assembles what has been measured, what has not, and what
 each figure does and does not cover, so the decision is made from evidence rather than from a summary
 of a summary.
 
@@ -18,7 +22,7 @@ the number quietly replaced.
 | representative query - heavy fold | baseline | **0.55-0.85x** (faster) | #987, re-run #981 |
 | representative query - authored views | baseline | **0.81-1.64x** | #996 |
 | general SQL via DataFusion, realistic layout | baseline | 2.53-2.80x (slower) | #964, re-run #981 |
-| concurrent throughput | **40.3 -> 39.6 qps, 1 -> 32 clients**; p50 24.1 -> 24.6 ms; **p99 29.5 -> 7066 ms** | 43 -> 107 qps, p99 944 ms | #986 |
+| concurrent throughput | ~~40.3 -> 39.6 qps~~ **WITHDRAWN - harness mutex, not the product's.** 14.8 -> 81.5 qps, 1 -> 32 clients | not comparable: the Rust figure was measured against that harness | #986, **struck by §14** |
 | peak RSS | ~60 MB, CI-gated at 256 MB | not measured for the candidate | `footprint` job |
 | ingest throughput | `bench backfill` events/sec | n/a - the candidate is not an ingest path | RFC-0004 |
 | restart-to-ready | **68.2 ms at 10 blocks, 74.0 ms at 500**; warm restart is **0.44-0.61x** a cold start | n/a | #992, corrected #999 |
@@ -53,10 +57,14 @@ segments**: parity exact, **0.81-1.64x**, faster on two of five including the la
 3. **Five of DuckDB's six roles have no implementation.** #966 established none blocks removal on its
    own. That is not the same as any being replaced. **Nothing has been built**: every measurement here
    comes from `tools/df-gate`, deliberately outside nuthatch's dependency graph.
-4. **The concurrency win is architectural, not an engine property.** The Rust path scales because it has
-   no shared connection. Any engine deployed as `analytics.rs` deploys DuckDB - one cached connection
-   under a mutex - would show the same flat 40 qps. See #991: this is a live product characteristic
-   independent of which engine wins.
+4. ~~**The concurrency win is architectural, not an engine property.** The Rust path scales because it
+   has no shared connection. Any engine deployed as `analytics.rs` deploys DuckDB - one cached
+   connection under a mutex - would show the same flat 40 qps. See #991: this is a live product
+   characteristic independent of which engine wins.~~
+   **STRUCK 2026-08-30 under RFC-0042 §14.** `analytics.rs` does not hold its mutex across the query;
+   both guards are statement temporaries taken for a map operation. Measured on the product's own path,
+   the same engine gives 14.7 qps with a held mutex and up to 81.5 qps without one. This was not a cost
+   of anything, and the concurrent-throughput row it supported cannot carry a removal argument.
 
 ## What is not measured, and should not be read as measured
 
@@ -79,9 +87,12 @@ much of its input was revised, and by whom.
 | #986: four §11 rows never measured | two already had harnesses | me |
 | #964/#987: "both orderings agree within noise" | the `REPEATS` path ignored `DF_FIRST`; one ordering ran twice | **review (#981)** |
 | #945: join corpus crosses the vector boundary | both sides grouped to three rows first | **review (#982)** |
+| **this document's own known cost 4, plus #986 and #991: `analytics.rs` serialises concurrent queries** | **it does not.** Both mutex guards are statement temporaries for a map operation; the query runs unlocked. 14.7 qps held vs 81.5 qps unheld, same engine, same path | **slice 6** |
 
-The common shape is a property asserted in prose that the code did not deliver. Two of four were caught
-by review rather than by the author.
+The common shape is a property asserted in prose that the code did not deliver. **Five of five now**,
+and the fifth is the worst of them: it originated in a source doc comment, was repeated into a
+benchmark document, then into an issue, then into this decision input, without anyone reading the
+function body. Three of five were caught by review rather than by the author.
 
 ## The two admissible outcomes
 

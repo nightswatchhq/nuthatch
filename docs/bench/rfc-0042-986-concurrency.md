@@ -6,17 +6,38 @@ Measured 2026-08-30 on the Linux dev box (`pepe-thinkpad`, 32 cores, 62 GB, load
 §11's concurrent-throughput row, and the reason `docs/bench/noise-floor.md` insists on **p95 under
 concurrency**: the distribution is bimodal, and a median cannot see it.
 
-## The two paths are not concurrent in the same way
+## CORRECTION, 2026-08-30: the premise of this section was false
 
-`analytics.rs` holds **one cached read-only DuckDB connection per directory, taken under a mutex**
+> **This document's DuckDB numbers were produced against a mutex the harness imposed, not one the
+> product holds. They do not measure DuckDB under concurrency, and no removal argument can rest on
+> them.** Corrected under RFC-0042 §14; the figures below are left unedited so the correction is
+> visible rather than absorbed.
+
+~~`analytics.rs` holds **one cached read-only DuckDB connection per directory, taken under a mutex**
 (#295) - "still read-only and still single-user; queries take the mutex". So concurrent `/sql` against
-one nest **serialises**, whatever the engine does inside a single query.
+one nest **serialises**, whatever the engine does inside a single query.~~
 
-The specialised operator (#987) has no shared connection. It is a pure function over files, so N
-callers genuinely overlap.
+~~Modelling DuckDB without that mutex would measure an engine nuthatch does not deploy, so the harness
+keeps it.~~
 
-Modelling DuckDB without that mutex would measure an engine nuthatch does not deploy, so the harness
-keeps it.
+**What `analytics.rs` actually does.** The cache mutex is taken twice per query, each time for a map
+operation: once to `remove()` the slot, once to put it back. Both guards are statement temporaries that
+drop at the semicolon, and the query runs unlocked. The quoted phrase is from `DuckCache`'s own doc
+comment, and "queries take the mutex" is true of the map operations only. This document read it as
+"queries serialise" and did not check the body of `attempt()`.
+
+**Measured on the product's own path** (`nuthatch::analytics::query_guarded`, one `Mutex<()>` the only
+variable between arms, `horizon-nest`, 32 clients, >= 15 repeats): **14.7 qps flat with a held mutex,
+up to 81.5 qps without one - 5.5x.** Harness and raw log at
+`tools/slice6-20260830T182428Z-ec26929f/`, `raw/a1a-conc.raw.log`.
+
+The specialised operator (#987) has no shared connection, so N callers genuinely overlap. That remains
+true - but it was never being compared against DuckDB. It was being compared against a serialisation
+the benchmark built, so the two arms differ by harness rather than by engine.
+
+**What is real underneath.** Concurrency costs *memory*, not throughput: while one query holds the slot
+out, another caller misses the cache and opens its own instance. Unbounded at 32 clients reached
+1,313 MB. `SQL_MAX_CONCURRENCY = 2` is therefore a RAM bound, and revisiting it is tracked separately.
 
 ## 100 segments
 

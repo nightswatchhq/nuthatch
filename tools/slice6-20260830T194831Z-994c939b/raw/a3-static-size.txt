@@ -1,0 +1,1 @@
+/tmp/slice6-20260830T194831Z-994c939b/target-static/release/nuthatch 102449024

@@ -43,9 +43,23 @@ fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// One cached read-only DuckDB (#295). A fresh in-memory instance per query was the rebuild the
-/// issue named: open, lockdown, attach, teardown. The connection is still read-only and still
-/// single-user; queries take the mutex, ingestion never writes here. An interrupt drops the slot
-/// rather than leaving DuckDB half-cancelled for the next caller.
+/// issue named: open, lockdown, attach, teardown. The connection is read-only and single-user, and
+/// ingestion never writes here.
+///
+/// **Concurrent queries do not serialise on this mutex, and this comment used to imply they did.**
+/// The cache mutex is taken twice per query, each time for a map operation: once to `remove()` the
+/// slot and once to put it back. Both guards are statement temporaries that drop at the semicolon,
+/// so the query itself runs unlocked - deliberately, see the note at the `remove()` call site. Two
+/// later pieces of work read the old wording ("queries take the mutex") as "queries serialise on the
+/// mutex" and published that as a *measured engine property*, in #986, in #991 and in RFC-0042's
+/// slice 5 decision input. It was wrong in all three: measured on this path, a held mutex gives
+/// 14.7 qps flat against up to 81.5 qps without one. Corrected under RFC-0042 §14.
+///
+/// What a concurrent caller does hit is the cache *miss* the `remove()` leaves behind: while one
+/// query holds the slot out, another opens its own instance. That is where concurrent RSS comes
+/// from, and it is why `SQL_MAX_CONCURRENCY` is a memory bound rather than a throughput one.
+///
+/// An interrupt drops the slot rather than leaving DuckDB half-cancelled for the next caller.
 struct DuckCache {
     dir: PathBuf,
     sealed_through: u64,
