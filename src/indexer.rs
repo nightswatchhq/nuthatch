@@ -5880,11 +5880,12 @@ mod tests {
     ///
     /// Returns one entry per sealed segment plus the unsealed remainder: together, the observable
     /// output that a differently-tuned operator has to reproduce byte for byte.
-    fn seal_through_windows(
-        rows: &[(u64, String)],
-        last_block: u64,
-        window: u64,
-    ) -> (Vec<(Vec<String>, u64)>, Vec<String>) {
+    /// One sealed segment: its rows, and the block it was cut at.
+    type Segment = (Vec<String>, u64);
+    /// Everything a run produces: the segments, and the unsealed remainder.
+    type SealRun = (Vec<Segment>, Vec<String>);
+
+    fn seal_through_windows(rows: &[(u64, String)], last_block: u64, window: u64) -> SealRun {
         let mut buf: Vec<(u64, String)> = Vec::new();
         let mut segments = Vec::new();
         let mut from = 0u64;
@@ -5927,7 +5928,7 @@ mod tests {
         // knob; 320 is what `nuthatch doctor` recommends for a range-only provider, 163840 is the
         // upper end it measured, and the ugly ones exist so no boundary can be an artefact of a
         // round number.
-        let mut reference: Option<(Vec<(Vec<String>, u64)>, Vec<String>)> = None;
+        let mut reference: Option<SealRun> = None;
         for window in [1u64, 7, 320, 4_999, 163_840] {
             let got = seal_through_windows(&rows, blocks - 1, window);
             match &reference {
