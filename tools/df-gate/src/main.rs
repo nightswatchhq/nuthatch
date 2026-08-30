@@ -36,10 +36,24 @@ async fn main() -> anyhow::Result<()> {
     let seg = dir.path().join(seal::SEGMENTS_DIR);
     std::fs::create_dir_all(&seg)?;
 
-    println!("== RFC-0013 gate: {rows} transfer rows, one sealed segment ==");
+    // **#964: segment count is the variable slice 2 could not see.** Slice 2 measured one segment; a
+    // real nest has 10,923 at a 6.3 KB median. `SEGMENTS=n` splits the same rows across n files, so a
+    // sweep says whether the ratio is a property of the engines or of the layout.
+    let segments: usize = std::env::var("SEGMENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    println!("== RFC-0013 gate: {rows} transfer rows across {segments} sealed segment(s) ==");
     let t = Instant::now();
-    write_fixture(&seg.join("t.parquet"), rows)?;
-    println!("fixture written in {:?} (rss {} MB)", t.elapsed(), rss_mb());
+    let written = write_fixture_segments(&seg, rows, segments)?;
+    println!(
+        "fixture written in {:?} ({} files, rss {} MB)",
+        t.elapsed(),
+        written,
+        rss_mb()
+    );
 
     // **Run order is a confound, not a detail.** Whichever engine goes first pays for warming the OS
     // page cache on the segment, and the second gets it free. The first OBIB run was 3.9x slower than
@@ -84,21 +98,79 @@ async fn main() -> anyhow::Result<()> {
 /// A transfer table shaped exactly like a sealed segment: uint256 values as strings, addresses as
 /// hex. The string-typed value column is the point - that is what forces the i128 cast both engines
 /// have to agree about.
+/// Split `rows` across `segments` Parquet files reproducing the **bimodal** shape #889 measured on
+/// `horizon-nest`: 80% of segments under 20 KB, a 6.3 KB median, and the three largest being the
+/// busiest table's backfill segments.
+///
+/// The distribution is bimodal because the two seal paths are (#947): the backfill path batches at
+/// 20,000 rows cutting on a data-chosen block boundary, while the tip path seals whatever finalised -
+/// a few blocks carrying a few rows. So this puts the bulk of the rows in the last 20% of files and
+/// scatters the remainder thinly across the first 80%.
+///
+/// **Not an even split.** An even split is a different problem and would flatter whichever engine
+/// handles uniform work better, which is exactly the confound this measurement exists to avoid.
+fn write_fixture_segments(
+    seg: &std::path::Path,
+    rows: usize,
+    segments: usize,
+) -> anyhow::Result<usize> {
+    if segments == 1 {
+        write_fixture(&seg.join("t.parquet"), rows)?;
+        return Ok(1);
+    }
+    let small_count = (segments * 4) / 5;
+    let large_count = segments - small_count;
+    // Give the small files ~5% of the rows between them, the large files the rest.
+    let small_total = (rows / 20).min(rows);
+    let per_small = (small_total / small_count.max(1)).max(1);
+    let small_total = per_small * small_count;
+    let per_large = (rows - small_total) / large_count.max(1);
+
+    let mut written = 0usize;
+    let mut emitted = 0usize;
+    for i in 0..segments {
+        let n = if i < small_count { per_small } else { per_large };
+        let n = if i == segments - 1 { rows - emitted } else { n };
+        if n == 0 {
+            continue;
+        }
+        write_fixture_offset(&seg.join(format!("t-{i:06}.parquet")), n, emitted)?;
+        emitted += n;
+        written += 1;
+    }
+    Ok(written)
+}
+
 fn write_fixture(path: &std::path::Path, rows: usize) -> anyhow::Result<()> {
+    write_fixture_offset(path, rows, 0)
+}
+
+/// Rows `offset .. offset + rows` of the same generated table.
+///
+/// The offset is what makes a segment sweep meaningful: the union of any layout is byte-for-byte the
+/// rows a single file of the same total would hold, so **`net_balances` must return an identical
+/// answer at every segment count.** A layout that changes the answer is a defect, not a slower plan,
+/// and the parity check catches it without a separate oracle.
+fn write_fixture_offset(
+    path: &std::path::Path,
+    rows: usize,
+    offset: usize,
+) -> anyhow::Result<()> {
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     let addrs: Vec<String> = (0..512).map(|i| format!("0x{i:040x}")).collect();
-    let from: Vec<&str> = (0..rows).map(|i| addrs[i % 512].as_str()).collect();
-    let to: Vec<&str> = (0..rows).map(|i| addrs[(i * 7 + 3) % 512].as_str()).collect();
+    let idx = |i: usize| i + offset;
+    let from: Vec<&str> = (0..rows).map(|i| addrs[idx(i) % 512].as_str()).collect();
+    let to: Vec<&str> = (0..rows).map(|i| addrs[(idx(i) * 7 + 3) % 512].as_str()).collect();
     // Values large enough that i64 would overflow and i128 would not - the reason HUGEINT is in the
     // query at all. A fixture of small values would let a broken cast pass.
     let value: Vec<String> = (0..rows)
-        .map(|i| format!("{}", 1_000_000_000_000_000_000u128 * (i as u128 % 97 + 1)))
+        .map(|i| format!("{}", 1_000_000_000_000_000_000u128 * (idx(i) as u128 % 97 + 1)))
         .collect();
-    let block: Vec<u64> = (0..rows).map(|i| i as u64 / 100).collect();
+    let block: Vec<u64> = (0..rows).map(|i| idx(i) as u64 / 100).collect();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("block_number", DataType::UInt64, false),
@@ -161,12 +233,11 @@ async fn datafusion_net_balances(
 ) -> anyhow::Result<(Vec<(String, i128)>, u128, u64)> {
     use datafusion::prelude::*;
     let ctx = SessionContext::new();
-    ctx.register_parquet(
-        "t",
-        seg.join("t.parquet").to_str().unwrap(),
-        ParquetReadOptions::default(),
-    )
-    .await?;
+    // The **directory**, not a file: with SEGMENTS>1 there are many, and DuckDB has always globbed
+    // `*.parquet` here. Registering one file would have silently compared all of DuckDB's segments
+    // against one of DataFusion's - a parity failure if we were lucky, a meaningless ratio if not.
+    ctx.register_parquet("t", seg.to_str().unwrap(), ParquetReadOptions::default())
+        .await?;
     // The dialect difference, stated rather than hidden: DataFusion has no HUGEINT. `DECIMAL(38,0)`
     // is the equivalent 128-bit width, and `arrow_cast` is how DataFusion spells a widening cast that
     // yields NULL rather than erroring on overflow.
