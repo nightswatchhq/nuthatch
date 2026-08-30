@@ -60,8 +60,12 @@ fetch one by hand.
 **The Linux binary is dynamically linked and needs two things**, both measured off the published
 artifact with `objdump -T` rather than inferred:
 
-- **glibc 2.35 or newer.** The measured floor is 2.34; 2.35 is what the release is built against, so it
-  is the number to trust.
+- **glibc 2.34 or newer** - the measured ABI floor, read off the published artifact with `objdump -T`.
+  The release is *built* on glibc 2.35, but building on 2.35 does not make 2.35 a runtime
+  requirement: the binary references no symbol newer than `GLIBC_2.34`, and that reference set is
+  what a loader checks. The two numbers answer different questions - **2.34 is what you need to run
+  it, 2.35 is what we compile it on** - and stating the build baseline as the requirement excluded a
+  platform we actually support (#978: the list below names RHEL 9, which ships glibc 2.34).
 - **libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`). This one has a cause worth
   knowing: the binary embeds DuckDB, which is C++, so it links `libstdc++.so.6` alongside `libc`,
   `libm` and `libgcc`.
