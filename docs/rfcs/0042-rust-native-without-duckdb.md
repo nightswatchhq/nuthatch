@@ -53,6 +53,35 @@ Candidates match or beat material workloads within measured baseline noise, not 
 
 Clean debug/release time, incremental rebuild, `target/` growth, final binary and required host packages must not materially regress, and should improve if this succeeds.
 
+### 3a - The outcome is binary: no query-routing hybrid (amended 2026-08-30)
+
+§11 lists "permanent dual production engines" as a risk. Slice 2 turned it into a live temptation, so
+it is promoted here from a risk to be managed into an **acceptance rule**.
+
+Slice 2 measured DataFusion at 0.84x DuckDB at 2 M rows and 2.4-2.6x slower at 8 M and 20 M. A
+crossover is exactly the evidence shape that invites "route small queries to one engine and large ones
+to the other". **That is not an admissible conclusion of this RFC.**
+
+Only two end states are acceptable:
+
+1. **DuckDB stays**, in every role slice 0 inventoried, with the measured regressions of the best Rust
+   candidate recorded against it (§0's explicitly successful outcome).
+2. **DuckDB goes entirely** - Tier 1 - and a Rust-native composition (§5.3) takes all six roles.
+
+DuckDB may survive Tier 1 **only** as a development-time differential oracle, per §2. It does not
+execute a user's query in a shipped binary under any condition, including a fast path for one size
+band.
+
+The reason is not aesthetic. A routing layer means two optimisers, two sets of null/decimal/overflow
+semantics and two cancellation paths behind one `/sql` surface, which puts §3's preservation list -
+exposed null, exact integer/decimal, overflow/refusal, cast behaviour, timeouts, row and byte limits -
+on both engines *and* on the router's choice between them. It also doubles the C++ tail rather than
+removing it, so it fails §1's premise while claiming §2's prize. A per-size split additionally makes
+the engine a function of data volume, so a nest's results and refusals change shape as it grows.
+
+If a candidate wins only in one size band, the finding is "the candidate does not meet the gate", and
+the honest write-up says so with the band named. It is not a reason to ship both.
+
 ## §4 - Slice zero: establish current truth
 
 Build a native bill of materials from build logs, objects and link maps for every release target. Record every build-script crate; C/C++ compiler or assembler invocation; static and dynamic library; native language; entry reason/feature; production/dev/target-only classification; attributable clean-build time; and output size. DuckDB, zstd, ring, mimalloc and Wasmtime are leads, not a limiting list.
