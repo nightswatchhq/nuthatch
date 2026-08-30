@@ -86,7 +86,7 @@ fn every_gate_audit_case_still_has_a_target() {
     );
     let extra: Vec<&String> = live
         .iter()
-        .filter(|l| !expected.iter().any(|e| *e == l.as_str()))
+        .filter(|l| !expected.contains(&l.as_str()))
         .collect();
     assert!(
         extra.is_empty(),
