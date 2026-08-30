@@ -294,9 +294,19 @@ fn rust_net_balances(seg: &std::path::Path) -> anyhow::Result<(Vec<(String, i128
                     let Ok(d) = value.value(i).parse::<i128>() else {
                         continue;
                     };
-                    for (addr, signed) in [(to.value(i), d), (from.value(i), -d)] {
+                    // **Checked arithmetic, matching DuckDB** (#998). `HUGEINT` overflow is an error
+                    // there - `Out of Range Error: Overflow in addition of INT128` - not a wrap and
+                    // not a panic. Plain `-d` overflows on `i128::MIN`, and plain `+=` wraps silently
+                    // in release, so the parity claim was never established at the numeric boundary:
+                    // the fixture's largest value is ~1e20, nowhere near `i128::MAX`.
+                    let debit = d.checked_neg().ok_or_else(|| {
+                        anyhow::anyhow!("Overflow in negation of INT128 ({d}) - i128::MIN has no positive")
+                    })?;
+                    for (addr, signed) in [(to.value(i), d), (from.value(i), debit)] {
                         if let Some(v) = acc.get_mut(addr) {
-                            *v += signed;
+                            *v = v.checked_add(signed).ok_or_else(|| {
+                                anyhow::anyhow!("Overflow in addition of INT128 ({v} + {signed}) for {addr}")
+                            })?;
                         } else {
                             acc.insert(addr.to_string(), signed);
                         }
@@ -307,10 +317,15 @@ fn rust_net_balances(seg: &std::path::Path) -> anyhow::Result<(Vec<(String, i128
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    // The merge overflows for the same reason a local accumulation does - two partials each within
+    // range can sum out of it - so it is checked too (#998).
     let mut acc: FxHashMap<String, i128> = FxHashMap::default();
     for part in partials {
         for (k, v) in part {
-            *acc.entry(k).or_insert(0) += v;
+            let slot = acc.entry(k.clone()).or_insert(0);
+            *slot = slot.checked_add(v).ok_or_else(|| {
+                anyhow::anyhow!("Overflow in addition of INT128 merging partials for {k}")
+            })?;
         }
     }
 
@@ -509,4 +524,38 @@ async fn datafusion_net_balances(
         }
     }
     Ok((out, ms, rss_mb()))
+}
+
+#[cfg(test)]
+mod overflow_semantics {
+    //! #998. The operator claims parity with a `SUM(TRY_CAST(value AS HUGEINT))`, and DuckDB **errors**
+    //! on `HUGEINT` overflow rather than wrapping. These pin the boundary the 24-configuration parity
+    //! sweep could not reach - its largest value is ~1e20 against an `i128::MAX` of ~1.7e38.
+
+    /// `i128::MIN` has no positive counterpart, so negating a debit of that value must refuse.
+    #[test]
+    fn negating_the_minimum_is_refused_not_wrapped() {
+        assert!(i128::MIN.checked_neg().is_none());
+        assert_eq!(i128::MIN.wrapping_neg(), i128::MIN, "wrapping would return the same value");
+    }
+
+    /// Two in-range credits to one address can leave the range. Wrapping turns a huge positive
+    /// balance into a huge negative one - a wrong answer that looks like a real balance.
+    #[test]
+    fn a_sum_past_the_maximum_is_refused_not_wrapped() {
+        let half = i128::MAX / 2 + 1;
+        assert!(half.checked_add(half).is_none());
+        assert!(
+            half.wrapping_add(half) < 0,
+            "wrapping flips the sign, which is why it must not be the behaviour"
+        );
+    }
+
+    /// And the merge of two per-row-group partials has the same exposure as a single accumulation.
+    #[test]
+    fn merging_partials_can_overflow_when_neither_partial_does() {
+        let a = i128::MAX - 1;
+        let b = 2i128;
+        assert!(a.checked_add(b).is_none(), "neither partial is out of range; their sum is");
+    }
 }
