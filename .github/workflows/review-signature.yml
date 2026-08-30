@@ -121,7 +121,7 @@ jobs:
       # own edited roster - the same trust boundary this file itself already sits inside, since a
       # PR can equally edit this workflow. persist-credentials is off; nothing here pushes.
       - name: check out the roster file
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: |
