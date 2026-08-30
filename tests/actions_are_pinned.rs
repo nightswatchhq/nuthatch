@@ -51,10 +51,40 @@ fn every_uses() -> Vec<(String, usize, String)> {
 }
 
 /// A local composite action (`./.github/actions/foo`) is this repository's own code and carries no
-/// third-party trust; a `docker://` reference is pinned by digest elsewhere. Everything else is
-/// somebody else's code running with our credentials.
+/// third-party trust. Everything else is somebody else's code running with our credentials.
+///
+/// # #973: `docker://` used to be excluded here, on a claim with nothing behind it
+///
+/// The old comment said *"a `docker://` reference is pinned by digest elsewhere"*. There was no
+/// elsewhere. No workflow used one, so the exclusion protected nothing, was verified by nothing, and
+/// the first `uses: docker://image:latest` anyone added would have run mutable third-party code with
+/// workflow credentials and passed this gate green.
+///
+/// A container image reference is third-party trust in exactly the way an action reference is - more
+/// so, since it is an entire root filesystem rather than a script - so it is no longer excluded. It
+/// is pinned by its own rule below, because the syntax differs: an action pins with `@<40-hex sha>`,
+/// an image pins with `@sha256:<64-hex digest>`.
 fn is_third_party(reference: &str) -> bool {
-    !reference.starts_with('.') && !reference.starts_with("docker://")
+    !reference.starts_with('.')
+}
+
+/// Is this a container image reference rather than an action reference?
+fn is_docker(reference: &str) -> bool {
+    reference.starts_with("docker://")
+}
+
+/// A `docker://` reference is immutable only when it names a digest: `docker://img@sha256:<64 hex>`.
+///
+/// A tag - `:latest`, `:v1`, or no tag at all - is a mutable pointer the publisher can repoint at
+/// any time, which is the whole reason actions are pinned to a sha rather than a tag.
+fn pinned_digest(reference: &str) -> Option<&str> {
+    let after = reference
+        .split('#')
+        .next()?
+        .trim()
+        .rsplit_once("@sha256:")?
+        .1;
+    (after.len() == 64 && after.chars().all(|c| c.is_ascii_hexdigit())).then_some(after)
 }
 
 fn pinned_sha(reference: &str) -> Option<&str> {
@@ -82,7 +112,15 @@ fn every_third_party_action_is_pinned_to_a_commit_sha() {
 
     let unpinned: Vec<String> = third_party
         .iter()
-        .filter(|(_, _, r)| pinned_sha(r).is_none())
+        .filter(|(_, _, r)| {
+            // #973: two syntaxes, two pins. An action pins with `@<40-hex sha>`; a container image
+            // pins with `@sha256:<64-hex digest>`. Neither is satisfied by a tag.
+            if is_docker(r) {
+                pinned_digest(r).is_none()
+            } else {
+                pinned_sha(r).is_none()
+            }
+        })
         .map(|(f, n, r)| format!("  {f}:{n}  {r}"))
         .collect();
 
@@ -104,7 +142,7 @@ fn every_third_party_action_is_pinned_to_a_commit_sha() {
 fn every_pin_records_the_version_it_pins() {
     let missing: Vec<String> = every_uses()
         .into_iter()
-        .filter(|(_, _, r)| is_third_party(r) && pinned_sha(r).is_some())
+        .filter(|(_, _, r)| is_third_party(r) && !is_docker(r) && pinned_sha(r).is_some())
         .filter(|(_, _, r)| !r.contains('#'))
         .map(|(f, n, r)| format!("  {f}:{n}  {r}"))
         .collect();
@@ -182,5 +220,79 @@ fn the_two_rust_toolchain_pins_stay_distinct() {
         by_comment.len(),
         "two rust-toolchain comments share a SHA, so two different toolchains resolve to the same \
          action branch - one of them is not the compiler its comment claims (#928):\n{by_comment:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #973 regression controls.
+//
+// The workflows use no `docker://` reference today, which is exactly why the old exclusion was
+// invisible: it protected nothing, was checked by nothing, and would have admitted the first one
+// anybody added. A gate for a case that does not occur yet can only be proven on synthetic input.
+// ---------------------------------------------------------------------------------------------
+
+/// The classifier and both pin rules, driven directly. Returns `true` if the reference would be
+/// reported as unpinned by `every_third_party_action_is_pinned_to_a_commit_sha`.
+fn would_be_reported(reference: &str) -> bool {
+    if !is_third_party(reference) {
+        return false;
+    }
+    if is_docker(reference) {
+        pinned_digest(reference).is_none()
+    } else {
+        pinned_sha(reference).is_none()
+    }
+}
+
+#[test]
+fn a_mutable_docker_reference_is_refused() {
+    for r in [
+        "docker://alpine:latest",
+        "docker://alpine",
+        "docker://alpine:3.20",
+        "docker://ghcr.io/owner/image:v1 # v1",
+        // A 40-hex sha is an *action* pin and means nothing to a registry: images are addressed by
+        // a 64-hex sha256 digest, so this must not be accepted by the action rule leaking across.
+        "docker://alpine@0123456789012345678901234567890123456789",
+        // Right prefix, wrong length.
+        "docker://alpine@sha256:0123456789abcdef",
+    ] {
+        assert!(
+            would_be_reported(r),
+            "`{r}` is a mutable or wrongly-pinned image reference and must be refused. Before #973 \
+             every one of these passed, because `docker://` was excluded from the gate on the claim \
+             that it was \"pinned by digest elsewhere\" - and there was no elsewhere."
+        );
+    }
+}
+
+#[test]
+fn a_digest_pinned_docker_reference_is_accepted() {
+    let digest = "a".repeat(64);
+    for r in [
+        format!("docker://alpine@sha256:{digest}"),
+        format!("docker://ghcr.io/owner/image@sha256:{digest} # 3.20"),
+    ] {
+        assert!(
+            !would_be_reported(&r),
+            "`{r}` names an immutable digest and must be accepted, or the gate is unsatisfiable and \
+             will simply be switched off by whoever needs a container step"
+        );
+    }
+}
+
+#[test]
+fn a_local_action_is_still_exempt_and_an_action_still_needs_its_sha() {
+    assert!(
+        !would_be_reported("./.github/actions/setup"),
+        "a local composite action is this repository's own code"
+    );
+    assert!(
+        would_be_reported("actions/checkout@v4"),
+        "the original rule must still hold - a tag is not a pin"
+    );
+    assert!(
+        !would_be_reported("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4"),
+        "a 40-hex commit sha is the action pin and must still be accepted"
     );
 }
