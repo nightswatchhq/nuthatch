@@ -43,6 +43,21 @@ That is the reason the large-size ratio is unchanged: a year of both projects' w
 ahead. **RFC-0013's core finding survives** - the gap widens with size, and at the sizes it measured,
 DataFusion is still ~2.6x slower.
 
+## Superseded in part by #964 (2026-08-30)
+
+> **The "DataFusion now wins at 2 M" finding below is an artefact of this fixture being one segment.**
+>
+> #964 re-ran the same gate across a sweep of segment counts on a realistic bimodal layout. The 2 M
+> crossover reproduces on other hardware and more strongly (0.54x), and then **inverts to 2.76x slower
+> at 10,000 segments** - the layout a real nest actually has. At a realistic segment count DataFusion
+> is 2.5-2.9x slower at *every* size measured.
+>
+> The limitation section at the end of this document called this out before the measurement was taken;
+> it turned out to be the finding rather than a caveat. Everything else here stands: the 8 M and 20 M
+> ratios, the parity, and the observation that both engines got ~2.2x faster since 2026-08-02.
+>
+> See `rfc-0042-964-segment-sweep.md`.
+
 ## What is genuinely new
 
 **At 2 M rows DataFusion now wins**, where it lost by 1.85x. The crossover sits somewhere between 2 M
