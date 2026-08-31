@@ -126,12 +126,28 @@ result, and score 3/3 by **discovering this repository** rather than by knowing 
 Changing a working directory is not isolation, and the failure is silent and flattering, which is the
 worst combination available. So the refusal is the default and there is no override.
 
+**It is a template, not a prefix.** `{workdir}` and `{rpc_port}` are substituted per run. The first
+interface took a fixed prefix supplied *before* the runner had created any workdir, so it pointed at
+a directory that did not exist: the probe could not read its own control file and a container that
+did start could reach neither the ABI nor the loopback RPC. Every keyed run would have been rejected
+or unable to author anything - a required interface that could never be used. **The workdir must be
+mounted at the same absolute path**, since the subject is handed host paths for the ABI and nest.
+
+```sh
+--sandbox 'docker run --rm --network host -v {workdir}:{workdir} -w {workdir} <image>'
+```
+
 **And the sandbox is verified, not believed.** Requiring the flag to be non-empty was still operator
 honesty with extra steps: `--sandbox env` satisfies it while handing the subject the entire
 filesystem. Before any run, the runner probes *through the operator's own prefix*, two-sided -
-it must be able to read a file in the subject's working directory, and it must **not** be able to
-read `eval/authoring.toml`. Only both together mean confined. A probe that simply fails would
-otherwise read as isolation, which is how this class of check usually goes wrong.
+it must be able to read a file in the subject's workdir at its host path, it must **not** be able to
+read this repository, and it must reach the fixture RPC on loopback. Only all three mean confined. A
+probe that simply fails would otherwise read as isolation, which is how this class of check usually
+goes wrong.
+
+The repository leg is probed at **several** paths, not one: `tests/authoring_eval_board.rs` carries
+the same fixture values, the expected total and the canned query verbatim, so a sandbox that hides
+`eval/authoring.toml` alone gives away exactly as much and is refused.
 
 ### Scoring does not depend on what the agent names things
 

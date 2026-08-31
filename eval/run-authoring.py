@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import signal
+import shlex
 import shutil
 import socket
 import subprocess
@@ -147,7 +148,7 @@ def wait_for(what: str, seconds: float, probe):
     return None
 
 
-def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str]:
+def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str, int]:
     port = free_port()
     proc = subprocess.Popen(
         [sys.executable, str(ROOT / "scripts/fixture_rpc.py"),
@@ -160,56 +161,100 @@ def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str]:
         die("the fixture chain never came up; nothing can be scored")
     post(f"{base}/control/tip", {"number": scenario["tip"]})
     post(f"{base}/control/finalized", {"number": scenario["finalized"]})
-    return proc, f"{base}/"
+    return proc, f"{base}/", port
 
 
 # --- the subject ---------------------------------------------------------------------------------
-def verify_sandbox(sandbox) -> None:
-    """Prove the sandbox actually isolates, by trying to read the answer key through it.
+def sandbox_argv(template: str, workdir: Path, rpc_port: int) -> list[str]:
+    """Build the sandbox command for *this* run's workdir and RPC port.
 
-    Requiring `--sandbox` to be non-empty is not enforcement - review of #1050 pointed out that
-    `--sandbox env` or `--sandbox nice` satisfies it while giving the subject the runner's entire
-    filesystem, `eval/authoring.toml` included. The claimed boundary then rests on operator honesty,
-    which is exactly what a mechanical score is supposed to replace.
+    A **template**, not a fixed prefix. Review of #1050 found the previous interface unusable rather
+    than merely weak: the operator supplied a static `docker run -v "$WORKDIR:/w"` before the runner
+    had created any workdir, so the prefix pointed at a directory that did not exist, the probe
+    could not read its own control file, and a container that did start could reach neither the ABI
+    nor the loopback RPC. Every keyed run would have been rejected or unable to author anything.
 
-    So the property is *tested* rather than declared, with the operator's own prefix, against the
-    file that would give the game away. Two-sided, because a probe that fails for an unrelated
-    reason would otherwise read as isolation:
+    `{workdir}` and `{rpc_port}` are substituted here, so the confinement is expressed against the
+    real directory and port. **The workdir must be mounted at the same absolute path**, because the
+    subject is handed host paths for the ABI and the nest and they have to remain valid inside; the
+    probe below proves that rather than trusting it.
+    """
+    return shlex.split(template.format(workdir=workdir, rpc_port=rpc_port))
 
-      1. the probe mechanism must work at all - it can read a file the subject is *meant* to have;
-      2. and it must **not** be able to read `eval/authoring.toml`.
 
-    Only (1) passing and (2) failing means confined.
+def verify_sandbox(template: str, rpc_port: int) -> None:
+    """Prove the sandbox confines, by probing it - positively and negatively.
+
+    Requiring `--sandbox` to be non-empty was not enforcement: `--sandbox env` satisfied it while
+    handing the subject the whole filesystem, so the boundary rested on operator honesty, which is
+    what a mechanical score exists to replace.
+
+    Three things must hold together, and any one alone is worthless:
+
+      1. the sandbox can read a file in the subject's workdir **at its host path** - otherwise the
+         ABI and nest paths the subject is given are meaningless inside it;
+      2. it cannot read this repository - probed at several paths, not one. The answer is not only
+         in `eval/authoring.toml`: `tests/authoring_eval_board.rs` carries the same fixture values,
+         the expected total, and the canned query verbatim, so hiding one file proves nothing;
+      3. it can reach the fixture RPC on loopback, or the subject cannot index at all.
     """
     with tempfile.TemporaryDirectory(prefix="nuthatch-sandbox-check-") as tmp:
-        allowed = Path(tmp) / "allowed"
-        allowed.write_text("readable")
+        workdir = Path(tmp)
+        (workdir / "allowed").write_text("readable")
+        argv = sandbox_argv(template, workdir, rpc_port)
 
-        def read(path) -> tuple[int, str]:
+        def run(script: str) -> tuple[int, str]:
             try:
-                out = subprocess.run([*sandbox, "sh", "-c", f"cat {path}"], cwd=tmp,
-                                     capture_output=True, text=True, timeout=120)
+                out = subprocess.run([*argv, "sh", "-c", script], cwd=workdir,
+                                     capture_output=True, text=True, timeout=180)
                 return out.returncode, out.stdout
             except Exception as error:
                 return 1, f"<{type(error).__name__}: {error}>"
 
-        code, body = read(allowed.name)
+        code, body = run(f"cat {workdir / 'allowed'}")
         if code != 0 or "readable" not in body:
             die(
-                f"the sandbox cannot read a file in the subject's own working directory "
-                f"({allowed.name}). It is not usable, and a probe that fails for its own reasons "
-                f"would otherwise be mistaken for isolation.\n  got: {body.strip()[:200]}"
+                f"the sandbox cannot read {workdir / 'allowed'} - the subject's own workdir, at its\n"
+                "host path. The ABI and nest paths handed to the subject would be meaningless inside\n"
+                "it, so it could not author anything. Mount the workdir at the SAME absolute path,\n"
+                f"e.g. --sandbox 'docker run --rm -v {{workdir}}:{{workdir}} -w {{workdir}} ...'\n"
+                f"  got: {body.strip()[:200]}"
             )
 
-        code, body = read(SCENARIO)
+        # (2) The repository, probed broadly. Any one of these is enough to score 3/3 by reading.
+        leaks = []
+        for path in (SCENARIO, ROOT / "tests/authoring_eval_board.rs", ROOT / "eval/run-authoring.py",
+                     ROOT / "eval/questions.toml"):
+            code, body = run(f"cat {path}")
+            if code == 0 and body.strip():
+                leaks.append(str(path))
+        code, body = run(f"ls {ROOT}")
         if code == 0 and body.strip():
+            leaks.append(f"{ROOT} (listable)")
+        if leaks:
             die(
-                f"the sandbox does not isolate: the subject can read {SCENARIO}, which carries the\n"
-                "expected result. An agent that finds it scores 3/3 without building anything, and\n"
-                "the report would record the run as sandboxed.\n"
+                "the sandbox does not isolate this repository. The subject can read:\n  "
+                + "\n  ".join(leaks)
+                + "\n\nEach of these gives away the answer - the scenario file carries the expected\n"
+                "result, and the board test carries the same fixture values, the expected total and\n"
+                "the canned query verbatim. An agent that finds any one scores 3/3 without building\n"
+                "a nest, and the report records the run as sandboxed.\n"
                 "\n"
-                "A command prefix that merely execs (`env`, `nice`) is not a sandbox. Use one that\n"
-                "confines the filesystem - a container, `bwrap --ro-bind`, `sandbox-exec -f`."
+                "A prefix that merely execs (`env`, `nice`) is not a sandbox. Use one that confines\n"
+                "the filesystem - a container, `bwrap --ro-bind`, `sandbox-exec -f`."
+            )
+
+        # (3) Loopback must reach the fixture chain, or nothing can be indexed from inside.
+        code, body = run(
+            f"sh -c 'command -v curl >/dev/null && curl -fsS -m 5 "
+            f"http://127.0.0.1:{rpc_port}/control/state || echo NOCURL'"
+        )
+        if "NOCURL" not in body and (code != 0 or not body.strip()):
+            die(
+                f"the sandbox cannot reach the fixture RPC on 127.0.0.1:{rpc_port}. The subject\n"
+                "would be unable to index, and every run would fail criteria 2 and 3 for a reason\n"
+                "that has nothing to do with the agent. Give the sandbox host loopback, e.g.\n"
+                "  --sandbox 'docker run --rm --network host -v {workdir}:{workdir} -w {workdir} ...'"
             )
 
 
@@ -254,7 +299,7 @@ def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
         pass
 
 
-def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
+def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_port: int, args):
     """One agent with the builder skill and a shell, and nothing else it is not given.
 
     It receives the task statement and the paths. It must **not** be able to reach the criteria, the
@@ -278,7 +323,7 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
         die(f"the builder skill is not at {skill}; there is nothing to evaluate")
     shutil.copytree(skill, workdir / ".claude" / "skills" / "nuthatch-builder")
 
-    command = list(args.sandbox) + [
+    command = sandbox_argv(args.sandbox, workdir, rpc_port) + [
         args.claude, "-p", "--model", args.model, "--no-session-persistence",
         "--output-format", "stream-json", "--verbose",
         "--max-budget-usd", str(args.max_budget_usd),
@@ -401,7 +446,7 @@ def resolve_table(api: str):
 
 
 def one_run(scenario, args):
-    chain, rpc = start_fixture_chain(scenario)
+    chain, rpc, rpc_port = start_fixture_chain(scenario)
     dev = None
     try:
         with tempfile.TemporaryDirectory(prefix="nuthatch-authoring-") as tmp:
@@ -411,7 +456,7 @@ def one_run(scenario, args):
             nest = work / "nest"
 
             unservable = None
-            model, completed = subject_run(scenario, work, rpc, abi, nest, args)
+            model, completed = subject_run(scenario, work, rpc, abi, nest, rpc_port, args)
             if completed.returncode != 0:
                 print(f"  subject exited {completed.returncode}: "
                       f"{completed.stderr.strip()[:200]}", file=sys.stderr)
@@ -564,7 +609,7 @@ def self_test() -> int:
     # satisfied the old non-empty check while handing the subject the whole filesystem. The property
     # is tested against the operator's own prefix, with the file that would give the game away.
     try:
-        verify_sandbox(["env"])
+        verify_sandbox("env", 9)
         check("a pass-through prefix is rejected as a sandbox", False, "accepted `env`")
     except SystemExit as exit_:
         check("a pass-through prefix is rejected as a sandbox",
@@ -572,12 +617,59 @@ def self_test() -> int:
 
     # ...and the probe must be two-sided, or a sandbox that cannot run at all reads as isolation.
     try:
-        verify_sandbox(["false"])
+        verify_sandbox("false", 9)
         check("an unusable sandbox is rejected, not mistaken for isolation", False, "accepted it")
     except SystemExit as exit_:
         check("an unusable sandbox is rejected, not mistaken for isolation",
-              "cannot read a file in the subject's own working directory" in str(exit_),
+              "the subject's own workdir" in str(exit_),
               f"refused for the wrong reason: {exit_}")
+
+    # A sandbox that hides the *answer key* but exposes the rest of the repository must still be
+    # refused. Review of #1050: `tests/authoring_eval_board.rs` carries the same fixture values, the
+    # expected total 3600 and the canned query verbatim, so blocking `authoring.toml` alone gives
+    # away exactly as much. Probing one path is not evidence of the boundary.
+    with tempfile.TemporaryDirectory(prefix="nuthatch-leakbox-") as tmp:
+        gate = Path(tmp) / "leaky.sh"
+        gate.write_text(
+            "#!/bin/sh\n"
+            "# Hides the scenario file and nothing else - the partial sandbox that must not pass.\n"
+            "case \"$*\" in *authoring.toml*) exit 13 ;; esac\n"
+            "exec \"$@\"\n"
+        )
+        gate.chmod(0o755)
+        try:
+            verify_sandbox(f"{gate} ", 9)
+            check("hiding only the answer key is not isolation", False, "accepted a partial sandbox")
+        except SystemExit as exit_:
+            check("hiding only the answer key is not isolation",
+                  "does not isolate this repository" in str(exit_),
+                  f"refused for another reason: {str(exit_)[:160]}")
+
+    # **The positive case.** Everything above proves the runner rejects things; none of it proves a
+    # genuine sandbox is *accepted*, and a `verify_sandbox` that refused everything would satisfy
+    # the lot while making the eval unrunnable. Review of #1050 found exactly that class of defect -
+    # a required interface that could never actually be used - so the acceptance path gets a test.
+    #
+    # A real confinement is stood up here with the tools that exist everywhere: a `chroot`-free
+    # approximation using `env -i` plus a wrapper that refuses paths outside the workdir. It is not
+    # the sandbox an operator should use; it is enough to prove the *contract* is satisfiable.
+    with tempfile.TemporaryDirectory(prefix="nuthatch-fakebox-") as tmp:
+        gate = Path(tmp) / "gate.sh"
+        gate.write_text(
+            "#!/bin/sh\n"
+            "# Confine by refusing any command mentioning the repository root.\n"
+            f"case \"$*\" in *{ROOT}*) exit 13 ;; esac\n"
+            "exec \"$@\"\n"
+        )
+        gate.chmod(0o755)
+        try:
+            verify_sandbox(f"{gate} ", 9)
+            check("a confining sandbox is accepted", True)
+        except SystemExit as exit_:
+            # Loopback is unreachable at port 9, which this stub cannot help; that specific refusal
+            # is the RPC leg and not a rejection of the confinement itself.
+            check("a confining sandbox is accepted", "cannot reach the fixture RPC" in str(exit_),
+                  f"rejected a confining sandbox: {str(exit_)[:200]}")
 
     # The eval's integrity property: a run must be impossible without isolation. Review of #1050
     # found the subject boundary asserted in a docstring and enforced nowhere - the agent could read
@@ -667,11 +759,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument(
-        "--sandbox", nargs=argparse.REMAINDER, default=None,
-        help="REQUIRED. Command prefix that confines the subject to `workdir` - e.g. a container "
-             "runner, `sandbox-exec -f <profile>`, or `bwrap --ro-bind ...`. The subject must not be "
-             "able to read this repository: `eval/authoring.toml` carries the expected result, and "
-             "an agent that finds it scores 3/3 without building anything. Recorded in the report.",
+        "--sandbox", default=None,
+        help="REQUIRED. A command TEMPLATE that confines the subject, with {workdir} and "
+             "{rpc_port} substituted per run - e.g. \"docker run --rm --network host "
+             "-v {workdir}:{workdir} -w {workdir} <image>\". The workdir must be mounted at the "
+             "SAME absolute path, because the subject is handed host paths for the ABI and nest. "
+             "Verified before every run, not taken on trust. Recorded in the report.",
     )
     ap.add_argument("--nuthatch", type=Path, default=ROOT / "target/release/nuthatch")
     ap.add_argument("--claude", default="claude")
@@ -687,8 +780,6 @@ def main():
 
     if args.runs < 3:
         die("refusing to publish fewer than three runs")
-    if args.sandbox:
-        verify_sandbox(args.sandbox)
     if not args.sandbox:
         die(
             "--sandbox is required. Without it the subject can read eval/authoring.toml, take the\n"
@@ -702,6 +793,14 @@ def main():
         die(f"{args.nuthatch} is not there; build it first")
 
     scenario = tomllib.load(open(SCENARIO, "rb"))
+    # Verified against a live fixture chain, because loopback reachability is part of the property.
+    probe_chain, _, probe_port = start_fixture_chain(scenario)
+    try:
+        verify_sandbox(args.sandbox, probe_port)
+    finally:
+        probe_chain.kill()
+        probe_chain.wait()
+
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                             capture_output=True, text=True).stdout.strip()
 
