@@ -96,21 +96,35 @@ fn row_compact(i: u64) -> Vec<u8> {
         }
         out.push(n as u8);
     }
+    // The same values `row_json` writes, not zeros. The first version filled the fixed-width tail
+    // with zero bytes while the JSON row carried values derived from `i`, so the two encodings did
+    // not represent the same row and nothing in the harness noticed. `decoders_agree` below is what
+    // stops that recurring.
+    fn word32(n: u128) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[16..].copy_from_slice(&n.to_be_bytes());
+        w
+    }
+    fn addr20(n: u64) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[12..].copy_from_slice(&n.to_be_bytes());
+        a
+    }
     let mut b = Vec::with_capacity(160);
     b.extend_from_slice(&[0u8, 1]); // table id, from a per-store dictionary
     varint(&mut b, 60_000_000 + i); // block_number
     varint(&mut b, 1_700_000_000 + i); // block_timestamp
     varint(&mut b, i % 8); // log_index
-    b.extend_from_slice(&[0u8; 32]); // block_hash
-    b.extend_from_slice(&[0u8; 32]); // tx_hash
-    b.extend_from_slice(&[0u8; 20]); // address
-    b.extend_from_slice(&[0u8; 20]); // from
-    b.extend_from_slice(&[0u8; 20]); // to
-    b.extend_from_slice(&[0u8; 32]); // value, as the word
+    b.extend_from_slice(&word32(i as u128)); // block_hash
+    b.extend_from_slice(&word32(i.wrapping_mul(7) as u128)); // tx_hash
+    b.extend_from_slice(&addr20(0xa0b8)); // address
+    b.extend_from_slice(&addr20(i % 5_000)); // from
+    b.extend_from_slice(&addr20((i * 3) % 5_000)); // to
+    b.extend_from_slice(&word32(1_000_000_000_000_000_000u128 + i as u128)); // value
     b.push(0); // value_overflow
-               // `value_dec` is not stored: it is the same number, and the duplicate is schema
-               // redundancy rather than encoding. The decision document excludes it from every
-               // figure for exactly this reason, so it is excluded here too.
+               // `value_dec` is not stored: it is the same number, and the duplicate is schema redundancy
+               // rather than encoding. The decision document excludes it from every figure for exactly this
+               // reason, so it is excluded here too.
     b
 }
 
@@ -368,6 +382,8 @@ fn compact_rows_rss() {
         build_store(&compact_path, n, true)
     };
 
+    std::fs::write(&stamp_path, &stamp).expect("stamp");
+
     println!(
         "\nfile: json {:.2} GB ({:.0} B/row), compact {:.2} GB ({:.0} B/row), ratio {:.2}x",
         json_len as f64 / 1e9,
@@ -442,4 +458,27 @@ fn compact_rows_rss() {
             field("point_us="),
         );
     }
+}
+
+/// The two encodings must represent the **same row**, or the latency comparison above is between two
+/// different pieces of work and means nothing.
+///
+/// This is the check whose absence review found twice: the first pass compared a full JSON parse
+/// against a partial compact read, and the second still wrote zero bytes into every fixed-width
+/// field of the compact row while the JSON row carried real values. Both were invisible because
+/// nothing ever compared the two decoders' output. Now something does, and it is a **normal test**
+/// rather than an ignored one, so it runs in CI where the measurement itself does not.
+#[test]
+fn the_two_encodings_decode_to_the_same_row() {
+    for i in [0u64, 1, 7, 127, 128, 5_000, 999_999, 1_599_999] {
+        let j = decode_one(row_json(i).as_bytes(), false);
+        let c = decode_one(&row_compact(i), true);
+        assert_eq!(j, c, "row {i}: json decoded to {j:#x}, compact to {c:#x}");
+    }
+
+    // And it must be able to tell rows apart - an encoder that returned a constant would satisfy the
+    // loop above without encoding anything at all.
+    let distinct: std::collections::HashSet<u64> =
+        (0..64).map(|i| decode_one(&row_compact(i), true)).collect();
+    assert_eq!(distinct.len(), 64, "compact decode is not row-dependent");
 }
