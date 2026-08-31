@@ -55,6 +55,86 @@ So the honest form is:
 The size argument is settled. The RSS argument is not, and this project has published enough
 asserted numbers this month.
 
+## The prototype was built, and it settles it the other way
+
+**Measured 2026-08-31, `tests/bench_compact_rows.rs`.** Two redb stores, 1,600,000 identical
+synthetic rows each - one holding today's JSON strings, one holding the compact encoding modelled
+above - written in 5,000-row windows as `commit_window` writes them. Each configuration is then read
+back **in its own process**, because `VmRSS` is process-wide and that is exactly the correction
+review made to the section above. Full scan to fill the cache, then 50,000 random point reads that
+actually decode the row.
+
+First, the file. The 2.45x is a *payload* ratio and the file does not inherit it:
+
+| | file | per row | ratio |
+| --- | ---: | ---: | ---: |
+| JSON | 2.16 GB | 1,348 B | |
+| compact | 1.08 GB | 674 B | **2.00x** |
+
+redb's per-row overhead is unchanged by the encoding, so a 3.1x payload cut is a 2.00x file cut.
+
+Then the thing the whole issue rests on. **RSS does not track the file. It tracks redb's cache
+setting, which nuthatch has never set:**
+
+| cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
+| --- | ---: | ---: | ---: | ---: |
+| 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.0 us | 1.1 us |
+| 512 MiB | **0.64 GB** | **0.64 GB** | 3.4 us | 1.5 us |
+| 256 MiB | **0.33 GB** | **0.33 GB** | 3.8 us | 2.0 us |
+| 128 MiB | **0.17 GB** | **0.17 GB** | 3.7 us | 2.2 us |
+
+**At every cache size smaller than both files, the two encodings land on identical RSS** - 0.64
+against 0.64, 0.33 against 0.33, 0.17 against 0.17 - across a 2.00x difference in file size. The
+encoding is not what is buying the memory. The cache size is, and it is the same lever in both
+columns.
+
+`Builder::new()` calls `set_cache_size(1 GiB)` (split 90% read / 10% write) and `store.rs` never
+overrides it at any of its three open sites. redb 2.6.3 does not mmap - `file_backend/unix.rs`
+preads into `Vec<u8>` - so every cached page is heap and counts in RSS. That 1 GiB is a real
+per-process heap ceiling that nobody chose.
+
+It also explains the production table above better than the fit that was withdrawn from it. Both
+large nests sit just over the ceiling and read 1.44 and 1.42 GB, and the **larger** store (1.14 GB)
+has the **smaller** RSS - which `RSS = k x file` cannot produce and a ceiling can.
+
+### So the recommendation changes
+
+The table below gains a fifth row that was missing because nobody knew the cache was a default:
+
+| option | cost | RSS saving, measured |
+| --- | --- | --- |
+| **Set redb's cache size** | one argument at three call sites | 1.28 -> 0.33 GB in the harness; ~950 MB/cursor |
+| Compact encoding | a storage format, a migration, and part of RFC-0020 | **nothing, once the cache is set** |
+
+The memory case for #296 is answered, and the answer is no: the saving it was justified by is
+already available, is larger, costs no format change, spends no part of the no-resync promise, and
+is one line. Per the sprint's own constraint - *do not trade away the no-resync promise by
+implication* - there is now nothing to trade it for.
+
+**What the encoding does own, and it is real:** point-read decode is **2.7x faster** (3.0 -> 1.1 us
+at 1 GiB, 3.8 -> 2.0 us at 256 MiB - a consistent ~1.7 us saved per read). That is a latency result,
+not a memory one. #296 asked for memory. If the decode win is worth wanting it should be argued on
+its own terms, against the cost of a migration, and it is a much weaker case than the one this
+document set out to make.
+
+Note the second column of that table for the cache option: a smaller cache costs **0.8 us** per
+point read (3.0 -> 3.8 us) for **950 MB**. And because the budget is per *cursor*, an unset cache
+means N cursors reserve N GiB - so this is worth more to multi-nest density than the encoding ever
+was.
+
+### What this measurement does not establish
+
+- **The latency figures are optimistic about disk.** Both boxes had the store in the OS page cache,
+  so a redb cache miss cost a memcpy, not a read. Under real memory pressure a 256 MiB cache would
+  fault to disk and the 3.8 us would be worse. Pulling the cache lever needs a production
+  measurement before a value is picked, and 256 MiB should not be assumed to be it.
+- **The point-read workload is uniformly random over 1.6M rows**, which is worse locality than a
+  nest serving a finality-bounded tail. That pushes the same numbers the other way. The two effects
+  are not netted here because neither is measured.
+- **The rows are synthetic** - an ERC-20 transfer shape, 1,348 B/row as JSON against production's
+  651 B/row payload. The *ratios* are what this establishes; the absolute per-row bytes are not
+  production's.
+
 ## What the format costs, on real rows
 
 Rows are stored as JSON strings: `ENTITIES: TableDefinition<&str, &str>` in `store.rs`, written by
@@ -85,14 +165,15 @@ every figure above.
 
 ## What is not measured
 
-- **Decode cost on point-read.** #296 names it; this does not measure it. A varint/fixed-width reader
-  should beat `serde_json` comfortably, but "should" is not a number, and the `point-read latency`
-  gate exists to settle it.
-- **redb's own overhead, exactly.** The 2.45x/2.49x figures are row payloads. The file includes
-  redb's B-tree and RSS adds another 1.24-1.48x on top, so the realised RSS saving is modelled by the
-  fit above rather than measured. A prototype encoder against a real store would settle it.
-- **Any prototype.** No encoder exists. The compact column is a model computed from the schema, not a
-  measurement of a format.
+*(Written before the prototype. All three are now measured - see "The prototype was built" above -
+and kept here because what they were expected to show is part of the record.)*
+
+- ~~**Decode cost on point-read.** #296 names it; this does not measure it.~~ **Measured: 2.7x
+  faster.** It was the one expectation that held, and it is the only benefit left standing.
+- ~~**redb's own overhead, exactly.**~~ **Measured: it does not shrink with the payload.** A 3.1x
+  payload cut is a 2.00x file cut, and a 0x RSS cut once the cache is set.
+- ~~**Any prototype.** No encoder exists.~~ One exists now, in `tests/bench_compact_rows.rs`, and it
+  falsified the hypothesis it was built to confirm.
 
 ## The contracts on the table
 
@@ -106,8 +187,15 @@ with no data migration. That promise is what this change spends.
 | **Rebuild the hot store only** - sealed Parquet untouched; drop and re-derive the unsealed tail from `sealed_through` | small: the hot store holds only rows past the sealed watermark, which is finality-bounded rather than history-bounded | little. It is a re-index of the *tail*, not of history |
 | **Do nothing** | free | leaves two nests at half their cursor budget in hot storage, and makes multi-nest density worse than it needs to be |
 
-**Recommendation, to take or reject: the third** - conditional on the RSS hypothesis above being
-measured first, since the case for spending any part of the promise rests on it. It gets the saving without spending the promise.
+**Recommendation withdrawn.** It was the third option, *conditional on the RSS hypothesis above being
+measured first, since the case for spending any part of the promise rests on it*. The prototype
+measured it and the hypothesis is false: the encoding buys no RSS once redb's cache size is set. The
+condition was not met, so the recommendation does not stand, and the reasoning below is kept only
+as the record of what it rested on.
+
+**Recommendation, in its place: the fourth - do nothing to the format - and set redb's cache size
+instead**, which is not in this table because it spends none of the promise and therefore is not an
+option *about* the promise at all. The rest of this section is the withdrawn argument.
 The no-resync commitment is about *history* - the part that costs hours and money - and the hot store
 is by construction the finality-bounded tail. Re-deriving it is a bounded, minutes-scale operation
 over data the nest has already sealed, and `sealed_through` marks exactly where to resume.
