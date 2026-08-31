@@ -47,7 +47,9 @@ fn the_tier_b_runner_passes_its_own_self_test() {
     // themselves things nothing exercised.
     for probe in [
         "unreachable scorer raises",
-        "shape mismatch raises",
+        "shape mismatch raises (rows is null)",
+        "shape mismatch raises (body is not an object)",
+        "a well-formed response is returned",
         "report without final_query is refused",
         "report with final_query is accepted",
     ] {

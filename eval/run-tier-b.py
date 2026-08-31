@@ -99,13 +99,24 @@ def sql_rows(url: str, query: str, limit: int = 200):
         raise
     except Exception as error:
         raise ScoringUnavailable(f"{type(error).__name__}: {error}") from error
+    # Validate the whole shape, not just the presence of a key (review of #1051). Checking only
+    # `"rows" not in payload` still let `{"rows": null}` and `{"rows": "not rows"}` through to the
+    # comparison, where they read as an ordinary wrong answer; and a bare JSON `null` body died on
+    # `"error" in payload` with a `TypeError` rather than following the fatal path. Every response
+    # that is not the shape we asked for is the scorer failing to obtain a verdict, and they must
+    # all leave by the same door.
+    if not isinstance(payload, dict):
+        raise ScoringUnavailable(f"response is {type(payload).__name__}, not an object")
     if "error" in payload:
         raise ScoringUnavailable(payload["error"])
     if "rows" not in payload:
-        # `payload.get("rows", [])` used to swallow this. An unexpected response shape then scored
-        # as *no rows*, which is a failure for every question - a silent, schema-valid 0/15.
         raise ScoringUnavailable(f"response has no 'rows' key: {sorted(payload)!r}")
-    return payload["rows"]
+    rows = payload["rows"]
+    if not isinstance(rows, list):
+        raise ScoringUnavailable(f"'rows' is {type(rows).__name__}, not an array")
+    if not all(isinstance(row, dict) for row in rows):
+        raise ScoringUnavailable("'rows' contains an entry that is not an object")
+    return rows
 
 
 def median(values):
@@ -312,16 +323,37 @@ def self_test() -> int:
     #    silent path: the old `payload.get("rows", [])` never threw at all.
     import io
     import unittest.mock as mock
-    with mock.patch("urllib.request.urlopen") as opener:
-        opener.return_value.__enter__ = lambda self_: io.StringIO(json.dumps({"unexpected": 1}))
-        opener.return_value.__exit__ = lambda *_: False
-        try:
-            sql_rows("http://example.invalid", "SELECT 1")
-            check("shape mismatch raises", False, "silently returned rows")
-        except ScoringUnavailable:
-            check("shape mismatch raises ScoringUnavailable", True)
-        except Exception as error:
-            check("shape mismatch raises ScoringUnavailable", False, f"raised {type(error).__name__}")
+
+    def served(body):
+        """Answer one request with `body` and report how sql_rows reacted."""
+        with mock.patch("urllib.request.urlopen") as opener:
+            opener.return_value.__enter__ = lambda self_: io.StringIO(json.dumps(body))
+            opener.return_value.__exit__ = lambda *_: False
+            try:
+                return ("returned", sql_rows("http://example.invalid", "SELECT 1"))
+            except ScoringUnavailable:
+                return ("fatal", None)
+            except Exception as error:
+                return (type(error).__name__, None)
+
+    # Every malformed shape must leave by the same door. `{"rows": null}` and `{"rows": "x"}` used
+    # to reach the comparison and read as a wrong answer; a bare `null` died with a TypeError.
+    for label, body in [
+        ("no rows key", {"unexpected": 1}),
+        ("rows is null", {"rows": None}),
+        ("rows is a string", {"rows": "not rows"}),
+        ("a row is not an object", {"rows": [1, 2]}),
+        ("body is not an object", None),
+        ("body is a list", [{"n": 1}]),
+    ]:
+        outcome, _ = served(body)
+        check(f"shape mismatch raises ({label})", outcome == "fatal", f"got {outcome}")
+
+    # ...and a well-formed response must still be returned, so the checks above are not passing
+    # because everything raises.
+    outcome, rows = served({"rows": [{"n": 8}]})
+    check("a well-formed response is returned", outcome == "returned" and rows == [{"n": 8}],
+          f"got {outcome} {rows}")
 
     # 3. A report whose results omit the diagnostic fields must be refused, so a future run cannot
     #    publish another undiagnosable zero.
