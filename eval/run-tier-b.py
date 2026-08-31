@@ -355,7 +355,38 @@ def self_test() -> int:
     check("a well-formed response is returned", outcome == "returned" and rows == [{"n": 8}],
           f"got {outcome} {rows}")
 
-    # 3. A report whose results omit the diagnostic fields must be refused, so a future run cannot
+    # 3. The regression itself, at the site it actually lives. Everything above exercises
+    #    `sql_rows`; re-adding the old try/except around its *call* in `evaluate_question` would
+    #    turn `ScoringUnavailable` back into a failed question while every probe above still
+    #    passed. Review of #1051 found exactly that hole, which is the same shape as the defect
+    #    this change exists to remove - a guard that does not cover the thing it names.
+    import unittest.mock as mock
+
+    class _Args:
+        url = "http://127.0.0.1:9"
+
+    question = {"id": "q", "class": "c", "question": "how many?", "expect": "[]"}
+    with mock.patch(f"{__name__}.subject_run", return_value=("m", 1, ["SELECT 1"])):
+        try:
+            evaluate_question(question, _Args())
+            check("evaluate_question propagates a scoring failure", False,
+                  "scored it instead of raising")
+        except ScoringUnavailable:
+            check("evaluate_question propagates a scoring failure", True)
+        except Exception as error:
+            check("evaluate_question propagates a scoring failure", False,
+                  f"raised {type(error).__name__}")
+
+    # ...and a reachable scorer must still produce a verdict, so the check above is not passing
+    # merely because everything raises.
+    with mock.patch(f"{__name__}.subject_run", return_value=("m", 1, ["SELECT 1"])), \
+            mock.patch(f"{__name__}.sql_rows", return_value=[{"n": 1}]):
+        question_ok = dict(question, expect='[{"n": 1}]')
+        _, result = evaluate_question(question_ok, _Args())
+        check("a reachable scorer still yields a verdict",
+              result["passed"] and result["final_query"] == "SELECT 1", str(result))
+
+    # 4. A report whose results omit the diagnostic fields must be refused, so a future run cannot
     #    publish another undiagnosable zero.
     stub = {
         "date": "2026-01-01", "commit": "0" * 40, "model": "m", "temperature": 1.0,
@@ -371,7 +402,7 @@ def self_test() -> int:
     except SystemExit:
         check("report without final_query is refused", True)
 
-    # 4. ...and accepted once they are present, so (3) is not passing for the wrong reason.
+    # 5. ...and accepted once they are present, so (4) is not passing for the wrong reason.
     stub["results"][0].update({"final_query": "SELECT 1", "final_rows": []})
     try:
         validate_report(stub)
