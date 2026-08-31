@@ -73,7 +73,7 @@ jobs:
           gh pr view "$PR" --repo "$REPO" --json title --jq '.title' > pr.title
           gh pr view "$PR" --repo "$REPO" --json body --jq '.body' > pr.body
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
-            '{name:"Jules approval",head_sha:($sha | rtrimstr("\\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
+            '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
           echo "id=$check_id" >> "$GITHUB_OUTPUT"
 
