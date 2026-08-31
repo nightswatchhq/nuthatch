@@ -5,7 +5,7 @@ because that is the surface that enforces the per-cursor RAM budget. The prior f
 32-core ThinkPad, and the whole reason #1006 was held back a sprint was that a ceiling set from the
 convenient box is how a ceiling lands in the wrong place.
 
-Binary: `nuthatch 3.0.1` built from `pete/1006-sql-concurrency-knob`, one binary at four settings via
+Binary: version 3.0.1, built from `pete/1006-sql-concurrency-knob`, one binary at four settings via
 `NUTHATCH_SQL_MAX_CONCURRENCY`. Corpus: a copy of `graph-staking-legacy-history`, **100 MB, 54
 sealed segments**. Load: 12 concurrent clients, 12 s per level,
 `SELECT COUNT(*) FROM staking_legacy__stake_delegated`.
