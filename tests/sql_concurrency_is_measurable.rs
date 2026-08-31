@@ -34,18 +34,39 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
 
 const KEY: &str = "NUTHATCH_SQL_MAX_CONCURRENCY";
 
-/// Set the variable, run `f`, and **restore whatever was there before** - including "absent".
+/// Install a value and restore the previous one **on every path, including a panic**.
 ///
-/// Restoring rather than removing matters: a test that unconditionally `remove_var`s on the way out
-/// destroys an operator-set value in a developer's shell run, and makes the next test's "unset"
-/// premise accidental rather than arranged.
-fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    let _g = env_lock().blocking_lock();
+/// Restoring rather than removing matters: an unconditional `remove_var` on the way out destroys an
+/// operator-set value in a developer's shell run, and makes the next test's "unset" premise
+/// accidental rather than arranged.
+///
+/// **`Drop`, not a trailing statement** (review of #1035). The first version restored after `f()`
+/// returned, which is not "every path": a panicking test - and a failing assertion *is* a panic -
+/// left the override installed for whoever ran next in the same process. The PR text claimed every
+/// path while the code claimed only the happy one, which is the exact class this file exists to
+/// stop. `Drop` runs during unwinding, so the guarantee is now structural.
+struct EnvRestore(Option<String>);
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        set_env(self.0.as_deref());
+    }
+}
+
+/// Take the captured value out of the way before installing the new one.
+#[must_use = "the restore happens when this guard drops; dropping it immediately restores at once"]
+fn install_env(value: Option<&str>) -> EnvRestore {
     let prev = std::env::var(KEY).ok();
     set_env(value);
-    let out = f();
-    set_env(prev.as_deref());
-    out
+    EnvRestore(prev)
+}
+
+fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    // Declaration order matters: `_restore` drops *before* `_g`, so the value is put back while the
+    // lock is still held and no other test can observe the gap.
+    let _g = env_lock().blocking_lock();
+    let _restore = install_env(value);
+    f()
 }
 
 fn set_env(value: Option<&str>) {
@@ -131,8 +152,7 @@ use nuthatch::indexer;
 ///
 /// The caller already holds [`env_lock`]; this must not take it again or it would deadlock.
 async fn permits_with(value: Option<&str>) -> usize {
-    let prev = std::env::var(KEY).ok();
-    set_env(value);
+    let _restore = install_env(value);
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
@@ -155,7 +175,6 @@ async fn permits_with(value: Option<&str>) -> usize {
     let ingest = rt.ingest;
     ingest.abort();
     let _ = ingest.await;
-    set_env(prev.as_deref());
     permits
 }
 
@@ -203,8 +222,7 @@ async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
 #[tokio::test(flavor = "multi_thread")]
 async fn nests_on_one_cursor_share_one_gate() {
     let _guard = env_lock().lock().await;
-    let prev = std::env::var(KEY).ok();
-    set_env(Some("4"));
+    let _restore = install_env(Some("4"));
 
     let health = Arc::new(nuthatch::health::RuntimeHealth::default());
     let tape = Arc::new(TapeSource::new());
@@ -292,5 +310,44 @@ async fn nests_on_one_cursor_share_one_gate() {
         w.abort();
         let _ = w.await;
     }
+}
+
+/// The guarantee the PR text claims, asserted rather than described (review of #1035).
+///
+/// A failing assertion *is* a panic, so "restores on every path" and "restores when a test fails"
+/// are the same sentence. Before this, restoration happened after `f()` returned, so a failing test
+/// handed its override to whoever ran next in the same process.
+///
+/// **Holds the lock for the whole check, and does not call `with_env`.** The first version of this
+/// test read the environment after releasing the lock and *survived the mutation* - other tests
+/// moved the value under the assertion, so it was reading the scheduler rather than the guard. It
+/// cannot call `with_env` either: that would take the same non-reentrant mutex and deadlock.
+#[test]
+fn the_previous_value_survives_a_panic_inside_the_guard() {
+    let _g = env_lock().blocking_lock();
+    let prev = std::env::var(KEY).ok();
+
+    set_env(Some("13"));
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("13"),
+        "premise: the outer value is installed"
+    );
+
+    let caught = std::panic::catch_unwind(|| {
+        let _inner = install_env(Some("999"));
+        panic!("a failing assertion, which is what this actually guards against");
+    })
+    .is_err();
+    assert!(caught, "premise: the closure panicked");
+
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("13"),
+        "the override installed inside the panicking scope outlived it. The next test in this \
+         process would then build its gate from 999 and either fail for the wrong reason or pass \
+         vacuously (#1035)"
+    );
+
     set_env(prev.as_deref());
 }
