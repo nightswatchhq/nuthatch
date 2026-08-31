@@ -76,13 +76,36 @@ def results_equal(expected, actual):
     return True
 
 
+class ScoringUnavailable(RuntimeError):
+    """The scorer could not obtain a verdict - as distinct from obtaining a wrong one.
+
+    This exists because the two were indistinguishable. `evaluate_question` used to catch every
+    exception from `sql_rows`, leave `final_rows` empty, and score the question **failed**; an
+    unreachable URL, a timeout, an HTTP error or a server that never came up therefore produced a
+    schema-valid, publishable **0/15** with nothing in the report to say why. That is the one way a
+    fabricated-looking number could arrive entirely by accident, in a file whose whole premise is
+    that published numbers are real.
+
+    A scoring failure is now fatal to the run. A zero must be earned.
+    """
+
+
 def sql_rows(url: str, query: str, limit: int = 200):
     params = urllib.parse.urlencode({"q": query, "max_rows": str(limit)})
-    with urllib.request.urlopen(f"{url}/sql?{params}", timeout=35) as response:
-        payload = json.load(response)
+    try:
+        with urllib.request.urlopen(f"{url}/sql?{params}", timeout=35) as response:
+            payload = json.load(response)
+    except ScoringUnavailable:
+        raise
+    except Exception as error:
+        raise ScoringUnavailable(f"{type(error).__name__}: {error}") from error
     if "error" in payload:
-        raise RuntimeError(payload["error"])
-    return payload.get("rows", [])
+        raise ScoringUnavailable(payload["error"])
+    if "rows" not in payload:
+        # `payload.get("rows", [])` used to swallow this. An unexpected response shape then scored
+        # as *no rows*, which is a failure for every question - a silent, schema-valid 0/15.
+        raise ScoringUnavailable(f"response has no 'rows' key: {sorted(payload)!r}")
+    return payload["rows"]
 
 
 def median(values):
@@ -139,16 +162,23 @@ def evaluate_question(question, args):
     model, tool_calls, queries = subject_run(question["question"], args)
     final_rows = []
     if queries:
-        try:
-            final_rows = sql_rows(args.url, queries[-1])
-        except Exception as error:
-            print(f"  {question['id']}: final SQL could not be scored: {error}", file=sys.stderr)
+        # Deliberately **not** caught. A scorer that cannot reach the nest has not discovered that
+        # the agent is wrong; it has discovered that it cannot tell. Those must not share a verdict.
+        final_rows = sql_rows(args.url, queries[-1])
     expected = json.loads(question["expect"])
     passed = bool(queries) and results_equal(expected, final_rows)
     return model, {
         "id": question["id"], "class": question["class"], "passed": passed,
         "first_try": passed and len(queries) == 1,
         "sql_attempts": len(queries), "tool_calls": tool_calls,
+        # Why a zero is a zero. Without these the baseline says all fifteen are wrong and cannot say
+        # whether the agent invented a table name, tripped the `value` / `value_dec` big-int footgun
+        # the fixture exists to probe, or fell over the `"from"` / `"to"` reserved words. RFC-0016
+        # S1's premise is that the MCP surface is a context-engineering problem *to be fixed*, and a
+        # score without a diagnosis gives the slices that follow nothing to aim at. It cannot be
+        # recovered later either - the transcripts are gone once the run ends.
+        "final_query": queries[-1] if queries else None,
+        "final_rows": final_rows if not passed else None,
     }
 
 
@@ -163,7 +193,8 @@ def validate_report(report):
         if key not in summary or not isinstance(summary[key], (int, float)):
             die(f"generated report has invalid summary.{key}")
     for result in report["results"]:
-        if set(result) != {"id", "class", "passed", "first_try", "sql_attempts", "tool_calls"}:
+        if set(result) != {"id", "class", "passed", "first_try", "sql_attempts", "tool_calls",
+                           "final_query", "final_rows"}:
             die("generated result does not match its schema")
 
 
@@ -254,5 +285,73 @@ def main():
     print(f"wrote {args.report}")
 
 
+def self_test() -> int:
+    """Prove the two properties #1051 is about, without a key, a nest, or a model.
+
+    Both defects this replaces were invisible precisely because nothing exercised them: the runner
+    scored a *verdict it never obtained* as a failure, and the report recorded no evidence for the
+    zero it published. A fix for that class must not itself ship unexercised.
+    """
+    failures = []
+
+    def check(name, condition, detail=""):
+        print(f"  {'ok  ' if condition else 'FAIL'} {name}{'' if condition else ' - ' + detail}")
+        if not condition:
+            failures.append(name)
+
+    # 1. An unreachable scorer must raise, not return an empty result set that scores as a failure.
+    try:
+        sql_rows("http://127.0.0.1:9", "SELECT 1")
+        check("unreachable scorer raises", False, "returned instead of raising")
+    except ScoringUnavailable:
+        check("unreachable scorer raises ScoringUnavailable", True)
+    except Exception as error:
+        check("unreachable scorer raises ScoringUnavailable", False, f"raised {type(error).__name__}")
+
+    # 2. A response with no `rows` key must raise rather than degrade to "no rows". This is the
+    #    silent path: the old `payload.get("rows", [])` never threw at all.
+    import io
+    import unittest.mock as mock
+    with mock.patch("urllib.request.urlopen") as opener:
+        opener.return_value.__enter__ = lambda self_: io.StringIO(json.dumps({"unexpected": 1}))
+        opener.return_value.__exit__ = lambda *_: False
+        try:
+            sql_rows("http://example.invalid", "SELECT 1")
+            check("shape mismatch raises", False, "silently returned rows")
+        except ScoringUnavailable:
+            check("shape mismatch raises ScoringUnavailable", True)
+        except Exception as error:
+            check("shape mismatch raises ScoringUnavailable", False, f"raised {type(error).__name__}")
+
+    # 3. A report whose results omit the diagnostic fields must be refused, so a future run cannot
+    #    publish another undiagnosable zero.
+    stub = {
+        "date": "2026-01-01", "commit": "0" * 40, "model": "m", "temperature": 1.0,
+        "question_set_hash": "0" * 64, "runs": 3,
+        "summary": {"first_try_pass_rate": 0.0, "overall_pass_rate": 0.0,
+                    "mean_sql_attempts": 1.0, "by_class": {}},
+        "results": [{"id": "q", "class": "c", "passed": False, "first_try": False,
+                     "sql_attempts": 1, "tool_calls": 1}],
+    }
+    try:
+        validate_report(stub)
+        check("report without final_query is refused", False, "accepted it")
+    except SystemExit:
+        check("report without final_query is refused", True)
+
+    # 4. ...and accepted once they are present, so (3) is not passing for the wrong reason.
+    stub["results"][0].update({"final_query": "SELECT 1", "final_rows": []})
+    try:
+        validate_report(stub)
+        check("report with final_query is accepted", True)
+    except SystemExit as error:
+        check("report with final_query is accepted", False, str(error))
+
+    print("self-test: " + ("PASS" if not failures else f"FAIL ({', '.join(failures)})"))
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(self_test())
     main()
