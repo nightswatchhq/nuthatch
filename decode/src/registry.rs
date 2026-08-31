@@ -1384,23 +1384,45 @@ mod stored_roundtrip {
              the shadowing one - in different columns, with nothing saying which is which"
         );
 
-        // 3. And the schema advertises the name twice rather than refusing it.
-        let mut sch = transfer_schema(true);
-        sch.columns.push(ColumnSchema {
-            name: "block_number".into(),
-            sol_type: "uint256".into(),
-            storage: "word32".into(),
-            indexed: false,
-        });
-        let dupes = sch
+        // 3. And the schema advertises the name twice rather than refusing it - asserted through
+        //    the **production** builder, not by pushing a duplicate column by hand.
+        //
+        //    The first version of this built `transfer_schema(true)` and then inserted a second
+        //    `block_number` itself, which would have passed even if `DecodeRegistry::build` rejected,
+        //    namespaced or dropped the collision (review of #814). It pinned nothing about `/tables`,
+        //    which was the whole claim.
+        let abi = r#"[{"type":"event","name":"Odd","anonymous":false,"inputs":[
+            {"name":"block_number","type":"uint256","indexed":false,"internalType":"uint256"},
+            {"name":"amount","type":"uint256","indexed":false,"internalType":"uint256"}
+        ]}]"#;
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "x".into(),
+            address: Address::from([0x11; 20]),
+            abi: serde_json::from_str(abi).expect("parse colliding ABI"),
+            events: Vec::new(),
+        }])
+        .expect(
+            "the registry accepts an ABI whose parameter shadows an implicit column. If this ever \
+             starts erroring, COR-6 has been decided in favour of refusal and this probe should be \
+             deleted rather than relaxed.",
+        );
+
+        let table = reg
+            .schema()
+            .into_iter()
+            .find(|t| t.table.contains("odd"))
+            .expect("the colliding table is in the schema");
+        let dupes = table
             .columns
             .iter()
             .filter(|c| c.name == "block_number")
             .count();
         assert_eq!(
             dupes, 2,
-            "the schema carries two columns of the same name; `implicit_columns()` is extended with \
-             the event's params and nothing checks for a clash"
+            "the production schema builder emits two columns named `block_number` - the implicit \
+             one and the event's - and `/tables`, `schema.json`, the MCP schema tool and `llms.txt` \
+             all publish it. Columns were: {:?}",
+            table.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
     }
 
