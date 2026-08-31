@@ -30,6 +30,81 @@ use tokio::sync::Semaphore;
 /// query. Kept small to stay well inside the embedded RAM budget; this is node self-protection, not
 /// per-caller rate-limiting (that needs identity and belongs in a gateway).
 pub const SQL_MAX_CONCURRENCY: usize = 2;
+
+/// Hard ceiling on the override below.
+///
+/// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
+/// RFC-0042 §14): concurrent queries do not serialise, but each one that misses the connection cache
+/// opens its own DuckDB. Measured on a 32-core box, unbounded at 32 clients reached **1,313 MB - 64%
+/// of one cursor's entire 2 GB budget**, shared across every nest on that cursor. So this is capped
+/// rather than free-form: an operator raising it is trading RAM they may not have, and the
+/// non-negotiable budget is per cursor rather than per nest.
+pub const SQL_MAX_CONCURRENCY_CEILING: usize = 16;
+
+/// The live permit count: [`SQL_MAX_CONCURRENCY`] unless `NUTHATCH_SQL_MAX_CONCURRENCY` overrides it.
+///
+/// **This exists so the value can be measured, not so it can be tuned casually.** #1006 asks for the
+/// throughput/RSS curve at 1/2/4/8/16 permits on the box that enforces the RAM budget, and with a
+/// bare `const` that needs five separate builds - which is how a ceiling ends up being set from
+/// whichever box was convenient. One binary, five settings, measured where it is enforced.
+///
+/// Refusals are loud and the value is clamped rather than silently accepted: a benchmark that
+/// requested 64 and quietly got 2 would publish a curve that is flat for the wrong reason.
+/// One analytical gate **per cursor**, shared by every nest on it.
+///
+/// # Why the cursor is the right unit, and why per-nest was wrong
+///
+/// [`SQL_MAX_CONCURRENCY`]'s own description has always said it "bounds the whole analytical
+/// surface's worst-case footprint". It did not: `build_nest` constructed a **separate** semaphore per
+/// nest, so a runtime hosting six nests admitted `6 x permits` concurrent DuckDB queries.
+///
+/// Survivable at a hardcoded 2; a foot-gun the moment the value became settable, because
+/// `NUTHATCH_SQL_MAX_CONCURRENCY=16` across six nests would admit **96**, each able to open its own
+/// DuckDB - precisely the per-cursor budget the override's warning claims to protect. Caught in
+/// review of #1006 (#1024), and the same shape as everything else this sprint found: a comment
+/// asserting a property the code did not deliver.
+///
+/// **The cursor, not the process.** CLAUDE.md's non-negotiable 2 is per *active-chain cursor*, shared
+/// across the nests on it - and `group_by_chain` gives one `spawn_runtime` per chain, so one call is
+/// one cursor. A process-global gate was the first attempt and is *too* blunt: it would make two
+/// unrelated cursors in a multichain runtime contend for one budget they do not share. The gate is
+/// therefore created by whoever knows the cursor boundary and passed down.
+///
+/// **The trade, stated rather than buried:** a multi-nest cursor's effective analytical concurrency
+/// drops from `N x permits` to `permits`. That is the documented behaviour finally being true, and it
+/// is the safe direction, but it is a real reduction for a dense cursor.
+/// `docs/bench/1006-sql-concurrency-hetzner.md` measures what a permit buys and recommends raising
+/// the default; that is a separate board decision and is not taken here.
+pub fn new_sql_gate() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(sql_max_concurrency()))
+}
+
+pub fn sql_max_concurrency() -> usize {
+    match std::env::var("NUTHATCH_SQL_MAX_CONCURRENCY") {
+        Err(_) => SQL_MAX_CONCURRENCY,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = SQL_MAX_CONCURRENCY,
+                    "NUTHATCH_SQL_MAX_CONCURRENCY is not a positive integer; using the default"
+                );
+                SQL_MAX_CONCURRENCY
+            }
+            Ok(n) if n > SQL_MAX_CONCURRENCY_CEILING => {
+                tracing::warn!(
+                    requested = n,
+                    ceiling = SQL_MAX_CONCURRENCY_CEILING,
+                    "NUTHATCH_SQL_MAX_CONCURRENCY above the ceiling; clamping. Each concurrent query \
+                     can open its own DuckDB, and the per-cursor budget is 2 GB shared across every \
+                     nest on the cursor (#1006)"
+                );
+                SQL_MAX_CONCURRENCY_CEILING
+            }
+            Ok(n) => n,
+        },
+    }
+}
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
 const SQL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on rows materialised from one analytical query - bounds the Rust-side result buffer, which
