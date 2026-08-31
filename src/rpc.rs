@@ -2785,10 +2785,11 @@ mod tests {
         // `block_timestamps`' hardcoded `true` - so both the `true` and `false` paths are exercised
         // here rather than only the one production wires up.
         async fn max_in_flight(parallel: bool) -> usize {
-            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-            IN_FLIGHT.store(0, Ordering::SeqCst);
-            MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+            // When each request was inside the server. Concurrency then becomes a question about
+            // these intervals rather than about the instant a counter happened to be read.
+            static INTERVALS: std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>> =
+                std::sync::Mutex::new(Vec::new());
+            INTERVALS.lock().unwrap().clear();
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = l.local_addr().unwrap();
             tokio::spawn(async move {
@@ -2801,38 +2802,33 @@ mod tests {
                         let n = sock.read(&mut buf).await.unwrap_or(0);
                         let req = String::from_utf8_lossy(&buf[..n]).to_string();
                         let n_items = req.matches("eth_getBlockByNumber").count();
-                        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-                        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
-                        // **Wait for a sibling rather than sleeping and hoping** (#1036).
+                        // **Record when each request was inside the server, and ask whether any two
+                        // overlapped** (#1036).
                         //
-                        // This was a flat 20 ms sleep to "widen the window", which makes the
-                        // assertion a race the test has to win: under load the first request can
-                        // finish before the second is dispatched, `MAX_IN_FLIGHT` reads 1, and a
-                        // test about concurrency fails for want of a scheduler. It did, twice, at
-                        // load averages 10.7 and 18.4, while passing in isolation and on `main`.
+                        // It began as a flat 20 ms sleep plus a sampled `MAX_IN_FLIGHT` counter,
+                        // which made the assertion a race the test had to win: under load the first
+                        // request can finish before the second is dispatched, the counter reads 1,
+                        // and a test about concurrency fails for want of a scheduler. It did, twice,
+                        // at load averages 10.7 and 18.4, while passing in isolation and on `main`.
                         //
-                        // Holding each request until a second one arrives makes concurrency
-                        // *observable* instead of sampled: with `parallel=true` both halves are in
-                        // flight and both release at once, deterministically. With `parallel=false`
-                        // no sibling ever comes, so the single request waits out the deadline and
-                        // proceeds - which is exactly the discrimination the assertions below want,
-                        // and it costs that arm one deadline rather than making it flaky.
-                        // Bounded, and only while a sibling is still possible: once two have been
-                        // seen concurrently the point is proved and later requests need not wait.
-                        // The deadline is generous against localhost dispatch but is paid only by
-                        // the sequential arm, where no sibling is ever coming.
-                        if MAX_IN_FLIGHT.load(Ordering::SeqCst) < 2 {
-                            let deadline =
-                                std::time::Instant::now() + std::time::Duration::from_millis(400);
-                            while IN_FLIGHT.load(Ordering::SeqCst) < 2
-                                && std::time::Instant::now() < deadline
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                            }
-                            MAX_IN_FLIGHT
-                                .fetch_max(IN_FLIGHT.load(Ordering::SeqCst), Ordering::SeqCst);
-                        }
-                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        // Two later attempts were worse. Polling the counter with a deadline still
+                        // let one side skip while the other waited (review of #1036). Blocking on a
+                        // real `Barrier` **deadlocks the property it measures**: holding request A in
+                        // the server stops the client dispatching B, so the barrier never trips and a
+                        // genuinely concurrent client looks sequential - measured, not theorised.
+                        //
+                        // Overlap of *recorded intervals* has neither problem. Nothing blocks, so the
+                        // client behaves normally, and the answer does not depend on when anything is
+                        // sampled - only on whether two requests were actually inside the server at
+                        // the same time, which is the property being asserted.
+                        let entered = std::time::Instant::now();
+                        // A modest hold so each interval has width; without it two genuinely
+                        // concurrent requests can both be instantaneous and never be seen to overlap.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        INTERVALS
+                            .lock()
+                            .unwrap()
+                            .push((entered, std::time::Instant::now()));
                         let items: Vec<String> = (0..n_items)
                             .map(|i| format!(
                                 r#"{{"jsonrpc":"2.0","id":{i},"error":{{"code":-32000,"message":"requested block is not available on this node"}}}}"#
@@ -2851,7 +2847,18 @@ mod tests {
             let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
             let blocks: Vec<u64> = (1..=8).collect();
             let _ = c.fetch_timestamp_batch(&blocks, false, parallel).await;
-            MAX_IN_FLIGHT.load(Ordering::SeqCst)
+
+            // The most intervals open at any one moment, computed from the record - so it cannot
+            // miss an overlap by looking at the wrong time.
+            let iv = INTERVALS.lock().unwrap().clone();
+            iv.iter()
+                .map(|(a_in, _)| {
+                    iv.iter()
+                        .filter(|(b_in, b_out)| b_in <= a_in && a_in < b_out)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
         }
 
         assert_eq!(
