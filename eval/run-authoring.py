@@ -266,7 +266,7 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
 
 
 # --- scoring: three facts, no prose --------------------------------------------------------------
-def score(scenario, nest: Path, api: str):
+def score(scenario, nest: Path, api: str, unservable: str | None = None):
     # **Is there anything to read at all?** Decided once, here, rather than per criterion.
     #
     # Review of #1050 caught the previous version claiming in a comment that an unindexed nest
@@ -278,13 +278,11 @@ def score(scenario, nest: Path, api: str):
     # A nest with no hot store is a *finished fact*, not a scorer problem: the agent did not index.
     # It scores false, honestly, and the run continues.
     indexed = (nest / "nuthatch.redb").exists()
+    unreadable = unservable if indexed else "the nest has no hot store: it was scaffolded but never indexed"
     results = []
     for criterion in scenario["criterion"]:
-        if not indexed and criterion["kind"] != "nest-exists":
-            results.append({
-                "id": criterion["id"], "passed": False,
-                "detail": "the nest has no hot store: it was scaffolded but never indexed",
-            })
+        if unreadable and criterion["kind"] != "nest-exists":
+            results.append({"id": criterion["id"], "passed": False, "detail": unreadable})
             continue
         kind, cid = criterion["kind"], criterion["id"]
         if kind == "nest-exists":
@@ -355,6 +353,7 @@ def one_run(scenario, args):
             abi.write_text(ERC20_TRANSFER_ABI)
             nest = work / "nest"
 
+            unservable = None
             model, completed = subject_run(scenario, work, rpc, abi, nest, args)
             if completed.returncode != 0:
                 print(f"  subject exited {completed.returncode}: "
@@ -386,26 +385,25 @@ def one_run(scenario, args):
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 if wait_for("the nest API", 60, lambda: http_json(f"{api}/tables")) is None:
-                    # `serve` refusing is TWO different facts and they must not share a verdict -
-                    # #1051's lesson, and the reason this is not a bare `raise`:
+                    # `serve` refusing is the **agent's** result, not the harness's.
                     #
-                    #   * **no redb at all** - the subject scaffolded a nest and never indexed it.
-                    #     `serve` says so itself ("no hot store to serve from ... `serve` never
-                    #     creates or writes to the local redb, only reads it"). That is an honest
-                    #     agent failure, and criteria 2 and 3 must simply score false. Aborting the
-                    #     run here would throw away a real result.
-                    #   * **a redb that will not open** - something else holds the exclusive lock,
-                    #     almost certainly a `dev` that outlived its subject. The scorer cannot
-                    #     look, which is a harness problem and never an agent's fault.
-                    if not (nest / "nuthatch.redb").exists():
-                        pass  # `score` reads this same fact and marks the criteria false
-                    elif dev.poll() is not None:
-                        raise ScoringUnavailable(
-                            f"`serve` exited {dev.returncode} against a nest that HAS a hot store; "
-                            "something still holds the redb lock, so the score would be about the "
-                            "harness rather than the agent"
-                        )
-            return model, score(scenario, nest, api)
+                    # The previous version raised `ScoringUnavailable` whenever a `nuthatch.redb`
+                    # existed, reasoning that something must still hold the lock. Review of #1050
+                    # pointed out it cannot know that: a subject can create the store and then die
+                    # mid-initialisation, leaving one that is empty, truncated or otherwise
+                    # unservable - and the run would abort rather than record the perfectly ordinary
+                    # `init-succeeds=true, reaches-pinned-tip=false, canned-question=false`.
+                    #
+                    # The reason it cannot be a lock is one line up: `subject_run` reaps the
+                    # subject's whole process group before returning, so nothing the agent started
+                    # is still alive to hold one. Having removed the harness's own contribution, an
+                    # unservable nest is an authoring failure and scores as one, with the reason
+                    # kept rather than thrown away.
+                    unservable = (
+                        f"`serve` could not open the nest the subject built "
+                        f"(exit {dev.returncode if dev.poll() is not None else 'still running'})"
+                    )
+            return model, score(scenario, nest, api, unservable)
     finally:
         for proc in (dev, chain):
             if proc is not None:
@@ -504,6 +502,24 @@ def self_test() -> int:
                     check(f"a malformed /sql shape is fatal ({label})", False, "scored it instead")
                 except ScoringUnavailable:
                     check(f"a malformed /sql shape is fatal ({label})", True)
+
+    # A store that exists but cannot be served - the subject died mid-initialisation - is the
+    # agent's failure, not the harness's, and must score rather than abort. The subject's process
+    # group is reaped before scoring, so there is no lock left that could excuse it.
+    with tempfile.TemporaryDirectory(prefix="nuthatch-corrupt-") as tmp:
+        nest = Path(tmp) / "nest"
+        nest.mkdir()
+        (nest / "nuthatch.toml").write_text("")
+        (nest / "schema.json").write_text("{}")
+        (nest / "nuthatch.redb").write_text("not a database")
+        try:
+            results = score(scenario, nest, "http://127.0.0.1:9", "`serve` could not open it")
+            passed = {r["id"]: r["passed"] for r in results}
+            check("an unservable nest scores rather than aborting",
+                  passed == {"init-succeeds": True, "reaches-pinned-tip": False,
+                             "canned-question": False}, str(passed))
+        except ScoringUnavailable as error:
+            check("an unservable nest scores rather than aborting", False, f"aborted: {error}")
 
     # The high-severity case review found: a subject that backgrounds a long-lived child must not
     # leave it alive holding the nest's redb lock. `start_new_session=True` alone does not do this -
