@@ -6,9 +6,9 @@ signature from an agent. What it has never had is a reviewer with no stake in th
 least two recorded cases of a double-dispatched run approving a PR and arming auto-merge while
 missing a real defect, and a second opinion from the same firm is not a second opinion.
 
-This is that outside reader. It is deliberately advisory: it posts a comment with a confidence score
-and findings, it is not in `.github/required-checks.txt`, and it blocks nothing. Promote it to a
-gate only once its comments have been read for a while and found to be worth reading.
+This is that outside reader. Jules publishes an App-owned `Jules approval` check as well as the
+comment. The check is green only for a `ship` verdict. A finding, a failed review, or malformed
+model output is red until the author addresses it and asks for `/re-review`.
 
 Model: `gpt-5.6-luna`, $0.20/$1.20 per MTok since 2026-07-30. A review of a typical diff runs about
 four pence, so the whole repo's traffic is under twenty dollars a month. That price is the reason
@@ -35,7 +35,8 @@ Reading the file rather than embedding a distilled copy means the rules cannot g
 staying current there.
 
 Usage:
-    pr-review.py --diff pr.diff --title "feat: ..." [--body-file body.txt] [--json]
+    pr-review.py --diff pr.diff --title "feat: ..." [--body-file body.txt]
+                 [--json] [--json-output review.json]
 
 Reads `OPENAI_API_KEY` from the environment. Prints Markdown on stdout, diagnostics on stderr.
 """
@@ -231,7 +232,7 @@ def render(review, model, truncated):
         )
         lines.append("")
     lines.append(
-        f"<sub>Jules · {model} · advisory, blocks nothing · comment `/re-review` to run again</sub>"
+        f"<sub>Jules · {model} · required approval · push a fix or comment `/re-review` to run again</sub>"
     )
     return "\n".join(lines)
 
@@ -243,6 +244,11 @@ def main():
     ap.add_argument("--body-file", type=Path, help="file holding the pull request description")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--json", action="store_true", help="print the raw structured review instead")
+    ap.add_argument(
+        "--json-output",
+        type=Path,
+        help="also write the raw structured review to this file (for the App check conclusion)",
+    )
     args = ap.parse_args()
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -265,6 +271,9 @@ def main():
         f"Diff:\n```diff\n{diff}\n```"
     )
     review = call_model(api_key, args.model, SYSTEM.format(claude_md=claude_md), user)
+
+    if args.json_output:
+        args.json_output.write_text(json.dumps(review, indent=2) + "\n")
 
     if args.json:
         print(json.dumps(review, indent=2))

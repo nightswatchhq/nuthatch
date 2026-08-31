@@ -38,6 +38,10 @@ if ! echo "$expected" | grep -qx 'reviewed-by signature'; then
   echo "required-checks.txt is missing 'reviewed-by signature'" >&2
   exit 1
 fi
+if ! echo "$expected" | grep -qx 'Jules approval'; then
+  echo "required-checks.txt is missing 'Jules approval'" >&2
+  exit 1
+fi
 
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 

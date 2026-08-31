@@ -10,17 +10,21 @@ fn names() -> Vec<String> {
 }
 
 #[test]
-fn required_checks_file_names_the_ten_including_the_signature() {
+fn required_checks_file_names_the_eleven_including_signature_and_jules() {
     let n = names();
     assert!(
         n.iter().any(|s| s == "reviewed-by signature"),
         "the file that forgot this is how the job ran red onto scenery for a week: {n:?}"
     );
     assert!(n.iter().any(|s| s == "fmt · clippy · test"), "{n:?}");
+    assert!(
+        n.iter().any(|s| s == "Jules approval"),
+        "the external review gate is not optional: {n:?}"
+    );
     assert_eq!(
         n.len(),
-        10,
-        "ten contexts on main when this was written: {n:?}"
+        11,
+        "eleven contexts on main after Jules became a required App check: {n:?}"
     );
 }
 

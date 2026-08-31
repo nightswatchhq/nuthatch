@@ -44,11 +44,12 @@ fn run(root: &Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), s)
 }
 
-const TEN: &str = "# comment\nfmt · clippy · test\nbuild release\nreviewed-by signature\n";
+const REQUIRED: &str =
+    "# comment\nfmt · clippy · test\nbuild release\nreviewed-by signature\nJules approval\n";
 
 #[test]
 fn no_token_is_a_failure_not_a_pass() {
-    let root = root_with(TEN);
+    let root = root_with(REQUIRED);
     let (code, out) = run(root.path(), &[]);
     assert_eq!(code, 1, "a tokenless run must fail:\n{out}");
     assert!(out.contains("FAIL"), "{out}");
@@ -67,7 +68,7 @@ fn the_failure_names_a_recovery_path_that_exists_in_the_failing_state() {
     // **It asserted `administration: read` until #909**, which is the very non-key that stopped this
     // workflow validating - so the test enforced the one recovery path that does not exist, which is
     // the failure it was written to prevent. The reachable path is the secret.
-    let root = root_with(TEN);
+    let root = root_with(REQUIRED);
     let (_, out) = run(root.path(), &[]);
     assert!(out.contains("PROTECTION_READ_TOKEN"), "{out}");
     assert!(
@@ -80,7 +81,7 @@ fn the_failure_names_a_recovery_path_that_exists_in_the_failing_state() {
 
 #[test]
 fn offline_passes_but_says_it_compared_nothing() {
-    let root = root_with(TEN);
+    let root = root_with(REQUIRED);
     let (code, out) = run(root.path(), &["--offline"]);
     assert_eq!(code, 0, "--offline is a deliberate, allowed mode:\n{out}");
     assert!(
@@ -101,7 +102,7 @@ fn a_file_missing_the_signature_context_fails_before_any_network() {
 fn an_unknown_flag_is_refused_rather_than_ignored() {
     // A typo'd flag silently ignored would run the network path when the caller asked for offline,
     // or vice versa. Both are worse than a usage error.
-    let root = root_with(TEN);
+    let root = root_with(REQUIRED);
     let (code, out) = run(root.path(), &["--ofline"]);
     assert_eq!(code, 2, "{out}");
     assert!(out.contains("usage"), "{out}");
@@ -123,5 +124,6 @@ fn the_committed_list_still_names_the_signature_context() {
         listed.iter().any(|l| l == "reviewed-by signature"),
         "{listed:?}"
     );
+    assert!(listed.iter().any(|l| l == "Jules approval"), "{listed:?}");
     let _: PathBuf = manifest().to_path_buf();
 }
