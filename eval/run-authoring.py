@@ -206,11 +206,19 @@ def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
 
 
 def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
-    """One isolated agent with the builder skill and a shell, and nothing else.
+    """One agent with the builder skill and a shell, and nothing else it is not given.
 
-    It is given the task statement and the paths; it is **not** given the criteria, the expected
-    result, or this repository. What it does with a shell is its business - the score is taken from
-    the artefacts afterwards.
+    It receives the task statement and the paths. It must **not** be able to reach the criteria, the
+    expected result, or this repository - and that is a property of the sandbox, not of this
+    function. Review of #1050 caught the first version claiming the boundary in a docstring while
+    doing nothing to enforce it: the subject ran with `cwd` set to a temporary directory and no
+    filesystem restriction whatever, so it could simply read `eval/authoring.toml`, take the
+    expected result, and score three out of three by discovering the repository rather than by
+    knowing how to build a nest.
+
+    `--sandbox` is therefore **required**, and `main` refuses to run without it. Changing a working
+    directory is not isolation, and an eval that can be solved by reading the answer key measures
+    nothing.
     """
     statement = scenario["task"]["statement"].format(
         contract=scenario["contract"], chain=scenario["chain"],
@@ -221,7 +229,7 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
         die(f"the builder skill is not at {skill}; there is nothing to evaluate")
     shutil.copytree(skill, workdir / ".claude" / "skills" / "nuthatch-builder")
 
-    command = [
+    command = list(args.sandbox) + [
         args.claude, "-p", "--model", args.model, "--no-session-persistence",
         "--output-format", "stream-json", "--verbose",
         "--max-budget-usd", str(args.max_budget_usd),
@@ -503,6 +511,24 @@ def self_test() -> int:
                 except ScoringUnavailable:
                     check(f"a malformed /sql shape is fatal ({label})", True)
 
+    # The eval's integrity property: a run must be impossible without isolation. Review of #1050
+    # found the subject boundary asserted in a docstring and enforced nowhere - the agent could read
+    # `eval/authoring.toml`, lift the expected result, and score 3/3 by discovering this repository.
+    # A refusal is the only honest default, because the failure is silent and flattering.
+    import unittest.mock as mock
+
+    class _NoSandbox:
+        self_test, runs, sandbox = False, 3, None
+        nuthatch = Path(sys.executable)  # exists, so the sandbox check is what refuses
+
+    with mock.patch(f"{__name__}.argparse.ArgumentParser.parse_args", return_value=_NoSandbox()):
+        try:
+            main()
+            check("a run without a sandbox is refused", False, "it ran anyway")
+        except SystemExit as exit_:
+            check("a run without a sandbox is refused", "--sandbox is required" in str(exit_),
+                  f"exited for another reason: {exit_}")
+
     # A store that exists but cannot be served - the subject died mid-initialisation - is the
     # agent's failure, not the harness's, and must score rather than abort. The subject's process
     # group is reaped before scoring, so there is no lock left that could excuse it.
@@ -572,6 +598,13 @@ def self_test() -> int:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument(
+        "--sandbox", nargs=argparse.REMAINDER, default=None,
+        help="REQUIRED. Command prefix that confines the subject to `workdir` - e.g. a container "
+             "runner, `sandbox-exec -f <profile>`, or `bwrap --ro-bind ...`. The subject must not be "
+             "able to read this repository: `eval/authoring.toml` carries the expected result, and "
+             "an agent that finds it scores 3/3 without building anything. Recorded in the report.",
+    )
     ap.add_argument("--nuthatch", type=Path, default=ROOT / "target/release/nuthatch")
     ap.add_argument("--claude", default="claude")
     ap.add_argument("--model", default="sonnet")
@@ -586,6 +619,15 @@ def main():
 
     if args.runs < 3:
         die("refusing to publish fewer than three runs")
+    if not args.sandbox:
+        die(
+            "--sandbox is required. Without it the subject can read eval/authoring.toml, take the\n"
+            "expected result, and score 3/3 by discovering this repository instead of by knowing\n"
+            "how to build a nest. A temporary working directory is not isolation.\n"
+            "\n"
+            "Pass a command prefix that confines the subject to its workdir, e.g.\n"
+            "  --sandbox docker run --rm -v $WORKDIR:/w -w /w <image>"
+        )
     if not args.nuthatch.is_file():
         die(f"{args.nuthatch} is not there; build it first")
 
@@ -609,6 +651,9 @@ def main():
     report = {
         "date": time.strftime("%Y-%m-%d"), "commit": commit, "model": model,
         "runs": args.runs, "scenario": "authoring (RFC-0017)",
+        # Recorded because the score is only as trustworthy as the isolation: a reader must be able
+        # to see what confined the subject, not take it on faith.
+        "sandbox": args.sandbox,
         "summary": {
             "end_to_end_pass_rate": sum(
                 1 for run in runs if all(r["passed"] for r in run)) / len(runs),

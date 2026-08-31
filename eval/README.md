@@ -89,6 +89,18 @@ Two things the board caught while being built, both by mutating it rather than b
   numeric comparison removed entirely, because `json.dumps(3600)` is `"3600"`. It takes a float to
   discriminate.
 
+### The subject must be sandboxed, and the runner refuses without one
+
+`--sandbox` is **required**. It takes a command prefix that confines the subject to its working
+directory - a container runner, `sandbox-exec -f`, `bwrap --ro-bind` - and is recorded in the report,
+because a score is only as trustworthy as the isolation behind it.
+
+The first version of this runner set the subject's `cwd` to a temporary directory, described that as
+isolation, and enforced nothing: the agent could read `eval/authoring.toml`, lift the expected
+result, and score 3/3 by **discovering this repository** rather than by knowing how to build a nest.
+Changing a working directory is not isolation, and the failure is silent and flattering, which is the
+worst combination available. So the refusal is the default and there is no override.
+
 ### Scoring does not depend on what the agent names things
 
 `init` derives the table name from the contract alias, which defaults to `c0` but is the agent's to
@@ -100,7 +112,8 @@ authoring.
 
 ```sh
 python3 eval/run-authoring.py --self-test                       # no key, no model, no network
-python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3
+python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3 \
+  --sandbox docker run --rm -v "$WORKDIR:/w" -w /w <image>
 ```
 
 **No baseline is published yet.** The board, the runner and both self-tests are in place and CI-gated;
