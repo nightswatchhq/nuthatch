@@ -122,8 +122,15 @@ def sql_rows(url: str, query: str, limit: int = 200):
     if not isinstance(payload, dict):
         raise ScoringUnavailable(f"response is {type(payload).__name__}, not an object")
     if "error" in payload:
+        # Validate the error's *shape* too. `{"error": null}` and `{"error": {}}` are not a server
+        # telling us the query is bad - they are a response we do not understand, and stringifying
+        # them into `query_error = "None"` would publish a failed verdict the scorer never actually
+        # obtained. That is the very defect this change exists to remove, recreated one branch over.
+        detail = payload["error"]
+        if not isinstance(detail, str) or not detail.strip():
+            raise ScoringUnavailable(f"malformed error payload: {payload['error']!r}")
         # The server is fine; the query is not. A verdict, not an absence of one.
-        raise QueryRejected(str(payload["error"]))
+        raise QueryRejected(detail)
     if "rows" not in payload:
         raise ScoringUnavailable(f"response has no 'rows' key: {sorted(payload)!r}")
     rows = payload["rows"]
@@ -366,6 +373,9 @@ def self_test() -> int:
         ("a row is not an object", {"rows": [1, 2]}),
         ("body is not an object", None),
         ("body is a list", [{"n": 1}]),
+        ("error is null", {"error": None}),
+        ("error is an object", {"error": {}}),
+        ("error is blank", {"error": "   "}),
     ]:
         outcome, _ = served(body)
         check(f"shape mismatch raises ({label})", outcome == "fatal", f"got {outcome}")
@@ -375,6 +385,20 @@ def self_test() -> int:
     outcome, rows = served({"rows": [{"n": 8}]})
     check("a well-formed response is returned", outcome == "returned" and rows == [{"n": 8}],
           f"got {outcome} {rows}")
+
+    # ...and a real error string must still be a *verdict*, not fatal, or the checks above are
+    # passing by making everything fatal - which is the opposite over-correction.
+    with mock.patch("urllib.request.urlopen") as opener:
+        opener.return_value.__enter__ = lambda self_: io.StringIO(
+            json.dumps({"error": "Table with name invented does not exist"}))
+        opener.return_value.__exit__ = lambda *_: False
+        try:
+            sql_rows("http://example.invalid", "SELECT 1")
+            check("a real error string is a rejected query", False, "returned instead")
+        except QueryRejected:
+            check("a real error string is a rejected query", True)
+        except Exception as error:
+            check("a real error string is a rejected query", False, type(error).__name__)
 
     # 3. The regression itself, at the site it actually lives. Everything above exercises
     #    `sql_rows`; re-adding the old try/except around its *call* in `evaluate_question` would
