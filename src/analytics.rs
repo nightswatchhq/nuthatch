@@ -1504,6 +1504,32 @@ fn reject_replacement_scan(sql: &str) -> Result<()> {
 /// whose net is exactly zero are omitted (matching the view's drop-at-zero behaviour). `table` and
 /// the column names come from the registry (`{alias}__transfer`; from/to/value column names vary by
 /// token - USDC from/to/value, WETH src/dst/wad), never user text, so there is no injection surface.
+/// Transfers in `table` whose value does not fit `i128`, and which [`net_balances`] therefore
+/// dropped (COR-8, #814).
+///
+/// A separate query rather than a column on the fold: the fold groups by address and sums, so a
+/// dropped row has no address to be counted against - it contributes NULL to both legs and vanishes
+/// before the `GROUP BY`. Counting it needs its own pass over the same predicate.
+///
+/// `TRY_CAST` is the same expression the fold uses, deliberately: a second spelling of "does not fit"
+/// could disagree with the one doing the dropping, and then the count would describe a different set
+/// of rows than the ones actually missing.
+pub fn over_i128_transfers(
+    dir: &Path,
+    table: &str,
+    value_col: &str,
+    sealed_through: u64,
+) -> Result<u64> {
+    let sql = format!(
+        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS HUGEINT) IS NULL"
+    );
+    Ok(query_cold(dir, &sql, sealed_through)?
+        .first()
+        .and_then(|r| r["n"].as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
 pub fn net_balances(
     dir: &Path,
     table: &str,

@@ -4519,6 +4519,16 @@ impl NestIngest {
                             )?;
                         }
                     }
+                } else if value.is_some() {
+                    // COR-8 (#814): a live transfer whose value exceeds `i128`. Skipped here exactly
+                    // as the cold fold skips it, so hot and sealed agree - but counted now, so the
+                    // balance says it is incomplete instead of looking complete.
+                    self.balances.note_over_i128(1);
+                    tracing::warn!(
+                        block = row.block_number,
+                        log_index = row.log_index,
+                        "transfer value does not fit i128; excluded from balances (#814)"
+                    );
                 }
                 if self.screener.is_some() {
                     to_screen.push(TransferRow {
@@ -5619,6 +5629,21 @@ fn rebuild_views(
                 }
             }
             Err(e) => tracing::debug!("no cold seed for {table}: {e:#}"),
+        }
+        // COR-8 (#814): the fold silently drops a transfer whose value exceeds `i128`. The drop is
+        // correct - both legs go, or the balance would gain value from nowhere - but it used to be
+        // invisible, so a balance missing a transfer was served exactly like a complete one.
+        match crate::analytics::over_i128_transfers(dir, table, val_col, sealed_through) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::warn!(
+                    "{n} transfer(s) in {table} have a value that does not fit i128 and are \
+                     excluded from balances; /balances reports this as `dropped_over_i128` (#814)"
+                );
+                balances.note_over_i128(n);
+            }
+            // A table with no sealed segment has no view to count over; that is not a failure.
+            Err(e) => tracing::debug!("no over-i128 count for {table}: {e:#}"),
         }
         if want_exposure {
             match crate::analytics::cold_exposure(

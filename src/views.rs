@@ -24,7 +24,7 @@ use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::{Arc, RwLock};
 
@@ -138,6 +138,22 @@ pub struct BalanceView {
     /// surface a dead derived-view thread and fail loudly, instead of silently serving frozen balances
     /// as if healthy (a dead task must surface, never be served over).
     healthy: Arc<AtomicBool>,
+    /// Transfers whose value does not fit `i128` and were therefore **dropped from these balances**
+    /// (COR-8, #814).
+    ///
+    /// The drop itself is correct and stays: `TRY_CAST(... AS HUGEINT)` yields NULL on the cold fold
+    /// and `str::parse::<i128>()` errors on the hot replay, and **both legs go**, because dropping
+    /// only one would invent value - a sender debited with nobody credited.
+    ///
+    /// What was wrong is that it was **silent**. A balance missing a transfer was served exactly
+    /// like a complete one, so a caller could not tell the two apart. Counting it is the whole fix:
+    /// the number stays what it is, and the caller learns it is incomplete.
+    ///
+    /// **Not `degraded_tables`.** That was the first choice, and it is the wrong channel: it lives
+    /// on `QueryOutput` and describes a `/sql` query's cold data, while these drops surface at
+    /// `/balances` and `/balance/{address}`. `analytics.rs` already faced this once and gave
+    /// `tip_unavailable` its own field rather than shoehorning it in, writing down why.
+    over_i128: Arc<AtomicU64>,
 }
 
 impl BalanceView {
@@ -182,6 +198,7 @@ impl BalanceView {
             tx,
             balances,
             healthy,
+            over_i128: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -227,6 +244,20 @@ impl BalanceView {
 
     pub fn holders(&self) -> usize {
         self.balances.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Record `n` transfers dropped for exceeding `i128` (COR-8, #814).
+    pub fn note_over_i128(&self, n: u64) {
+        if n > 0 {
+            self.over_i128.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// How many transfers these balances are missing because their value exceeds `i128`.
+    ///
+    /// Zero is the ordinary answer and means the balances are complete with respect to this cause.
+    pub fn dropped_over_i128(&self) -> u64 {
+        self.over_i128.load(Ordering::Relaxed)
     }
 }
 
