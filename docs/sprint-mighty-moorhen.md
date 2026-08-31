@@ -1,13 +1,13 @@
 # Sprint: mighty-moorhen
 
-**Eleven issues.** A sprint is a labelled set, not a calendar. This is deliberately the large cleanup
+**Twelve issues.** A sprint is a labelled set, not a calendar. This is deliberately the large cleanup
 sprint after the backlog reconciliation: product correctness, measurement, documentation, and two
 external decisions which need to stay visible rather than being mistaken for code tasks.
 
 ## Definition of done
 
 Every issue carrying the **`mighty-moorhen`** label is closed, and no open PR is for one of them.
-That is #296, #750, #790, #814, #815, #1006, #1025, #1026, #1027, #1028 and **#1046**. Work
+That is #296, #750, #790, #814, #815, #1006, #1025, #1026, #1027, #1028, **#1046** and **#1050**. Work
 discovered in flight is filed **unlabelled**. Pulling it into scope needs a board reply.
 
 **#1046 was pulled in by board reply, 2026-08-31**, having been filed unlabelled while measuring
@@ -26,7 +26,7 @@ paths; read-only readiness and tip-lag are existing operational surfaces; the AB
 checks make stated facts remain true. The Lodestar host and keyed AI evaluations are explicitly
 external tracks, not work to be faked from a repository checkout.
 
-## The eleven
+## The twelve
 
 1. **#296 - compact binary rows.** ~~Measure the hot-store cost and choose a versioned migration or
    an explicit rebuild-on-upgrade contract.~~ **Closed 2026-08-31: neither.** The prototype
@@ -40,8 +40,11 @@ external tracks, not work to be faked from a repository checkout.
    files one issue per actual finding.
 4. **#814 - COR-6 and COR-8.** Decide the reserved-column refusal/namespace rule and the honest
    treatment of values beyond `i128`.
-5. **#815 - keyed AI evaluation.** Board-only: run the two evaluations without retaining keys in the
-   firm, and record the result or the decision not to run them.
+5. **#815 - keyed AI evaluation.** Board-only: run the evaluation without retaining keys in the firm.
+   **Split 2026-08-31**, and retitled to the RFC-0016 half it actually delivered. The Tier-B baseline
+   is **0/15 first-try and 0/15 overall** on `claude-sonnet-5`, median of three isolated MCP-only
+   runs. The number was verified rather than accepted: all 15 known-correct oracles score as passes
+   through the runner's own path, so the zero belongs to the agent and not the harness.
 6. **#1006 - SQL concurrency.** Measure the throughput/RSS curve on the enforcing production box,
    then set or retain the bound with a per-cursor explanation and a gate that can fail.
 7. **#1025 - read-only readiness.** A sealed-history nest must be ready by its sealed state, not by
@@ -50,7 +53,11 @@ external tracks, not work to be faked from a repository checkout.
    floor rather than merely searching for nearby words.
 9. **#1027 - Cargo timing discovery.** Recognise the normal unsuffixed `cargo-timing.html` report.
 10. **#1028 - rendered tip lag.** Exercise the per-nest Prometheus value the operator actually sees.
-11. **#1046 - redb's unset cache ceiling.** Make the cache size settable (default unchanged, a
+11. **#1050 - the RFC-0017 authoring-eval runner.** The half #815 could not deliver, because it had
+    no runner at all. It sat blocked under `board-only`, which covers the keyed *run* and not the
+    *runner* - so the missing thing was in a bucket agents must not touch. Unblocked engineering
+    now; the keyed run stays board-only and is the last step.
+12. **#1046 - redb's unset cache ceiling.** Make the cache size settable (default unchanged, a
     no-op), then measure RSS, point-read p50/p99 and tip lag on the enforcing production box at
     1 GiB / 512 / 256 MiB and pick a default from that. **The harness figures must not be used to
     pick the value**: both boxes had the store in OS page cache, so a miss cost a memcpy rather
