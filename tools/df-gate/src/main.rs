@@ -32,6 +32,35 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_000_000);
+    // **#1012: the concurrency mode is retired, and says so rather than being ignored.**
+    //
+    // `CONCURRENCY` and `PER_CLIENT` used to select a concurrent DuckDB-vs-Rust benchmark. That
+    // branch was deleted by the #981 fix, after which requesting it fell through to an ordinary
+    // single-client run - so an invocation asking for concurrency got one-client evidence and no
+    // indication that it had. A benchmark that silently answers a different question than the one
+    // asked is the failure this tool exists to avoid.
+    //
+    // **Retired rather than restored**, deliberately. RFC-0042 §14 *withdrew* the concurrent-
+    // throughput row: it compared a mutex the harness built against an unserialised Rust operator,
+    // so it never compared two engines and could not support a removal argument. Rebuilding a
+    // benchmark for a withdrawn row would be work for nobody. The live concurrency question is
+    // #1006 - the permit count as a RAM bound - and it is measured against the product, not here.
+    for var in ["CONCURRENCY", "PER_CLIENT"] {
+        if std::env::var(var).is_ok() {
+            anyhow::bail!(
+                "{var} is retired (#1012). This tool no longer has a concurrency mode; it was \
+                 deleted by the #981 fix and requesting it silently produced single-client numbers.\n\
+                 \n\
+                 RFC-0042 §14 withdrew the concurrent-throughput row it served: the DuckDB side was \
+                 measured against a mutex the harness itself imposed, which `analytics.rs` does not \
+                 hold, so the row compared a harness to an engine.\n\
+                 \n\
+                 If you want concurrency numbers, measure the product: NUTHATCH_SQL_MAX_CONCURRENCY \
+                 against a running nest (#1006). Unset {var} to run the single-client gate."
+            );
+        }
+    }
+
     // KEEP_FIXTURE=<dir> writes the fixture somewhere durable so other tools can profile the same
     // bytes rather than a freshly generated approximation of them.
     let keep = std::env::var("KEEP_FIXTURE").ok();
@@ -294,18 +323,31 @@ fn rust_net_balances(seg: &std::path::Path) -> anyhow::Result<(Vec<(String, i128
                     let Ok(d) = value.value(i).parse::<i128>() else {
                         continue;
                     };
-                    // **Checked arithmetic, matching DuckDB** (#998). `HUGEINT` overflow is an error
-                    // there - `Out of Range Error: Overflow in addition of INT128` - not a wrap and
-                    // not a panic. Plain `-d` overflows on `i128::MIN`, and plain `+=` wraps silently
-                    // in release, so the parity claim was never established at the numeric boundary:
-                    // the fixture's largest value is ~1e20, nowhere near `i128::MAX`.
+                    // **Checked arithmetic, matching DuckDB's failure *semantics*** (#998, narrowed
+                    // by #1014). `HUGEINT` overflow is an error in DuckDB - not a wrap and not a
+                    // panic - and this path now errors too. Plain `-d` overflows on `i128::MIN`, and
+                    // plain `+=` wraps silently in release, so the parity claim was never established
+                    // at the numeric boundary: the fixture's largest value is ~1e20, nowhere near
+                    // `i128::MAX`.
+                    //
+                    // **The error *text* is not DuckDB's and is not claimed to be.** DuckDB says
+                    // `Out of Range Error: Overflow in addition of INT128 (...)`; this path reports
+                    // its own negation, accumulation and merge messages. An earlier version of this
+                    // comment read as if the wording matched, which is the same class of overclaim
+                    // as the doc comment that put a false serialisation property into three
+                    // published documents. What is asserted, and all that is asserted: **both
+                    // engines refuse rather than wrap, at the same inputs.**
                     let debit = d.checked_neg().ok_or_else(|| {
-                        anyhow::anyhow!("Overflow in negation of INT128 ({d}) - i128::MIN has no positive")
+                        anyhow::anyhow!(
+                            "Overflow in negation of INT128 ({d}) - i128::MIN has no positive"
+                        )
                     })?;
                     for (addr, signed) in [(to.value(i), d), (from.value(i), debit)] {
                         if let Some(v) = acc.get_mut(addr) {
                             *v = v.checked_add(signed).ok_or_else(|| {
-                                anyhow::anyhow!("Overflow in addition of INT128 ({v} + {signed}) for {addr}")
+                                anyhow::anyhow!(
+                                    "Overflow in addition of INT128 ({v} + {signed}) for {addr}"
+                                )
                             })?;
                         } else {
                             acc.insert(addr.to_string(), signed);
@@ -536,7 +578,11 @@ mod overflow_semantics {
     #[test]
     fn negating_the_minimum_is_refused_not_wrapped() {
         assert!(i128::MIN.checked_neg().is_none());
-        assert_eq!(i128::MIN.wrapping_neg(), i128::MIN, "wrapping would return the same value");
+        assert_eq!(
+            i128::MIN.wrapping_neg(),
+            i128::MIN,
+            "wrapping would return the same value"
+        );
     }
 
     /// Two in-range credits to one address can leave the range. Wrapping turns a huge positive
@@ -556,6 +602,9 @@ mod overflow_semantics {
     fn merging_partials_can_overflow_when_neither_partial_does() {
         let a = i128::MAX - 1;
         let b = 2i128;
-        assert!(a.checked_add(b).is_none(), "neither partial is out of range; their sum is");
+        assert!(
+            a.checked_add(b).is_none(),
+            "neither partial is out of range; their sum is"
+        );
     }
 }

@@ -13,6 +13,7 @@
 //! what nuthatch runs, so both engines get base views that add them.
 //!
 //! Usage: `view_exec <nest-dir>`
+use anyhow::Context as _;
 use std::time::Instant;
 
 use datafusion::prelude::*;
@@ -208,11 +209,26 @@ async fn main() -> anyhow::Result<()> {
             // **Medians, not single runs.** `docs/bench/noise-floor.md`: "A single measurement is
             // worthless here" - compare medians of at least 15 runs, never one, never the mean.
             // REPEATS is lower by default because these are seconds-scale queries over 38k segments.
+            //
+            // #1011: the floor was `.max(1)`, so `REPEATS=1` produced a "median" of one sample while
+            // the published record claimed a repeat policy. A single sample is a reading, not a
+            // median, and `docs/bench/noise-floor.md` asks for >= 15 precisely because the
+            // distribution is not tight. Three is the floor here rather than fifteen because these
+            // are seconds-scale queries over 38,428 real segments and fifteen repeats of five views
+            // is an hour of wall clock - but a floor there must be, and it is enforced rather than
+            // described.
             let repeats: usize = std::env::var("REPEATS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(5)
-                .max(1);
+                .unwrap_or(5);
+            const MIN_REPEATS: usize = 3;
+            if repeats < MIN_REPEATS {
+                anyhow::bail!(
+                    "REPEATS={repeats} is below the minimum of {MIN_REPEATS}. A median of fewer \
+                     samples is a reading dressed as a distribution, and this tool's output is \
+                     cited in RFC-0042 §14 (#1011)."
+                );
+            }
             let mut d_times = Vec::new();
             let mut d = Vec::new();
             let mut duck_failed = None;
@@ -283,13 +299,31 @@ async fn main() -> anyhow::Result<()> {
             // Repeat the DataFusion side the same number of times, discarding the rows - parity was
             // established on the first execution and re-comparing every repeat would time the
             // comparison rather than the query.
-            for _ in 1..repeats {
+            //
+            // **#1011: a failed repeat is a failed benchmark, not a discarded sample.** This used to
+            // be `if let Ok(df) = ... { if ....is_ok() { push } }`, so a repeat that errored was
+            // silently dropped and the median taken over whatever survived - four failures of five
+            // would have published a one-sample "median" as a measured figure. That is the same
+            // defect as #977 in `noise-floor.sh`, and this tool's numbers are cited in RFC-0042 §14.
+            for i in 1..repeats {
                 let t = Instant::now();
-                if let Ok(df) = ctx.sql(&df_sql).await {
-                    if df.collect().await.is_ok() {
-                        f_times.push(t.elapsed().as_millis());
-                    }
-                }
+                let df = ctx.sql(&df_sql).await.with_context(|| {
+                    format!("view `{name}`: DataFusion repeat {i}/{repeats} failed to plan")
+                })?;
+                df.collect().await.with_context(|| {
+                    format!("view `{name}`: DataFusion repeat {i}/{repeats} failed to execute")
+                })?;
+                f_times.push(t.elapsed().as_millis());
+            }
+            // Belt and braces: the median below indexes `f_times`, so an empty or short vector must
+            // never reach it silently.
+            if f_times.len() != repeats {
+                anyhow::bail!(
+                    "view `{name}`: {} successful DataFusion samples out of {repeats} requested. \
+                     A median over a partial sample is not the figure this tool claims to report \
+                     (#1011).",
+                    f_times.len()
+                );
             }
             f_times.sort_unstable();
             let f_ms = f_times[f_times.len() / 2];
