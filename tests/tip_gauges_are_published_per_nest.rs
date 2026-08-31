@@ -187,7 +187,61 @@ async fn tip_lag_can_be_non_zero_and_is_not_merely_saturating_to_health() {
         "the recorded tip must be the source's tip, not some other nest's or a stale value"
     );
 
+    // **The rendered gauge, not just the accessor** (review of #1021). Asserting `m.tip()` proves
+    // the struct holds a tip; it does not prove the exporter renders it.
+    //
+    // Lag deliberately is **not** asserted positive here: this nest catches up to block 40 in
+    // milliseconds, so by render time it is genuinely at tip and 0 is the correct answer. Waiting
+    // for a window where it is still behind would be a race. The lag gauge gets its own test below,
+    // against the renderer, where "behind" can be stated rather than hoped for.
+    let text = METRICS.render();
+    let tip_gauge = labelled_values(&text, "nuthatch_nest_tip_height")
+        .into_iter()
+        .find(|(l, _)| l.contains(name))
+        .map(|(_, v)| v)
+        .unwrap_or(0);
+    assert_eq!(
+        tip_gauge, 40,
+        "the rendered tip gauge must agree with the accessor and with the source. If they diverge, \
+         one of the two surfaces is lying, which is the whole subject of this file.\n{text}"
+    );
+
     let ingest = rt.ingest;
     ingest.abort();
     let _ = ingest.await;
+}
+
+/// #1021, from review: **the lag gauge itself must be able to render non-zero.**
+///
+/// The two tests above prove `index_loop` publishes the tip. Neither proves the *renderer* turns a
+/// tip and a stored block into a lag, because a nest that catches up in milliseconds is correctly at
+/// lag 0 by the time anything can scrape it, and waiting for the window where it is behind is a
+/// race.
+///
+/// So this one has a different subject: not the loop, but `nuthatch_nest_tip_lag_blocks`. It sets a
+/// nest deliberately behind and reads the rendered exporter. A renderer that always emitted 0 -
+/// which is indistinguishable from the production fault, since `tip.saturating_sub(last)` turns an
+/// unset tip into "exactly at tip" - fails here and passes everywhere else.
+///
+/// **This is the shape of test that was worthless for the loop and is right for the renderer.**
+/// Setting the tip by hand cannot test the code whose bug was failing to set it; it is exactly how
+/// to test the code that formats it.
+#[test]
+fn the_lag_gauge_renders_a_real_distance_not_a_constant_zero() {
+    let name = "tiplag-render";
+    let m = METRICS.nest(name);
+    m.set_last_block(500_198_889);
+    m.set_tip(500_198_892);
+
+    let text = METRICS.render();
+    let (label, lag) = labelled_values(&text, "nuthatch_nest_tip_lag_blocks")
+        .into_iter()
+        .find(|(l, _)| l.contains(name))
+        .unwrap_or_else(|| panic!("no nuthatch_nest_tip_lag_blocks for `{name}`:\n{text}"));
+    assert_eq!(
+        lag, 3,
+        "`nuthatch_nest_tip_lag_blocks{{{label}}}` rendered {lag} for a nest 3 blocks behind. \
+         0 in particular is not 'unknown' - it is the healthiest possible reading, and it is what \
+         five production nests reported while genuinely 2-4 blocks behind (#1020).\n{text}"
+    );
 }
