@@ -64,13 +64,26 @@ back **in its own process**, because `VmRSS` is process-wide and that is exactly
 review made to the section above. Full scan to fill the cache, then 50,000 random point reads that
 decode the row.
 
-**Corrected after review, and the correction went against the framing here.** The first pass parsed
+**Corrected twice after review, and the first correction went against the framing here.** The first pass parsed
 the JSON object in full with `serde_json` while the compact side read three varints and sliced
 twenty bytes, then reported the difference as a decode win. That is a full parse against a partial
 one. Both paths now materialise **every** field into the same struct - the JSON side hex-decoding
 the hashes and addresses and parsing the decimal `value`, which is exactly the work the compact side
 avoids. On Linux the honest comparison made the encoding's decode win **larger** (3.4x, against the
-2.8x first published), not smaller. The figures below are the corrected ones.
+2.8x first published), not smaller.
+
+A second round found the deeper version of the same fault: `row_compact` was writing **zero bytes**
+into every fixed-width field while `row_json` wrote values derived from the row index, so the two
+encodings did not represent the same row and nothing compared the decoders' output. Both faults were
+invisible for the same reason - the harness measured two paths without ever checking they agreed.
+`the_two_encodings_decode_to_the_same_row` now does, as a **normal test that runs in CI** rather than
+an ignored one, and it was mutation-checked before being trusted: zeros back into `block_hash` fails
+on row 1, and a constant encoder fails the distinctness arm.
+
+The corrected encoding changed neither the file sizes (byte-identical, as the field widths did not
+move) nor the timings (a memcpy costs the same whatever the bytes are). But that is now measured
+rather than assumed. **The figures below are from the corrected harness, and across three
+independent runs per box the RSS columns have not moved at all.**
 
 First, the file. The 2.45x is a *payload* ratio and the file does not inherit it:
 
@@ -88,10 +101,10 @@ setting, which nuthatch has never set:**
 
 | cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
 | --- | ---: | ---: | ---: | ---: |
-| 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.3 us | 1.2 us |
+| 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.3 us | 1.1 us |
 | 512 MiB | **0.64 GB** | **0.64 GB** | 3.7 us | 1.6 us |
-| 256 MiB | **0.33 GB** | **0.33 GB** | 4.0 us | 2.0 us |
-| 128 MiB | **0.17 GB** | **0.17 GB** | 4.0 us | 2.4 us |
+| 256 MiB | **0.33 GB** | **0.33 GB** | 3.8 us | 2.0 us |
+| 128 MiB | **0.17 GB** | **0.17 GB** | 3.9 us | 2.2 us |
 
 **Linux** (Debian 13, 6.12.94, 32 core - the platform production runs), same commit, byte-identical
 stores:
@@ -100,8 +113,8 @@ stores:
 | --- | ---: | ---: | ---: | ---: |
 | 1 GiB (today's default) | 1.00 GB | 0.69 GB | 4.8 us | 1.4 us |
 | 512 MiB | **0.50 GB** | **0.50 GB** | 5.3 us | 2.2 us |
-| 256 MiB | **0.25 GB** | **0.25 GB** | 5.5 us | 2.8 us |
-| 128 MiB | **0.13 GB** | **0.13 GB** | 5.6 us | 3.0 us |
+| 256 MiB | **0.25 GB** | **0.25 GB** | 5.4 us | 2.6 us |
+| 128 MiB | **0.13 GB** | **0.13 GB** | 5.6 us | 2.8 us |
 
 **At every cache size smaller than both files, on both platforms, the two encodings land on
 identical RSS** - 0.50 against 0.50, 0.25 against 0.25, 0.13 against 0.13 on Linux - across a 2.00x
@@ -138,7 +151,7 @@ is one line. Per the sprint's own constraint - *do not trade away the no-resync 
 implication* - there is now nothing to trade it for.
 
 **What the encoding does own, and it is real:** point-read decode is **3.4x faster on Linux** and
-2.75x on macOS (4.8 -> 1.4 us at 1 GiB, 5.5 -> 2.8 us at 256 MiB - 2.7-3.4 us saved per read). It is
+2.75x on macOS (4.8 -> 1.4 us at 1 GiB, 5.4 -> 2.6 us at 256 MiB - 2.8-3.4 us saved per read). It is
 the one expectation the prototype confirmed, and the only claim here that the review correction made
 *stronger*. That is a latency result,
 not a memory one. #296 asked for memory. If the decode win is worth wanting it should be argued on
@@ -146,7 +159,7 @@ its own terms, against the cost of a migration, and it is a much weaker case tha
 document set out to make.
 
 Note the second column of that table for the cache option: on Linux a smaller cache costs **0.7 us**
-per point read (4.8 -> 5.5 us) for **750 MB**. And because the budget is per *cursor*, an unset cache
+per point read (4.8 -> 5.4 us) for **750 MB**. And because the budget is per *cursor*, an unset cache
 means N cursors reserve N GiB - so this is worth more to multi-nest density than the encoding ever
 was.
 
