@@ -44,7 +44,8 @@ fn run(root: &Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), s)
 }
 
-const REQUIRED: &str = "# comment\nfmt · clippy · test\nbuild release\nreviewed-by signature\nJules approval\n";
+const REQUIRED: &str =
+    "# comment\nfmt · clippy · test\nbuild release\nreviewed-by signature\nJules approval\n";
 
 #[test]
 fn no_token_is_a_failure_not_a_pass() {
