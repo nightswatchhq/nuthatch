@@ -18,10 +18,93 @@
 //! they are the blocking primitive, and it is the caller's job to place them correctly.
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Builder, Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// redb's own default cache size, and therefore ours: **this constant is a no-op**, chosen so that
+/// making the value settable changes nothing until someone measures and picks another.
+///
+/// `redb::Builder::new()` calls `set_cache_size(1 GiB)`, split 90% read / 10% write, and nuthatch has
+/// never overridden it at any of its open sites. That matters more than it sounds, because redb 2.6
+/// does **not** mmap - `file_backend/unix.rs` preads into `Vec<u8>` - so every cached page is heap
+/// and lands in `VmRSS`, which is what non-negotiable 2 bounds.
+///
+/// Measured in `tests/bench_compact_rows.rs` against a 2.16 GB store, on Linux: RSS tracks this
+/// number almost one-for-one (1.00 GB at 1 GiB, 0.50 at 512 MiB, 0.25 at 256 MiB) and is
+/// **independent of the file**, while a point read costs +0.6 us going from 1 GiB to 256 MiB. The
+/// two live Lodestar cursors sit at 1.44 and 1.42 GB against their 2 GB, and the *larger* store has
+/// the *smaller* RSS - which a linear `RSS = k x file` cannot produce and a ceiling can.
+pub const HOT_STORE_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Floor on the override. Below this redb thrashes rather than caches, and a benchmark that asked
+/// for 1 MiB and silently got it would publish a latency curve whose right-hand end is meaningless.
+pub const HOT_STORE_CACHE_FLOOR: usize = 16 * 1024 * 1024;
+
+/// Ceiling on the override, deliberately equal to the default.
+///
+/// **This knob exists to lower a ceiling nobody chose, not to raise one.** Non-negotiable 2 is 2 GB
+/// per *cursor*, and the cache is per **store** - `Store::open` is called once per nest inside
+/// `build_nest`, so a cursor hosting N nests carries N of these. Two nests at the default already
+/// exceed a whole cursor's budget in cache alone. Letting an operator raise it past 1 GiB would hand
+/// them one environment variable that breaks the budget N times over, which is the shape of the
+/// per-nest-semaphore fault #1024 found in #1006's override. Same trap, so the same answer.
+///
+/// It is a *ceiling* rather than a reservation - redb fills it as pages are read - which is why a
+/// dense cursor of small nests survives today and a dense cursor of large ones would not.
+pub const HOT_STORE_CACHE_CEILING: usize = HOT_STORE_CACHE_BYTES;
+
+/// The live cache size: [`HOT_STORE_CACHE_BYTES`] unless `NUTHATCH_HOT_STORE_CACHE_BYTES` overrides.
+///
+/// **This exists so the value can be measured, not so it can be tuned casually** - the same reason
+/// and the same shape as [`crate::serve::sql_max_concurrency`]. #1046 asks for the RSS / point-read /
+/// tip-lag curve at 1 GiB, 512 MiB and 256 MiB on the box that enforces the budget; with a bare
+/// constant that needs three separate builds, which is how a ceiling ends up being set from whichever
+/// box was convenient. One binary, three settings, measured where it is enforced.
+///
+/// Refusals are loud and the value is clamped rather than silently accepted, so a run that requested
+/// something out of range cannot publish a curve that is flat for the wrong reason.
+pub fn hot_store_cache_bytes() -> usize {
+    match std::env::var("NUTHATCH_HOT_STORE_CACHE_BYTES") {
+        Err(_) => HOT_STORE_CACHE_BYTES,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = HOT_STORE_CACHE_BYTES,
+                    "NUTHATCH_HOT_STORE_CACHE_BYTES is not a positive integer; using the default"
+                );
+                HOT_STORE_CACHE_BYTES
+            }
+            Ok(n) if n < HOT_STORE_CACHE_FLOOR => {
+                tracing::warn!(
+                    requested = n,
+                    floor = HOT_STORE_CACHE_FLOOR,
+                    "NUTHATCH_HOT_STORE_CACHE_BYTES below the floor; clamping. Below this redb                      thrashes rather than caches and point-read latency stops meaning anything (#1046)"
+                );
+                HOT_STORE_CACHE_FLOOR
+            }
+            Ok(n) if n > HOT_STORE_CACHE_CEILING => {
+                tracing::warn!(
+                    requested = n,
+                    ceiling = HOT_STORE_CACHE_CEILING,
+                    "NUTHATCH_HOT_STORE_CACHE_BYTES above the ceiling; clamping. The cache is per                      store and one cursor holds one per nest, so raising it multiplies against a 2 GB                      per-cursor budget (#1046)"
+                );
+                HOT_STORE_CACHE_CEILING
+            }
+            Ok(n) => n,
+        },
+    }
+}
+
+/// A redb builder carrying the configured cache size. Every open site in this file goes through it,
+/// so none of them can quietly keep redb's default.
+fn builder() -> Builder {
+    let mut b = Builder::new();
+    b.set_cache_size(hot_store_cache_bytes());
+    b
+}
 
 const ENTITIES: TableDefinition<&str, &str> = TableDefinition::new("entities");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
@@ -280,7 +363,8 @@ pub struct Store {
 /// Errors are returned rather than folded into `false`: an unreadable store is not an empty one, and
 /// the caller is the only one who knows which way to be wrong about it.
 pub fn store_holds_rows(path: &Path) -> Result<bool> {
-    let db = Database::open(path)
+    let db = builder()
+        .open(path)
         .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
     let rtx = db.begin_read()?;
     let meta = rtx.open_table(META)?;
@@ -300,7 +384,8 @@ pub fn store_holds_rows(path: &Path) -> Result<bool> {
 impl Store {
     /// Open the store at `path`, **creating it if it is not there**. What a cursor starting up wants.
     pub fn open(path: &Path) -> Result<Store> {
-        let db = Database::create(path)
+        let db = builder()
+            .create(path)
             .with_context(|| format!("failed to open redb at {}", path.display()))?;
         Store::from_db(db)
     }
@@ -327,7 +412,8 @@ impl Store {
     /// read wouldn't hit redb's raw `TableDoesNotExist` instead of an answer. A read txn proves the
     /// same thing without committing - see the explicit check below.
     pub fn open_existing(path: &Path) -> Result<Store> {
-        let db = Database::open(path)
+        let db = builder()
+            .open(path)
             .with_context(|| format!("failed to open an existing redb at {}", path.display()))?;
         {
             let rtx = db.begin_read().with_context(|| {
