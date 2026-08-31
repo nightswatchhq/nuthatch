@@ -145,6 +145,12 @@ read this repository, and it must reach the fixture RPC on loopback. Only all th
 probe that simply fails would otherwise read as isolation, which is how this class of check usually
 goes wrong.
 
+Reachability is **proved**, never assumed: curl, wget and python3 are each tried, and *none of them
+existing is a refusal rather than a pass*. An earlier version ran `curl || echo NOCURL` and skipped
+the check when the tool was missing, so a `--network none` image without curl sailed through the
+very leg meant to prove reachability - and the subject would have taken a false zero somewhere it
+could never index.
+
 All three legs are mutation-checked in `--self-test`: rejecting at *any* of them makes the
 acceptance case fail, so a `verify_sandbox` that refuses everything cannot pass CI while leaving the
 eval unrunnable. The acceptance case runs against a real fixture chain and requires a clean return -

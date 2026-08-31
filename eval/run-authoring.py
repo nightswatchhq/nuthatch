@@ -244,18 +244,46 @@ def verify_sandbox(template: str, rpc_port: int) -> None:
                 "the filesystem - a container, `bwrap --ro-bind`, `sandbox-exec -f`."
             )
 
-        # (3) Loopback must reach the fixture chain, or nothing can be indexed from inside.
-        code, body = run(
-            f"sh -c 'command -v curl >/dev/null && curl -fsS -m 5 "
-            f"http://127.0.0.1:{rpc_port}/control/state || echo NOCURL'"
-        )
-        if "NOCURL" not in body and (code != 0 or not body.strip()):
+        # (3) Loopback must reach the fixture chain, **proved**, not assumed.
+        #
+        # The first version ran `curl ... || echo NOCURL` and then skipped the failure whenever
+        # NOCURL appeared - so a `--network none` image with `sh` and no curl sailed through the leg
+        # meant to prove reachability, and the subject would have run somewhere it could never
+        # index, taking a false zero. Absent evidence reading as healthy is the failure this project
+        # keeps finding, and here it was written into the check itself.
+        #
+        # Several tools are tried because images differ; **none of them existing is a refusal**, not
+        # a pass. The subject has to make HTTP requests from in there regardless.
+        state, reached = None, False
+        for probe in (
+            f"curl -fsS -m 5 http://127.0.0.1:{rpc_port}/control/state",
+            f"wget -qO- -T 5 http://127.0.0.1:{rpc_port}/control/state",
+            "python3 -c \"import urllib.request as u;"
+            f"print(u.urlopen('http://127.0.0.1:{rpc_port}/control/state',timeout=5).read().decode())\"",
+        ):
+            tool = probe.split()[0]
+            code, body = run(f"command -v {tool} >/dev/null 2>&1 || exit 97; {probe}")
+            if code == 97:
+                continue  # not in this image; try the next
+            state = body
+            if code == 0 and "mode" in body:
+                reached = True
+                break
+        if not reached:
             die(
-                f"the sandbox cannot reach the fixture RPC on 127.0.0.1:{rpc_port}. The subject\n"
-                "would be unable to index, and every run would fail criteria 2 and 3 for a reason\n"
-                "that has nothing to do with the agent. Give the sandbox host loopback, e.g.\n"
-                "  --sandbox 'docker run --rm --network host -v {workdir}:{workdir} -w {workdir} ...'"
+                f"the sandbox could not reach the fixture RPC on 127.0.0.1:{rpc_port}.\n"
+                "\n"
+                + ("None of curl, wget or python3 exists inside it, so reachability cannot be\n"
+                   "established - and it is not assumed. The subject must make HTTP requests from\n"
+                   "in there, so the image needs one of them."
+                   if state is None else
+                   f"  got: {str(state).strip()[:200]}")
+                + "\n\nThe subject would be unable to index and every run would fail criteria 2 and 3\n"
+                "for a reason that has nothing to do with the agent. Give the sandbox host loopback,\n"
+                "e.g. --sandbox 'docker run --rm --network host -v {workdir}:{workdir} -w {workdir} ...'"
             )
+
+
 
 
 def spawn_group(command, **kwargs) -> tuple[subprocess.Popen, int]:
@@ -643,6 +671,29 @@ def self_test() -> int:
         except SystemExit as exit_:
             check("hiding only the answer key is not isolation",
                   "does not isolate this repository" in str(exit_),
+                  f"refused for another reason: {str(exit_)[:160]}")
+
+    # A sandbox with no way to make an HTTP request must be **refused**, not waved through. The
+    # first version ran `curl || echo NOCURL` and skipped the check when the tool was missing, so a
+    # `--network none` image without curl passed the very leg meant to prove reachability. Absent
+    # evidence is not evidence.
+    with tempfile.TemporaryDirectory(prefix="nuthatch-notools-") as tmp:
+        gate = Path(tmp) / "notools.sh"
+        gate.write_text(
+            "#!/bin/sh\n"
+            "# Confines the repository and hides every HTTP client, leaving the rest usable - i.e.\n"
+            "# a working image on a network the fixture is not on.\n"
+            f"case \"$*\" in *{ROOT}*) exit 13 ;; esac\n"
+            "case \"$*\" in *curl*|*wget*|*urllib*) exit 97 ;; esac\n"
+            "exec \"$@\"\n"
+        )
+        gate.chmod(0o755)
+        try:
+            verify_sandbox(f"{gate} ", 9)
+            check("a sandbox with no HTTP client is refused", False, "accepted it")
+        except SystemExit as exit_:
+            check("a sandbox with no HTTP client is refused",
+                  "could not reach the fixture RPC" in str(exit_),
                   f"refused for another reason: {str(exit_)[:160]}")
 
     # **The positive case, with no escape hatch.**

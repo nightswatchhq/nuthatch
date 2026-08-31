@@ -51,6 +51,7 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "a pass-through prefix is rejected as a sandbox",
         "an unusable sandbox is rejected, not mistaken for isolation",
         "hiding only the answer key is not isolation",
+        "a sandbox with no HTTP client is refused",
         "a confining sandbox is accepted",
         "a malformed /sql shape is fatal (rows is null)",
         "the reap check has a live child to kill (normal exit)",
