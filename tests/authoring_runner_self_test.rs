@@ -47,6 +47,9 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "the builder skill the subject is given exists",
         "an unindexed nest scores rather than aborting",
         "a malformed /sql shape is fatal (rows is null)",
+        "the reap check has a live child to kill (normal exit)",
+        "a backgrounded child is reaped (normal exit)",
+        "a backgrounded child is reaped (timeout)",
     ] {
         assert!(
             stdout.contains(probe),

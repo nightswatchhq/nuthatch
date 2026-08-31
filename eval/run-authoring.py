@@ -23,6 +23,8 @@ Fully offline: `scripts/fixture_rpc.py` serves the chain over loopback and the A
 
 import argparse
 import json
+import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -162,6 +164,47 @@ def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str]:
 
 
 # --- the subject ---------------------------------------------------------------------------------
+def spawn_group(command, **kwargs) -> tuple[subprocess.Popen, int]:
+    """Start a process as the leader of a new group, and capture that group id **now**.
+
+    Capturing it at spawn is the whole point. Reaping via `os.getpgid(proc.pid)` after the fact
+    looks equivalent and is not: once the leader has exited and been waited on, that call raises
+    `ProcessLookupError` and the surviving children are never signalled at all. Found by writing a
+    self-test that backgrounds a real child and checks whether it is still running - it was, on the
+    normal-exit path, which is the common one.
+    """
+    proc = subprocess.Popen(command, start_new_session=True, **kwargs)
+    return proc, os.getpgid(proc.pid)
+
+
+def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
+    """Kill a subject's entire process group and wait for it to be gone.
+
+    `SIGTERM` first so a `dev` gets to close its store cleanly, then `SIGKILL` for anything that
+    ignores it. `ProcessLookupError` is swallowed because a group that is already gone is the
+    outcome wanted, not an error.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            continue
+        # The leader is gone; confirm the group is too before returning, since a stray `dev` in it
+        # would still hold the redb lock.
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
     """One isolated agent with the builder skill and a shell, and nothing else.
 
@@ -186,12 +229,30 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
         "You are working in a shell. The nuthatch builder skill is installed; consult it.",
         "--", statement,
     ]
-    # Its own process group, so anything the subject backgrounded - a `dev` it forgot to stop -
-    # is reaped when its turn ends. Without this a stray `dev` keeps the exclusive redb lock and
-    # the scorer cannot open the store at all.
-    completed = subprocess.run(
-        command, cwd=workdir, capture_output=True, text=True, timeout=args.timeout,
-        start_new_session=True,
+    # Its own process group, **and actually killed**.
+    #
+    # The previous version passed `start_new_session=True` and a comment saying anything the subject
+    # backgrounded "is reaped when its turn ends". It is not: that flag *creates* a session, it does
+    # not end one, and `subprocess.run(timeout=...)` raises without touching the group either. So a
+    # subject that backgrounded `nuthatch dev` left it alive holding the nest's exclusive redb lock;
+    # the scorer's `serve` could then not open the store at all, and criterion 2 would sit in a
+    # 180-second poll before failing for a reason that had nothing to do with the agent.
+    #
+    # Killing the group on **every** path - normal exit, timeout, and anything else - is what makes
+    # one run isolated from the next. Reaped before scoring, so the lock is provably gone.
+    proc, pgid = spawn_group(
+        command, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stdout, stderr = "", f"subject exceeded {args.timeout}s"
+    finally:
+        reap_group(proc, pgid)
+    completed = subprocess.CompletedProcess(
+        command, -1 if timed_out else (proc.returncode or 0), stdout or "", stderr or ""
     )
     model = None
     for line in completed.stdout.splitlines():
@@ -443,6 +504,50 @@ def self_test() -> int:
                     check(f"a malformed /sql shape is fatal ({label})", False, "scored it instead")
                 except ScoringUnavailable:
                     check(f"a malformed /sql shape is fatal ({label})", True)
+
+    # The high-severity case review found: a subject that backgrounds a long-lived child must not
+    # leave it alive holding the nest's redb lock. `start_new_session=True` alone does not do this -
+    # it creates the group, it does not end it.
+    #
+    # **With a positive control**, because the first version of this check was inert: the child was
+    # spawned through nested `-c` quoting, never actually started, and the marker therefore never
+    # appeared whether or not anything was killed. Neutering `os.killpg` left it green. So the check
+    # now proves the child is running *before* it proves it stopped.
+    for label, timeout in [("normal exit", 30.0), ("timeout", 1.0)]:
+        with tempfile.TemporaryDirectory(prefix="nuthatch-reap-") as tmp:
+            marker = Path(tmp) / "alive"
+            child = Path(tmp) / "child.py"
+            child.write_text(
+                "import pathlib, time\n"
+                f"m = pathlib.Path({str(marker)!r})\n"
+                "while True:\n    m.touch()\n    time.sleep(0.05)\n"
+            )
+            parent = Path(tmp) / "parent.py"
+            parent.write_text(
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+                f"time.sleep({30 if timeout < 5 else 0.4})\n"
+            )
+            proc, pgid = spawn_group([sys.executable, str(parent)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # Positive control: the backgrounded child must genuinely be running, or this proves
+            # nothing about reaping.
+            alive = wait_for("the backgrounded child to start", 10, lambda: marker.exists() or None)
+            check(f"the reap check has a live child to kill ({label})", alive is not None,
+                  "the child never started, so the reap assertion below would be vacuous")
+
+            try:
+                proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                reap_group(proc, pgid)
+
+            marker.unlink(missing_ok=True)
+            time.sleep(0.5)
+            check(f"a backgrounded child is reaped ({label})", not marker.exists(),
+                  "the child is still running and would hold the redb lock")
 
     print("self-test: " + ("PASS" if not failures else f"FAIL ({', '.join(failures)})"))
     return 1 if failures else 0
