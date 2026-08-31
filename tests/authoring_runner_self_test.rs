@@ -48,6 +48,8 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "an unindexed nest scores rather than aborting",
         "an unservable nest scores rather than aborting",
         "a run without a sandbox is refused",
+        "a operator-asserted report is labelled operator-asserted",
+        "a enforced-by-runner report is labelled enforced-by-runner",
         "a pass-through prefix is rejected as a sandbox",
         "an unusable sandbox is rejected, not mistaken for isolation",
         "hiding only the answer key is not isolation",

@@ -114,52 +114,43 @@ Two things the board caught while being built, both by mutating it rather than b
   numeric comparison removed entirely, because `json.dumps(3600)` is `"3600"`. It takes a float to
   discriminate.
 
-### The subject must be sandboxed, and the runner refuses without one
+### Isolation: enforced by construction, or labelled as asserted
 
-`--sandbox` is **required**. It takes a command prefix that confines the subject to its working
-directory - a container runner, `sandbox-exec -f`, `bwrap --ro-bind` - and is recorded in the report,
-because a score is only as trustworthy as the isolation behind it.
+The subject must not be able to read this repository. `eval/authoring.toml` carries the expected
+result, and `tests/authoring_eval_board.rs` carries the same fixture values, the expected total and
+the canned query verbatim - an agent that finds either scores 3/3 without building anything, and the
+failure is silent and flattering.
 
-The first version of this runner set the subject's `cwd` to a temporary directory, described that as
-isolation, and enforced nothing: the agent could read `eval/authoring.toml`, lift the expected
-result, and score 3/3 by **discovering this repository** rather than by knowing how to build a nest.
-Changing a working directory is not isolation, and the failure is silent and flattering, which is the
-worst combination available. So the refusal is the default and there is no override.
+Exactly one of two modes is required; there is no default.
 
-**It is a template, not a prefix.** `{workdir}` and `{rpc_port}` are substituted per run. The first
-interface took a fixed prefix supplied *before* the runner had created any workdir, so it pointed at
-a directory that did not exist: the probe could not read its own control file and a container that
-did start could reach neither the ABI nor the loopback RPC. Every keyed run would have been rejected
-or unable to author anything - a required interface that could never be used. **The workdir must be
-mounted at the same absolute path**, since the subject is handed host paths for the ABI and nest.
+**`--docker-image IMG` - enforced.** The runner builds the whole `docker run` itself, mounting only
+the workdir (at its own path, so the ABI and nest paths stay valid) with `--network host` for the
+fixture chain. The repository is **not mounted**, so it is unreachable *by construction*.
 
-```sh
---sandbox 'docker run --rm --network host -v {workdir}:{workdir} -w {workdir} <image>'
+**`--sandbox TEMPLATE` - asserted.** Your own confinement, with `{workdir}` and `{rpc_port}`
+substituted. Sanity-checked for usability, and **not enforcement**.
+
+The distinction is a limit rather than laziness: **probing cannot prove the absence of a
+capability.** An earlier design tested an operator template against a fixed set of commands and
+paths, and four rounds of review kept finding the same defeat - a wrapper that rejects exactly those
+probes and permits everything else passes every one, after which the subject reads the repository by
+relative path, by building the path at runtime, or through an API the probes never considered. Each
+new probe is one more special case for a wrapper to know about. So the runner stopped claiming what
+it cannot check, and every report records which mode produced it:
+
+```json
+"isolation": "enforced-by-runner" | "operator-asserted"
 ```
 
-**And the sandbox is verified, not believed.** Requiring the flag to be non-empty was still operator
-honesty with extra steps: `--sandbox env` satisfies it while handing the subject the entire
-filesystem. Before any run, the runner probes *through the operator's own prefix*, two-sided -
-it must be able to read a file in the subject's workdir at its host path, it must **not** be able to
-read this repository, and it must reach the fixture RPC on loopback. Only all three mean confined. A
-probe that simply fails would otherwise read as isolation, which is how this class of check usually
-goes wrong.
+Only `enforced-by-runner` may be published as an isolated score.
 
-Reachability is **proved**, never assumed: curl, wget and python3 are each tried, and *none of them
-existing is a refusal rather than a pass*. An earlier version ran `curl || echo NOCURL` and skipped
-the check when the tool was missing, so a `--network none` image without curl sailed through the
-very leg meant to prove reachability - and the subject would have taken a false zero somewhere it
-could never index.
+### What the probes still do
 
-All three legs are mutation-checked in `--self-test`: rejecting at *any* of them makes the
-acceptance case fail, so a `verify_sandbox` that refuses everything cannot pass CI while leaving the
-eval unrunnable. The acceptance case runs against a real fixture chain and requires a clean return -
-an earlier version ran it against a dead port and counted the resulting refusal as success, which
-guarded nothing.
-
-The repository leg is probed at **several** paths, not one: `tests/authoring_eval_board.rs` carries
-the same fixture values, the expected total and the canned query verbatim, so a sandbox that hides
-`eval/authoring.toml` alone gives away exactly as much and is refused.
+Both modes are checked for **usability**, because a confinement the subject cannot work in yields a
+false zero - a number that looks like an agent failing and is actually a broken environment. The
+sandbox must read a file in the workdir at its host path, and must reach the fixture RPC on
+loopback. Reachability is proved, never assumed: curl, wget and python3 are each tried and *none of
+them existing is a refusal rather than a pass*.
 
 ### Scoring does not depend on what the agent names things
 

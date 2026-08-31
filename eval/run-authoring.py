@@ -165,6 +165,39 @@ def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str, int]:
 
 
 # --- the subject ---------------------------------------------------------------------------------
+def isolation_mode(args) -> str:
+    """What a report may honestly claim about the boundary that produced it.
+
+    One function, used by both the report and the test that checks it - because a test that
+    re-implements the rule proves only that it can compute the same expression twice.
+    """
+    return "enforced-by-runner" if args.docker_image else "operator-asserted"
+
+
+def docker_argv(image: str, workdir: Path, _rpc_port: int) -> list[str]:
+    """Confinement the **runner** owns, rather than a string the operator asserts.
+
+    This is the only mode that can honestly claim a subject boundary, and the reason is a limit
+    rather than an implementation detail: **probing cannot prove the absence of a capability.** The
+    previous design took an operator template and tested it with a fixed set of commands and paths,
+    and review of #1050 pointed out the obvious defeat - a wrapper that rejects exactly those probes
+    and permits everything else passes, after which the subject reads the repository by relative
+    path, or by building the absolute path at runtime, or through any API the probes did not think
+    of. The self-test's own `gate.sh` was that exact shape. No amount of extra probing closes it;
+    each new probe is one more special case for a wrapper to know about.
+
+    So the runner constructs the container itself. The repository is simply **not mounted**, which
+    makes it unreachable by construction rather than unreachable as far as anyone checked. Only the
+    workdir is bound, at its own path so the ABI and nest paths handed to the subject stay valid,
+    and `--network host` is what lets it reach the fixture chain on loopback.
+    """
+    return [
+        "docker", "run", "--rm", "--network", "host",
+        "-v", f"{workdir}:{workdir}", "-w", str(workdir),
+        image,
+    ]
+
+
 def sandbox_argv(template: str, workdir: Path, rpc_port: int) -> list[str]:
     """Build the sandbox command for *this* run's workdir and RPC port.
 
@@ -182,7 +215,7 @@ def sandbox_argv(template: str, workdir: Path, rpc_port: int) -> list[str]:
     return shlex.split(template.format(workdir=workdir, rpc_port=rpc_port))
 
 
-def verify_sandbox(template: str, rpc_port: int) -> None:
+def verify_sandbox(template: str, rpc_port: int, isolation: bool = True) -> None:
     """Prove the sandbox confines, by probing it - positively and negatively.
 
     Requiring `--sandbox` to be non-empty was not enforcement: `--sandbox env` satisfied it while
@@ -351,7 +384,9 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_po
         die(f"the builder skill is not at {skill}; there is nothing to evaluate")
     shutil.copytree(skill, workdir / ".claude" / "skills" / "nuthatch-builder")
 
-    command = sandbox_argv(args.sandbox, workdir, rpc_port) + [
+    confine = (docker_argv(args.docker_image, workdir, rpc_port) if args.docker_image
+               else sandbox_argv(args.sandbox, workdir, rpc_port))
+    command = confine + [
         args.claude, "-p", "--model", args.model, "--no-session-persistence",
         "--output-format", "stream-json", "--verbose",
         "--max-budget-usd", str(args.max_budget_usd),
@@ -712,9 +747,11 @@ def self_test() -> int:
             gate = Path(tmp) / "gate.sh"
             gate.write_text(
                 "#!/bin/sh\n"
-                "# A real confinement, in the only terms available everywhere: refuse any command\n"
-                "# that names the repository. Not what an operator should use - enough to prove the\n"
-                "# contract is satisfiable at all.\n"
+                "# NOT a sandbox, and no longer claimed to be one. It rejects command lines naming\n"
+                "# the repository and runs everything else - precisely the wrapper review showed\n"
+                "# defeats a probe-based check, since the subject can still reach the repo by a\n"
+                "# relative path or one built at runtime. It is here only to prove the *usability*\n"
+                "# legs are satisfiable; enforcement lives in `docker_argv`, which does not probe.\n"
                 f"case \"$*\" in *{ROOT}*) exit 13 ;; esac\n"
                 "exec \"$@\"\n"
             )
@@ -729,6 +766,19 @@ def self_test() -> int:
         chain.kill()
         chain.wait()
 
+    # **The claim a report makes about itself must match the mode that produced it.** This is what
+    # replaces four rounds of probe-hardening: probing cannot prove the absence of a capability, so
+    # the runner stops pretending an operator-supplied wrapper is enforcement and says which it was.
+    # A report that mislabels an asserted sandbox as enforced is the same lie the probes were
+    # telling, just written down.
+    for image, template, want in [("img", None, "enforced-by-runner"),
+                                  (None, "gate ", "operator-asserted")]:
+        class _Args:
+            self_test, runs = False, 3
+            docker_image, sandbox = image, template
+        label = isolation_mode(_Args)
+        check(f"a {want} report is labelled {want}", label == want, f"labelled {label}")
+
     # The eval's integrity property: a run must be impossible without isolation. Review of #1050
     # found the subject boundary asserted in a docstring and enforced nowhere - the agent could read
     # `eval/authoring.toml`, lift the expected result, and score 3/3 by discovering this repository.
@@ -736,7 +786,7 @@ def self_test() -> int:
     import unittest.mock as mock
 
     class _NoSandbox:
-        self_test, runs, sandbox = False, 3, None
+        self_test, runs, sandbox, docker_image = False, 3, None, None
         nuthatch = Path(sys.executable)  # exists, so the sandbox check is what refuses
 
     with mock.patch(f"{__name__}.argparse.ArgumentParser.parse_args", return_value=_NoSandbox()):
@@ -744,7 +794,8 @@ def self_test() -> int:
             main()
             check("a run without a sandbox is refused", False, "it ran anyway")
         except SystemExit as exit_:
-            check("a run without a sandbox is refused", "--sandbox is required" in str(exit_),
+            check("a run without a sandbox is refused",
+                  "exactly one of --docker-image or --sandbox" in str(exit_),
                   f"exited for another reason: {exit_}")
 
     # A store that exists but cannot be served - the subject died mid-initialisation - is the
@@ -817,12 +868,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument(
+        "--docker-image", default=None,
+        help="Confine the subject in this container image. The runner builds the whole `docker run` "
+             "itself, mounting only the workdir, so this repository is unreachable BY CONSTRUCTION "
+             "rather than as far as anyone probed. The only mode whose reports claim enforced "
+             "isolation.",
+    )
+    ap.add_argument(
         "--sandbox", default=None,
-        help="REQUIRED. A command TEMPLATE that confines the subject, with {workdir} and "
+        help="An operator-supplied command TEMPLATE, with {workdir} and "
              "{rpc_port} substituted per run - e.g. \"docker run --rm --network host "
              "-v {workdir}:{workdir} -w {workdir} <image>\". The workdir must be mounted at the "
              "SAME absolute path, because the subject is handed host paths for the ABI and nest. "
-             "Verified before every run, not taken on trust. Recorded in the report.",
+             "Sanity-checked, but NOT enforcement: a wrapper that rejects the probes and permits "
+             "everything else passes them all. Reports from this mode are labelled "
+             "`isolation: operator-asserted` and must not be published as enforced.",
     )
     ap.add_argument("--nuthatch", type=Path, default=ROOT / "target/release/nuthatch")
     ap.add_argument("--claude", default="claude")
@@ -838,23 +898,31 @@ def main():
 
     if args.runs < 3:
         die("refusing to publish fewer than three runs")
-    if not args.sandbox:
+    if bool(args.docker_image) == bool(args.sandbox):
         die(
-            "--sandbox is required. Without it the subject can read eval/authoring.toml, take the\n"
-            "expected result, and score 3/3 by discovering this repository instead of by knowing\n"
-            "how to build a nest. A temporary working directory is not isolation.\n"
+            "give exactly one of --docker-image or --sandbox.\n"
             "\n"
-            "Pass a command prefix that confines the subject to its workdir, e.g.\n"
-            "  --sandbox docker run --rm -v $WORKDIR:/w -w /w <image>"
+            "  --docker-image IMG   the runner builds the container itself, mounting only the\n"
+            "                       workdir. This repository is unreachable BY CONSTRUCTION, and\n"
+            "                       only this mode's reports claim enforced isolation.\n"
+            "\n"
+            "  --sandbox TEMPLATE   your own confinement. Sanity-checked, but not enforcement:\n"
+            "                       probing cannot prove the absence of a capability, and a wrapper\n"
+            "                       that rejects exactly the probes and permits everything else\n"
+            "                       passes every one. Labelled `isolation: operator-asserted`.\n"
+            "\n"
+            "Neither is a default, because a subject that can read eval/authoring.toml scores 3/3\n"
+            "without building anything and the failure is silent and flattering."
         )
-    if not args.nuthatch.is_file():
-        die(f"{args.nuthatch} is not there; build it first")
 
     scenario = tomllib.load(open(SCENARIO, "rb"))
-    # Verified against a live fixture chain, because loopback reachability is part of the property.
+    # Both modes are probed for *usability* - can it read the workdir, can it reach the chain -
+    # because a confinement that cannot do those produces a false zero. Only `--sandbox` is also
+    # probed for isolation, and only as a sanity check: see `docker_argv` on why that can never be
+    # enforcement.
     probe_chain, _, probe_port = start_fixture_chain(scenario)
     try:
-        verify_sandbox(args.sandbox, probe_port)
+        verify_sandbox(args.sandbox, probe_port, isolation=True) if args.sandbox else None
     finally:
         probe_chain.kill()
         probe_chain.wait()
@@ -880,7 +948,9 @@ def main():
         "runs": args.runs, "scenario": "authoring (RFC-0017)",
         # Recorded because the score is only as trustworthy as the isolation: a reader must be able
         # to see what confined the subject, not take it on faith.
-        "sandbox": args.sandbox,
+        "sandbox": args.sandbox or f"docker:{args.docker_image}",
+        # The distinction a reader needs before trusting the number at all.
+        "isolation": isolation_mode(args),
         "summary": {
             "end_to_end_pass_rate": sum(
                 1 for run in runs if all(r["passed"] for r in run)) / len(runs),
