@@ -66,6 +66,48 @@ impl LogFilter {
     }
 }
 
+/// A source for a role that **never polls one** (#815).
+///
+/// `serve_role` owns no cursor - its own comment says "No `Source` is ever polled on this role; the
+/// parameter exists for the ingest half we discard" - and yet it built an [`RpcClient`] from
+/// `config.nest.rpc_urls` to satisfy `build_nest`, whose first parameter is named `_source` and is
+/// unused. A vestigial dependency, and not a harmless one: a nest with `rpc_urls = []` could not be
+/// served at all, failing with `no RPC URLs configured`.
+///
+/// That shape is not exotic. It is exactly a **finished, fully-sealed nest** with no chain behind it
+/// any more - including the RFC-0016 eval fixture, which is why this was found. The production
+/// read-only shadow on the Lodestar box only starts because it happens to carry URLs it never uses.
+///
+/// Every method errors rather than returning an empty success. If a future change starts polling on
+/// a serve-only role, it must fail loudly at the first call rather than silently indexing nothing -
+/// an empty result here would be indistinguishable from "the chain had nothing", which is the
+/// asymmetry `block_headers` already documents below.
+pub struct UnpolledSource;
+
+#[async_trait::async_trait]
+impl Source for UnpolledSource {
+    async fn tip(&self) -> Result<u64> {
+        anyhow::bail!(
+            "this role serves a nest without indexing it and has no ingestion source; something \
+             asked it for the chain tip, which means a cursor is running where none should be"
+        )
+    }
+
+    async fn block_hash(&self, _number: u64) -> Result<Option<String>> {
+        anyhow::bail!(
+            "this role serves a nest without indexing it and has no ingestion source; something \
+             asked it for a block hash, which means reorg detection is running where none should be"
+        )
+    }
+
+    async fn logs(&self, _filter: &LogFilter, _from: u64, _to: u64) -> Result<Vec<Log>> {
+        anyhow::bail!(
+            "this role serves a nest without indexing it and has no ingestion source; something \
+             asked it for logs, which means an ingest loop is running where none should be"
+        )
+    }
+}
+
 /// Everything the indexer needs from an ingestion source. Pull-shaped: the single-cursor loop asks
 /// for the tip, verifies canonical hashes (reorg detection), and requests decoded logs for a range.
 #[async_trait::async_trait]
