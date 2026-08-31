@@ -104,19 +104,71 @@ fn main() {
 /// A file with no `CREATE VIEW` at all is treated as a single bare select, which is what the
 /// standalone query files look like.
 fn view_bodies(body: &str) -> Vec<(String, String)> {
+    // **Positions inside a string literal or a quoted identifier are not code** (#1023, caught in
+    // review). The first version of this scanner searched the raw uppercased text, so
+    //
+    //     CREATE VIEW v AS SELECT 'CREATE VIEW fake AS SELECT 1;' AS text;
+    //
+    // reported **two** views, invented one called `fake`, and truncated `v` at the literal - after
+    // which both failed to parse on both engines. A probe whose job is to count views must not be
+    // able to hallucinate one out of a string. The earlier false-positive test used `CREATE TABLE`,
+    // a sequence this scanner never matched, so it passed while covering nothing.
+    //
+    // SQL escapes a quote inside a string by doubling it; double quotes delimit identifiers. Line
+    // comments are already stripped by the caller.
+    let bytes = body.as_bytes();
+    let mut code = vec![false; bytes.len()];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                code[i] = true;
+                i += 1;
+            }
+        }
+    }
+
     let up = body.to_ascii_uppercase();
-    let mut heads: Vec<(usize, usize, String)> = Vec::new(); // (start of CREATE, end of AS, name)
+    let mut heads: Vec<(usize, usize, String)> = Vec::new();
     let mut at = 0usize;
     while let Some(rel) = up[at..].find("CREATE") {
         let c = at + rel;
         at = c + 6;
-        // token boundary before CREATE
+        if !code.get(c).copied().unwrap_or(false) {
+            continue;
+        }
         if c > 0 && (up.as_bytes()[c - 1] as char).is_alphanumeric() {
             continue;
         }
         let rest = &up[c..];
-        // CREATE [OR REPLACE] [TEMP|TEMPORARY] VIEW
         let Some(v) = rest.find("VIEW") else { continue };
+        if !code.get(c + v).copied().unwrap_or(false) {
+            continue;
+        }
         let between = &rest[6..v];
         if !between
             .split_whitespace()
@@ -125,7 +177,6 @@ fn view_bodies(body: &str) -> Vec<(String, String)> {
             continue;
         }
         let after_view = c + v + 4;
-        // name, then AS
         let name: String = body[after_view..]
             .trim_start()
             .chars()
@@ -201,14 +252,54 @@ mod tests {
         assert_eq!(got[0].1, "SELECT 1 AS x");
     }
 
-    /// The false-positive direction: `CREATE TABLE` is not a view and must not be split on.
+    /// The false-positive direction, and the case the first version of this test **missed**.
+    ///
+    /// It used `'CREATE TABLE x'`, a sequence this scanner never matched, so it passed while
+    /// covering nothing. What matters is `CREATE VIEW` inside a literal - review caught it (#1023),
+    /// and unfixed it reported two views for this one-view file and truncated the real one.
     #[test]
-    fn create_table_is_not_mistaken_for_a_view() {
+    fn create_view_inside_a_string_literal_is_not_a_view() {
+        let got = view_bodies("CREATE VIEW v AS SELECT 'CREATE VIEW fake AS SELECT 1;' AS text;");
+        assert_eq!(
+            got.len(),
+            1,
+            "a literal containing CREATE VIEW invented a view: {got:?}"
+        );
+        assert_eq!(got[0].0, "v");
+        assert!(
+            got[0].1.contains("AS text"),
+            "the real view's body was truncated at the literal: {:?}",
+            got[0].1
+        );
+    }
+
+    #[test]
+    fn create_table_in_a_literal_is_not_a_view_either() {
         let got = view_bodies("CREATE VIEW v AS SELECT * FROM t WHERE k = 'CREATE TABLE x';");
         assert_eq!(
             got.len(),
             1,
             "a literal mentioning CREATE TABLE split the file: {got:?}"
         );
+    }
+
+    /// A doubled quote escapes a quote inside a SQL string. A scanner that reads the second as a
+    /// terminator resumes "code" mode in the middle of a literal.
+    #[test]
+    fn an_escaped_quote_does_not_end_the_literal() {
+        let got = view_bodies("CREATE VIEW v AS SELECT 'it''s CREATE VIEW nope AS x' AS t;");
+        assert_eq!(
+            got.len(),
+            1,
+            "an escaped quote let the scanner out of the string: {got:?}"
+        );
+        assert_eq!(got[0].0, "v");
+    }
+
+    /// A quoted identifier is not code either.
+    #[test]
+    fn a_quoted_identifier_containing_the_keyword_is_not_a_view() {
+        let got = view_bodies("CREATE VIEW v AS SELECT x AS \"CREATE VIEW y AS\" FROM t;");
+        assert_eq!(got.len(), 1, "a quoted identifier split the file: {got:?}");
     }
 }
