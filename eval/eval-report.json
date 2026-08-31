@@ -1,0 +1,143 @@
+{
+  "date": "2026-08-31",
+  "commit": "4bc5402e901e74b27d472f9e31a59fa1022ec855",
+  "model": "claude-sonnet-5",
+  "temperature": 1.0,
+  "question_set_hash": "6006cc59b282f1f9bd470d572023d2b4bcaffe2dadc5138af37d6622d987b848",
+  "runs": 3,
+  "summary": {
+    "first_try_pass_rate": 0.0,
+    "overall_pass_rate": 0.0,
+    "mean_sql_attempts": 1.2666666666666666,
+    "by_class": {
+      "aggregation": 0.0,
+      "big-int": 0.0,
+      "coverage": 0.0,
+      "filter": 0.0,
+      "group-by": 0.0,
+      "reserved-word": 0.0
+    }
+  },
+  "results": [
+    {
+      "id": "count-all",
+      "class": "aggregation",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 1
+    },
+    {
+      "id": "sum-value-bigint",
+      "class": "big-int",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 2,
+      "tool_calls": 3
+    },
+    {
+      "id": "max-value",
+      "class": "big-int",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "min-value",
+      "class": "big-int",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "avg-value",
+      "class": "aggregation",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 2,
+      "tool_calls": 3
+    },
+    {
+      "id": "reserved-word-from",
+      "class": "reserved-word",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 3
+    },
+    {
+      "id": "reserved-word-to",
+      "class": "reserved-word",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 3
+    },
+    {
+      "id": "sum-by-sender",
+      "class": "big-int",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 3
+    },
+    {
+      "id": "distinct-senders",
+      "class": "aggregation",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "distinct-receivers",
+      "class": "aggregation",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "block-range",
+      "class": "coverage",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "filter-by-block",
+      "class": "filter",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    },
+    {
+      "id": "top-receiver",
+      "class": "aggregation",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 2,
+      "tool_calls": 3
+    },
+    {
+      "id": "value-per-sender",
+      "class": "group-by",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 3
+    },
+    {
+      "id": "count-in-block",
+      "class": "filter",
+      "passed": false,
+      "first_try": false,
+      "sql_attempts": 1,
+      "tool_calls": 2
+    }
+  ]
+}
