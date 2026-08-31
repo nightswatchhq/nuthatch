@@ -79,6 +79,39 @@ fn scenario() -> toml::Value {
     raw.parse::<toml::Value>().expect("parse scenario")
 }
 
+/// Pin the fixture chain to the scenario's declared tip and finality, and **prove it took**.
+///
+/// Extracted so both board tests use one implementation. `serve_cannot_index...` had none at all:
+/// it ran against `fixture_rpc.py`'s built-in defaults rather than the scenario, which is a
+/// different chain from the one `start_fixture_chain` gives the keyed runner. A board that is not
+/// the scenario proves nothing about it.
+///
+/// The read-back is new. The inline version this replaces fired two `POST`s and never checked
+/// either landed, so a control endpoint that answered 200 and changed nothing would have left the
+/// board exactly as wrong while looking exactly as green.
+fn pin_chain(rpc_port: u16, tip: i64, finalized: i64) {
+    for (path, n) in [("tip", tip), ("finalized", finalized)] {
+        let ok = Command::new("curl")
+            .args(["-fsS", "-m", "5", "-XPOST"])
+            .arg(format!("http://127.0.0.1:{rpc_port}/control/{path}"))
+            .args(["-d", &format!("{{\"number\": {n}}}")])
+            .status()
+            .expect("curl")
+            .success();
+        assert!(ok, "could not pin {path} to {n}");
+    }
+    let state = poll("the fixture chain to report its state", 15, || {
+        get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
+    });
+    let v: serde_json::Value = serde_json::from_str(&state).expect("parse /control/state");
+    assert_eq!(v["tip"].as_i64(), Some(tip), "tip did not take: {state}");
+    assert_eq!(
+        v["finalized"].as_i64(),
+        Some(finalized),
+        "finalized did not take: {state}"
+    );
+}
+
 #[test]
 fn the_authoring_scenario_is_achievable_and_its_criteria_are_exact() {
     let s = scenario();
@@ -106,16 +139,7 @@ fn the_authoring_scenario_is_achievable_and_its_criteria_are_exact() {
     poll("the fixture RPC to come up", 30, || {
         get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
     });
-    for (path, n) in [("tip", tip), ("finalized", finalized)] {
-        let ok = Command::new("curl")
-            .args(["-fsS", "-m", "5", "-XPOST"])
-            .arg(format!("http://127.0.0.1:{rpc_port}/control/{path}"))
-            .args(["-d", &format!("{{\"number\": {n}}}")])
-            .status()
-            .expect("curl")
-            .success();
-        assert!(ok, "could not pin {path} to {n}");
-    }
+    pin_chain(rpc_port, tip, finalized);
 
     // --- criterion 1: `init` succeeds, entirely offline -------------------------------------------
     let nest = dir.path().join("nest");
@@ -344,6 +368,11 @@ fn serve_cannot_index_so_the_scorer_cannot_do_the_agents_work() {
     poll("the fixture RPC to come up", 30, || {
         get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
     });
+    pin_chain(
+        rpc_port,
+        s["tip"].as_integer().unwrap(),
+        s["finalized"].as_integer().unwrap(),
+    );
 
     // Scaffold a nest and then deliberately never run `dev` - the "agent stopped after init" case.
     let nest = dir.path().join("nest");
