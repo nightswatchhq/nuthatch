@@ -1,0 +1,85 @@
+# eval/authoring.toml - the pinned scenario for RFC-0017's authoring eval.
+#
+# RFC-0016 S1 measures **runtime** knowledge: an agent with the MCP tools querying a nest that
+# already exists. This measures **authoring** knowledge: an agent with the builder skill and a shell
+# that must produce a working nest from nothing. An agent with only MCP cannot scaffold a nest; an
+# agent with only the skill cannot say what a table means as of block N (RFC-0017, "The two skills").
+#
+# RFC-0017 fixes the three criteria and this file does not get to reinvent them:
+#
+#   "an agent with only the builder skill + a shell takes a contract address and must produce a
+#    working nest against the fixture tape - `init` succeeds, `dev` reaches the pinned tip, one
+#    canned question answers correctly via `nuthatch sql`. Scored mechanically (exit codes + result
+#    comparison)"
+#
+# **Mechanically** is the load-bearing word, and it is why this file carries no rubric. Nothing here
+# scores prose, effort, or whether the agent explained itself well. Three facts about the filesystem
+# and one result set, or it did not work.
+#
+# Fully offline and deterministic: `scripts/fixture_rpc.py` serves the chain over real HTTP, and the
+# ABI is handed over as a local file, so no Sourcify, no Etherscan, and no network at all. A score
+# that moved because a third party was slow would be a number about the internet.
+
+schema_version = 1
+
+# The fixture chain, from scripts/fixture_rpc.py. Blocks 1..=8 each carry one ERC-20 Transfer on
+# `contract`; tip is pinned at 9 (no logs there) and finality at 8, so the whole history seals in one
+# pass and tip-following then idles somewhere stable rather than racing the scorer.
+contract = "0x000000000000000000000000000000000000c0de"
+chain = "arbitrum-one"
+chain_id = 42161
+tip = 9
+finalized = 8
+
+[task]
+# What the subject is given. Everything it needs, nothing about how nuthatch works - that is what the
+# builder skill is for, and supplying it here would measure the prompt rather than the skill.
+statement = """
+Set up a nuthatch nest that indexes ERC-20 Transfer events for contract {contract} on {chain}.
+
+The chain is served at {rpc} - it is a local test endpoint, not a public one, and it has no
+block explorer, so use the ABI file already sitting at {abi} rather than resolving one.
+Create the nest in {dir}.
+
+Then run it until it has indexed the whole chain, and stop it when it has.
+"""
+
+[[criterion]]
+id = "init-succeeds"
+kind = "nest-exists"
+description = """
+`init` succeeded: a nest directory exists with a `nuthatch.toml` and a generated `schema.json`.
+Checked as a fact about the filesystem rather than by scraping the agent's transcript for a claim
+that it ran - the point of a mechanical score is that the artefact is the evidence.
+"""
+
+[[criterion]]
+id = "reaches-pinned-tip"
+kind = "sealed-through"
+value = 8
+description = """
+`dev` reached the pinned tip: `sealed_through` is at the finalized block. Deliberately the *sealed*
+watermark and not `as_of`, because a nest that merely opened an HTTP port and answered `select 1`
+has reached nothing. This is the criterion an agent passes only by actually indexing.
+
+Read back through `nuthatch serve`, which owns no cursor and never advances one, so the scorer
+cannot index on the subject's behalf. See the runner's note on why this is not `dev`.
+"""
+
+[[criterion]]
+id = "canned-question"
+kind = "sql"
+# `{table}` is resolved by the runner from `/tables`, never assumed.
+#
+# Scoring must not depend on what the agent chose to call things. `init` derives the table name from
+# the contract alias, which defaults to `c0` but is the agent's to set - so a hardcoded
+# `c0__transfer` would fail a perfectly good nest for picking a nicer name, and would be measuring
+# obedience rather than authoring. The scenario has exactly one table by construction.
+sql = "SELECT COUNT(*) AS n, MIN(block_number) AS lo, MAX(block_number) AS hi, SUM(CAST(value_dec AS HUGEINT)) AS total FROM \"{table}\""
+expect = '[{"n": 8, "lo": 1, "hi": 8, "total": "3600"}]'
+description = """
+One canned question, answered from the nest the agent built. Every transfer, its range, and its
+summed value: eight transfers over blocks 1..=8 totalling 3600. Comparison is order-normalised and
+numeric-tolerant, exactly as Tier A and the RFC-0016 runner compare - a score must not acquire a
+second definition of correctness merely because it is keyed.
+"""

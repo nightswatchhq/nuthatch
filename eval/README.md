@@ -78,3 +78,111 @@ reserved words - and RFC-0016 §1's whole premise is that the MCP surface is a c
 problem *to be fixed*. The fields are optional in the schema and **mandatory in the runner**: the
 0.4 baseline below predates them and genuinely lacks them, and backfilling `null` would assert the
 subject issued no SQL, which is a different claim from "nobody recorded it".
+
+## The authoring eval (RFC-0017, #1050)
+
+The two evals answer different questions and neither substitutes for the other. RFC-0016 §1 above
+measures **runtime** knowledge - an agent with the MCP tools querying a nest that already exists.
+This measures **authoring** knowledge: the builder skill plus a shell, a contract address, and
+nothing else. An agent with only MCP cannot scaffold a nest; an agent with only the skill cannot say
+what a table means as of block N.
+
+RFC-0017 fixes the three criteria, and `eval/authoring.toml` does not get to reinvent them: `init`
+succeeds, `dev` reaches the pinned tip, one canned question answers correctly - *"scored mechanically
+(exit codes + result comparison)"*. **Mechanically** is load-bearing: nothing scores prose, effort,
+or how well the agent explained itself. Three facts about the filesystem and one result set.
+
+Fully offline and deterministic. `scripts/fixture_rpc.py` serves the chain over loopback and the ABI
+is handed over as a local file, so there is no Sourcify, no Etherscan and no network - a score that
+moved because a third party was slow would be a number about the internet.
+
+### The board is proven before anyone plays on it
+
+`tests/authoring_eval_board.rs` walks the scenario with a **scripted reference solution** and must
+satisfy every criterion, in CI, with no key. If it is red, an agent scoring 0/3 tells you nothing
+about the agent. It also pins the criteria to nuthatch's own surface in the direction that actually
+rots: a criterion is a claim that `init` writes a `schema.json`, that `sealed_through` appears in
+`/sql` provenance, that `value_dec` exists - and any of those could change without an eval file
+being touched, after which the next keyed run scores zero and it reads as a model that got worse.
+
+Two things the board caught while being built, both by mutating it rather than by reading it:
+
+- **The `reaches-pinned-tip` criterion was decorative.** The scenario declared `value = 8` and the
+  test read the chain's `finalized` pin instead, so editing the criterion changed nothing. A
+  criterion the scorer does not consult is not a criterion.
+- **The runner's numeric-tolerance check proved nothing.** `"3600"` against `3600` passes even with
+  numeric comparison removed entirely, because `json.dumps(3600)` is `"3600"`. It takes a float to
+  discriminate.
+
+### Isolation: enforced by construction, or labelled as asserted
+
+The subject must not be able to read this repository. `eval/authoring.toml` carries the expected
+result, and `tests/authoring_eval_board.rs` carries the same fixture values, the expected total and
+the canned query verbatim - an agent that finds either scores 3/3 without building anything, and the
+failure is silent and flattering.
+
+Exactly one of two modes is required; there is no default.
+
+**`--docker-image IMG` - enforced.** The runner builds the whole `docker run` itself. Two properties,
+both by construction:
+
+- **The repository is not mounted.** Only the workdir is bound, at its own path so the ABI and nest
+  paths stay valid. `eval/authoring.toml` and the board test are unreachable.
+- **There is no route to the internet.** The network is Docker `--internal`. `--network host` was
+  the first attempt and handed the subject the entire host network, so an agent could consult
+  external documentation or a data service and the eval would be neither offline nor limited to the
+  builder skill.
+
+The fixture chain runs **inside** that network, because nothing on an internal network is reachable
+from the host - which is also why it is pinned at startup (`--tip`/`--finalized`) rather than through
+`/control/*`. The image is preflighted before any run: workdir readable, repository not, fixture
+reachable, `claude` on `PATH`. A broken image must not publish a zero that reads as a failing agent.
+
+All three isolation properties are exercised against a live container in `--self-test` when
+`NUTHATCH_EVAL_STUB_IMAGE` is set, and the skip is printed otherwise so a green run cannot be
+mistaken for a verified one. Mutation-checked: switching back to `--network host` reds the internet
+and fixture legs; mounting the repo reds the repository leg.
+
+**`--sandbox TEMPLATE` - asserted.** Your own confinement, with `{workdir}` and `{rpc_port}`
+substituted. Sanity-checked for usability, and **not enforcement**.
+
+The distinction is a limit rather than laziness: **probing cannot prove the absence of a
+capability.** An earlier design tested an operator template against a fixed set of commands and
+paths, and four rounds of review kept finding the same defeat - a wrapper that rejects exactly those
+probes and permits everything else passes every one, after which the subject reads the repository by
+relative path, by building the path at runtime, or through an API the probes never considered. Each
+new probe is one more special case for a wrapper to know about. So the runner stopped claiming what
+it cannot check, and every report records which mode produced it:
+
+```json
+"isolation": "enforced-by-runner" | "operator-asserted"
+```
+
+Only `enforced-by-runner` may be published as an isolated score.
+
+### What the probes still do
+
+Both modes are checked for **usability**, because a confinement the subject cannot work in yields a
+false zero - a number that looks like an agent failing and is actually a broken environment. The
+sandbox must read a file in the workdir at its host path, and must reach the fixture RPC on
+loopback. Reachability is proved, never assumed: curl, wget and python3 are each tried and *none of
+them existing is a refusal rather than a pass*.
+
+### Scoring does not depend on what the agent names things
+
+`init` derives the table name from the contract alias, which defaults to `c0` but is the agent's to
+choose. The runner resolves `{table}` from `/tables` rather than hardcoding `c0__transfer`, which
+would fail a perfectly good nest for picking a nicer name - measuring obedience rather than
+authoring.
+
+### Running it
+
+```sh
+python3 eval/run-authoring.py --self-test                       # no key, no model, no network
+python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3 \
+  --sandbox docker run --rm -v "$WORKDIR:/w" -w /w <image>
+```
+
+**No baseline is published yet.** The board, the runner and both self-tests are in place and CI-gated;
+the score lands the first time the keyed runner is executed, and is board-only because a keyed run is
+credentials. The same refusal as RFC-0016's: a number here is real or it is absent.

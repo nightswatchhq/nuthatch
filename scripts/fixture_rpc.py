@@ -200,10 +200,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8945)
     ap.add_argument("--contract", required=True)
+    # Startup-settable tip/finality, and a bindable address. All three default to today's behaviour,
+    # so the existing callers (scripts/cross-nest-adoption.sh, tests/authoring_eval_board.rs) are
+    # untouched - they pin via /control/* after start, which still works.
+    #
+    # These exist for the authoring eval's enforced-isolation mode (#1050): the subject runs on an
+    # `--internal` Docker network so it has no route to the internet, which also means the runner on
+    # the host has no route to *it*. The control endpoints are therefore unreachable there, and the
+    # chain has to arrive already pinned.
+    ap.add_argument("--tip", type=int, default=None, help="initial eth_blockNumber / latest")
+    ap.add_argument("--finalized", type=int, default=None, help="initial finalized block")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="address to listen on; 0.0.0.0 to be reachable from a container")
     args = ap.parse_args()
     STATE = State(args.contract)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"fixture-rpc listening on http://127.0.0.1:{args.port}/ contract={STATE.contract}", flush=True)
+    if args.tip is not None:
+        STATE.tip = args.tip
+    if args.finalized is not None:
+        STATE.finalized = args.finalized
+    server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    print(f"fixture-rpc listening on http://{args.bind}:{args.port}/ contract={STATE.contract} "
+          f"tip={STATE.tip} finalized={STATE.finalized}", flush=True)
     server.serve_forever()
 
 
