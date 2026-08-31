@@ -299,24 +299,47 @@ async fn materialise_the_eval_fixture() {
             .expect("read eval/questions.toml"),
     )
     .expect("parse questions.toml");
+    // **`results_equal`, not a row count** (review of #815). The first version compared only
+    // `rows.len()`, so a fixture answering `[11]` where the oracle says `[10]` would pass and still
+    // print a usable fixture path and question-set hash - certifying a wrong board while claiming to
+    // prove it. That is the failure the comment above claims to prevent, committed in the code that
+    // claims to prevent it.
+    //
+    // This is the same order-normalised, numeric-tolerant comparison Tier A scores with, reused
+    // rather than reimplemented: a second comparison would be a second opinion about what "correct"
+    // means, and the two could drift.
     let hot = store.hot_rows_by_table().unwrap();
+    let mut failures = Vec::new();
     for q in &set.question {
-        let got = analytics::query_hot_cold(&dir, &q.sql, guard(), &hot, sealed_through, &[])
-            .unwrap_or_else(|e| panic!("question '{}' failed on the durable fixture: {e}", q.id));
         let expected: Vec<Value> = serde_json::from_str::<Value>(&q.expect)
             .ok()
             .and_then(|v| v.as_array().cloned())
-            .unwrap();
-        assert_eq!(
-            got.rows.len(),
-            expected.len(),
-            "question '{}' returns {} rows on the durable fixture but {} on the ephemeral one - the \
-             board is not the one the oracle was proved against",
-            q.id,
-            got.rows.len(),
-            expected.len()
-        );
+            .unwrap_or_else(|| panic!("question '{}' has a non-array expect", q.id));
+        match analytics::query_hot_cold(&dir, &q.sql, guard(), &hot, sealed_through, &[]) {
+            Err(e) => failures.push(format!("[{}] query errored: {e:#}", q.id)),
+            Ok(out) => {
+                if !results_equal(&expected, &out.rows) {
+                    failures.push(format!(
+                        "[{}] ({}) mismatch\n    sql:      {}\n    expected: {}\n    actual:   {}",
+                        q.id,
+                        q.class,
+                        q.sql,
+                        Value::Array(expected),
+                        Value::Array(out.rows),
+                    ));
+                }
+            }
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "the durable fixture does not answer the oracle it was built from ({}/{} questions). \
+         Refusing to print a fixture path or a question-set hash for a board that would score an \
+         agent against the wrong answers:\n{}",
+        failures.len(),
+        set.question.len(),
+        failures.join("\n")
+    );
 
     // The runner needs the exact question-set hash for `eval-report.json`.
     // sha256, matching how every other content hash in this repo is spelled.
