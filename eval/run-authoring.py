@@ -137,16 +137,32 @@ def post(url: str, payload: dict, timeout: float = 5.0) -> None:
         pass
 
 
-def wait_for(what: str, seconds: float, probe):
+def wait_for(what: str, seconds: float, probe, strict: bool = False):
+    """Poll until `probe` returns something, or the deadline passes.
+
+    `strict` exists because the blanket `except` below quietly undid the distinction this runner is
+    built on. A scorer that died mid-poll raised `ScoringUnavailable`, which was swallowed, retried
+    until the deadline, and returned `None` - which the caller then recorded as a **failed
+    criterion**. That is a scorer failure written down as an agent failure, exactly what
+    `ScoringUnavailable` exists to prevent, defeated one layer down.
+
+    With `strict`, a poll where **every** attempt raised re-raises the last exception instead of
+    reporting a tidy `None`. Where a probe legitimately means "not there" - is `serve` up at all -
+    the lenient form is still right, so this is opt-in rather than the default.
+    """
     deadline = time.monotonic() + seconds
+    last, any_ok = None, False
     while time.monotonic() < deadline:
         try:
             value = probe()
+            any_ok = True
             if value is not None:
                 return value
-        except Exception:
-            pass
+        except Exception as error:
+            last = error
         time.sleep(0.25)
+    if strict and not any_ok and last is not None:
+        raise last
     return None
 
 
@@ -543,11 +559,25 @@ def score(scenario, nest: Path, api: str, unservable: str | None = None):
             results.append({"id": cid, "passed": not missing,
                             "detail": "ok" if not missing else f"missing {missing}"})
         elif kind == "sealed-through":
-            got = wait_for("the nest to seal", 180, lambda: (
-                http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
+            # Wait for the watermark to **reach the target**, not merely to be readable.
+            #
+            # The probe used to return whatever `sealed_through` said, so the first reading -
+            # commonly 0 while the store is still being opened, or mid-index - satisfied `wait_for`
+            # immediately and the criterion scored false. The SQL criterion then ran against an
+            # incomplete dataset, so a subject that indexed everything could take 0/3 on timing
+            # alone: a false zero, which is the failure this whole runner exists to avoid.
+            #
+            # `tests/authoring_eval_board.rs` had it right - `.filter(|&n| n >= want_sealed)` - and
+            # the Python side did not. Returning `None` until the target is met is what makes the
+            # 180s a deadline rather than a formality.
+            want = criterion["value"]
+            got = wait_for("the nest to seal", 180, strict=True, probe=lambda: (
+                (lambda n: n if n is not None and n >= want else None)(
+                    http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
+                )
             ))
-            results.append({"id": cid, "passed": got == criterion["value"],
-                            "detail": f"sealed_through={got}, wanted {criterion['value']}"})
+            results.append({"id": cid, "passed": got == want,
+                            "detail": f"sealed_through={got}, wanted {want}"})
         elif kind == "sql":
             table = resolve_table(api)
             if table is None:
@@ -673,12 +703,17 @@ def one_run(scenario, args, isolation=None):
                 proc.wait()
 
 
+_real_wait_for = None  # bound below, so the self-test can shorten a deadline without recursing
+
+
 def self_test() -> int:
     """Prove the runner's properties with no key, no model and no network.
 
     Written on day one rather than after a published zero, because #1051 is what the alternative
     looks like: two defects that were invisible precisely because nothing exercised them.
     """
+    global _real_wait_for
+    _real_wait_for = wait_for
     failures = []
 
     def check(name, ok, detail=""):
@@ -894,6 +929,60 @@ def self_test() -> int:
             check("a run without a sandbox is refused",
                   "exactly one of --docker-image or --sandbox" in str(exit_),
                   f"exited for another reason: {exit_}")
+
+    # Two faults found by auditing this file rather than by being told about them.
+    #
+    # (a) The sealed-through probe returned the *first* reading, so a store still reporting 0 - being
+    #     opened, or mid-index - satisfied the poll at once and scored the criterion false. The SQL
+    #     criterion then ran against an incomplete dataset, and a subject that indexed everything
+    #     could take 0/3 on timing. The Rust board had this right all along.
+    # (b) `wait_for` swallowed every exception, so a scorer that died mid-poll became a *failed
+    #     criterion* rather than an unavailable scorer - the distinction this runner exists to draw,
+    #     defeated one layer below it.
+    import itertools
+    import unittest.mock as mock
+
+    with tempfile.TemporaryDirectory(prefix="nuthatch-seal-") as tmp:
+        nest = Path(tmp) / "nest"
+        nest.mkdir()
+        (nest / "nuthatch.toml").write_text("")
+        (nest / "schema.json").write_text("{}")
+        (nest / "nuthatch.redb").write_text("x")
+        target = next(c for c in scenario["criterion"] if c["kind"] == "sealed-through")["value"]
+        expected = json.loads(next(c for c in scenario["criterion"] if c["kind"] == "sql")["expect"])
+
+        # (a) 0, 0, 0, then the target: the criterion must wait rather than score the first reading.
+        readings = itertools.chain([0, 0, 0], itertools.repeat(target))
+        with mock.patch(f"{__name__}.http_json",
+                        side_effect=lambda *_: {"provenance": {"sealed_through": next(readings)},
+                                                "rows": expected}), \
+                mock.patch(f"{__name__}.resolve_table", return_value="t"):
+            passed = {r["id"]: r["passed"] for r in score(scenario, nest, "http://x")}
+        check("a nest still sealing is waited for, not scored at zero",
+              passed.get("reaches-pinned-tip") is True, str(passed))
+
+        # (b) `wait_for(strict=True)` must re-raise when **every** attempt failed - tested on the
+        #     function itself, not through `score`. Routed through the scorer it passed for the
+        #     wrong reason: the SQL criterion raises `ScoringUnavailable` directly, so the check was
+        #     green with the strict branch removed entirely. Found by mutating, not by reading.
+        def always_raises():
+            raise ScoringUnavailable("serve died")
+
+        try:
+            wait_for("a dead scorer", 0.5, always_raises, strict=True)
+            check("wait_for(strict) re-raises rather than reporting None", False, "returned")
+        except ScoringUnavailable:
+            check("wait_for(strict) re-raises rather than reporting None", True)
+
+        # ...and the lenient form must still report None, since "is serve up at all" legitimately
+        # means "not there" rather than "cannot tell".
+        check("wait_for without strict still reports None",
+              wait_for("a dead probe", 0.5, always_raises) is None)
+
+        # A probe that answers but never reaches its target is not a failure to look: it timed out,
+        # and must report None rather than raise.
+        check("a probe that answers but never satisfies reports None",
+              wait_for("never satisfied", 0.5, lambda: None, strict=True) is None)
 
     # A store that exists but cannot be served - the subject died mid-initialisation - is the
     # agent's failure, not the harness's, and must score rather than abort. The subject's process
