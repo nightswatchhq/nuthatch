@@ -1875,7 +1875,17 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
         .into_iter()
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
-    Json(json!({ "holders": s.balances.holders(), "count": items.len(), "items": items }))
+    // COR-8 (#814): a transfer whose value exceeds `i128` is dropped from these balances - both
+    // legs, deliberately, because dropping one would invent value. Saying so is the whole fix: the
+    // numbers stay what they are, and a caller can tell an incomplete answer from a complete one.
+    // Zero is the ordinary case and is reported rather than omitted, so its absence means an old
+    // build rather than a clean nest.
+    Json(json!({
+        "holders": s.balances.holders(),
+        "count": items.len(),
+        "items": items,
+        "dropped_over_i128": s.balances.dropped_over_i128(),
+    }))
 }
 
 /// The nest's authored incremental entities, and how current each one is (RFC-0041 §5.4, #822).
@@ -2120,7 +2130,15 @@ async fn derived_all(
 async fn balance(State(s): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
     let address = address.to_ascii_lowercase();
     match s.balances.balance(&address) {
-        Some(b) => Json(json!({ "address": address, "balance": b.to_string() })).into_response(),
+        // Same COR-8 caveat as `/balances`: a single address's balance is as incomplete as the set
+        // it came from, and a caller reading one address should not have to query another endpoint
+        // to learn that.
+        Some(b) => Json(json!({
+            "address": address,
+            "balance": b.to_string(),
+            "dropped_over_i128": s.balances.dropped_over_i128(),
+        }))
+        .into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no balance", "address": address })),
