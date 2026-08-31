@@ -2426,6 +2426,8 @@ async fn build_nest(
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
+        // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
+        cursorless: false,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
         surface: Arc::new(crate::allowlist::Surface::default()),
@@ -2482,6 +2484,8 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     };
 
     // No `Source` is ever polled on this role; the parameter exists for the ingest half we discard.
+    // That fact is handed to `/ready` below as `cursorless` - it used to be known only here, which is
+    // why a serve-only nest reported `stalled:true` forever (#1025).
     let source: Arc<dyn Source> =
         Arc::new(crate::rpc::RpcClient::new(config.nest.rpc_urls.clone())?);
 
@@ -2503,6 +2507,13 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
         serve::new_sql_gate(),
     )
     .await?;
+    // **This role owns no cursor** (#1025). `/ready`'s liveness terms all ask about one - has it
+    // polled, has `last_block` advanced - and a role that never polls fails them permanently rather
+    // than transiently. Told once, here, rather than inferred at the endpoint.
+    let state = serve::AppState {
+        cursorless: true,
+        ..state
+    };
 
     // The delivery worker belongs to whoever owns the cursor. Two processes draining one outbox would
     // deliver the same webhook twice, and at-least-once is a promise about failure, not a licence to

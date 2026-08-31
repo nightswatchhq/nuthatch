@@ -184,6 +184,23 @@ pub struct AppState {
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
     /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
     pub sql_max_hot_rows: usize,
+    /// This process owns **no cursor**: it serves a nest it does not index (`nuthatch serve`).
+    ///
+    /// `/ready`'s liveness terms are all about a cursor - has it polled recently, has `last_block`
+    /// advanced, did the first poll fail. A role that deliberately never polls fails every one of
+    /// them forever (#1025): `graph-staking-legacy-readonly` on the Lodestar box answered 162
+    /// queries correctly while reporting `ready:false, stalled:true` continuously from 2026-08-24,
+    /// because `poll_stalled` falls back to `started_at` when `last_poll` is 0 and the grace then
+    /// expires and never returns.
+    ///
+    /// That is the mirror of #1020. There an unpopulated gauge rendered as perfect health and no
+    /// alert could fire; here a healthy service renders as permanently stalled, so any alert on it
+    /// fires forever and gets muted - and a muted alert is not an alert. It also makes the nest
+    /// unusable behind anything that gates on `/ready`.
+    ///
+    /// **Not a new flag.** `serve_role` already knows - its own comment says "No `Source` is ever
+    /// polled on this role" - it simply never told this endpoint.
+    pub cursorless: bool,
     /// The SQL surface this mount exposes (RFC-0034). Default is [`Open`](crate::allowlist::SqlAccess::Open) -
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
@@ -1101,20 +1118,36 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     // serving frozen derived state as healthy "a lie with a pleasant HTTP status", and a cursor
     // polling happily while an entity is dead is exactly that lie.
     let (entities, entities_stalled) = entity_readiness(&s, last, now);
-    let stalled = seal_stalled
-        || entities_stalled
-        || (!seal_direct_active
+    // **A role with no cursor is judged on what it serves, not on a poll it never makes** (#1025).
+    //
+    // `initial_failure`, `poll_stalled` and `wedged` are all statements about a cursor. `nuthatch
+    // serve` deliberately has none - `serve_role`'s own comment says "No `Source` is ever polled on
+    // this role" - so all three are permanently true for it, and `/ready` answered `stalled:true`
+    // continuously on a nest answering queries correctly.
+    //
+    // What remains meaningful is the derived state: an entity that has stopped is still a lie with a
+    // pleasant HTTP status, whoever is driving the cursor. That term is kept.
+    let cursor_stalled = if s.cursorless {
+        false
+    } else {
+        !seal_direct_active
             && (initial_failure
                 || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
-                || wedged));
+                || wedged)
+    };
+    let stalled = seal_stalled || entities_stalled || cursor_stalled;
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
         "wedged": wedged,
         "initial_poll_failed": initial_failure,
-        "tip": tip,
+        // Null rather than 0 for a cursorless role: it has no tip and no lag, and **0 is a value**
+        // an operator or a dashboard will read as "exactly at tip" (the #1020 lesson, on the other
+        // surface). Absent is honest; zero is a claim.
+        "tip": if s.cursorless { serde_json::Value::Null } else { tip.into() },
         "last_block": last,
-        "lag_blocks": lag,
+        "lag_blocks": if s.cursorless { serde_json::Value::Null } else { lag.into() },
+        "cursorless": s.cursorless,
         "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
@@ -2520,6 +2553,7 @@ mod tests {
             velocity_threshold: None,
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
+            cursorless: false,
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             surface: Arc::new(crate::allowlist::Surface::default()),
             nid: None,
@@ -2953,6 +2987,112 @@ mod tests {
             "an advancing block must stamp the clock"
         );
         handle.end_seal_direct();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // #1025 - a role with no cursor is judged on what it serves.
+    //
+    // `graph-staking-legacy-readonly` on the Lodestar box is a sealed-history shadow started with
+    // `nuthatch serve`. It owns no cursor, makes zero RPC calls, answered 162 queries correctly,
+    // and reported `ready:false, stalled:true` continuously from 2026-08-24 - because
+    // `poll_stalled` falls back to `started_at` when `last_poll` is 0, so the startup grace expires
+    // and never returns.
+    //
+    // The mirror of #1020: there an unpopulated gauge read as perfect health and no alert could
+    // fire; here a healthy service reads as permanently stalled, so any alert fires forever and
+    // gets muted. These drive the real router, because the defect was in the endpoint's verdict.
+    // ---------------------------------------------------------------------------------------
+
+    /// **Per-nest metrics, not the process globals.**
+    ///
+    /// The first version of these tests stamped `METRICS.set_started_at_for_test` - a *process*
+    /// global - and read `/ready`'s `None` branch. Cargo runs tests in parallel, so they raced each
+    /// other's stamp and **both mutations of the fix survived**: reverting the verdict and reverting
+    /// the null-vs-zero rendering each left every case green. A test whose fixture is shared mutable
+    /// state is timing the scheduler.
+    ///
+    /// Setting `runtime_health` puts `/ready` on its per-nest branch, so each case owns a
+    /// uniquely-named `NestMetrics` and nothing is shared.
+    async fn ready_of(cursorless: bool, started_secs_ago: u64) -> serde_json::Value {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let name = format!("cursorless-probe-{}", N.fetch_add(1, Ordering::SeqCst));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        st.cursorless = cursorless;
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register(&name, "arbitrum-one");
+        st.runtime_health = Some((name.clone(), health));
+        let router = router(SharedNest::new(st));
+
+        let now = crate::metrics::now_unix();
+        let m = crate::metrics::METRICS.nest(&name);
+        // Never polled, started long enough ago that any grace has expired - the live shape.
+        m.set_started_at_for_test(now.saturating_sub(started_secs_ago));
+        assert_eq!(m.last_poll_ok(), 0, "premise: this nest has never polled");
+
+        let (_code, body) = get(router, "/ready").await;
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cursorless_role_that_never_polls_is_ready() {
+        let b = ready_of(true, 86_400).await;
+        assert_eq!(
+            b["ready"],
+            json!(true),
+            "a `nuthatch serve` nest never polls by design; judging it on a poll clock leaves it \
+             permanently unready while it answers queries correctly (#1025): {b}"
+        );
+        assert_eq!(b["stalled"], json!(false), "{b}");
+    }
+
+    /// The control that stops the fix being a blanket exemption.
+    #[tokio::test]
+    async fn a_cursor_owning_role_that_never_polls_is_still_stalled() {
+        let b = ready_of(false, 86_400).await;
+        assert_eq!(
+            b["ready"],
+            json!(false),
+            "a role that owns a cursor and has not polled within the grace window must still be \
+             unready. If this passes, #1025 has disabled the check for everyone rather than for the \
+             role that has no cursor: {b}"
+        );
+        assert_eq!(b["stalled"], json!(true), "{b}");
+    }
+
+    /// Absent, not zero - the other half of #1020's lesson on this surface.
+    ///
+    /// `0` is a **value**: a dashboard reads `lag_blocks: 0` as "exactly at tip". A role with no
+    /// cursor has no lag at all, and saying so is honest where saying zero is a claim.
+    #[tokio::test]
+    async fn a_cursorless_role_reports_no_tip_rather_than_a_tip_of_zero() {
+        let b = ready_of(true, 86_400).await;
+        assert!(
+            b["tip"].is_null(),
+            "`tip` must be null for a role with no cursor, not 0 - 0 reads as a block height: {b}"
+        );
+        assert!(
+            b["lag_blocks"].is_null(),
+            "`lag_blocks` must be null, not 0. 0 is the healthiest possible reading, which is \
+             exactly how #1020 hid a real fault on the metrics surface: {b}"
+        );
+        assert_eq!(
+            b["cursorless"],
+            json!(true),
+            "the body must say which shape it is, or an operator cannot tell an absent tip from a \
+             broken one: {b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_owning_role_still_reports_its_numbers() {
+        let b = ready_of(false, 86_400).await;
+        assert!(
+            b["tip"].is_number() && b["lag_blocks"].is_number(),
+            "nulling these for a cursor-owning role would remove the figures an operator uses: {b}"
+        );
     }
 
     #[test]
