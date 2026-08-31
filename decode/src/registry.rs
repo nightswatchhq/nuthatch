@@ -1345,6 +1345,63 @@ mod stored_roundtrip {
         }
     }
 
+    /// **COR-6 probe (#814).** An event parameter named like an implicit column.
+    ///
+    /// Not a fix - a demonstration, so the decision in #814 is taken against behaviour rather than
+    /// against a description of it. Delete this if the collision is refused at build time; keep it
+    /// as a regression control if the columns are namespaced instead.
+    #[test]
+    fn cor6_an_event_param_named_block_number_shadows_the_real_one() {
+        let mut row = a_row(true);
+        // An ABI is free to name a parameter `block_number`; nothing refuses it.
+        row.params
+            .push(("block_number".into(), Value::Word32(U256::from(7u64).to_be_bytes::<32>())));
+
+        let j = row.to_json();
+        let obj = j.as_object().unwrap();
+
+        // 1. The row's own block number is gone from the serialised form.
+        assert_eq!(
+            obj["block_number"],
+            json!("7"),
+            "the event parameter overwrote the chain's block number: `to_json` inserts the implicit \
+             columns first and then loops over params, and `serde_json::Map::insert` replaces"
+        );
+        assert_ne!(
+            obj["block_number"],
+            json!(4_000_000u64),
+            "the real block number 4,000,000 is not in the row at all"
+        );
+
+        // 2. But `_seq` was computed before the overwrite, so one row now disagrees with itself.
+        let seq = obj["_seq"].as_u64().expect("_seq is numeric");
+        assert_eq!(
+            seq >> 20,
+            4_000_000,
+            "`_seq` still encodes the true block, so the row carries both the real block number and \
+             the shadowing one - in different columns, with nothing saying which is which"
+        );
+
+        // 3. And the schema advertises the name twice rather than refusing it.
+        let mut sch = transfer_schema(true);
+        sch.columns.push(ColumnSchema {
+            name: "block_number".into(),
+            sol_type: "uint256".into(),
+            storage: "word32".into(),
+            indexed: false,
+        });
+        let dupes = sch
+            .columns
+            .iter()
+            .filter(|c| c.name == "block_number")
+            .count();
+        assert_eq!(
+            dupes, 2,
+            "the schema carries two columns of the same name; `implicit_columns()` is extended with \
+             the event's params and nothing checks for a clash"
+        );
+    }
+
     fn a_row(timestamps: bool) -> DecodedRow {
         DecodedRow {
             table: "usdc__transfer".into(),
