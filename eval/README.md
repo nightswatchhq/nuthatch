@@ -46,10 +46,35 @@ hand-typed scores, including flattering ones (the house rule since RFC-0004).
 
 ### Baseline status
 
-The **0.4 Tier B baseline** is [0/15 first-try and 0/15 overall](eval-report.json), median of three
+The **0.4 Tier B baseline** is [0/15 first-try and 0/15 overall](eval-report.json) - **verified, not
+merely reported**: all 15 known-correct oracles score as *passes* through the runner's own
+`sql_rows` and `results_equal`, against the same `question_set_hash` the report carries, so the zero
+belongs to the agent and not the harness. Median of three
 runs on `claude-sonnet-5` at the provider-default temperature 1.0. Mean SQL attempts were 1.267.
 The exact commit, question-set hash, per-question outcomes, and class breakdown are in the report.
 
 The runner invokes each subject as a separate restricted process with only the nuthatch MCP bridge;
 the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only
 worth anything if its numbers are real.
+
+**A rejected query is a verdict; an unreachable scorer is not (#1051).** The two look alike and are
+opposites. An invented table name comes back as a well-formed `{"error": ...}` from a healthy nest -
+the scorer looked, and what it saw was bad SQL - so it scores a *diagnosed failure* and records why.
+An unreachable nest is the scorer failing to look at all, and that is fatal. Collapsing them in
+either direction loses the same information, and this file has done both.
+
+**A scoring failure is fatal to the run, not a zero (#1051).** An unreachable nest, a timeout, an
+HTTP error or a response of an unexpected shape used to leave the row set empty and score the
+question *failed* - so a scorer that could not reach the nest published a schema-valid 0/15 with
+nothing to say why. A scorer that cannot obtain a verdict has not discovered the agent is wrong; it
+has discovered it cannot tell, and those must not share a result. `python3 eval/run-tier-b.py
+--self-test` proves it without a key, a nest or a model, and `cargo test --test
+eval_runner_self_test` runs that inside CI's required check.
+
+**Every failing result records its query (#1051).** `final_query`, plus `final_rows` on a failure.
+Without them a zero cannot say whether the agent invented a table name, tripped the
+`value`/`value_dec` big-int footgun this fixture exists to probe, or fell over the `"from"`/`"to"`
+reserved words - and RFC-0016 §1's whole premise is that the MCP surface is a context-engineering
+problem *to be fixed*. The fields are optional in the schema and **mandatory in the runner**: the
+0.4 baseline below predates them and genuinely lacks them, and backfilling `null` would assert the
+subject issued no SQL, which is a different claim from "nobody recorded it".
