@@ -2778,7 +2778,6 @@ mod tests {
     #[tokio::test]
     async fn parallel_top_level_split_runs_two_requests_concurrently() {
         use super::RpcClient;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Runs one `fetch_timestamp_batch(blocks, false, parallel)` call directly - bypassing
