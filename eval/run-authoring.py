@@ -186,8 +186,12 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
         "You are working in a shell. The nuthatch builder skill is installed; consult it.",
         "--", statement,
     ]
+    # Its own process group, so anything the subject backgrounded - a `dev` it forgot to stop -
+    # is reaped when its turn ends. Without this a stray `dev` keeps the exclusive redb lock and
+    # the scorer cannot open the store at all.
     completed = subprocess.run(
-        command, cwd=workdir, capture_output=True, text=True, timeout=args.timeout
+        command, cwd=workdir, capture_output=True, text=True, timeout=args.timeout,
+        start_new_session=True,
     )
     model = None
     for line in completed.stdout.splitlines():
@@ -210,9 +214,12 @@ def score(scenario, nest: Path, api: str):
             results.append({"id": cid, "passed": not missing,
                             "detail": "ok" if not missing else f"missing {missing}"})
         elif kind == "sealed-through":
-            got = wait_for("the nest to seal", 180, lambda: (
-                http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
-            ))
+            # No store means nothing to wait for: a nest that was never indexed is a fact already,
+            # and polling it for three minutes only makes the run slower and the failure vaguer.
+            got = None if not (nest / "nuthatch.redb").exists() else wait_for(
+                "the nest to seal", 180, lambda: (
+                    http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
+                ))
             results.append({"id": cid, "passed": got == criterion["value"],
                             "detail": f"sealed_through={got}, wanted {criterion['value']}"})
         elif kind == "sql":
@@ -266,19 +273,51 @@ def one_run(scenario, args):
                 print(f"  subject exited {completed.returncode}: "
                       f"{completed.stderr.strip()[:200]}", file=sys.stderr)
 
-            # The subject was asked to leave the nest running. If it did not, the remaining criteria
-            # still get a fair reading: this scores whether a *working nest* was produced, and a
-            # correctly-built nest the agent forgot to leave running is not a decode failure. What
-            # is NOT done here is fixing its config - only starting what it built.
+            # --- read the store back WITHOUT touching it ----------------------------------------
+            #
+            # `serve`, never `dev`. This is the whole correctness of the eval and review of #1050
+            # caught it: the first version started `dev` unconditionally after the subject finished,
+            # which broke the score in *both* directions.
+            #
+            #   * A subject that complied and left `dev` running lost the exclusive redb lock fight
+            #     with the scorer's second `dev`, which then died before serving - so the better the
+            #     agent behaved, the worse it scored.
+            #   * A subject that ran only `init` and stopped had its indexing done **for it**: the
+            #     scorer's `dev` walked the chain and the agent collected `reaches-pinned-tip` and
+            #     `canned-question` it had not earned.
+            #
+            # `nuthatch serve` is the RFC-0022 query-FE role: it owns no cursor and never advances
+            # one. It can only report what the subject actually indexed. A nest that was never run
+            # reads `sealed_through = 0` and fails criterion 2 honestly, and there is no arrangement
+            # of the scorer that can rescue it.
             api_port = free_port()
             api = f"http://127.0.0.1:{api_port}"
             if (nest / "nuthatch.toml").exists():
                 dev = subprocess.Popen(
-                    [str(args.nuthatch), "dev", "--dir", str(nest),
-                     "--listen", f"127.0.0.1:{api_port}", "--seal-direct"],
+                    [str(args.nuthatch), "serve", "--dir", str(nest),
+                     "--listen", f"127.0.0.1:{api_port}"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                wait_for("the nest API", 60, lambda: http_json(f"{api}/tables"))
+                if wait_for("the nest API", 60, lambda: http_json(f"{api}/tables")) is None:
+                    # `serve` refusing is TWO different facts and they must not share a verdict -
+                    # #1051's lesson, and the reason this is not a bare `raise`:
+                    #
+                    #   * **no redb at all** - the subject scaffolded a nest and never indexed it.
+                    #     `serve` says so itself ("no hot store to serve from ... `serve` never
+                    #     creates or writes to the local redb, only reads it"). That is an honest
+                    #     agent failure, and criteria 2 and 3 must simply score false. Aborting the
+                    #     run here would throw away a real result.
+                    #   * **a redb that will not open** - something else holds the exclusive lock,
+                    #     almost certainly a `dev` that outlived its subject. The scorer cannot
+                    #     look, which is a harness problem and never an agent's fault.
+                    if not (nest / "nuthatch.redb").exists():
+                        pass  # scored below, honestly, as a nest that was never indexed
+                    elif dev.poll() is not None:
+                        raise ScoringUnavailable(
+                            f"`serve` exited {dev.returncode} against a nest that HAS a hot store; "
+                            "something still holds the redb lock, so the score would be about the "
+                            "harness rather than the agent"
+                        )
             return model, score(scenario, nest, api)
     finally:
         for proc in (dev, chain):

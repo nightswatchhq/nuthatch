@@ -41,7 +41,7 @@ The chain is served at {rpc} - it is a local test endpoint, not a public one, an
 block explorer, so use the ABI file already sitting at {abi} rather than resolving one.
 Create the nest in {dir}.
 
-Then run it until it has caught up with the chain, and leave it running.
+Then run it until it has indexed the whole chain, and stop it when it has.
 """
 
 [[criterion]]
@@ -61,6 +61,9 @@ description = """
 `dev` reached the pinned tip: `sealed_through` is at the finalized block. Deliberately the *sealed*
 watermark and not `as_of`, because a nest that merely opened an HTTP port and answered `select 1`
 has reached nothing. This is the criterion an agent passes only by actually indexing.
+
+Read back through `nuthatch serve`, which owns no cursor and never advances one, so the scorer
+cannot index on the subject's behalf. See the runner's note on why this is not `dev`.
 """
 
 [[criterion]]

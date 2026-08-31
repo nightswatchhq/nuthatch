@@ -309,3 +309,78 @@ fn scalar_string(v: &serde_json::Value) -> String {
         .map(String::from)
         .unwrap_or_else(|| v.to_string())
 }
+
+/// The property the runner's correctness rests on: **`serve` cannot index on the subject's behalf.**
+///
+/// Review of #1050 found the first runner starting `dev` after the subject finished, which broke the
+/// score in both directions - a compliant agent that left `dev` running lost the exclusive redb lock
+/// fight and scored *worse*, while an agent that ran only `init` had its indexing done for it and
+/// collected two criteria it never earned. The runner now reads the store back through `serve`, the
+/// RFC-0022 query-FE role, which owns no cursor and never advances one.
+///
+/// That is a claim about nuthatch's surface, so it is pinned here rather than trusted. If `serve`
+/// ever gained the ability to advance a cursor, the authoring eval would start passing agents that
+/// built a nest and never ran it - and nothing else in the tree would notice.
+#[test]
+fn serve_cannot_index_so_the_scorer_cannot_do_the_agents_work() {
+    let s = scenario();
+    let contract = s["contract"].as_str().unwrap().to_string();
+    let chain = s["chain"].as_str().unwrap().to_string();
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let abi = dir.path().join("erc20.json");
+    std::fs::write(&abi, ERC20_TRANSFER_ABI).expect("write abi");
+
+    let rpc_port = free_port();
+    let _rpc = Reaped(
+        Command::new("python3")
+            .arg(root().join("scripts/fixture_rpc.py"))
+            .args(["--port", &rpc_port.to_string(), "--contract", &contract])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fixture_rpc.py"),
+    );
+    poll("the fixture RPC to come up", 30, || {
+        get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
+    });
+
+    // Scaffold a nest and then deliberately never run `dev` - the "agent stopped after init" case.
+    let nest = dir.path().join("nest");
+    let init = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["init", &contract, "--chain", &chain, "--rpc"])
+        .arg(format!("http://127.0.0.1:{rpc_port}/"))
+        .arg("--abi")
+        .arg(&abi)
+        .arg("--dir")
+        .arg(&nest)
+        .output()
+        .expect("run init");
+    assert!(init.status.success(), "init failed");
+    assert!(
+        !nest.join("nuthatch.redb").exists(),
+        "`init` alone created a hot store; the runner distinguishes 'never indexed' from 'locked'          by exactly that file's absence, and this would break it"
+    );
+
+    let api_port = free_port();
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["serve", "--dir"])
+        .arg(&nest)
+        .args(["--listen", &format!("127.0.0.1:{api_port}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+
+    let status = poll("serve to decide what it is doing", 45, || {
+        serve.try_wait().ok().flatten()
+    });
+    assert!(
+        !status.success(),
+        "`serve` came up against a nest with no hot store. If it can serve - or worse, create - one,          then an agent that ran only `init` would collect `reaches-pinned-tip` and `canned-question`          it never earned"
+    );
+    assert!(
+        !nest.join("nuthatch.redb").exists(),
+        "`serve` created a hot store. It is documented as never creating or writing the local redb,          and the authoring eval's whole correctness rests on it"
+    );
+}
