@@ -736,6 +736,72 @@ pub struct DecodeRegistry {
     blocks: bool,
 }
 
+/// Event parameter names that would collide with a column nuthatch adds itself.
+///
+/// Every table carries the implicit columns before the event's own parameters (see
+/// [`implicit_columns`]). An ABI is free to name a parameter any of them, and until #814 nothing
+/// refused it - with two consequences, both silent:
+///
+///  * **The parameter won the data.** `DecodedRow::to_json` inserts the implicit columns first and
+///    then loops over params; `serde_json::Map::insert` *replaces*. A row whose true block was
+///    4,000,000 serialised with the event's number instead, and the chain's block number was not in
+///    the row at all - while `_seq`, computed before the overwrite, still encoded the true block.
+///  * **The schema advertised the name twice**, and `/tables`, `schema.json`, the MCP schema tool
+///    and `llms.txt` all published it.
+///
+/// `DecodedRow::from_stored` reads `block_number` back out on the reorg path, where a retraction
+/// built from a different value than its insertion does not cancel it in DBSP - it lands beside it
+/// and stays. That is why the board chose refusal over renaming (2026-08-31): it is the only option
+/// that cannot produce a wrong number.
+///
+/// **Reserved regardless of the `block_timestamps` flag.** A timestamp-free nest does not carry that
+/// column today, but flipping the flag is supported (RFC-0029 §6b) and would otherwise turn a
+/// working nest into a colliding one at the worst possible moment.
+fn reserved_column_names() -> &'static [&'static str] {
+    &[
+        "block_number",
+        "block_hash",
+        "block_timestamp",
+        "tx_hash",
+        "log_index",
+        "address",
+        "_seq",
+        "table",
+    ]
+}
+
+/// Refuse an ABI whose decoded events name a parameter after an implicit column (#814).
+fn refuse_reserved_parameter_names(
+    what: &str,
+    who: &str,
+    abi: &JsonAbi,
+    allowlist: &[String],
+) -> Result<()> {
+    for ev in abi.events() {
+        // Only events that will actually be decoded: an allowlisted nest is not broken by a
+        // colliding parameter on an event it never reads.
+        if !allowlist.is_empty() && !allowlist.iter().any(|a| a == &ev.name) {
+            continue;
+        }
+        for input in &ev.inputs {
+            if reserved_column_names().contains(&input.name.as_str()) {
+                bail!(
+                    "{what} '{who}' declares event '{}' with a parameter named '{}', which is a \
+                     column nuthatch adds to every row. Indexing it would silently replace the \
+                     chain's own value with the event's - the block number in the stored row would \
+                     be the event's parameter, not the block it came from (#814). Reserved names: \
+                     {}. There is no safe automatic rename: the column name is part of the query \
+                     surface that views, `entities.toml` and any published schema already depend on.",
+                    ev.name,
+                    input.name,
+                    reserved_column_names().join(", "),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl DecodeRegistry {
     /// Build from a nest's config: load each contract's vendored ABI and register its events.
     /// dozens of test and tool call sites that don't care keep the behaviour they had.
@@ -794,6 +860,7 @@ impl DecodeRegistry {
                     }
                 }
             }
+            refuse_reserved_parameter_names("contract", &c.alias, &c.abi, &c.events)?;
             skipped_anonymous +=
                 register_events(&mut by_topic0, &c.alias, c.address, &c.abi, &c.events);
         }
@@ -822,6 +889,7 @@ impl DecodeRegistry {
                     }
                 }
             }
+            refuse_reserved_parameter_names("template", &t.name, &t.abi, &t.events)?;
             // An empty allowlist still decodes everything, so a template that does not set `events`
             // behaves exactly as it did before RFC-0009 gained one.
             skipped_anonymous += register_events(
@@ -1343,6 +1411,104 @@ mod stored_roundtrip {
             selector: String::new(),
             columns,
         }
+    }
+
+    /// COR-6 (#814): an ABI naming a parameter after an implicit column is **refused**.
+    ///
+    /// Board decision 2026-08-31. The probe that stood here demonstrated the alternative - the
+    /// parameter replaced the chain's block number in the stored row while `_seq` kept the true one,
+    /// and the schema published the name twice - and its own comment said to delete it rather than
+    /// relax it if refusal was chosen. It was.
+    ///
+    /// Refusal rather than renaming because `from_stored` reads `block_number` back on the reorg
+    /// path, and a retraction built from a different value than its insertion does not cancel it in
+    /// DBSP; it lands beside it and stays. Nothing else on the table could rule that out.
+    #[test]
+    fn cor6_a_parameter_named_like_an_implicit_column_is_refused() {
+        let odd = |param: &str| {
+            format!(
+                r#"[{{"type":"event","name":"Odd","anonymous":false,"inputs":[
+                    {{"name":"{param}","type":"uint256","indexed":false,"internalType":"uint256"}}
+                ]}}]"#
+            )
+        };
+        let build = |abi_json: &str| {
+            DecodeRegistry::build(vec![ContractSpec {
+                alias: "x".into(),
+                address: Address::from([0x11; 20]),
+                abi: serde_json::from_str(abi_json).expect("parse ABI"),
+                events: Vec::new(),
+            }])
+        };
+
+        for name in [
+            "block_number",
+            "block_hash",
+            "block_timestamp",
+            "tx_hash",
+            "log_index",
+            "address",
+            "_seq",
+            "table",
+        ] {
+            // `DecodeRegistry` is not `Debug`, so match on the arm rather than `expect_err`.
+            let msg = match build(&odd(name)) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!(
+                    "a parameter named '{name}' collides with a column nuthatch adds to every row \
+                     and must be refused rather than indexed"
+                ),
+            };
+            assert!(
+                msg.contains(name) && msg.contains("Odd"),
+                "the refusal must name the offending parameter and its event, or an operator with \
+                 several ABIs cannot tell which to open; got: {msg}"
+            );
+        }
+    }
+
+    /// The false-positive direction: an ordinary ABI must still build.
+    ///
+    /// A guard that fires on normal input gets switched off, so this is the half that keeps the
+    /// refusal deployable.
+    #[test]
+    fn cor6_an_ordinary_abi_is_unaffected() {
+        let abi = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+            {"name":"from","type":"address","indexed":true,"internalType":"address"},
+            {"name":"to","type":"address","indexed":true,"internalType":"address"},
+            {"name":"value","type":"uint256","indexed":false,"internalType":"uint256"}
+        ]}]"#;
+        DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: Address::from([0x11; 20]),
+            abi: serde_json::from_str(abi).unwrap(),
+            events: Vec::new(),
+        }])
+        .unwrap_or_else(|e| panic!("an ordinary Transfer ABI must still build: {e:#}"));
+    }
+
+    /// A collision on an event the nest never decodes must not refuse it.
+    ///
+    /// RFC-0011 allowlists exist so a nest can read two events from a busy contract. Refusing on an
+    /// event outside the allowlist would break nests that work today, for a shadowing that cannot
+    /// happen because the row is never produced.
+    #[test]
+    fn cor6_a_collision_on_a_non_allowlisted_event_is_ignored() {
+        let abi = r#"[
+            {"type":"event","name":"Good","anonymous":false,"inputs":[
+                {"name":"amount","type":"uint256","indexed":false,"internalType":"uint256"}]},
+            {"type":"event","name":"Bad","anonymous":false,"inputs":[
+                {"name":"block_number","type":"uint256","indexed":false,"internalType":"uint256"}]}
+        ]"#;
+        DecodeRegistry::build(vec![ContractSpec {
+            alias: "x".into(),
+            address: Address::from([0x11; 20]),
+            abi: serde_json::from_str(abi).unwrap(),
+            events: vec!["Good".into()],
+        }])
+        .unwrap_or_else(|e| {
+            panic!("the colliding event is not allowlisted, so it is never decoded: {e:#}")
+        });
     }
 
     fn a_row(timestamps: bool) -> DecodedRow {
