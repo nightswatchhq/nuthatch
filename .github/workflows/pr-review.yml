@@ -1,30 +1,14 @@
-# An outside reader on every pull request.
+# Jules is an independent GitHub App reviewer, not an advisory Actions comment.
+# The App owns `Jules approval`, which is green only for a `ship` verdict. A finding, malformed
+# response, or failed review is red until a fix is pushed or a maintainer asks for `/re-review`.
 #
-# Ten required contexts on `main` and a `reviewed-by signature` gate, and every one of those
-# signatures comes from the same firm that wrote the change. Twice now a double-dispatched run has
-# approved a PR and armed auto-merge while missing a real defect (#421, #412). A second opinion from
-# the same agents is not a second opinion. This job is one from outside: a different vendor, a
-# different model, no stake in the sprint, no knowledge of who wrote what.
-#
-# **Advisory on purpose.** It is not in `.github/required-checks.txt` and it blocks nothing. A
-# reviewer nobody has read yet is not a control, and a required check that fails on prose judgement
-# is a trap for the author. Promote it only if its comments turn out to be worth reading - the test
-# being whether it ever finds something the firm's own review missed.
-#
-# **The diff comes from the API, never from a checkout of the head.** The checkout is pinned to the
-# default branch - see the note on the step, which is load-bearing rather than decorative - and the
-# diff arrives through `gh`. PR code is read as text and sent to a model; it is never placed on the
-# runner, and never executed with a secret in scope.
-#
-# **Who may spend our tokens.** `pull_request` from a fork gets no secrets, so an outsider's PR is
-# skipped rather than reviewed - that is GitHub's rule, not ours, and the job says so instead of
-# failing. `issue_comment` *does* carry secrets, which is why `/re-review` is gated on write access:
-# without that check any passer-by could run the model as often as they liked on our account.
-name: outside review
+# `pull_request_target` runs this trusted default-branch workflow with the App key, but PR code is
+# never checked out or executed. The diff is fetched as data, so forks can be reviewed safely too.
+name: Jules review
 
 on:
-  pull_request:
-    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -36,37 +20,22 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
 
-# One review at a time per PR. A `/re-review` fired twice in quick succession should cost one
-# review, not two, and the later comment is the one anybody wants.
 concurrency:
-  group: outside-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  group: jules-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
   cancel-in-progress: true
 
 jobs:
   review:
-    name: outside review
+    name: Jules workflow
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/re-review') &&
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && contains(github.event.comment.body, '/re-review') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
-      # `ref` is not optional here, and the reason cost us a live finding on PR #908. The default
-      # for `actions/checkout` on a `pull_request` event is the PR's own merge ref - so without
-      # this, the `pr-review.py` executed below with `OPENAI_API_KEY` in scope is the version the
-      # PR author wrote, and any collaborator could edit it to post the key elsewhere. The
-      # fork-gets-no-secrets rule does not help: a same-repo PR carries the secret, and this repo
-      # takes fifteen same-repo PRs a day. Pin to the default branch; the PR reaches this job as
-      # data through `gh pr diff` and never as code.
-      #
-      # The consequence is deliberate: a PR that edits this script or `CLAUDE.md` is reviewed by
-      # `main`'s copy of both, not its own. That is the correct direction - a change cannot vouch
-      # for itself.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -74,57 +43,73 @@ jobs:
 
       - name: which pull request
         id: pr
-        run: |
-          case "${{ github.event_name }}" in
-            pull_request)   n='${{ github.event.pull_request.number }}' ;;
-            issue_comment)  n='${{ github.event.issue.number }}' ;;
-            workflow_dispatch) n='${{ inputs.pr }}' ;;
-          esac
-          echo "number=$n" >> "$GITHUB_OUTPUT"
-          echo "Reviewing #$n" >> "$GITHUB_STEP_SUMMARY"
-
-      # Warn and skip, in the one case where a missing key is expected rather than broken: a PR from
-      # a fork, which GitHub deliberately runs without secrets. Anything else with no key is a
-      # misconfiguration and should be loud, so it is reported as a skip with its reason named.
-      - name: is the key here
-        id: key
         env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          case "$PR_NUMBER" in ''|*[!0-9]*) echo "invalid PR number" >&2; exit 1;; esac
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: mint Jules App token
+        id: jules
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.JULES_APP_ID }}
+          private-key: ${{ secrets.JULES_PRIVATE_KEY }}
+          permission-checks: write
+          permission-pull-requests: write
+
+      - name: fetch PR data and create Jules check
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JULES_TOKEN: ${{ steps.jules.outputs.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' > head.sha
+          gh pr diff "$PR" --repo "$REPO" > pr.diff
+          gh pr view "$PR" --repo "$REPO" --json title --jq '.title' > pr.title
+          gh pr view "$PR" --repo "$REPO" --json body --jq '.body' > pr.body
+          payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
+            '{name:"Jules approval",head_sha:($sha | rtrimstr("\\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
+          check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
+          echo "id=$check_id" >> "$GITHUB_OUTPUT"
+
+      - name: review, report, and conclude
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JULES_TOKEN: ${{ steps.jules.outputs.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          CHECK_ID: ${{ steps.check.outputs.id }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "have=no" >> "$GITHUB_OUTPUT"
-            echo "No \`OPENAI_API_KEY\` in this context - skipped, not reviewed." >> "$GITHUB_STEP_SUMMARY"
+          set -uo pipefail
+          conclusion=failure
+          title="Jules could not complete the review"
+          summary="The review failed closed. Fix the workflow or credentials, then comment /re-review."
+          if python3 scripts/pr-review.py --diff pr.diff --title "$(cat pr.title)" \
+              --body-file pr.body --json-output review.json > review.md; then
+            if GH_TOKEN="$JULES_TOKEN" gh pr comment "$PR" --repo "$REPO" --body-file review.md; then
+              verdict="$(jq -r '.verdict' review.json)"
+              findings="$(jq '.findings | length' review.json)"
+              if [ "$verdict" = ship ]; then
+                conclusion=success
+                title="Jules approves"
+                summary="Jules returned ship with no blocking finding."
+              else
+                title="Jules requests follow-up"
+                summary="Verdict: $verdict. Jules recorded $findings finding(s). Ask Claude to address them, push the fix, then comment /re-review if an immediate new pass is wanted."
+              fi
+            else
+              summary="Jules produced a review but could not post it. Check the App Pull requests permission, then comment /re-review."
+            fi
           else
-            echo "have=yes" >> "$GITHUB_OUTPUT"
+            summary="Jules did not return a complete structured review. This is intentionally red rather than pretending the PR was approved. Comment /re-review after the failure is corrected."
           fi
-
-      - name: fetch the diff
-        if: steps.key.outputs.have == 'yes'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr diff "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" > pr.diff
-          gh pr view "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
-            --json title,body --jq '.title' > pr.title
-          gh pr view "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
-            --json title,body --jq '.body' > pr.body
-          wc -c pr.diff
-
-      - name: review
-        if: steps.key.outputs.have == 'yes'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python3 scripts/pr-review.py \
-            --diff pr.diff \
-            --title "$(cat pr.title)" \
-            --body-file pr.body > review.md
-          cat review.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: post it
-        if: steps.key.outputs.have == 'yes'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr comment "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" \
-            --body-file review.md
+          payload="$(jq -n --arg conclusion "$conclusion" --arg title "$title" --arg summary "$summary" \
+            '{status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}')"
+          GH_TOKEN="$JULES_TOKEN" gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" --input - <<<"$payload"
+          [ "$conclusion" = success ]
