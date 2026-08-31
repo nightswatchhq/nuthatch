@@ -12,22 +12,47 @@
 
 use nuthatch::serve::{sql_max_concurrency, SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
 
-/// The env var is process-global, so these run under one lock rather than in parallel.
+/// **One lock for every read or write of the variable** (#1035).
+///
+/// `NUTHATCH_SQL_MAX_CONCURRENCY` is process-global. This file used to guard it with *two* unrelated
+/// locks - a `std::sync::Mutex` for the parser tests and a separate `tokio::sync::Mutex` for the
+/// async wiring tests - which exclude each other not at all. Cargo runs both concurrently, so a
+/// parser test could replace the value while `permits_with` was awaiting `spawn_nest`, and the
+/// wiring test would then build its gate from someone else's number.
+///
+/// That is worse than an ordinary flake: the wiring test is the **only** one that catches the
+/// per-nest-gate defect #1024 fixed, so a race here quietly removes the coverage rather than
+/// obviously breaking it.
+///
+/// A `tokio::sync::Mutex` because async callers must hold it across `.await`; the synchronous tests
+/// take it with `blocking_lock`, which is correct precisely because they are `#[test]` and not
+/// `#[tokio::test]`, so there is no runtime on their thread to block.
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+const KEY: &str = "NUTHATCH_SQL_MAX_CONCURRENCY";
+
+/// Set the variable, run `f`, and **restore whatever was there before** - including "absent".
+///
+/// Restoring rather than removing matters: a test that unconditionally `remove_var`s on the way out
+/// destroys an operator-set value in a developer's shell run, and makes the next test's "unset"
+/// premise accidental rather than arranged.
 fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let key = "NUTHATCH_SQL_MAX_CONCURRENCY";
-    let prev = std::env::var(key).ok();
-    match value {
-        Some(v) => std::env::set_var(key, v),
-        None => std::env::remove_var(key),
-    }
+    let _g = env_lock().blocking_lock();
+    let prev = std::env::var(KEY).ok();
+    set_env(value);
     let out = f();
-    match prev {
-        Some(p) => std::env::set_var(key, p),
-        None => std::env::remove_var(key),
-    }
+    set_env(prev.as_deref());
     out
+}
+
+fn set_env(value: Option<&str>) {
+    match value {
+        Some(v) => std::env::set_var(KEY, v),
+        None => std::env::remove_var(KEY),
+    }
 }
 
 #[test]
@@ -102,18 +127,12 @@ use std::sync::Arc;
 use common::tape::*;
 use nuthatch::indexer;
 
-/// `NUTHATCH_SQL_MAX_CONCURRENCY` is process-global, so tests that vary it take this first.
-fn gate_lock() -> &'static tokio::sync::Mutex<()> {
-    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    L.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
+/// Build a nest under a given override and report the permits its gate actually got.
+///
+/// The caller already holds [`env_lock`]; this must not take it again or it would deadlock.
 async fn permits_with(value: Option<&str>) -> usize {
-    let key = "NUTHATCH_SQL_MAX_CONCURRENCY";
-    match value {
-        Some(v) => std::env::set_var(key, v),
-        None => std::env::remove_var(key),
-    }
+    let prev = std::env::var(KEY).ok();
+    set_env(value);
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
@@ -136,13 +155,13 @@ async fn permits_with(value: Option<&str>) -> usize {
     let ingest = rt.ingest;
     ingest.abort();
     let _ = ingest.await;
-    std::env::remove_var(key);
+    set_env(prev.as_deref());
     permits
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
-    let _guard = gate_lock().lock().await;
+    let _guard = env_lock().lock().await;
     // Serialised deliberately: the env var is process-global.
     assert_eq!(
         permits_with(None).await,
@@ -183,8 +202,9 @@ async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
 /// sprint that a test proved a mechanism instead of a seam, so the real call is exercised here.
 #[tokio::test(flavor = "multi_thread")]
 async fn nests_on_one_cursor_share_one_gate() {
-    let _guard = gate_lock().lock().await;
-    std::env::set_var("NUTHATCH_SQL_MAX_CONCURRENCY", "4");
+    let _guard = env_lock().lock().await;
+    let prev = std::env::var(KEY).ok();
+    set_env(Some("4"));
 
     let health = Arc::new(nuthatch::health::RuntimeHealth::default());
     let tape = Arc::new(TapeSource::new());
@@ -272,5 +292,5 @@ async fn nests_on_one_cursor_share_one_gate() {
         w.abort();
         let _ = w.await;
     }
-    std::env::remove_var("NUTHATCH_SQL_MAX_CONCURRENCY");
+    set_env(prev.as_deref());
 }
