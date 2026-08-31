@@ -207,9 +207,53 @@ fn measure_child() {
     );
 }
 
-/// Decode one stored row far enough to have paid the real cost, and return something derived from it
-/// so the work cannot be optimised away.
+/// The fields a caller gets back from one stored row. Both decoders must produce **all** of it, or
+/// the comparison is not one.
+///
+/// The first version of this harness parsed the JSON object in full with `serde_json` and, on the
+/// compact side, read three varints and sliced twenty bytes - then reported the difference as a
+/// decode win. Review caught it. That is a full parse against a partial one, and the number it
+/// produced was not a measurement of anything. This struct exists so the two paths cannot drift
+/// apart again: every field is materialised on both sides, and `checksum` forces all of it to be
+/// read rather than optimised out.
+#[derive(Default)]
+struct Row {
+    block: u64,
+    ts: u64,
+    log_index: u64,
+    seq: u64,
+    block_hash: [u8; 32],
+    tx_hash: [u8; 32],
+    address: [u8; 20],
+    from: [u8; 20],
+    to: [u8; 20],
+    value: [u8; 32],
+    overflow: bool,
+}
+
+impl Row {
+    fn checksum(&self) -> u64 {
+        let b = |x: &[u8]| {
+            x.iter()
+                .fold(0u64, |a, &c| a.wrapping_mul(31).wrapping_add(c as u64))
+        };
+        self.block
+            ^ self.ts
+            ^ self.log_index
+            ^ self.seq
+            ^ b(&self.block_hash)
+            ^ b(&self.tx_hash)
+            ^ b(&self.address)
+            ^ b(&self.from)
+            ^ b(&self.to)
+            ^ b(&self.value)
+            ^ self.overflow as u64
+    }
+}
+
+/// Decode one stored row into `Row`, by whichever encoding it is in.
 fn decode_one(buf: &[u8], compact: bool) -> u64 {
+    let mut r = Row::default();
     if compact {
         fn varint(buf: &[u8], p: &mut usize) -> u64 {
             let (mut n, mut shift) = (0u64, 0u32);
@@ -224,22 +268,45 @@ fn decode_one(buf: &[u8], compact: bool) -> u64 {
             }
         }
         let mut p = 2usize; // table id
-        let block = varint(buf, &mut p);
-        let ts = varint(buf, &mut p);
-        let log_index = varint(buf, &mut p);
-        // The fixed-width tail is addressed, not parsed: that is the point of fixed width.
-        let addr = &buf[p + 64..p + 84];
-        // `_seq` is derived rather than stored.
-        let seq = (block << 20) | log_index;
-        block ^ ts ^ seq ^ addr[0] as u64
+        r.block = varint(buf, &mut p);
+        r.ts = varint(buf, &mut p);
+        r.log_index = varint(buf, &mut p);
+        let mut take = |n: usize, out: &mut [u8]| {
+            out.copy_from_slice(&buf[p..p + n]);
+            p += n;
+        };
+        take(32, &mut r.block_hash);
+        take(32, &mut r.tx_hash);
+        take(20, &mut r.address);
+        take(20, &mut r.from);
+        take(20, &mut r.to);
+        take(32, &mut r.value);
+        r.overflow = buf[p] != 0;
+        // `_seq` is derived rather than stored - that saving is part of the encoding.
+        r.seq = (r.block << 20) | r.log_index;
     } else {
         let v: serde_json::Value = serde_json::from_slice(buf).expect("json");
-        let block = v["block_number"].as_u64().unwrap_or(0);
-        let ts = v["block_timestamp"].as_u64().unwrap_or(0);
-        let seq = v["_seq"].as_u64().unwrap_or(0);
-        let addr = v["address"].as_str().unwrap_or("").len() as u64;
-        block ^ ts ^ seq ^ addr
+        r.block = v["block_number"].as_u64().unwrap_or(0);
+        r.ts = v["block_timestamp"].as_u64().unwrap_or(0);
+        r.log_index = v["log_index"].as_u64().unwrap_or(0);
+        r.seq = v["_seq"].as_u64().unwrap_or(0);
+        // The hex strings must actually be turned into bytes: that is the work the compact side
+        // does not have to do, and it is the whole of the difference being measured.
+        let un = |v: &serde_json::Value, out: &mut [u8]| {
+            let s = v.as_str().unwrap_or("");
+            let _ = hex::decode_to_slice(s.strip_prefix("0x").unwrap_or(s), out);
+        };
+        un(&v["block_hash"], &mut r.block_hash);
+        un(&v["tx_hash"], &mut r.tx_hash);
+        un(&v["address"], &mut r.address);
+        un(&v["from"], &mut r.from);
+        un(&v["to"], &mut r.to);
+        // `value` is stored as a decimal string and its word form is what a caller wants.
+        let n: u128 = v["value"].as_str().unwrap_or("0").parse().unwrap_or(0);
+        r.value[16..].copy_from_slice(&n.to_be_bytes());
+        r.overflow = v["value_overflow"].as_bool().unwrap_or(false);
     }
+    r.checksum()
 }
 
 #[test]
@@ -267,10 +334,27 @@ fn compact_rows_rss() {
 
     let json_path = dir.join("json.redb");
     let compact_path = dir.join("compact.redb");
-    let reuse = json_path.exists() && compact_path.exists();
+    // A reused store must prove it holds what this run is about to report on. Without the stamp,
+    // `NUTHATCH_296_ROWS=1000` against a directory built at 1,600,000 prints bytes-per-row computed
+    // from one number while the children measure the other, and the two disagree silently. Review
+    // caught that too.
+    let stamp_path = dir.join("stamp");
+    let stamp = format!("rows={n} enc=v1");
+    let reuse = json_path.exists()
+        && compact_path.exists()
+        && std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str());
     if reuse {
-        println!("reusing stores in {}", dir.display());
+        println!("reusing stores in {} ({stamp})", dir.display());
     } else {
+        if json_path.exists() || compact_path.exists() {
+            let found = std::fs::read_to_string(&stamp_path).unwrap_or_else(|_| "unstamped".into());
+            println!(
+                "rebuilding: {} holds `{found}`, this run wants `{stamp}`",
+                dir.display()
+            );
+            let _ = std::fs::remove_file(&json_path);
+            let _ = std::fs::remove_file(&compact_path);
+        }
         println!("building {n} rows into two stores (this takes a few minutes)");
     }
     let json_len = if reuse {
@@ -345,6 +429,13 @@ fn compact_rows_rss() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| panic!("missing {k} in {line}"))
         };
+        // Belt as well as braces on the stamp: the child says what it actually walked, and a
+        // disagreement with what the parent priced is a hard stop rather than a footnote.
+        let seen = field("rows=") as u64;
+        assert_eq!(
+            seen, n,
+            "{label}: child measured {seen} rows, parent priced {n}"
+        );
         println!(
             "{label:<28} rss {:>6.2} GB   point-read {:>6.1} us",
             field("scan_rss=") / 1e9,
