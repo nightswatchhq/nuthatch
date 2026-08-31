@@ -22,6 +22,7 @@ Fully offline: `scripts/fixture_rpc.py` serves the chain over loopback and the A
 """
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -35,6 +36,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.parse
+import uuid
 import urllib.request
 from pathlib import Path
 
@@ -174,28 +176,113 @@ def isolation_mode(args) -> str:
     return "enforced-by-runner" if args.docker_image else "operator-asserted"
 
 
-def docker_argv(image: str, workdir: Path, _rpc_port: int) -> list[str]:
-    """Confinement the **runner** owns, rather than a string the operator asserts.
+class DockerIsolation:
+    """Confinement the **runner** owns, on a network with no route out.
 
-    This is the only mode that can honestly claim a subject boundary, and the reason is a limit
-    rather than an implementation detail: **probing cannot prove the absence of a capability.** The
-    previous design took an operator template and tested it with a fixed set of commands and paths,
-    and review of #1050 pointed out the obvious defeat - a wrapper that rejects exactly those probes
-    and permits everything else passes, after which the subject reads the repository by relative
-    path, or by building the absolute path at runtime, or through any API the probes did not think
-    of. The self-test's own `gate.sh` was that exact shape. No amount of extra probing closes it;
-    each new probe is one more special case for a wrapper to know about.
+    Two properties, both by construction rather than by probing:
 
-    So the runner constructs the container itself. The repository is simply **not mounted**, which
-    makes it unreachable by construction rather than unreachable as far as anyone checked. Only the
-    workdir is bound, at its own path so the ABI and nest paths handed to the subject stay valid,
-    and `--network host` is what lets it reach the fixture chain on loopback.
+    * **The repository is not mounted.** Only the workdir is bound, so `eval/authoring.toml` and the
+      board test are unreachable - not "unreachable as far as the probes checked". This replaced a
+      probe-based check that review defeated four times over; a wrapper that rejects exactly the
+      probes and permits everything else passes them all, and each new probe is one more special
+      case for it to know about. Probing cannot prove the absence of a capability.
+    * **No internet.** `--network host` was the first attempt and hands the subject the whole host
+      network, so an agent could consult external documentation or a data service and the eval would
+      not be offline or limited to the builder skill at all. The network here is Docker `--internal`:
+      containers on it reach each other and nothing else.
+
+    The fixture chain runs *inside* that network, because the subject must reach it and nothing on
+    an internal network is reachable from the host. That is also why it is pinned at startup
+    (`--tip`/`--finalized`) rather than through `/control/*`: the runner cannot post to it either.
     """
-    return [
-        "docker", "run", "--rm", "--network", "host",
-        "-v", f"{workdir}:{workdir}", "-w", str(workdir),
-        image,
-    ]
+
+    def __init__(self, image: str, scenario, run_id: str):
+        self.image, self.scenario, self.run_id = image, scenario, run_id
+        self.network = f"nuthatch-eval-{run_id}"
+        self.fixture = f"nuthatch-fixture-{run_id}"
+        self.rpc_port = 8945
+        self.rpc = f"http://{self.fixture}:{self.rpc_port}/"
+
+    def __enter__(self):
+        script = ROOT / "scripts" / "fixture_rpc.py"
+        _sh(["docker", "network", "create", "--internal", self.network])
+        _sh([
+            "docker", "run", "-d", "--rm", "--name", self.fixture, "--network", self.network,
+            "-v", f"{script}:{script}:ro", self.image,
+            "python3", str(script),
+            "--port", str(self.rpc_port), "--bind", "0.0.0.0",
+            "--contract", self.scenario["contract"],
+            # Pinned here: the control endpoints are unreachable from the host on this network.
+            "--tip", str(self.scenario["tip"]),
+            "--finalized", str(self.scenario["finalized"]),
+        ])
+        return self
+
+    def argv(self, workdir: Path) -> list[str]:
+        return [
+            "docker", "run", "--rm", "--network", self.network,
+            "-v", f"{workdir}:{workdir}", "-w", str(workdir),
+            self.image,
+        ]
+
+    def __exit__(self, *_):
+        _sh(["docker", "rm", "-f", self.fixture], check=False)
+        _sh(["docker", "network", "rm", self.network], check=False)
+        return False
+
+    def preflight(self, workdir: Path) -> None:
+        """Reject an unusable image **before** any score is recorded.
+
+        `--docker-image` used to skip every check that `--sandbox` had to pass, so a missing image,
+        or one without `claude`, reached the subject and was recorded as an agent failure with the
+        criteria false. A broken environment must not publish a zero that reads as a failing agent.
+        """
+        (workdir / "allowed").write_text("readable")
+        code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {workdir / 'allowed'}"])
+        if code != 0 or "readable" not in out:
+            die(f"the image cannot read the workdir at its own path.\n  got: {out.strip()[:200]}")
+
+        code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {SCENARIO} 2>/dev/null || true"])
+        if out.strip():
+            die(f"the image can read {SCENARIO}; the repository must not be mounted into it")
+
+        for tool in ("curl", "wget", "python3"):
+            code, out = _run(self.argv(workdir) + [
+                "sh", "-c",
+                f"command -v {tool} >/dev/null 2>&1 || exit 97; "
+                f"{'curl -fsS -m 5' if tool == 'curl' else 'wget -qO- -T 5' if tool == 'wget' else 'python3 -c'} "
+                + (f"\"import urllib.request as u;print(u.urlopen('{self.rpc}control/state',timeout=5)"
+                   f".read().decode())\"" if tool == "python3" else f"{self.rpc}control/state"),
+            ])
+            if code == 97:
+                continue
+            if code == 0 and "mode" in out:
+                break
+        else:
+            die(
+                f"the image cannot reach the fixture at {self.rpc}. Either it has none of curl, "
+                "wget or python3 - in which case reachability cannot be established and is not "
+                "assumed - or the fixture container did not come up."
+            )
+
+        code, out = _run(self.argv(workdir) + ["sh", "-c", "command -v claude >/dev/null && echo yes"])
+        if "yes" not in out:
+            die("the image has no `claude` on PATH; every run would fail for the image's reasons")
+
+
+def _run(argv, timeout=180):
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return out.returncode, out.stdout
+    except Exception as error:
+        return 1, f"<{type(error).__name__}: {error}>"
+
+
+def _sh(argv, check=True):
+    code, out = _run(argv)
+    if check and code != 0:
+        die(f"{' '.join(argv[:4])} failed: {out.strip()[:200]}")
+    return out
 
 
 def sandbox_argv(template: str, workdir: Path, rpc_port: int) -> list[str]:
@@ -360,7 +447,8 @@ def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
         pass
 
 
-def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_port: int, args):
+def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_port: int, args,
+                isolation=None):
     """One agent with the builder skill and a shell, and nothing else it is not given.
 
     It receives the task statement and the paths. It must **not** be able to reach the criteria, the
@@ -384,7 +472,7 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_po
         die(f"the builder skill is not at {skill}; there is nothing to evaluate")
     shutil.copytree(skill, workdir / ".claude" / "skills" / "nuthatch-builder")
 
-    confine = (docker_argv(args.docker_image, workdir, rpc_port) if args.docker_image
+    confine = (isolation.argv(workdir) if isolation is not None
                else sandbox_argv(args.sandbox, workdir, rpc_port))
     command = confine + [
         args.claude, "-p", "--model", args.model, "--no-session-persistence",
@@ -508,8 +596,17 @@ def resolve_table(api: str):
     return names[0] if len(names) == 1 else None
 
 
-def one_run(scenario, args):
-    chain, rpc, rpc_port = start_fixture_chain(scenario)
+def one_run(scenario, args, isolation=None):
+    """One subject, one score.
+
+    The chain lives wherever the subject can reach it: inside the isolated Docker network for the
+    enforced mode (the host cannot reach that network, which is the point), on host loopback for an
+    operator-supplied sandbox.
+    """
+    if isolation is not None:
+        chain, rpc, rpc_port = None, isolation.rpc, isolation.rpc_port
+    else:
+        chain, rpc, rpc_port = start_fixture_chain(scenario)
     dev = None
     try:
         with tempfile.TemporaryDirectory(prefix="nuthatch-authoring-") as tmp:
@@ -519,7 +616,7 @@ def one_run(scenario, args):
             nest = work / "nest"
 
             unservable = None
-            model, completed = subject_run(scenario, work, rpc, abi, nest, rpc_port, args)
+            model, completed = subject_run(scenario, work, rpc, abi, nest, rpc_port, args, isolation)
             if completed.returncode != 0:
                 print(f"  subject exited {completed.returncode}: "
                       f"{completed.stderr.strip()[:200]}", file=sys.stderr)
@@ -860,6 +957,35 @@ def self_test() -> int:
             check(f"a backgrounded child is reaped ({label})", not marker.exists(),
                   "the child is still running and would hold the redb lock")
 
+    # **The enforced mode, exercised for real** - if Docker and a stub image are available.
+    #
+    # Everything else here tests the *asserted* mode's probes. The enforced mode is the one that
+    # claims a boundary, so its claim is checked against a live container rather than reasoned
+    # about: the repository unreadable, the fixture reachable, and no route to the internet. Skipped
+    # rather than failed where Docker is absent, and the skip is printed so a green run cannot be
+    # mistaken for a verified one.
+    stub = os.environ.get("NUTHATCH_EVAL_STUB_IMAGE")
+    if stub and shutil.which("docker"):
+        run_id = f"selftest{os.getpid()}"
+        try:
+            with DockerIsolation(stub, scenario, run_id) as iso:
+                with tempfile.TemporaryDirectory(prefix="nuthatch-iso-") as tmp:
+                    work = Path(tmp)
+                    (work / "allowed").write_text("readable")
+                    code, out = _run(iso.argv(work) + ["sh", "-c", f"cat {SCENARIO} 2>/dev/null"])
+                    check("enforced: the repository is unreadable", not out.strip(),
+                          f"leaked {out.strip()[:80]}")
+                    code, out = _run(iso.argv(work) + [
+                        "sh", "-c", f"curl -fsS -m 5 {iso.rpc}control/state"])
+                    check("enforced: the fixture chain is reachable", "mode" in out, out.strip()[:120])
+                    code, out = _run(iso.argv(work) + [
+                        "sh", "-c", "curl -sS -m 5 https://example.com >/dev/null 2>&1 && echo LEAK || echo none"])
+                    check("enforced: there is no route to the internet", "LEAK" not in out, out.strip())
+        except SystemExit as error:
+            check("enforced: the isolated network stands up", False, str(error)[:200])
+    else:
+        print("  skip enforced-mode checks (set NUTHATCH_EVAL_STUB_IMAGE and have docker)")
+
     print("self-test: " + ("PASS" if not failures else f"FAIL ({', '.join(failures)})"))
     return 1 if failures else 0
 
@@ -931,12 +1057,18 @@ def main():
                             capture_output=True, text=True).stdout.strip()
 
     runs, model = [], None
-    for n in range(args.runs):
-        print(f"run {n + 1}/{args.runs}")
-        model, results = one_run(scenario, args)
-        for r in results:
-            print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['id']}: {r['detail']}")
-        runs.append(results)
+    isolation_cm = (DockerIsolation(args.docker_image, scenario, uuid.uuid4().hex[:8])
+                    if args.docker_image else contextlib.nullcontext())
+    with isolation_cm as isolation:
+        if isolation is not None:
+            with tempfile.TemporaryDirectory(prefix="nuthatch-preflight-") as pre:
+                isolation.preflight(Path(pre))
+        for n in range(args.runs):
+            print(f"run {n + 1}/{args.runs}")
+            model, results = one_run(scenario, args, isolation)
+            for r in results:
+                print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['id']}: {r['detail']}")
+            runs.append(results)
 
     per_criterion = {
         c["id"]: sum(1 for run in runs if next(r for r in run if r["id"] == c["id"])["passed"])

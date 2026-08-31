@@ -123,9 +123,25 @@ failure is silent and flattering.
 
 Exactly one of two modes is required; there is no default.
 
-**`--docker-image IMG` - enforced.** The runner builds the whole `docker run` itself, mounting only
-the workdir (at its own path, so the ABI and nest paths stay valid) with `--network host` for the
-fixture chain. The repository is **not mounted**, so it is unreachable *by construction*.
+**`--docker-image IMG` - enforced.** The runner builds the whole `docker run` itself. Two properties,
+both by construction:
+
+- **The repository is not mounted.** Only the workdir is bound, at its own path so the ABI and nest
+  paths stay valid. `eval/authoring.toml` and the board test are unreachable.
+- **There is no route to the internet.** The network is Docker `--internal`. `--network host` was
+  the first attempt and handed the subject the entire host network, so an agent could consult
+  external documentation or a data service and the eval would be neither offline nor limited to the
+  builder skill.
+
+The fixture chain runs **inside** that network, because nothing on an internal network is reachable
+from the host - which is also why it is pinned at startup (`--tip`/`--finalized`) rather than through
+`/control/*`. The image is preflighted before any run: workdir readable, repository not, fixture
+reachable, `claude` on `PATH`. A broken image must not publish a zero that reads as a failing agent.
+
+All three isolation properties are exercised against a live container in `--self-test` when
+`NUTHATCH_EVAL_STUB_IMAGE` is set, and the skip is printed otherwise so a green run cannot be
+mistaken for a verified one. Mutation-checked: switching back to `--network host` reds the internet
+and fixture legs; mounting the repo reds the repository leg.
 
 **`--sandbox TEMPLATE` - asserted.** Your own confinement, with `{workdir}` and `{rpc_port}`
 substituted. Sanity-checked for usability, and **not enforcement**.
