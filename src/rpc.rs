@@ -2803,10 +2803,35 @@ mod tests {
                         let n_items = req.matches("eth_getBlockByNumber").count();
                         let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
                         MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
-                        // Widens the window a concurrent sibling request would also be in flight -
-                        // without it, two requests issued back-to-back could each complete before the
-                        // other starts, hiding genuine concurrency behind a fast round trip.
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        // **Wait for a sibling rather than sleeping and hoping** (#1036).
+                        //
+                        // This was a flat 20 ms sleep to "widen the window", which makes the
+                        // assertion a race the test has to win: under load the first request can
+                        // finish before the second is dispatched, `MAX_IN_FLIGHT` reads 1, and a
+                        // test about concurrency fails for want of a scheduler. It did, twice, at
+                        // load averages 10.7 and 18.4, while passing in isolation and on `main`.
+                        //
+                        // Holding each request until a second one arrives makes concurrency
+                        // *observable* instead of sampled: with `parallel=true` both halves are in
+                        // flight and both release at once, deterministically. With `parallel=false`
+                        // no sibling ever comes, so the single request waits out the deadline and
+                        // proceeds - which is exactly the discrimination the assertions below want,
+                        // and it costs that arm one deadline rather than making it flaky.
+                        // Bounded, and only while a sibling is still possible: once two have been
+                        // seen concurrently the point is proved and later requests need not wait.
+                        // The deadline is generous against localhost dispatch but is paid only by
+                        // the sequential arm, where no sibling is ever coming.
+                        if MAX_IN_FLIGHT.load(Ordering::SeqCst) < 2 {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_millis(400);
+                            while IN_FLIGHT.load(Ordering::SeqCst) < 2
+                                && std::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            }
+                            MAX_IN_FLIGHT
+                                .fetch_max(IN_FLIGHT.load(Ordering::SeqCst), Ordering::SeqCst);
+                        }
                         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                         let items: Vec<String> = (0..n_items)
                             .map(|i| format!(
