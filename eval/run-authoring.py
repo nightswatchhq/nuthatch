@@ -645,31 +645,38 @@ def self_test() -> int:
                   "does not isolate this repository" in str(exit_),
                   f"refused for another reason: {str(exit_)[:160]}")
 
-    # **The positive case.** Everything above proves the runner rejects things; none of it proves a
-    # genuine sandbox is *accepted*, and a `verify_sandbox` that refused everything would satisfy
-    # the lot while making the eval unrunnable. Review of #1050 found exactly that class of defect -
-    # a required interface that could never actually be used - so the acceptance path gets a test.
+    # **The positive case, with no escape hatch.**
     #
-    # A real confinement is stood up here with the tools that exist everywhere: a `chroot`-free
-    # approximation using `env -i` plus a wrapper that refuses paths outside the workdir. It is not
-    # the sandbox an operator should use; it is enough to prove the *contract* is satisfiable.
-    with tempfile.TemporaryDirectory(prefix="nuthatch-fakebox-") as tmp:
-        gate = Path(tmp) / "gate.sh"
-        gate.write_text(
-            "#!/bin/sh\n"
-            "# Confine by refusing any command mentioning the repository root.\n"
-            f"case \"$*\" in *{ROOT}*) exit 13 ;; esac\n"
-            "exec \"$@\"\n"
-        )
-        gate.chmod(0o755)
-        try:
-            verify_sandbox(f"{gate} ", 9)
-            check("a confining sandbox is accepted", True)
-        except SystemExit as exit_:
-            # Loopback is unreachable at port 9, which this stub cannot help; that specific refusal
-            # is the RPC leg and not a rejection of the confinement itself.
-            check("a confining sandbox is accepted", "cannot reach the fixture RPC" in str(exit_),
-                  f"rejected a confining sandbox: {str(exit_)[:200]}")
+    # Everything above proves the runner *rejects* things. None of it proves it *accepts* a genuine
+    # sandbox - and a `verify_sandbox` that refused everything would satisfy the lot while making
+    # the eval unrunnable, which is the very defect review found in the interface itself.
+    #
+    # The first attempt at this check was worse than none: it ran against port 9 with no chain
+    # there, so a correctly confined wrapper reached the RPC leg and raised, and the check counted
+    # that specific failure as success. A regression rejecting every sandbox would have passed it
+    # unchanged. So a **real fixture chain** is started and `verify_sandbox` must return cleanly.
+    chain, _, port = start_fixture_chain(scenario)
+    try:
+        with tempfile.TemporaryDirectory(prefix="nuthatch-fakebox-") as tmp:
+            gate = Path(tmp) / "gate.sh"
+            gate.write_text(
+                "#!/bin/sh\n"
+                "# A real confinement, in the only terms available everywhere: refuse any command\n"
+                "# that names the repository. Not what an operator should use - enough to prove the\n"
+                "# contract is satisfiable at all.\n"
+                f"case \"$*\" in *{ROOT}*) exit 13 ;; esac\n"
+                "exec \"$@\"\n"
+            )
+            gate.chmod(0o755)
+            try:
+                verify_sandbox(f"{gate} ", port)
+                check("a confining sandbox is accepted", True)
+            except SystemExit as exit_:
+                check("a confining sandbox is accepted", False,
+                      f"rejected a working sandbox: {str(exit_)[:200]}")
+    finally:
+        chain.kill()
+        chain.wait()
 
     # The eval's integrity property: a run must be impossible without isolation. Review of #1050
     # found the subject boundary asserted in a docstring and enforced nowhere - the agent could read

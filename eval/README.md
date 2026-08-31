@@ -145,6 +145,12 @@ read this repository, and it must reach the fixture RPC on loopback. Only all th
 probe that simply fails would otherwise read as isolation, which is how this class of check usually
 goes wrong.
 
+All three legs are mutation-checked in `--self-test`: rejecting at *any* of them makes the
+acceptance case fail, so a `verify_sandbox` that refuses everything cannot pass CI while leaving the
+eval unrunnable. The acceptance case runs against a real fixture chain and requires a clean return -
+an earlier version ran it against a dead port and counted the resulting refusal as success, which
+guarded nothing.
+
 The repository leg is probed at **several** paths, not one: `tests/authoring_eval_board.rs` carries
 the same fixture values, the expected total and the canned query verbatim, so a sandbox that hides
 `eval/authoring.toml` alone gives away exactly as much and is refused.
