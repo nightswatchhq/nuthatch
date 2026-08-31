@@ -4,6 +4,13 @@
 [high-level-roadmap-jul-aug-2026.md](high-level-roadmap-jul-aug-2026.md), which covered the previous
 window and is now historical record.
 
+**2026-08-31 update.** The capability items deferred by this direction were closed into
+[frozen-for-2027.md](frozen-for-2027.md). That register, rather than an open issue label, is the
+reopening record for 2027.
+
+The issue references in the five workstreams are the evidence available when this direction was
+agreed, not a second backlog. Consult [backlog.md](backlog.md) and GitHub for what remains.
+
 ## The thesis
 
 nuthatch's core deliverables are shipped, and then some. The original vision was a single static
@@ -39,7 +46,8 @@ Building more on top of that would have been the wrong year.
 
 ## The five workstreams
 
-Each names real, open, already-triaged work. This is a plan, not a wish list.
+Each named real, already-triaged work at the date of this decision. This is a direction record, not
+a second live queue.
 
 ### 1. The delightful core, made best in class
 
@@ -77,7 +85,10 @@ and wants enforcing rather than restating.
 
 - [#295](https://github.com/nightswatchhq/nuthatch/issues/295) hold a persistent DuckDB connection instead of rebuilding the world per query.
 - [#296](https://github.com/nightswatchhq/nuthatch/issues/296) a compact binary row format instead of JSON-string storage.
-- [#282](https://github.com/nightswatchhq/nuthatch/issues/282), [#285](https://github.com/nightswatchhq/nuthatch/issues/285), [#286](https://github.com/nightswatchhq/nuthatch/issues/286), [#298](https://github.com/nightswatchhq/nuthatch/issues/298) tip lag, a published backfill number, the RAM budget under a hostile contract, the RFC-0004 perf set.
+- The remaining open performance item is [#296](https://github.com/nightswatchhq/nuthatch/issues/296),
+  compact binary rows. Tip-lag evidence, the published backfill number, and the wider RFC-0004
+  performance set are deferred in [frozen-for-2027.md](frozen-for-2027.md); the hostile-contract RAM
+  budget (#286) was closed after its evidence landed.
 
 ### 5. Maintenance and marketing
 
@@ -92,13 +103,13 @@ one day and failed its own endpoint bar the next ([#679](https://github.com/nigh
 
 ## Parked, not cancelled
 
-A dozen open issues describe new capability: the revm state engine, trace and state-diff extraction,
-ExEx against a real reth node, DataFusion convergence, a Turso hot store, tier-4 hosted call cache,
-wildcard-address decode, the OBIB cases, whole-derivation reuse.
+A set of former issues describes new capability: the revm state engine, trace and state-diff
+extraction, ExEx against a real reth node, DataFusion convergence, a Turso hot store, tier-4 hosted
+call cache, wildcard-address decode, the OBIB cases, and whole-derivation reuse.
 
-None of these are bad ideas and none are repudiated. They are **parked for 2026** and want a label
-saying so, because an open issue reads as an invitation and these currently point contributors and
-agents at construction the project is not doing this year.
+None of these are bad ideas and none are repudiated. They are **deferred for 2026** in the
+[frozen register](frozen-for-2027.md), because an open issue reads as an invitation and this work is
+not construction the project is doing this year.
 
 The `CLAUDE.md` out-of-scope list is unchanged and still binds: no hosted service, no token, no
 non-EVM before EVM is airtight, no TEE or zk, no Kubernetes.
