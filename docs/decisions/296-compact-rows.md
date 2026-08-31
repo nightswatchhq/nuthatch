@@ -76,6 +76,8 @@ redb's per-row overhead is unchanged by the encoding, so a 3.1x payload cut is a
 Then the thing the whole issue rests on. **RSS does not track the file. It tracks redb's cache
 setting, which nuthatch has never set:**
 
+**macOS** (M-series, MacBook):
+
 | cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
 | --- | ---: | ---: | ---: | ---: |
 | 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.0 us | 1.1 us |
@@ -83,10 +85,26 @@ setting, which nuthatch has never set:**
 | 256 MiB | **0.33 GB** | **0.33 GB** | 3.8 us | 2.0 us |
 | 128 MiB | **0.17 GB** | **0.17 GB** | 3.7 us | 2.2 us |
 
-**At every cache size smaller than both files, the two encodings land on identical RSS** - 0.64
-against 0.64, 0.33 against 0.33, 0.17 against 0.17 - across a 2.00x difference in file size. The
-encoding is not what is buying the memory. The cache size is, and it is the same lever in both
-columns.
+**Linux** (Debian 13, 6.12.94, 32 core - the platform production runs), same commit, byte-identical
+stores:
+
+| cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
+| --- | ---: | ---: | ---: | ---: |
+| 1 GiB (today's default) | 1.00 GB | 0.69 GB | 4.2 us | 1.5 us |
+| 512 MiB | **0.50 GB** | **0.50 GB** | 4.9 us | 2.0 us |
+| 256 MiB | **0.25 GB** | **0.25 GB** | 4.9 us | 2.6 us |
+| 128 MiB | **0.13 GB** | **0.13 GB** | 5.0 us | 2.9 us |
+
+**At every cache size smaller than both files, on both platforms, the two encodings land on
+identical RSS** - 0.50 against 0.50, 0.25 against 0.25, 0.13 against 0.13 on Linux - across a 2.00x
+difference in file size. The encoding is not what is buying the memory. The cache size is, and it is
+the same lever in both columns.
+
+Linux is the cleaner of the two: RSS tracks the cache setting almost one-for-one, where macOS's
+allocator adds a roughly 1.25x overhead on top. The conclusion does not depend on which, but the
+Linux figures are the ones to reason about, because that is where the nests run. Its point-reads are
+slower in absolute terms (4.2 us against 3.0) on a different CPU under load average 20-30; the
+*ratios* are what transfer, and they agree to within 0.1x.
 
 `Builder::new()` calls `set_cache_size(1 GiB)` (split 90% read / 10% write) and `store.rs` never
 overrides it at any of its three open sites. redb 2.6.3 does not mmap - `file_backend/unix.rs`
@@ -103,7 +121,7 @@ The table below gains a fifth row that was missing because nobody knew the cache
 
 | option | cost | RSS saving, measured |
 | --- | --- | --- |
-| **Set redb's cache size** | one argument at three call sites | 1.28 -> 0.33 GB in the harness; ~950 MB/cursor |
+| **Set redb's cache size** | one argument at three call sites | 1.00 -> 0.25 GB on Linux; **~750 MB/cursor** |
 | Compact encoding | a storage format, a migration, and part of RFC-0020 | **nothing, once the cache is set** |
 
 The memory case for #296 is answered, and the answer is no: the saving it was justified by is
@@ -111,20 +129,22 @@ already available, is larger, costs no format change, spends no part of the no-r
 is one line. Per the sprint's own constraint - *do not trade away the no-resync promise by
 implication* - there is now nothing to trade it for.
 
-**What the encoding does own, and it is real:** point-read decode is **2.7x faster** (3.0 -> 1.1 us
-at 1 GiB, 3.8 -> 2.0 us at 256 MiB - a consistent ~1.7 us saved per read). That is a latency result,
+**What the encoding does own, and it is real:** point-read decode is **2.7x faster on macOS and 2.8x
+on Linux** (4.2 -> 1.5 us at 1 GiB, 4.9 -> 2.6 us at 256 MiB - a consistent 1.7-2.7 us saved per
+read). It is the one expectation the prototype confirmed. That is a latency result,
 not a memory one. #296 asked for memory. If the decode win is worth wanting it should be argued on
 its own terms, against the cost of a migration, and it is a much weaker case than the one this
 document set out to make.
 
-Note the second column of that table for the cache option: a smaller cache costs **0.8 us** per
-point read (3.0 -> 3.8 us) for **950 MB**. And because the budget is per *cursor*, an unset cache
+Note the second column of that table for the cache option: on Linux a smaller cache costs **0.7 us**
+per point read (4.2 -> 4.9 us) for **750 MB**. And because the budget is per *cursor*, an unset cache
 means N cursors reserve N GiB - so this is worth more to multi-nest density than the encoding ever
 was.
 
 ### What this measurement does not establish
 
-- **The latency figures are optimistic about disk.** Both boxes had the store in the OS page cache,
+- **The latency figures are optimistic about disk.** Both boxes had the store in the OS page cache
+  (the Linux box has 62 GB of RAM and 38 GB of it in buff/cache),
   so a redb cache miss cost a memcpy, not a read. Under real memory pressure a 256 MiB cache would
   fault to disk and the 3.8 us would be worse. Pulling the cache lever needs a production
   measurement before a value is picked, and 256 MiB should not be assumed to be it.
