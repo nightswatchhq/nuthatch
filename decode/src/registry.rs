@@ -1354,8 +1354,10 @@ mod stored_roundtrip {
     fn cor6_an_event_param_named_block_number_shadows_the_real_one() {
         let mut row = a_row(true);
         // An ABI is free to name a parameter `block_number`; nothing refuses it.
-        row.params
-            .push(("block_number".into(), Value::Word32(U256::from(7u64).to_be_bytes::<32>())));
+        row.params.push((
+            "block_number".into(),
+            Value::Word32(U256::from(7u64).to_be_bytes::<32>()),
+        ));
 
         let j = row.to_json();
         let obj = j.as_object().unwrap();
