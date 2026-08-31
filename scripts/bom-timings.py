@@ -15,7 +15,7 @@ output rather than something to reconstruct afterwards: the selected file, its m
 the rustc/commit it came from are printed with the table.
 
 Usage:
-    scripts/bom-timings.py <path to cargo-timing-*.html>
+    scripts/bom-timings.py <path to cargo-timing.html or cargo-timing-<ts>.html>
     scripts/bom-timings.py --dir <cargo-timings dir>     # newest by mtime, and says which
     scripts/bom-timings.py --json                        # machine-readable, for a doc generator
 
@@ -71,13 +71,22 @@ def pick_report(explicit: str | None, directory: str | None) -> pathlib.Path:
     for d in dirs:
         if not d.is_dir():
             continue
-        # By mtime, not by name: a lexicographic pick is not a choice, and `cargo-timing.html`
-        # (unsuffixed) sorts before every dated file.
-        reports = sorted(d.glob("cargo-timing-*.html"), key=lambda f: f.stat().st_mtime)
+        # **Both forms** (#1027). Cargo writes a timestamped `cargo-timing-<ts>.html` *and* an
+        # unsuffixed `cargo-timing.html`; a first `--timings` run can leave only the latter, which the
+        # previous glob rejected outright. The comment here already named that file as the reason not
+        # to sort by name, and then the glob on the next line excluded it - prose describing a hazard
+        # the code did not handle.
+        #
+        # By mtime, not by name: a lexicographic pick is not a choice, and the unsuffixed file sorts
+        # before every dated one, so name order would prefer a stale report over a fresh one.
+        reports = sorted(
+            set(d.glob("cargo-timing-*.html")) | set(d.glob("cargo-timing.html")),
+            key=lambda f: f.stat().st_mtime,
+        )
         if reports:
             return reports[-1]
     sys.exit(
-        "no cargo-timing-*.html found in "
+        "no cargo-timing.html or cargo-timing-*.html found in "
         + ", ".join(str(d) for d in dirs)
         + "\nRun `cargo build --release --locked --timings` first, or pass a path explicitly."
     )
@@ -105,7 +114,7 @@ def provenance(report: pathlib.Path) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("report", nargs="?", help="path to a cargo-timing-*.html")
+    ap.add_argument("report", nargs="?", help="path to a cargo-timing[-<ts>].html")
     ap.add_argument("--dir", help="directory of cargo-timing reports; newest by mtime is used")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args()
