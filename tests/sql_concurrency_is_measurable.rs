@@ -102,12 +102,23 @@ use std::sync::Arc;
 use common::tape::*;
 use nuthatch::indexer;
 
+/// The gate is now **one per process** (#1024), so tests that vary it cannot run concurrently -
+/// which is the fix working rather than an inconvenience. Both async tests take this first.
+fn gate_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn permits_with(value: Option<&str>) -> usize {
     let key = "NUTHATCH_SQL_MAX_CONCURRENCY";
     match value {
         Some(v) => std::env::set_var(key, v),
         None => std::env::remove_var(key),
     }
+    // Production memoises the gate for the life of the process (#1024). A test that varies the
+    // override has to rebuild it, and needing this seam is itself the point: two nests must not be
+    // able to hold two different views of one budget.
+    nuthatch::serve::rebuild_sql_gate_for_test();
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
@@ -136,7 +147,8 @@ async fn permits_with(value: Option<&str>) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
-    // Serialised deliberately: the env var is process-global and these spawn real nests.
+    let _guard = gate_lock().lock().await;
+    // Serialised deliberately: the env var and the gate are both process-global (#1024).
     assert_eq!(
         permits_with(None).await,
         SQL_MAX_CONCURRENCY,
@@ -154,4 +166,83 @@ async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
         SQL_MAX_CONCURRENCY_CEILING,
         "the ceiling must hold at the gate, not only in the parser"
     );
+}
+
+/// #1024 - the gate must be **one per process**, not one per nest.
+///
+/// Caught in review, and it is the same shape as everything else this sprint found: the doc comment
+/// on `SQL_MAX_CONCURRENCY` has always claimed to bound "the whole analytical surface", while
+/// `build_nest` gave every nest its own semaphore. At a hardcoded 2 that was survivable. Made
+/// settable, `NUTHATCH_SQL_MAX_CONCURRENCY=16` across six nests would admit **96** concurrent
+/// queries, each able to open its own DuckDB - the exact per-cursor overrun the override's warning
+/// claims to prevent.
+///
+/// The budget is per cursor and shared across the nests on it, so a per-nest gate cannot express it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_nest_in_a_runtime_shares_one_gate() {
+    let _guard = gate_lock().lock().await;
+    std::env::set_var("NUTHATCH_SQL_MAX_CONCURRENCY", "4");
+    nuthatch::serve::rebuild_sql_gate_for_test();
+
+    let mut runtimes = Vec::new();
+    let mut dirs = Vec::new();
+    for i in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let tape = Arc::new(TapeSource::new());
+        tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
+        tape.advance_tip_to(1);
+        let cfg = scaffold_nest(dir.path(), &format!("shared{i}"), USDC);
+        let rt = indexer::spawn_nest(
+            tape,
+            dir.path().to_path_buf(),
+            cfg,
+            None,
+            false,
+            1,
+            Some(2),
+            false,
+            None,
+        )
+        .await
+        .expect("spawn_nest");
+        runtimes.push(rt);
+        dirs.push(dir);
+    }
+
+    // Same allocation, not merely the same number: three nests must hold three handles to one gate.
+    let gates: Vec<_> = runtimes.iter().map(|r| r.state.sql_gate.clone()).collect();
+    for (i, g) in gates.iter().enumerate().skip(1) {
+        assert!(
+            Arc::ptr_eq(&gates[0], g),
+            "nest {i} has its own semaphore. Three nests would then admit 3 x 4 = 12 concurrent \
+             analytical queries against a budget that is per cursor and shared across the nests on \
+             it (#1024). Equal permit counts are not enough - they must be the same gate."
+        );
+    }
+
+    // And the observable consequence: taking every permit through one nest must starve the others.
+    let held: Vec<_> = (0..4)
+        .map(|_| {
+            gates[0]
+                .clone()
+                .try_acquire_owned()
+                .expect("4 permits available")
+        })
+        .collect();
+    assert_eq!(held.len(), 4);
+    for (i, g) in gates.iter().enumerate() {
+        assert!(
+            g.clone().try_acquire_owned().is_err(),
+            "nest {i} could still admit a query while another nest held every permit. That is the \
+             per-nest gate reappearing, whatever the pointers say"
+        );
+    }
+    drop(held);
+
+    for rt in runtimes {
+        let ingest = rt.ingest;
+        ingest.abort();
+        let _ = ingest.await;
+    }
+    std::env::remove_var("NUTHATCH_SQL_MAX_CONCURRENCY");
 }

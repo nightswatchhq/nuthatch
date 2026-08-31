@@ -2409,7 +2409,7 @@ async fn build_nest(
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
-        sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::sql_max_concurrency())),
+        sql_gate: serve::sql_gate(),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.

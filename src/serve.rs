@@ -50,6 +50,61 @@ pub const SQL_MAX_CONCURRENCY_CEILING: usize = 16;
 ///
 /// Refusals are loud and the value is clamped rather than silently accepted: a benchmark that
 /// requested 64 and quietly got 2 would publish a curve that is flat for the wrong reason.
+/// The **one** analytical gate for this process, shared by every nest.
+///
+/// # Why shared, and why that is a fix rather than a change of mind
+///
+/// [`SQL_MAX_CONCURRENCY`]'s own description has always said it "bounds the whole analytical
+/// surface's worst-case footprint". It did not. `build_nest` constructed a **separate** semaphore per
+/// nest, so a runtime hosting six nests admitted `6 x permits` concurrent DuckDB queries, not
+/// `permits`.
+///
+/// That was survivable at a hardcoded 2 and became a foot-gun the moment the value was made
+/// settable: `NUTHATCH_SQL_MAX_CONCURRENCY=16` across six nests would admit **96**, each able to open
+/// its own DuckDB - precisely the per-cursor budget the override's own warning claims to protect.
+/// Caught in review of #1006 (#1024), and the same shape as everything else this sprint found: a
+/// comment asserting a property the code did not deliver.
+///
+/// The budget is **per cursor and shared across the nests on it** (CLAUDE.md non-negotiable 2), so a
+/// per-nest gate cannot express it. One gate per process is the conservative reading: a process holds
+/// one or more cursors, so a single gate is never *weaker* than a per-cursor one.
+///
+/// **The trade, stated rather than buried:** a multi-nest runtime's effective analytical concurrency
+/// drops from `N x permits` to `permits`. That is the documented behaviour finally being true, and it
+/// is the safe direction, but it is a real reduction for a dense runtime.
+/// `docs/bench/1006-sql-concurrency-hetzner.md` measures what a permit buys and recommends raising
+/// the default; that is a separate board decision and is not taken here.
+pub fn sql_gate() -> Arc<Semaphore> {
+    static GATE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    // Tests vary the override inside one process, which a `OnceLock` cannot express. They take the
+    // overridable path; production never sets it and takes the memoised one.
+    if let Ok(g) = test_gate_override().lock() {
+        if let Some(g) = g.as_ref() {
+            return g.clone();
+        }
+    }
+    GATE.get_or_init(|| Arc::new(Semaphore::new(sql_max_concurrency())))
+        .clone()
+}
+
+fn test_gate_override() -> &'static std::sync::Mutex<Option<Arc<Semaphore>>> {
+    static O: std::sync::OnceLock<std::sync::Mutex<Option<Arc<Semaphore>>>> =
+        std::sync::OnceLock::new();
+    O.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Test seam: pin the process gate to a fresh semaphore built from the current override.
+///
+/// **Nothing in the product calls this**, and it is `pub` only because an integration test links the
+/// crate without `cfg(test)` - the same arrangement as `NestMetrics::set_last_poll_ok_for_test`.
+/// Production memoises deliberately: a gate that could be rebuilt at runtime would let two nests
+/// hold two different views of one budget, which is the bug this exists to prove is fixed.
+pub fn rebuild_sql_gate_for_test() {
+    if let Ok(mut g) = test_gate_override().lock() {
+        *g = Some(Arc::new(Semaphore::new(sql_max_concurrency())));
+    }
+}
+
 pub fn sql_max_concurrency() -> usize {
     match std::env::var("NUTHATCH_SQL_MAX_CONCURRENCY") {
         Err(_) => SQL_MAX_CONCURRENCY,
