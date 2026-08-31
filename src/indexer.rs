@@ -436,6 +436,8 @@ pub async fn spawn_nest(
         admin_enabled,
         admin_token,
         None,
+        // A solo `dev` nest is its own cursor, so it owns the gate outright (#1024).
+        serve::new_sql_gate(),
     )
     .await?;
     refuse_seal_direct_with_entities(seal_direct, &nest)?;
@@ -616,6 +618,8 @@ pub async fn spawn_nest_on_store(
         false,
         None,
         Some(store),
+        // One writer, one cursor (#1024).
+        serve::new_sql_gate(),
     )
     .await?;
     refuse_seal_direct_with_entities(seal_direct, &nest)?;
@@ -1761,6 +1765,10 @@ pub async fn spawn_runtime(
     let mut states = Vec::new();
     let mut alert_workers: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut window = None;
+    // **One gate for this cursor** (#1024). `group_by_chain` gives one `spawn_runtime` per chain, so
+    // this call *is* the cursor, and every nest built below shares the budget rather than each
+    // getting its own copy of it.
+    let sql_gate = serve::new_sql_gate();
     for (name, dir, config) in nests {
         let (nest, state, worker, w) = build_nest(
             &source,
@@ -1770,6 +1778,7 @@ pub async fn spawn_runtime(
             admin_enabled,
             admin_token.clone(),
             None,
+            sql_gate.clone(),
         )
         .await?;
         window.get_or_insert(w);
@@ -1906,6 +1915,8 @@ pub async fn build_and_prepare_nest(
         admin_enabled,
         admin_token,
         store_override,
+        // One nest built on its own is one cursor (#1024).
+        serve::new_sql_gate(),
     )
     .await?;
     let next = nest
@@ -1947,6 +1958,7 @@ pub fn full_schema(
 /// the caller's job ([`spawn_nest`] today; a runtime driver tomorrow, RFC-0012). Per-nest isolation
 /// (own store, own segments, own views) is the CLAUDE.md non-negotiable a runtime preserves by calling
 /// this once per nest.
+#[allow(clippy::too_many_arguments)]
 async fn build_nest(
     // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
     // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
@@ -1957,6 +1969,9 @@ async fn build_nest(
     admin_enabled: bool,
     admin_token: Option<String>,
     store_override: Option<Arc<dyn crate::store::HotStore>>,
+    // The cursor's analytical gate, shared by every nest on this cursor (#1024). Created by the
+    // caller because only the caller knows the cursor boundary: `spawn_runtime` is one cursor.
+    sql_gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
@@ -2409,7 +2424,7 @@ async fn build_nest(
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
-        sql_gate: Arc::new(tokio::sync::Semaphore::new(serve::SQL_MAX_CONCURRENCY)),
+        sql_gate,
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
@@ -2485,6 +2500,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
         admin_enabled,
         admin_token,
         store_override,
+        serve::new_sql_gate(),
     )
     .await?;
 
@@ -7236,10 +7252,18 @@ template = "pool"
         .unwrap();
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        let (nest, _state, _worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .unwrap();
+        let (nest, _state, _worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
         assert!(nest.factory.is_some(), "fixture must be a factory nest");
         nest
     }
@@ -7257,10 +7281,18 @@ template = "pool"
         .unwrap();
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        let (nest, _state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .expect("a contract-free blocks nest must build (#445)");
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a contract-free blocks nest must build (#445)");
         if let Some(w) = worker {
             w.abort();
         }
@@ -7335,10 +7367,18 @@ template = "pool"
         .unwrap();
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        let (nest, _state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .unwrap();
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
         if let Some(w) = worker {
             w.abort();
         }
@@ -7383,6 +7423,7 @@ template = "pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a contract-free blocks nest must build");
@@ -9313,10 +9354,18 @@ template="pool"
         .unwrap();
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        let (nest, _state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .expect("a nest with a contract and [extract] blocks must build");
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a nest with a contract and [extract] blocks must build");
         if let Some(w) = worker {
             w.abort();
         }
@@ -9423,6 +9472,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a calls nest with a state RPC must build");
@@ -9498,6 +9548,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .unwrap();
@@ -9587,6 +9638,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .unwrap();
@@ -9702,6 +9754,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a calls nest with a state RPC must build");
@@ -9808,6 +9861,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .unwrap();
@@ -9875,6 +9929,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .unwrap();
@@ -9956,6 +10011,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a calls nest with a state RPC must build");
@@ -10043,10 +10099,18 @@ template="pool"
         let mut config = Config::load(dir).unwrap();
         config.ipfs_gateways = vec![gateway];
 
-        let (mut nest, state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .expect("an ipfs nest must build");
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("an ipfs nest must build");
         if let Some(w) = worker {
             w.abort();
         }
@@ -10278,6 +10342,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a top-level-calls nest must build with no node");
@@ -10364,6 +10429,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a row-driven calls nest must build");
@@ -10464,6 +10530,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await;
         // `unwrap_err` would need `Debug` on the Ok type, and `NestIngest`/`AppState` do not carry it.
@@ -10862,10 +10929,18 @@ template="pool"
         let config = Config::load(dir).unwrap();
         assert!(config.extract.blocks, "the fixture must be a blocks nest");
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-        let (nest, _state, worker, _w) =
-            build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                .await
-                .unwrap();
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
         if let Some(w) = worker {
             w.abort();
         }
@@ -11177,6 +11252,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         {
@@ -11333,6 +11409,7 @@ template="pool"
             false,
             None,
             None,
+            serve::new_sql_gate(),
         )
         .await
         .expect("a nest with a contract whose ABI has no events builds - primary() is satisfied");
@@ -12330,10 +12407,18 @@ template="pool"
         async fn build(dir: &std::path::Path) {
             let config = Config::load(dir).unwrap();
             let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
-            let (_nest, _state, worker, _w) =
-                build_nest(&source, dir.to_path_buf(), &config, None, false, None, None)
-                    .await
-                    .unwrap();
+            let (_nest, _state, worker, _w) = build_nest(
+                &source,
+                dir.to_path_buf(),
+                &config,
+                None,
+                false,
+                None,
+                None,
+                serve::new_sql_gate(),
+            )
+            .await
+            .unwrap();
             if let Some(w) = worker {
                 w.abort();
             }

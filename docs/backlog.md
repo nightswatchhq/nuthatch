@@ -13,15 +13,16 @@ one better written than the entry it came from. A second list is a list that dri
 |---|---|
 | What is each RFC, and is it built? | [RFC index](rfcs/README.md) |
 | **What is left to do?** | **[Open issues](https://github.com/nightswatchhq/nuthatch/issues)** |
+| What is the current sprint or a deferred capability? | [Documentation guide](README.md) |
 | What must be true before this runs unattended? | [prod-readiness.md](prod-readiness.md) |
 | How do I prove a claim on my own hardware? | [verification.md](verification.md) |
 
 ## Reading the queue
 
-Labels carry the meaning that this file's "tracks" used to. Every open issue carries **exactly one of
-a priority, `parked`, or `frozen`** - that is the invariant this queue is kept to, and a bare issue
-with none of those is a bug in the backlog rather than a style choice. `frozen` may sit alongside
-`parked`. It must not sit alongside a `p*`.
+Labels carry the meaning that this file's "tracks" used to. Every open issue carries **exactly one
+priority or `parked`**. A bare issue with neither is a backlog bug rather than a style choice.
+The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-for-2027.md), so
+`frozen` is not an open-queue state.
 
 **How urgent is it?**
 
@@ -31,7 +32,6 @@ with none of those is a bug in the backlog rather than a style choice. `frozen` 
 | `p1` | Next: a real correctness or coverage gap, with no immediate exposure |
 | `p2` | Later: tidy-up, ergonomics, or a gap with a known workaround |
 | `parked` | **Deferred by decision, not by oversight. Do not treat as a blocker please.** Carries no priority, on purpose - re-raising it as one is how a settled decision gets relitigated |
-| `frozen` | **Feature freeze (rest of 2026): no new capability.** Do not start. Revisit in 2027. Not a close and not a repudiation. `docs/roadmap-2027.md` is the decision |
 
 **What kind of thing is it?** More than one may apply.
 
@@ -55,10 +55,10 @@ with none of those is a bug in the backlog rather than a style choice. `frozen` 
 | `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
-are left in place afterwards as history. **A sprint label on an open issue means work in flight; on a
-closed one it means nothing but provenance.** In flight: `yawning-yellowthroat` (#823) and
-`xenial-xenops` (#817). `watchful-wren` landed as #816. `veracious-vireo` landed as #813.
-`tenacious-thrush` landed as #809. `unhurried-urial` landed as #811. `steady-starling` landed as #808.
+remain afterwards as provenance. The current sprint is
+[`mighty-moorhen`](sprint-mighty-moorhen.md). A sprint label on any other closed issue is historical;
+do not use it to infer that work remains. The [documentation guide](README.md) separates the live
+sprint from the dated records.
 
 The queries that matter:
 
@@ -67,13 +67,11 @@ gh issue list --limit 100 --json number,title,labels          # everything open
 gh issue list --label p0                                      # drop what you are doing
 gh issue list --label p1                                      # the real queue
 gh issue list --label parked                                  # deliberately not now
-gh issue list --label frozen                                  # not until 2027
 gh issue list --label verification                            # claims owing a measurement
 ```
 
-Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label and
-does not carry `frozen`. `grep -v parked` used to be the recommendation here only because priorities
-did not exist yet.
+Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label.
+`grep -v parked` used to be the recommendation here only because priorities did not exist yet.
 
 ## Standing decisions - do not re-raise these as blockers
 
@@ -86,10 +84,10 @@ RFC-0014 extracts from, and it stays the single unlock for that branch. The cost
 Deferring it is a decision. What it gates stays `parked`: ExEx wiring, trace/state extraction, an
 honest tip-lag number, and RFC-0023 tier 3's pinned-block verification.
 
-**DataFusion did not meet its gate** (2026-08-02). Measured at **1.6-2.7x DuckDB's latency** on
-`net_balances` over sealed segments, widening with segment size, at exact result parity. DuckDB stays
-in both modes. RFC-0013 §2's destination is *unmet, not repudiated* - re-run the gate before planning
-around it, and do not re-argue it from first principles in the meantime.
+**The first DataFusion gate did not meet its bar** (2026-08-02). It measured **1.6-2.7x DuckDB's
+latency** on `net_balances` over sealed segments, widening with segment size, at exact result parity.
+That result remains evidence, not an architectural commandment: [RFC-0042](rfcs/0042-rust-native-without-duckdb.md)
+sets the current bounded re-evaluation path and its acceptance gate.
 
 **Turso is double-gated**, not rejected: a production-ready release, and a measured win over redb
 that federation does not already provide. Until both, no.
@@ -121,5 +119,5 @@ you finish; a bullet in a document gets closed when someone remembers.
 Dated records, not live plans. Read them for *why*, never for *what is left*:
 
 - [progress-log.md](progress-log.md) - what happened, when
-- [sprint-amiable-axolotl.md](sprint-amiable-axolotl.md), [sprint-boisterous-badger.md](sprint-boisterous-badger.md) - sprint scopes as they stood
-- [high-level-roadmap-aug-2026.md](high-level-roadmap-aug-2026.md) - the architecture session that produced RFCs 0032-0035
+- `sprint-*.md` - completed sprint scopes as they stood; see the [documentation guide](README.md)
+- [high-level-roadmap-jul-aug-2026.md](high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035
