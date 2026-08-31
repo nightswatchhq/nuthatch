@@ -2364,6 +2364,21 @@ pub fn declared_but_never_sealed(
     declared: &[crate::registry::TableSchema],
 ) -> Vec<String> {
     let manifest = crate::seal::load_manifest(dir).unwrap_or_default();
+    // **Nothing sealed at all means we have not looked yet, not that nothing ever fires** (#1042).
+    //
+    // The predicate is "declared, and absent from the seal manifest". On a cold start the manifest is
+    // empty, so *every* table matches and the caller announces that every declared event has likely
+    // never fired on this chain - seconds before they all populate. A fresh operator running the
+    // tyre-kicking pass hit exactly that on both a USDC and a stETH nest, and recorded it as the
+    // product's first substantive line telling them their contract looked dead.
+    //
+    // An empty manifest carries no information about any individual table, so there is nothing
+    // honest to say. The claim becomes available the moment *something* has sealed: from then on,
+    // a table still missing from the manifest is genuinely a table whose event has not fired in the
+    // range we have covered - which is what #663 wanted to surface, and is still surfaced.
+    if manifest.tables.is_empty() {
+        return Vec::new();
+    }
     declared
         .iter()
         .map(|t| &t.table)
@@ -5785,13 +5800,19 @@ events = ["Transfer"]
                 columns: vec![],
             },
         ];
-        // No manifest on disk at all yet: both tables read as never-sealed.
-        assert_eq!(
-            declared_but_never_sealed(dir.path(), &declared),
-            vec![
-                "gns__signal_minted".to_string(),
-                "gns__grt_withdrawn".to_string()
-            ]
+        // **No manifest at all: nothing is claimed** (#1042, changed from the opposite assertion).
+        //
+        // This used to assert that both tables read as never-sealed, which is literally true of the
+        // manifest and false about the chain - and the caller turns it into "the event has likely
+        // never fired on this chain". On a cold start that fires for every table, seconds before
+        // they all populate. A fresh operator hit it on both a USDC and a stETH nest.
+        //
+        // An empty manifest carries no information about any individual table, so the honest answer
+        // is silence. The old assertion was pinning the defect.
+        assert!(
+            declared_but_never_sealed(dir.path(), &declared).is_empty(),
+            "with nothing sealed the nest has not looked yet, and must claim nothing about any \
+             declared event"
         );
 
         // A real sealed segment for `gns__signal_minted` only - `gns__grt_withdrawn` still has none.
@@ -5803,7 +5824,9 @@ events = ["Transfer"]
         assert_eq!(
             declared_but_never_sealed(dir.path(), &declared),
             vec!["gns__grt_withdrawn".to_string()],
-            "the table with a sealed segment drops off the list; the genuinely never-fired one remains"
+            "the table with a sealed segment drops off the list; the genuinely never-fired one \
+             remains - this is #663's case and it must keep working, or suppressing the cold-start \
+             noise would have cost the signal it was added for"
         );
     }
 
