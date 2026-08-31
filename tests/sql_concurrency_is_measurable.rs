@@ -231,22 +231,39 @@ async fn nests_on_one_cursor_share_one_gate() {
         );
     }
 
-    // The consequence, which pointer equality alone does not demonstrate: exhausting the gate
-    // through one nest must starve its co-tenants.
-    let held: Vec<_> = (0..4)
-        .map(|_| gates[0].clone().try_acquire_owned().expect("4 permits"))
-        .collect();
+    // The consequence, which pointer equality alone does not demonstrate: a permit taken through one
+    // nest must be *missing* from its co-tenants.
+    //
+    // **Not "acquire all 4 and expect starvation".** That was the first version and it failed on CI
+    // with `4 permits: NoPermits` while passing locally: these nests are spawned and running, so the
+    // runtime legitimately holds permits of its own, and a test that assumes an idle gate is timing
+    // the machine rather than the property. Taking *one* and watching the count fall on every other
+    // handle is the same assertion without the race.
+    let before: Vec<usize> = gates.iter().map(|g| g.available_permits()).collect();
+    assert!(
+        before.iter().all(|&n| n == before[0]),
+        "handles on one cursor disagree about the permit count before anything is taken: {before:?}"
+    );
+    let held = gates[0].clone().try_acquire_owned().unwrap_or_else(|_| {
+        panic!(
+            "no permit was free on a 4-permit cursor ({before:?}), so the observable below cannot be \
+             read. This run proves nothing rather than passing."
+        )
+    });
     for (i, g) in gates.iter().enumerate() {
-        assert!(
-            g.clone().try_acquire_owned().is_err(),
-            "nest {i} could still admit a query while a co-tenant held every permit on the cursor"
+        assert_eq!(
+            g.available_permits(),
+            before[i] - 1,
+            "a permit taken through nest 0 did not reduce what nest {i} can admit. Its gate is its \
+             own, so three nests would admit 3 x 4 = 12 concurrent analytical queries against a \
+             budget that is per cursor and shared across the nests on it (#1024)"
         );
     }
     drop(held);
     assert_eq!(
         gates[1].available_permits(),
-        4,
-        "permits return to the shared gate"
+        before[1],
+        "releasing through one handle must return the permit to the shared gate"
     );
 
     cursor.ingest.abort();
