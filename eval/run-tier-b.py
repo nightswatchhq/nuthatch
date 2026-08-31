@@ -90,6 +90,20 @@ class ScoringUnavailable(RuntimeError):
     """
 
 
+class QueryRejected(RuntimeError):
+    """The server answered, and the answer is that the subject's SQL is wrong.
+
+    The opposite of `ScoringUnavailable`, and the distinction review of #1051 insisted on. An
+    invented table name or a syntax error comes back as a well-formed `{"error": ...}` from a
+    perfectly healthy nest: the scorer looked, and what it saw was a bad query. That is an ordinary
+    failed verdict - and it is the *most* diagnostic one there is, since "the agent invented a table
+    name" is exactly what `final_query` exists to reveal.
+
+    Making it fatal was an over-correction: this file swung from scoring every failure as a zero to
+    aborting the run on the commonest agent mistake, and both extremes lose the same information.
+    """
+
+
 def sql_rows(url: str, query: str, limit: int = 200):
     params = urllib.parse.urlencode({"q": query, "max_rows": str(limit)})
     try:
@@ -108,7 +122,8 @@ def sql_rows(url: str, query: str, limit: int = 200):
     if not isinstance(payload, dict):
         raise ScoringUnavailable(f"response is {type(payload).__name__}, not an object")
     if "error" in payload:
-        raise ScoringUnavailable(payload["error"])
+        # The server is fine; the query is not. A verdict, not an absence of one.
+        raise QueryRejected(str(payload["error"]))
     if "rows" not in payload:
         raise ScoringUnavailable(f"response has no 'rows' key: {sorted(payload)!r}")
     rows = payload["rows"]
@@ -171,13 +186,18 @@ def subject_run(question: str, args):
 def evaluate_question(question, args):
     """Run one isolated subject and score only its final SQL invocation."""
     model, tool_calls, queries = subject_run(question["question"], args)
-    final_rows = []
+    final_rows, query_error = [], None
     if queries:
-        # Deliberately **not** caught. A scorer that cannot reach the nest has not discovered that
-        # the agent is wrong; it has discovered that it cannot tell. Those must not share a verdict.
-        final_rows = sql_rows(args.url, queries[-1])
+        try:
+            # `ScoringUnavailable` is deliberately **not** caught. A scorer that cannot reach the
+            # nest has not discovered that the agent is wrong; it has discovered that it cannot
+            # tell, and those must not share a verdict.
+            final_rows = sql_rows(args.url, queries[-1])
+        except QueryRejected as rejected:
+            # A rejected query *is* the verdict, and recording why is the point of this change.
+            query_error = str(rejected)
     expected = json.loads(question["expect"])
-    passed = bool(queries) and results_equal(expected, final_rows)
+    passed = bool(queries) and query_error is None and results_equal(expected, final_rows)
     return model, {
         "id": question["id"], "class": question["class"], "passed": passed,
         "first_try": passed and len(queries) == 1,
@@ -190,6 +210,7 @@ def evaluate_question(question, args):
         # recovered later either - the transcripts are gone once the run ends.
         "final_query": queries[-1] if queries else None,
         "final_rows": final_rows if not passed else None,
+        "query_error": query_error,
     }
 
 
@@ -205,7 +226,7 @@ def validate_report(report):
             die(f"generated report has invalid summary.{key}")
     for result in report["results"]:
         if set(result) != {"id", "class", "passed", "first_try", "sql_attempts", "tool_calls",
-                           "final_query", "final_rows"}:
+                           "final_query", "final_rows", "query_error"}:
             die("generated result does not match its schema")
 
 
@@ -377,6 +398,24 @@ def self_test() -> int:
             check("evaluate_question propagates a scoring failure", False,
                   f"raised {type(error).__name__}")
 
+    # The commonest agent mistake - an invented table name - must produce a *diagnosed failure*,
+    # not an aborted run. Review of #1051 caught this file over-correcting into exactly that: it
+    # swung from scoring every failure as a zero to killing the run on a bad query, and both
+    # extremes throw away the same information.
+    with mock.patch(f"{__name__}.subject_run", return_value=("m", 1, ["SELECT * FROM invented"])), \
+            mock.patch(f"{__name__}.sql_rows",
+                       side_effect=QueryRejected("Table with name invented does not exist")):
+        try:
+            _, result = evaluate_question(question, _Args())
+            check("a rejected query is a diagnosed failure, not an aborted run",
+                  result["passed"] is False
+                  and result["final_query"] == "SELECT * FROM invented"
+                  and "invented" in (result["query_error"] or ""),
+                  str(result))
+        except Exception as error:
+            check("a rejected query is a diagnosed failure, not an aborted run", False,
+                  f"raised {type(error).__name__}: {error}")
+
     # ...and a reachable scorer must still produce a verdict, so the check above is not passing
     # merely because everything raises.
     with mock.patch(f"{__name__}.subject_run", return_value=("m", 1, ["SELECT 1"])), \
@@ -403,7 +442,7 @@ def self_test() -> int:
         check("report without final_query is refused", True)
 
     # 5. ...and accepted once they are present, so (4) is not passing for the wrong reason.
-    stub["results"][0].update({"final_query": "SELECT 1", "final_rows": []})
+    stub["results"][0].update({"final_query": "SELECT 1", "final_rows": [], "query_error": None})
     try:
         validate_report(stub)
         check("report with final_query is accepted", True)

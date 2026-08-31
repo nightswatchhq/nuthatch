@@ -44,7 +44,8 @@
           "sql_attempts": { "type": "integer", "minimum": 0 },
           "tool_calls": { "type": "integer", "minimum": 0 },
           "final_query": { "type": ["string", "null"], "description": "The last SQL the subject issued, or null if it issued none. Why a zero is a zero: without it a failing result cannot say whether the agent invented a table name, tripped the value/value_dec big-int footgun, or fell over the \"from\"/\"to\" reserved words. Unrecoverable after the run - the transcripts are gone (#1051)." },
-          "final_rows": { "type": ["array", "null"], "items": { "type": "object" }, "description": "What that query returned, recorded on failures only (null on a pass, where the rows are the expected ones by definition). Distinguishes a wrong answer from an empty one." }
+          "final_rows": { "type": ["array", "null"], "items": { "type": "object" }, "description": "What that query returned, recorded on failures only (null on a pass, where the rows are the expected ones by definition). Distinguishes a wrong answer from an empty one." },
+          "query_error": { "type": ["string", "null"], "description": "The server's rejection of that query, when it rejected one - an invented table name or a syntax error. A verdict, not an absence of one: the scorer looked and what it saw was bad SQL. Distinguished from a scorer that could not look at all, which is fatal to the run (#1051)." }
         }
       }
     }

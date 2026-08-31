@@ -57,6 +57,12 @@ The runner invokes each subject as a separate restricted process with only the n
 the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only
 worth anything if its numbers are real.
 
+**A rejected query is a verdict; an unreachable scorer is not (#1051).** The two look alike and are
+opposites. An invented table name comes back as a well-formed `{"error": ...}` from a healthy nest -
+the scorer looked, and what it saw was bad SQL - so it scores a *diagnosed failure* and records why.
+An unreachable nest is the scorer failing to look at all, and that is fatal. Collapsing them in
+either direction loses the same information, and this file has done both.
+
 **A scoring failure is fatal to the run, not a zero (#1051).** An unreachable nest, a timeout, an
 HTTP error or a response of an unexpected shape used to leave the row set empty and score the
 question *failed* - so a scorer that could not reach the nest published a schema-valid 0/15 with

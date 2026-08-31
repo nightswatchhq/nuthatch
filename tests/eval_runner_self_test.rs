@@ -51,6 +51,7 @@ fn the_tier_b_runner_passes_its_own_self_test() {
         "shape mismatch raises (body is not an object)",
         "a well-formed response is returned",
         "evaluate_question propagates a scoring failure",
+        "a rejected query is a diagnosed failure, not an aborted run",
         "a reachable scorer still yields a verdict",
         "report without final_query is refused",
         "report with final_query is accepted",
