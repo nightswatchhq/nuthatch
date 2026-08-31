@@ -6,24 +6,43 @@ product commitment, so this measures the cost, prices the options, and stops.
 
 Measured 2026-08-31 against the **live Lodestar deployment**, not a fixture.
 
-## The hot store is already over half the budget
+## The hot store is most of the budget - in RSS, which is what the budget is about
 
-`nuthatch_hot_store_bytes`, read live:
+**Corrected after review.** The first version of this document quoted `nuthatch_hot_store_bytes` and
+called it budget usage. That gauge is the **redb file on disk**, and non-negotiable 2 is **resident
+memory per cursor**. Equating them was the error this sprint keeps finding, made in the headline
+argument of a decision document. Both are now measured.
 
-| port | nest | hot store |
-| ---: | --- | ---: |
-| 8095 | graph-staking-nest | **1,084,432,384 B (1.08 GB)** |
-| 8096 | graph-gns-nest | **1,140,813,824 B (1.14 GB)** |
-| 8098 | horizon | 334,966,784 B (335 MB) |
-| 8104 | dips-nest | 48,607,232 B (49 MB) |
+Read live, 2026-08-31 - `nuthatch_hot_store_bytes` beside the process's `VmRSS`:
 
-The per-cursor budget is **2 GB**, shared across every nest on that cursor. These four are separate
-processes, so each is its own cursor today - but two of them already spend **over half their budget
-on the hot store alone**, before DuckDB, before serving, before a second nest is mounted beside them.
+| unit | nest | hot-store file | **RSS** | RSS/file |
+| --- | --- | ---: | ---: | ---: |
+| `nuthatch` | graph-staking-nest | 1,084,432,384 B (1.08 GB) | **1,447,247,872 B (1.45 GB)** | 1.33 |
+| `nuthatch-gns` | graph-gns-nest | 1,140,813,824 B (1.14 GB) | **1,415,196,672 B (1.42 GB)** | 1.24 |
+| `horizon-nest` | horizon | 334,966,784 B (335 MB) | 439,259,136 B (439 MB) | 1.31 |
+| `nuthatch-dips` | dips-nest | 48,607,232 B (49 MB) | 72,073,216 B (72 MB) | 1.48 |
 
-That is why this issue is worth more than a size saving. CLAUDE.md's non-negotiable 2 makes density
-RAM-bounded by design, so this is the difference between "one nest per cursor is comfortable" and
-"two nests per cursor is possible".
+**RSS is consistently *above* the file, by 1.24-1.48x.** So the file was not merely an imperfect
+proxy - it *understated* the thing the budget bounds, and the corrected figures are worse than the
+claim they replace: two cursors at **72% and 71% of their 2 GB**, not "over half".
+
+Each of these is a separate process and therefore its own cursor today. Mounting a second nest beside
+either of the two large ones does not fit.
+
+### What that implies for the saving, stated as a fit rather than a proportion
+
+Across the four points, RSS tracks the file closely:
+
+> RSS ≈ **7 MB + 1.33 × hot-store file**
+
+A 59% cut in row bytes would take `graph-staking-nest` from a 1.08 GB file to roughly 440 MB, and by
+that fit from **1.45 GB RSS to roughly 600 MB** - back under a third of the budget.
+
+**That is a four-point fit over two nest shapes, and it should be read as an order of magnitude, not
+a forecast.** It also assumes redb's own overhead scales with payload, which is plausible for a
+B-tree but unmeasured here. The honest claim is: the file is a floor for RSS, the relationship is
+close to linear across two orders of magnitude, and shrinking the payload is the only lever in this
+issue that moves it.
 
 ## What the format costs, on real rows
 
@@ -58,8 +77,9 @@ every figure above.
 - **Decode cost on point-read.** #296 names it; this does not measure it. A varint/fixed-width reader
   should beat `serde_json` comfortably, but "should" is not a number, and the `point-read latency`
   gate exists to settle it.
-- **redb's own overhead.** The figures above are row payloads. `hot_store_bytes` is the file, which
-  includes redb's B-tree, so the realised saving will be **smaller** than 59%.
+- **redb's own overhead, exactly.** The 2.45x/2.49x figures are row payloads. The file includes
+  redb's B-tree and RSS adds another 1.24-1.48x on top, so the realised RSS saving is modelled by the
+  fit above rather than measured. A prototype encoder against a real store would settle it.
 - **Any prototype.** No encoder exists. The compact column is a model computed from the schema, not a
   measurement of a format.
 
