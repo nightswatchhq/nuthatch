@@ -45,6 +45,7 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "a wrong total does not pass",
         "a missing column does not pass",
         "the builder skill the subject is given exists",
+        "an unindexed nest scores rather than aborting",
     ] {
         assert!(
             stdout.contains(probe),

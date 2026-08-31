@@ -206,20 +206,34 @@ def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, args):
 
 # --- scoring: three facts, no prose --------------------------------------------------------------
 def score(scenario, nest: Path, api: str):
+    # **Is there anything to read at all?** Decided once, here, rather than per criterion.
+    #
+    # Review of #1050 caught the previous version claiming in a comment that an unindexed nest
+    # scores criteria 2 and 3 false, while criterion 3 went to `/tables` regardless - against a
+    # `serve` that had refused to start - and the resulting `ScoringUnavailable` aborted the whole
+    # run. So a perfectly ordinary agent failure (scaffolded a nest, never indexed it) produced no
+    # score at all, and the comment asserted a behaviour the code did not have.
+    #
+    # A nest with no hot store is a *finished fact*, not a scorer problem: the agent did not index.
+    # It scores false, honestly, and the run continues.
+    indexed = (nest / "nuthatch.redb").exists()
     results = []
     for criterion in scenario["criterion"]:
+        if not indexed and criterion["kind"] != "nest-exists":
+            results.append({
+                "id": criterion["id"], "passed": False,
+                "detail": "the nest has no hot store: it was scaffolded but never indexed",
+            })
+            continue
         kind, cid = criterion["kind"], criterion["id"]
         if kind == "nest-exists":
             missing = [f for f in ("nuthatch.toml", "schema.json") if not (nest / f).exists()]
             results.append({"id": cid, "passed": not missing,
                             "detail": "ok" if not missing else f"missing {missing}"})
         elif kind == "sealed-through":
-            # No store means nothing to wait for: a nest that was never indexed is a fact already,
-            # and polling it for three minutes only makes the run slower and the failure vaguer.
-            got = None if not (nest / "nuthatch.redb").exists() else wait_for(
-                "the nest to seal", 180, lambda: (
-                    http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
-                ))
+            got = wait_for("the nest to seal", 180, lambda: (
+                http_json(f"{api}/sql?q=select%201").get("provenance", {}).get("sealed_through")
+            ))
             results.append({"id": cid, "passed": got == criterion["value"],
                             "detail": f"sealed_through={got}, wanted {criterion['value']}"})
         elif kind == "sql":
@@ -311,7 +325,7 @@ def one_run(scenario, args):
                     #     almost certainly a `dev` that outlived its subject. The scorer cannot
                     #     look, which is a harness problem and never an agent's fault.
                     if not (nest / "nuthatch.redb").exists():
-                        pass  # scored below, honestly, as a nest that was never indexed
+                        pass  # `score` reads this same fact and marks the criteria false
                     elif dev.poll() is not None:
                         raise ScoringUnavailable(
                             f"`serve` exited {dev.returncode} against a nest that HAS a hot store; "
@@ -377,6 +391,27 @@ def self_test() -> int:
 
     check("the builder skill the subject is given exists",
           (ROOT / "skills" / "nuthatch-builder" / "SKILL.md").is_file())
+
+    # The case review found the code not doing what its own comment claimed: a subject that
+    # scaffolded a nest and never indexed it must **score**, with criteria 2 and 3 false, rather
+    # than reaching for an API that is not there and aborting the run. The scorer is pointed at a
+    # deliberately dead port, so if any criterion tries to talk to it this check fails.
+    with tempfile.TemporaryDirectory(prefix="nuthatch-authoring-selftest-") as tmp:
+        nest = Path(tmp) / "nest"
+        nest.mkdir()
+        (nest / "nuthatch.toml").write_text("")
+        (nest / "schema.json").write_text("{}")
+        assert not (nest / "nuthatch.redb").exists()
+        try:
+            results = score(scenario, nest, "http://127.0.0.1:9")
+            passed = {r["id"]: r["passed"] for r in results}
+            check("an unindexed nest scores rather than aborting",
+                  passed == {"init-succeeds": True, "reaches-pinned-tip": False,
+                             "canned-question": False},
+                  str(passed))
+        except ScoringUnavailable as error:
+            check("an unindexed nest scores rather than aborting", False,
+                  f"aborted the run: {error}")
 
     print("self-test: " + ("PASS" if not failures else f"FAIL ({', '.join(failures)})"))
     return 1 if failures else 0
