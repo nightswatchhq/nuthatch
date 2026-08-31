@@ -46,10 +46,10 @@ hand-typed scores, including flattering ones (the house rule since RFC-0004).
 
 ### Baseline status
 
-The Tier B runner is a keyed harness (a follow-up within RFC-0016 S1): the **0.4 baseline number is
-not yet published**, because publishing a score means running a real agent against a real key and
-committing the resulting `eval-report.json` - not typing a plausible figure here. The deterministic
-spine (fixture + oracle + report schema) is in place; the baseline lands the first time the keyed
-runner is executed, and each subsequent slice (S2-S5) republishes against it.
+The **0.4 Tier B baseline** is [0/15 first-try and 0/15 overall](eval-report.json), median of three
+runs on `claude-sonnet-5` at the provider-default temperature 1.0. Mean SQL attempts were 1.267.
+The exact commit, question-set hash, per-question outcomes, and class breakdown are in the report.
 
-This honesty is the point: the eval is only worth anything if its numbers are real.
+The runner invokes each subject as a separate restricted process with only the nuthatch MCP bridge;
+the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only
+worth anything if its numbers are real.
