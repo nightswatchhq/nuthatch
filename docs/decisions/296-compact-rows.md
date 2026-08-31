@@ -29,20 +29,31 @@ claim they replace: two cursors at **72% and 71% of their 2 GB**, not "over half
 Each of these is a separate process and therefore its own cursor today. Mounting a second nest beside
 either of the two large ones does not fit.
 
-### What that implies for the saving, stated as a fit rather than a proportion
+### What that implies for the saving - a hypothesis, not a forecast
 
-Across the four points, RSS tracks the file closely:
+**Corrected twice, and the second correction is the more important one.** An earlier version of this
+section fitted `RSS ≈ 7 MB + 1.33 x hot-store file` across the four points and used it to predict
+roughly 600 MB after a 59% payload cut. That fit does not support a forecast, for a reason worth
+writing down rather than softening:
 
-> RSS ≈ **7 MB + 1.33 × hot-store file**
+**`VmRSS` is the whole process.** It includes the allocator, ingestion and RPC state, HTTP serving,
+DuckDB's own working set, and every buffer in flight. The four samples have no baseline and no
+controlled workload, so they do not isolate what redb contributes, and nothing here measures how RSS
+moves *after* a re-encode. Reducing payload bytes plausibly reduces resident pages; **by how much is
+unmeasured.**
 
-A 59% cut in row bytes would take `graph-staking-nest` from a 1.08 GB file to roughly 440 MB, and by
-that fit from **1.45 GB RSS to roughly 600 MB** - back under a third of the budget.
+So the honest form is:
 
-**That is a four-point fit over two nest shapes, and it should be read as an order of magnitude, not
-a forecast.** It also assumes redb's own overhead scales with payload, which is plausible for a
-B-tree but unmeasured here. The honest claim is: the file is a floor for RSS, the relationship is
-close to linear across two orders of magnitude, and shrinking the payload is the only lever in this
-issue that moves it.
+- **Measured:** two cursors sit at 1.45 GB and 1.42 GB RSS against a 2 GB budget - 72% and 71%. That
+  is a fact about today and it does not depend on any model.
+- **Measured:** row payloads are 2.45-2.49x larger as JSON than as a schema-driven binary encoding,
+  on two independent table shapes.
+- **Hypothesis, unvalidated:** shrinking payloads by ~59% would bring those cursors materially back
+  under budget. **A prototype encoder measured against a real store is the only thing that settles
+  it**, and nothing in this document should be read as having done so.
+
+The size argument is settled. The RSS argument is not, and this project has published enough
+asserted numbers this month.
 
 ## What the format costs, on real rows
 
@@ -95,7 +106,8 @@ with no data migration. That promise is what this change spends.
 | **Rebuild the hot store only** - sealed Parquet untouched; drop and re-derive the unsealed tail from `sealed_through` | small: the hot store holds only rows past the sealed watermark, which is finality-bounded rather than history-bounded | little. It is a re-index of the *tail*, not of history |
 | **Do nothing** | free | leaves two nests at half their cursor budget in hot storage, and makes multi-nest density worse than it needs to be |
 
-**Recommendation, to take or reject: the third.** It gets the saving without spending the promise.
+**Recommendation, to take or reject: the third** - conditional on the RSS hypothesis above being
+measured first, since the case for spending any part of the promise rests on it. It gets the saving without spending the promise.
 The no-resync commitment is about *history* - the part that costs hours and money - and the hot store
 is by construction the finality-bounded tail. Re-deriving it is a bounded, minutes-scale operation
 over data the nest has already sealed, and `sealed_through` marks exactly where to resume.
