@@ -5028,17 +5028,34 @@ async fn index_loop(
         let tip = match source.tip().await {
             Ok(t) => {
                 poll_failures = 0;
-                METRICS.mark_poll_ok();
+                // **Per-nest, not the process global.** `NestMetrics::{set_tip, mark_poll_ok}` fan out
+                // to the global as well, but `METRICS::*` does not fan *in* - so calling the global
+                // here left this nest's own `tip` and `last_poll_ok` at zero forever.
+                //
+                // That is invisible on `/ready`, which falls back to the global for a solo runtime,
+                // and wrong on `/metrics`, which prefers the per-nest struct whenever one exists. The
+                // two surfaces then disagree about one fact, and the wrong one is where Prometheus
+                // looks - the same shape as #918's `sealed_through`.
+                //
+                // Measured live on the Lodestar box, three nests at tip: `/ready` reported
+                // `"tip":500198892,"lag_blocks":3`, while `/metrics` reported `nuthatch_tip_height 0`,
+                // `nuthatch_tip_lag_blocks 0` and `nuthatch_last_poll_unixtime 0`.
+                //
+                // **Lag is the dangerous one**: it renders as `tip.saturating_sub(last)`, so an unset
+                // tip saturates to **0** - the healthiest possible reading. An alert on tip lag could
+                // never fire, whatever the nest did. `last_block` was always correct because its
+                // setter is the fanning-out one; this line was the only thing keeping tip behind.
+                nest.metrics.mark_poll_ok();
                 t
             }
             Err(e) => {
-                METRICS.mark_poll_failed();
+                nest.metrics.mark_poll_failed();
                 poll_failures = escalate_stall(poll_failures, &e);
                 sleep_secs(3).await;
                 continue;
             }
         };
-        METRICS.set_tip(tip);
+        nest.metrics.set_tip(tip);
 
         if let Some(new_next) = nest.handle_reorg(source.as_ref(), next).await? {
             next = new_next;
