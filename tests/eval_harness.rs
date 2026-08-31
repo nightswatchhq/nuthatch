@@ -250,3 +250,94 @@ fn scalar_string(v: &Value) -> String {
         other => other.to_string(),
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// Tier B enablement (#815).
+//
+// Tier B needs a real agent talking to a real MCP server, and the fixture only ever existed inside
+// a `tempfile::tempdir()` that vanished when this test returned. `build_fixture` was already
+// parameterised by directory, so the missing piece was small: materialise it somewhere durable so
+// `nuthatch serve --dir <fixture>` can serve it and `nuthatch mcp` can bridge to it.
+//
+// `serve` rather than `dev` is deliberate. The fixture is a sealed, finished nest with no chain
+// behind it - exactly the cursorless role, which until #1025 reported `ready:false` forever and
+// would have made the fixture unusable behind anything that gates on `/ready`.
+//
+// **Not a scoring harness.** This writes the board; who plays and how the score is recorded is
+// `eval/README.md`'s runbook. Deliberately `#[ignore]`d: it writes outside the target directory.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "writes a durable fixture for a Tier B run; set EVAL_FIXTURE_DIR"]
+async fn materialise_the_eval_fixture() {
+    let dir = std::env::var("EVAL_FIXTURE_DIR").unwrap_or_else(|_| {
+        panic!(
+            "set EVAL_FIXTURE_DIR to the directory the fixture should be written to, e.g.\n\
+             \n\
+             \x20  EVAL_FIXTURE_DIR=/tmp/nuthatch-eval-nest \\\n\
+             \x20  cargo test --test eval_harness materialise_the_eval_fixture -- --ignored --nocapture\n"
+        )
+    });
+    let dir = std::path::PathBuf::from(dir);
+    assert!(
+        !dir.exists() || std::fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(false),
+        "{} already exists and is not empty. Refusing to build a fixture over it: a half-overwritten \
+         nest would score an agent against a board nobody can reproduce.",
+        dir.display()
+    );
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+
+    let rt = build_fixture(&dir).await;
+    let store = rt.state.store.clone();
+    let sealed_through = store.sealed_through();
+
+    // Prove the board before handing it to a player: every oracle must still answer correctly here,
+    // exactly as Tier A asserts against the ephemeral copy. A fixture that is subtly different from
+    // the one the oracle was proved against is worse than no fixture.
+    let set: QuestionSet = toml::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/eval/questions.toml"))
+            .expect("read eval/questions.toml"),
+    )
+    .expect("parse questions.toml");
+    let hot = store.hot_rows_by_table().unwrap();
+    for q in &set.question {
+        let got = analytics::query_hot_cold(&dir, &q.sql, guard(), &hot, sealed_through, &[])
+            .unwrap_or_else(|e| panic!("question '{}' failed on the durable fixture: {e}", q.id));
+        let expected: Vec<Value> = serde_json::from_str::<Value>(&q.expect)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap();
+        assert_eq!(
+            got.rows.len(),
+            expected.len(),
+            "question '{}' returns {} rows on the durable fixture but {} on the ephemeral one - the \
+             board is not the one the oracle was proved against",
+            q.id,
+            got.rows.len(),
+            expected.len()
+        );
+    }
+
+    // The runner needs the exact question-set hash for `eval-report.json`.
+    // sha256, matching how every other content hash in this repo is spelled.
+    let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/eval/questions.toml")).unwrap();
+    let hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&raw);
+        format!("{:x}", h.finalize())
+    };
+
+    let ingest = rt.ingest;
+    ingest.abort();
+    let _ = ingest.await;
+
+    println!("\nfixture written to      {}", dir.display());
+    println!("questions               {}", set.question.len());
+    println!("sealed_through          {sealed_through}");
+    println!("question_set_hash       {hash}");
+    println!(
+        "\nserve it with:\n  nuthatch serve --dir {} --listen 127.0.0.1:8299\n",
+        dir.display()
+    );
+}

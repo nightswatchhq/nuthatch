@@ -2486,8 +2486,11 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     // No `Source` is ever polled on this role; the parameter exists for the ingest half we discard.
     // That fact is handed to `/ready` below as `cursorless` - it used to be known only here, which is
     // why a serve-only nest reported `stalled:true` forever (#1025).
-    let source: Arc<dyn Source> =
-        Arc::new(crate::rpc::RpcClient::new(config.nest.rpc_urls.clone())?);
+    //
+    // **And it is no longer an `RpcClient`** (#815). Building one here required `rpc_urls` to be
+    // non-empty for a client that is passed to `build_nest`'s `_source` parameter and never touched,
+    // so a fully-sealed nest with no chain behind it - `rpc_urls = []` - could not be served at all.
+    let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
 
     // The FE role gets the *same* admin derivation as `dev` and the roost runtime, not a bare read of
     // the env var. Reading it directly left `--admin` on an off-localhost bind serving `/_admin/` with
