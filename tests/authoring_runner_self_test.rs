@@ -48,6 +48,8 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "an unindexed nest scores rather than aborting",
         "an unservable nest scores rather than aborting",
         "a run without a sandbox is refused",
+        "a pass-through prefix is rejected as a sandbox",
+        "an unusable sandbox is rejected, not mistaken for isolation",
         "a malformed /sql shape is fatal (rows is null)",
         "the reap check has a live child to kill (normal exit)",
         "a backgrounded child is reaped (normal exit)",

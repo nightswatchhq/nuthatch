@@ -164,6 +164,55 @@ def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str]:
 
 
 # --- the subject ---------------------------------------------------------------------------------
+def verify_sandbox(sandbox) -> None:
+    """Prove the sandbox actually isolates, by trying to read the answer key through it.
+
+    Requiring `--sandbox` to be non-empty is not enforcement - review of #1050 pointed out that
+    `--sandbox env` or `--sandbox nice` satisfies it while giving the subject the runner's entire
+    filesystem, `eval/authoring.toml` included. The claimed boundary then rests on operator honesty,
+    which is exactly what a mechanical score is supposed to replace.
+
+    So the property is *tested* rather than declared, with the operator's own prefix, against the
+    file that would give the game away. Two-sided, because a probe that fails for an unrelated
+    reason would otherwise read as isolation:
+
+      1. the probe mechanism must work at all - it can read a file the subject is *meant* to have;
+      2. and it must **not** be able to read `eval/authoring.toml`.
+
+    Only (1) passing and (2) failing means confined.
+    """
+    with tempfile.TemporaryDirectory(prefix="nuthatch-sandbox-check-") as tmp:
+        allowed = Path(tmp) / "allowed"
+        allowed.write_text("readable")
+
+        def read(path) -> tuple[int, str]:
+            try:
+                out = subprocess.run([*sandbox, "sh", "-c", f"cat {path}"], cwd=tmp,
+                                     capture_output=True, text=True, timeout=120)
+                return out.returncode, out.stdout
+            except Exception as error:
+                return 1, f"<{type(error).__name__}: {error}>"
+
+        code, body = read(allowed.name)
+        if code != 0 or "readable" not in body:
+            die(
+                f"the sandbox cannot read a file in the subject's own working directory "
+                f"({allowed.name}). It is not usable, and a probe that fails for its own reasons "
+                f"would otherwise be mistaken for isolation.\n  got: {body.strip()[:200]}"
+            )
+
+        code, body = read(SCENARIO)
+        if code == 0 and body.strip():
+            die(
+                f"the sandbox does not isolate: the subject can read {SCENARIO}, which carries the\n"
+                "expected result. An agent that finds it scores 3/3 without building anything, and\n"
+                "the report would record the run as sandboxed.\n"
+                "\n"
+                "A command prefix that merely execs (`env`, `nice`) is not a sandbox. Use one that\n"
+                "confines the filesystem - a container, `bwrap --ro-bind`, `sandbox-exec -f`."
+            )
+
+
 def spawn_group(command, **kwargs) -> tuple[subprocess.Popen, int]:
     """Start a process as the leader of a new group, and capture that group id **now**.
 
@@ -511,6 +560,25 @@ def self_test() -> int:
                 except ScoringUnavailable:
                     check(f"a malformed /sql shape is fatal ({label})", True)
 
+    # A prefix that merely execs is not a sandbox, and saying so is not enough: `--sandbox env`
+    # satisfied the old non-empty check while handing the subject the whole filesystem. The property
+    # is tested against the operator's own prefix, with the file that would give the game away.
+    try:
+        verify_sandbox(["env"])
+        check("a pass-through prefix is rejected as a sandbox", False, "accepted `env`")
+    except SystemExit as exit_:
+        check("a pass-through prefix is rejected as a sandbox",
+              "does not isolate" in str(exit_), f"refused for another reason: {exit_}")
+
+    # ...and the probe must be two-sided, or a sandbox that cannot run at all reads as isolation.
+    try:
+        verify_sandbox(["false"])
+        check("an unusable sandbox is rejected, not mistaken for isolation", False, "accepted it")
+    except SystemExit as exit_:
+        check("an unusable sandbox is rejected, not mistaken for isolation",
+              "cannot read a file in the subject's own working directory" in str(exit_),
+              f"refused for the wrong reason: {exit_}")
+
     # The eval's integrity property: a run must be impossible without isolation. Review of #1050
     # found the subject boundary asserted in a docstring and enforced nowhere - the agent could read
     # `eval/authoring.toml`, lift the expected result, and score 3/3 by discovering this repository.
@@ -619,6 +687,8 @@ def main():
 
     if args.runs < 3:
         die("refusing to publish fewer than three runs")
+    if args.sandbox:
+        verify_sandbox(args.sandbox)
     if not args.sandbox:
         die(
             "--sandbox is required. Without it the subject can read eval/authoring.toml, take the\n"
