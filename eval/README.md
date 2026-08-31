@@ -53,3 +53,56 @@ The exact commit, question-set hash, per-question outcomes, and class breakdown 
 The runner invokes each subject as a separate restricted process with only the nuthatch MCP bridge;
 the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only
 worth anything if its numbers are real.
+
+## The authoring eval (RFC-0017, #1050)
+
+The two evals answer different questions and neither substitutes for the other. RFC-0016 §1 above
+measures **runtime** knowledge - an agent with the MCP tools querying a nest that already exists.
+This measures **authoring** knowledge: the builder skill plus a shell, a contract address, and
+nothing else. An agent with only MCP cannot scaffold a nest; an agent with only the skill cannot say
+what a table means as of block N.
+
+RFC-0017 fixes the three criteria, and `eval/authoring.toml` does not get to reinvent them: `init`
+succeeds, `dev` reaches the pinned tip, one canned question answers correctly - *"scored mechanically
+(exit codes + result comparison)"*. **Mechanically** is load-bearing: nothing scores prose, effort,
+or how well the agent explained itself. Three facts about the filesystem and one result set.
+
+Fully offline and deterministic. `scripts/fixture_rpc.py` serves the chain over loopback and the ABI
+is handed over as a local file, so there is no Sourcify, no Etherscan and no network - a score that
+moved because a third party was slow would be a number about the internet.
+
+### The board is proven before anyone plays on it
+
+`tests/authoring_eval_board.rs` walks the scenario with a **scripted reference solution** and must
+satisfy every criterion, in CI, with no key. If it is red, an agent scoring 0/3 tells you nothing
+about the agent. It also pins the criteria to nuthatch's own surface in the direction that actually
+rots: a criterion is a claim that `init` writes a `schema.json`, that `sealed_through` appears in
+`/sql` provenance, that `value_dec` exists - and any of those could change without an eval file
+being touched, after which the next keyed run scores zero and it reads as a model that got worse.
+
+Two things the board caught while being built, both by mutating it rather than by reading it:
+
+- **The `reaches-pinned-tip` criterion was decorative.** The scenario declared `value = 8` and the
+  test read the chain's `finalized` pin instead, so editing the criterion changed nothing. A
+  criterion the scorer does not consult is not a criterion.
+- **The runner's numeric-tolerance check proved nothing.** `"3600"` against `3600` passes even with
+  numeric comparison removed entirely, because `json.dumps(3600)` is `"3600"`. It takes a float to
+  discriminate.
+
+### Scoring does not depend on what the agent names things
+
+`init` derives the table name from the contract alias, which defaults to `c0` but is the agent's to
+choose. The runner resolves `{table}` from `/tables` rather than hardcoding `c0__transfer`, which
+would fail a perfectly good nest for picking a nicer name - measuring obedience rather than
+authoring.
+
+### Running it
+
+```sh
+python3 eval/run-authoring.py --self-test                       # no key, no model, no network
+python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3
+```
+
+**No baseline is published yet.** The board, the runner and both self-tests are in place and CI-gated;
+the score lands the first time the keyed runner is executed, and is board-only because a keyed run is
+credentials. The same refusal as RFC-0016's: a number here is real or it is absent.
