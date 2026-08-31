@@ -46,6 +46,7 @@ fn the_authoring_runner_passes_its_own_self_test() {
         "a missing column does not pass",
         "the builder skill the subject is given exists",
         "an unindexed nest scores rather than aborting",
+        "a malformed /sql shape is fatal (rows is null)",
     ] {
         assert!(
             stdout.contains(probe),

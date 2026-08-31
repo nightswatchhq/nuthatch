@@ -244,16 +244,28 @@ def score(scenario, nest: Path, api: str):
             query = criterion["sql"].replace("{table}", table)
             payload = http_json(f"{api}/sql?" + urllib.parse.urlencode({"q": query}))
             if "error" in payload:
-                results.append({"id": cid, "passed": False, "detail": f"query error: {payload['error'][:120]}"})
+                # A verdict, not an absence of one - and here it means something sharper than in the
+                # RFC-0016 runner, where the SQL is the *agent's*. This query is **ours**, and
+                # `tests/authoring_eval_board.rs` proves it runs against a reference nest on every
+                # commit. So a rejection at eval time says the agent built something structurally
+                # different - no `value_dec`, a different decode - which is an authoring failure and
+                # scores as one, with the reason kept.
+                results.append({"id": cid, "passed": False, "detail": f"query error: {payload['error'][:120]}",
+                                "query_error": str(payload["error"])})
                 continue
-            if "rows" not in payload:
-                # Never degrade an unexpected shape to "no rows" - #1051's silent path.
-                raise ScoringUnavailable(f"/sql response has no 'rows' key: {sorted(payload)!r}")
+            # Validate the whole shape, not merely the presence of a key: `{"rows": null}` and
+            # `{"rows": "x"}` would otherwise reach the comparison and read as an ordinary wrong
+            # answer. Same fault, same fix, as the sibling runner (#1051).
+            rows = payload.get("rows")
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ScoringUnavailable(
+                    f"/sql returned a 'rows' that is not an array of objects: {type(rows).__name__}"
+                )
             expected = json.loads(criterion["expect"])
-            passed = results_equal(expected, payload["rows"])
+            passed = results_equal(expected, rows)
             results.append({"id": cid, "passed": passed,
-                            "detail": "ok" if passed else f"got {json.dumps(payload['rows'])[:200]}",
-                            "final_rows": None if passed else payload["rows"]})
+                            "detail": "ok" if passed else f"got {json.dumps(rows)[:200]}",
+                            "final_rows": None if passed else rows})
         else:
             die(f"unknown criterion kind {kind!r}")
     return results
@@ -412,6 +424,25 @@ def self_test() -> int:
         except ScoringUnavailable as error:
             check("an unindexed nest scores rather than aborting", False,
                   f"aborted the run: {error}")
+
+    import unittest.mock as mock
+    for label, body in [("rows is null", {"rows": None}), ("rows is a string", {"rows": "x"}),
+                        ("a row is not an object", {"rows": [1]})]:
+        with tempfile.TemporaryDirectory(prefix="nuthatch-shape-") as tmp:
+            nest = Path(tmp) / "nest"
+            nest.mkdir()
+            (nest / "nuthatch.toml").write_text("")
+            (nest / "schema.json").write_text("{}")
+            (nest / "nuthatch.redb").write_text("")  # "indexed", so scoring reaches the query
+            with mock.patch(f"{__name__}.http_json") as fetch, \
+                    mock.patch(f"{__name__}.resolve_table", return_value="t"), \
+                    mock.patch(f"{__name__}.wait_for", return_value=scenario["finalized"]):
+                fetch.return_value = body
+                try:
+                    score(scenario, nest, "http://example.invalid")
+                    check(f"a malformed /sql shape is fatal ({label})", False, "scored it instead")
+                except ScoringUnavailable:
+                    check(f"a malformed /sql shape is fatal ({label})", True)
 
     print("self-test: " + ("PASS" if not failures else f"FAIL ({', '.join(failures)})"))
     return 1 if failures else 0
