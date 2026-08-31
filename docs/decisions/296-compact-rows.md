@@ -62,7 +62,15 @@ synthetic rows each - one holding today's JSON strings, one holding the compact 
 above - written in 5,000-row windows as `commit_window` writes them. Each configuration is then read
 back **in its own process**, because `VmRSS` is process-wide and that is exactly the correction
 review made to the section above. Full scan to fill the cache, then 50,000 random point reads that
-actually decode the row.
+decode the row.
+
+**Corrected after review, and the correction went against the framing here.** The first pass parsed
+the JSON object in full with `serde_json` while the compact side read three varints and sliced
+twenty bytes, then reported the difference as a decode win. That is a full parse against a partial
+one. Both paths now materialise **every** field into the same struct - the JSON side hex-decoding
+the hashes and addresses and parsing the decimal `value`, which is exactly the work the compact side
+avoids. On Linux the honest comparison made the encoding's decode win **larger** (3.4x, against the
+2.8x first published), not smaller. The figures below are the corrected ones.
 
 First, the file. The 2.45x is a *payload* ratio and the file does not inherit it:
 
@@ -80,20 +88,20 @@ setting, which nuthatch has never set:**
 
 | cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
 | --- | ---: | ---: | ---: | ---: |
-| 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.0 us | 1.1 us |
-| 512 MiB | **0.64 GB** | **0.64 GB** | 3.4 us | 1.5 us |
-| 256 MiB | **0.33 GB** | **0.33 GB** | 3.8 us | 2.0 us |
-| 128 MiB | **0.17 GB** | **0.17 GB** | 3.7 us | 2.2 us |
+| 1 GiB (today's default) | 1.28 GB | 0.89 GB | 3.3 us | 1.2 us |
+| 512 MiB | **0.64 GB** | **0.64 GB** | 3.7 us | 1.6 us |
+| 256 MiB | **0.33 GB** | **0.33 GB** | 4.0 us | 2.0 us |
+| 128 MiB | **0.17 GB** | **0.17 GB** | 4.0 us | 2.4 us |
 
 **Linux** (Debian 13, 6.12.94, 32 core - the platform production runs), same commit, byte-identical
 stores:
 
 | cache | JSON (2.16 GB file) | compact (1.08 GB file) | JSON point-read | compact point-read |
 | --- | ---: | ---: | ---: | ---: |
-| 1 GiB (today's default) | 1.00 GB | 0.69 GB | 4.2 us | 1.5 us |
-| 512 MiB | **0.50 GB** | **0.50 GB** | 4.9 us | 2.0 us |
-| 256 MiB | **0.25 GB** | **0.25 GB** | 4.9 us | 2.6 us |
-| 128 MiB | **0.13 GB** | **0.13 GB** | 5.0 us | 2.9 us |
+| 1 GiB (today's default) | 1.00 GB | 0.69 GB | 4.8 us | 1.4 us |
+| 512 MiB | **0.50 GB** | **0.50 GB** | 5.3 us | 2.2 us |
+| 256 MiB | **0.25 GB** | **0.25 GB** | 5.5 us | 2.8 us |
+| 128 MiB | **0.13 GB** | **0.13 GB** | 5.6 us | 3.0 us |
 
 **At every cache size smaller than both files, on both platforms, the two encodings land on
 identical RSS** - 0.50 against 0.50, 0.25 against 0.25, 0.13 against 0.13 on Linux - across a 2.00x
@@ -103,8 +111,8 @@ the same lever in both columns.
 Linux is the cleaner of the two: RSS tracks the cache setting almost one-for-one, where macOS's
 allocator adds a roughly 1.25x overhead on top. The conclusion does not depend on which, but the
 Linux figures are the ones to reason about, because that is where the nests run. Its point-reads are
-slower in absolute terms (4.2 us against 3.0) on a different CPU under load average 20-30; the
-*ratios* are what transfer, and they agree to within 0.1x.
+slower in absolute terms (4.8 us against 3.3) on a different CPU under load average 20-30. The RSS
+columns were byte-identical across two independent runs on each box.
 
 `Builder::new()` calls `set_cache_size(1 GiB)` (split 90% read / 10% write) and `store.rs` never
 overrides it at any of its three open sites. redb 2.6.3 does not mmap - `file_backend/unix.rs`
@@ -129,15 +137,16 @@ already available, is larger, costs no format change, spends no part of the no-r
 is one line. Per the sprint's own constraint - *do not trade away the no-resync promise by
 implication* - there is now nothing to trade it for.
 
-**What the encoding does own, and it is real:** point-read decode is **2.7x faster on macOS and 2.8x
-on Linux** (4.2 -> 1.5 us at 1 GiB, 4.9 -> 2.6 us at 256 MiB - a consistent 1.7-2.7 us saved per
-read). It is the one expectation the prototype confirmed. That is a latency result,
+**What the encoding does own, and it is real:** point-read decode is **3.4x faster on Linux** and
+2.75x on macOS (4.8 -> 1.4 us at 1 GiB, 5.5 -> 2.8 us at 256 MiB - 2.7-3.4 us saved per read). It is
+the one expectation the prototype confirmed, and the only claim here that the review correction made
+*stronger*. That is a latency result,
 not a memory one. #296 asked for memory. If the decode win is worth wanting it should be argued on
 its own terms, against the cost of a migration, and it is a much weaker case than the one this
 document set out to make.
 
 Note the second column of that table for the cache option: on Linux a smaller cache costs **0.7 us**
-per point read (4.2 -> 4.9 us) for **750 MB**. And because the budget is per *cursor*, an unset cache
+per point read (4.8 -> 5.5 us) for **750 MB**. And because the budget is per *cursor*, an unset cache
 means N cursors reserve N GiB - so this is worth more to multi-nest density than the encoding ever
 was.
 
@@ -188,8 +197,8 @@ every figure above.
 *(Written before the prototype. All three are now measured - see "The prototype was built" above -
 and kept here because what they were expected to show is part of the record.)*
 
-- ~~**Decode cost on point-read.** #296 names it; this does not measure it.~~ **Measured: 2.7x
-  faster.** It was the one expectation that held, and it is the only benefit left standing.
+- ~~**Decode cost on point-read.** #296 names it; this does not measure it.~~ **Measured: 3.4x
+  faster on Linux.** It was the one expectation that held, and it is the only benefit left standing.
 - ~~**redb's own overhead, exactly.**~~ **Measured: it does not shrink with the payload.** A 3.1x
   payload cut is a 2.00x file cut, and a 0x RSS cut once the cache is set.
 - ~~**Any prototype.** No encoder exists.~~ One exists now, in `tests/bench_compact_rows.rs`, and it
