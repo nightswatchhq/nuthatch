@@ -128,10 +128,18 @@ both by construction:
 
 - **The repository is not mounted.** Only the workdir is bound, at its own path so the ABI and nest
   paths stay valid. `eval/authoring.toml` and the board test are unreachable.
-- **There is no route to the internet.** The network is Docker `--internal`. `--network host` was
-  the first attempt and handed the subject the entire host network, so an agent could consult
-  external documentation or a data service and the eval would be neither offline nor limited to the
-  builder skill.
+- **The only reachable host is the model API.** The network is Docker `--internal`, and a small
+  tinyproxy container (`eval/image/proxy`) straddles it with a `FilterDefaultDeny` allow-list of one
+  entry. `--network host` was the first attempt and handed the subject the entire host network;
+  `--internal` alone was the second and handed it **nothing** - review of #1058 caught that `claude`
+  could not resolve `api.anthropic.com`, so the enforced mode had never been runnable and would have
+  failed every subject for the harness's reasons.
+
+  Both halves are preflighted, because either alone is a broken eval: without egress the subject
+  cannot think, and with open egress it can read nuthatch's documentation and score well without the
+  builder skill having taught it anything. Verified in both directions - model API **405** (reached),
+  `example.com` and `github.com` **403** (denied) - and mutation-checked: disabling the allow-list
+  makes `example.com` answer **200** and the preflight refuse.
 
 The fixture chain runs **inside** that network, because nothing on an internal network is reachable
 from the host - which is also why it is pinned at startup (`--tip`/`--finalized`) rather than through

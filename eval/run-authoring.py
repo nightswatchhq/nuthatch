@@ -212,16 +212,31 @@ class DockerIsolation:
     (`--tip`/`--finalized`) rather than through `/control/*`: the runner cannot post to it either.
     """
 
-    def __init__(self, image: str, scenario, run_id: str):
+    def __init__(self, image: str, scenario, run_id: str, proxy_image: str = "nuthatch-eval-proxy"):
         self.image, self.scenario, self.run_id = image, scenario, run_id
         self.network = f"nuthatch-eval-{run_id}"
+        self.egress = f"nuthatch-egress-{run_id}"
         self.fixture = f"nuthatch-fixture-{run_id}"
+        self.proxy = f"nuthatch-proxy-{run_id}"
+        self.proxy_image = proxy_image
         self.rpc_port = 8945
         self.rpc = f"http://{self.fixture}:{self.rpc_port}/"
+        # `claude` must reach its own model service and nothing else. Review of #1058 found the
+        # subject could reach *nothing*: `--internal` blocks all egress, so the model API was
+        # unresolvable and the enforced mode would have failed every subject for the harness's
+        # reasons. The proxy allows one host by allow-list; the documentation stays out of reach.
+        self.proxy_url = f"http://{self.proxy}:8888"
 
     def __enter__(self):
         script = ROOT / "scripts" / "fixture_rpc.py"
         _sh(["docker", "network", "create", "--internal", self.network])
+        # A second, ordinary network for the proxy's outward half only. The subject is never on it.
+        _sh(["docker", "network", "create", self.egress])
+        _sh([
+            "docker", "run", "-d", "--rm", "--name", self.proxy, "--network", self.network,
+            self.proxy_image,
+        ])
+        _sh(["docker", "network", "connect", self.egress, self.proxy])
         _sh([
             "docker", "run", "-d", "--rm", "--name", self.fixture, "--network", self.network,
             "-v", f"{script}:{script}:ro", self.image,
@@ -238,12 +253,19 @@ class DockerIsolation:
         return [
             "docker", "run", "--rm", "--network", self.network,
             "-v", f"{workdir}:{workdir}", "-w", str(workdir),
+            # Only the model API resolves through here; everything else is denied by the proxy's
+            # allow-list, so the subject can think but cannot read the manual.
+            "-e", f"HTTPS_PROXY={self.proxy_url}",
+            "-e", f"HTTP_PROXY={self.proxy_url}",
+            "-e", f"NO_PROXY={self.fixture},localhost,127.0.0.1",
             self.image,
         ]
 
     def __exit__(self, *_):
         _sh(["docker", "rm", "-f", self.fixture], check=False)
+        _sh(["docker", "rm", "-f", self.proxy], check=False)
         _sh(["docker", "network", "rm", self.network], check=False)
+        _sh(["docker", "network", "rm", self.egress], check=False)
         return False
 
     def preflight(self, workdir: Path) -> None:
@@ -298,6 +320,35 @@ class DockerIsolation:
         code, out = _run(self.argv(workdir) + ["sh", "-c", "command -v claude >/dev/null && echo yes"])
         if "yes" not in out:
             die("the image has no `claude` on PATH; every run would fail for the image's reasons")
+
+        # **The subject must be able to reach its own model, and nothing else.** Both halves, because
+        # either alone is a broken eval: without egress `claude` cannot run at all (review of #1058
+        # found exactly that - `Could not resolve host: api.anthropic.com` - so the enforced mode had
+        # never been runnable), and with open egress the agent can read nuthatch's documentation and
+        # score without the builder skill teaching it anything.
+        code, out = _run(self.argv(workdir) + [
+            "sh", "-c",
+            "curl -sS -m 15 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/messages 2>&1 || true",
+        ])
+        if not out.strip().endswith(("200", "400", "401", "403", "404", "405")):
+            die(
+                "the subject cannot reach the model API through the egress proxy.\n"
+                f"  got: {out.strip()[-160:]}\n"
+                "\n`claude` would be unable to run, and every criterion would score false for the\n"
+                "harness's reasons rather than the agent's. Check the proxy container is up and that\n"
+                f"`{self.proxy_image}` is built (eval/image/proxy)."
+            )
+
+        code, out = _run(self.argv(workdir) + [
+            "sh", "-c",
+            "curl -sS -m 12 -o /dev/null -w '%{http_code}' https://example.com 2>&1 || true",
+        ])
+        if out.strip().endswith(("200", "301", "302")):
+            die(
+                "the subject can reach the open internet. It could read nuthatch's documentation and\n"
+                "score without the builder skill teaching it anything, which is the thing this eval\n"
+                "measures. The proxy's allow-list is not denying - check FilterDefaultDeny."
+            )
 
 
 def _run(argv, timeout=180):
