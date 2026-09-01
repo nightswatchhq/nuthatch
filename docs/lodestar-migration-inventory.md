@@ -309,3 +309,84 @@ and the QoS oracle pending §5.
 Explicitly **not** the goal: zero `GRAPH_API_KEY` in the repository. Per #638, the goal is that the
 key is not load-bearing for Lodestar's own dashboard. Fifty-six files touch a gateway and roughly
 twenty of them always will.
+
+## Appendix: how to re-derive every count
+
+Run from `~/Projects/lodestar` unless stated. Every headline figure in this document came from one of
+these, re-run and confirmed on 2026-09-01 at `ee78088`.
+
+**Two traps, both of which produced a confident zero while writing this.** `rg` on this machine is a
+shell function from Claude Code's snapshot rather than a binary, so it does not exist inside a spawned
+`bash script.sh`; and zsh does not word-split, so passing `"src scripts"` as one variable searches a
+path of that name and finds nothing. A probe that errors prints `0` and reads exactly like a real
+zero. `dispatchRegistryQuery: 0` below is a **real** zero, and the way to know that is that the same
+command returns 56, 37, 5, 3, 2 and 1 for its siblings.
+
+```sh
+# The helper every count below uses. Paths literal, never via one variable.
+n() { rg -l "$1" src scripts --glob '*.ts' --glob '*.tsx' \
+        | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort -u | wc -l; }
+
+n 'subgraphQuery|ensQuery|horizonPerfQuery|delegationEventsQuery|qosOracleQuery|GRAPH_API_KEY'  # 56
+n '\bsubgraphQuery\b'                                                                          # 37
+n '\bensQuery\b'                                                                               #  5
+n '\bdelegationEventsQuery\b'                                                                  #  3
+n '\bqosOracleQuery\b'                                                                         #  2
+n '\bhorizonPerfQuery\b'                                                                       #  1
+n '\bdispatchRegistryQuery\b'                                                                  #  0
+```
+
+```sh
+# The 14 that reach GRAPH_API_KEY without importing the shared client - why client-anchored
+# sweeps undercount.
+comm -23 \
+  <(rg -l 'subgraphQuery|ensQuery|horizonPerfQuery|delegationEventsQuery|qosOracleQuery|GRAPH_API_KEY' \
+      src scripts --glob '*.ts' --glob '*.tsx' | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort) \
+  <(rg -l 'subgraphQuery|ensQuery|horizonPerfQuery|delegationEventsQuery|qosOracleQuery' \
+      src scripts --glob '*.ts' --glob '*.tsx' | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort)
+```
+
+```sh
+# The 27 API routes, and the 21/6 request-time partition of §6a.
+rg -l '\bsubgraphQuery\b' src/app/api --glob '*.ts' | grep -v __tests__ | sort > /tmp/sq.txt   # 27
+while read f; do
+  if grep -qE "from '@/lib/(studio/)?db'" "$f"; then echo "$f" >> /tmp/db.txt
+  else echo "$f" >> /tmp/nodb.txt; fi
+done < /tmp/sq.txt        # nodb 21, db 6, and they partition
+
+# `@/lib/db` and `@/lib/studio/db` are the only two database import paths under src/app/api:
+rg -o --no-filename "from '[^']*(db|database|postgres|pg)[^']*'" src/app/api --glob '*.ts' | sort -u
+```
+
+```sh
+# Already served by a nest (11), and the crons (19).
+rg -l 'nuthatchSql|nuthatchEnabled|hasNuthatch' src --glob '*.ts' --glob '*.tsx' | grep -v __tests__
+python3 -c "import json;print(len(json.load(open('vercel.json'))['crons']))"
+
+# api/subgraph's production guard, and its size.
+grep -n "NODE_ENV === 'production'" src/app/api/subgraph/route.ts && wc -l src/app/api/subgraph/route.ts
+```
+
+**The group C partition (12 / 12 / 5 / 1 over 30 rows) is derived from this file's own table**, so it
+is checkable against the document rather than the repo. Run from the nuthatch repo:
+
+```sh
+python3 - <<'EOF'
+s=open('docs/lodestar-migration-inventory.md').read()
+i=s.index('## 3. Group C'); j=s.index('**Thirty surfaces**')
+rows=[l for l in s[i:j].split('\n') if l.startswith('| `')]
+b={'covered':0,'needs a view':0,'mixed':0,'follows':0}
+for r in rows:
+    c=[x.strip() for x in r.strip('|').split('|')]; nest,onchain=c[3],c[2]
+    if '.sql`' in nest: b['covered']+=1
+    elif nest=='**no view**' and onchain=='**mixed**': b['mixed']+=1
+    elif nest=='**no view**': b['needs a view']+=1
+    elif nest=='partial': b['mixed']+=1
+    else: b['follows']+=1
+print(b, 'sum', sum(b.values()), 'rows', len(rows))
+EOF
+```
+
+The first two drafts of this file stated totals that its own tables did not support, twice. The
+partition script above exists because hand-counting a thirty-row table into prose is how that
+happened, and it is the check that should run before any figure here is quoted elsewhere.
