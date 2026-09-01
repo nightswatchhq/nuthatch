@@ -187,7 +187,7 @@ Correct as they are. A subgraph playground with no subgraph is a deleted feature
 `api/indexer-status/[address]`, `api/indexing-status/[hash]`, `cron/check-subgraph-health`,
 `api/indexer-trends`.
 
-**Eleven surfaces**, one more than #1079's seven, and it is a decision rather than an oversight in
+**Eleven surfaces**, four more than #1079's seven, and it is a decision rather than an oversight in
 two of them: `indexer-status` and `indexing-status` query indexers' own `/status` endpoints, which is
 serving telemetry, not chain state.
 
@@ -402,10 +402,13 @@ a reproducible count and a lucky one.
 ```sh
 # The 27 API routes, and the 21/6 request-time partition of §6a.
 rg -l '\bsubgraphQuery\b' src/app/api --glob '*.ts' | grep -v __tests__ | sort > /tmp/sq.txt   # 27
+: > /tmp/db.txt; : > /tmp/nodb.txt      # truncate first: the loop appends, so a second run
+                                       # without this doubles both files and they stop partitioning
 while read f; do
   if grep -qE "from '@/lib/(studio/)?db'" "$f"; then echo "$f" >> /tmp/db.txt
   else echo "$f" >> /tmp/nodb.txt; fi
-done < /tmp/sq.txt        # nodb 21, db 6, and they partition
+done < /tmp/sq.txt        # nodb 21, db 6
+wc -l < /tmp/db.txt; wc -l < /tmp/nodb.txt   # 6 and 21; assert they sum to 27 before using either
 
 # `@/lib/db` and `@/lib/studio/db` are the only two database import paths under src/app/api:
 rg -o --no-filename "from '[^']*(db|database|postgres|pg)[^']*'" src/app/api --glob '*.ts' | sort -u
