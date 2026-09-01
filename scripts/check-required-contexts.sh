@@ -34,8 +34,11 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 file="$root/.github/required-checks.txt"
 expected=$(grep -v '^#' "$file" | grep -v '^$' | sort)
 
-if ! echo "$expected" | grep -qx 'reviewed-by signature'; then
-  echo "required-checks.txt is missing 'reviewed-by signature'" >&2
+# The `reviewed-by signature` gate was retired: a PR is admitted by CI and Jules, not by a line of
+# text a party could type about itself. Asserted in the negative because re-adding the context
+# without re-adding the workflow blocks every PR on a check that can never report.
+if echo "$expected" | grep -qx 'reviewed-by signature'; then
+  echo "required-checks.txt names the retired 'reviewed-by signature' context, whose workflow no longer exists" >&2
   exit 1
 fi
 if ! echo "$expected" | grep -qx 'Jules approval'; then
@@ -46,7 +49,7 @@ fi
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 if [ "$offline" -eq 1 ]; then
-  echo "offline: file lists $(echo "$expected" | wc -l | tr -d ' ') contexts including reviewed-by signature."
+  echo "offline: file lists $(echo "$expected" | wc -l | tr -d ' ') contexts including Jules approval."
   echo "offline: NOT compared against live protection - this is not a drift check."
   exit 0
 fi

@@ -40,8 +40,8 @@ a PR author cannot satisfy it by changing their PR, and a required check nobody 
 
 `protect-branch.sh` is the other direction - it *writes* `main`'s context list onto a named branch.
 It stays manual because it mutates repository settings, which is not a thing a schedule should do
-unsupervised. It is the checklist item `review-signature.yml` describes: a new `sprint/*` branch
-starts unprotected, and PRs onto it are gated by nothing until someone runs this.
+unsupervised. The hazard it addresses: a new `sprint/*` branch starts unprotected, and PRs onto it
+are gated by nothing until someone runs this.
 
 Since 2026-08-20 sprint work has gone straight to `main` (a sprint is a labelled set of issues, not a
 branch - #810), so in practice this script is only needed if that changes back.
