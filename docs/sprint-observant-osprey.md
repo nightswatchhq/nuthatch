@@ -1,13 +1,13 @@
 # Sprint: observant-osprey
 
-**Five issues.** A sprint is a labelled set, not a calendar. This is the small sprint after a release:
+**Six issues.** A sprint is a labelled set, not a calendar. This is the small sprint after a release:
 nothing here is a feature, and nothing here is a bug in the ordinary sense. Every item is a thing the
 project currently *believes* without having looked, or an instrument that cannot tell us what we need.
 
 ## Definition of done
 
 Every issue carrying the **`observant-osprey`** label is closed, and no open PR is for one of them.
-That is #1056, #1057, #1058, #1059 and #1060. Work discovered in flight is filed **unlabelled**;
+That is #1056, #1057, #1058, #1059, #1060 and #1062. Work discovered in flight is filed **unlabelled**;
 pulling it into scope needs a board reply.
 
 ## The theme
@@ -26,17 +26,17 @@ several of our instruments do not answer the question they appear to answer:
 - RFC-0017's authoring eval has a proven board, a runner and two isolation modes, and **cannot
   produce a single number** because the container image it requires does not exist (#1058).
 - The reviewer that found 26 of 28 real defects last sprint is handed a diff and never a commit
-  range, so it reported a security fix missing from a release that contains it (#1056).
+  range, so it reported a security fix missing from a release that contains it (#1056) - and whether
+  a different model would do better is itself unmeasured (#1062).
 
 None of these fails loudly. That is the point, and it is the same fault the last sprint kept finding
 in tests: a mechanism that reports success because it never looked.
 
-## The five
+## The six
 
 1. **#1056 - the review harness.** Give Jules the commit range, add a per-finding confidence distinct
-   from merge-safety, and stop a cancelled run leaving a red check that reads as a verdict. Not a
-   model swap: `terra` may be better, but a reviewer with a measured record is not replaced by one
-   without, and the evidence for that is a parallel run rather than a switch.
+   from merge-safety, and stop a cancelled run leaving a red check that reads as a verdict. Fixing
+   this first is what makes #1062's comparison a measurement of models rather than of harnesses.
 2. **#1057 - pick the cache size.** The RSS/point-read/tip-lag curve at 1 GiB / 512 / 256 MiB **on the
    box that enforces the budget**, then a default and a documented per-cursor figure. The harness
    numbers must not be used: both boxes had the store in page cache, so a miss cost a memcpy rather
@@ -49,7 +49,12 @@ in tests: a mechanism that reports success because it never looked.
    against `docs/bench/segment-layout.md`'s 10,923 files at a 6 KB median. A watch, not a defect -
    and it degrades gradually rather than failing, so nothing will alert on it. Close it once someone
    has actually looked.
-5. **#1060 - version the units, verify the deploy.** Every `ExecStart` names a version; the deploy
+5. **#1062 - terra against luna.** Board decision: evaluate the alternative reviewer and switch if it
+   wins. **Sequenced after #1056** - two of luna's misses trace to the harness rather than the model,
+   so comparing against a fixed harness measures the models and comparing against the current one
+   measures the harness twice. "Keep luna, with these measured differences" is a successful outcome,
+   the same rule RFC-0042 §0 set for DuckDB.
+6. **#1060 - version the units, verify the deploy.** Every `ExecStart` names a version; the deploy
    asserts the binary it installed before restarting. A `cp` over a running binary fails with `Text
    file busy`, and the script that ignored it nearly reported a fix that had not been deployed.
 
@@ -57,7 +62,6 @@ in tests: a mechanism that reports success because it never looked.
 
 - Every `frozen` issue. The 2026 freeze remains intact, and **both carve-outs are spent**.
 - New engine, chain, extraction, or AI capability.
-- Switching Jules to `terra`. Measure both first; see #1056.
 - New findings discovered while doing these five, unless the board adds them explicitly.
 
 ## How this sprint runs
