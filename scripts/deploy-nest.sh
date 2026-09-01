@@ -73,9 +73,24 @@ cmd_roll() {
 cmd_check() {
   local bad=0 seen=0
   printf '%-38s %-9s %-28s %s\n' UNIT ACTIVE BINARY VERSION
-  for f in /etc/systemd/system/*.service; do
+  # **Every** unit directory systemd reads, not just the one operators usually edit. Globbing
+  # `/etc/systemd/system` alone means a unit shipped in `/lib` or generated into `/run` is invisible
+  # to a check whose entire purpose is answering "what is running" - and it would report all clear
+  # while never having looked at it. Review of #1060.
+  local dirs=(/etc/systemd/system /run/systemd/system /lib/systemd/system /usr/lib/systemd/system)
+  local files=()
+  for d in "${dirs[@]}"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.service; do [ -e "$f" ] && files+=("$f"); done
+  done
+  # A unit in /etc shadows the same name elsewhere, exactly as systemd resolves it, so the same
+  # service is not counted twice under two paths.
+  local seen_names=" "
+  for f in "${files[@]}"; do
     local u b v act
     u=$(basename "$f" .service)
+    case "$seen_names" in *" $u "*) continue ;; esac
+    seen_names="$seen_names$u "
     grep -q nuthatch "$f" 2>/dev/null || continue
     # `|| true` on every one of these: `systemctl is-active` exits non-zero for an inactive unit,
     # and under `set -e` that assignment kills the loop at the first disabled service - which is
