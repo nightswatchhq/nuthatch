@@ -228,6 +228,13 @@ class DockerIsolation:
         self.proxy_url = f"http://{self.proxy}:8888"
 
     def __enter__(self):
+        # Refuse early and say which image is missing. The runner starts the proxy unconditionally,
+        # so on a host that has only built the subject image `docker run` fails deep inside setup
+        # with a registry error - and review of #1058 pointed out the documented baseline command
+        # did not run as written. A missing prerequisite should be a sentence, not a stack trace.
+        for image, where in ((self.image, "eval/image"), (self.proxy_image, "eval/image/proxy")):
+            if _run(["docker", "image", "inspect", image])[0] != 0:
+                die(f"the image '{image}' is not built. Run:  docker build -t {image} {where}")
         script = ROOT / "scripts" / "fixture_rpc.py"
         _sh(["docker", "network", "create", "--internal", self.network])
         # A second, ordinary network for the proxy's outward half only. The subject is never on it.

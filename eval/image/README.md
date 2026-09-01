@@ -4,8 +4,12 @@
 runner refuses to start, which is why RFC-0017's authoring eval has a proven board, a runner, two
 isolation modes and **no baseline**.
 
+**Two images are required**, and the runner refuses by name if either is missing. The proxy is what
+lets the subject reach its model without reaching anything else — see below.
+
 ```sh
 docker build -t nuthatch-eval-subject eval/image
+docker build -t nuthatch-eval-proxy   eval/image/proxy
 # If buildx complains about ~/.docker/buildx/activity, DOCKER_BUILDKIT=0 builds it with the legacy
 # builder. That is a local docker-state problem, not a Dockerfile one.
 python3 eval/run-authoring.py --docker-image nuthatch-eval-subject --runs 3 \
@@ -42,7 +46,12 @@ Instead every image records what it contains:
 
 ```sh
 docker run --rm nuthatch-eval-subject cat /etc/nuthatch-eval-image.manifest
+docker run --rm nuthatch-eval-proxy   cat /etc/nuthatch-eval-proxy.manifest
 ```
+
+The **proxy** is pinned the same way and for a sharper reason: it is the component enforcing the
+network boundary, so rebuilding the eval against a different tinyproxy would change what the subject
+could reach — the one thing the isolation claim rests on.
 
 Reproducibility you can verify after the fact beats reproducibility you assert and cannot check.
 

@@ -11,7 +11,11 @@
 #
 # So: one host, and only one. This container straddles the internal network and a normal one, and
 # tinyproxy's filter denies everything that is not the model API.
-FROM alpine:3.20
+# Digest-pinned, like the subject image. The subject's Dockerfile argues that a score is a number
+# about a *pairing* that has to hold still - and the component **enforcing the network boundary** is
+# part of that pairing. Rebuilding the eval later against a different tinyproxy would change what the
+# subject could reach, which is the one thing the isolation claim rests on. Review of #1058.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 RUN apk add --no-cache tinyproxy >/dev/null
 
@@ -29,7 +33,11 @@ RUN printf '%s\n' \
       'FilterExtended On' \
       'LogLevel Info' \
     > /etc/tinyproxy/tinyproxy.conf \
- && printf '%s\n' '^api\.anthropic\.com$' > /etc/tinyproxy/allow.txt
+ && printf '%s\n' '^api\.anthropic\.com$' > /etc/tinyproxy/allow.txt \
+ && { echo "base: alpine:3.20 (digest-pinned in this Dockerfile)"; \
+      echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+      apk list --installed tinyproxy 2>/dev/null | head -1; \
+    } > /etc/nuthatch-eval-proxy.manifest
 
 EXPOSE 8888
 CMD ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
