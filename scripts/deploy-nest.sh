@@ -101,7 +101,7 @@ cmd_check() {
     local ident
     ident=$([ -x "$b" ] && { "$b" --version 2>/dev/null; } || echo '')
     v=$(echo "$ident" | awk '$1=="nuthatch"{print $2}')
-    [ -n "$v" ] || v='-'""
+    [ -n "$v" ] || v="-"
     if [ "$act" = active ] && { [ -z "$v" ] || [ "$v" = "-" ]; }; then
       printf '%-38s %-9s %-28s %s   (not a nuthatch binary - not enforced)\n' "$u" "$act" "$b" "-"
       continue
