@@ -78,37 +78,37 @@ Ethereum mainnet and therefore a different chain, a different cursor, and a diff
 
 This is the numerator and the denominator both.
 
-| surface | entities read | on-chain | nest status | blocker |
-| --- | --- | --- | --- | --- |
-| `api/network-stats` | `graphNetwork`, `block` | yes | `80-lodestar-network.sql` | nest undeployed (#1075) |
-| `api/grt-flow` | `graphNetwork` | yes | `80-lodestar-network.sql` | nest undeployed |
-| `lib/ingest/network-snapshot.ts` | `graphNetwork` | yes | `80-lodestar-network.sql` | nest undeployed |
-| `api/epochs` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
-| `api/token-metrics` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
-| `lib/ingest/epochs.ts` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
-| `lib/ingest/allocations.ts` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
-| `api/poi` | `allocations`, `indexer` | yes | `40-lodestar-allocations.sql` | nest undeployed |
-| `api/cron/tap-provision` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
-| `lib/ingest/disputes.ts` | `disputes`, `fisherman` | yes | `60-lodestar-disputes.sql` | nest undeployed |
-| `lib/ingest/rav.ts` | `paymentsEscrowTransactions` | yes | `70-lodestar-escrow.sql` | nest undeployed |
-| `api/payments` | `paymentsEscrow*`, `graphTallyTokensCollecteds` | yes | `70-lodestar-escrow.sql` | nest undeployed |
-| `api/indexers` | `indexers`, `account` | yes | **no view** | view + nest |
-| `api/indexer-stake-history/[address]` | staking history | yes | **no view** | view + nest |
-| `api/rewards-history` | `indexer`, `stakes`, `delegator` | yes | **no view** | view + nest (#1082) |
-| `api/curators` | `curators` | yes | **no view** | view + nest |
-| `lib/ingest/delegations.ts` | `delegationEvents` (3rd-party sg) | yes | **no view** | view + nest (#1082) |
-| `api/cron/ingest-horizon-activity` | `delegationEvents`, `provisions` | yes | **no view** | view + nest (#1084) |
-| `api/provisions` | `provisions` + ENS | **mixed** | **no view** | split first |
-| `api/indexer/[address]` | indexer + delegators + metadata | **mixed** | partial | split first |
-| `api/portfolio` | delegator/stakes/signals + ENS | **mixed** | partial | split first |
-| `api/apr-provenance/[address]` | `indexer` + ENS | **mixed** | partial | split first |
-| `api/feed` | network activity | yes | **no view** | unclassified, needs a read |
-| `api/cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
-| `lib/protocols/fetcher.ts` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
-| `lib/refresh.ts` | 11 entities across 3 subgraphs | **mixed** | partial | split first |
-| `lib/ingest/qos.ts` | `allocationDailyDataPoints`, `queryDailyDataPoints` | yes (oracle) | **no view** | decode shape undecided (#1083) |
-| `api/indexer-qos/[address]` | QoS oracle daily grain | yes (oracle) | **no view** | decode shape undecided (#1083) |
-| `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
+| # | surface | entities read | on-chain | nest status | blocker |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | `api/network-stats` | `graphNetwork`, `block` | yes | `80-lodestar-network.sql` | nest undeployed (#1075) |
+| 2 | `api/grt-flow` | `graphNetwork` | yes | `80-lodestar-network.sql` | nest undeployed |
+| 3 | `lib/ingest/network-snapshot.ts` | `graphNetwork` | yes | `80-lodestar-network.sql` | nest undeployed |
+| 4 | `api/epochs` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
+| 5 | `api/token-metrics` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
+| 6 | `lib/ingest/epochs.ts` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
+| 7 | `lib/ingest/allocations.ts` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
+| 8 | `api/poi` | `allocations`, `indexer` | yes | `40-lodestar-allocations.sql` | nest undeployed |
+| 9 | `api/cron/tap-provision` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
+| 10 | `lib/ingest/disputes.ts` | `disputes`, `fisherman` | yes | `60-lodestar-disputes.sql` | nest undeployed |
+| 11 | `lib/ingest/rav.ts` | `paymentsEscrowTransactions` | yes | `70-lodestar-escrow.sql` | nest undeployed |
+| 12 | `api/payments` | `paymentsEscrow*`, `graphTallyTokensCollecteds` | yes | `70-lodestar-escrow.sql` | nest undeployed |
+| 13 | `api/indexers` | `indexers`, `account` | yes | **no view** | view + nest |
+| 14 | `api/indexer-stake-history/[address]` | staking history | yes | **no view** | view + nest |
+| 15 | `api/rewards-history` | `indexer`, `stakes`, `delegator` | yes | **no view** | view + nest (#1082) |
+| 16 | `api/curators` | `curators` | yes | **no view** | view + nest |
+| 17 | `lib/ingest/delegations.ts` | `delegationEvents` (3rd-party sg) | yes | **no view** | view + nest (#1082) |
+| 18 | `api/cron/ingest-horizon-activity` | `delegationEvents`, `provisions` | yes | **no view** | view + nest (#1084) |
+| 19 | `api/provisions` | `provisions` + ENS | **mixed** | **no view** | split first |
+| 20 | `api/indexer/[address]` | indexer + delegators + metadata | **mixed** | partial | split first |
+| 21 | `api/portfolio` | delegator/stakes/signals + ENS | **mixed** | partial | split first |
+| 22 | `api/apr-provenance/[address]` | `indexer` + ENS | **mixed** | partial | split first |
+| 23 | `api/feed` | network activity | yes | **no view** | unclassified, needs a read |
+| 24 | `api/cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
+| 25 | `lib/protocols/fetcher.ts` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
+| 26 | `lib/refresh.ts` | 11 entities across 3 subgraphs | **mixed** | partial | split first |
+| 27 | `lib/ingest/qos.ts` | `allocationDailyDataPoints`, `queryDailyDataPoints` | yes (oracle) | **no view** | decode shape undecided (#1083) |
+| 28 | `api/indexer-qos/[address]` | QoS oracle daily grain | yes (oracle) | **no view** | decode shape undecided (#1083) |
+| 29 | `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
 
 **Twenty-nine surfaces, one per row**, partitioned on the nest-status column: **12** with a view file
 of the right shape; **12** needing a view written, of which three nobody has read yet and two are the
@@ -430,11 +430,11 @@ is checkable against the document rather than the repo. Run from the nuthatch re
 python3 - <<'EOF'
 s=open('docs/lodestar-migration-inventory.md').read()
 i=s.index('## 3. Group C'); j=s.index('**Twenty-nine surfaces')
-rows=[l for l in s[i:j].split('\n') if l.startswith('| `')]
+rows=[l for l in s[i:j].split('\n') if l.startswith('| ') and l.split('|')[1].strip().isdigit()]
 b={'covered':0,'needs a view':0,'mixed':0,'unclassified':0}
-multi=[r for r in rows if ',' in r.strip('|').split('|')[0]]
+multi=[r for r in rows if ',' in r.strip('|').split('|')[1]]
 for r in rows:
-    c=[x.strip() for x in r.strip('|').split('|')]; nest,onchain=c[3],c[2]
+    c=[x.strip() for x in r.strip('|').split('|')]; nest,onchain=c[4],c[3]
     if '.sql`' in nest: b['covered']+=1
     elif nest=='**no view**' and onchain=='**mixed**': b['mixed']+=1
     elif nest=='**no view**': b['needs a view']+=1
@@ -455,20 +455,20 @@ updated when the table moved.** So the check that matters asserts the prose:
 
 ```sh
 python3 - <<'EOF'
-import re
 s = open('docs/lodestar-migration-inventory.md').read()
 i = s.index('## 3. Group C'); j = s.index('**Twenty-nine surfaces')
-rows = [l for l in s[i:j].split('\n') if l.startswith('| `')]
+rows = [l for l in s[i:j].split('\n') if l.startswith('| ') and l.split('|')[1].strip().isdigit()]
 cov = noview = mixed = 0
 for r in rows:
-    c = [x.strip() for x in r.strip('|').split('|')]; nest, onchain = c[3], c[2]
+    c = [x.strip() for x in r.strip('|').split('|')]; nest, onchain = c[4], c[3]
     if '.sql`' in nest: cov += 1
     elif nest == '**no view**' and onchain == '**mixed**': mixed += 1
     elif nest == '**no view**': noview += 1
     elif nest == 'partial': mixed += 1
 n = len(rows)
 assert (n, cov, noview, mixed) == (29, 12, 12, 5), (n, cov, noview, mixed)
-assert not [r for r in rows if ',' in r.strip('|').split('|')[0]], 'a row names two surfaces'
+assert [int(r.split('|')[1]) for r in rows] == list(range(1, n + 1)), 'row numbers are not 1..n'
+assert not [r for r in rows if ',' in r.strip('|').split('|')[1]], 'a row names two surfaces'
 
 # Every sentence that quotes one of those numbers, by the number it must quote.
 must = [
