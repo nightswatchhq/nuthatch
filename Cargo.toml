@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch"
-version = "3.0.1"
+version = "3.1.0"
 edition = "2021"
 # **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
 # 1.94, actix 1.88 - so the 1.85 this declared until 1.0 was a promise nothing could keep. 1.95 is what
