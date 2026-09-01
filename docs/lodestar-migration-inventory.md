@@ -108,23 +108,29 @@ This is the numerator and the denominator both.
 | `lib/refresh.ts` | 11 entities across 3 subgraphs | **mixed** | partial | split first |
 | `lib/ingest/qos.ts` | `allocationDailyDataPoints`, `queryDailyDataPoints` | yes (oracle) | **no view** | decode shape undecided (#1083) |
 | `api/indexer-qos/[address]` | QoS oracle daily grain | yes (oracle) | **no view** | decode shape undecided (#1083) |
-| `scripts/backfill.ts`, `backfill-rav.ts` | historical loads | yes | follows the above | nest undeployed |
 | `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
 
-**Thirty surfaces**, partitioned on the nest-status column: **12** with a view file of the right
-shape; **12** needing a view written, of which three nobody has read yet and two are the QoS pair
-blocked on the shape question rather than on effort; **5** mixed, and unclassifiable until the
-on-chain half is split from the ENS/IPFS half; and **1** pair of backfill scripts that follow
-whatever the rows above them do.
+**Twenty-nine surfaces, one per row**, partitioned on the nest-status column: **12** with a view file
+of the right shape; **12** needing a view written, of which three nobody has read yet and two are the
+QoS pair blocked on the shape question rather than on effort; and **5** mixed, unclassifiable until
+the on-chain half is split from the ENS/IPFS half.
+
+**One row, one surface, deliberately.** An earlier draft carried `scripts/backfill.ts` and
+`backfill-rav.ts` as a single row naming two files, which made "rows" and "surfaces" different words
+for different numbers and left the appendix checker unable to validate the total it was checking.
+They are excluded now, for the reason already applied to `scripts/backfill-qos.ts` in §5: a backfill
+script is a **runner** for an ingestion module already counted here, not a data dependency of its
+own. Migrate `lib/ingest/rav.ts` and `backfill-rav.ts` follows it; counting both would double-count
+one dependency and flatter the denominator.
 
 **The blocker column names the *next* blocker, not the only one**, and "a view exists" is the first
 of three steps rather than a state of near-readiness. Each of the 12 still needs: the nest deployed
 (#1075), its fields proven against the subgraph it replaces at a pinned block (#1076), and the route
-or module switched to read it (#1078). Twenty-two of these thirty are request-time routes calling
+or module switched to read it (#1078). Twenty-one of these twenty-nine are request-time routes calling
 `subgraphQuery` in the handler (§6a), so **deploying the nest migrates none of them on its own** - it
 only makes the next step possible.
 
-So the honest figure today, against group C, is **0 of 30 migrated**, with 12 having cleared the
+So the honest figure today, against group C, is **0 of 29 migrated**, with 12 having cleared the
 first of three steps. Not a percentage anyone should publish yet, because the five mixed rows can
 move the denominator in either direction once split, and "has a view" is the weakest of the three
 things a migrated surface needs.
@@ -281,7 +287,7 @@ no issue" - and it wants filing rather than leaving here.
 
 - **#1074 is not board-only and needs no GraphOps conversation.** The repository is on this laptop.
   This file is the deliverable; what remains is reading the five mixed and three unclassified rows.
-- **#1078's table is 7 rows of a 30-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
+- **#1078's table is 7 rows of a 29-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
   six clients, so a nuthatch-backed implementation behind it migrates the Graph Network surfaces and
   touches none of ENS, QoS or delegation events.
 - **#1079 should cover 11 group-A surfaces and 11 group-B, not 7 and 2**, and should say for each
@@ -296,11 +302,11 @@ no issue" - and it wants filing rather than leaving here.
   migrated in 4.26.0 "need a configured Nuthatch origin and fail visibly without one, with no
   alternate Graph source". Fail-visibly is therefore the *existing* policy for migrated surfaces, not
   an open choice, and `NUTHATCH_DIPS`'s "no fallback exists" is that policy rather than an exception.
-  #1080's real question is whether it survives contact with group C's 30.
+  #1080's real question is whether it survives contact with group C's 29.
 
 ## 8. The denominator, stated
 
-**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 30 surfaces
+**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 29 surfaces
 today, minus whatever the five mixed rows shed on splitting.
 
 Explicitly outside it, and finished by being correct: group A's 11, group B's off-chain half, ENS,
@@ -367,23 +373,27 @@ python3 -c "import json;print(len(json.load(open('vercel.json'))['crons']))"
 grep -n "NODE_ENV === 'production'" src/app/api/subgraph/route.ts && wc -l src/app/api/subgraph/route.ts
 ```
 
-**The group C partition (12 / 12 / 5 / 1 over 30 rows) is derived from this file's own table**, so it
+**The group C partition (12 / 12 / 5 over 29 rows) is derived from this file's own table**, so it
 is checkable against the document rather than the repo. Run from the nuthatch repo:
 
 ```sh
 python3 - <<'EOF'
 s=open('docs/lodestar-migration-inventory.md').read()
-i=s.index('## 3. Group C'); j=s.index('**Thirty surfaces**')
+i=s.index('## 3. Group C'); j=s.index('**Twenty-nine surfaces')
 rows=[l for l in s[i:j].split('\n') if l.startswith('| `')]
-b={'covered':0,'needs a view':0,'mixed':0,'follows':0}
+b={'covered':0,'needs a view':0,'mixed':0,'unclassified':0}
+multi=[r for r in rows if ',' in r.strip('|').split('|')[0]]
 for r in rows:
     c=[x.strip() for x in r.strip('|').split('|')]; nest,onchain=c[3],c[2]
     if '.sql`' in nest: b['covered']+=1
     elif nest=='**no view**' and onchain=='**mixed**': b['mixed']+=1
     elif nest=='**no view**': b['needs a view']+=1
     elif nest=='partial': b['mixed']+=1
-    else: b['follows']+=1
+    else: b['unclassified']+=1
 print(b, 'sum', sum(b.values()), 'rows', len(rows))
+# One row is one surface: a row naming two files makes the total unverifiable.
+assert not multi, f'row names more than one surface: {multi}'
+assert sum(b.values()) == len(rows) == 29 and b['unclassified'] == 0
 EOF
 ```
 
