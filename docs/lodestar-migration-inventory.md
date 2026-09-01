@@ -88,7 +88,7 @@ This is the numerator and the denominator both.
 | `lib/ingest/epochs.ts` | `epoches` | yes | `50-lodestar-epochs.sql` | nest undeployed |
 | `lib/ingest/allocations.ts` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
 | `api/poi` | `allocations`, `indexer` | yes | `40-lodestar-allocations.sql` | nest undeployed |
-| `cron/tap-provision` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
+| `api/cron/tap-provision` | `allocations` | yes | `40-lodestar-allocations.sql` | nest undeployed |
 | `lib/ingest/disputes.ts` | `disputes`, `fisherman` | yes | `60-lodestar-disputes.sql` | nest undeployed |
 | `lib/ingest/rav.ts` | `paymentsEscrowTransactions` | yes | `70-lodestar-escrow.sql` | nest undeployed |
 | `api/payments` | `paymentsEscrow*`, `graphTallyTokensCollecteds` | yes | `70-lodestar-escrow.sql` | nest undeployed |
@@ -97,13 +97,13 @@ This is the numerator and the denominator both.
 | `api/rewards-history` | `indexer`, `stakes`, `delegator` | yes | **no view** | view + nest (#1082) |
 | `api/curators` | `curators` | yes | **no view** | view + nest |
 | `lib/ingest/delegations.ts` | `delegationEvents` (3rd-party sg) | yes | **no view** | view + nest (#1082) |
-| `cron/ingest-horizon-activity` | `delegationEvents`, `provisions` | yes | **no view** | view + nest (#1084) |
+| `api/cron/ingest-horizon-activity` | `delegationEvents`, `provisions` | yes | **no view** | view + nest (#1084) |
 | `api/provisions` | `provisions` + ENS | **mixed** | **no view** | split first |
 | `api/indexer/[address]` | indexer + delegators + metadata | **mixed** | partial | split first |
 | `api/portfolio` | delegator/stakes/signals + ENS | **mixed** | partial | split first |
 | `api/apr-provenance/[address]` | `indexer` + ENS | **mixed** | partial | split first |
 | `api/feed` | network activity | yes | **no view** | unclassified, needs a read |
-| `cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
+| `api/cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
 | `lib/protocols/fetcher.ts` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
 | `lib/refresh.ts` | 11 entities across 3 subgraphs | **mixed** | partial | split first |
 | `lib/ingest/qos.ts` | `allocationDailyDataPoints`, `queryDailyDataPoints` | yes (oracle) | **no view** | decode shape undecided (#1083) |
@@ -126,9 +126,11 @@ one dependency and flatter the denominator.
 **The blocker column names the *next* blocker, not the only one**, and "a view exists" is the first
 of three steps rather than a state of near-readiness. Each of the 12 still needs: the nest deployed
 (#1075), its fields proven against the subgraph it replaces at a pinned block (#1076), and the route
-or module switched to read it (#1078). Twenty-one of these twenty-nine are request-time routes calling
-`subgraphQuery` in the handler (§6a), so **deploying the nest migrates none of them on its own** - it
-only makes the next step possible.
+or module switched to read it (#1078). **Twelve** of these twenty-nine are request-time handlers
+calling `subgraphQuery` with no database module between the user and the gateway (§6a), so **deploying
+the nest migrates none of them on its own** - it only makes the next step possible. (The 21 in §6a is
+a count over the 27 API routes, not over this group: nine of the 21 are group A or group B, and group
+C also contains ingestion modules that are not routes at all.)
 
 So the honest figure today, against group C, is **0 of 29 migrated**, with 12 having cleared the
 first of three steps. Not a percentage anyone should publish yet, because the five mixed rows can
@@ -309,8 +311,16 @@ no issue" - and it wants filing rather than leaving here.
 **"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 29 surfaces
 today, minus whatever the five mixed rows shed on splitting.
 
-Explicitly outside it, and finished by being correct: group A's 11, group B's off-chain half, ENS,
-and the QoS oracle pending §5.
+Explicitly **inside** it, provisionally: the **two QoS surfaces**, on the §5 reasoning that an oracle
+subgraph exists because an oracle posts to chain. Their blocker is a decode-shape question, not a
+remit one, and until that is answered against the oracle contract they are counted as remaining work.
+If the payload turns out not to be event-shaped they leave the denominator and it becomes 27, so the
+figure is stated with that caveat rather than by quietly picking whichever answer is smaller. The
+same rule applies as everywhere else here: a surface whose data is on chain stays in the denominator
+even when we do not yet know how to reach it.
+
+Explicitly outside it, and finished by being correct: group A's 11, group B's off-chain half, and
+ENS - Ethereum mainnet, and therefore a different chain, cursor and nest.
 
 Explicitly **not** the goal: zero `GRAPH_API_KEY` in the repository. Per #638, the goal is that the
 key is not load-bearing for Lodestar's own dashboard. Fifty-six files touch a gateway and roughly
