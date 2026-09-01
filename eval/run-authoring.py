@@ -244,6 +244,25 @@ class DockerIsolation:
             self.proxy_image,
         ])
         _sh(["docker", "network", "connect", self.egress, self.proxy])
+        # Wait for the proxy to actually accept connections. Review of #1058: the preflight probed
+        # through it immediately after `docker run -d` returned, and a container that has been
+        # *created* is not a proxy that is *listening* - so a slow start would surface as "the
+        # subject cannot reach the model API", sending whoever ran it hunting a network problem that
+        # was a race. Polled, not slept, so a genuinely broken proxy still fails rather than passing
+        # after a fixed delay.
+        for _ in range(60):
+            code, _out = _run([
+                "docker", "run", "--rm", "--network", self.network, self.image,
+                "sh", "-c", f"curl -sS -m 3 -o /dev/null {self.proxy_url} 2>&1 || exit 1",
+            ], timeout=30)
+            if code == 0:
+                break
+            time.sleep(1)
+        else:
+            die(
+                f"the egress proxy '{self.proxy}' never started listening on {self.proxy_url}.\n"
+                f"Check `docker logs {self.proxy}`; the image is {self.proxy_image}."
+            )
         _sh([
             "docker", "run", "-d", "--rm", "--name", self.fixture, "--network", self.network,
             "-v", f"{script}:{script}:ro", self.image,
