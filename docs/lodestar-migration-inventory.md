@@ -294,7 +294,10 @@ no issue" - and it wants filing rather than leaving here.
   touches none of ENS, QoS or delegation events.
 - **#1079 should cover 11 group-A surfaces and 11 group-B, not 7 and 2**, and should say for each
   mixed row which half stays.
-- **#1082 is bigger than `delegations`.** Nine group-C surfaces have no view, not one.
+- **#1082 is bigger than `delegations`.** **Twelve** group-C surfaces have no view at all, not one,
+  and a further **five** are the mixed rows whose on-chain half has no view either - so seventeen of
+  the twenty-nine are short of one, against twelve that have a view file of the right shape. #1082
+  names `delegations` and the escrow asymmetry; those are two of the twelve.
 - **#1083's premise needs replacing** with the shape question in §5.
 - **#1086's eight routes are correct and incomplete**; the direct-`GRAPH_API_KEY` set adds fourteen
   more files it did not see, and §6a raises its 8 request-time routes to 12 group-C ones (21 in all).
@@ -418,6 +421,40 @@ assert sum(b.values()) == len(rows) == 29 and b['unclassified'] == 0
 EOF
 ```
 
-The first two drafts of this file stated totals that its own tables did not support, twice. The
-partition script above exists because hand-counting a thirty-row table into prose is how that
-happened, and it is the check that should run before any figure here is quoted elsewhere.
+### And the prose against the table
+
+The partition script checks the table against itself. That is not where this document kept going
+wrong: **seven review rounds found seven stale figures, every one of them a sentence that had not been
+updated when the table moved.** So the check that matters asserts the prose:
+
+```sh
+python3 - <<'EOF'
+import re
+s = open('docs/lodestar-migration-inventory.md').read()
+i = s.index('## 3. Group C'); j = s.index('**Twenty-nine surfaces')
+rows = [l for l in s[i:j].split('\n') if l.startswith('| `')]
+cov = noview = mixed = 0
+for r in rows:
+    c = [x.strip() for x in r.strip('|').split('|')]; nest, onchain = c[3], c[2]
+    if '.sql`' in nest: cov += 1
+    elif nest == '**no view**' and onchain == '**mixed**': mixed += 1
+    elif nest == '**no view**': noview += 1
+    elif nest == 'partial': mixed += 1
+n = len(rows)
+assert (n, cov, noview, mixed) == (29, 12, 12, 5), (n, cov, noview, mixed)
+assert not [r for r in rows if ',' in r.strip('|').split('|')[0]], 'a row names two surfaces'
+
+# Every sentence that quotes one of those numbers, by the number it must quote.
+must = [
+    f'group C, {n} surfaces', f'0 of {n} migrated', f'7 rows of a {n}-row group',
+    f"group C's {n}", f'**{cov}** with a view file', f'**{noview}** needing a view written',
+    f'**{mixed}** mixed', f'{cov} having cleared the', f'{cov} / {noview} / {mixed} over {n} rows',
+]
+missing = [m for m in must if m not in s]
+assert not missing, f'prose disagrees with the table: {missing}'
+print(f'{n} rows = {cov} covered + {noview} no view + {mixed} mixed; prose agrees')
+EOF
+```
+
+Run it before quoting any figure from this file elsewhere. A number here that no longer matches the
+table is the single most likely defect in the document, on seven rounds of evidence.
