@@ -17,8 +17,20 @@ into scope needs a board reply.
 **100% of what?**
 
 The goal is stated plainly and repeatedly: Lodestar's data comes from nuthatch nests on the VPS
-rather than from subgraphs through the gateway. Eleven of these eighteen issues are that migration,
-and the sprint exists because the goal is currently an **intention rather than a measurable state**.
+rather than from subgraphs through the gateway, and the sprint exists because that goal is currently
+an **intention rather than a measurable state**.
+
+The eighteen break down as follows, stated rather than summarised because "how many are migration"
+turns out to depend on whether the box counts, and a sprint about honest denominators should not
+fudge its own:
+
+| group | count | issues |
+| --- | --- | --- |
+| the Lodestar migration proper | **10** | #1074, #1075, #1076, #1078, #1079, #1080, #1082, #1083, #1084, #1086 |
+| the measurement its largest decision needs | **1** | #1069 |
+| the box that has to carry it | **2** | #1077, #1081 |
+| the public record | **2** | #1070, #1072 |
+| the tail | **3** | #1067, #1068, #1071 |
 
 Four things are true at once, and each one on its own would sink the claim:
 
@@ -36,7 +48,7 @@ Four things are true at once, and each one on its own would sink the claim:
   default-off flag. It is not survivable as the pattern for the several surfaces #1078 switches, and
   the box restarted seven services this morning (#1080).
 
-Two of the remaining seven are the same fault pointed at the public record: the site advertises
+**The public record carries the same fault**, pointed outward instead of inward: the site advertises
 **v3.0.0** and calls it "the current, executable path" while v3.1.0 - carrying a security fix -
 has shipped (#1072), and the only report of a fresh operator working the product blind exists on
 **one laptop** because committing it reds CI (#1070).
