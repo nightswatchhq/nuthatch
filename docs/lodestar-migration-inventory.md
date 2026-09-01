@@ -288,7 +288,7 @@ no issue" - and it wants filing rather than leaving here.
   migrated in 4.26.0 "need a configured Nuthatch origin and fail visibly without one, with no
   alternate Graph source". Fail-visibly is therefore the *existing* policy for migrated surfaces, not
   an open choice, and `NUTHATCH_DIPS`'s "no fallback exists" is that policy rather than an exception.
-  #1080's real question is whether it survives contact with 29 more surfaces.
+  #1080's real question is whether it survives contact with group C's 30.
 
 ## 8. The denominator, stated
 
