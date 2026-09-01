@@ -107,6 +107,8 @@ SCHEMA = {
     "properties": {
         "confidence": {
             "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
             "description": "0-100, confidence this change is safe to merge as it stands.",
         },
         "verdict": {"type": "string", "enum": ["ship", "comment", "changes-requested"]},
@@ -119,9 +121,22 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["severity", "file", "line", "title", "detail"],
+                "required": ["severity", "file", "line", "title", "detail", "certainty"],
                 "properties": {
                     "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "certainty": {
+                        "type": "integer",
+                        # Bounded, not merely typed. `certainty: 150` satisfied "integer" and
+                        # rendered as a score, against a contract that says 0-100 (review of #1056).
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "0-100, how sure you are THIS FINDING is real - a different "
+                        "question from the merge-safety `confidence` above. A correct high-severity "
+                        "finding makes a PR unsafe and drives that score down, so the two moved "
+                        "together and a reader could not use either to triage. Be honest and "
+                        "willing to be low: a finding you are 40 sure of is worth raising and worth "
+                        "labelling as such.",
+                    },
                     "file": {"type": "string"},
                     "line": {"type": "integer", "description": "0 if not tied to one line."},
                     "title": {"type": "string"},
@@ -242,8 +257,24 @@ def main():
     ap.add_argument("--diff", required=True, type=Path, help="unified diff of the pull request")
     ap.add_argument("--title", default="", help="pull request title")
     ap.add_argument("--body-file", type=Path, help="file holding the pull request description")
+    ap.add_argument(
+        "--commits-file",
+        type=Path,
+        help="file holding the PR's commit subjects, one per line. Without it a reviewer can only "
+             "see this diff, and reports a change absent from the diff as absent from the branch - "
+             "which is how the 3.1.0 release PR was told its security fix was missing (#1056).",
+    )
+    ap.add_argument("--base-file", type=Path, help="file holding the PR's base branch name")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--json", action="store_true", help="print the raw structured review instead")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the prompt that would be sent and exit, without calling the model or needing a "
+             "key. This is how the harness is tested: #1056 exists because nobody could see what "
+             "the reviewer was actually given, and 'we pass the commits now' is a claim until "
+             "something prints them.",
+    )
     ap.add_argument(
         "--json-output",
         type=Path,
@@ -252,7 +283,7 @@ def main():
     args = ap.parse_args()
 
     api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    if not api_key and not args.dry_run:
         raise SystemExit("pr-review: OPENAI_API_KEY is not set")
 
     diff = args.diff.read_text(errors="replace")
@@ -265,11 +296,18 @@ def main():
     body = args.body_file.read_text(errors="replace") if args.body_file else ""
     claude_md = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else "(not available)"
 
+    commits = args.commits_file.read_text(errors="replace").strip() if args.commits_file else ""
+    base = args.base_file.read_text(errors="replace").strip() if args.base_file else ""
     user = (
         f"Pull request title: {args.title}\n\n"
         f"Description:\n{body or '(none)'}\n\n"
+        f"Base branch: {base or '(not supplied)'}\n\n"
+        f"Commits on this branch ({len(commits.splitlines())}):\n{commits or '(not supplied)'}\n\n"
         f"Diff:\n```diff\n{diff}\n```"
     )
+    if args.dry_run:
+        print(user)
+        return
     review = call_model(api_key, args.model, SYSTEM.format(claude_md=claude_md), user)
 
     if args.json_output:
