@@ -6,6 +6,8 @@ isolation modes and **no baseline**.
 
 ```sh
 docker build -t nuthatch-eval-subject eval/image
+# If buildx complains about ~/.docker/buildx/activity, DOCKER_BUILDKIT=0 builds it with the legacy
+# builder. That is a local docker-state problem, not a Dockerfile one.
 python3 eval/run-authoring.py --docker-image nuthatch-eval-subject --runs 3 \
         --nuthatch target/release/nuthatch
 ```
