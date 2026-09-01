@@ -49,11 +49,13 @@ in tests: a mechanism that reports success because it never looked.
    against `docs/bench/segment-layout.md`'s 10,923 files at a 6 KB median. A watch, not a defect -
    and it degrades gradually rather than failing, so nothing will alert on it. Close it once someone
    has actually looked.
-5. **#1062 - terra against luna.** Board decision: evaluate the alternative reviewer and switch if it
-   wins. **Sequenced after #1056** - two of luna's misses trace to the harness rather than the model,
-   so comparing against a fixed harness measures the models and comparing against the current one
-   measures the harness twice. "Keep luna, with these measured differences" is a successful outcome,
-   the same rule RFC-0042 §0 set for DuckDB.
+5. **#1062 - terra against luna. CLOSED 2026-09-01: stay on luna.** Decided rather than measured,
+   which the framing allowed for: *"keep luna, with these measured differences" is a successful
+   outcome*. luna is at ~29 of 31 real findings across two sprints with none found by the author
+   first, and both of its misses trace to context rather than the model - which is what #1056 fixes.
+   The shadow-reviewer mechanism was drafted and deliberately **not** landed: apparatus for a
+   comparison nobody will run is scope, not caution. Four reopen conditions are recorded on the
+   issue.
 6. **#1060 - version the units, verify the deploy.** Every `ExecStart` names a version; the deploy
    asserts the binary it installed before restarting. A `cp` over a running binary fails with `Text
    file busy`, and the script that ignored it nearly reported a fix that had not been deployed.
