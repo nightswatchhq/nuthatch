@@ -83,8 +83,17 @@ jobs:
           # The REST commits endpoint paginates, and the count is stated so a truncated history
           # cannot pass for a complete one. Review of #1056.
           base="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq '.baseRefName')"
-          gh api --paginate "repos/$REPO/pulls/$PR/commits" \
-            --jq '.[] | "\(.sha[0:9]) \(.commit.message | split("\n")[0])"' > pr.commits 2>/dev/null || : > pr.commits
+          # NOT swallowed. `|| : > pr.commits` turned a transient API error into an empty file,
+          # which `pr-review.py` renders as the same `(not supplied)` marker it uses when no file
+          # was passed - so the review would proceed from the diff alone and produce a verdict,
+          # recreating the exact missing-context failure this change exists to prevent. Review of
+          # #1056, and the second time in this PR a fix reintroduced its own fault by failing soft.
+          if ! gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+               --jq '.[] | "\(.sha[0:9]) \(.commit.message | split("\n")[0])"' > pr.commits; then
+            echo "::error::could not fetch the commit list; refusing to review from the diff alone"
+            exit 1
+          fi
+          [ -s pr.commits ] || { echo "::error::the commit list came back empty for PR $PR"; exit 1; }
           # The base goes in its OWN file, not appended to the commit list. Appending it made the
           # prompt's "Commits on this branch (N)" count it as a commit, so a two-commit PR announced
           # three - a number stated to be trustworthy that was wrong by one. Review of #1056.

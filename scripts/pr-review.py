@@ -107,6 +107,8 @@ SCHEMA = {
     "properties": {
         "confidence": {
             "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
             "description": "0-100, confidence this change is safe to merge as it stands.",
         },
         "verdict": {"type": "string", "enum": ["ship", "comment", "changes-requested"]},
@@ -124,6 +126,10 @@ SCHEMA = {
                     "severity": {"type": "string", "enum": ["high", "medium", "low"]},
                     "certainty": {
                         "type": "integer",
+                        # Bounded, not merely typed. `certainty: 150` satisfied "integer" and
+                        # rendered as a score, against a contract that says 0-100 (review of #1056).
+                        "minimum": 0,
+                        "maximum": 100,
                         "description": "0-100, how sure you are THIS FINDING is real - a different "
                         "question from the merge-safety `confidence` above. A correct high-severity "
                         "finding makes a PR unsafe and drives that score down, so the two moved "

@@ -143,6 +143,38 @@ fn the_commit_list_is_paginated_rather_than_capped_at_one_page() {
     );
 }
 
+/// Both scores are 0-100 by contract, so the schema must say so. `"type": "integer"` alone accepts
+/// `150` and renders it as a certainty.
+#[test]
+fn both_scores_are_bounded_not_merely_typed() {
+    let script = std::fs::read_to_string(root().join("scripts/pr-review.py")).expect("read");
+    let count = script.matches("\"maximum\": 100").count();
+    assert!(
+        count >= 2,
+        "expected both `confidence` and `certainty` to be bounded 0-100; found {count} bound(s)"
+    );
+}
+
+/// A commit list that could not be fetched must **stop** the review, not render as "(not supplied)"
+/// and let a verdict be produced from the diff alone - which is the failure this whole PR removes.
+#[test]
+fn a_failed_commit_fetch_stops_the_review() {
+    let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
+    let code: String = wf
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("|| : > pr.commits"),
+        "the commit fetch still fails soft into an empty file, which reads as `(not supplied)`"
+    );
+    assert!(
+        code.contains("[ -s pr.commits ]"),
+        "nothing checks the commit list is non-empty, so an empty result still reaches the model"
+    );
+}
+
 #[test]
 fn a_superseded_review_is_neutral_rather_than_a_red_verdict() {
     let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
