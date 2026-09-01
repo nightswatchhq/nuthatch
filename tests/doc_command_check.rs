@@ -262,6 +262,18 @@ fn backtick_spans(text: &str) -> Vec<(usize, String)> {
 /// any subcommand word that doesn't resolve and any `--flag` not present anywhere in the tree.
 /// Stops requiring subcommand resolution the moment a leaf (a command with no further subcommands)
 /// is reached - the rest of the tokens are that leaf's own args/positionals, out of scope here.
+/// A semver-shaped token: three dot-separated numeric parts, with any `-pre` / `+build` tail
+/// ignored. Deliberately narrow - `3.0.0-alpha.1` yes, `2.5` and `v3` no - because the point is to
+/// recognise the exact thing `--version` prints, not to excuse every numeric word from checking.
+fn is_version_token(tok: &str) -> bool {
+    let core = tok.split(['-', '+']).next().unwrap_or(tok);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn walk_invocation(
     tokens: &[(usize, &str)],
     root: &clap::Command,
@@ -288,6 +300,20 @@ fn walk_invocation(
                     detail: format!("`{flag}` is not a flag `nuthatch` accepts anywhere"),
                 });
             }
+            i += 1;
+            continue;
+        }
+        if resolving && std::ptr::eq(cmd, root) && is_version_token(tok) {
+            // `nuthatch 3.0.0-alpha.1` - the shape `--version` prints, and the line every
+            // validation report opens with. That is the binary naming itself, not an invocation.
+            // No subcommand in this CLI is version-shaped, so nothing real is skipped here.
+            //
+            // Only at the root: after a real subcommand a version-shaped word is a positional
+            // value, which the arm below already stops resolving on. #1070 - the #790 tyre-kicking
+            // report could not be committed without reddening this check, so it sat untracked on
+            // one laptop for a week instead. A report that cannot enter the repository is a report
+            // nobody has.
+            resolving = false;
             i += 1;
             continue;
         }
@@ -668,6 +694,37 @@ fn a_bare_mention_of_the_product_name_is_not_an_invocation() {
     assert!(
         findings.is_empty(),
         "prose mentions of the product name must not be parsed as invocations: {findings:?}"
+    );
+}
+
+#[test]
+fn a_version_string_is_not_a_subcommand() {
+    let real = real_flags();
+    let mut findings = Vec::new();
+    check_text(
+        "Binary: `nuthatch 3.0.0-alpha.1`, built 2026-08-28. Also `nuthatch 3.1.0`.",
+        "docs/validation/example.md",
+        &real,
+        &mut findings,
+    );
+    assert!(
+        findings.is_empty(),
+        "a version string is the binary naming itself, not a subcommand: {findings:?}"
+    );
+
+    // The narrowness is the point: a bare word in the same position is still checked, or the
+    // guard would be an amnesty on the first token rather than on version strings.
+    let mut still_checked = Vec::new();
+    check_text(
+        "Run `nuthatch roost dev` to start.",
+        "docs/validation/example.md",
+        &real,
+        &mut still_checked,
+    );
+    assert_eq!(
+        still_checked.len(),
+        1,
+        "an unreal subcommand in the same position must still be reported: {still_checked:?}"
     );
 }
 
