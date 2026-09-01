@@ -63,7 +63,20 @@ performed so far has been a replacement, not a fallback.
 
 ## 3. Group C: the migration
 
-Network state from the Graph Network subgraph. This is the numerator and the denominator both.
+**Scope, stated explicitly, because the first two drafts left it ambiguous.** Group C is *on-chain
+state Lodestar reads, whichever subgraph currently serves it* - not "surfaces of the Graph Network
+subgraph". nuthatch indexes chains, not subgraphs, so which subgraph a fact arrives through today is
+an implementation detail of the thing being replaced.
+
+That admits two sets a Graph-Network-only reading would have excluded: the **delegation-events**
+subgraph, a third party's, indexing the same Arbitrum staking contracts `graph-allocations-nest`
+already declares; and the **QoS oracle**, which §5 establishes is on chain by construction.
+
+Excluded, with reasons rather than by omission: **group A**, where the gateway itself is the subject;
+**group B's off-chain half**, where the meaning behind a hash lives on IPFS; and **ENS**, which is
+Ethereum mainnet and therefore a different chain, a different cursor, and a different nest.
+
+This is the numerator and the denominator both.
 
 | surface | entities read | on-chain | nest status | blocker |
 | --- | --- | --- | --- | --- |
@@ -93,15 +106,18 @@ Network state from the Graph Network subgraph. This is the numerator and the den
 | `cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
 | `lib/protocols/fetcher.ts` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
 | `lib/refresh.ts` | 11 entities across 3 subgraphs | **mixed** | partial | split first |
+| `lib/ingest/qos.ts` | `allocationDailyDataPoints`, `queryDailyDataPoints` | yes (oracle) | **no view** | decode shape undecided (#1083) |
+| `api/indexer-qos/[address]` | QoS oracle daily grain | yes (oracle) | **no view** | decode shape undecided (#1083) |
 | `scripts/backfill.ts`, `backfill-rav.ts` | historical loads | yes | follows the above | nest undeployed |
 | `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
 
-**Twenty-eight surfaces**, partitioned on the nest-status column: **12** covered by an existing view
-and blocked only on #1075; **10** needing a view written, three of which nobody has read yet; **5**
-mixed, and unclassifiable until the on-chain half is split from the ENS/IPFS half; and **1** pair of
-backfill scripts that follow whatever the rows above them do.
+**Thirty surfaces**, partitioned on the nest-status column: **12** covered by an existing view and
+blocked only on #1075; **12** needing a view written, of which three nobody has read yet and two are
+the QoS pair blocked on the shape question rather than on effort; **5** mixed, and unclassifiable
+until the on-chain half is split from the ENS/IPFS half; and **1** pair of backfill scripts that
+follow whatever the rows above them do.
 
-So the honest figure today, against group C, is **0 of 28 migrated, with 12 unblockable by anything
+So the honest figure today, against group C, is **0 of 30 migrated, with 12 unblockable by anything
 except deploying the nest.** Not a percentage anyone should publish yet, because the five mixed rows
 can move the denominator in either direction once split.
 
@@ -159,19 +175,27 @@ Correct as they are. A subgraph playground with no subgraph is a deleted feature
 two of them: `indexer-status` and `indexing-status` query indexers' own `/status` endpoints, which is
 serving telemetry, not chain state.
 
-### The QoS question, which #1083 gets backwards
+### The QoS question, which #1083 gets backwards - and which is why QoS is in group C, not here
+
+This is the one classification that moved between drafts, so the reasoning is recorded rather than
+just the answer.
 
 #1083 argues `qos.ts` is out of remit because quality-of-service "never existed on chain". Read, it
 does not query the gateway's telemetry API at all. It queries **a subgraph of the Gateway QoS
 Oracle** (`allocationDailyDataPoints`, `queryDailyDataPoints`), and an oracle subgraph exists because
 an oracle **posts to chain**.
 
-So the data is on chain by construction, and the real question is not remit but **shape**: whether
-the oracle's payload arrives as decodable events or as opaque calldata, because nuthatch decodes
-topic0-keyed events and nothing else. That is a different question with a different answer, and it
-wants checking against the oracle contract rather than reasoning about.
+So the data is on chain by construction. The real question is not remit but **shape**: whether the
+oracle's payload arrives as decodable events or as opaque calldata, because nuthatch decodes
+topic0-keyed events and nothing else. That wants checking against the oracle contract rather than
+reasoning about.
 
-Affected: `lib/ingest/qos.ts`, `api/indexer-qos/[address]`, `scripts/backfill-qos.ts`.
+**Which is why `lib/ingest/qos.ts` and `api/indexer-qos/[address]` are counted in group C**, with a
+blocker of "decode shape undecided", and not parked here as out of remit. A surface whose data is on
+chain belongs in the denominator even when we do not yet know how to reach it; putting it in group A
+would make the goal look closer than it is, which is precisely what §3's scope statement exists to
+prevent. `scripts/backfill-qos.ts` is a runner for `lib/ingest/qos.ts` rather than a surface of its
+own, so it is not counted separately.
 
 ## 6. The crons, which are the live dependency
 
@@ -249,7 +273,7 @@ no issue" - and it wants filing rather than leaving here.
 
 - **#1074 is not board-only and needs no GraphOps conversation.** The repository is on this laptop.
   This file is the deliverable; what remains is reading the five mixed and three unclassified rows.
-- **#1078's table is 7 rows of a 28-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
+- **#1078's table is 7 rows of a 30-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
   six clients, so a nuthatch-backed implementation behind it migrates the Graph Network surfaces and
   touches none of ENS, QoS or delegation events.
 - **#1079 should cover 11 group-A surfaces and 11 group-B, not 7 and 2**, and should say for each
@@ -264,11 +288,11 @@ no issue" - and it wants filing rather than leaving here.
   migrated in 4.26.0 "need a configured Nuthatch origin and fail visibly without one, with no
   alternate Graph source". Fail-visibly is therefore the *existing* policy for migrated surfaces, not
   an open choice, and `NUTHATCH_DIPS`'s "no fallback exists" is that policy rather than an exception.
-  #1080's real question is whether it survives contact with 28 more surfaces.
+  #1080's real question is whether it survives contact with 29 more surfaces.
 
 ## 8. The denominator, stated
 
-**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 28 surfaces
+**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 30 surfaces
 today, minus whatever the five mixed rows shed on splitting.
 
 Explicitly outside it, and finished by being correct: group A's 11, group B's off-chain half, ENS,
