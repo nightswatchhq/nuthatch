@@ -16,6 +16,8 @@ fn root() -> PathBuf {
 }
 
 fn dry_run(commits: Option<&Path>) -> String {
+    let base = root().join("target/pr-review-test.base");
+    std::fs::write(&base, "main").expect("write base");
     let diff = root().join("target/pr-review-test.diff");
     std::fs::write(&diff, "diff --git a/x b/x\n+one line\n").expect("write diff");
     let mut c = Command::new("python3");
@@ -23,6 +25,7 @@ fn dry_run(commits: Option<&Path>) -> String {
         .arg("--diff")
         .arg(&diff)
         .args(["--title", "release: 3.1.0", "--dry-run"]);
+    c.arg("--base-file").arg(&base);
     if let Some(p) = commits {
         c.arg("--commits-file").arg(p);
     }
@@ -56,6 +59,14 @@ fn the_reviewer_is_given_the_commit_range_not_only_the_diff() {
         "the count is not stated, and a reviewer cannot tell 'no commits supplied' from 'a branch \
          with no commits':\n{prompt}"
     );
+    // The count must be the number of COMMITS, not of lines in the file. The base branch was once
+    // appended to that same list, so a two-commit PR announced three - a number stated to be
+    // trustworthy and wrong by one. It travels in its own file now.
+    assert!(
+        prompt.contains("Base branch:"),
+        "the base branch is not stated, so the reviewer cannot tell what the range is against:\n{prompt}"
+    );
+
     // The diff must still be there - a prompt that swapped one context for the other would satisfy
     // the assertions above while reviewing nothing.
     assert!(

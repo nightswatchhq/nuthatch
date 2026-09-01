@@ -258,6 +258,7 @@ def main():
              "see this diff, and reports a change absent from the diff as absent from the branch - "
              "which is how the 3.1.0 release PR was told its security fix was missing (#1056).",
     )
+    ap.add_argument("--base-file", type=Path, help="file holding the PR's base branch name")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--json", action="store_true", help="print the raw structured review instead")
     ap.add_argument(
@@ -290,9 +291,11 @@ def main():
     claude_md = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else "(not available)"
 
     commits = args.commits_file.read_text(errors="replace").strip() if args.commits_file else ""
+    base = args.base_file.read_text(errors="replace").strip() if args.base_file else ""
     user = (
         f"Pull request title: {args.title}\n\n"
         f"Description:\n{body or '(none)'}\n\n"
+        f"Base branch: {base or '(not supplied)'}\n\n"
         f"Commits on this branch ({len(commits.splitlines())}):\n{commits or '(not supplied)'}\n\n"
         f"Diff:\n```diff\n{diff}\n```"
     )

@@ -85,7 +85,10 @@ jobs:
           base="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq '.baseRefName')"
           gh api --paginate "repos/$REPO/pulls/$PR/commits" \
             --jq '.[] | "\(.sha[0:9]) \(.commit.message | split("\n")[0])"' > pr.commits 2>/dev/null || : > pr.commits
-          echo "(base: $base)" >> pr.commits
+          # The base goes in its OWN file, not appended to the commit list. Appending it made the
+          # prompt's "Commits on this branch (N)" count it as a commit, so a two-commit PR announced
+          # three - a number stated to be trustworthy that was wrong by one. Review of #1056.
+          printf '%s' "$base" > pr.base
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
@@ -126,7 +129,7 @@ jobs:
           title="Jules could not complete the review"
           summary="The review failed closed. Fix the workflow or credentials, then comment /re-review."
           if python3 scripts/pr-review.py --diff pr.diff --title "$(cat pr.title)" \
-              --body-file pr.body --commits-file pr.commits --json > review.json; then
+              --body-file pr.body --commits-file pr.commits --base-file pr.base --json > review.json; then
             {
               echo '<!-- pr-review:luna -->'
               jq -r '"### Jules · merge-safety \(.confidence)/100\n\nverdict: **\(.verdict)**\n\n\(.summary)\n"' review.json
