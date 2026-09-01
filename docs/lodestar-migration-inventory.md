@@ -187,19 +187,34 @@ API routes - a conclusion reached only after first writing the issue the other w
 rg -l "\bsubgraphQuery\b" src/app/api --glob '*.ts' | grep -v __tests__   # 27 routes
 ```
 
-**22 of those 27 routes reference no database module at all.** `network-stats`, `curators`,
-`epochs`, `grt-flow`, `payments`, `poi`, `portfolio`, `provisions`, `indexers`, `indexer/[address]`,
-`rewards-history` and the seven `subgraph-*` routes call `subgraphQuery` **at request time**, on the
-hot path of a page load, with no Postgres between the user and the gateway.
+**21 of those 27 routes reference no database module at all** - no `@/lib/db` and no
+`@/lib/studio/db`, the only two database import paths in `src/app/api`. The two lists partition the
+27 exactly:
 
-Five do touch a database: `apr-provenance`, `bounty-query`, `cron/tap-provision`,
-`cron/check-subgraph-health`, `token-metrics` and `rewards-history`.
+*No database module (21).* `cron/ingest-horizon-activity`, `curators`, `epochs`, `grt-flow`,
+`indexer-stake-history/[address]`, `indexer-status/[address]`, `indexer/[address]`, `indexers`,
+`indexing-status/[hash]`, `network-stats`, `payments`, `poi`, `portfolio`, `provisions`,
+`subgraph-curation/[hash]`, `subgraph-deployments`, `subgraph-fees-30d`, `subgraph-history/[hash]`,
+`subgraph-names`, `subgraph-search`, `subgraph-versions/[hash]`.
+
+*Has a database module (6).* `apr-provenance/[address]`, `bounty-query/[id]`,
+`cron/check-subgraph-health`, `cron/tap-provision`, `rewards-history`, `token-metrics`.
+
+Spot-checked three of the 21 by hand: `network-stats:51`, `curators:44` and `epochs:19` each `await
+subgraphQuery(...)` in the request handler with nothing between the user and the gateway.
+
+**Split by group, because the 21 is not all migration work.** Two are group A and correctly stay
+(`indexer-status`, `indexing-status`, which query indexers' own `/status` endpoints). Seven are the
+group B `subgraph-*` metadata routes, whose on-chain half is migratable and whose display names are
+not. **Twelve are group C network state**: `cron/ingest-horizon-activity`, `curators`, `epochs`,
+`grt-flow`, `indexer-stake-history`, `indexer/[address]`, `indexers`, `network-stats`, `payments`,
+`poi`, `portfolio`, `provisions`.
 
 The consequence is concrete and it is the sprint's central question: **migrating the ingestion layer
-alone leaves 22 request-time gateway dependencies standing.** A completion claim resting on the nine
-`src/lib/ingest/*` modules would be a claim about the cron path only, and every one of those 22
-routes would still 503 without `GRAPH_API_KEY`. That is precisely the failure #1086 describes, at
-roughly three times the size it describes it at.
+alone leaves 21 request-time gateway dependencies standing, 12 of them network state.** A completion
+claim resting on the nine `src/lib/ingest/*` modules would be a claim about the cron path only, and
+every one of those routes would still 503 without `GRAPH_API_KEY`. That is the failure #1086
+describes, and #1086's eight is an undercount against these twelve.
 
 This is offered as the §6 deliverable the audit plan asks for - "find a migration-relevant thing with
 no issue" - and it wants filing rather than leaving here.
@@ -216,7 +231,7 @@ no issue" - and it wants filing rather than leaving here.
 - **#1082 is bigger than `delegations`.** Nine group-C surfaces have no view, not one.
 - **#1083's premise needs replacing** with the shape question in §5.
 - **#1086's eight routes are correct and incomplete**; the direct-`GRAPH_API_KEY` set adds fourteen
-  more files it did not see, and §6a raises its 8 request-time routes to 22.
+  more files it did not see, and §6a raises its 8 request-time routes to 12 group-C ones (21 in all).
 - **The audit plan's own module table undercounts by construction.** It lists nine `src/lib/ingest/*`
   modules and their gateway-reference counts. Those nine are real, and they are 9 of 56.
 - **#1080 has already been answered once, by accident.** `lib/nuthatch.ts` records that the panels
