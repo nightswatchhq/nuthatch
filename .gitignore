@@ -30,3 +30,22 @@ nuthatch-trial/
 # import at worst.
 __pycache__/
 *.pyc
+
+# Scratch from builds, test runs and background jobs, at the repo ROOT only.
+#
+# **Anchored with a leading slash on purpose.** `docs/bench/*.raw.log` and `tools/**/raw/*.log` are
+# tracked measurement artefacts - a bare `*.log` would not untrack them, but it would mean the next
+# raw benchmark log needs `git add -f`, and a measurement this project relies on should not be
+# harder to commit than the code it measures.
+#
+# 99 of these had accumulated by 2026-09-01. They are what a careless `git add .` sweeps up, which
+# is how a compiled `.pyc` reached main that morning (#1066).
+/*.err
+/*.out
+/*.log
+
+# Local experiment directories that are not artefacts of anything.
+/.vercel/
+/demo-usdc/
+/evaluation-2026-08-23/
+/mutants.out.old/
