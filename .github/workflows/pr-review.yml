@@ -113,7 +113,15 @@ jobs:
           payload="$(jq -n '{status:"completed",conclusion:"neutral",output:{
             title:"Superseded by a newer commit",
             summary:"This review was cancelled because the branch moved under it. It is not a verdict, and nothing was found. The run for the new head decides."}}')"
-          GH_TOKEN="$JULES_TOKEN" gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" --input - <<<"$payload" >/dev/null || true
+          # NOT swallowed. If neutralising fails, the check stays red from the run this cancelled -
+          # the exact state this step exists to prevent - and swallowing it means nobody ever finds
+          # out. A visible failure here is a workflow problem to fix; a silent one is a PR that
+          # reads red forever with no finding behind it. Review of #1056.
+          if ! GH_TOKEN="$JULES_TOKEN" gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+               --input - <<<"$payload" >/dev/null; then
+            echo "::error::could not neutralise the superseded check-run $CHECK_ID - it will stay red with no finding behind it"
+            exit 1
+          fi
 
       - name: review, report, and conclude
         env:

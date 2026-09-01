@@ -156,4 +156,22 @@ fn a_superseded_review_is_neutral_rather_than_a_red_verdict() {
         wf.contains("conclusion:\"neutral\""),
         "the cancellation handler does not set the check to neutral"
     );
+    // ...and it must not swallow its own failure. If the PATCH fails silently the check stays red
+    // from the run that was cancelled - precisely the state this handler exists to prevent - and
+    // nobody ever learns why. A guard that hides its own failure is not a guard.
+    let handler = wf
+        .split("a superseded review is neutral")
+        .nth(1)
+        .expect("the cancellation step")
+        .split("- name:")
+        .next()
+        .expect("step body");
+    assert!(
+        !handler.contains("--input - <<<\"$payload\" >/dev/null || true"),
+        "the neutralising PATCH swallows its failure with `|| true`:\n{handler}"
+    );
+    assert!(
+        handler.contains("::error::"),
+        "the cancellation handler does not report a failure to neutralise:\n{handler}"
+    );
 }
