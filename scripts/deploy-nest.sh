@@ -100,9 +100,20 @@ cmd_check() {
     # `*/nuthatch-[0-9]*` then flagged that same gateway for not following a scheme it has no reason
     # to follow. The honest rule is about identity, not spelling: if it says it is nuthatch, its
     # path must say which nuthatch.
-    if [ "$act" = active ] && [ -n "$v" ] && [ "$v" != "-" ] && [[ "$b" != */nuthatch-[0-9]* ]]; then
-      printf '  ^ active unit names an unversioned binary: systemctl cannot say what it runs\n'
-      bad=1
+    if [ "$act" = active ] && [ -n "$v" ] && [ "$v" != "-" ]; then
+      if [[ "$b" != */nuthatch-[0-9]* ]]; then
+        printf '  ^ active unit names an unversioned binary: systemctl cannot say what it runs\n'
+        bad=1
+      else
+        # And the path must not *lie*. A versioned name is only useful if it matches what the binary
+        # reports - `nuthatch-3.1.0` containing a 2.7.1 build reads as informative and is worse than
+        # the unversioned path it replaced, because now nobody thinks to check. Review of #1060.
+        local named=${b##*/nuthatch-}
+        if [ "$named" != "$v" ]; then
+          printf '  ^ path says %s, binary reports %s - the version in the name is wrong\n' "$named" "$v"
+          bad=1
+        fi
+      fi
     fi
   done
   # A floor, so "examined nothing" can never read as "all clear".
