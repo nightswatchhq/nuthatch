@@ -44,8 +44,7 @@ fn run(root: &Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), s)
 }
 
-const REQUIRED: &str =
-    "# comment\nfmt · clippy · test\nbuild release\nreviewed-by signature\nJules approval\n";
+const REQUIRED: &str = "# comment\nfmt · clippy · test\nbuild release\nJules approval\n";
 
 #[test]
 fn no_token_is_a_failure_not_a_pass() {
@@ -91,11 +90,23 @@ fn offline_passes_but_says_it_compared_nothing() {
 }
 
 #[test]
-fn a_file_missing_the_signature_context_fails_before_any_network() {
+fn a_file_missing_the_jules_context_fails_before_any_network() {
     let root = root_with("fmt · clippy · test\nbuild release\n");
     let (code, out) = run(root.path(), &["--offline"]);
-    assert_eq!(code, 1, "the signature context is not optional:\n{out}");
-    assert!(out.contains("reviewed-by signature"), "{out}");
+    assert_eq!(code, 1, "the external review gate is not optional:\n{out}");
+    assert!(out.contains("Jules approval"), "{out}");
+}
+
+/// The retired gate, asserted in the negative. Re-adding the context without re-adding the workflow
+/// blocks every PR on a check that can never report, which is the failure mode that took a week to
+/// spot the last time a required context named a job nothing ran.
+#[test]
+fn a_file_naming_the_retired_signature_context_fails_before_any_network() {
+    let root =
+        root_with("fmt · clippy · test\nbuild release\nreviewed-by signature\nJules approval\n");
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_eq!(code, 1, "the retired context must be refused:\n{out}");
+    assert!(out.contains("retired"), "{out}");
 }
 
 #[test]
@@ -111,7 +122,7 @@ fn an_unknown_flag_is_refused_rather_than_ignored() {
 /// The committed script and the committed list are the ones CI runs, so assert against them rather
 /// than only against fixtures - a fixture-only suite cannot see the real file drifting.
 #[test]
-fn the_committed_list_still_names_the_signature_context() {
+fn the_committed_list_names_jules_and_not_the_retired_signature_context() {
     let listed: Vec<String> =
         std::fs::read_to_string(manifest().join(".github/required-checks.txt"))
             .expect("required-checks.txt")
@@ -121,8 +132,9 @@ fn the_committed_list_still_names_the_signature_context() {
             .map(str::to_string)
             .collect();
     assert!(
-        listed.iter().any(|l| l == "reviewed-by signature"),
-        "{listed:?}"
+        !listed.iter().any(|l| l == "reviewed-by signature"),
+        "the signature gate was retired and its workflow deleted; a required context with no job \
+         behind it blocks every PR forever: {listed:?}"
     );
     assert!(listed.iter().any(|l| l == "Jules approval"), "{listed:?}");
     let _: PathBuf = manifest().to_path_buf();

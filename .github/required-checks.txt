@@ -10,5 +10,4 @@ cargo-deny (vulns · licences · bans)
 point-read latency
 per-cursor RAM budget (dense multi-nest)
 fuzz smoke (decode path)
-reviewed-by signature
 Jules approval

@@ -40,8 +40,19 @@ a PR author cannot satisfy it by changing their PR, and a required check nobody 
 
 `protect-branch.sh` is the other direction - it *writes* `main`'s context list onto a named branch.
 It stays manual because it mutates repository settings, which is not a thing a schedule should do
-unsupervised. It is the checklist item `review-signature.yml` describes: a new `sprint/*` branch
-starts unprotected, and PRs onto it are gated by nothing until someone runs this.
+unsupervised. The hazard it addresses: a new `sprint/*` branch starts unprotected, and PRs onto it
+are gated by nothing until someone runs this.
+
+`apply-required-contexts.sh` is the third of the set and the one that touches `main`. It PATCHes the
+required-context list alone from `.github/required-checks.txt`, reading `strict` back and re-sending
+it unchanged, and it is a dry run unless given `--apply`. `protect-branch.sh` deliberately is not
+used for this: it PUTs a whole protection object, so on `main` it would also write `strict` and
+`enforce_admins` that the caller never mentioned.
+
+Together the three are read, write-new-branch, write-main - and the committed list is the source of
+truth for all of them. Note that the drift checker cannot currently run in CI at all (#1095): the
+`PROTECTION_READ_TOKEN` secret has never existed, so it has failed on `main` every day since
+2026-08-28 without blocking anything.
 
 Since 2026-08-20 sprint work has gone straight to `main` (a sprint is a labelled set of issues, not a
 branch - #810), so in practice this script is only needed if that changes back.

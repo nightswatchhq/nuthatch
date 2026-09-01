@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Review one pull request's diff with GPT-5.6 Luna and print a Markdown comment.
 
-The repo takes fifteen pull requests a day and every one of them already carries a `Reviewed-by:`
-signature from an agent. What it has never had is a reviewer with no stake in the sprint. We have at
-least two recorded cases of a double-dispatched run approving a PR and arming auto-merge while
-missing a real defect, and a second opinion from the same firm is not a second opinion.
+The repo takes fifteen pull requests a day and what it has never had is a reviewer with no stake in
+the sprint. We have at least two recorded cases of a double-dispatched run approving a PR and arming
+auto-merge while missing a real defect, and a second opinion from the same firm is not a second
+opinion. The `Reviewed-by:` signature gate that used to sit alongside this was retired in favour of
+it: a line of text a party types about itself is not review, and the workflow enforcing it recorded
+in its own comments that it detected approximately none of the forgeries it was built for.
 
 This is that outside reader. Jules publishes an App-owned `Jules approval` check as well as the
 comment. The check is green only for a `ship` verdict. A finding, a failed review, or malformed
