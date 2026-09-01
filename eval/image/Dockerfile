@@ -25,6 +25,21 @@ RUN apt-get update \
       ca-certificates curl git jq python3 xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
+# **Apt packages are not version-pinned, and that is a stated limitation rather than an oversight.**
+# Review of #1058 is right that a digest-pinned base does not make `apt-get install` reproducible:
+# it pulls from the live archive. Pinning exact versions is worse, though - Debian rotates packages
+# out, so a pinned build stops working later rather than reproducing earlier, which trades a small
+# unreproducibility for a large one.
+#
+# So the versions are *recorded* instead. `/etc/nuthatch-eval-image.manifest` says exactly what a
+# given image contains, which is reproducibility you can verify after the fact rather than falsely
+# promise. What actually has to hold still for a score to be comparable is the base (digest-pinned
+# above) and `claude` (pinned below); curl's patch version cannot move an authoring result.
+RUN { echo "base: node:22-bookworm-slim (digest-pinned in this Dockerfile)"; \
+      echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+      dpkg-query -W -f='${binary:Package}=${Version}\n' ca-certificates curl git jq python3 xz-utils; \
+    } > /etc/nuthatch-eval-image.manifest
+
 # Pinned rather than `@latest`: a score is a number about a *pairing*, and an eval whose subject
 # silently changes underneath it cannot be compared with last month's run. Bump deliberately, and
 # say so in the report when you do.

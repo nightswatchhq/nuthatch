@@ -31,6 +31,21 @@ what is being measured. Baking one in scores an easier task.
 and an agent that could reach the internet could read the nuthatch documentation and score well
 without the builder skill teaching it anything.
 
+## Reproducibility, honestly
+
+The **base** is digest-pinned and **`claude`** is version-pinned: those are the parts of the pairing
+that can move a score. Apt packages are **not** version-pinned, deliberately - Debian rotates
+packages out of the archive, so a pinned build stops working later rather than reproducing earlier,
+which trades a small unreproducibility for a larger one.
+
+Instead every image records what it contains:
+
+```sh
+docker run --rm nuthatch-eval-subject cat /etc/nuthatch-eval-image.manifest
+```
+
+Reproducibility you can verify after the fact beats reproducibility you assert and cannot check.
+
 ## Pinning
 
 `CLAUDE_CODE_VERSION` is pinned rather than `@latest`. A score is a number about a *pairing* of model,
