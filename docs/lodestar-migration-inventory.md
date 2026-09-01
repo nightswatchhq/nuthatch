@@ -278,9 +278,32 @@ not. **Twelve are group C network state**: `cron/ingest-horizon-activity`, `cura
 
 The consequence is concrete and it is the sprint's central question: **migrating the ingestion layer
 alone leaves 21 request-time gateway dependencies standing, 12 of them network state.** A completion
-claim resting on the nine `src/lib/ingest/*` modules would be a claim about the cron path only, and
-every one of those routes would still 503 without `GRAPH_API_KEY`. That is the failure #1086
-describes, and #1086's eight is an undercount against these twelve.
+claim resting on the nine `src/lib/ingest/*` modules would be a claim about the cron path only. That
+is the failure #1086 describes, and #1086's eight is an undercount against these twelve.
+
+**What those routes actually do without the key**, checked rather than assumed, because "it would
+break" is not a finding and the answer turned out to matter:
+
+```sh
+for f in $(cat /tmp/nodb.txt); do grep -A3 "if (!hasSubgraphAccess())" "$f" | head -4; done
+```
+
+All 21 carry a `hasSubgraphAccess()` guard. **Twenty return `503 {"error": "No API key
+configured"}`** - a visible, honest failure.
+
+**One does not.** `api/subgraph-names`:
+
+```ts
+if (!hasSubgraphAccess()) return NextResponse.json({ data: {} });
+```
+
+**`200`, with an empty body.** It is the route that resolves deployment IPFS hashes to display names,
+so with no key every subgraph name on the site silently becomes blank and nothing anywhere reports a
+fault. That is this project's most-recorded defect - an absence rendering as health - sitting in
+production code on the one route whose failure is least visible, because a missing name looks like a
+subgraph that has no name.
+
+Worth its own issue rather than a line here.
 
 This is offered as the §6 deliverable the audit plan asks for - "find a migration-relevant thing with
 no issue" - and it wants filing rather than leaving here.
