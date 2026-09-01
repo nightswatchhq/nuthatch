@@ -212,16 +212,57 @@ class DockerIsolation:
     (`--tip`/`--finalized`) rather than through `/control/*`: the runner cannot post to it either.
     """
 
-    def __init__(self, image: str, scenario, run_id: str):
+    def __init__(self, image: str, scenario, run_id: str, proxy_image: str = "nuthatch-eval-proxy"):
         self.image, self.scenario, self.run_id = image, scenario, run_id
         self.network = f"nuthatch-eval-{run_id}"
+        self.egress = f"nuthatch-egress-{run_id}"
         self.fixture = f"nuthatch-fixture-{run_id}"
+        self.proxy = f"nuthatch-proxy-{run_id}"
+        self.proxy_image = proxy_image
         self.rpc_port = 8945
         self.rpc = f"http://{self.fixture}:{self.rpc_port}/"
+        # `claude` must reach its own model service and nothing else. Review of #1058 found the
+        # subject could reach *nothing*: `--internal` blocks all egress, so the model API was
+        # unresolvable and the enforced mode would have failed every subject for the harness's
+        # reasons. The proxy allows one host by allow-list; the documentation stays out of reach.
+        self.proxy_url = f"http://{self.proxy}:8888"
 
     def __enter__(self):
+        # Refuse early and say which image is missing. The runner starts the proxy unconditionally,
+        # so on a host that has only built the subject image `docker run` fails deep inside setup
+        # with a registry error - and review of #1058 pointed out the documented baseline command
+        # did not run as written. A missing prerequisite should be a sentence, not a stack trace.
+        for image, where in ((self.image, "eval/image"), (self.proxy_image, "eval/image/proxy")):
+            if _run(["docker", "image", "inspect", image])[0] != 0:
+                die(f"the image '{image}' is not built. Run:  docker build -t {image} {where}")
         script = ROOT / "scripts" / "fixture_rpc.py"
         _sh(["docker", "network", "create", "--internal", self.network])
+        # A second, ordinary network for the proxy's outward half only. The subject is never on it.
+        _sh(["docker", "network", "create", self.egress])
+        _sh([
+            "docker", "run", "-d", "--rm", "--name", self.proxy, "--network", self.network,
+            self.proxy_image,
+        ])
+        _sh(["docker", "network", "connect", self.egress, self.proxy])
+        # Wait for the proxy to actually accept connections. Review of #1058: the preflight probed
+        # through it immediately after `docker run -d` returned, and a container that has been
+        # *created* is not a proxy that is *listening* - so a slow start would surface as "the
+        # subject cannot reach the model API", sending whoever ran it hunting a network problem that
+        # was a race. Polled, not slept, so a genuinely broken proxy still fails rather than passing
+        # after a fixed delay.
+        for _ in range(60):
+            code, _out = _run([
+                "docker", "run", "--rm", "--network", self.network, self.image,
+                "sh", "-c", f"curl -sS -m 3 -o /dev/null {self.proxy_url} 2>&1 || exit 1",
+            ], timeout=30)
+            if code == 0:
+                break
+            time.sleep(1)
+        else:
+            die(
+                f"the egress proxy '{self.proxy}' never started listening on {self.proxy_url}.\n"
+                f"Check `docker logs {self.proxy}`; the image is {self.proxy_image}."
+            )
         _sh([
             "docker", "run", "-d", "--rm", "--name", self.fixture, "--network", self.network,
             "-v", f"{script}:{script}:ro", self.image,
@@ -238,12 +279,19 @@ class DockerIsolation:
         return [
             "docker", "run", "--rm", "--network", self.network,
             "-v", f"{workdir}:{workdir}", "-w", str(workdir),
+            # Only the model API resolves through here; everything else is denied by the proxy's
+            # allow-list, so the subject can think but cannot read the manual.
+            "-e", f"HTTPS_PROXY={self.proxy_url}",
+            "-e", f"HTTP_PROXY={self.proxy_url}",
+            "-e", f"NO_PROXY={self.fixture},localhost,127.0.0.1",
             self.image,
         ]
 
     def __exit__(self, *_):
         _sh(["docker", "rm", "-f", self.fixture], check=False)
+        _sh(["docker", "rm", "-f", self.proxy], check=False)
         _sh(["docker", "network", "rm", self.network], check=False)
+        _sh(["docker", "network", "rm", self.egress], check=False)
         return False
 
     def preflight(self, workdir: Path) -> None:
@@ -256,7 +304,21 @@ class DockerIsolation:
         (workdir / "allowed").write_text("readable")
         code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {workdir / 'allowed'}"])
         if code != 0 or "readable" not in out:
-            die(f"the image cannot read the workdir at its own path.\n  got: {out.strip()[:200]}")
+            # Name the likely cause. "cannot read the workdir" is true and unhelpful: the commonest
+            # reason is not the image at all but the host refusing to share the path - macOS Docker
+            # Desktop does not share `/var/folders`, which is exactly where `mktemp -d` puts things,
+            # so the mount silently yields an empty directory. That cost a wrong diagnosis once.
+            listing = _run(self.argv(workdir) + ["sh", "-c", f"ls -a {workdir} 2>&1"])[1].strip()
+            die(
+                f"the image cannot read {workdir / 'allowed'} - the subject's own workdir, at its\n"
+                f"host path. The subject could not author anything there.\n"
+                f"  cat said: {out.strip()[:120] or '(nothing)'}\n"
+                f"  the container sees: {listing[:160] or '(nothing)'}\n"
+                "\nIf the container sees an EMPTY directory, the host is not sharing that path with\n"
+                "Docker rather than the image being wrong - macOS Docker Desktop does not share\n"
+                "/var/folders, where mktemp puts things. Set TMPDIR to a shared location, or run\n"
+                "the eval on Linux."
+            )
 
         code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {SCENARIO} 2>/dev/null || true"])
         if out.strip():
@@ -284,6 +346,35 @@ class DockerIsolation:
         code, out = _run(self.argv(workdir) + ["sh", "-c", "command -v claude >/dev/null && echo yes"])
         if "yes" not in out:
             die("the image has no `claude` on PATH; every run would fail for the image's reasons")
+
+        # **The subject must be able to reach its own model, and nothing else.** Both halves, because
+        # either alone is a broken eval: without egress `claude` cannot run at all (review of #1058
+        # found exactly that - `Could not resolve host: api.anthropic.com` - so the enforced mode had
+        # never been runnable), and with open egress the agent can read nuthatch's documentation and
+        # score without the builder skill teaching it anything.
+        code, out = _run(self.argv(workdir) + [
+            "sh", "-c",
+            "curl -sS -m 15 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/messages 2>&1 || true",
+        ])
+        if not out.strip().endswith(("200", "400", "401", "403", "404", "405")):
+            die(
+                "the subject cannot reach the model API through the egress proxy.\n"
+                f"  got: {out.strip()[-160:]}\n"
+                "\n`claude` would be unable to run, and every criterion would score false for the\n"
+                "harness's reasons rather than the agent's. Check the proxy container is up and that\n"
+                f"`{self.proxy_image}` is built (eval/image/proxy)."
+            )
+
+        code, out = _run(self.argv(workdir) + [
+            "sh", "-c",
+            "curl -sS -m 12 -o /dev/null -w '%{http_code}' https://example.com 2>&1 || true",
+        ])
+        if out.strip().endswith(("200", "301", "302")):
+            die(
+                "the subject can reach the open internet. It could read nuthatch's documentation and\n"
+                "score without the builder skill teaching it anything, which is the thing this eval\n"
+                "measures. The proxy's allow-list is not denying - check FilterDefaultDeny."
+            )
 
 
 def _run(argv, timeout=180):
