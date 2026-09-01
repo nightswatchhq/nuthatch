@@ -111,15 +111,23 @@ This is the numerator and the denominator both.
 | `scripts/backfill.ts`, `backfill-rav.ts` | historical loads | yes | follows the above | nest undeployed |
 | `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
 
-**Thirty surfaces**, partitioned on the nest-status column: **12** covered by an existing view and
-blocked only on #1075; **12** needing a view written, of which three nobody has read yet and two are
-the QoS pair blocked on the shape question rather than on effort; **5** mixed, and unclassifiable
-until the on-chain half is split from the ENS/IPFS half; and **1** pair of backfill scripts that
-follow whatever the rows above them do.
+**Thirty surfaces**, partitioned on the nest-status column: **12** with a view file of the right
+shape; **12** needing a view written, of which three nobody has read yet and two are the QoS pair
+blocked on the shape question rather than on effort; **5** mixed, and unclassifiable until the
+on-chain half is split from the ENS/IPFS half; and **1** pair of backfill scripts that follow
+whatever the rows above them do.
 
-So the honest figure today, against group C, is **0 of 30 migrated, with 12 unblockable by anything
-except deploying the nest.** Not a percentage anyone should publish yet, because the five mixed rows
-can move the denominator in either direction once split.
+**The blocker column names the *next* blocker, not the only one**, and "a view exists" is the first
+of three steps rather than a state of near-readiness. Each of the 12 still needs: the nest deployed
+(#1075), its fields proven against the subgraph it replaces at a pinned block (#1076), and the route
+or module switched to read it (#1078). Twenty-two of these thirty are request-time routes calling
+`subgraphQuery` in the handler (§6a), so **deploying the nest migrates none of them on its own** - it
+only makes the next step possible.
+
+So the honest figure today, against group C, is **0 of 30 migrated**, with 12 having cleared the
+first of three steps. Not a percentage anyone should publish yet, because the five mixed rows can
+move the denominator in either direction once split, and "has a view" is the weakest of the three
+things a migrated surface needs.
 
 ### `api/subgraph` is not in this group, and is not a surface at all
 
