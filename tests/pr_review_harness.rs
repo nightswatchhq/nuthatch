@@ -107,6 +107,31 @@ fn every_finding_carries_its_own_certainty_distinct_from_merge_safety() {
     );
 }
 
+/// The commit list must not silently stop at a page boundary. `gh pr view --json commits` caps at
+/// 100, and a release PR can exceed that - producing a *truncated* history that looks complete,
+/// which is the same class of fault as the missing history it replaced.
+#[test]
+fn the_commit_list_is_paginated_rather_than_capped_at_one_page() {
+    let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
+    assert!(
+        wf.contains("--paginate") && wf.contains("/commits"),
+        "the commit list is fetched without pagination, so a PR over the page limit is silently          truncated and the reviewer again reasons from an incomplete history"
+    );
+    // Comments stripped first. The assertion below failed on this file's own explanatory comment,
+    // which *mentions* `gh pr view --json commits` while explaining why it is not used - the mirror
+    // of the "gate matches its own comment" fault this repo keeps finding. A check must read the
+    // code, not the prose about it.
+    let code: String = wf
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("--json commits"),
+        "still using `gh pr view --json commits`, which caps at 100 with no indication it did"
+    );
+}
+
 #[test]
 fn a_superseded_review_is_neutral_rather_than_a_red_verdict() {
     let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");

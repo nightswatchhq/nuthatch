@@ -78,8 +78,14 @@ jobs:
           # commits earlier and was already on the base. A release is a *range*, and no reviewer
           # reading only the diff could have got that right. Subjects only - cheap, and enough to
           # tell "absent from this diff" from "absent from the release".
-          gh pr view "$PR" --repo "$REPO" --json commits \
-            --jq '.commits[] | "\(.oid[0:9]) \(.messageHeadline)"' > pr.commits || : > pr.commits
+          # `gh pr view --json commits` caps at 100 (GraphQL page limit), and a release PR can
+          # exceed that - silently, which is the failure mode this whole change exists to remove.
+          # The REST commits endpoint paginates, and the count is stated so a truncated history
+          # cannot pass for a complete one. Review of #1056.
+          base="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq '.baseRefName')"
+          gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+            --jq '.[] | "\(.sha[0:9]) \(.commit.message | split("\n")[0])"' > pr.commits 2>/dev/null || : > pr.commits
+          echo "(base: $base)" >> pr.commits
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
