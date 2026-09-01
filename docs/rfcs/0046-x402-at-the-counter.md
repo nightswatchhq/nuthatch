@@ -1,8 +1,9 @@
 # RFC-0046: x402 at the counter - selling an operator's data to agents without a gated product
 
-- Status: **Draft - design only, not a carve-out.** The 2026 feature freeze applies. This proposes
-  nothing be built this year; it exists so that when the question is asked again the answer is
-  written down rather than re-derived.
+- Status: **Accepted in principle, design only.** The §8 governance question was put to Chief on
+  2026-08-30 and answered: **we cross the line deliberately and use x402 wherever it fits.** The
+  2026 feature freeze still applies, so nothing is built in nuthatch this year - but the argument in
+  §8 is settled rather than open, and a future slice does not have to re-open it.
 - Author: Pete (cargopete)
 - Date: 2026-08-30
 - Depends on: RFC-0045 (which recorded the absence this closes), RFC-0034 (the bounded surface is
@@ -196,9 +197,16 @@ protocol, x402 as an on-ramp for agents outside it, with the second understood a
 than as a bypass. The indefensible one is reaching for x402 because it is easier and quietly routing
 around the thing the rest of the work is for.
 
-This RFC does not settle that. It records that the question exists, that it is a governance question
-and not an engineering one, and that it should be answered before any slice runs and in public,
-alongside the community that raised it.
+**Answered, 2026-08-30: two doors, deliberately.** x402 is adopted wherever it fits, and the
+reasoning is not that Horizon does not matter but that an agent which has never heard of The Graph
+is not a consumer Horizon was ever going to capture. A payment rail nobody uses routes nothing.
+
+That makes the second door an on-ramp rather than a bypass, and the obligation that comes with the
+decision is to keep saying so out loud: the moment x402 starts carrying revenue that *would* have
+gone through TAP, this section needs revisiting rather than quietly not mentioning it.
+
+The question was recorded here before it was answered, which is the only reason it could be answered
+rather than drifted into.
 
 ## 9. Risks
 
