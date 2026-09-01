@@ -14,7 +14,11 @@
 # Deliberately NOT here: a `nuthatch` binary. The subject is expected to obtain one the way a real
 # user would, and how well it manages that is part of what the eval measures. Baking one in would
 # score a different, easier task.
-FROM node:22-bookworm-slim
+# Pinned by **digest**, not tag. `node:22-bookworm-slim` is a moving target: the same tag six weeks
+# apart is a different base, so an eval built from it cannot be compared with the run before it. A
+# score is a number about a *pairing* of model, prompt and tooling, and every part of it has to hold
+# still. Review of #1058.
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
