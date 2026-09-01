@@ -256,7 +256,21 @@ class DockerIsolation:
         (workdir / "allowed").write_text("readable")
         code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {workdir / 'allowed'}"])
         if code != 0 or "readable" not in out:
-            die(f"the image cannot read the workdir at its own path.\n  got: {out.strip()[:200]}")
+            # Name the likely cause. "cannot read the workdir" is true and unhelpful: the commonest
+            # reason is not the image at all but the host refusing to share the path - macOS Docker
+            # Desktop does not share `/var/folders`, which is exactly where `mktemp -d` puts things,
+            # so the mount silently yields an empty directory. That cost a wrong diagnosis once.
+            listing = _run(self.argv(workdir) + ["sh", "-c", f"ls -a {workdir} 2>&1"])[1].strip()
+            die(
+                f"the image cannot read {workdir / 'allowed'} - the subject's own workdir, at its\n"
+                f"host path. The subject could not author anything there.\n"
+                f"  cat said: {out.strip()[:120] or '(nothing)'}\n"
+                f"  the container sees: {listing[:160] or '(nothing)'}\n"
+                "\nIf the container sees an EMPTY directory, the host is not sharing that path with\n"
+                "Docker rather than the image being wrong - macOS Docker Desktop does not share\n"
+                "/var/folders, where mktemp puts things. Set TMPDIR to a shared location, or run\n"
+                "the eval on Linux."
+            )
 
         code, out = _run(self.argv(workdir) + ["sh", "-c", f"cat {SCENARIO} 2>/dev/null || true"])
         if out.strip():
