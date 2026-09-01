@@ -354,13 +354,24 @@ n '\bdispatchRegistryQuery\b'                                                   
 
 ```sh
 # The 14 that reach GRAPH_API_KEY without importing the shared client - why client-anchored
-# sweeps undercount.
-comm -23 \
-  <(rg -l 'subgraphQuery|ensQuery|horizonPerfQuery|delegationEventsQuery|qosOracleQuery|GRAPH_API_KEY' \
-      src scripts --glob '*.ts' --glob '*.tsx' | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort) \
-  <(rg -l 'subgraphQuery|ensQuery|horizonPerfQuery|delegationEventsQuery|qosOracleQuery' \
-      src scripts --glob '*.ts' --glob '*.tsx' | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort)
+# sweeps undercount. Note the THREE import styles: an earlier version of this command knew only
+# `@/lib/subgraph` and would have miscounted the eight files using a relative path.
+rg -l 'GRAPH_API_KEY' src scripts --glob '*.ts' --glob '*.tsx' \
+  | grep -v __tests__ | grep -v 'lib/subgraph.ts' | sort > /tmp/gk.txt      # 17 reference the key
+while read f; do
+  grep -qE "from ['\"](@/lib/subgraph|\.\./subgraph|\./subgraph)['\"]" "$f" || echo "$f"
+done < /tmp/gk.txt                                                          # 14 do so directly
+
+# The import styles actually present, so the alternation above can be checked rather than trusted:
+rg -o --no-filename "from ['\"][^'\"]*subgraph['\"]" src scripts --glob '*.ts' --glob '*.tsx' \
+  | sort | uniq -c        # 40 @/lib/subgraph, 7 ../subgraph, 1 ./subgraph
 ```
+
+An earlier draft derived this set with a `comm` of the with-key and without-key symbol sweeps. That
+computes "references `GRAPH_API_KEY` and none of the five query symbols", which is a different claim:
+a file could do both and be wrongly excluded. The membership happened to be identical - the same 14
+files - but the command did not compute the sentence attached to it, which is the difference between
+a reproducible count and a lucky one.
 
 ```sh
 # The 27 API routes, and the 21/6 request-time partition of §6a.
