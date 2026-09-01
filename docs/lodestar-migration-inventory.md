@@ -249,7 +249,7 @@ no issue" - and it wants filing rather than leaving here.
 
 - **#1074 is not board-only and needs no GraphOps conversation.** The repository is on this laptop.
   This file is the deliverable; what remains is reading the five mixed and three unclassified rows.
-- **#1078's table is 7 rows of a 29-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
+- **#1078's table is 7 rows of a 28-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
   six clients, so a nuthatch-backed implementation behind it migrates the Graph Network surfaces and
   touches none of ENS, QoS or delegation events.
 - **#1079 should cover 11 group-A surfaces and 11 group-B, not 7 and 2**, and should say for each
@@ -264,11 +264,11 @@ no issue" - and it wants filing rather than leaving here.
   migrated in 4.26.0 "need a configured Nuthatch origin and fail visibly without one, with no
   alternate Graph source". Fail-visibly is therefore the *existing* policy for migrated surfaces, not
   an open choice, and `NUTHATCH_DIPS`'s "no fallback exists" is that policy rather than an exception.
-  #1080's real question is whether it survives contact with 29 more surfaces.
+  #1080's real question is whether it survives contact with 28 more surfaces.
 
 ## 8. The denominator, stated
 
-**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 29 surfaces
+**"100% of Lodestar's on-chain network state, served by nuthatch nests"** = group C, 28 surfaces
 today, minus whatever the five mixed rows shed on splitting.
 
 Explicitly outside it, and finished by being correct: group A's 11, group B's off-chain half, ENS,
