@@ -89,7 +89,6 @@ Network state from the Graph Network subgraph. This is the numerator and the den
 | `api/indexer/[address]` | indexer + delegators + metadata | **mixed** | partial | split first |
 | `api/portfolio` | delegator/stakes/signals + ENS | **mixed** | partial | split first |
 | `api/apr-provenance/[address]` | `indexer` + ENS | **mixed** | partial | split first |
-| `api/subgraph` | the shared proxy route | yes | n/a | the seam itself |
 | `api/feed` | network activity | yes | **no view** | unclassified, needs a read |
 | `cron/check-conversions` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
 | `lib/protocols/fetcher.ts` | direct `GRAPH_API_KEY` | ? | **no view** | unclassified, needs a read |
@@ -97,13 +96,40 @@ Network state from the Graph Network subgraph. This is the numerator and the den
 | `scripts/backfill.ts`, `backfill-rav.ts` | historical loads | yes | follows the above | nest undeployed |
 | `app/indexers/[address]/opengraph-image.tsx` | `account`, `indexer` | yes | **no view** | view + nest |
 
-**Twenty-nine surfaces.** Twelve are covered by an existing view and blocked only on #1075. Nine
-need a view written. Five are mixed and need splitting before they can be classified at all. Three
-are unclassified and need somebody to read them.
+**Twenty-eight surfaces**, partitioned on the nest-status column: **12** covered by an existing view
+and blocked only on #1075; **10** needing a view written, three of which nobody has read yet; **5**
+mixed, and unclassifiable until the on-chain half is split from the ENS/IPFS half; and **1** pair of
+backfill scripts that follow whatever the rows above them do.
 
-So the honest figure today, against group C, is **0 of 29 migrated, with 12 unblockable by anything
+So the honest figure today, against group C, is **0 of 28 migrated, with 12 unblockable by anything
 except deploying the nest.** Not a percentage anyone should publish yet, because the five mixed rows
 can move the denominator in either direction once split.
+
+### `api/subgraph` is not in this group, and is not a surface at all
+
+It reads as the obvious seam - it is pinned to the Graph Network subgraph and returns `graphNetwork`
+aggregates - and the first draft of this file listed it as group C on that basis. Reading it settles
+it differently:
+
+```ts
+export async function POST(request: NextRequest) {
+  // In production, block direct subgraph proxy - all queries must go through cached GET endpoints
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json({ error: 'Direct subgraph queries are disabled...' }, { status: 403 });
+  }
+```
+
+**It returns 403 in production on every request.** It is development-only tooling, it carries no
+production gateway dependency, and migrating it would migrate nothing. It is excluded from the
+denominator rather than counted as remaining work.
+
+Two things about it are worth recording even so, because they are the sprint's own theme wearing a
+different hat. The file is 588 lines, of which roughly 320 are **hand-written mock data** - invented
+GraphOps and Stake.fish indexers with fabricated stake figures. And at line 299 a real GraphQL error
+from the gateway does not fail: it logs and **falls through to that mock data**, so in development a
+broken query renders as a healthy network. Neither reaches production. Both are the pattern this
+project keeps finding in its own tests, and they sit in the one route a developer is most likely to
+trust while checking whether a migration worked.
 
 ## 4. Group B: chain-derived hash, off-chain meaning
 
