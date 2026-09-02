@@ -1299,13 +1299,6 @@ async fn fan_out_window(
     to: u64,
     tip: u64,
 ) -> Result<()> {
-    let mut hot = 0usize;
-    for &j in live {
-        if let Some(n) = nests[j].as_ref() {
-            hot = hot.saturating_add(n.store.count().unwrap_or(0) as usize);
-        }
-    }
-    let force_remainder = hot >= CURSOR_HOLD_ROWS;
     for &i in live {
         if nexts[i] > to {
             continue;
@@ -1324,7 +1317,7 @@ async fn fan_out_window(
         // webhook sink): quarantine it and let its co-tenants finish the window. Before
         // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
         match live_nest(nests, i)
-            .process_window(source, &nest_logs, nexts[i], to, tip, force_remainder)
+            .process_window(source, &nest_logs, nexts[i], to, tip)
             .await
         {
             Ok(Some(_)) => {
@@ -2583,12 +2576,6 @@ fn shorten_store(url: &str) -> &str {
 /// [`take_sealable`], the tip path via [`tip_seal_cut`]. Public so integration tests can pad a
 /// finalized range to the same threshold without duplicating the number.
 pub const SEAL_DIRECT_BATCH: usize = 20_000;
-
-/// Cursor-wide cap on unsealed hot rows. The per-nest batch is [`SEAL_DIRECT_BATCH`]; the
-/// RAM budget is per cursor and shared across its nests. 20 is the multinest CI scenario.
-/// Above this, a nest that would hold instead seals its finalized remainder so stacking
-/// sparse nests cannot silently exceed 2 GB (#1067).
-const CURSOR_HOLD_ROWS: usize = SEAL_DIRECT_BATCH.saturating_mul(20);
 
 /// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
 /// window happened to stop (RFC-0028 §4).
@@ -4444,7 +4431,6 @@ impl NestIngest {
         next: u64,
         to: u64,
         tip: u64,
-        force_seal_remainder: bool,
     ) -> Result<Option<usize>> {
         // Decode first so factory discovery is inline (a child created at log i is in the
         // registry before its own activity at log j>i - RFC-0009 same-block handling), then
@@ -4980,7 +4966,6 @@ impl NestIngest {
             finalized_through,
             snapshot.as_deref(),
             &self.metrics,
-            force_seal_remainder,
         )
         .await
         {
@@ -5158,14 +5143,7 @@ async fn index_loop(
                 chunker.observed(logs.len() as u64);
                 let n = logs.len() as u64;
                 match nest
-                    .process_window(
-                        source.as_ref(),
-                        &logs,
-                        next,
-                        to,
-                        tip,
-                        nest.store.count().unwrap_or(0) as usize >= CURSOR_HOLD_ROWS,
-                    )
+                    .process_window(source.as_ref(), &logs, next, to, tip)
                     .await?
                 {
                     // Window processed and committed - advance the cursor past it.
@@ -5396,8 +5374,7 @@ fn block_number_of(json: &str) -> Option<u64> {
 }
 
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
-/// chosen from the data. Rows short of the threshold stay in the hot store until the next call,
-/// unless `force_remainder` is set because the cursor as a whole is over [`CURSOR_HOLD_ROWS`].
+/// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
 ///
 /// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
 /// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
@@ -5408,7 +5385,6 @@ async fn maybe_seal(
     finalized_through: u64,
     registry_snapshot: Option<&str>,
     metrics: &crate::metrics::NestMetrics,
-    force_remainder: bool,
 ) -> Result<()> {
     if finalized_through == 0 {
         return Ok(());
@@ -5450,19 +5426,6 @@ async fn maybe_seal(
                     "blocks {from}..={ceiling} finalized with no transfers; watermark advanced"
                 );
                 return Ok(());
-            }
-            None if force_remainder => {
-                // Cursor-wide pressure: seal this nest's finalized remainder rather than
-                // holding another ~20k rows. The cut is still a block in the data.
-                match entities.last().and_then(|j| block_number_of(j)) {
-                    Some(cut) => cut,
-                    None => {
-                        if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                            store.set_block_hash(ceiling, &hash)?;
-                        }
-                        return Ok(());
-                    }
-                }
             }
             None => {
                 // Still pin the finalized ceiling. Holding rows does not mean the reorg
@@ -6364,7 +6327,7 @@ mod tests {
         let store = Store::open(&tmp.path().join("t.redb")).unwrap();
         load_rows(&store, 100);
         let metrics = crate::metrics::NestMetrics::default();
-        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, false)
+        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics)
             .await
             .unwrap();
         assert_eq!(
@@ -6394,33 +6357,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_seal_drains_under_cursor_pressure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
-        load_rows(&store, 100);
-        let metrics = crate::metrics::NestMetrics::default();
-        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
-            Some("99"),
-            "cursor pressure must seal the finalized remainder even below SEAL_DIRECT_BATCH"
-        );
-        assert!(
-            store.entities_in_range(0, 99).unwrap().is_empty(),
-            "the forced remainder must be pruned from hot"
-        );
-    }
-
-    #[tokio::test]
     async fn maybe_seal_cuts_once_the_threshold_is_crossed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("t.redb")).unwrap();
         let n = SEAL_DIRECT_BATCH as u64 + 50;
         load_rows(&store, n);
         let metrics = crate::metrics::NestMetrics::default();
-        maybe_seal(tmp.path(), &store, &HashOnly, n - 1, None, &metrics, false)
+        maybe_seal(tmp.path(), &store, &HashOnly, n - 1, None, &metrics)
             .await
             .unwrap();
         let sealed = store
@@ -9868,7 +9811,7 @@ template="pool"
             w.abort();
         }
 
-        nest.process_window(source.as_ref(), &[], 1, 3, 100, false)
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -10152,7 +10095,7 @@ template="pool"
 
         // `every = 1` over blocks 1..=3 samples all three, so a per-block hash fetch would be three
         // `block_hash` round trips; a batched one is a single `block_headers` call for all three.
-        nest.process_window(source.as_ref(), &[], 1, 3, 100, false)
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -10407,7 +10350,7 @@ template="pool"
             w.abort();
         }
 
-        nest.process_window(source.as_ref(), &[], 1, 3, 100, false)
+        nest.process_window(source.as_ref(), &[], 1, 3, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -10525,7 +10468,7 @@ template="pool"
                 log_index: i,
             })
             .collect();
-        nest.process_window(source.as_ref(), &logs, 9, 9, 100, false)
+        nest.process_window(source.as_ref(), &logs, 9, 9, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -10738,7 +10681,7 @@ template="pool"
             w.abort();
         }
 
-        nest.process_window(source.as_ref(), &[], 4, 4, 100, false)
+        nest.process_window(source.as_ref(), &[], 4, 4, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -10849,7 +10792,7 @@ template="pool"
             })
             .collect();
 
-        nest.process_window(source.as_ref(), &logs, 5, 5, 100, false)
+        nest.process_window(source.as_ref(), &logs, 5, 5, 100)
             .await
             .unwrap()
             .expect("the window must commit");
@@ -11015,7 +10958,7 @@ template="pool"
             log_index: 0,
         }];
 
-        nest.process_window(&src, &logs, 1, 3, 100, false)
+        nest.process_window(&src, &logs, 1, 3, 100)
             .await
             .unwrap()
             .expect("the window must commit");
