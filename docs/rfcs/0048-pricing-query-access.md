@@ -278,6 +278,36 @@ The two behaviours differ because the failure modes differ. Absorbing a price ga
 operator a fraction of one query's margin. Absorbing a resource gap costs the operator the outage
 that flat pricing plus an admission check was designed to prevent.
 
+**Where the check is enforced, which is what makes the ceiling hard.** Re-estimating at execution is
+still only an estimate if the query then runs for thirty seconds against a hot store that ingestion
+keeps growing. A query admitted at 900 MB under a 1 GB threshold could scan 1.2 GB by the time it
+finishes, and the guard would have guarded nothing.
+
+The architecture already supplies the answer and it needs no lock on the ingestion path. `/sql` does
+not evaluate against the live hot store: `analytics.rs` **scans hot rows into per-table temp tables**
+and `UNION ALL`s them into each table's view, with hot and cold kept structurally disjoint by the
+`sealed_through` watermark. That materialisation is a bounded, observable step that happens **before**
+any user SQL is evaluated, and it is therefore the enforcement point:
+
+- Materialise the hot side under **one redb read transaction**, so the set is fixed for the
+  query's lifetime and blocks arriving mid-scan land in a later version it cannot see.
+- **Count real bytes while materialising**, and abort the moment the running total crosses the
+  admitted ceiling. Not an estimate compared against a threshold, but the actual copy refusing to
+  grow past it.
+- The cold side is already immutable by construction: sealed segments never change, and the
+  catalogue version pins which of them exist.
+
+That makes the ceiling hard **by construction** rather than by promise, and it costs no coordination
+with the writer, which matters because the single-writer ingestion thread is not something a serving
+path may block. It also relocates the guard from a prediction to a measurement, which is the general
+shape this RFC should prefer wherever it can: §3's byte bound stays a *quote* input, and the thing
+that actually stops a runaway scan is a counter on a copy that is already being made.
+
+The cost is stated rather than hidden: aborting mid-materialisation means the node did real work for
+a query it will not serve, and it must not bill for it. That is the same rule as a rejected
+admission, and RFC-0046 already gives it - the authorisation is recorded on serving, so a query that
+never serves is never recorded.
+
 This is also the sharpest freeze-legality point in the RFC. The scan classes above are a claim
 about what the planner can prove, and nothing in the tree proves them today. Whoever builds this
 owes a slice zero that demonstrates the classifier on the real named-query corpus **before** any
