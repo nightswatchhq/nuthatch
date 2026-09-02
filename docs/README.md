@@ -8,7 +8,7 @@ not to infer work that remains.
 
 - [Backlog guide](backlog.md) - GitHub is the live queue; this explains its labels and settled
   decisions.
-- [Sprint: mighty-moorhen](sprint-mighty-moorhen.md) - the current ten-issue cleanup sprint.
+- [Sprint: questioning-quelea](sprint-questioning-quelea.md) - the current nine-issue sprint.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
