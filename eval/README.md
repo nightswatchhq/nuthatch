@@ -46,12 +46,16 @@ hand-typed scores, including flattering ones (the house rule since RFC-0004).
 
 ### Baseline status
 
-The **0.4 Tier B baseline** is [0/15 first-try and 0/15 overall](eval-report.json) - **verified, not
-merely reported**: all 15 known-correct oracles score as *passes* through the runner's own
-`sql_rows` and `results_equal`, against the same `question_set_hash` the report carries, so the zero
-belongs to the agent and not the harness. Median of three
-runs on `claude-sonnet-5` at the provider-default temperature 1.0. Mean SQL attempts were 1.267.
-The exact commit, question-set hash, per-question outcomes, and class breakdown are in the report.
+The **0.4 Tier B baseline** was 0/15 first-try and 0/15 overall, verified against the oracle, and
+could not say why. **#1071 re-ran it** on 2026-09-02 (`claude-sonnet-5`, median of three, same
+question-set hash). Still [0/15 first-try and 0/15 overall](eval-report.json). The zeros are now
+diagnosed: the agent queries `usdc__transfer`, quotes `"from"`/`"to"`, and uses `value_dec`, then
+aliases the result `total_transfers` where the oracle expects `n`. Invented table names and the
+big-int footgun are not this run's failure mode. Mean SQL attempts were 1.267, unchanged.
+
+The report's `commit` is the tree the MCP surface was evaluated at (`132e658` on this run: `main`
+when the runner executed). It cannot equal the SHA of the commit that *adds* the report: that SHA
+does not exist until after the file is written.
 
 The runner invokes each subject as a separate restricted process with only the nuthatch MCP bridge;
 the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only

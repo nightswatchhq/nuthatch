@@ -1,6 +1,6 @@
 {
-  "date": "2026-08-31",
-  "commit": "4bc5402e901e74b27d472f9e31a59fa1022ec855",
+  "date": "2026-09-02",
+  "commit": "132e65838082d1170b9e2fda8758c510d4a00bfc",
   "model": "claude-sonnet-5",
   "temperature": 1.0,
   "question_set_hash": "6006cc59b282f1f9bd470d572023d2b4bcaffe2dadc5138af37d6622d987b848",
@@ -25,7 +25,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 1
+      "tool_calls": 1,
+      "final_query": "SELECT COUNT(*) AS total_transfers FROM usdc__transfer",
+      "final_rows": [
+        {
+          "total_transfers": 10
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "sum-value-bigint",
@@ -33,7 +40,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 2,
-      "tool_calls": 3
+      "tool_calls": 4,
+      "final_query": "SELECT SUM(value_dec) AS total_value FROM usdc__transfer",
+      "final_rows": [
+        {
+          "total_value": "5500"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "max-value",
@@ -41,15 +55,33 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT tx_hash, log_index, \"from\", \"to\", value FROM usdc__transfer ORDER BY value DESC LIMIT 1",
+      "final_rows": [
+        {
+          "from": "0x0000000000000000000000000000000000000002",
+          "log_index": 0,
+          "to": "0x0000000000000000000000000000000000000003",
+          "tx_hash": "0x0000000000000000000000000000000000000000000000000000000000900000",
+          "value": "900"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "min-value",
       "class": "big-int",
       "passed": false,
       "first_try": false,
-      "sql_attempts": 1,
-      "tool_calls": 2
+      "sql_attempts": 2,
+      "tool_calls": 3,
+      "final_query": "SELECT MIN(CAST(value AS HUGEINT)) AS min_value FROM usdc__transfer WHERE CAST(value AS HUGEINT) > 0",
+      "final_rows": [
+        {
+          "min_value": "100"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "avg-value",
@@ -57,7 +89,15 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 2,
-      "tool_calls": 3
+      "tool_calls": 3,
+      "final_query": "SELECT AVG(value_dec) AS avg_value, COUNT(*) AS n FROM usdc__transfer",
+      "final_rows": [
+        {
+          "avg_value": 550.0,
+          "n": 10
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "reserved-word-from",
@@ -65,7 +105,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 3
+      "tool_calls": 3,
+      "final_query": "SELECT count(*) AS cnt FROM usdc__transfer WHERE \"from\" LIKE '%0001'",
+      "final_rows": [
+        {
+          "cnt": 5
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "reserved-word-to",
@@ -73,7 +120,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 3
+      "tool_calls": 3,
+      "final_query": "SELECT count(*) AS cnt FROM usdc__transfer WHERE \"to\" LIKE '%0002'",
+      "final_rows": [
+        {
+          "cnt": 5
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "sum-by-sender",
@@ -81,7 +135,16 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 3
+      "tool_calls": 3,
+      "final_query": "SELECT \"from\", SUM(value_dec) AS total_sent, COUNT(*) AS n\nFROM usdc__transfer\nWHERE \"from\" LIKE '%0002'\nGROUP BY \"from\"",
+      "final_rows": [
+        {
+          "from": "0x0000000000000000000000000000000000000002",
+          "n": 5,
+          "total_sent": "4000"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "distinct-senders",
@@ -89,7 +152,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT COUNT(DISTINCT \"from\") AS distinct_senders FROM usdc__transfer",
+      "final_rows": [
+        {
+          "distinct_senders": 2
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "distinct-receivers",
@@ -97,7 +167,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT COUNT(DISTINCT \"to\") AS distinct_receivers FROM usdc__transfer",
+      "final_rows": [
+        {
+          "distinct_receivers": 2
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "block-range",
@@ -105,7 +182,15 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT MIN(block_number) AS first_block, MAX(block_number) AS last_block FROM usdc__transfer",
+      "final_rows": [
+        {
+          "first_block": 1,
+          "last_block": 10
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "filter-by-block",
@@ -113,15 +198,34 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT COUNT(*) AS cnt FROM usdc__transfer WHERE block_number > 5",
+      "final_rows": [
+        {
+          "cnt": 5
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "top-receiver",
       "class": "aggregation",
       "passed": false,
       "first_try": false,
-      "sql_attempts": 2,
-      "tool_calls": 3
+      "sql_attempts": 1,
+      "tool_calls": 3,
+      "final_query": "SELECT \"to\" AS address, SUM(value_dec) AS total_received FROM usdc__transfer GROUP BY \"to\" ORDER BY total_received DESC LIMIT 5",
+      "final_rows": [
+        {
+          "address": "0x0000000000000000000000000000000000000003",
+          "total_received": "4000"
+        },
+        {
+          "address": "0x0000000000000000000000000000000000000002",
+          "total_received": "1500"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "value-per-sender",
@@ -129,7 +233,21 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 3
+      "tool_calls": 3,
+      "final_query": "SELECT \"from\" AS sender, SUM(value_dec) AS total_value_sent, COUNT(*) AS num_transfers\nFROM usdc__transfer\nGROUP BY \"from\"\nORDER BY total_value_sent DESC",
+      "final_rows": [
+        {
+          "num_transfers": 5,
+          "sender": "0x0000000000000000000000000000000000000002",
+          "total_value_sent": "4000"
+        },
+        {
+          "num_transfers": 5,
+          "sender": "0x0000000000000000000000000000000000000001",
+          "total_value_sent": "1500"
+        }
+      ],
+      "query_error": null
     },
     {
       "id": "count-in-block",
@@ -137,7 +255,14 @@
       "passed": false,
       "first_try": false,
       "sql_attempts": 1,
-      "tool_calls": 2
+      "tool_calls": 2,
+      "final_query": "SELECT COUNT(*) AS cnt FROM usdc__transfer WHERE block_number = 3",
+      "final_rows": [
+        {
+          "cnt": 1
+        }
+      ],
+      "query_error": null
     }
   ]
 }
