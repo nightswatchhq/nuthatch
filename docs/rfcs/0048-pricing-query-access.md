@@ -173,6 +173,41 @@ So the bound is two terms, and the hot term is a **scan class**, not a catalogue
 bound = cold_bytes(catalogue, predicate) + hot_bytes(scan_class, hot_rows)
 ```
 
+**`cold_bytes` is per physical scan operator, not per distinct segment.** Written as a function of a
+predicate it reads like "the set of segments this query touches", and that is not an upper bound. A
+named query that self-joins a sealed table, reads it through two CTEs, or unions two branches over
+it visits those segments **more than once**, and a set has no way to say so. Deduplicating segments
+across operators under-prices exactly the queries that do the most I/O.
+
+The rule, and it is deliberately crude in the safe direction:
+
+1. Take the **physical plan**, not the SQL text. Two CTEs that the optimiser materialises once are
+   one scan; two that it inlines are two. Only the plan knows which.
+2. For **every scan operator** over a sealed table, add the bytes of every segment that operator can
+   still touch after predicate and partition pushdown.
+3. **Sum over operators with no deduplication.** A segment read by three operators is charged three
+   times, because it is read three times.
+4. Any operator the rule does not recognise, or any plan that cannot be obtained, **refuses to
+   quote**. Fail closed. A bound that silently skips a node it has never seen is not a bound.
+5. **Recursive CTEs are refused outright.** Their scan count is not statically bounded, so no finite
+   upper bound exists, and no named query the counter serves needs one.
+
+**The reason this is tractable at all is that named queries are a fixed, reviewed corpus.** This RFC
+does not price open `/sql`, and that is not only a safety decision - it is what makes the cold bound
+computable. A named query's plan is known at **publish time**, so its bound is computed once per
+(query, catalogue version) and reviewed by a person, rather than derived from arbitrary SQL under
+request latency. A query whose bound cannot be computed does not get published, which is a far
+better failure than one that gets published and then cannot be priced.
+
+**What is enforced at runtime, stated honestly.** The hot side has a real counter, described below:
+the materialisation refuses to grow past the ceiling. The cold side does **not** have an equivalent
+byte counter today, so its guarantee rests on the plan bound plus the existing wall-clock timeout and
+512 MB memory cap. That is weaker, and it is weaker in a specific way worth writing down rather than
+glossing: the plan bound is sound only if rules 1 to 5 hold, and nothing at runtime would catch it if
+they did not. Adding a cold bytes-read counter to the scan path, and aborting on it the way the hot
+materialisation does, is the item that would make both halves symmetrical. It is not in Phase 0 and
+Phase 0 should not claim it is.
+
 The hot side has a property the cold side does not: it is **bounded by construction**. The hot
 store holds only blocks in `(sealed_through, tip]`, so its size is capped by the finality window
 rather than by history, and the node knows its own hot row count without consulting anything. That
