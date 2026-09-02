@@ -5428,6 +5428,10 @@ async fn maybe_seal(
                 return Ok(());
             }
             None => {
+                // Held, not drained. A cursor-wide "seal because co-tenants are fat"
+                // flush was considered and reverted: it made segment identity depend
+                // on which nests share the cursor. The 2 GB budget is the multinest
+                // RAM job (measured 372 MB for 20 nests × 12,010 rows against 2048).
                 // Still pin the finalized ceiling. Holding rows does not mean the reorg
                 // walker can do without a checkpoint: #461 was a walk that skipped past
                 // sealed_through to an older sparse checkpoint and tripped the finality
