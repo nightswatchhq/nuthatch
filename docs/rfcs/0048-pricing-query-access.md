@@ -146,8 +146,40 @@ common. Do not add it on day one.
 
 A single flat price per named query, in the asset RFC-0046 already chose, plus a
 **deterministic byte-scan admission check** that rejects a query whose planned upper bound
-exceeds a fixed threshold. The threshold is an operator config key, default conservative
-(order of 1 GB is a starting number, not a measurement).
+exceeds a threshold.
+
+**That threshold is derived, not chosen, and an earlier draft of this RFC got it wrong.** It said
+"an operator config key, order of 1 GB". Put that next to the two facts either side of it and it
+does not survive: `SQL_MAX_CONCURRENCY` admits **two** concurrent queries, and the enforcement
+below copies hot rows into per-query temp tables. Two admissions at 1 GB is **2 GB of hot copies
+alone**, before DuckDB's 512 MB working memory, before the redb store, before ingestion state,
+before serving overhead. `CLAUDE.md`'s **≤2 GB per active-chain cursor** is not a target to be
+approached from below by one subsystem; it is the whole cursor, shared across every nest on it. A
+freely-configurable byte threshold is a way to violate a non-negotiable by editing a config file.
+
+So the ceiling is a **cursor-wide reservation, divided**:
+
+```
+threshold ≤ (cursor_budget − ingestion − store − serving − duckdb_working_set) / SQL_MAX_CONCURRENCY
+```
+
+Three consequences follow, and none of them is optional:
+
+- **Admission is accounted cursor-wide, not per query.** A second query admitted while the first is
+  still materialising must be checked against what is left, not against the same ceiling again.
+  Per-query admission with a shared budget is how two individually-legal queries become one
+  violation.
+- **The starting number is a few hundred megabytes, not 1 GB**, and this RFC declines to write a
+  figure at all until the subtractions above are measured. RFC-0047's fourth commitment is exactly
+  that work - expose the existing 512 MB and two-thread DuckDB caps as config and name the ingestion
+  reservation - so this is a dependency, not a coincidence.
+- **`SQL_MAX_CONCURRENCY` is a divisor here**, which changes its character. Raising it does not only
+  add throughput, it shrinks every query's ceiling. That is worth stating because revisiting that
+  constant is already an open item, and this RFC gives it a second constraint it did not have.
+
+The CI per-cursor RAM budget is the check that would actually catch a mistake here, and a Phase 0
+that ships without a scenario exercising `SQL_MAX_CONCURRENCY` admissions at the threshold has not
+been tested against the thing most likely to go wrong.
 
 This is the Agora lesson made mechanical: do not build a DSL until usage proves you need one.
 The admission check is what stops the pathological scan that flat pricing cannot survive. It
