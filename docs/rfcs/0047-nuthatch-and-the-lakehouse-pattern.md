@@ -239,7 +239,21 @@ New keys, conservative defaults equal to what the binary already does:
   is arithmetic in one place rather than a comment in `serve.rs`. Exact default is an unresolved
   measurement.
 
-`SQL_MAX_CONCURRENCY` stays the permit count it is. This RFC does not raise it.
+Before any of those keys becomes operator-visible, startup must reject the configuration unless:
+
+```text
+(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
+```
+
+`sql_permits` is the one cursor-wide gate, not a per-nest value. `runtime_headroom` is the
+measured high-water mark for Rust, DBSP, decode and result materialisation outside DuckDB; it is
+not a hand-waved remainder. `analytics.max_temp_size` is a separate disk cap and does not buy RAM
+in that equation. The defaults and hard maxima wait for that measurement, and the validator ships
+with them. A knob without this refusal is not resource governance, it is an invitation to find the
+2 GB limit by falling over.
+
+`SQL_MAX_CONCURRENCY` stays the permit count it is. This RFC does not raise it, and its existing
+benchmark override is not promoted to an unconstrained configuration key by this RFC.
 
 **Normative principle, and it belongs in the docs:** ingestion liveness outranks query
 completion. A query that cannot run in its budget fails with a clear error naming the keys. It
@@ -255,7 +269,7 @@ Making it config makes the wall visible.
 | `manifest_version` and additive catalogue fields | spec + small writer | no, if additive and dual-readable |
 | Writer-settings table matching the code | docs | no |
 | zstd / bloom / checksums on **new** seals | writer config, performance | no, if measured and not a format break |
-| `analytics.*` config keys defaulting to current constants | config over existing behaviour | no |
+| `analytics.*` config keys plus the startup budget validator | config over existing behaviour | no, only with measured headroom and the 2 GiB refusal above |
 | `doctor` catalogue check | CLI over the existing integrity walk | no |
 | Utf8 → FLBA32, or seal-fail on wide uint256, or `semantic.toml` projection policies | format / behaviour / schema surface | **yes, or a named exception in this RFC once the board takes it** |
 
