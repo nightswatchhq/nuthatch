@@ -32,16 +32,17 @@ async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
     let a1 = account(1);
     let a2 = account(2);
     for b in 1..=10u64 {
-        tape.insert_block(
+        let mut fx = transfers_block(
             b,
-            transfers_block(
-                b,
-                0,
-                1_700_000_000 + b,
-                USDC,
-                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
-            ),
+            0,
+            1_700_000_000 + b,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
         );
+        if b == 5 {
+            pad_address_to_seal(&mut fx, USDC, 4);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(10);
 
@@ -68,11 +69,12 @@ async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
     .await;
     assert!(landed, "nest did not index to the tip in time");
 
-    // Hot rows for the whole range are present; nothing sealed yet.
+    // Hot rows for the whole range are present; nothing sealed yet. Block 5 is padded
+    // to [`indexer::SEAL_DIRECT_BATCH`] so the tip path will actually cut (#1067).
     assert_eq!(
         store.entities_in_range(1, 10).unwrap().len(),
-        10,
-        "all ten transfers should be in the hot store"
+        indexer::SEAL_DIRECT_BATCH + 5,
+        "the ten real transfers plus the seal-batch padding in block 5"
     );
     assert_eq!(store.sealed_through(), 0, "nothing is final yet");
     assert!(
@@ -86,7 +88,7 @@ async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
     tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
     tape.advance_tip_to(11);
 
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await;
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await;
     assert!(sealed, "range [1,5] did not seal in time");
 
     // Segments now exist for the transfer table.
@@ -558,16 +560,17 @@ async fn total_supply_recipe_derives_mints_minus_burns() {
         3,
         transfers_block(3, 0, 1_700_000_003, USDC, &[(a1.as_str(), zero, 200)]),
     );
-    tape.insert_block(
-        4,
-        transfers_block(
+    tape.insert_block(4, {
+        let mut fx = transfers_block(
             4,
             0,
             1_700_000_004,
             USDC,
             &[(a1.as_str(), a2.as_str(), 100)],
-        ),
-    );
+        );
+        pad_address_to_seal(&mut fx, USDC, 3);
+        fx
+    });
     tape.advance_tip_to(4);
     tape.advance_finalized_to(4);
     tape.insert_block(5, empty_block(5, 0, 1_700_000_005));
@@ -588,7 +591,7 @@ async fn total_supply_recipe_derives_mints_minus_burns() {
     .expect("spawn_nest");
     let store = rt.state.store.clone();
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 4).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 4).await,
         "transfers did not seal"
     );
 
@@ -660,7 +663,11 @@ async fn reserves_recipe_derives_latest_sync_per_pair() {
     // Three Syncs for the pool; the current reserves are the LATEST: (1200, 3000).
     tape.insert_block(1, sync_block(1, 0, 1_700_000_001, USDC, &[(1000, 2000)]));
     tape.insert_block(2, sync_block(2, 0, 1_700_000_002, USDC, &[(1500, 2500)]));
-    tape.insert_block(3, sync_block(3, 0, 1_700_000_003, USDC, &[(1200, 3000)]));
+    tape.insert_block(3, {
+        let mut fx = sync_block(3, 0, 1_700_000_003, USDC, &[(1200, 3000)]);
+        pad_clone_last_to_seal(&mut fx, 2);
+        fx
+    });
     tape.advance_tip_to(3);
     tape.advance_finalized_to(3);
     tape.insert_block(4, empty_block(4, 0, 1_700_000_004));
@@ -681,7 +688,7 @@ async fn reserves_recipe_derives_latest_sync_per_pair() {
     .expect("spawn_nest");
     let store = rt.state.store.clone();
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 3).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 3).await,
         "syncs did not seal"
     );
 
@@ -729,16 +736,17 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
         let tape = Arc::new(TapeSource::new());
         let (a1, a2) = (account(1), account(2));
         for b in 1..=10u64 {
-            tape.insert_block(
+            let mut fx = transfers_block(
                 b,
-                transfers_block(
-                    b,
-                    0,
-                    1_700_000_000 + b,
-                    USDC,
-                    &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
-                ),
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
             );
+            if b == 5 {
+                pad_address_to_seal(&mut fx, USDC, 4);
+            }
+            tape.insert_block(b, fx);
         }
         tape.advance_tip_to(10);
         let rt = indexer::spawn_nest(
@@ -769,12 +777,20 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
         tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
         tape.advance_tip_to(11);
         assert!(
-            wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await,
+            wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await,
             "old did not seal [1,5]"
         );
         rt.ingest.abort();
         let _ = rt.ingest.await;
+        if let Some(w) = rt.alert_worker {
+            w.abort();
+            let _ = w.await;
+        }
         drop(store);
+        // redb is single-writer: the aborted tasks must actually drop their Store
+        // clones before reuse_segments opens the same file. 20k padded rows made
+        // this race visible in CI (#1067).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     // Mount the old's sealed segments into the fresh new nest.
@@ -844,20 +860,25 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     let tape = Arc::new(TapeSource::new());
 
-    // Ten blocks, one USDC transfer each.
+    // Ten blocks, one USDC transfer each. Blocks 3 and 6 are padded so each of the
+    // two sequential seals crosses SEAL_DIRECT_BATCH and cuts at that block (#1067).
     let a1 = account(1);
     let a2 = account(2);
     for b in 1..=10u64 {
-        tape.insert_block(
+        let mut fx = transfers_block(
             b,
-            transfers_block(
-                b,
-                0,
-                1_700_000_000 + b,
-                USDC,
-                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
-            ),
+            0,
+            1_700_000_000 + b,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
         );
+        if b == 3 {
+            pad_address_to_seal(&mut fx, USDC, 2);
+        }
+        if b == 6 {
+            pad_address_to_seal(&mut fx, USDC, 2);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(10);
 
@@ -889,14 +910,14 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
     tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
     tape.advance_tip_to(11);
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 3).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 3).await,
         "range [1,3] did not seal in time"
     );
     tape.advance_finalized_to(6);
     tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
     tape.advance_tip_to(12);
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 6).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 6).await,
         "range [4,6] did not seal in time"
     );
 
@@ -1434,14 +1455,16 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
             (100 * b) as u128,
         );
         let arb_log = transfer_log(ARB, b, 1, &hash, a1.as_str(), a2.as_str(), (7 * b) as u128);
-        tape.insert_block(
-            b,
-            BlockFixture {
-                hash,
-                timestamp: 1_700_000_000 + b,
-                logs: vec![usdc_log, arb_log],
-            },
-        );
+        let mut fx = BlockFixture {
+            hash,
+            timestamp: 1_700_000_000 + b,
+            logs: vec![usdc_log, arb_log],
+        };
+        if b == 3 {
+            pad_address_to_seal(&mut fx, USDC, 2);
+            pad_address_to_seal(&mut fx, ARB, 2);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(6);
 
@@ -1474,7 +1497,7 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
     tape.insert_block(7, empty_block(7, 0, 1_700_000_100));
     tape.advance_tip_to(7);
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 3).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 3).await,
         "range [1,3] did not seal in time"
     );
 

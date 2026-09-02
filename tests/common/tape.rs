@@ -161,6 +161,77 @@ pub fn empty_block(number: u64, variant: u64, timestamp: u64) -> BlockFixture {
     }
 }
 
+/// Counterparties for the zero-value Transfer logs [`pad_address_to_seal`] appends.
+/// Recipe and restart tests must not query these: the pads exist only to cross
+/// [`nuthatch::indexer::SEAL_DIRECT_BATCH`].
+pub fn seal_pad_from() -> String {
+    account(10_000)
+}
+pub fn seal_pad_to() -> String {
+    account(10_001)
+}
+
+/// Append zero-value Transfer logs for `address` so a nest that only indexes that
+/// address will cut at this block once it is finalized, given `rows_before` already
+/// indexed rows of this address in the range being sealed.
+///
+/// The tip path holds below [`nuthatch::indexer::SEAL_DIRECT_BATCH`] (#1067). Tests that
+/// need a sealed watermark, or real Parquet, have to cross that threshold with rows the
+/// nest will actually decode. Zero-value pads between [`seal_pad_from`] and [`seal_pad_to`]
+/// do not move balances, supply, or holder counts.
+pub fn pad_address_to_seal(fx: &mut BlockFixture, address: &str, rows_before: usize) {
+    let already_here = fx
+        .logs
+        .iter()
+        .filter(|l| l.address.eq_ignore_ascii_case(address))
+        .count();
+    let need = nuthatch::indexer::SEAL_DIRECT_BATCH
+        .saturating_sub(rows_before.saturating_add(already_here));
+    if need == 0 {
+        return;
+    }
+    let from = seal_pad_from();
+    let to = seal_pad_to();
+    let block_number = fx.logs.first().map(|l| l.block_number).unwrap_or(0);
+    let start = fx.logs.len() as u64;
+    for i in 0..need {
+        let log_index = start + i as u64;
+        fx.logs.push(transfer_log(
+            address,
+            block_number,
+            log_index,
+            &fx.hash,
+            &from,
+            &to,
+            0,
+        ));
+    }
+}
+
+/// Append copies of the last log so this block crosses the tip-path batch threshold.
+/// Used for Sync (and anything else whose latest-row semantics must survive padding):
+/// the real last log stays last if the caller pads *from a clone of it*, so we copy it
+/// and the latest value does not change.
+pub fn pad_clone_last_to_seal(fx: &mut BlockFixture, rows_before: usize) {
+    let need = nuthatch::indexer::SEAL_DIRECT_BATCH
+        .saturating_sub(rows_before.saturating_add(fx.logs.len()));
+    if need == 0 {
+        return;
+    }
+    let template = fx
+        .logs
+        .last()
+        .cloned()
+        .expect("pad_clone_last_to_seal needs an existing log");
+    let start = fx.logs.len() as u64;
+    for i in 0..need {
+        let mut log = template.clone();
+        log.log_index = start + i as u64;
+        log.tx_hash = format!("0x{:064x}", (log.block_number << 20) | log.log_index);
+        fx.logs.push(log);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TapeSource
 // ---------------------------------------------------------------------------
@@ -502,3 +573,41 @@ pub async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> b
 /// A generous ceiling for a bounded poll. The loop's own idle re-poll is ~2 s, so this comfortably
 /// covers reorg detection + reconvergence while still failing fast on a genuine hang.
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Waiting for a tip-path seal now means decoding and writing
+/// [`nuthatch::indexer::SEAL_DIRECT_BATCH`] rows, which is more than [`POLL_TIMEOUT`] on a
+/// debug build. Last-block waits stay on [`POLL_TIMEOUT`].
+pub const SEAL_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Seal `from..=to` through the public seal API and prune the hot store.
+///
+/// Use this in fixtures that need Parquet and a watermark but do not need to
+/// prove `maybe_seal` itself. The tip path will not seal a short range (#1067),
+/// and stuffing [`nuthatch::indexer::SEAL_DIRECT_BATCH`] dummy events into a
+/// fixture that later asserts exact row counts (or runs an entity circuit)
+/// is the wrong tool.
+pub fn force_seal_through(dir: &Path, to: u64) {
+    let store = nuthatch::store::Store::open(&dir.join("nuthatch.redb")).expect("open store");
+    let from = match store.sealed_through() {
+        0 => 1,
+        n => n + 1,
+    };
+    if to < from {
+        return;
+    }
+    let rows = store
+        .entities_in_range(from, to)
+        .expect("entities_in_range");
+    if rows.is_empty() {
+        store
+            .set_meta("sealed_through", &to.to_string())
+            .expect("advance empty watermark");
+        return;
+    }
+    nuthatch::seal::seal_range(dir, &rows, from, to)
+        .unwrap()
+        .expect("range holds rows");
+    store
+        .prune_and_set_meta(from, to, "sealed_through", &to.to_string())
+        .expect("prune sealed range");
+}

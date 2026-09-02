@@ -27,14 +27,19 @@ fn dual_block(b: u64) -> BlockFixture {
     let hash = block_hash(b, 0);
     let a1 = account(1);
     let a2 = account(2);
-    BlockFixture {
+    let mut fx = BlockFixture {
         hash: hash.clone(),
         timestamp: 1_700_000_000 + b,
         logs: vec![
             transfer_log(USDC, b, 0, &hash, &a1, &a2, (100 * b) as u128),
             transfer_log(ARB, b, 1, &hash, &a1, &a2, (200 * b) as u128),
         ],
+    };
+    if b == 6 {
+        pad_address_to_seal(&mut fx, USDC, 5);
+        pad_address_to_seal(&mut fx, ARB, 5);
     }
+    fx
 }
 
 fn seg_hashes(dir: &Path, name: &str) -> Vec<String> {
@@ -122,7 +127,7 @@ async fn migrating_preserves_every_sealed_byte() {
     tape.advance_finalized_to(6);
     tape.insert_block(9, empty_block(9, 0, 1_700_000_009));
     tape.advance_tip_to(9);
-    let sealed = wait_until(POLL_TIMEOUT, || {
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || {
         stores.iter().all(|s| s.sealed_through() >= 6)
     })
     .await;

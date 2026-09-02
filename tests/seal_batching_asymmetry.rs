@@ -3,8 +3,8 @@
 //!
 //! `indexer::take_sealable` holds rows until `SEAL_DIRECT_BATCH` and cuts at a block boundary chosen
 //! from the data, so segment identity does not depend on `--window` or `--concurrency`. The tip path
-//! (`seal_finalized`) has no threshold: it seals whatever finalised, which at tip is a few blocks
-//! carrying a few rows.
+//! (`seal_finalized` / `maybe_seal`) had no threshold: it sealed whatever finalised, which at tip
+//! is a few blocks carrying a few rows. #1067 gave the tip path the same cut.
 //!
 //! Measured on the Lodestar box: median segment **6.3 KB**, p80 17.1 KB, max 1,864 KB, and the three
 //! largest are all from the busiest table's backfill. `docs/bench/segment-layout.md`.

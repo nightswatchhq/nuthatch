@@ -75,10 +75,15 @@ That was true and it was not the mechanism.
 the block that carried the buffer past the threshold". That is what makes segment identity independent
 of `--window` and `--concurrency`, which RFC-0019's bundles and RFC-0020's segment reuse both rest on.
 
-**The tip path does not.** `seal_finalized` computes `from = sealed_through + 1` and
-`ceiling = min(finalized_through, last_indexed)` and seals that range, with no row threshold at all.
-At tip, each finality advance is a handful of blocks carrying a handful of rows, and each becomes its
-own Parquet file.
+**The tip path did not.** `maybe_seal` (called `seal_finalized` in earlier write-ups) computed
+`from = sealed_through + 1` and `ceiling = min(finalized_through, last_indexed)` and sealed that
+range, with no row threshold at all. At tip, each finality advance is a handful of blocks carrying a
+handful of rows, and each became its own Parquet file. **#1067 gave it the same `take_sealable` cut
+the backfill path already had**: hold until `SEAL_DIRECT_BATCH` rows have finalised, then cut at the
+block that carried the buffer past the threshold. The numbers below are why.
+
+The measurement that follows is from before that change. It stays, because it is the evidence the
+change rests on, not a description of the binary after it.
 
 The distribution says so plainly:
 

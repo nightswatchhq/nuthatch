@@ -36,7 +36,11 @@ fn transfer_at(b: u64) -> BlockFixture {
 fn tape_with_ten_transfers() -> Arc<TapeSource> {
     let tape = Arc::new(TapeSource::new());
     for b in 1..=10u64 {
-        tape.insert_block(b, transfer_at(b));
+        let mut fx = transfer_at(b);
+        if b == 5 {
+            pad_address_to_seal(&mut fx, USDC, 4);
+        }
+        tape.insert_block(b, fx);
     }
     tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
     tape.advance_tip_to(11);
@@ -132,7 +136,7 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     tape.advance_finalized_to(5);
     tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
     tape.advance_tip_to(12);
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await;
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await;
     assert!(sealed, "range [1,5] did not seal in time");
 
     let before = balances_of(&rt);
@@ -219,14 +223,18 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
     // Snapshot the hot rows for [1,5] BEFORE they are sealed and pruned - these are the rows a crash
     // would leave behind, so re-inserting them later reproduces the state exactly.
     let doomed: Vec<String> = store.entities_in_range(1, 5).unwrap();
-    assert_eq!(doomed.len(), 5, "blocks 1..=5 should be hot before sealing");
+    assert_eq!(
+        doomed.len(),
+        indexer::SEAL_DIRECT_BATCH,
+        "blocks 1..=5 should be hot before sealing, including the seal-batch padding"
+    );
 
     // Now let the pipeline seal [1,5] and prune it, for real.
     tape.advance_finalized_to(5);
     tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
     tape.advance_tip_to(12);
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await,
         "range [1,5] did not seal in time"
     );
     shutdown(rt).await;
@@ -247,7 +255,7 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
         s.set_meta("sealed_through", "0").unwrap();
         assert_eq!(
             s.entities_in_range(1, 10).unwrap().len(),
-            10,
+            indexer::SEAL_DIRECT_BATCH + 5,
             "the crash state must hold every row hot AND sealed"
         );
     }
@@ -305,7 +313,7 @@ async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
     tape.insert_block(12, empty_block(12, 0, 1_700_000_200));
     tape.advance_tip_to(12);
     assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 5).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await,
         "range [1,5] did not seal in time"
     );
     // **Pin a watermark no seal in this fixture could produce.**
