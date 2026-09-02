@@ -10,8 +10,10 @@
 # This version compares:
 #   allocations  nest count vs subgraph allocations where isLegacy: false
 #   disputes     nest ids vs subgraph disputes where isLegacy: false
-#   epochs       last 30 overlapping ids, field-by-field; start/end block are
-#                L2 vs L1 and are reported as INCOMPARABLE, not DIFF
+#   epochs       field-by-field over the closed, comparable window (see EPOCH_PARITY_FROM).
+#                The reward trio is a hard gate. Three fields measure a different quantity
+#                from their subgraph namesakes and are reported KNOWN-DIFF (#1113), never OK.
+#                start/end block are L2 vs L1 and are INCOMPARABLE, not DIFF.
 #   escrow       counts, with a type breakdown; ids are different schemes
 #
 # On disagreement it prints the differing rows, not just a count.
@@ -22,7 +24,20 @@ BLOCK=${PINNED_BLOCK:-}
 NETWORK_SG=DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp
 GATEWAY=${GRAPH_GATEWAY:-https://gateway-arbitrum.network.thegraph.com}
 
+# The nest indexes Horizon (`subgraph_service__*`) events only. Below epoch 1195 the network was
+# still paying legacy staking rewards the nest never sees, so the two sides describe different
+# populations there and a comparison would be the same category error as all-time
+# `allocationCount` vs Horizon-only allocations. 1195 is the first epoch at which the reward trio
+# agrees to the digit and keeps agreeing. The script asserts BOTH halves of that claim: agreement
+# above the boundary, and continued disagreement below it. A window widened until it goes green
+# therefore fails instead.
+EPOCH_PARITY_FROM=${EPOCH_PARITY_FROM:-1195}
+case "$EPOCH_PARITY_FROM" in
+  ''|*[!0-9]*) die_early=1 ;;
+esac
+
 die() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+[ -z "${die_early:-}" ] || die "EPOCH_PARITY_FROM must be a decimal epoch, got ${EPOCH_PARITY_FROM}"
 
 if [ -n "$BLOCK" ]; then
   case "$BLOCK" in
@@ -41,9 +56,15 @@ if not d.get("ready"):
 print("ready last_block=%s sealed_through=%s" % (d.get("last_block"), d.get("sealed_through")))
 PY
 
-# Aggregate nest views do not expose historical versions or a reorg generation. The comparison is
-# therefore valid only for immutable fact rows at the sealed boundary. Mutable epoch aggregates
-# have no as-of surface and are deliberately count-only below.
+# Aggregate nest views do not expose historical versions or a reorg generation, so the comparison is
+# pinned to the sealed boundary.
+#
+# Epoch aggregates were previously skipped here as having "no as-of surface". That is not true, and
+# #1113 records the measurement. `lodestar_epochs` aggregates with no block filter, but every epoch
+# except the newest is immutable at a pin: rewards group by the event's own `currentEpoch`, which is
+# monotonic in block, and fees and signal bucket by `block_number` inside a window that closes as
+# soon as the successor epoch is first observed. An epoch whose successor is already visible at the
+# pin cannot change. Only the newest epoch is open, and it is excluded below.
 if [ -z "$BLOCK" ]; then
   BLOCK=$(python3 - "$ready" << 'PY'
 import json,sys
@@ -97,6 +118,10 @@ echo "nest lodestar_epochs $(nest_count lodestar_epochs start_block)"
 echo "nest lodestar_disputes $(nest_count lodestar_disputes created_at_block)"
 echo "nest lodestar_escrow_transactions $(nest_count lodestar_escrow_transactions block_number)"
 
+EPOCH_SUMMARY=$(mktemp)
+trap 'rm -f "$EPOCH_SUMMARY"' EXIT
+export EPOCH_SUMMARY
+
 if [ -z "${GRAPH_API_KEY:-}" ]; then
   die "GRAPH_API_KEY is unset: the subgraph side was not asked, so this is not a comparison"
 fi
@@ -107,7 +132,7 @@ EPOCH_N=$(nest_count lodestar_epochs start_block)
 DISPUTE_N=$(nest_count lodestar_disputes created_at_block)
 ESCROW_N=$(nest_count lodestar_escrow_transactions block_number)
 
-export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY NEST
+export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY NEST EPOCH_PARITY_FROM
 python3 - << 'PY' || die "subgraph comparison failed"
 import json, os, sys, urllib.parse, urllib.request
 
@@ -246,7 +271,146 @@ if only_sg:
     failed = True
     print("  subgraph-only: %s" % ", ".join(only_sg[:20]))
 
-print("lodestar_epochs count-only: mutable aggregates have no historical snapshot surface")
+# --- epochs: field-by-field at the pinned block ---
+# Two classes of field, and the difference is the whole point of #1113:
+#   gate       the reward trio, which is keyed by the event's own `currentEpoch` and is directly
+#              comparable. Any disagreement above EPOCH_PARITY_FROM fails the run.
+#   known-diff signalled_tokens, query_fees_collected and curator_query_fees, which measure a
+#              different quantity from their subgraph namesakes. They are compared and their
+#              disagreement is printed, but the count is not silently absorbed: the run cannot
+#              report OK on their behalf, and if one of them starts agreeing that is reported too,
+#              because it means #1113 moved and this script's classification is stale.
+EPOCH_GATE = [
+    ("total_rewards", "totalRewards"),
+    ("total_indexer_rewards", "totalIndexerRewards"),
+    ("total_delegator_rewards", "totalDelegatorRewards"),
+]
+EPOCH_KNOWN_DIFF = [
+    ("signalled_tokens", "signalledTokens"),
+    ("query_fees_collected", "queryFeesCollected"),
+    ("curator_query_fees", "curatorQueryFees"),
+]
+epoch_from = int(os.environ["EPOCH_PARITY_FROM"])
+
+nest_epochs = {
+    str(r["id"]): r
+    for r in nest_sql(
+        "SELECT * FROM lodestar_epochs WHERE start_block <= %s" % block
+    )
+}
+if not nest_epochs:
+    raise SystemExit("lodestar_epochs returned no rows at block %s" % block)
+# EPOCH_N was counted before the subgraph was asked. If the two reads of the same pinned view
+# disagree the snapshot moved underneath us and nothing below is a comparison.
+if len(nest_epochs) != int(os.environ["EPOCH_N"]):
+    raise SystemExit(
+        "lodestar_epochs changed between reads at block %s: counted %s, then read %s"
+        % (block, os.environ["EPOCH_N"], len(nest_epochs))
+    )
+
+# The newest epoch at the pin is still open: its end_block is its own last observation and both it
+# and its totals still move. Excluding it is what makes the rest immutable.
+open_epoch = max(nest_epochs, key=int)
+
+sg_epochs = {}
+ordered = sorted(nest_epochs, key=int)
+for i in range(0, len(ordered), 100):
+    chunk = ordered[i : i + 100]
+    data = gql(
+        "{ epoches(first: 1000, where: { id_in: [%s] }, block: { number: %s }) { id %s } }"
+        % (
+            ",".join('"%s"' % e for e in chunk),
+            block,
+            " ".join(g for _, g in EPOCH_GATE + EPOCH_KNOWN_DIFF),
+        )
+    )
+    for r in data.get("epoches") or []:
+        sg_epochs[str(r["id"])] = r
+
+overlap = [e for e in ordered if e in sg_epochs and e != open_epoch]
+if not overlap:
+    raise SystemExit(
+        "no closed epoch is held by both sides at block %s, so nothing was compared" % block
+    )
+gated = [e for e in overlap if int(e) >= epoch_from]
+below = [e for e in overlap if int(e) < epoch_from]
+if not gated:
+    raise SystemExit(
+        "EPOCH_PARITY_FROM=%s leaves no epoch to compare (overlap is %s..%s)"
+        % (epoch_from, overlap[0], overlap[-1])
+    )
+
+print(
+    "lodestar_epochs nest=%s overlap=%s open_excluded=%s gated=%s (>=%s) below=%s"
+    % (len(nest_epochs), len(overlap) + 1, open_epoch, len(gated), epoch_from, len(below))
+)
+
+def disagreements(ids, pairs):
+    out = {}
+    for nest_col, sg_col in pairs:
+        bad = [
+            (e, str(nest_epochs[e][nest_col]), str(sg_epochs[e][sg_col]))
+            for e in ids
+            if str(nest_epochs[e][nest_col]) != str(sg_epochs[e][sg_col])
+        ]
+        out[nest_col] = bad
+    return out
+
+gate_bad = disagreements(gated, EPOCH_GATE)
+for nest_col, _ in EPOCH_GATE:
+    bad = gate_bad[nest_col]
+    status = "OK" if not bad else "DIFF"
+    print("  %s %s/%s epochs agree %s" % (nest_col, len(gated) - len(bad), len(gated), status))
+    if bad:
+        failed = True
+        for e, a, b in bad[:20]:
+            print("    epoch %s nest=%s subgraph=%s" % (e, a, b))
+
+# The boundary must have teeth. If the reward trio also agrees below EPOCH_PARITY_FROM then the
+# window is not measuring what its comment claims, and a green run above it proves nothing.
+if below:
+    below_bad = disagreements(below, EPOCH_GATE)
+    if not any(below_bad[c] for c, _ in EPOCH_GATE):
+        failed = True
+        print(
+            "  BOUNDARY epochs below %s now agree too: EPOCH_PARITY_FROM excludes comparable data "
+            "and must be lowered" % epoch_from
+        )
+    else:
+        print(
+            "  boundary holds: %s of %s epochs below %s still disagree (legacy staking rewards)"
+            % (
+                max(len(below_bad[c]) for c, _ in EPOCH_GATE),
+                len(below),
+                epoch_from,
+            )
+        )
+
+known_bad = disagreements(gated, EPOCH_KNOWN_DIFF)
+epoch_known_diff = []
+for nest_col, _ in EPOCH_KNOWN_DIFF:
+    bad = known_bad[nest_col]
+    if bad:
+        epoch_known_diff.append(nest_col)
+        print(
+            "  %s %s/%s epochs disagree KNOWN-DIFF (#1113)"
+            % (nest_col, len(bad), len(gated))
+        )
+        for e, a, b in bad[:3]:
+            print("    epoch %s nest=%s subgraph=%s" % (e, a, b))
+    else:
+        # Not a failure, but the classification above is now wrong and must not go unnoticed.
+        failed = True
+        print(
+            "  %s now agrees on all %s epochs: #1113 has moved, reclassify it as a gate"
+            % (nest_col, len(gated))
+        )
+
+# start_block/end_block are L2 observations here and L1 epoch boundaries there.
+print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
+
+with open(os.environ["EPOCH_SUMMARY"], "w") as fh:
+    fh.write("%s %s\n" % (len(gated), ",".join(epoch_known_diff) or "-"))
 
 # --- escrow: counts only at pinned block; ids are different schemes ---
 escrow_sg = page_count("paymentsEscrowTransactions")
@@ -260,7 +424,7 @@ types = nest_sql(
 print("  nest types: %s" % ", ".join("%s=%s" % (t["type"], t["n"]) for t in types))
 if status == "DIFF":
     failed = True
-    print("  ids are not joinable (nest tx_hash-log_index vs subgraph bytes id)")
+    print("  ids are not joinable (nest tx_hash-log_index vs subgraph bytes id); see #1114")
 
 if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
@@ -282,4 +446,9 @@ PY
 EOF
 [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
 [ "$AFTER_SEALED" -eq "$BLOCK" ] || die "sealed boundary changed during comparison"
+read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
 echo "parity OK at block $BLOCK"
+echo "  proved: allocation counts, dispute id sets, escrow counts, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
+if [ "$EPOCH_KNOWN" != "-" ]; then
+  echo "  NOT proved: epoch fields ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113"
+fi
