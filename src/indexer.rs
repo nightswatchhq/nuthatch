@@ -2605,19 +2605,25 @@ fn drain_sealable(buf: &mut Vec<(u64, String)>) -> Vec<String> {
     buf.drain(..).map(|(_, j)| j).collect()
 }
 
-/// Drain every currently-sealable prefix from `buf`.
+/// Drain every currently-sealable prefix from `buf` one segment at a time via `f`.
 ///
 /// `while`, not `if` (#980, #1015). A fetched chunk can carry many multiples of
 /// `SEAL_DIRECT_BATCH`; taking only one of them per chunk made the *number* of
 /// segments a function of `--window`. The three production loops and the
 /// window-independence tests all go through here, so turning this back into
 /// `if let` is visible.
-fn take_all_sealable(buf: &mut Vec<(u64, String)>) -> Vec<(Vec<String>, u64)> {
-    let mut out = Vec::new();
-    while let Some(seg) = take_sealable(buf) {
-        out.push(seg);
+///
+/// Dispatches each segment to `f` immediately as it is detached from `buf`, so
+/// segments are sealed and dropped one by one without accumulating multiple
+/// segments in memory concurrently.
+fn drain_all_sealable(
+    buf: &mut Vec<(u64, String)>,
+    mut f: impl FnMut(Vec<String>, u64) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    while let Some((rows, seal_to)) = take_sealable(buf) {
+        f(rows, seal_to)?;
     }
-    out
+    Ok(())
 }
 
 /// Above this many discovered children, the factory backfill flips from an address-list filter to a
@@ -3054,7 +3060,7 @@ pub async fn backfill_direct(
 
         // Flush on a data-determined boundary (RFC-0028 §4), not on the fetch window's end.
         //
-        // `take_all_sealable` is `while`, not `if` (#980, #1015). A single fetched chunk can carry
+        // `drain_all_sealable` is `while`, not `if` (#980, #1015). A single fetched chunk can carry
         // many multiples of `SEAL_DIRECT_BATCH`, and sealing only one of them per chunk made the
         // *number* of segments a function of `--window`: measured on a 30,000-block corpus, window
         // 320 produced 6 segments with a largest of 20,003 rows, and window 163,840 produced 2 with
@@ -3062,10 +3068,11 @@ pub async fn backfill_direct(
         // the operator-dependent segmentation RFC-0028 §4 exists to prevent and what RFC-0019
         // bundles and RFC-0020 segment reuse both rest on. Draining fully restores it: 6 segments at
         // every window.
-        for (rows, seal_to) in take_all_sealable(&mut buf) {
+        drain_all_sealable(&mut buf, |rows, seal_to| {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
-        }
+            Ok(())
+        })?;
         if next > to && !buf.is_empty() {
             seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
             batch_from = next;
@@ -3641,13 +3648,14 @@ pub async fn backfill_direct_pipelined(
         total += n;
         buf.extend(json);
         on_progress(w_to, n);
-        // `take_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
+        // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
-        for (rows, seal_to) in take_all_sealable(&mut buf) {
+        drain_all_sealable(&mut buf, |rows, seal_to| {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
             on_seal(seal_to)?;
-        }
+            Ok(())
+        })?;
     }
     if !buf.is_empty() {
         seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
@@ -3893,9 +3901,9 @@ pub async fn backfill_direct_factory(
         on_progress(chunk_to, row_count as u64);
 
         // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path - including
-        // `take_all_sealable`'s `while` rather than `if` (#980, #1015), so segment identity does
+        // `drain_all_sealable`'s `while` rather than `if` (#980, #1015), so segment identity does
         // not depend on `--window`.
-        for (rows, seal_to) in take_all_sealable(&mut buf) {
+        drain_all_sealable(&mut buf, |rows, seal_to| {
             // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
             seal::seal_range_with_snapshot(
                 dir,
@@ -3906,7 +3914,8 @@ pub async fn backfill_direct_factory(
             )?;
             batch_from = seal_to + 1;
             on_seal(seal_to)?;
-        }
+            Ok(())
+        })?;
         if next > to && !buf.is_empty() {
             seal::seal_range_with_snapshot(
                 dir,
@@ -5981,9 +5990,12 @@ mod tests {
             let to = (from + window - 1).min(last_block);
             buf.extend(rows.iter().filter(|(b, _)| *b >= from && *b <= to).cloned());
             from = to + 1;
-            // Production drain, not a copy of it (#1015). Reverting `take_all_sealable`'s
+            // Production drain, not a copy of it (#1015). Reverting `drain_all_sealable`'s
             // `while` to `if` is this test going red.
-            segments.extend(take_all_sealable(&mut buf));
+            let _ = drain_all_sealable(&mut buf, |rows, seal_to| {
+                segments.push((rows, seal_to));
+                Ok(())
+            });
         }
         (segments, drain_sealable(&mut buf))
     }
