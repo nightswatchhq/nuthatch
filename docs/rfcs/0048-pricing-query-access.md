@@ -345,20 +345,32 @@ and `UNION ALL`s them into each table's view, with hot and cold kept structurall
 `sealed_through` watermark. That materialisation is a bounded, observable step that happens **before**
 any user SQL is evaluated, and it is therefore the enforcement point:
 
+- Refuse at admission, before materialising anything, when `cold_bound >= threshold`. There is no
+  budget left to spend and no reason to copy a single hot row first.
 - Materialise the hot side under **one redb read transaction**, so the set is fixed for the
   query's lifetime and blocks arriving mid-scan land in a later version it cannot see. Today that
   set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
-- **Count real bytes while materialising**, and abort the moment the running total crosses the
-  admitted ceiling. Not an estimate compared against a threshold, but the actual copy refusing to
-  grow past it.
+- **Count real bytes while materialising, against the residual budget** - `threshold - cold_bound`,
+  not the threshold. Charging the hot copy against the whole ceiling is the obvious mistake and it
+  is worth naming: a 1 GB threshold with a 900 MB cold bound and 200 MB of hot rows passes a naive
+  hot counter while the query reads 1.1 GB. The hot side may only spend what cold has not already
+  claimed.
 - The cold side is already immutable by construction: sealed segments never change, and the
   catalogue version pins which of them exist.
 
-That makes the ceiling hard **by construction** rather than by promise, and it costs no coordination
-with the writer, which matters because the single-writer ingestion thread is not something a serving
-path may block. It also relocates the guard from a prediction to a measurement, which is the general
-shape this RFC should prefer wherever it can: §3's byte bound stays a *quote* input, and the thing
-that actually stops a runaway scan is a counter on a copy that is already being made.
+**What that adds up to, without overclaiming.** The hot half is hard by construction: a measured
+counter on a copy that is already being made, needing no coordination with the single-writer
+ingestion thread, which a serving path may not block. The cold half is **plan-bounded, not
+counted** - its guarantee is rules 1 to 5 above plus the existing wall-clock timeout and 512 MB
+memory cap.
+
+So the honest description of Phase 0 is **not** "a hard total byte ceiling". It is a hard ceiling on
+hot bytes and a reviewed static bound on cold bytes, and the two are not the same kind of promise.
+Writing it the other way round would be the exact failure this RFC keeps warning about elsewhere:
+a check that reads as a guarantee because nobody said which half it covers. A cold bytes-read
+counter on the scan path, aborting the way the hot materialisation does, is what would make the
+total ceiling hard, and until it exists the RFC should say total *bound* and reserve *cap* for the
+hot side.
 
 The cost is stated rather than hidden: aborting mid-materialisation means the node did real work for
 a query it will not serve, and it must not bill for it. That is the same rule as a rejected
