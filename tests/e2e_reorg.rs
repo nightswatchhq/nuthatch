@@ -474,6 +474,21 @@ async fn reorg_below_finality_halts() {
     let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 8).await;
     assert!(sealed, "range [1,8] did not seal in time");
 
+    // The tip moved to 12 above, and waiting only for the seal says nothing about where the *cursor*
+    // got to. Without this the snapshot below races the ingest loop: it can catch `last_block` at 10,
+    // 11 or 12 depending on scheduling, and the post-halt assertion then compares the settled cursor
+    // against a stale snapshot and reports a rollback that never happened. Observed in CI on
+    // 2026-09-02 as `left: Some("12"), right: Some("10")` under a message about a rollback, which is
+    // the opposite direction to what the numbers say (#1119).
+    let settled = wait_until(POLL_TIMEOUT, || {
+        store.get_meta("last_block").ok().flatten().as_deref() == Some("12")
+    })
+    .await;
+    assert!(
+        settled,
+        "nest did not index blocks 11 and 12 before the snapshot"
+    );
+
     // Snapshot the sealed layer and the cursor *before* the violation, so "it did not touch them"
     // is an observation rather than an assumption.
     let sealed_before = sealed_bytes(dir.path());
@@ -512,8 +527,10 @@ async fn reorg_below_finality_halts() {
     assert_eq!(
         store.get_meta("last_block").unwrap(),
         cursor_before,
-        "the hot cursor was rolled back into the sealed range before the refusal - the halt must \
-         come before the rollback, not after it"
+        "the hot cursor moved before the refusal - the halt must come before any cursor write, \
+         whichever direction it goes. A rollback into the sealed range is the feared case; a cursor \
+         that advanced instead means the loop indexed past the snapshot, which is a fixture race \
+         rather than a violation (#1119), and the numbers tell you which"
     );
     assert_eq!(
         store.entities_in_range(1, 12).unwrap(),
