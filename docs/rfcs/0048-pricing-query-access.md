@@ -279,7 +279,7 @@ not.
 So the snapshot carries `hot_bytes`, the store's real size, and not merely a row count:
 
 ```
-(catalogue_version, sealed_through, hot_rows, hot_bytes)
+(catalogue_hash, sealed_through, hot_rows, hot_bytes)
 ```
 
 `hot_bytes` makes the unbounded class **exact** rather than estimated, which matters because that is
@@ -312,7 +312,7 @@ captured **before planning**, and the `402` body quotes it alongside the coeffic
 is a **four-field record**, and each element is load-bearing:
 
 ```
-(catalogue_version, sealed_through, hot_rows, hot_bytes)
+(catalogue_hash, sealed_through, hot_rows, hot_bytes)
 ```
 
 `sealed_through` and `hot_rows` alone are **not sufficient**, and assuming they were is the easiest
@@ -321,10 +321,22 @@ side of it*. A catalogue revision can restate segment statistics, or compact and
 segment set, with both of those numbers unchanged. A client recomputing from the quoted pair would
 then derive a different `cold_bytes` than the node did, and execution could admit against a
 different bound than the one quoted, while §4 goes on claiming the price is reproducible over
-published metadata. Binding the quote to the catalogue version closes that, and it is the direct
-consumer of RFC-0047's second commitment - version the catalogue that already exists rather than
-adding a second source of truth. **Execution must use that exact catalogue.** If it has been
-superseded, the node re-quotes rather than silently pricing against a newer one.
+published metadata.
+
+**And it must be the catalogue's content hash, not a version label.** A version is a name, and a
+name can be re-pointed: the manifest for `v` replaced in place, or two hosts resolving `v` to
+different bytes. Either breaks the recomputation §4 promises while every field in the quote still
+matches. This is not a new discipline to invent - the architecture is content-addressed throughout,
+segments included, and RFC-0047's second commitment is to version the manifest that already exists
+with an atomic rename rather than add a second source of truth. The quote carries the hash of that
+manifest, and **execution must use that exact catalogue**. If it has been superseded, the node
+re-quotes rather than silently pricing against a newer one.
+
+Which imposes one obligation worth stating rather than discovering later: **a quoted catalogue hash
+must stay resolvable for as long as the quote is valid.** A quote whose catalogue has been compacted
+away cannot be honoured or verified, so quote validity and catalogue retention are the same window,
+and the shorter of the two is the real one. That is the whole contract: hash in the quote, retention
+at least as long as the quote, and a re-quote rather than a substitution when either lapses.
 
 The boundary half is not ceremony either. It moves on its own: measured on the Lodestar box on
 2026-09-02, `sealed_through` advanced from 501070866 to 501072741 inside a few minutes of ordinary
