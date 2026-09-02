@@ -41,32 +41,36 @@ if not d.get("ready"):
 print("ready last_block=%s sealed_through=%s" % (d.get("last_block"), d.get("sealed_through")))
 PY
 
-# Aggregate nest views do not expose historical versions. The comparison is therefore valid only
-# at the nest's current block, not at an arbitrary old pin: filtering a current aggregate by its
-# start block does not turn its values into an as-of snapshot.
+# Aggregate nest views do not expose historical versions or a reorg generation. The comparison is
+# therefore valid only at the immutable sealed boundary: filtering a current aggregate by its
+# start block does not turn its values into an as-of snapshot, and height equality alone does not
+# distinguish two canonical histories after a reorg.
 if [ -z "$BLOCK" ]; then
   BLOCK=$(python3 - "$ready" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
-n=d.get("last_block") or 0
+n=d.get("sealed_through") or 0
 if not n:
     raise SystemExit(1)
 print(int(n))
 PY
-) || die "last_block is missing so there is no pin"
-  echo "PINNED_BLOCK defaulted to nest last_block=$BLOCK"
+) || die "sealed_through is missing so there is no immutable pin"
+  echo "PINNED_BLOCK defaulted to sealed_through=$BLOCK"
 fi
 
-NEST_BLOCK=$(python3 - "$ready" << 'PY'
+read -r NEST_BLOCK NEST_SEALED <<EOF
+$(python3 - "$ready" << 'PY'
 import json,sys
-n=json.loads(sys.argv[1]).get("last_block")
-if n is None:
+d=json.loads(sys.argv[1])
+if d.get("last_block") is None or d.get("sealed_through") is None:
     raise SystemExit(1)
-print(int(n))
+print(int(d["last_block"]), int(d["sealed_through"]))
 PY
-) || die "nest last_block is missing"
-[ "$NEST_BLOCK" -eq "$BLOCK" ] || die \
-  "PINNED_BLOCK=$BLOCK but nest is at $NEST_BLOCK; current aggregate views have no as-of query"
+)
+EOF
+[ -n "${NEST_BLOCK:-}" ] && [ -n "${NEST_SEALED:-}" ] || die "nest readiness lacks a stable boundary"
+[ "$NEST_BLOCK" -eq "$BLOCK" ] && [ "$NEST_SEALED" -eq "$BLOCK" ] || die \
+  "PINNED_BLOCK=$BLOCK requires last_block=sealed_through=$BLOCK; live hot state has no stable snapshot"
 
 nest_count() {
   local view="$1" col="$2"
@@ -316,19 +320,21 @@ if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
 PY
 
-# `/sql` reads the live aggregate. The pre-read equality check above establishes the snapshot at
-# entry; this post-read check makes it stable for the full comparison rather than allowing the
-# cursor to advance while the GraphQL pages are being fetched.
+# `/sql` reads the live aggregate. The pre-read sealed boundary is immutable; this post-read check
+# rejects any progress, so the comparison cannot mix that sealed snapshot with later hot state.
 ready_after=$(curl -fsS -m10 -A 'nuthatch-lodestar-parity' "$NEST/ready" || true)
 [ -n "$ready_after" ] || die "nest at $NEST did not answer /ready after comparison"
-AFTER_BLOCK=$(python3 - "$ready_after" << 'PY'
+read -r AFTER_BLOCK AFTER_SEALED <<EOF
+$(python3 - "$ready_after" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
-if not d.get("ready") or d.get("last_block") is None:
+if not d.get("ready") or d.get("last_block") is None or d.get("sealed_through") is None:
     raise SystemExit(1)
-print(int(d["last_block"]))
+print(int(d["last_block"]), int(d["sealed_through"]))
 PY
-) || die "nest /ready was not ready after comparison"
-[ "$AFTER_BLOCK" -eq "$BLOCK" ] || die \
-  "nest advanced from pinned block $BLOCK to $AFTER_BLOCK during comparison; no stable snapshot"
+)
+EOF
+[ -n "${AFTER_BLOCK:-}" ] && [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
+[ "$AFTER_BLOCK" -eq "$BLOCK" ] && [ "$AFTER_SEALED" -eq "$BLOCK" ] || die \
+  "nest changed during comparison: expected last_block=sealed_through=$BLOCK, got $AFTER_BLOCK/$AFTER_SEALED"
 echo "parity OK at block $BLOCK"
