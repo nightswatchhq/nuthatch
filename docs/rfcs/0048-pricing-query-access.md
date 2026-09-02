@@ -180,21 +180,50 @@ is what makes a deterministic hot term possible at all.
 
 | scan class | planner proves | hot term |
 |---|---|---|
-| keyed point read | entity key fully bound | one row width, a constant |
-| bounded range | block or key range bound, or `LIMIT` before any hot scan | `min(range_rows, hot_rows) × row_width` |
-| unbounded hot scan | nothing | `hot_rows × row_width`, the whole window |
+| keyed point read | the hot store's own key is fully bound by the predicate | one row width, a constant |
+| bounded range | a contiguous range **of that key** is bound, so the access path visits only that range | `min(range_rows, hot_rows) × row_width` |
+| unbounded hot scan | nothing above | `hot_rows × row_width`, the whole window |
 
 The third row is the honest default. It is a large number, and it should be: an unbounded scan of
 the mutable tip is exactly what a flat price cannot survive. It is still finite, and it is finite
 for a structural reason rather than an empirical one.
 
+**`LIMIT` is not a proof and must not be treated as one.** It bounds the rows a query *returns*,
+not the rows it *reads*. `SELECT ... FROM hot WHERE value = 7 LIMIT 1` has a predicate on a
+non-key column, so the access path is a full scan that stops early at best and reads the whole
+hot store when no row matches - which is the case a hostile caller picks. `ORDER BY ... LIMIT 1`
+is worse, since the sort must see every candidate before it can name the first. Both are
+**unbounded hot scans** for admission purposes and are priced as such. The classifier keys on the
+access path the planner actually chose, never on the shape of the SQL, because those two agree
+right up until the moment it matters.
+
+The bias is deliberate and one-directional: a query the classifier cannot prove bounded is priced
+as unbounded. That over-prices some legitimate queries, which is a complaint. The opposite error
+admits an unbounded scan under a bounded quote, which is an outage.
+
 **The consistency rule, which is the part that bites.** Both terms are computed against a snapshot
-`(sealed_through, hot_rows)` captured **before planning**, and the `402` body quotes that pair
-alongside the coefficients. This is not ceremony. The boundary moves on its own: measured on the
-Lodestar box on 2026-09-02, `sealed_through` advanced from 501070866 to 501072741 inside a few
-minutes of ordinary operation, and a parity script pinned to the earlier value refused to run
-against the later one. A quote that does not name its snapshot is a quote against an unstated
-moving target.
+captured **before planning**, and the `402` body quotes it alongside the coefficients. The snapshot
+is a **triple**, and each element is load-bearing:
+
+```
+(catalogue_version, sealed_through, hot_rows)
+```
+
+`sealed_through` and `hot_rows` alone are **not sufficient**, and assuming they were is the easiest
+mistake to make here. They pin *where* the boundary sits, not *what the node knows about the cold
+side of it*. A catalogue revision can restate segment statistics, or compact and replace the
+segment set, with both of those numbers unchanged. A client recomputing from the quoted pair would
+then derive a different `cold_bytes` than the node did, and execution could admit against a
+different bound than the one quoted, while §4 goes on claiming the price is reproducible over
+published metadata. Binding the quote to the catalogue version closes that, and it is the direct
+consumer of RFC-0047's second commitment - version the catalogue that already exists rather than
+adding a second source of truth. **Execution must use that exact catalogue.** If it has been
+superseded, the node re-quotes rather than silently pricing against a newer one.
+
+The boundary half is not ceremony either. It moves on its own: measured on the Lodestar box on
+2026-09-02, `sealed_through` advanced from 501070866 to 501072741 inside a few minutes of ordinary
+operation, and a parity script pinned to the earlier value refused to run against the later one. A
+quote that does not name its snapshot is a quote against an unstated moving target.
 
 Sealing between quote and execution moves rows from hot to cold, which can move bytes from a
 scan-class term to a catalogue term and change the total in either direction.
