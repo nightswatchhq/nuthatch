@@ -1,4 +1,9 @@
-# Sprint: patient-plover
+# Sprint: patient-plover - **closed**
+
+> Closed 2026-09-02. Fifteen of eighteen landed. The board moved #1067, #1076 and #1078 out of
+> the labelled set so the sprint could close rather than wait on remaining CI, a Vercel Secret,
+> and the Lodestar cutover that depends on both. Those three stay open, unlabelled, for the next
+> sprint. PR 1098 remains in flight against #1067.
 
 **Eighteen issues** - every issue open on 2026-09-01. A sprint is a labelled set, not a calendar.
 This is a bigger set than `observant-osprey`'s six because the board's standing rule filled the
@@ -8,9 +13,15 @@ this is the bill for that.
 ## Definition of done
 
 Every issue carrying the **`patient-plover`** label is closed, and no open PR is for one of them.
-That is #1067, #1068, #1069, #1070, #1071, #1072, #1074, #1075, #1076, #1077, #1078, #1079, #1080,
-#1081, #1082, #1083, #1084 and #1086. Work discovered in flight is filed **unlabelled**; pulling it
-into scope needs a board reply.
+Work discovered in flight is filed **unlabelled**; pulling it into scope needs a board reply.
+
+As filed, that was eighteen: #1067, #1068, #1069, #1070, #1071, #1072, #1074, #1075, #1076, #1077,
+#1078, #1079, #1080, #1081, #1082, #1083, #1084 and #1086.
+
+**Reduced 2026-09-02.** The board unlabelled #1067, #1076 and #1078. Those three stay open, outside
+the labelled set (PR 1098 remains in flight against #1067). The labelled remainder, and the
+close, is the fifteen that completed: #1068, #1069, #1070, #1071, #1072, #1074, #1075, #1077,
+#1079, #1080, #1081, #1082, #1083, #1084 and #1086.
 
 ## The theme
 
