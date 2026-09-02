@@ -266,9 +266,13 @@ scan as a point read is worse than no admission check at all.
 
 Only after that benchmark.
 
-- **Hot / tip tier:** flat. The planner proves the query is bounded (point read, bounded-range
-  hot lookup, `LIMIT`-ed tip). Charge like an RPC call. Most consumer named queries should live
-  here.
+- **Hot / tip tier:** flat. Entry is the **keyed point read** and **bounded range** scan classes
+  from Phase 0, and nothing else. The proof is a key-bound access path, never a `LIMIT`: this tier
+  is the one place where getting that wrong is profitable to exploit, since a caller who can dress
+  an unbounded scan as a tip lookup buys it at RPC-call prices. `SELECT * FROM hot WHERE value = 7
+  LIMIT 1` is an unbounded hot scan here exactly as it is in Phase 0, and a query the planner
+  cannot prove key-bound falls to the cold tier or is refused. Most consumer named queries should
+  still live here, because most of them really are point reads.
 - **Cold analytical tier:** `price = base + α·bytes_scanned_upper_bound` (+ optional
   `β·rows_returned` for egress). `base` covers fixed overhead; `α` covers I/O per byte of
   sealed Parquet. **Cap on the quoted bound, settle on actuals** if actuals are measured. The
