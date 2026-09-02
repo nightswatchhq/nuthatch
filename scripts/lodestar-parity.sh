@@ -190,12 +190,16 @@ if status == "DIFF":
     failed = True
     print("  (all-time graphNetwork.allocationCount is a different population and is not compared)")
 
-# --- disputes: id sets, legacy excluded ---
-nest_disputes = {r["id"].lower() for r in nest_sql("SELECT id FROM lodestar_disputes")}
+# --- disputes: id sets at pinned block, legacy excluded ---
+# Note: lodestar_disputes indexes Arbitrum One (Horizon) dispute manager events directly.
+nest_disputes = {
+    r["id"].lower()
+    for r in nest_sql("SELECT id FROM lodestar_disputes WHERE created_at_block <= %s" % block)
+}
 sg_disputes = []
 last = ""
 while True:
-    w = f', where: {{ id_gt: "{last}" }}' if last else ""
+    w = f', where: {{ id_gt: "{last}", isLegacy: false }}' if last else ", where: { isLegacy: false }"
     data = gql(
         "{ disputes(first: 1000, orderBy: id, orderDirection: asc, block: { number: %s }%s) { id type isLegacy } }"
         % (block, w)
@@ -221,14 +225,15 @@ if only_sg:
     failed = True
     print("  subgraph-only: %s" % ", ".join(only_sg[:20]))
 
-# --- epochs: overlapping recent ids, skip L1-vs-L2 start/end ---
+# --- epochs: overlapping recent ids at pinned block, skip L1-vs-L2 start/end ---
 epoch_rows = nest_sql(
     "SELECT id, total_rewards, total_indexer_rewards, total_delegator_rewards, "
     "query_fees_collected, curator_query_fees, signalled_tokens "
-    "FROM lodestar_epochs ORDER BY id DESC LIMIT 30"
+    "FROM lodestar_epochs WHERE start_block <= %s ORDER BY id DESC LIMIT 30"
+    % block
 )
 if not epoch_rows:
-    raise SystemExit("nest lodestar_epochs returned no rows for field comparison")
+    raise SystemExit("nest lodestar_epochs returned no rows for field comparison at block %s" % block)
 ids = [str(int(r["id"])) for r in epoch_rows]
 id_list = ", ".join('"%s"' % i for i in ids)
 sg_epochs = {
@@ -274,12 +279,15 @@ print(
     % (len(ids) - len(missing_sg), epoch_diffs)
 )
 
-# --- escrow: counts only; ids are different schemes ---
+# --- escrow: counts only at pinned block; ids are different schemes ---
 escrow_sg = page_count("paymentsEscrowTransactions")
 escrow_nest = int(os.environ["ESCROW_N"])
 status = "OK" if escrow_nest == escrow_sg else "DIFF"
 print("lodestar_escrow_transactions nest=%s subgraph=%s %s" % (escrow_nest, escrow_sg, status))
-types = nest_sql("SELECT type, count(*) AS n FROM lodestar_escrow_transactions GROUP BY type ORDER BY type")
+types = nest_sql(
+    "SELECT type, count(*) AS n FROM lodestar_escrow_transactions WHERE block_number <= %s GROUP BY type ORDER BY type"
+    % block
+)
 print("  nest types: %s" % ", ".join("%s=%s" % (t["type"], t["n"]) for t in types))
 if status == "DIFF":
     failed = True
