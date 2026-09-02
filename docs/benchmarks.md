@@ -442,15 +442,20 @@ smaller band and a ceiling below the healthy enforced figure (#395).
 | | ceiling | what a breach means |
 |---|---|---|
 | `MAX_RSS_MB` | 2048 MB | the **budget** was broken. A product promise, not a tuning parameter. |
-| `REGRESSION_MB` | 180 MB | this scenario got materially more expensive. |
+| `REGRESSION_MB` | 466 MB | this scenario got materially more expensive. |
 
-Both halves of that 180 are measured **on the runner that enforces it**, which is the only place the
+Both halves of that 466 are measured **on the runner that enforces it**, which is the only place the
 margin is real:
 
 | | |
 |---|---|
-| runner baseline | 131 MB (ceiling sits 1.37x above) |
-| runner, carrying a deliberate leak | 323 MB (ceiling sits 1.79x below) |
+| runner baseline (#1067) | 372 MB (ceiling sits 1.25x above; CI run 33602467469) |
+| previous baseline (pre-batching) | 131 MB, ceiling 180 MB |
+
+#1067 is why it moved. The scenario is 12,010 rows per nest, below `SEAL_DIRECT_BATCH` (20,000), so
+the tip path now holds the whole 240,200 rows in the hot store instead of sealing each finality
+advance. The 2 GB budget still has 1.6 GB of margin. Re-derive with `scripts/multinest-rss-spread.sh`
+on the runner before moving it again.
 
 The budget alone cannot be a regression gate. The scenario measures ~145 MB against 2048, so a change
 could cost ten times the memory and still pass. A gate that cannot fail is not coverage, so the

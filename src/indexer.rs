@@ -2572,9 +2572,10 @@ fn shorten_store(url: &str) -> &str {
     }
 }
 
-/// Batch size (rows) at which `backfill_direct` flushes a sealed segment - bounds RSS during a
-/// from-history backfill regardless of how long the range is.
-const SEAL_DIRECT_BATCH: usize = 20_000;
+/// Batch size (rows) at which both seal paths cut a segment: `backfill_direct` via
+/// [`take_sealable`], the tip path via [`tip_seal_cut`]. Public so integration tests can pad a
+/// finalized range to the same threshold without duplicating the number.
+pub const SEAL_DIRECT_BATCH: usize = 20_000;
 
 /// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
 /// window happened to stop (RFC-0028 §4).

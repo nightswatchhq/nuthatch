@@ -40,16 +40,17 @@ fn fresh_tape() -> Arc<TapeSource> {
     let a1 = account(1);
     let a2 = account(2);
     for b in 1..=BLOCKS {
-        tape.insert_block(
+        let mut fx = transfers_block(
             b,
-            transfers_block(
-                b,
-                0,
-                1_700_000_000 + b,
-                USDC,
-                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
-            ),
+            0,
+            1_700_000_000 + b,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
         );
+        if b == BLOCKS - 2 {
+            pad_address_to_seal(&mut fx, USDC, (BLOCKS - 3) as usize);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(BLOCKS);
     tape
@@ -110,7 +111,7 @@ async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
     tape.advance_finalized_to(BLOCKS - 2);
     tape.insert_block(BLOCKS + 1, empty_block(BLOCKS + 1, 0, 1_700_000_100));
     tape.advance_tip_to(BLOCKS + 1);
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= BLOCKS - 2).await;
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= BLOCKS - 2).await;
     assert!(sealed, "did not seal in time");
     let watermark = store.sealed_through();
 

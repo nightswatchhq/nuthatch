@@ -23,11 +23,16 @@ fn dual_block(b: u64) -> BlockFixture {
         transfer_log(USDC, b, 0, &hash, &a1, &a2, (100 * b) as u128),
         transfer_log(ARB, b, 1, &hash, &a1, &a2, (200 * b) as u128),
     ];
-    BlockFixture {
+    let mut fx = BlockFixture {
         hash,
         timestamp: 1_700_000_000 + b,
         logs,
+    };
+    if b == 6 {
+        pad_address_to_seal(&mut fx, USDC, 5);
+        pad_address_to_seal(&mut fx, ARB, 5);
     }
+    fx
 }
 
 /// A fresh, identically-scripted tape: blocks 1..=8 (dual transfers), tip 8, finality 0.
@@ -54,7 +59,7 @@ async fn drive_to_seal(tape: &TapeSource, stores: &[std::sync::Arc<dyn HotStore>
     tape.insert_block(9, empty_block(9, 0, 1_700_000_009));
     tape.advance_tip_to(9);
 
-    let sealed = wait_until(POLL_TIMEOUT, || {
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || {
         stores.iter().all(|s| s.sealed_through() >= 6)
     })
     .await;

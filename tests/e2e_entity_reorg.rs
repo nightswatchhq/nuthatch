@@ -706,24 +706,43 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     }
     tape.advance_tip_to(10);
     let first = spawn_with_entity(dir.path(), tape.clone(), 10).await;
+    shutdown_and_settle(first).await;
 
-    // Finalize through 8 so [1,8] seals and leaves the hot store, then index past it.
-    tape.advance_finalized_to(8);
+    // The tip path will not seal eight rows (#1067). This test is about the entity
+    // seed reading Parquet, not about maybe_seal, so the range is sealed through the
+    // public seal API the pipeline itself calls. Feeding SEAL_DIRECT_BATCH events
+    // through the entity circuit just to move the watermark hangs the nest.
+    {
+        let store = nuthatch::store::Store::open(&dir.path().join("nuthatch.redb")).unwrap();
+        let rows = store.entities_in_range(1, 8).unwrap();
+        assert_eq!(
+            rows.len(),
+            8,
+            "fixture must hold [1,8] hot before we seal it"
+        );
+        nuthatch::seal::seal_range(dir.path(), &rows, 1, 8)
+            .unwrap()
+            .expect("range holds rows");
+        store
+            .prune_and_set_meta(1, 8, "sealed_through", "8")
+            .unwrap();
+        assert_eq!(store.sealed_through(), 8);
+        assert!(
+            store.entities_in_range(1, 8).unwrap().is_empty(),
+            "manual seal must prune [1,8] or the seed could still read hot"
+        );
+    }
+
     for b in 11..=14u64 {
         tape.insert_block(b, empty_block(b, 0, 1_700_000_100 + b));
     }
     tape.advance_tip_to(14);
+    let first = spawn_with_entity(dir.path(), tape.clone(), 14).await;
     let store = first.state.store.clone();
-    assert!(
-        wait_until(POLL_TIMEOUT, || store.sealed_through() >= 8).await,
-        "range [1,8] did not seal in time - without it this test is about nothing"
-    );
-    assert!(
-        wait_until(POLL_TIMEOUT, || {
-            store.get_meta("last_block").ok().flatten().as_deref() == Some("14")
-        })
-        .await,
-        "nest did not index to block 14"
+    assert_eq!(
+        store.sealed_through(),
+        8,
+        "respawn must keep the watermark the manual seal wrote"
     );
 
     // The premise, asserted rather than assumed: the sealed rows are gone from hot.

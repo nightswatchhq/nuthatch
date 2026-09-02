@@ -145,8 +145,14 @@ async fn a_dead_cursor_leaves_its_sibling_indexing_and_the_runtime_up() {
     let tape_a = Arc::new(TapeSource::new());
     let tape_b = Arc::new(TapeSource::new());
     for b in 1..=10u64 {
-        tape_a.insert_block(b, canonical_block(b));
-        tape_b.insert_block(b, canonical_block(b));
+        let mut a = canonical_block(b);
+        let mut bb = canonical_block(b);
+        if b == 8 {
+            pad_address_to_seal(&mut a, USDC, 7);
+            pad_address_to_seal(&mut bb, USDC, 7);
+        }
+        tape_a.insert_block(b, a);
+        tape_b.insert_block(b, bb);
     }
     tape_a.advance_tip_to(10);
     tape_b.advance_tip_to(10);
@@ -188,7 +194,7 @@ async fn a_dead_cursor_leaves_its_sibling_indexing_and_the_runtime_up() {
     tape_a.insert_block(12, empty_block(12, 0, 1_700_000_112));
     tape_a.advance_tip_to(12);
     assert!(
-        wait_until(POLL_TIMEOUT, || store_a.sealed_through() >= 8).await,
+        wait_until(SEAL_POLL_TIMEOUT, || store_a.sealed_through() >= 8).await,
         "chain A did not seal [1,8] in time - without a sealed watermark above the fork the reorg \
          below it is routine and no cursor dies"
     );
