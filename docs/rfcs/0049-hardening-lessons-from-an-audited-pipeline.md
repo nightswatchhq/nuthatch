@@ -1,4 +1,4 @@
-# RFC-0047: Hardening lessons from an audited ingestion pipeline - eight failure shapes, checked against ours
+# RFC-0049: Hardening lessons from an audited ingestion pipeline - eight failure shapes, checked against ours
 
 - Status: **Reference and analysis. No implementation, no decision.** Under the 2026 feature freeze
   this is a document to argue with, not work to start. It is **not** a carve-out and it does not
