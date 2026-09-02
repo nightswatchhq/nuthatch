@@ -423,22 +423,36 @@ execution* sees only rows after `B+100`. Rows `B+1..B+100` are in neither. A rea
 late cannot recover rows that were hot when the quote was made and have since been sealed into a
 catalogue the quote does not name.
 
-So the snapshot has to be taken **whole, at quote time, and held**: the catalogue hash and the redb
-read transaction are one atomic act, not two checks at two moments. The read transaction is opened
-before the bound is computed and held until execution finishes, which is what makes
-`(catalogue_hash, sealed_through, hot_rows, hot_bytes)` describe a single consistent world rather
-than four numbers gathered as the world moved.
+**The obvious fix is to hold a redb read transaction from quote to execution, and it must not be
+taken.** An outstanding quote is unpaid by definition, and `SQL_MAX_CONCURRENCY` bounds *executing*
+queries, not outstanding quotes. A caller who asks for a thousand quotes and pays for none would pin
+a thousand read transactions, block redb reclamation indefinitely, and walk through the ≤2 GB
+per-cursor budget without ever spending anything. A payment surface whose *unpaid* path holds
+resources has the incentives exactly backwards.
 
-That has a price and it sets the quote's lifetime: an open read transaction pins redb space against
-reclamation, so a quote cannot be long-lived, and **a quote expires when its read transaction is
-released**. A client that does not execute within that window re-quotes. Combined with the retention
-rule above, the quote lifetime is the shortest of three things - catalogue retention, read-transaction
-hold, and any commercial expiry - and the design should say which one binds rather than leaving three
-independent clocks.
+So **a quote holds nothing.** It *names* the snapshot rather than retaining it, and the gap is closed
+at the other end:
 
-With both halves pinned the bound is static rather than merely bounded: the cold term cannot move
-because `H1` is immutable, and the hot term cannot move because the transaction is held. Nothing
-under the quote is still in motion at execution:
+- The quote carries `(catalogue_hash, sealed_through, hot_rows, hot_bytes)` and no server-side state
+  beyond those bytes.
+- **Execution revalidates the boundary and refuses if it moved.** If `sealed_through` has advanced
+  past the quoted value, the world the quote described no longer exists as a readable whole, so the
+  node returns a stale-quote error and the client re-quotes. It never executes against a mixture.
+
+That is cheap on both sides: the check is an integer comparison, the failure is a re-quote, and no
+caller can make the node retain anything by not paying. What it costs is that a quote goes stale on
+the sealing cadence, which is a latency and retry concern rather than a safety one, and it puts the
+pressure in the right place - **a client that pays promptly is never affected, and a client that
+does not is the one that pays for it in retries.**
+
+Quote lifetime is then the shorter of two things rather than three, since nothing is being held:
+catalogue retention, and the next seal. In practice the second binds.
+
+With the catalogue pinned by hash and the boundary revalidated at execution, the bound is static by
+the time anything runs: the cold term cannot move because `H1` is immutable, and the hot term is
+taken under a single read transaction opened **at execution** and held only for the query's own
+lifetime, which `SQL_MAX_CONCURRENCY` already bounds. Nothing under the quote is still in motion at
+execution:
 
 **Two ceilings, and conflating them is the mistake to avoid.** They sit at different heights, they
 are checked at different moments, and only one of them is negotiable.
@@ -484,8 +498,10 @@ any user SQL is evaluated, and it is therefore the enforcement point:
 
 - Refuse at admission, before materialising anything, when `cold_bound >= threshold`. There is no
   budget left to spend and no reason to copy a single hot row first.
-- Materialise the hot side under **one redb read transaction**, so the set is fixed for the
-  query's lifetime and blocks arriving mid-scan land in a later version it cannot see. Today that
+- Materialise the hot side under **one redb read transaction opened at execution**, so the set is
+  fixed for the query's lifetime and blocks arriving mid-scan land in a later version it cannot see.
+  Opening it here rather than at quote time is what keeps an unpaid quote from pinning anything, and
+  the number of such transactions is bounded by `SQL_MAX_CONCURRENCY`. Today that
   set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
 - **Count the destination allocation, not the source bytes.** `hot_bytes` is the redb store's
   serialized size, and the copy lands in a DuckDB temp table with vector layout, row overhead, type
