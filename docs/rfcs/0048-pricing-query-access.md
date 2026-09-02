@@ -194,10 +194,38 @@ The rule, and it is deliberately crude in the safe direction:
 
 **The reason this is tractable at all is that named queries are a fixed, reviewed corpus.** This RFC
 does not price open `/sql`, and that is not only a safety decision - it is what makes the cold bound
-computable. A named query's plan is known at **publish time**, so its bound is computed once per
-(query, catalogue version) and reviewed by a person, rather than derived from arbitrary SQL under
-request latency. A query whose bound cannot be computed does not get published, which is a far
-better failure than one that gets published and then cannot be priced.
+reviewable. A query whose bound cannot be computed does not get published, which is a far better
+failure than one that gets published and then cannot be priced.
+
+**But the publish-time plan is not the execution plan, and treating it as one would sink the whole
+guard.** DuckDB re-plans: join order, CTE materialisation, predicate pushdown and the number of scan
+operators all depend on the current catalogue, the contents and statistics of the hot temp tables,
+and the session's settings. A query quoted from a plan with one sealed-table scan can execute with
+two. Rules 1 to 5 are only sound against the plan that actually runs.
+
+So the two bounds have different jobs and must not be confused:
+
+| | publish-time bound | execution-time bound |
+|---|---|---|
+| computed from | the plan at review, per (query, catalogue version) | the plan the node is about to run |
+| what it is for | the **quote**, and the human review that decides publishability | the **guard** |
+| when it is wrong | the query is re-reviewed | the query is refused |
+
+The execution-time bound is obtained on the same connection, with the same catalogue and the same
+settings, and it is the number admission is checked against. Any setting that can change a plan is
+**fixed for named queries** rather than left to the session, because a bound that moves with a
+session variable is not reproducible and §4's verifiability claim depends on it being so.
+
+**The ordering that makes this work**, and it falls out of the hot rule rather than needing anything
+new. Hot materialisation happens first and is already bounded by the residual budget. Only once the
+temp tables exist does the planner see the statistics it will actually plan against, so the
+execution plan is taken **after materialisation and before the user SQL is evaluated**, and the cold
+bound is checked there. That is a safe place to abort: materialisation reads the hot store, not the
+segments, so **no cold I/O has happened yet** at the moment the cold bound is tested.
+
+A large divergence between the two bounds is not an error in itself, since data grows, but it is the
+signal that the published quote needs re-reviewing, and it should be reported rather than absorbed
+silently.
 
 **What is enforced at runtime, stated honestly.** The hot side has a real counter, described below:
 the materialisation refuses to grow past the ceiling. The cold side does **not** have an equivalent
