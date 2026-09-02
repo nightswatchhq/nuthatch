@@ -41,8 +41,8 @@ landed.
 
 The migration is sized by #1092, so that is first even though the nest is already up.
 
-1. **#1092 - the 22 request-time routes.** Correct `docs/audits/2026-09-plan.md` §6 (the UI does
-   *not* mostly read Postgres). Fold the 22 into #1074's denominator and #1078's completion
+1. **#1092 - the 21 request-time routes.** Correct `docs/audits/2026-09-plan.md` §6 (the UI does
+   *not* mostly read Postgres). Fold the 21 into #1074's denominator and #1078's completion
    condition. **Decide**, in this sprint, whether those routes migrate to a nest directly or move
    behind the Postgres cache first. They are two different jobs, and only one of them is what
    "migrate the ingestion layer" meant. Leaving the decision unmade makes #1078's done-state a
@@ -55,9 +55,10 @@ The migration is sized by #1092, so that is first even though the nest is alread
    mode-600 file; not chat). Then `GRAPH_API_KEY=… NEST_URL=http://127.0.0.1:8105 bash
    scripts/lodestar-parity.sh`. An absent comparison must not read as agreement; that half of the
    script already fails closed. The subgraph half has never executed.
-4. **#1078 - switch group C**, once #1076 is a match or a recorded DIFF, and once #1092 has folded
-   the 22 into the completion condition. The defensible claim remains #638's: the gateway key is no
-   longer load-bearing for Lodestar's own dashboard. Not zero `GRAPH_API_KEY` in the repository.
+4. **#1078 - switch group C**, once #1076 is a match (or any difference is documented, understood,
+   and explicitly approved as safe), and once #1092 has folded the 21 request-time routes into the
+   completion condition. The defensible claim remains #638's: the gateway key is no longer
+   load-bearing for Lodestar's own dashboard. Not zero `GRAPH_API_KEY` in the repository.
 
 ## What runs in parallel, and does not wait for the spine
 
