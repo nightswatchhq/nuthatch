@@ -23,9 +23,10 @@ Plover made the Lodestar migration measurable: there is a denominator, the nest 
 decisions are written down. It did not switch anything, and it did not run the comparison. Four
 things found in that work say why "Lodestar is on nuthatch" would currently be a lie:
 
-- **Twenty-two of twenty-seven subgraph-calling API routes hit the gateway at request time**, not
-  via Postgres (#1092). Completing the ingest layer and removing `GRAPH_API_KEY` 503s those pages
-  immediately. #1086 named eight of them; the count is 22.
+- **Twenty-one of twenty-seven subgraph-calling API routes hit the gateway at request time**, not
+  via Postgres (#1092; originally filed as 22 before re-measuring the partition with the 6 database routes).
+  Completing the ingest layer does not touch them, and removing `GRAPH_API_KEY` 503s those pages
+  immediately. #1086 named eight of them; the count is 21.
 - **Three routes return success when the key is absent**, each indistinguishable from a real
   empty result. `api/subgraph-names` 200 {} (#1097), `api/ens` 200 `{ ensName: null }` (#1103),
   `api/token-metrics` 200 `{ data: [] }` (#1104). Twenty sibling routes 503. Absence reading as
@@ -84,8 +85,8 @@ them in. They are the same fault as #1097, not a new class. #1067 stays in the l
 because it completed here; #1093 is the next layer of the same seal-loop guard.
 
 **#1092's decision is taken in this sprint, not deferred.** Nest-direct versus Postgres-cache-first
-changes what #1078 has to do, and a completion claim that does not include the 22 will not survive
-removing the key.
+changes what #1078 has to do, and a completion claim that does not include the 21 request-time routes
+will not survive removing the key.
 
 ## Explicitly not in this sprint
 
