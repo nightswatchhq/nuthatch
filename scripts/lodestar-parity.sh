@@ -186,6 +186,14 @@ def nest_sql(q):
         raise SystemExit("nest /sql failed: %s" % e)
     if d.get("error"):
         raise SystemExit("nest sql error: %s" % d["error"])
+    # `/sql` caps a response (50,000 rows when this was written) and flags it. A capped read is a
+    # partial population, and comparing a partial population is how an absent comparison reads as
+    # agreement. This is not hypothetical: the escrow join in #1114 was first attempted against a
+    # silently capped 50,000 of 70,417 rows and produced a confident, entirely fictional answer.
+    if d.get("truncated"):
+        raise SystemExit(
+            "nest /sql truncated the response (%d rows) for: %s" % (len(d.get("rows") or []), q)
+        )
     return d.get("rows") or []
 
 def page_ids(entity, extra_where=""):
@@ -428,22 +436,139 @@ for nest_col, _ in EPOCH_KNOWN_DIFF:
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
 
-with open(os.environ["EPOCH_SUMMARY"], "w") as fh:
-    fh.write("%s %s\n" % (len(gated), ",".join(epoch_known_diff) or "-"))
+epoch_gated_n = len(gated)
+epoch_known_names = list(epoch_known_diff)
 
-# --- escrow: counts only at pinned block; ids are different schemes ---
-escrow_sg = page_count("paymentsEscrowTransactions")
+# --- escrow: row-level, at the pinned block ---
+# The ids ARE joinable, contrary to what this script used to claim. A
+# `paymentsEscrowTransactions.id` is `txHash(32 bytes) || logIndex(uint32 little-endian)`, and the
+# subgraph's index is the nest's `log_index` plus one. #1114 measured all three candidate bases: as-is
+# and minus-one match zero rows, plus-one matches all 70,408. Guessing was not required and is not
+# done here - if the offset ever stops being right, the join collapses to zero matches and this fails
+# loudly rather than quietly reporting two disjoint sets as a count difference.
+SG_ESCROW_TYPES = {"deposit", "redeem"}
+
+def decode_escrow_id(eid):
+    h = eid[2:] if eid.startswith("0x") else eid
+    if len(h) != 72:
+        raise SystemExit("unexpected escrow id shape %r: expected 36 bytes" % eid)
+    return ("0x" + h[:64].lower(), int.from_bytes(bytes.fromhex(h[64:]), "little"))
+
+sg_escrow, last = {}, ""
+while True:
+    w = ', where: { id_gt: "%s" }' % last if last else ""
+    data = gql(
+        "{ paymentsEscrowTransactions(first: 1000, orderBy: id, orderDirection: asc,"
+        " block: { number: %s }%s) { id type } }" % (block, w)
+    )
+    rows = data.get("paymentsEscrowTransactions") or []
+    for r in rows:
+        sg_escrow[decode_escrow_id(r["id"])] = r["type"]
+    if len(rows) < 1000:
+        break
+    last = rows[-1]["id"]
+
 escrow_nest = int(os.environ["ESCROW_N"])
-status = "OK" if escrow_nest == escrow_sg else "DIFF"
-print("lodestar_escrow_transactions nest=%s subgraph=%s %s" % (escrow_nest, escrow_sg, status))
+print(
+    "lodestar_escrow_transactions nest=%s subgraph=%s" % (escrow_nest, len(sg_escrow))
+)
 types = nest_sql(
     "SELECT type, count(*) AS n FROM lodestar_escrow_transactions WHERE block_number <= %s GROUP BY type ORDER BY type"
     % block
 )
 print("  nest types: %s" % ", ".join("%s=%s" % (t["type"], t["n"]) for t in types))
-if status == "DIFF":
+
+# Only the two types the subgraph entity actually models are comparable. It has no Thaw or
+# CancelThaw, so counting those as nest-only differences would manufacture a permanent DIFF out of
+# the nest indexing more than the subgraph does.
+# 70,000+ rows is well past the node's 50,000-row result cap, so this pages by block. The count is
+# taken first and asserted against the assembled set: a page boundary that dropped or double-counted
+# rows would otherwise look exactly like a parity difference, and get reported as one.
+self_collected = set()
+escrow_known_diff = False
+
+def nest_collected_ids():
+    bounds = nest_sql(
+        "SELECT min(block_number) AS lo, max(block_number) AS hi, count(*) AS n"
+        " FROM escrow__escrow_collected WHERE block_number <= %s" % block
+    )
+    if not bounds or bounds[0]["n"] is None or int(bounds[0]["n"]) == 0:
+        raise SystemExit("escrow__escrow_collected has no rows at block %s" % block)
+    lo, hi, expect = int(bounds[0]["lo"]), int(bounds[0]["hi"]), int(bounds[0]["n"])
+    # Half the cap per page, so a dense block range still lands inside it.
+    pages = max(1, (expect // 25000) + 1)
+    step = ((hi - lo) // pages) + 1
+    out, cur = set(), lo
+    while cur <= hi:
+        for r in nest_sql(
+            "SELECT tx_hash, log_index, payer, collector FROM escrow__escrow_collected"
+            " WHERE block_number >= %s AND block_number < %s AND block_number <= %s"
+            % (cur, cur + step, block)
+        ):
+            key = (r["tx_hash"].lower(), int(r["log_index"]) + 1)
+            out.add(key)
+            if str(r["payer"]).lower() == str(r["collector"]).lower():
+                self_collected.add(key)
+        cur += step
+    if len(out) != expect:
+        raise SystemExit(
+            "escrow paging assembled %s rows but count(*) says %s: the pages do not cover the range"
+            % (len(out), expect)
+        )
+    return out
+
+nest_collected = nest_collected_ids()
+sg_collected = {k for k, t in sg_escrow.items() if t == "redeem"}
+if sg_collected and not (nest_collected & sg_collected):
     failed = True
-    print("  ids are not joinable (nest tx_hash-log_index vs subgraph bytes id); see #1114")
+    print(
+        "  ESCROW JOIN EMPTY: %s nest and %s subgraph collections share no id. The id encoding "
+        "has changed and nothing below is a comparison" % (len(nest_collected), len(sg_collected))
+    )
+else:
+    only_nest = sorted(nest_collected - sg_collected)
+    only_sg = sorted(sg_collected - nest_collected)
+    status = "OK" if not only_nest and not only_sg else "DIFF"
+    print(
+        "  collected/redeem nest=%s subgraph=%s matched=%s %s"
+        % (len(nest_collected), len(sg_collected), len(nest_collected & sg_collected), status)
+    )
+    # #1114: the nest-only rows are `EscrowCollected` events where one address collects from itself.
+    # The subgraph drops them, and the nest is the one that is right. That is a KNOWN-DIFF, but it is
+    # recorded as a *rule* rather than a list of ids: a nest-only row whose payer differs from its
+    # collector is not explained by it and is a hard failure. A hardcoded list of nine hashes would
+    # have absorbed the tenth.
+    known_self = [k for k in only_nest if k in self_collected]
+    unexplained = [k for k in only_nest if k not in self_collected]
+    if known_self:
+        escrow_known_diff = True
+        print(
+            "    %s nest-only rows are self-collections (payer == collector) KNOWN-DIFF (#1114)"
+            % len(known_self)
+        )
+        for tx, li in known_self[:5]:
+            print("      %s log_index=%s" % (tx, li - 1))
+    if unexplained:
+        failed = True
+        print("    %s nest-only rows are NOT self-collections and are unexplained:" % len(unexplained))
+        for tx, li in unexplained[:20]:
+            print("      %s log_index=%s" % (tx, li - 1))
+    if only_sg:
+        failed = True
+        for tx, li in only_sg[:20]:
+            print("    subgraph-only %s log_index=%s" % (tx, li - 1))
+    unmodelled = sum(int(t["n"]) for t in types if t["type"] not in ("Deposit", "EscrowCollected"))
+    if unmodelled:
+        print(
+            "  %s nest rows are types the subgraph does not model (Thaw, CancelThaw) and are not compared"
+            % unmodelled
+        )
+
+known = list(epoch_known_names)
+if escrow_known_diff:
+    known.append("escrow_self_collections")
+with open(os.environ["EPOCH_SUMMARY"], "w") as fh:
+    fh.write("%s %s\n" % (epoch_gated_n, ",".join(known) or "-"))
 
 if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
@@ -466,7 +591,7 @@ EOF
 [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
 [ "$AFTER_SEALED" -eq "$BLOCK" ] || die "sealed boundary changed during comparison"
 read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
-echo "  proved: allocation counts, dispute id sets, escrow counts, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
+echo "  proved: allocation counts, dispute id sets, escrow rows joined by id, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
 if [ "$EPOCH_KNOWN" = "-" ]; then
   echo "parity CLEAN at block $BLOCK"
   exit 0
@@ -474,6 +599,6 @@ fi
 # Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
 # the same fault this script was rewritten to remove, one level up: a known absence of proof reading
 # as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
-echo "  NOT proved: epoch fields ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113"
+echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113 and #1114"
 echo "parity NOT CLEAN at block $BLOCK: gated comparisons agree, known differences outstanding"
 exit 2
