@@ -3,7 +3,18 @@
 #
 # An absent comparison must not read as agreement. This script exits 1 when it
 # cannot reach the nest, when a view returns no rows, when GRAPH_API_KEY is
-# unset so the subgraph side cannot be asked, or when the two sides disagree.
+# unset so the subgraph side cannot be asked, or when comparable sides disagree.
+#
+# The first run compared incomparable populations (all-time subgraph totals vs
+# Horizon-only nest views) and reported four DIFFs that were not row disagreements.
+# This version compares:
+#   allocations  nest count vs subgraph allocations where isLegacy: false
+#   disputes     nest ids vs subgraph disputes where isLegacy: false
+#   epochs       last 30 overlapping ids, field-by-field; start/end block are
+#                L2 vs L1 and are reported as INCOMPARABLE, not DIFF
+#   escrow       counts, with a type breakdown; ids are different schemes
+#
+# On disagreement it prints the differing rows, not just a count.
 set -euo pipefail
 
 NEST=${NEST_URL:-http://127.0.0.1:8105}
@@ -76,20 +87,23 @@ if [ -z "${GRAPH_API_KEY:-}" ]; then
   die "GRAPH_API_KEY is unset: the subgraph side was not asked, so this is not a comparison"
 fi
 
+export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N
 ALLOC_N=$(nest_count lodestar_allocations created_at_block)
 EPOCH_N=$(nest_count lodestar_epochs start_block)
 DISPUTE_N=$(nest_count lodestar_disputes created_at_block)
 ESCROW_N=$(nest_count lodestar_escrow_transactions block_number)
 
-export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY
+export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY NEST
 python3 - << 'PY' || die "subgraph comparison failed"
-import json, os, sys, urllib.request
+import json, os, sys, urllib.parse, urllib.request
 
 key = os.environ["GRAPH_API_KEY"]
 block = int(os.environ["BLOCK"])
 sg = os.environ["NETWORK_SG"]
 gateway = os.environ["GATEWAY"].rstrip("/")
+nest = os.environ["NEST"].rstrip("/")
 url = f"{gateway}/api/{key}/subgraphs/id/{sg}"
+failed = False
 
 def gql(query):
     req = urllib.request.Request(
@@ -113,25 +127,47 @@ def gql(query):
         raise SystemExit("subgraph returned no data: %s" % body[:300])
     return d["data"]
 
-def page_count(entity, extra_where=""):
-    n = 0
+def nest_sql(q):
+    qs = urllib.parse.urlencode({"q": q})
+    req = urllib.request.Request(
+        f"{nest}/sql?{qs}",
+        headers={"User-Agent": "nuthatch-lodestar-parity"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read().decode())
+    except urllib.error.URLError as e:
+        raise SystemExit("nest /sql failed: %s" % e)
+    if d.get("error"):
+        raise SystemExit("nest sql error: %s" % d["error"])
+    return d.get("rows") or []
+
+def page_ids(entity, extra_where=""):
+    out = []
     last = ""
-    where = extra_where.strip()
     while True:
-        parts = ["first: 1000", "orderBy: id", "orderDirection: asc", f"block: {{ number: {block} }}"]
+        parts = [
+            "first: 1000",
+            "orderBy: id",
+            "orderDirection: asc",
+            f"block: {{ number: {block} }}",
+        ]
         cond = []
-        if where:
-            cond.append(where)
+        if extra_where.strip():
+            cond.append(extra_where.strip())
         if last:
             cond.append(f'id_gt: "{last}"')
         if cond:
             parts.append("where: { %s }" % ", ".join(cond))
         data = gql("{ %s(%s) { id } }" % (entity, " ".join(parts)))
         rows = data.get(entity) or []
-        n += len(rows)
+        out.extend(r["id"] for r in rows)
         if len(rows) < 1000:
-            return n
+            return out
         last = rows[-1]["id"]
+
+def page_count(entity, extra_where=""):
+    return len(page_ids(entity, extra_where))
 
 meta = gql("{ _meta { block { number } } }")
 sg_block = (meta.get("_meta") or {}).get("block", {}).get("number")
@@ -145,28 +181,110 @@ if sg_block < block:
         % (sg_block, block)
     )
 
-net = gql("{ graphNetwork(id: \"1\", block: { number: %s }) { allocationCount } }" % block)
-alloc_sg = (net.get("graphNetwork") or {}).get("allocationCount")
-if alloc_sg is None:
-    raise SystemExit("graphNetwork.allocationCount missing at pin %s" % block)
-alloc_sg = int(alloc_sg)
+# --- allocations: Horizon vs Horizon, not all-time allocationCount ---
+alloc_sg = page_count("allocations", "isLegacy: false")
+alloc_nest = int(os.environ["ALLOC_N"])
+status = "OK" if alloc_nest == alloc_sg else "DIFF"
+print("lodestar_allocations nest=%s subgraph_isLegacy_false=%s %s" % (alloc_nest, alloc_sg, status))
+if status == "DIFF":
+    failed = True
+    print("  (all-time graphNetwork.allocationCount is a different population and is not compared)")
 
-epoch_sg = page_count("epoches")
-dispute_sg = page_count("disputes")
-escrow_sg = page_count("paymentsEscrowTransactions")
+# --- disputes: id sets, legacy excluded ---
+nest_disputes = {r["id"].lower() for r in nest_sql("SELECT id FROM lodestar_disputes")}
+sg_disputes = []
+last = ""
+while True:
+    w = f', where: {{ id_gt: "{last}" }}' if last else ""
+    data = gql(
+        "{ disputes(first: 1000, orderBy: id, orderDirection: asc, block: { number: %s }%s) { id type isLegacy } }"
+        % (block, w)
+    )
+    rows = data.get("disputes") or []
+    sg_disputes.extend(rows)
+    if len(rows) < 1000:
+        break
+    last = rows[-1]["id"]
+sg_live = {d["id"].lower() for d in sg_disputes if not d.get("isLegacy")}
+sg_legacy = {d["id"].lower() for d in sg_disputes if d.get("isLegacy")}
+only_nest = sorted(nest_disputes - sg_live)
+only_sg = sorted(sg_live - nest_disputes)
+status = "OK" if not only_nest and not only_sg else "DIFF"
+print(
+    "lodestar_disputes nest=%s subgraph_live=%s subgraph_legacy_excluded=%s %s"
+    % (len(nest_disputes), len(sg_live), len(sg_legacy), status)
+)
+if only_nest:
+    failed = True
+    print("  nest-only: %s" % ", ".join(only_nest[:20]))
+if only_sg:
+    failed = True
+    print("  subgraph-only: %s" % ", ".join(only_sg[:20]))
 
-pairs = [
-    ("lodestar_allocations", int(os.environ["ALLOC_N"]), alloc_sg),
-    ("lodestar_epochs", int(os.environ["EPOCH_N"]), epoch_sg),
-    ("lodestar_disputes", int(os.environ["DISPUTE_N"]), dispute_sg),
-    ("lodestar_escrow_transactions", int(os.environ["ESCROW_N"]), escrow_sg),
+# --- epochs: overlapping recent ids, skip L1-vs-L2 start/end ---
+epoch_rows = nest_sql(
+    "SELECT id, total_rewards, total_indexer_rewards, total_delegator_rewards, "
+    "query_fees_collected, curator_query_fees, signalled_tokens "
+    "FROM lodestar_epochs ORDER BY id DESC LIMIT 30"
+)
+if not epoch_rows:
+    raise SystemExit("nest lodestar_epochs returned no rows for field comparison")
+ids = [str(int(r["id"])) for r in epoch_rows]
+id_list = ", ".join('"%s"' % i for i in ids)
+sg_epochs = {
+    str(e["id"]): e
+    for e in (
+        gql(
+            "{ epoches(where: { id_in: [%s] }, block: { number: %s }) { "
+            "id totalRewards totalIndexerRewards totalDelegatorRewards "
+            "queryFeesCollected curatorQueryFees signalledTokens } }"
+            % (id_list, block)
+        ).get("epoches")
+        or []
+    )
+}
+FIELDS = [
+    ("total_rewards", "totalRewards"),
+    ("total_indexer_rewards", "totalIndexerRewards"),
+    ("total_delegator_rewards", "totalDelegatorRewards"),
+    ("query_fees_collected", "queryFeesCollected"),
+    ("curator_query_fees", "curatorQueryFees"),
+    ("signalled_tokens", "signalledTokens"),
 ]
-failed = False
-for name, nest, sub in pairs:
-    status = "OK" if nest == sub else "DIFF"
-    print("%s nest=%s subgraph=%s %s" % (name, nest, sub, status))
-    if nest != sub:
-        failed = True
+epoch_diffs = 0
+missing_sg = [i for i in ids if i not in sg_epochs]
+if missing_sg:
+    failed = True
+    epoch_diffs += len(missing_sg)
+    print("lodestar_epochs subgraph missing ids: %s" % ", ".join(missing_sg[:20]))
+for r in epoch_rows:
+    eid = str(int(r["id"]))
+    sg = sg_epochs.get(eid)
+    if not sg:
+        continue
+    for nest_k, sg_k in FIELDS:
+        nv = str(r.get(nest_k) if r.get(nest_k) is not None else "0")
+        sv = str(sg.get(sg_k) if sg.get(sg_k) is not None else "0")
+        if nv != sv:
+            epoch_diffs += 1
+            failed = True
+            print("lodestar_epochs id=%s %s nest=%s subgraph=%s DIFF" % (eid, nest_k, nv, sv))
+print(
+    "lodestar_epochs compared %s overlapping ids, %s field diffs; start/end block L1-vs-L2 INCOMPARABLE"
+    % (len(ids) - len(missing_sg), epoch_diffs)
+)
+
+# --- escrow: counts only; ids are different schemes ---
+escrow_sg = page_count("paymentsEscrowTransactions")
+escrow_nest = int(os.environ["ESCROW_N"])
+status = "OK" if escrow_nest == escrow_sg else "DIFF"
+print("lodestar_escrow_transactions nest=%s subgraph=%s %s" % (escrow_nest, escrow_sg, status))
+types = nest_sql("SELECT type, count(*) AS n FROM lodestar_escrow_transactions GROUP BY type ORDER BY type")
+print("  nest types: %s" % ", ".join("%s=%s" % (t["type"], t["n"]) for t in types))
+if status == "DIFF":
+    failed = True
+    print("  ids are not joinable (nest tx_hash-log_index vs subgraph bytes id)")
+
 if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
 print("parity OK at block %s" % block)
