@@ -397,7 +397,7 @@ are checked at different moments, and only one of them is negotiable.
 | | the admission threshold | the quoted price ceiling |
 |---|---|---|
 | what it protects | the node's resources | the client's wallet |
-| set by | operator config, order of 1 GB | the quote for this query |
+| set by | **derived** from the per-cursor budget over `SQL_MAX_CONCURRENCY` (§3); config may lower it, never raise it above the derived ceiling | the quote for this query |
 | evaluated against | the **current** snapshot, at execution | the **quoted** snapshot |
 | when the bound grows past it | **reject** | serve, and absorb the difference |
 
@@ -421,8 +421,11 @@ that flat pricing plus an admission check was designed to prevent.
 
 **Where the check is enforced, which is what makes the ceiling hard.** Re-estimating at execution is
 still only an estimate if the query then runs for thirty seconds against a hot store that ingestion
-keeps growing. A query admitted at 900 MB under a 1 GB threshold could scan 1.2 GB by the time it
-finishes, and the guard would have guarded nothing.
+keeps growing. Take a derived threshold of `T` and a query admitted at `0.9 T`: it can be scanning
+`1.2 T` by the time it finishes, and the guard would have guarded nothing. (The figures below are
+written as fractions of `T` deliberately - §3 declines to name a byte value until the per-cursor
+subtractions are measured, and a worked example in round gigabytes would quietly reintroduce the
+number it just withdrew.)
 
 The architecture already supplies the answer and it needs no lock on the ingestion path. `/sql` does
 not evaluate against the live hot store: `analytics.rs` **scans hot rows into per-table temp tables**
@@ -437,9 +440,9 @@ any user SQL is evaluated, and it is therefore the enforcement point:
   set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
 - **Count real bytes while materialising, against the residual budget** - `threshold - cold_bound`,
   not the threshold. Charging the hot copy against the whole ceiling is the obvious mistake and it
-  is worth naming: a 1 GB threshold with a 900 MB cold bound and 200 MB of hot rows passes a naive
-  hot counter while the query reads 1.1 GB. The hot side may only spend what cold has not already
-  claimed.
+  is worth naming: a threshold `T` with a cold bound of `0.9 T` and hot rows worth `0.2 T` passes a
+  naive hot counter while the query reads `1.1 T`. The hot side may only spend what cold has not
+  already claimed.
 - The cold side is already immutable by construction: sealed segments never change, and the
   catalogue version pins which of them exist.
 
