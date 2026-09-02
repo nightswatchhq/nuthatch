@@ -524,8 +524,10 @@ async fn reorg_below_finality_halts() {
     assert_eq!(
         store.get_meta("last_block").unwrap(),
         cursor_before,
-        "the hot cursor was rolled back into the sealed range before the refusal - the halt must \
-         come before the rollback, not after it"
+        "the hot cursor moved before the refusal - the halt must come before any cursor write, \
+         whichever direction it goes. A rollback into the sealed range is the feared case; a cursor \
+         that advanced instead means the loop indexed past the snapshot, which is a fixture race \
+         rather than a violation (#1119), and the numbers tell you which"
     );
     assert_eq!(
         store.entities_in_range(1, 12).unwrap(),
