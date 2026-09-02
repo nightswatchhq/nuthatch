@@ -484,7 +484,10 @@ async fn reorg_below_finality_halts() {
         store.get_meta("last_block").ok().flatten().as_deref() == Some("12")
     })
     .await;
-    assert!(settled, "nest did not index blocks 11 and 12 before the snapshot");
+    assert!(
+        settled,
+        "nest did not index blocks 11 and 12 before the snapshot"
+    );
 
     // Snapshot the sealed layer and the cursor *before* the violation, so "it did not touch them"
     // is an observation rather than an assumption.
