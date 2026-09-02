@@ -782,7 +782,15 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
         );
         rt.ingest.abort();
         let _ = rt.ingest.await;
+        if let Some(w) = rt.alert_worker {
+            w.abort();
+            let _ = w.await;
+        }
         drop(store);
+        // redb is single-writer: the aborted tasks must actually drop their Store
+        // clones before reuse_segments opens the same file. 20k padded rows made
+        // this race visible in CI (#1067).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     // Mount the old's sealed segments into the fresh new nest.

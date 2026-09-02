@@ -6234,7 +6234,30 @@ mod tests {
             }
             cuts
         }
-        let by_one = cuts_of(&json);
+        // One schedule: finality advances one block at a time, so each call to
+        // `tip_seal_cut` sees only the prefix that has finalized. The other: the
+        // whole corpus is already finalized. #1067 requires those to agree.
+        fn cuts_as_finality_advances(json: &[String]) -> Vec<u64> {
+            let mut cuts = Vec::new();
+            let mut start = 0usize;
+            let mut i = 0usize;
+            while i < json.len() {
+                let b = block_number_of(&json[i]).expect("block");
+                while i < json.len() && block_number_of(&json[i]) == Some(b) {
+                    i += 1;
+                }
+                if let Some(cut) = tip_seal_cut(&json[start..i]) {
+                    cuts.push(cut);
+                    let n = json[start..i]
+                        .iter()
+                        .take_while(|j| block_number_of(j).expect("block") <= cut)
+                        .count();
+                    start += n;
+                }
+            }
+            cuts
+        }
+        let by_one = cuts_as_finality_advances(&json);
         let all_at_once = cuts_of(&json);
         assert!(
             !by_one.is_empty(),
