@@ -180,9 +180,31 @@ is what makes a deterministic hot term possible at all.
 
 | scan class | planner proves | hot term |
 |---|---|---|
-| keyed point read | the hot store's own key is fully bound by the predicate | one row width, a constant |
-| bounded range | a contiguous range **of that key** is bound, so the access path visits only that range | `min(range_rows, hot_rows) × row_width` |
-| unbounded hot scan | nothing above | `hot_rows × row_width`, the whole window |
+| keyed point read | the hot store's own key is fully bound by the predicate | `max_row_bytes` |
+| bounded range | a contiguous range **of that key** is bound, so the access path visits only that range | `min(range_rows × max_row_bytes, hot_bytes)` |
+| unbounded hot scan | nothing above | `hot_bytes`, the whole window |
+
+**`max_row_bytes` must be an enforced ceiling, not an observed width, and this is the part that
+decides whether the check is a guard or a decoration.** Hot rows are redb values and are
+variable-width: a decoded event with a long `bytes` field is not the same size as a balance. An
+average or a representative width **underestimates**, and it underestimates exactly on the rows an
+adversarial caller would pick, so a keyed read of the largest value in the store could be admitted
+under a threshold it actually exceeds. A pricing estimate may use an average. A resource cap may
+not.
+
+So the snapshot carries `hot_bytes`, the store's real size, and not merely a row count:
+
+```
+(catalogue_version, sealed_through, hot_rows, hot_bytes)
+```
+
+`hot_bytes` makes the unbounded class **exact** rather than estimated, which matters because that is
+the class the guard exists for. The two bounded classes then need `max_row_bytes` to be a number
+the node **enforces at write time**, so that no row can exceed it. If the hot store does not enforce
+such a ceiling, the only sound bound for every class is `hot_bytes`, the tiers collapse into one,
+and the RFC should say so plainly rather than quote a width it cannot defend. Establishing whether
+that ceiling exists, or can be added without disturbing the ingestion path, is slice zero work and
+a precondition for Phase 1, not a detail to settle during implementation.
 
 The third row is the honest default. It is a large number, and it should be: an unbounded scan of
 the mutable tip is exactly what a flat price cannot survive. It is still finite, and it is finite
@@ -206,7 +228,7 @@ captured **before planning**, and the `402` body quotes it alongside the coeffic
 is a **triple**, and each element is load-bearing:
 
 ```
-(catalogue_version, sealed_through, hot_rows)
+(catalogue_version, sealed_through, hot_rows, hot_bytes)
 ```
 
 `sealed_through` and `hot_rows` alone are **not sufficient**, and assuming they were is the easiest
