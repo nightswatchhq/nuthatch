@@ -5428,6 +5428,14 @@ async fn maybe_seal(
                 return Ok(());
             }
             None => {
+                // Still pin the finalized ceiling. Holding rows does not mean the reorg
+                // walker can do without a checkpoint: #461 was a walk that skipped past
+                // sealed_through to an older sparse checkpoint and tripped the finality
+                // guard on a block the reorg never touched. The empty-range arm already
+                // pins; this one must too (#1067).
+                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                    store.set_block_hash(ceiling, &hash)?;
+                }
                 tracing::debug!(
                     rows = entities.len(),
                     threshold = SEAL_DIRECT_BATCH,
@@ -6338,6 +6346,13 @@ mod tests {
                 .map(|m| m.tables.is_empty())
                 .unwrap_or(true),
             "a short range produced a segment file"
+        );
+        let pinned = format!("{:064x}", 99);
+        assert_eq!(
+            store.get_block_hash(99).unwrap().as_deref(),
+            Some(pinned.as_str()),
+            "a held finalized range must still pin a checkpoint at the ceiling, or a later \
+             reorg walks past it to an older sparse checkpoint (#461 / #1067)"
         );
     }
 
