@@ -184,6 +184,27 @@ is what makes a deterministic hot term possible at all.
 | bounded range | a contiguous range **of that key** is bound, so the access path visits only that range | `min(range_rows × max_row_bytes, hot_bytes)` |
 | unbounded hot scan | nothing above | `hot_bytes`, the whole window |
 
+**On today's `/sql` path there is only one class, and it is the third one.** This has to be said
+before the table is read as a description of the node. `analytics.rs` gathers hot rows via
+`Store::hot_rows_by_table` and `load_hot_temp` copies them into a per-table DuckDB temp table, and
+only then is the user's SQL evaluated. The key predicate applies **after** the copy. So
+`SELECT * FROM hot WHERE id = ?` materialises the whole hot table exactly as `SELECT * FROM hot`
+does, and pricing it at `max_row_bytes` would admit an unbounded operation under a point-read bound.
+The one path that genuinely avoids this is the trusted point-read endpoint, which passes no hot rows
+at all - a different route through the node, not a cheaper query on this one.
+
+**So the scan classes are conditional, and the condition is a real piece of engineering:** a redb
+key and range pushdown that runs *before* materialisation, so a bounded query copies a bounded set.
+Until that exists, every named query is an **unbounded hot scan** for admission purposes and the hot
+term is `hot_bytes`, full stop. The table above describes what the classifier could distinguish once
+the pushdown lands, and nothing before.
+
+That is not as bad as it sounds, because `hot_bytes` is bounded by the finality window rather than by
+history, so a threshold set above it is workable. It is simply not yet *discriminating*: the check
+stops a runaway cold scan and treats every hot query alike. It also settles Phase 1's sequencing
+rather than leaving it to taste - **the hot/tip tier cannot ship before the pushdown**, because its
+whole premise is a distinction the serving path cannot currently make.
+
 **`max_row_bytes` must be an enforced ceiling, not an observed width, and this is the part that
 decides whether the check is a guard or a decoration.** Hot rows are redb values and are
 variable-width: a decoded event with a long `bytes` field is not the same size as a balance. An
@@ -290,7 +311,8 @@ and `UNION ALL`s them into each table's view, with hot and cold kept structurall
 any user SQL is evaluated, and it is therefore the enforcement point:
 
 - Materialise the hot side under **one redb read transaction**, so the set is fixed for the
-  query's lifetime and blocks arriving mid-scan land in a later version it cannot see.
+  query's lifetime and blocks arriving mid-scan land in a later version it cannot see. Today that
+  set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
 - **Count real bytes while materialising**, and abort the moment the running total crosses the
   admitted ceiling. Not an estimate compared against a threshold, but the actual copy refusing to
   grow past it.
@@ -318,8 +340,9 @@ scan as a point read is worse than no admission check at all.
 
 Only after that benchmark.
 
-- **Hot / tip tier:** flat. Entry is the **keyed point read** and **bounded range** scan classes
-  from Phase 0, and nothing else. The proof is a key-bound access path, never a `LIMIT`: this tier
+- **Hot / tip tier:** flat, and **blocked on the redb key/range pushdown named in Phase 0** - until
+  a bounded query materialises a bounded set, this tier is a price for a distinction the node cannot
+  make. Entry is then the **keyed point read** and **bounded range** scan classes, and nothing else. The proof is a key-bound access path, never a `LIMIT`: this tier
   is the one place where getting that wrong is profitable to exploit, since a caller who can dress
   an unbounded scan as a tip lookup buys it at RPC-call prices. `SELECT * FROM hot WHERE value = 7
   LIMIT 1` is an unbounded hot scan here exactly as it is in Phase 0, and a query the planner
