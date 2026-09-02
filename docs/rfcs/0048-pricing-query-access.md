@@ -388,8 +388,23 @@ The boundary half is not ceremony either. It moves on its own: measured on the L
 operation, and a parity script pinned to the earlier value refused to run against the later one. A
 quote that does not name its snapshot is a quote against an unstated moving target.
 
-Sealing between quote and execution moves rows from hot to cold, which can move bytes from a
-scan-class term to a catalogue term and change the total in either direction.
+**One rule for a catalogue that moves between quote and execution, because two half-rules were in
+conflict.** An earlier draft said both "execution must use the exact catalogue in the quote" and
+"sealing may change the bound, serve it anyway", which cannot both hold: quote against `H1`, seal a
+segment, publish `H2`, and executing against `H1` omits the newly sealed data while executing
+against `H2` breaks the exact-catalogue contract.
+
+The rule is **execute against `H1`**, and it is the one the architecture already implies. Sealed
+segments are immutable and content-addressed, so `H1`'s segments still exist for as long as `H1` is
+retained; `H1` is a complete and self-consistent view of history, not a damaged one. The result
+therefore covers exactly what `H1` described, the response says so in its provenance the way `/sql`
+already stamps `sealed_through`, and a caller who wants the newer data asks again. The **only** case
+that forces a re-quote is `H1` having aged past retention, which is why the retention window and the
+quote lifetime are the same question.
+
+This also makes the bound static rather than merely bounded. With `H1` pinned the cold term cannot
+move at all, and the hot side is pinned by the read transaction below, so nothing under the quote is
+still in motion at execution:
 
 **Two ceilings, and conflating them is the mistake to avoid.** They sit at different heights, they
 are checked at different moments, and only one of them is negotiable.
@@ -438,7 +453,16 @@ any user SQL is evaluated, and it is therefore the enforcement point:
 - Materialise the hot side under **one redb read transaction**, so the set is fixed for the
   query's lifetime and blocks arriving mid-scan land in a later version it cannot see. Today that
   set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
-- **Count real bytes while materialising, against the residual budget** - `threshold - cold_bound`,
+- **Count the destination allocation, not the source bytes.** `hot_bytes` is the redb store's
+  serialized size, and the copy lands in a DuckDB temp table with vector layout, row overhead, type
+  conversion and per-table structure on top. Resident memory can be materially larger than the bytes
+  read, so a counter on the source would let two queries each pass their divided allowance while
+  their temp tables together exceed what the cursor has left. The counter has to be on the thing that
+  occupies RAM. Until the expansion factor between the two is **measured** on the real corpus, this
+  RFC claims a bytes-read bound and **not** a RAM guarantee, and §3's derived threshold inherits that
+  caveat: it divides a RAM budget by a concurrency, so it is only sound once the bytes-to-resident
+  factor is known and folded in.
+- **Count while materialising, against the residual budget** - `threshold - cold_bound`,
   not the threshold. Charging the hot copy against the whole ceiling is the obvious mistake and it
   is worth naming: a threshold `T` with a cold bound of `0.9 T` and hot rows worth `0.2 T` passes a
   naive hot counter while the query reads `1.1 T`. The hot side may only spend what cold has not
