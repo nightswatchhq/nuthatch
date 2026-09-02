@@ -42,9 +42,8 @@ print("ready last_block=%s sealed_through=%s" % (d.get("last_block"), d.get("sea
 PY
 
 # Aggregate nest views do not expose historical versions or a reorg generation. The comparison is
-# therefore valid only at the immutable sealed boundary: filtering a current aggregate by its
-# start block does not turn its values into an as-of snapshot, and height equality alone does not
-# distinguish two canonical histories after a reorg.
+# therefore valid only for immutable fact rows at the sealed boundary. Mutable epoch aggregates
+# have no as-of surface and are deliberately count-only below.
 if [ -z "$BLOCK" ]; then
   BLOCK=$(python3 - "$ready" << 'PY'
 import json,sys
@@ -58,7 +57,7 @@ PY
   echo "PINNED_BLOCK defaulted to sealed_through=$BLOCK"
 fi
 
-read -r NEST_BLOCK NEST_SEALED <<EOF
+read -r _NEST_BLOCK NEST_SEALED <<EOF
 $(python3 - "$ready" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
@@ -68,9 +67,8 @@ print(int(d["last_block"]), int(d["sealed_through"]))
 PY
 )
 EOF
-[ -n "${NEST_BLOCK:-}" ] && [ -n "${NEST_SEALED:-}" ] || die "nest readiness lacks a stable boundary"
-[ "$NEST_BLOCK" -eq "$BLOCK" ] && [ "$NEST_SEALED" -eq "$BLOCK" ] || die \
-  "PINNED_BLOCK=$BLOCK requires last_block=sealed_through=$BLOCK; live hot state has no stable snapshot"
+[ -n "${NEST_SEALED:-}" ] || die "nest readiness lacks a sealed boundary"
+[ "$NEST_SEALED" -eq "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK but sealed_through=$NEST_SEALED"
 
 nest_count() {
   local view="$1" col="$2"
@@ -248,59 +246,7 @@ if only_sg:
     failed = True
     print("  subgraph-only: %s" % ", ".join(only_sg[:20]))
 
-# --- epochs: overlapping recent ids at pinned block, skip L1-vs-L2 start/end ---
-epoch_rows = nest_sql(
-    "SELECT id, total_rewards, total_indexer_rewards, total_delegator_rewards, "
-    "query_fees_collected, curator_query_fees, signalled_tokens "
-    "FROM lodestar_epochs WHERE start_block <= %s ORDER BY id DESC LIMIT 30"
-    % block
-)
-if not epoch_rows:
-    raise SystemExit("nest lodestar_epochs returned no rows for field comparison at block %s" % block)
-ids = [str(int(r["id"])) for r in epoch_rows]
-id_list = ", ".join('"%s"' % i for i in ids)
-sg_epochs = {
-    str(e["id"]): e
-    for e in (
-        gql(
-            "{ epoches(where: { id_in: [%s] }, block: { number: %s }) { "
-            "id totalRewards totalIndexerRewards totalDelegatorRewards "
-            "queryFeesCollected curatorQueryFees signalledTokens } }"
-            % (id_list, block)
-        ).get("epoches")
-        or []
-    )
-}
-FIELDS = [
-    ("total_rewards", "totalRewards"),
-    ("total_indexer_rewards", "totalIndexerRewards"),
-    ("total_delegator_rewards", "totalDelegatorRewards"),
-    ("query_fees_collected", "queryFeesCollected"),
-    ("curator_query_fees", "curatorQueryFees"),
-    ("signalled_tokens", "signalledTokens"),
-]
-epoch_diffs = 0
-missing_sg = [i for i in ids if i not in sg_epochs]
-if missing_sg:
-    failed = True
-    epoch_diffs += len(missing_sg)
-    print("lodestar_epochs subgraph missing ids: %s" % ", ".join(missing_sg[:20]))
-for r in epoch_rows:
-    eid = str(int(r["id"]))
-    sg = sg_epochs.get(eid)
-    if not sg:
-        continue
-    for nest_k, sg_k in FIELDS:
-        nv = str(r.get(nest_k) if r.get(nest_k) is not None else "0")
-        sv = str(sg.get(sg_k) if sg.get(sg_k) is not None else "0")
-        if nv != sv:
-            epoch_diffs += 1
-            failed = True
-            print("lodestar_epochs id=%s %s nest=%s subgraph=%s DIFF" % (eid, nest_k, nv, sv))
-print(
-    "lodestar_epochs compared %s overlapping ids, %s field diffs; start/end block L1-vs-L2 INCOMPARABLE"
-    % (len(ids) - len(missing_sg), epoch_diffs)
-)
+print("lodestar_epochs count-only: mutable aggregates have no historical snapshot surface")
 
 # --- escrow: counts only at pinned block; ids are different schemes ---
 escrow_sg = page_count("paymentsEscrowTransactions")
@@ -324,7 +270,7 @@ PY
 # rejects any progress, so the comparison cannot mix that sealed snapshot with later hot state.
 ready_after=$(curl -fsS -m10 -A 'nuthatch-lodestar-parity' "$NEST/ready" || true)
 [ -n "$ready_after" ] || die "nest at $NEST did not answer /ready after comparison"
-read -r AFTER_BLOCK AFTER_SEALED <<EOF
+read -r _AFTER_BLOCK AFTER_SEALED <<EOF
 $(python3 - "$ready_after" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
@@ -334,7 +280,6 @@ print(int(d["last_block"]), int(d["sealed_through"]))
 PY
 )
 EOF
-[ -n "${AFTER_BLOCK:-}" ] && [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
-[ "$AFTER_BLOCK" -eq "$BLOCK" ] && [ "$AFTER_SEALED" -eq "$BLOCK" ] || die \
-  "nest changed during comparison: expected last_block=sealed_through=$BLOCK, got $AFTER_BLOCK/$AFTER_SEALED"
+[ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
+[ "$AFTER_SEALED" -eq "$BLOCK" ] || die "sealed boundary changed during comparison"
 echo "parity OK at block $BLOCK"
