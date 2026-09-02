@@ -187,10 +187,23 @@ The rule, and it is deliberately crude in the safe direction:
    still touch after predicate and partition pushdown.
 3. **Sum over operators with no deduplication.** A segment read by three operators is charged three
    times, because it is read three times.
+3b. **Refuse any plan in which a sealed scan can be re-executed.** Counting an operator once is only
+   an upper bound if it runs once, and it does not: a scan on the inner side of a nested-loop join,
+   inside a correlated subquery, or under a lateral is **rescanned per outer row**. One operator,
+   many passes over the same segments, and the per-operator sum charges it a single time while
+   execution touches it thousands. With no cold bytes-read counter there is nothing downstream to
+   catch it either, so this is the hole through which an unbounded cold scan would walk.
+
+   Bounding it properly needs a proven multiplicity, which means trusting a cardinality estimate,
+   and a resource cap resting on an estimate is not a cap. So the rule refuses instead: a named
+   query whose plan contains a rescan-capable sealed scan is **not publishable**. That is a real
+   restriction and it is meant to be - it is also usually a rewrite away, since a hash join over the
+   same two relations reads each side once and is what the planner should have picked.
 4. Any operator the rule does not recognise, or any plan that cannot be obtained, **refuses to
    quote**. Fail closed. A bound that silently skips a node it has never seen is not a bound.
-5. **Recursive CTEs are refused outright.** Their scan count is not statically bounded, so no finite
-   upper bound exists, and no named query the counter serves needs one.
+5. **Recursive CTEs are refused outright**, for the same reason as 3b and more starkly: their scan
+   count is not statically bounded at all, so no finite upper bound exists, and no named query the
+   counter serves needs one.
 
 **The reason this is tractable at all is that named queries are a fixed, reviewed corpus.** This RFC
 does not price open `/sql`, and that is not only a safety decision - it is what makes the cold bound
@@ -532,5 +545,7 @@ This RFC adds, after those:
 - Whether a named query's tier is declared in the pricing manifest or inferred by the
   planner. Declaration is simpler and Agora-proof; inference is how a "hot" query silently
   becomes a cold scan after a view change.
-- How the quote binds to a catalogue hash, so a client that recomputes against a different
-  `manifest_version` cannot be told they mis-read.
+- Catalogue **retention**, now that §3 has settled the binding itself: the quote carries the
+  manifest's content hash and execution must use that exact catalogue, so the open question is only
+  how long a quoted catalogue is kept resolvable, and therefore how long a quote may live. The
+  shorter of the two is the real quote lifetime; neither number is chosen here.
