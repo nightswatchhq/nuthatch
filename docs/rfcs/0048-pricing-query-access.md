@@ -148,56 +148,52 @@ A single flat price per named query, in the asset RFC-0046 already chose, plus a
 **deterministic byte-scan admission check** that rejects a query whose planned upper bound
 exceeds a threshold.
 
-**That threshold is derived, not chosen, and an earlier draft of this RFC got it wrong.** It said
-"an operator config key, order of 1 GB". Put that next to the two facts either side of it and it
-does not survive: `SQL_MAX_CONCURRENCY` admits **two** concurrent queries, and the enforcement
-below copies hot rows into per-query temp tables. Two admissions at 1 GB is **2 GB of hot copies
-alone**, before DuckDB's 512 MB working memory, before the redb store, before ingestion state,
-before serving overhead. `CLAUDE.md`'s **≤2 GB per active-chain cursor** is not a target to be
-approached from below by one subsystem; it is the whole cursor, shared across every nest on it. A
-freely-configurable byte threshold is a way to violate a non-negotiable by editing a config file.
+**The threshold is a scan-byte budget, and this RFC deliberately stops short of calling it a RAM
+ceiling.** Two earlier drafts went the other way and both were wrong, in instructive ways worth
+leaving on the record rather than quietly deleting.
 
-So the ceiling is a **cursor-wide reservation, divided** - and the per-query terms must be inside the
-division, not outside it. DuckDB's 512 MB cap is one query's working set, so at concurrency 2 the
-cursor owes **two** of them:
+The first said "an operator config key, order of 1 GB". That does not survive the two facts either
+side of it: `SQL_MAX_CONCURRENCY` admits **two** concurrent queries, and enforcement copies hot rows
+into per-query temp tables. Two admissions at 1 GB is 2 GB of copies alone, before DuckDB's working
+memory, the redb store, ingestion state and serving overhead - and `CLAUDE.md`'s **≤2 GB per
+active-chain cursor** covers all of it, shared across every nest on the cursor. A freely
+configurable byte threshold is a way to violate a non-negotiable by editing a config file.
+
+The second tried to fix that by deriving the threshold from the RAM budget, and **mixed units doing
+it**. `cold_bound` counts bytes read from sealed segments. The hot counter counts the resident size
+of a DuckDB temp table. A RAM-derived threshold is resident bytes. Subtracting a scan quantity from
+a residency quantity and comparing the difference to a third thing is arithmetic on unlike units,
+and the "cursor-wide RAM protection" it appeared to prove did not follow.
+
+So Phase 0 uses **one unit throughout: source bytes read.**
 
 ```
-per_query_resident = (cursor_budget − ingestion − store − serving) / SQL_MAX_CONCURRENCY
-                     − duckdb_working_set
-threshold_bytes    = per_query_resident / expansion_factor
+bound = cold_scan_bytes + hot_scan_bytes        # both bytes read, neither resident size
 ```
 
-Subtracting `duckdb_working_set` once from the whole budget, as an earlier draft did, under-reserves
-by `(SQL_MAX_CONCURRENCY − 1)` working sets - half a gigabyte at today's settings, which is a
-quarter of the cursor.
+`cold_scan_bytes` comes from the catalogue per the per-operator rules above; `hot_scan_bytes` is the
+redb-serialized size of the rows the query copies, counted as it copies them. Commensurate, both
+measurable, and both bounding the thing the check was actually invented for - the pathological scan
+that flat pricing cannot survive.
 
-Three consequences follow, and none of them is optional:
+**What that concedes, plainly: a scan-byte bound is not the RAM guard, and Phase 0 does not add
+one.** RAM is protected by the caps the node already has - DuckDB's 512 MB, two threads,
+`SQL_MAX_CONCURRENCY`, the hot-row cap and the wall-clock timeout - and whether those are sufficient
+at concurrency 2 against the ≤2 GB cursor budget is a real question this RFC does not answer.
+Answering it needs three measurements that do not exist: the ingestion, store and serving
+reservations; the per-query DuckDB working set under this workload; and the bytes-to-resident
+expansion factor for a hot temp table. Those are RFC-0047's fourth commitment, and until they land,
+**a byte threshold and a RAM budget are two different guards and this RFC only proposes one of
+them.** Saying otherwise would be the fault this document keeps identifying elsewhere: a check that
+reads as a guarantee because nobody said what it covers.
 
-- **Admission is accounted cursor-wide, not per query.** A second query admitted while the first is
-  still materialising must be checked against what is left, not against the same ceiling again.
-  Per-query admission with a shared budget is how two individually-legal queries become one
-  violation.
-- **The starting number is a few hundred megabytes, not 1 GB**, and this RFC declines to write a
-  figure at all until the subtractions above are measured. RFC-0047's fourth commitment is exactly
-  that work - expose the existing 512 MB and two-thread DuckDB caps as config and name the ingestion
-  reservation - so this is a dependency, not a coincidence.
-- **And until `expansion_factor` is measured, Phase 0's check is a bytes-read guard and not a RAM
-  ceiling.** That is the honest description and this RFC adopts it rather than the flattering one.
-  `threshold_bytes` above is derived from a RAM budget, but it converts through a factor nobody has
-  measured, so what the node actually enforces is a bound on bytes copied, which is *correlated* with
-  resident memory and not equal to it. Three measured inputs would close the gap and they are named
-  here so the work is visible rather than implied: the ingestion, store and serving reservations; the
-  real per-query DuckDB working set under this workload; and the bytes-to-resident expansion factor
-  for a hot temp table. **Calling it a RAM ceiling before those exist would be the same fault this
-  RFC keeps identifying elsewhere** - a check that reads as a guarantee because nobody said what it
-  covers.
-- **`SQL_MAX_CONCURRENCY` is a divisor here**, which changes its character. Raising it does not only
-  add throughput, it shrinks every query's ceiling. That is worth stating because revisiting that
-  constant is already an open item, and this RFC gives it a second constraint it did not have.
-
-The CI per-cursor RAM budget is the check that would actually catch a mistake here, and a Phase 0
-that ships without a scenario exercising `SQL_MAX_CONCURRENCY` admissions at the threshold has not
-been tested against the thing most likely to go wrong.
+One consequence survives from the RAM framing and is worth keeping. `SQL_MAX_CONCURRENCY` still
+matters here, because whatever the threshold is, N concurrent admissions at it are what the cursor
+must absorb. Raising that constant therefore has a second cost it did not have before, which is
+relevant given revisiting it is already an open item. And the CI per-cursor RAM budget is the check
+that would actually catch a mistake: a Phase 0 that ships without a scenario exercising
+`SQL_MAX_CONCURRENCY` admissions at the threshold has not been tested against the thing most likely
+to go wrong.
 
 This is the Agora lesson made mechanical: do not build a DSL until usage proves you need one.
 The admission check is what stops the pathological scan that flat pricing cannot survive. It
@@ -478,7 +474,7 @@ are checked at different moments, and only one of them is negotiable.
 | | the admission threshold | the quoted price ceiling |
 |---|---|---|
 | what it protects | the node's resources | the client's wallet |
-| set by | **derived** from the per-cursor budget over `SQL_MAX_CONCURRENCY` (§3); config may lower it, never raise it above the derived ceiling | the quote for this query |
+| unit | source bytes read (cold scan + hot scan) | the quote's asset |
 | evaluated against | the **current** snapshot, at execution | the **quoted** snapshot |
 | when the bound grows past it | **reject** | serve, and absorb the difference |
 
@@ -521,15 +517,11 @@ any user SQL is evaluated, and it is therefore the enforcement point:
   Opening it here rather than at quote time is what keeps an unpaid quote from pinning anything, and
   the number of such transactions is bounded by `SQL_MAX_CONCURRENCY`. Today that
   set is the whole hot side for every query; with the pushdown it is whatever the bound admitted.
-- **Count the destination allocation, not the source bytes.** `hot_bytes` is the redb store's
-  serialized size, and the copy lands in a DuckDB temp table with vector layout, row overhead, type
-  conversion and per-table structure on top. Resident memory can be materially larger than the bytes
-  read, so a counter on the source would let two queries each pass their divided allowance while
-  their temp tables together exceed what the cursor has left. The counter has to be on the thing that
-  occupies RAM. Until the expansion factor between the two is **measured** on the real corpus, this
-  RFC claims a bytes-read bound and **not** a RAM guarantee, and §3's derived threshold inherits that
-  caveat: it divides a RAM budget by a concurrency, so it is only sound once the bytes-to-resident
-  factor is known and folded in.
+- **Count source bytes, in the same unit as the cold term**, so the residual arithmetic below is
+  arithmetic on like quantities. Note what this does *not* measure: the copy lands in a DuckDB temp
+  table with vector layout, row overhead and type conversion on top, so resident memory is larger
+  than the bytes counted here by an unmeasured factor. That is the reason §3 declines to call this a
+  RAM ceiling, and it is a limitation of the guard rather than a detail of it.
 - **Count while materialising, against the residual budget** - `threshold - cold_bound`,
   not the threshold. Charging the hot copy against the whole ceiling is the obvious mistake and it
   is worth naming: a threshold `T` with a cold bound of `0.9 T` and hot rows worth `0.2 T` passes a
