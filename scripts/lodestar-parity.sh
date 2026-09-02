@@ -615,10 +615,23 @@ if only_sg:
     failed = True
     for tx, li in only_sg[:20]:
         print("    subgraph-only %s log_index=%s" % (tx, li - collected_off))
-unmodelled = sum(int(t["n"]) for t in types if t["type"] not in ("Deposit", "EscrowCollected"))
+# The nest's type vocabulary is closed here on purpose. `Deposit` and `EscrowCollected` are compared
+# above; `Thaw` and `CancelThaw` are the two the subgraph's entity genuinely does not model. Anything
+# else is a type nobody has decided about, and excluding it because it is unrecognised is precisely
+# how an unchecked population reads as agreement. A new escrow event, or a misclassified row, fails.
+NEST_COMPARED_TYPES = {"Deposit", "EscrowCollected"}
+NEST_UNMODELLED_TYPES = {"Thaw", "CancelThaw"}
+unexpected = [t for t in types if t["type"] not in NEST_COMPARED_TYPES | NEST_UNMODELLED_TYPES]
+if unexpected:
+    failed = True
+    print(
+        "    nest escrow types nobody has classified, so they were never compared: %s"
+        % ", ".join("%s=%s" % (t["type"], t["n"]) for t in unexpected)
+    )
+unmodelled = sum(int(t["n"]) for t in types if t["type"] in NEST_UNMODELLED_TYPES)
 if unmodelled:
     print(
-        "  %s nest rows are types the subgraph does not model (Thaw, CancelThaw) and are not compared"
+        "  %s nest rows are Thaw/CancelThaw, which the subgraph does not model, and are not compared"
         % unmodelled
     )
 
