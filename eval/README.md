@@ -53,6 +53,10 @@ diagnosed: the agent queries `usdc__transfer`, quotes `"from"`/`"to"`, and uses 
 aliases the result `total_transfers` where the oracle expects `n`. Invented table names and the
 big-int footgun are not this run's failure mode. Mean SQL attempts were 1.267, unchanged.
 
+The report's `commit` is the tree the MCP surface was evaluated at (`132e658` on this run: `main`
+when the runner executed). It cannot equal the SHA of the commit that *adds* the report: that SHA
+does not exist until after the file is written.
+
 The runner invokes each subject as a separate restricted process with only the nuthatch MCP bridge;
 the runner alone reads the SQL and expected answers. This honesty is the point: the eval is only
 worth anything if its numbers are real.
