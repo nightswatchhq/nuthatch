@@ -11,6 +11,12 @@ BLOCK=${PINNED_BLOCK:-}
 
 die() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
+if [ -n "$BLOCK" ]; then
+  case "$BLOCK" in
+    ''|*[!0-9]*) die "PINNED_BLOCK must be a decimal block number, got ${BLOCK}" ;;
+  esac
+fi
+
 ready=$(curl -fsS -m10 "$NEST/ready" || true)
 [ -n "$ready" ] || die "nest at $NEST did not answer /ready"
 
@@ -30,7 +36,7 @@ for view in lodestar_allocations lodestar_epochs lodestar_disputes lodestar_escr
   fi
   body=$(curl -fsS -m30 --get "$NEST/sql" --data-urlencode "q=$q" || true)
   [ -n "$body" ] || die "view $view: nest /sql did not answer"
-  python3 - "$view" "$body" << 'PY' || die "view $1 returned no rows"
+  python3 - "$view" "$body" << 'PY' || die "view ${view} returned no rows"
 import json,sys
 view, body = sys.argv[1], sys.argv[2]
 d=json.loads(body)
