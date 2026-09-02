@@ -197,13 +197,35 @@ against the later one. A quote that does not name its snapshot is a quote agains
 moving target.
 
 Sealing between quote and execution moves rows from hot to cold, which can move bytes from a
-scan-class term to a catalogue term and change the total in either direction. The rule follows
-RFC-0046's existing posture and Phase 1's: **the quoted ceiling binds, and the server eats the
-gap.** If re-estimating at execution against the current snapshot exceeds the quoted ceiling, the
-node serves the query anyway and absorbs it, because the client authorised a maximum in good
-faith against a snapshot the node itself published. What it must not do is re-quote upward
-mid-flight. The incentive that keeps this cheap is the same one Phase 1 names: tight catalogue
-stats, and a quote whose snapshot is fresh.
+scan-class term to a catalogue term and change the total in either direction.
+
+**Two ceilings, and conflating them is the mistake to avoid.** They sit at different heights, they
+are checked at different moments, and only one of them is negotiable.
+
+| | the admission threshold | the quoted price ceiling |
+|---|---|---|
+| what it protects | the node's resources | the client's wallet |
+| set by | operator config, order of 1 GB | the quote for this query |
+| evaluated against | the **current** snapshot, at execution | the **quoted** snapshot |
+| when the bound grows past it | **reject** | serve, and absorb the difference |
+
+The admission threshold is **hard and re-evaluated at execution**. A query quoted at 900 MB that
+sealing has since made a 1.2 GB scan is rejected, authorisation or no authorisation, because the
+whole purpose of the check is that the node never runs the pathological scan. A guard that a
+stale quote can walk past is not a guard, and "we already quoted it" is not a reason to run a
+query the operator configured the node to refuse. Rejection at that point is a `4xx` with the
+recomputed bound and both snapshots, and it charges nothing: RFC-0046 records the authorisation on
+serving, so a refused query is simply never recorded.
+
+The **price** is what the server eats. Where the bound grew but stayed under the admission
+threshold, the client pays the quoted amount and the node absorbs the extra bytes, because the
+client authorised a maximum in good faith against a snapshot the node itself published. What the
+node must never do is re-quote upward mid-flight. The incentive that keeps this cheap is the same
+one Phase 1 names: tight catalogue stats, and a quote whose snapshot is fresh.
+
+The two behaviours differ because the failure modes differ. Absorbing a price gap costs the
+operator a fraction of one query's margin. Absorbing a resource gap costs the operator the outage
+that flat pricing plus an admission check was designed to prevent.
 
 This is also the sharpest freeze-legality point in the RFC. The scan classes above are a claim
 about what the planner can prove, and nothing in the tree proves them today. Whoever builds this
