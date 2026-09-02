@@ -287,12 +287,19 @@ def main():
     results = []
     for position, question in enumerate(questions):
         samples = [run[position] for run in all_runs]
+        passed = bool(median([sample["passed"] for sample in samples]))
+        # Diagnostic fields cannot be median'd. Take them from a run that agrees
+        # with the median verdict, so a published zero still says which query failed.
+        witness = next((sample for sample in samples if sample["passed"] == passed), samples[0])
         results.append({
             "id": question["id"], "class": question["class"],
-            "passed": bool(median([sample["passed"] for sample in samples])),
+            "passed": passed,
             "first_try": bool(median([sample["first_try"] for sample in samples])),
             "sql_attempts": int(median([sample["sql_attempts"] for sample in samples])),
             "tool_calls": int(median([sample["tool_calls"] for sample in samples])),
+            "final_query": witness.get("final_query"),
+            "final_rows": None if passed else witness.get("final_rows"),
+            "query_error": witness.get("query_error"),
         })
     run_summaries = []
     for outcomes in all_runs:
