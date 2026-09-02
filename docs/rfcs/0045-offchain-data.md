@@ -14,8 +14,9 @@
   pack, whose list snapshots are the other one), RFC-0018 §1 (authored SQL over hot ∪ sealed),
   RFC-0034 (the bounded query surface this must not widen), RFC-0041 (whether an offchain table can
   be a DBSP input), RFC-0042 (which engine federates it, and the role inventory this belongs in).
-- Blocks: nothing. It explicitly does **not** unblock or reorder RFC-0042, whose slice-2 decision is
-  unchanged by this document.
+- Blocks: nothing. It did not unblock RFC-0042, and RFC-0042 has since closed: **KEEP DuckDB**
+  (§14, 2026-08-30). Offchain federation, if it ever ships, is a DuckDB role. The DataFusion
+  `TableProvider` path waits on a §14 reopen.
 
 ## §0 - Why write this down at all
 
@@ -247,27 +248,29 @@ RFC-0041 shipped 2026-08-28, so the DBSP input question has an answer available 
 dependency: an append-only offchain feed is a valid input, a wholesale-replaced snapshot is not, and
 §4 records that.
 
-RFC-0042 is the live one. Its carve-out was taken 2026-08-29 for **slices 0 and 1 only**: the native
-bill of materials and DuckDB role inventory (#935), and the engine boundary and parity corpus (#936).
-Slices 2 and beyond need their own decision.
+**Amended 2026-09-02.** RFC-0042 closed on 2026-08-30: **KEEP DuckDB**, parked to 2027-09-01 with
+four reopen triggers. The engine question this section was waiting on has an answer. Offchain
+tables, if they ever ship, federate as local sealed Parquet through DuckDB. The DataFusion
+`TableProvider` / `ListingTable` path recorded below is what a §14 reopen would use; it is not
+the path now.
 
-That has a direct consequence for this RFC, and it is the one operational note in the whole document:
-**offchain tables would hand DuckDB a fifth role.** RFC-0042 §9 currently inventories four (parser,
-incremental reference, restart seed, entity serving); federating an external namespace is a fifth, and
-whether it is `read_parquet` over a directory or a DataFusion `TableProvider` is exactly the kind of
-thing slice 0 exists to record. **The right action is to note the prospective role in #935's inventory
-now, while the inventory is being written, rather than discover it after an engine decision has been
-made without it.** That is a sentence in an issue, not a slice of work, and it is the only thing this
-RFC asks for before the freeze lifts.
+The prospective fifth DuckDB role (federating an external namespace, alongside parser, incremental
+reference, restart seed, and entity serving) is therefore DuckDB's to keep. The 2026-08-29
+operational ask, to note it in #935's inventory while that inventory was open, is spent with the
+decision. It does not become a slice of work.
 
-For the record, the Rust-native path is well trodden here. DataFusion's extension point is the
-`TableProvider` trait with `SchemaProvider`/`CatalogProvider`; `ListingTable` covers the file-drop
-case across Parquet, CSV, JSON and Avro with Hive partitioning and metadata caching, `StreamingTable`
-covers unbounded inputs, and `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION` registers external
-data from SQL. The `datafusion-table-providers` crate ships working providers for Postgres, MySQL,
-SQLite, DuckDB, Flight SQL and ODBC. So the offchain work would *reduce* RFC-0042 risk rather than add
-to it, by forcing an external-table abstraction that DataFusion supports natively instead of a
-DuckDB-specific `read_parquet` idiom.
+The source report was delivered again on 2026-09-02. It is the same document this RFC was read
+against on 2026-08-29, not a new RFC. Numbering it a second time would split the argument. The
+corrections in §5 still hold: httpfs is refused, fetching is not a WASM capability, x402 is not
+in this tree (the counter design is now RFC-0046, still unbuilt).
+
+For the record, the Rust-native path remains well trodden if RFC-0042 reopens. DataFusion's
+extension point is the `TableProvider` trait with `SchemaProvider`/`CatalogProvider`;
+`ListingTable` covers the file-drop case across Parquet, CSV, JSON and Avro with Hive
+partitioning and metadata caching, `StreamingTable` covers unbounded inputs, and
+`CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION` registers external data from SQL. The
+`datafusion-table-providers` crate ships working providers for Postgres, MySQL, SQLite, DuckDB,
+Flight SQL and ODBC. That reduces reopen risk. It is not permission to start.
 
 ## §8 - The proposal, if the freeze ever lifts for it
 
@@ -290,25 +293,26 @@ wrong. Note RFC-0037's outstanding limit as the precedent to avoid repeating: it
 runs inline under a 64-fetch budget rather than out of band, and that is the remaining work there.
 
 **Stage 3 - deferred, and larger than it looks.** Push/webhook ingestion, and paid feeds. The latter
-requires building x402 support first, which this product does not have. Neither should be considered
-until stages 1 and 2 have proved the namespace and provenance model.
+is RFC-0046 (accepted in principle, unbuilt) stacked on stages 1 and 2, not an enhancement to a
+connector that exists. Neither should be considered until stages 1 and 2 have proved the namespace
+and provenance model.
 
-**Thresholds that would change the plan.** If RFC-0042 slice 2 runs and DuckDB goes, stage 1 ships as
-a `ListingTable`/`TableProvider` from the first commit rather than being ported later. If offchain
-datasets routinely exceed a single node, adopt a Hive-partitioned layout before adding connectors. If
-verifiability ever becomes a product requirement, escalate provenance from journaled to
-content-addressed and signed, following The Graph's PoI argument rather than Dune's stamp-the-source.
+**Thresholds that would change the plan.** If RFC-0042 reopens under a §14 trigger and DuckDB goes,
+stage 1 ships as a `ListingTable`/`TableProvider` from the first commit rather than being ported
+later. If offchain datasets routinely exceed a single node, adopt a Hive-partitioned layout before
+adding connectors. If verifiability ever becomes a product requirement, escalate provenance from
+journaled to content-addressed and signed, following The Graph's PoI argument rather than Dune's
+stamp-the-source.
 
 ## §9 - What this RFC does not do
 
 It does not start work. It is not a third carve-out and does not ask to become one; per CLAUDE.md a
 carve-out is a decision Chief records in that file, and an approved RFC is not one until it appears
-there. It does not reorder or unblock RFC-0042, whose slice-2 decision stands on RFC-0042 §13's
-evidence and nothing in here. It proposes no change to the query surface, and specifically proposes
-**not** enabling httpfs, now or later.
+there. RFC-0042 is closed; this RFC does not reopen it. It proposes no change to the query surface,
+and specifically proposes **not** enabling httpfs, now or later.
 
-Its only operational output is the note in §7: record the prospective fifth DuckDB role in #935's
-inventory while that inventory is open.
+The 2026-08-29 operational output (note the fifth DuckDB role in #935) is spent. There is no new
+operational output on 2026-09-02.
 
 ## §10 - Provenance of the claims in this document
 
