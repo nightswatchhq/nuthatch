@@ -211,7 +211,9 @@ nest_disputes = {
 sg_disputes = []
 last = ""
 while True:
-    w = f', where: {{ id_gt: "{last}", isLegacy: false }}' if last else ", where: { isLegacy: false }"
+    # Fetch the complete pinned classification first. Filtering legacy rows here would make
+    # `sg_legacy` empty and leave the nest-side exclusion below as rather fine decoration.
+    w = f', where: {{ id_gt: "{last}" }}' if last else ""
     data = gql(
         "{ disputes(first: 1000, orderBy: id, orderDirection: asc, block: { number: %s }%s) { id type isLegacy } }"
         % (block, w)
@@ -312,5 +314,21 @@ if status == "DIFF":
 
 if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
-print("parity OK at block %s" % block)
 PY
+
+# `/sql` reads the live aggregate. The pre-read equality check above establishes the snapshot at
+# entry; this post-read check makes it stable for the full comparison rather than allowing the
+# cursor to advance while the GraphQL pages are being fetched.
+ready_after=$(curl -fsS -m10 -A 'nuthatch-lodestar-parity' "$NEST/ready" || true)
+[ -n "$ready_after" ] || die "nest at $NEST did not answer /ready after comparison"
+AFTER_BLOCK=$(python3 - "$ready_after" << 'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+if not d.get("ready") or d.get("last_block") is None:
+    raise SystemExit(1)
+print(int(d["last_block"]))
+PY
+) || die "nest /ready was not ready after comparison"
+[ "$AFTER_BLOCK" -eq "$BLOCK" ] || die \
+  "nest advanced from pinned block $BLOCK to $AFTER_BLOCK during comparison; no stable snapshot"
+echo "parity OK at block $BLOCK"
