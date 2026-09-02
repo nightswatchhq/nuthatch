@@ -157,6 +157,60 @@ is also the missing row in the guard table in §1.
 hitting the ceiling, or a byte-scan distribution spanning more than two orders of magnitude
 among queries that *pass* admission.
 
+### Phase 0 - what the byte bound actually counts
+
+The bound above is derived from the RFC-0047 catalogue, and the catalogue describes **sealed
+Parquet only**. A named query runs over hot redb ∪ sealed segments, so a catalogue-derived bound
+is not a whole-query bound and must not be called one. Taken literally it prices a query that
+reads two million unsealed hot rows and touches no segment at **zero**, which is the worst
+possible failure for an admission check: the pathological case scores best. The obvious inverse,
+charging the whole hot store to every query, fails in the other direction and rejects the bounded
+point reads that Phase 1's hot tier exists to serve cheaply.
+
+So the bound is two terms, and the hot term is a **scan class**, not a catalogue lookup:
+
+```
+bound = cold_bytes(catalogue, predicate) + hot_bytes(scan_class, hot_rows)
+```
+
+The hot side has a property the cold side does not: it is **bounded by construction**. The hot
+store holds only blocks in `(sealed_through, tip]`, so its size is capped by the finality window
+rather than by history, and the node knows its own hot row count without consulting anything. That
+is what makes a deterministic hot term possible at all.
+
+| scan class | planner proves | hot term |
+|---|---|---|
+| keyed point read | entity key fully bound | one row width, a constant |
+| bounded range | block or key range bound, or `LIMIT` before any hot scan | `min(range_rows, hot_rows) × row_width` |
+| unbounded hot scan | nothing | `hot_rows × row_width`, the whole window |
+
+The third row is the honest default. It is a large number, and it should be: an unbounded scan of
+the mutable tip is exactly what a flat price cannot survive. It is still finite, and it is finite
+for a structural reason rather than an empirical one.
+
+**The consistency rule, which is the part that bites.** Both terms are computed against a snapshot
+`(sealed_through, hot_rows)` captured **before planning**, and the `402` body quotes that pair
+alongside the coefficients. This is not ceremony. The boundary moves on its own: measured on the
+Lodestar box on 2026-09-02, `sealed_through` advanced from 501070866 to 501072741 inside a few
+minutes of ordinary operation, and a parity script pinned to the earlier value refused to run
+against the later one. A quote that does not name its snapshot is a quote against an unstated
+moving target.
+
+Sealing between quote and execution moves rows from hot to cold, which can move bytes from a
+scan-class term to a catalogue term and change the total in either direction. The rule follows
+RFC-0046's existing posture and Phase 1's: **the quoted ceiling binds, and the server eats the
+gap.** If re-estimating at execution against the current snapshot exceeds the quoted ceiling, the
+node serves the query anyway and absorbs it, because the client authorised a maximum in good
+faith against a snapshot the node itself published. What it must not do is re-quote upward
+mid-flight. The incentive that keeps this cheap is the same one Phase 1 names: tight catalogue
+stats, and a quote whose snapshot is fresh.
+
+This is also the sharpest freeze-legality point in the RFC. The scan classes above are a claim
+about what the planner can prove, and nothing in the tree proves them today. Whoever builds this
+owes a slice zero that demonstrates the classifier on the real named-query corpus **before** any
+price is attached to its output, because an admission check that silently classifies an unbounded
+scan as a point read is worse than no admission check at all.
+
 ### Phase 1 - Two-tier quote-then-pay
 
 Only after that benchmark.
