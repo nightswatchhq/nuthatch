@@ -135,7 +135,15 @@ def page_count(entity, extra_where=""):
 
 meta = gql("{ _meta { block { number } } }")
 sg_block = (meta.get("_meta") or {}).get("block", {}).get("number")
+if sg_block is None:
+    raise SystemExit("subgraph _meta.block.number missing, so the pin cannot be checked")
+sg_block = int(sg_block)
 print("subgraph _meta.block.number=%s pin=%s" % (sg_block, block))
+if sg_block < block:
+    raise SystemExit(
+        "subgraph head %s is below pin %s: a match here would not be a comparison at that block"
+        % (sg_block, block)
+    )
 
 net = gql("{ graphNetwork(id: \"1\", block: { number: %s }) { allocationCount } }" % block)
 alloc_sg = (net.get("graphNetwork") or {}).get("allocationCount")
