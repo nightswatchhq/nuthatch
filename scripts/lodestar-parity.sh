@@ -5,6 +5,13 @@
 # cannot reach the nest, when a view returns no rows, when GRAPH_API_KEY is
 # unset so the subgraph side cannot be asked, or when comparable sides disagree.
 #
+# Exit status:
+#   0  parity CLEAN - every comparison ran and agreed
+#   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1113)
+#   1  anything else, including a genuine disagreement and any failure to compare
+# 0 is the only status that means parity. 2 exists so "agrees" is distinguishable from
+# "agrees on the parts we check", which is the distinction the epoch fields cost us.
+#
 # The first run compared incomparable populations (all-time subgraph totals vs
 # Horizon-only nest views) and reported four DIFFs that were not row disagreements.
 # This version compares:
@@ -327,7 +334,19 @@ for i in range(0, len(ordered), 100):
     for r in data.get("epoches") or []:
         sg_epochs[str(r["id"])] = r
 
-overlap = [e for e in ordered if e in sg_epochs and e != open_epoch]
+closed_nest = [e for e in ordered if e != open_epoch]
+# The intersection is where an absent comparison would hide. The Graph Network subgraph holds every
+# epoch the network has had, and the nest holds a Horizon-era subset, so every closed nest epoch
+# must come back. Silently intersecting instead would let the subgraph drop a disagreeing epoch and
+# leave the survivors to report parity.
+missing = [e for e in closed_nest if e not in sg_epochs]
+if missing:
+    failed = True
+    print(
+        "  MISSING %s of %s closed nest epochs absent from the subgraph response at block %s: %s"
+        % (len(missing), len(closed_nest), block, ", ".join(missing[:20]))
+    )
+overlap = [e for e in closed_nest if e in sg_epochs]
 if not overlap:
     raise SystemExit(
         "no closed epoch is held by both sides at block %s, so nothing was compared" % block
@@ -447,8 +466,14 @@ EOF
 [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
 [ "$AFTER_SEALED" -eq "$BLOCK" ] || die "sealed boundary changed during comparison"
 read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
-echo "parity OK at block $BLOCK"
 echo "  proved: allocation counts, dispute id sets, escrow counts, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
-if [ "$EPOCH_KNOWN" != "-" ]; then
-  echo "  NOT proved: epoch fields ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113"
+if [ "$EPOCH_KNOWN" = "-" ]; then
+  echo "parity CLEAN at block $BLOCK"
+  exit 0
 fi
+# Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
+# the same fault this script was rewritten to remove, one level up: a known absence of proof reading
+# as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
+echo "  NOT proved: epoch fields ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113"
+echo "parity NOT CLEAN at block $BLOCK: gated comparisons agree, known differences outstanding"
+exit 2
