@@ -157,11 +157,19 @@ before serving overhead. `CLAUDE.md`'s **≤2 GB per active-chain cursor** is no
 approached from below by one subsystem; it is the whole cursor, shared across every nest on it. A
 freely-configurable byte threshold is a way to violate a non-negotiable by editing a config file.
 
-So the ceiling is a **cursor-wide reservation, divided**:
+So the ceiling is a **cursor-wide reservation, divided** - and the per-query terms must be inside the
+division, not outside it. DuckDB's 512 MB cap is one query's working set, so at concurrency 2 the
+cursor owes **two** of them:
 
 ```
-threshold ≤ (cursor_budget − ingestion − store − serving − duckdb_working_set) / SQL_MAX_CONCURRENCY
+per_query_resident = (cursor_budget − ingestion − store − serving) / SQL_MAX_CONCURRENCY
+                     − duckdb_working_set
+threshold_bytes    = per_query_resident / expansion_factor
 ```
+
+Subtracting `duckdb_working_set` once from the whole budget, as an earlier draft did, under-reserves
+by `(SQL_MAX_CONCURRENCY − 1)` working sets - half a gigabyte at today's settings, which is a
+quarter of the cursor.
 
 Three consequences follow, and none of them is optional:
 
@@ -173,6 +181,16 @@ Three consequences follow, and none of them is optional:
   figure at all until the subtractions above are measured. RFC-0047's fourth commitment is exactly
   that work - expose the existing 512 MB and two-thread DuckDB caps as config and name the ingestion
   reservation - so this is a dependency, not a coincidence.
+- **And until `expansion_factor` is measured, Phase 0's check is a bytes-read guard and not a RAM
+  ceiling.** That is the honest description and this RFC adopts it rather than the flattering one.
+  `threshold_bytes` above is derived from a RAM budget, but it converts through a factor nobody has
+  measured, so what the node actually enforces is a bound on bytes copied, which is *correlated* with
+  resident memory and not equal to it. Three measured inputs would close the gap and they are named
+  here so the work is visible rather than implied: the ingestion, store and serving reservations; the
+  real per-query DuckDB working set under this workload; and the bytes-to-resident expansion factor
+  for a hot temp table. **Calling it a RAM ceiling before those exist would be the same fault this
+  RFC keeps identifying elsewhere** - a check that reads as a guarantee because nobody said what it
+  covers.
 - **`SQL_MAX_CONCURRENCY` is a divisor here**, which changes its character. Raising it does not only
   add throughput, it shrinks every query's ceiling. That is worth stating because revisiting that
   constant is already an open item, and this RFC gives it a second constraint it did not have.
