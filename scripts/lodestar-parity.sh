@@ -41,20 +41,32 @@ if not d.get("ready"):
 print("ready last_block=%s sealed_through=%s" % (d.get("last_block"), d.get("sealed_through")))
 PY
 
-# Default the pin to the nest's sealed watermark so both sides answer the same
-# history. A live tip vs a live subgraph is lag, not disagreement.
+# Aggregate nest views do not expose historical versions. The comparison is therefore valid only
+# at the nest's current block, not at an arbitrary old pin: filtering a current aggregate by its
+# start block does not turn its values into an as-of snapshot.
 if [ -z "$BLOCK" ]; then
   BLOCK=$(python3 - "$ready" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
-n=d.get("sealed_through") or 0
+n=d.get("last_block") or 0
 if not n:
     raise SystemExit(1)
 print(int(n))
 PY
-) || die "sealed_through is missing so there is no pin"
-  echo "PINNED_BLOCK defaulted to sealed_through=$BLOCK"
+) || die "last_block is missing so there is no pin"
+  echo "PINNED_BLOCK defaulted to nest last_block=$BLOCK"
 fi
+
+NEST_BLOCK=$(python3 - "$ready" << 'PY'
+import json,sys
+n=json.loads(sys.argv[1]).get("last_block")
+if n is None:
+    raise SystemExit(1)
+print(int(n))
+PY
+) || die "nest last_block is missing"
+[ "$NEST_BLOCK" -eq "$BLOCK" ] || die \
+  "PINNED_BLOCK=$BLOCK but nest is at $NEST_BLOCK; current aggregate views have no as-of query"
 
 nest_count() {
   local view="$1" col="$2"
@@ -211,12 +223,17 @@ while True:
     last = rows[-1]["id"]
 sg_live = {d["id"].lower() for d in sg_disputes if not d.get("isLegacy")}
 sg_legacy = {d["id"].lower() for d in sg_disputes if d.get("isLegacy")}
-only_nest = sorted(nest_disputes - sg_live)
+# Apply the subgraph's pinned legacy classification to the nest set too. The nest view is event
+# derived and carries no `is_legacy` column of its own, so comparing every nest id to a
+# legacy-filtered subgraph set would manufacture nest-only differences.
+nest_live = nest_disputes - sg_legacy
+nest_legacy = nest_disputes & sg_legacy
+only_nest = sorted(nest_live - sg_live)
 only_sg = sorted(sg_live - nest_disputes)
 status = "OK" if not only_nest and not only_sg else "DIFF"
 print(
-    "lodestar_disputes nest=%s subgraph_live=%s subgraph_legacy_excluded=%s %s"
-    % (len(nest_disputes), len(sg_live), len(sg_legacy), status)
+    "lodestar_disputes nest_live=%s nest_legacy_excluded=%s subgraph_live=%s subgraph_legacy_excluded=%s %s"
+    % (len(nest_live), len(nest_legacy), len(sg_live), len(sg_legacy), status)
 )
 if only_nest:
     failed = True
