@@ -225,7 +225,7 @@ admits an unbounded scan under a bounded quote, which is an outage.
 
 **The consistency rule, which is the part that bites.** Both terms are computed against a snapshot
 captured **before planning**, and the `402` body quotes it alongside the coefficients. The snapshot
-is a **triple**, and each element is load-bearing:
+is a **four-field record**, and each element is load-bearing:
 
 ```
 (catalogue_version, sealed_through, hot_rows, hot_bytes)
