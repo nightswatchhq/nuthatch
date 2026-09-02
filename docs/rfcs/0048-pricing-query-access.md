@@ -261,12 +261,26 @@ settings, and it is the number admission is checked against. Any setting that ca
 **fixed for named queries** rather than left to the session, because a bound that moves with a
 session variable is not reproducible and §4's verifiability claim depends on it being so.
 
-**The ordering that makes this work**, and it falls out of the hot rule rather than needing anything
-new. Hot materialisation happens first and is already bounded by the residual budget. Only once the
-temp tables exist does the planner see the statistics it will actually plan against, so the
-execution plan is taken **after materialisation and before the user SQL is evaluated**, and the cold
-bound is checked there. That is a safe place to abort: materialisation reads the hot store, not the
-segments, so **no cold I/O has happened yet** at the moment the cold bound is tested.
+**The ordering that makes this work, and the circularity it has to break.** Hot materialisation is
+bounded by `threshold - cold_bound`; the execution-time cold bound needs the plan; the plan needs the
+temp tables to exist. Each waits on the other, and the publish-time bound has already been rejected
+as the guard.
+
+The way out is that **a reservation and a guard are different things, and only one of them has to be
+right**. So it runs in two stages:
+
+1. **Reserve** using the publish-time cold bound. Materialise hot against `threshold - reserved`.
+   The publish-time number is not trusted here and does not need to be: being wrong about a
+   reservation costs a copy that gets thrown away, never an unbounded scan, and the hot side is in
+   any case separately capped by `hot_bytes`, which is finite by construction. A reservation may be
+   an estimate. A guard may not.
+2. **Guard** using the execution plan, taken once the temp tables exist and the planner can see the
+   statistics it will actually plan against, and checked **before the user SQL is evaluated**. If
+   the real cold bound exceeds what is left, abort.
+
+Stage 2 is a safe place to abort because materialisation reads the hot store and not the segments,
+so **no cold I/O has happened yet** when the cold bound is tested. The worst case is a wasted hot
+copy, bounded by the hot cap, which is exactly the cost the split was chosen to pay.
 
 A large divergence between the two bounds is not an error in itself, since data grows, but it is the
 signal that the published quote needs re-reviewing, and it should be reported rather than absorbed
@@ -402,9 +416,29 @@ already stamps `sealed_through`, and a caller who wants the newer data asks agai
 that forces a re-quote is `H1` having aged past retention, which is why the retention window and the
 quote lifetime are the same question.
 
-This also makes the bound static rather than merely bounded. With `H1` pinned the cold term cannot
-move at all, and the hot side is pinned by the read transaction below, so nothing under the quote is
-still in motion at execution:
+**Pinning the catalogue is not sufficient on its own, and the gap it leaves is the one that would
+lose data rather than merely mis-price it.** Quote at `sealed_through = B`, then let `B+100` seal
+before execution. `H1`'s segments cover history through `B`; a redb read transaction *taken at
+execution* sees only rows after `B+100`. Rows `B+1..B+100` are in neither. A read transaction opened
+late cannot recover rows that were hot when the quote was made and have since been sealed into a
+catalogue the quote does not name.
+
+So the snapshot has to be taken **whole, at quote time, and held**: the catalogue hash and the redb
+read transaction are one atomic act, not two checks at two moments. The read transaction is opened
+before the bound is computed and held until execution finishes, which is what makes
+`(catalogue_hash, sealed_through, hot_rows, hot_bytes)` describe a single consistent world rather
+than four numbers gathered as the world moved.
+
+That has a price and it sets the quote's lifetime: an open read transaction pins redb space against
+reclamation, so a quote cannot be long-lived, and **a quote expires when its read transaction is
+released**. A client that does not execute within that window re-quotes. Combined with the retention
+rule above, the quote lifetime is the shortest of three things - catalogue retention, read-transaction
+hold, and any commercial expiry - and the design should say which one binds rather than leaving three
+independent clocks.
+
+With both halves pinned the bound is static rather than merely bounded: the cold term cannot move
+because `H1` is immutable, and the hot term cannot move because the transaction is held. Nothing
+under the quote is still in motion at execution:
 
 **Two ceilings, and conflating them is the mistake to avoid.** They sit at different heights, they
 are checked at different moments, and only one of them is negotiable.
