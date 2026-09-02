@@ -36,7 +36,7 @@ remaining three are open, and they are open in the same direction; §9 says what
 
 | § | Shape | Verdict here |
 |---|---|---|
-| §1 | The reference list is never itself checked | **Open** |
+| §1 | The reference list is never itself checked | **Open** - and only the empty case is cheaply answerable |
 | §2 | The decoder's drops are invisible | **Open** |
 | §3 | Configured-but-empty means off, and the surface still says on | **Partly** - one case, and it is the compliance one |
 | §4 | The check that cannot fire | **Partly** - the mechanism exists, its coverage does not reach the risky code |
@@ -75,15 +75,31 @@ is small, and independent per block, so *k* consecutive positives against zero h
 evidence roughly to the *k*th power. That makes this a **sampled audit, not a per-block gate**, which
 is also what keeps it affordable.
 
+**What it does not catch, stated before anyone builds it on the strength of the paragraph above.**
+The bloom is a membership filter, not a count. It answers *was there a log matching this address and
+topic in this block*, and nothing else. So it catches the **empty** case - we harvested nothing where
+something existed - and it is blind to the partial one. Ten logs in the block and nine in our hands
+leaves the bloom positive and our response non-empty, and this check passes. That is half of the
+failure named at the top of this section, and it is the half a `getLogs` response is most likely to
+produce by an off-by-one at a chunk boundary.
+
+Two things follow. The empty case is still worth catching on its own terms: an entire window
+silently empty is the catastrophic version, it is what a misfiled filter or a provider serving a
+stale index produces, and today nothing at all would notice it. And **detecting a partial omission
+needs a counting oracle, which the header does not give us** - `receiptsRoot` would, but verifying it
+means fetching every receipt in the block, which is the expensive path this whole approach exists to
+avoid. So the honest scope is "did we get nothing where there was something", and any proposal that
+claims more than that is claiming more than the bloom can deliver.
+
 The cost is the header, and for a nest with `extract.blocks` on (RFC-0036) we are already fetching
 it. Shape: a log-completeness mode on `nuthatch audit` over a sealed range, in the same family as
 that command's existing screening replay, which re-derives stored annotations rather than trusting
 them. No flag is named here - the doc-command gate is right that a document should not describe an
-invocation the binary does not accept.
-This is the same idea pointed at the layer below.
+invocation the binary does not accept. This is the same idea pointed at the layer below.
 
-**Verdict: open.** It is the one claim in `verification.md`'s "what we do not claim" section that has
-an affordable partial answer, and it does not need a second endpoint or a consensus client.
+**Verdict: open, and only partly answerable.** The empty case has an affordable check and does not
+need a second endpoint or a consensus client. The short-by-a-few case does not, and stays where
+`verification.md`'s "what we do not claim" section already puts it.
 
 ## §2 - The decoder's drops are invisible
 
@@ -343,7 +359,9 @@ section.
    decorative test there survives indefinitely. Maintenance; sequence it after item 1.
 5. **A sampled `logsBloom` audit over a sealed range** (§1). The only independent oracle available
    without a second endpoint or a consensus client, one-sided in the useful direction, and free for a
-   nest already fetching headers under RFC-0036. Shape it as a mode of `nuthatch audit`, alongside the
+   nest already fetching headers under RFC-0036. **Scope it to the empty case and say so in the
+   name**: the bloom is a membership filter and cannot count, so it catches "nothing where there was
+   something" and is blind to "nine where there were ten". Shape it as a mode of `nuthatch audit`, alongside the
    screening replay, and state the false-positive caveat in the output rather than in a footnote.
    The largest of the five; propose it only if item 1 finds anything.
 
