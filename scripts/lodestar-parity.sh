@@ -96,7 +96,11 @@ PY
 )
 EOF
 [ -n "${NEST_SEALED:-}" ] || die "nest readiness lacks a sealed boundary"
-[ "$NEST_SEALED" -eq "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK but sealed_through=$NEST_SEALED"
+# `-ge`, not `-eq`. What the pin needs is that the block is at or below a sealed boundary, so both
+# sides describe immutable history. A pin *older* than the current watermark satisfies that more
+# strongly, not less - more of it is settled. Demanding equality made every run a race against the
+# sealer, which is a poor property for a check billed as continuous.
+[ "$NEST_SEALED" -ge "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK is above sealed_through=$NEST_SEALED, so it is not settled history"
 
 nest_count() {
   local view="$1" col="$2"
@@ -660,7 +664,12 @@ PY
 )
 EOF
 [ -n "${AFTER_SEALED:-}" ] || die "nest /ready was not ready after comparison"
-[ "$AFTER_SEALED" -eq "$BLOCK" ] || die "sealed boundary changed during comparison"
+# Ordinary forward progress during the run is not a problem: the pin is still sealed, so every read
+# above saw settled history. The boundary going *backwards* is the thing worth catching - a reorg
+# past the pin, or a nest that lost sealed state - and `-ge` still catches exactly that. Under `-eq`
+# this failed a run in which every comparison had already passed, purely because the nest sealed a
+# batch while the escrow join was paging.
+[ "$AFTER_SEALED" -ge "$BLOCK" ] || die "sealed boundary went backwards during comparison: $BLOCK -> $AFTER_SEALED"
 read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
 echo "  proved: allocation counts, dispute id sets, escrow rows joined by id, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
 if [ "$EPOCH_KNOWN" = "-" ]; then
