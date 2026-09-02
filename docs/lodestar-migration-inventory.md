@@ -303,10 +303,37 @@ fault. That is this project's most-recorded defect - an absence rendering as hea
 production code on the one route whose failure is least visible, because a missing name looks like a
 subgraph that has no name.
 
-Worth its own issue rather than a line here.
+Worth its own issue rather than a line here. Filed as #1097; the same sweep then found #1103
+(`api/ens` 200 `{ ensName: null }`) and #1104 (`api/token-metrics` 200 `{ data: [] }`).
 
 This is offered as the §6 deliverable the audit plan asks for - "find a migration-relevant thing with
 no issue" - and it wants filing rather than leaving here.
+
+### Decision (#1092): nest-direct
+
+Taken 2026-09-02. The 12 group-C request-time routes migrate onto a nest, not onto Postgres first.
+
+Postgres-cache-first would be a new cache layer those routes do not have, filled from the gateway,
+and only later from a nest. After that first step, removing `GRAPH_API_KEY` would not 503 the pages:
+it would serve whatever Postgres last wrote, with no freshness. #1080 forbids that. Completing the
+nine `src/lib/ingest/*` modules does not touch these routes at all, which is the failure the issue
+describes.
+
+The five surfaces already on a nest are nest-direct and fail visibly without a configured origin.
+That is the pattern, and #1080 already wrote the serving rules in front of it (`/ready` before
+answering, freshness on the response, no Graph fallback). No further switch until those three are
+implemented.
+
+**#1078's done-state is therefore:** every group-C surface, including these 12 request-time routes,
+served by a nest, with that readiness gate in front. Not "the ingest modules switched". The 6 routes
+that already read Postgres keep that path; their crons are the ingest job. Group A stays on the
+gateway. Group B's display names stay.
+
+The issue title said 22 of 27. Re-measured on 2026-09-02 against `~/Projects/lodestar` at `fa18fc4`,
+same commands as the appendix: **21 of 27** have no database module, and they partition the 27 with
+the 6 that do. The body listed those 21 and then six database-touching routes as "five".
+`token-metrics` is the interesting extra: it has a database module and still falls through to the
+gateway on a miss (#1104).
 
 ## 7. What this changes about the open issues
 
@@ -314,7 +341,10 @@ no issue" - and it wants filing rather than leaving here.
   This file is the deliverable; what remains is reading the five mixed and three unclassified rows.
 - **#1078's table is 7 rows of a 29-row group.** Its `src/lib/subgraph.ts` seam is real but is one of
   six clients, so a nuthatch-backed implementation behind it migrates the Graph Network surfaces and
-  touches none of ENS, QoS or delegation events.
+  touches none of ENS, QoS or delegation events. **Done is not the ingest modules.** Per the §6a
+  decision, done is every group-C surface served by a nest, including the 12 request-time routes,
+  nest-direct, behind the #1080 readiness gate. The 6 Postgres-reading routes keep that path and
+  migrate with their crons.
 - **#1079 should cover 11 group-A surfaces and 11 group-B, not 7 and 2**, and should say for each
   mixed row which half stays.
 - **#1082 is bigger than `delegations`.** **Twelve** group-C surfaces have no view at all, not one,
