@@ -17,8 +17,8 @@ That is #1067, #1068, #1069, #1070, #1071, #1072, #1074, #1075, #1076, #1077, #1
 #1081, #1082, #1083, #1084 and #1086. Work discovered in flight is filed **unlabelled**; pulling it
 into scope needs a board reply.
 
-**Reduced 2026-09-02.** The board unlabelled #1067, #1076 and #1078. The labelled remainder is the
-fifteen closed issues; that is the close.
+**Reduced 2026-09-02.** The board unlabelled #1067, #1076 and #1078. Those three stay open. The
+labelled remainder is the fifteen issues that completed in the sprint; that is the close.
 
 ## The theme
 
