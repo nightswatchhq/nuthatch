@@ -110,6 +110,7 @@ async fn bring_up(
         health.register(name, "arbitrum-one");
     }
     let names: Vec<String> = mounted.iter().map(|(n, _, _)| n.clone()).collect();
+    let dirs: Vec<std::path::PathBuf> = mounted.iter().map(|(_, d, _)| d.clone()).collect();
     let cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
@@ -134,22 +135,20 @@ async fn bring_up(
     .await;
     assert!(landed, "the runtime did not reach block {tip} in time");
 
-    // Seal past finality, so the rows compared later are real Parquet segments and the adoption is
-    // not being judged on the hot store alone. Sealing runs at a window boundary, so finality moving
-    // is not enough on its own - a fresh block has to arrive after it.
     tape.advance_finalized_to(finalized);
     tape.insert_block(tip + 1, empty_block(tip + 1, 0, 1_700_000_001 + tip));
     tape.advance_tip_to(tip + 1);
-    let sealed = wait_until(POLL_TIMEOUT, || {
-        cursor
-            .states
-            .iter()
-            .all(|(_, s)| s.store.sealed_through() >= finalized)
+    let followed = wait_until(POLL_TIMEOUT, || {
+        let want = (tip + 1).to_string();
+        cursor.states.iter().all(|(_, s)| {
+            s.store.get_meta("last_block").ok().flatten().as_deref() == Some(want.as_str())
+        })
     })
     .await;
     assert!(
-        sealed,
-        "the runtime did not seal through {finalized} in time"
+        followed,
+        "the runtime did not follow to block {} in time",
+        tip + 1
     );
 
     // Read the heights off the live states: reopening a store the aborted cursor still holds would
@@ -173,6 +172,13 @@ async fn bring_up(
     // databases. It used to be written out here; it now lives on `ChainCursor` so the next fixture
     // that reopens a store cannot step in the same hole (#407).
     cursor.shutdown().await;
+
+    // The tip path will not seal four rows (#1067). Seal through the public API so the
+    // adoption assertions see real Parquet without stuffing dummy events into a fixture
+    // that counts them.
+    for dir in &dirs {
+        force_seal_through(dir, finalized);
+    }
     heights
 }
 

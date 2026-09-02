@@ -247,7 +247,11 @@ async fn nest_with_a_sealed_range(
     std::collections::BTreeMap<String, Vec<u8>>,
 ) {
     for b in 1..=10u64 {
-        tape.insert_block(b, canonical_block(b));
+        let mut fx = canonical_block(b);
+        if b == 8 {
+            pad_address_to_seal(&mut fx, USDC, 7);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(10);
     let (rt, store) = spawn_indexed(dir, tape.clone(), 10).await;
@@ -257,7 +261,7 @@ async fn nest_with_a_sealed_range(
         tape.insert_block(b, empty_block(b, 0, 1_700_000_100 + b));
     }
     tape.advance_tip_to(14);
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= 8).await;
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 8).await;
     assert!(sealed, "range [1,8] did not seal in time");
     let landed = wait_until(POLL_TIMEOUT, || {
         store.get_meta("last_block").ok().flatten().as_deref() == Some("14")
@@ -432,7 +436,11 @@ async fn reorg_below_finality_halts() {
     let tape = Arc::new(TapeSource::new());
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     for b in 1..=10u64 {
-        tape.insert_block(b, canonical_block(b));
+        let mut fx = canonical_block(b);
+        if b == 8 {
+            pad_address_to_seal(&mut fx, USDC, 7);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(10);
 
@@ -463,7 +471,7 @@ async fn reorg_below_finality_halts() {
     tape.insert_block(11, empty_block(11, 0, 1_700_000_111));
     tape.insert_block(12, empty_block(12, 0, 1_700_000_112));
     tape.advance_tip_to(12);
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= 8).await;
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 8).await;
     assert!(sealed, "range [1,8] did not seal in time");
 
     // Snapshot the sealed layer and the cursor *before* the violation, so "it did not touch them"

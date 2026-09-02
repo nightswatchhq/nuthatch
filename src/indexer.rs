@@ -2572,9 +2572,10 @@ fn shorten_store(url: &str) -> &str {
     }
 }
 
-/// Batch size (rows) at which `backfill_direct` flushes a sealed segment - bounds RSS during a
-/// from-history backfill regardless of how long the range is.
-const SEAL_DIRECT_BATCH: usize = 20_000;
+/// Batch size (rows) at which both seal paths cut a segment: `backfill_direct` via
+/// [`take_sealable`], the tip path via [`tip_seal_cut`]. Public so integration tests can pad a
+/// finalized range to the same threshold without duplicating the number.
+pub const SEAL_DIRECT_BATCH: usize = 20_000;
 
 /// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
 /// window happened to stop (RFC-0028 §4).
@@ -5349,8 +5350,34 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
     }
 }
 
-/// Seal every indexed block up to `finalized_through` (the finality-safe ceiling) that isn't sealed
-/// yet, advancing the `sealed_through` watermark and pruning the sealed range from the hot store.
+/// Block at which the tip path should cut a segment, or `None` to keep holding in the hot store.
+///
+/// Same rule as [`take_sealable`]: wait until `SEAL_DIRECT_BATCH` rows have finalised, then cut at
+/// the block that carried the buffer past the threshold. The cut is a function of the rows, not of
+/// when finality advanced, so two operators whose tips move on different schedules still produce
+/// identical segments (#1067). A range with no rows is `None` as well; the caller advances the
+/// watermark in that case because there is nothing to batch.
+fn tip_seal_cut(entities: &[String]) -> Option<u64> {
+    if entities.len() < SEAL_DIRECT_BATCH {
+        return None;
+    }
+    block_number_of(&entities[SEAL_DIRECT_BATCH - 1])
+}
+
+fn block_number_of(json: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    match v.get("block_number")? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
+/// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
+///
+/// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
+/// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
 async fn maybe_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
@@ -5368,7 +5395,7 @@ async fn maybe_seal(
     };
     let ceiling = finalized_through.min(last_indexed);
 
-    let from = match store.get_meta(SEALED_THROUGH_KEY)? {
+    let mut from = match store.get_meta(SEALED_THROUGH_KEY)? {
         Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
         None => store
             .get_meta(START_BLOCK_KEY)?
@@ -5379,52 +5406,79 @@ async fn maybe_seal(
         return Ok(()); // nothing new has finalized
     }
 
-    // Pin a checkpoint exactly at the new watermark. `detect_reorg` can only verify a checkpoint it
-    // holds, and checkpoints are otherwise sparse - one per processed window, not one per block. Without
-    // one pinned here, a reorg forking strictly above `sealed_through` can still walk past the watermark
-    // to some far older surviving checkpoint, under-shoot below it, and trip the finality guard on a
-    // block the reorg never touched (#461). Best-effort: a source hiccup here just leaves the walk as
-    // sparse as before, it doesn't block sealing.
-    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-        store.set_block_hash(ceiling, &hash)?;
-    }
+    loop {
+        if ceiling < from {
+            return Ok(());
+        }
+        let entities = store.entities_in_range(from, ceiling)?;
+        let cut = match tip_seal_cut(&entities) {
+            None if entities.is_empty() => {
+                // Finalized range with no transfers - just advance the watermark. Pinning a
+                // checkpoint at the new watermark is what stops a later reorg from walking past it
+                // to an older surviving checkpoint and tripping the finality guard on a block the
+                // reorg never touched (#461). Best-effort: a source hiccup leaves the walk sparse.
+                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                    store.set_block_hash(ceiling, &hash)?;
+                }
+                store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
+                metrics.set_sealed_through(ceiling);
+                tracing::debug!(
+                    "blocks {from}..={ceiling} finalized with no transfers; watermark advanced"
+                );
+                return Ok(());
+            }
+            None => {
+                // Held, not drained. A cursor-wide "seal because co-tenants are fat"
+                // flush was considered and reverted: it made segment identity depend
+                // on which nests share the cursor. The 2 GB budget is the multinest
+                // RAM job (measured 372 MB for 20 nests × 12,010 rows against 2048).
+                // Still pin the finalized ceiling. Holding rows does not mean the reorg
+                // walker can do without a checkpoint: #461 was a walk that skipped past
+                // sealed_through to an older sparse checkpoint and tripped the finality
+                // guard on a block the reorg never touched. The empty-range arm already
+                // pins; this one must too (#1067).
+                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                    store.set_block_hash(ceiling, &hash)?;
+                }
+                tracing::debug!(
+                    rows = entities.len(),
+                    threshold = SEAL_DIRECT_BATCH,
+                    from,
+                    ceiling,
+                    "tip path holding finalized rows until the batch threshold"
+                );
+                return Ok(());
+            }
+            Some(cut) => cut,
+        };
 
-    let entities = store.entities_in_range(from, ceiling)?;
-    // Every table in the range seals together (per-table segments), so once sealing succeeds the
-    // whole range is safe to prune from the hot store - the watermark stays global.
-    match seal::seal_range_with_snapshot(dir, &entities, from, ceiling, registry_snapshot)? {
-        Some(summary) => {
-            // COR-1: prune the sealed rows from hot AND advance the watermark in one atomic txn, AFTER
-            // the segment is durable. The watermark advancing is what makes the range "cold", so it must
-            // happen with the prune, never before it - else a crash between the two would leave the range
-            // permanently in both layers (double-counted forever). `seal_range` is idempotent, so a crash
-            // before this line just re-seals on restart.
-            let pruned = store.prune_and_set_meta(
-                from,
-                ceiling,
-                SEALED_THROUGH_KEY,
-                &ceiling.to_string(),
-            )?;
-            metrics.set_sealed_through(ceiling);
-            metrics.add_rows_sealed(summary.rows as u64);
-            // Debug, not info: over a from-history backfill nearly every window seals, so this is
-            // per-window spam. The sealed watermark is in `/metrics` (SEALED_THROUGH) for observability.
-            tracing::debug!(
-                "sealed blocks {from}..={ceiling}: {} rows across {} table(s); pruned {pruned} from hot",
-                summary.rows,
-                summary.tables
-            );
+        if let Ok(Some(hash)) = source.block_hash(cut).await {
+            store.set_block_hash(cut, &hash)?;
         }
-        None => {
-            // Finalized range with no transfers - just advance the watermark.
-            store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
-            metrics.set_sealed_through(ceiling);
-            tracing::debug!(
-                "blocks {from}..={ceiling} finalized with no transfers; watermark advanced"
-            );
+
+        let to_seal = store.entities_in_range(from, cut)?;
+        match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
+            Some(summary) => {
+                let pruned =
+                    store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
+                metrics.set_sealed_through(cut);
+                metrics.add_rows_sealed(summary.rows as u64);
+                tracing::debug!(
+                    "sealed blocks {from}..={cut}: {} rows across {} table(s); pruned {pruned} from hot",
+                    summary.rows,
+                    summary.tables
+                );
+            }
+            None => {
+                store.set_meta(SEALED_THROUGH_KEY, &cut.to_string())?;
+                metrics.set_sealed_through(cut);
+                tracing::debug!(
+                    "blocks {from}..={cut} finalized with no transfers; watermark advanced"
+                );
+            }
         }
+        from = cut + 1;
     }
-    Ok(())
 }
 
 /// Build a weight −1 retraction batch from stored transfer JSON (used on reorg rollback).
@@ -6094,6 +6148,248 @@ mod tests {
             "adding rows to the first block did not move the first seal boundary, so this \
              observable cannot see a boundary change at all and the assertions above would pass \
              against a broken implementation"
+        );
+    }
+
+    fn entity_json(block: u64, i: u64) -> String {
+        format!(r#"{{"table":"t__x","block_number":{block},"log_index":{i},"v":"{i}"}}"#)
+    }
+
+    fn entities_for(blocks: u64, per_block: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            for i in 0..per_block {
+                out.push(entity_json(b, i));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_tip_path_holds_below_the_batch_threshold() {
+        let short = entities_for(100, 3);
+        assert!(
+            short.len() < SEAL_DIRECT_BATCH,
+            "fixture accidentally crossed the threshold"
+        );
+        assert_eq!(
+            tip_seal_cut(&short),
+            None,
+            "the tip path sealed {n} rows, below SEAL_DIRECT_BATCH={SEAL_DIRECT_BATCH}. \
+             That is the 6 KB median: each finality advance becoming its own Parquet file (#1067).",
+            n = short.len()
+        );
+        assert_eq!(
+            tip_seal_cut(&[]),
+            None,
+            "an empty range must also return None so the caller can advance the watermark \
+             without inventing a segment"
+        );
+    }
+
+    #[test]
+    fn the_tip_path_cuts_at_the_same_block_as_the_backfill_path() {
+        let mut rows = Vec::new();
+        let mut json = Vec::new();
+        for b in 0..30_000u64 {
+            for i in 0..((b % 7) + 1) {
+                rows.push((b, format!("{b}:{i}")));
+                json.push(entity_json(b, i));
+            }
+        }
+        assert!(json.len() > SEAL_DIRECT_BATCH);
+
+        let backfill_cut = take_sealable(&mut rows).map(|(_, b)| b);
+        let tip_cut = tip_seal_cut(&json);
+        assert_eq!(
+            tip_cut, backfill_cut,
+            "tip and backfill cuts disagree, so a nest that backfilled and then followed the tip \
+             would produce a different segment than one that sealed the same rows in one pass"
+        );
+        let cut = tip_cut.expect("corpus crossed the threshold");
+        let in_cut = json
+            .iter()
+            .filter(|j| block_number_of(j) == Some(cut))
+            .count();
+        assert!(in_cut >= 1, "the cut block has no rows in the corpus");
+        let before_or_at: usize = json
+            .iter()
+            .take_while(|j| block_number_of(j).expect("block") <= cut)
+            .count();
+        assert!(
+            before_or_at >= SEAL_DIRECT_BATCH,
+            "the cut left the threshold row in the remainder"
+        );
+    }
+
+    #[test]
+    fn two_tip_schedules_produce_the_same_cuts() {
+        let json = entities_for(9_000, 5);
+        assert!(json.len() > SEAL_DIRECT_BATCH * 2);
+
+        fn cuts_of(json: &[String]) -> Vec<u64> {
+            let mut cuts = Vec::new();
+            let mut start = 0usize;
+            while start < json.len() {
+                match tip_seal_cut(&json[start..]) {
+                    None => break,
+                    Some(cut) => {
+                        let n = json[start..]
+                            .iter()
+                            .take_while(|j| block_number_of(j).expect("block") <= cut)
+                            .count();
+                        assert!(n > 0, "cut {cut} consumed no rows");
+                        cuts.push(cut);
+                        start += n;
+                    }
+                }
+            }
+            cuts
+        }
+        // One schedule: finality advances one block at a time, so each call to
+        // `tip_seal_cut` sees only the prefix that has finalized. The other: the
+        // whole corpus is already finalized. #1067 requires those to agree.
+        fn cuts_as_finality_advances(json: &[String]) -> Vec<u64> {
+            let mut cuts = Vec::new();
+            let mut start = 0usize;
+            let mut i = 0usize;
+            while i < json.len() {
+                let b = block_number_of(&json[i]).expect("block");
+                while i < json.len() && block_number_of(&json[i]) == Some(b) {
+                    i += 1;
+                }
+                if let Some(cut) = tip_seal_cut(&json[start..i]) {
+                    cuts.push(cut);
+                    let n = json[start..i]
+                        .iter()
+                        .take_while(|j| block_number_of(j).expect("block") <= cut)
+                        .count();
+                    start += n;
+                }
+            }
+            cuts
+        }
+        let by_one = cuts_as_finality_advances(&json);
+        let all_at_once = cuts_of(&json);
+        assert!(
+            !by_one.is_empty(),
+            "the schedule never crossed the threshold, so the comparison is vacuous"
+        );
+        assert_eq!(
+            by_one, all_at_once,
+            "tip-path cuts depend on how finality was reported, which is the thing #1067 exists \
+             to stop"
+        );
+    }
+
+    #[test]
+    fn dropping_the_tip_threshold_is_visible() {
+        let short = entities_for(3, 10);
+        assert!(short.len() < SEAL_DIRECT_BATCH);
+        let old_rule_would_seal = !short.is_empty();
+        let new_rule_seals = tip_seal_cut(&short).is_some();
+        assert!(
+            old_rule_would_seal && !new_rule_seals,
+            "the old tip path and the new one agree on a {n}-row range, so this suite cannot \
+             detect a revert to sealing every finality advance",
+            n = short.len()
+        );
+    }
+
+    struct HashOnly;
+
+    #[async_trait::async_trait]
+    impl Source for HashOnly {
+        async fn tip(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    fn load_rows(store: &Store, n: u64) {
+        let entities: Vec<(String, String)> = (0..n)
+            .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+            .collect();
+        store
+            .commit_window(&entities, Some((n - 1, "aa")), n - 1)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn maybe_seal_holds_a_short_finalized_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        load_rows(&store, 100);
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap(),
+            None,
+            "maybe_seal sealed a 100-row range. The batching lives in tip_seal_cut; if this \
+             fires, maybe_seal stopped asking it (#1067)."
+        );
+        assert_eq!(
+            store.entities_in_range(0, 99).unwrap().len(),
+            100,
+            "held rows were pruned from the hot store even though the watermark did not move"
+        );
+        assert!(
+            seal::load_manifest(tmp.path())
+                .map(|m| m.tables.is_empty())
+                .unwrap_or(true),
+            "a short range produced a segment file"
+        );
+        let pinned = format!("{:064x}", 99);
+        assert_eq!(
+            store.get_block_hash(99).unwrap().as_deref(),
+            Some(pinned.as_str()),
+            "a held finalized range must still pin a checkpoint at the ceiling, or a later \
+             reorg walks past it to an older sparse checkpoint (#461 / #1067)"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_seal_cuts_once_the_threshold_is_crossed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let n = SEAL_DIRECT_BATCH as u64 + 50;
+        load_rows(&store, n);
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(tmp.path(), &store, &HashOnly, n - 1, None, &metrics)
+            .await
+            .unwrap();
+        let sealed = store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .expect("watermark must move once the threshold is crossed")
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(
+            sealed,
+            SEAL_DIRECT_BATCH as u64 - 1,
+            "one row per block, so the cut must be the block of row SEAL_DIRECT_BATCH-1"
+        );
+        let remain = store.entities_in_range(sealed + 1, n - 1).unwrap().len();
+        assert_eq!(
+            remain, 50,
+            "the post-cut remainder must stay in the hot store"
+        );
+        let manifest = seal::load_manifest(tmp.path()).expect("manifest");
+        assert!(
+            !manifest.tables.is_empty(),
+            "crossing the threshold produced no segment"
         );
     }
 

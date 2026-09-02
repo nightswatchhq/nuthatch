@@ -88,16 +88,17 @@ async fn bring_up(
     let a1 = account(1);
     let a2 = account(2);
     for b in 1..=6u64 {
-        tape.insert_block(
+        let mut fx = transfers_block(
             b,
-            transfers_block(
-                b,
-                0,
-                1_700_000_000 + b,
-                USDC,
-                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
-            ),
+            0,
+            1_700_000_000 + b,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
         );
+        if b == 4 {
+            pad_address_to_seal(&mut fx, USDC, 3);
+        }
+        tape.insert_block(b, fx);
     }
     tape.advance_tip_to(6);
 
@@ -142,7 +143,7 @@ async fn bring_up(
     tape.advance_finalized_to(4);
     tape.insert_block(7, empty_block(7, 0, 1_700_000_007));
     tape.advance_tip_to(7);
-    let sealed = wait_until(POLL_TIMEOUT, || {
+    let sealed = wait_until(SEAL_POLL_TIMEOUT, || {
         cursor
             .states
             .iter()

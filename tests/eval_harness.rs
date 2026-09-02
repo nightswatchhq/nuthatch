@@ -108,12 +108,18 @@ async fn build_fixture(dir: &std::path::Path) -> indexer::NestRuntime {
     .await;
     assert!(landed, "fixture did not index to the tip");
 
-    // Seal 1..=7; a fresh empty block past the finality boundary triggers the seal of the finalized range.
+    // Finality advances, but ten rows is below SEAL_DIRECT_BATCH so the tip path holds
+    // them in the hot store (#1067). The oracle queries hot∪cold, so the answers are
+    // the same ten transfers either way; padding to force a seal would change COUNT(*)
+    // and MIN(value) and invalidate questions.toml.
     tape.advance_finalized_to(7);
     tape.insert_block(11, empty_block(11, 0, 1_700_000_100));
     tape.advance_tip_to(11);
-    let sealed = wait_until(POLL_TIMEOUT, || store.sealed_through() >= 7).await;
-    assert!(sealed, "range [1,7] did not seal");
+    let caught = wait_until(POLL_TIMEOUT, || {
+        store.get_meta("last_block").ok().flatten().as_deref() == Some("11")
+    })
+    .await;
+    assert!(caught, "fixture did not index the post-finality block");
 
     rt
 }
