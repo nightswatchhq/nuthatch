@@ -51,12 +51,29 @@ if [ ! -r "$file" ]; then
   echo "cannot read $file, so the committed list was never compared" >&2
   exit 1
 fi
-# `grep -v` exits 1 when it prints nothing, which is not an error here - a file of only comments is a
-# legitimate thing to find and a bad thing to proceed from. Let the pipeline be quiet and let the
-# emptiness itself be the failure, so one message covers all the ways nothing gets read.
-expected=$(grep -v '^#' "$file" | grep -v '^$' | sort || true)
+# **Read the whole file first, and check that it was read.** The case neither the `-r` test nor the
+# emptiness test below can see is a read that fails *after* emitting some lines: `expected` comes out
+# non-empty and **incomplete**, and the drift check then reports contexts missing from a file that
+# actually has them.
+#
+# A filter pipeline cannot answer "was the whole file read". Under `pipefail` the status is the
+# rightmost failure, so `grep -v '^#'` failing with 2 is masked by the next `grep -v '^$'` exiting 1
+# for empty input - which is how a directory in place of the file reported itself as "empty or all
+# comments". One `cat`, one status, one question answered.
+set +e
+raw=$(cat -- "$file")
+read_status=$?
+set -e
+if [ "$read_status" -ne 0 ]; then
+  echo "reading $file failed with status $read_status - the list may be truncated, so nothing here is a comparison" >&2
+  exit 1
+fi
+
+# Now the filtering, where `grep -v` exiting 1 for no output is expected rather than an error: a file
+# of only comments is a legitimate thing to find and a bad thing to proceed from.
+expected=$(printf '%s\n' "$raw" | grep -v '^#' | grep -v '^$' | sort || true)
 if [ -z "$expected" ]; then
-  echo "read no contexts from $file - it is empty, all comments, or unreadable. Nothing was compared, so this is not a drift check" >&2
+  echo "read no contexts from $file - it is empty or all comments. Nothing was compared, so this is not a drift check" >&2
   exit 1
 fi
 

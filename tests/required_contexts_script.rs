@@ -193,4 +193,24 @@ fn reading_nothing_is_reported_as_reading_nothing() {
     let (code, out) = run(root.path(), &["--offline"]);
     assert_ne!(code, 0, "an absent list must not pass: {out}");
     assert!(out.contains("cannot read"), "{out}");
+
+    // Readable but not readable *through*: a read that fails partway leaves a non-empty, incomplete
+    // list, and neither the existence test nor the emptiness test can see that. A directory in place
+    // of the file is the cheapest way to make the read itself fail. It must report a failed read
+    // rather than an empty one - under `pipefail` the filter pipeline reported this as "empty or all
+    // comments", because the rightmost stage exiting 1 on no input masked the real error upstream.
+    let root = root_with(REQUIRED);
+    let f = root.path().join(".github/required-checks.txt");
+    std::fs::remove_file(&f).unwrap();
+    std::fs::create_dir(&f).unwrap();
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an unreadable list must not pass: {out}");
+    assert!(
+        out.contains("failed with status"),
+        "a failed read must say so, not be reported as an empty file:\n{out}"
+    );
+    assert!(
+        !out.contains("is missing 'Jules approval'"),
+        "and it must never blame the contents:\n{out}"
+    );
 }
