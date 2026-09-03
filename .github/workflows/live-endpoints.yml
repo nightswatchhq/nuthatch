@@ -145,6 +145,30 @@ jobs:
           # every new user of that chain, and a warning nobody reads is how this one survived a month.
           exit $fail
 
+      # **`init` itself, against a real contract, with no key** (#1138). Sourcify changed which v2
+      # field selectors it accepts, the code's request got HTTP 400 on every chain for an unknown
+      # stretch, and keyless `init` survived only where a Blockscout instance happened to be wired.
+      # No unit test asks the live service what it accepts, and the endpoint probes above never touch
+      # the ABI path. So run the one command the README leads with and require the line that says
+      # *which* source answered - a fallback quietly answering instead is the failure this exists to
+      # see. `if: always()` because this judges a different promise from the getLogs gate above and
+      # must not be skipped by it.
+      - name: keyless init resolves an ABI through Sourcify
+        if: always()
+        run: |
+          set -u
+          if out=$(./target/release/nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet --dir "$(mktemp -d)" 2>&1); then
+            echo "$out" | tail -20
+          else
+            echo "$out" | tail -40
+            echo "::error::keyless init of mainnet USDC failed - the README's first command does not work"
+            exit 1
+          fi
+          if ! echo "$out" | grep -q "ABI resolved via Sourcify"; then
+            echo "::error::init resolved the ABI somewhere other than Sourcify - the v2 request shape or the service changed (#1138); the Etherscan-keyed chains are dark again"
+            exit 1
+          fi
+
   # **A failed scheduled run is invisible, so it files an issue** (#1130). A `schedule:` run
   # attaches its check to no pull request, and a red nightly is not what the branch badge reflects,
   # so `required contexts match protection` sat red for six consecutive days unnoticed.
