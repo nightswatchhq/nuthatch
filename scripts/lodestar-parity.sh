@@ -378,7 +378,6 @@ if not overlap:
         "no closed epoch is held by both sides at block %s, so nothing was compared" % block
     )
 top_closed = max(overlap, key=int)
-overlap_set = set(overlap)
 
 print(
     "lodestar_epochs nest=%s overlap=%s open_excluded=%s floor=%s"
@@ -549,9 +548,21 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
     # Tested against `from_epoch`, the **measured** boundary, never against `cut`. An operator raising
     # the floor to narrow the window is doing something this script supports, and testing the raised
     # cut would reject it.
-    one_lower = str(from_epoch - 1)
-    if one_lower in overlap_set:
-        extended = [e for e in overlap if int(e) >= from_epoch - 1]
+    # The predecessor may be absent - an epoch in which nothing happened leaves no row at all, which
+    # the view's header warns about. Skipping the test then would leave a hardcoded constant
+    # unproven, and this script's own rule is that a failure to compare is not parity. So step down
+    # to the nearest epoch that *is* present, and if there is none the boundary sits at the bottom of
+    # the overlap and cannot be shown minimal at all.
+    lower = [e for e in overlap if int(e) < from_epoch]
+    if not lower:
+        failed = True
+        print(
+            "    BOUNDARY %s starts at %s with no epoch below it in the overlap, so it cannot be "
+            "shown to be the lowest comparable one" % (nest_col, from_epoch)
+        )
+    else:
+        step_to = max(lower, key=int)
+        extended = [e for e in overlap if int(e) >= int(step_to)]
         still_holds = (
             not deltas(extended, nest_col, sg_col)
             if klass == "gate"
@@ -562,7 +573,7 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
             print(
                 "    BOUNDARY %s still holds with epoch %s included, so %s is not the lowest "
                 "comparable epoch and the boundary must come down"
-                % (nest_col, one_lower, from_epoch)
+                % (nest_col, step_to, from_epoch)
             )
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
