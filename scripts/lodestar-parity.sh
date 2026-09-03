@@ -396,6 +396,16 @@ def cancels_into_open_epoch(nest_col, sg_col, top_delta):
     cancels. Measured at pin 501162197: epoch 1369 is high by 10194076412605471504 and 1370 is low by
     exactly that.
     """
+    # **Adjacency first.** A pair is two *neighbouring* epochs, and cancellation alone is not that.
+    # If the overlap is missing the real next closed epoch on either side, `top_closed` is older than
+    # it looks and a residue there could be cancelled by a non-adjacent open epoch and waved through
+    # as drift. The relationship has to hold, not just the arithmetic.
+    if int(open_epoch) != int(top_closed) + 1:
+        print(
+            "    epoch %s is not adjacent to the open epoch %s, so its residue cannot be an edge "
+            "artefact - the overlap is missing an epoch between them" % (top_closed, open_epoch)
+        )
+        return False
     if open_epoch not in sg_epochs:
         return False
     a = str(nest_epochs[open_epoch][nest_col])
