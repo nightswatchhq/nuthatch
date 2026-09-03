@@ -68,4 +68,11 @@ runs:
           "Close this once the check is green again. It will be refiled if it fails after that," \
           "and no duplicate is filed while it stays open.")"
 
-        gh issue create --repo "${REPO}" --title "${title}" --label bug --body "${body}"
+        # The label is a courtesy, not a dependency. `gh issue create --label` fails outright if the
+        # label does not exist, and a reporter that cannot deliver because somebody renamed `bug` is
+        # the silent red this action exists to prevent. So: with the label, then without it, and only
+        # then fail the step so the run at least shows two red jobs instead of one.
+        if ! gh issue create --repo "${REPO}" --title "${title}" --label bug --body "${body}"; then
+          echo "::warning::could not file with the bug label - filing unlabelled"
+          gh issue create --repo "${REPO}" --title "${title}" --body "${body}"
+        fi
