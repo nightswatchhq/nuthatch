@@ -198,6 +198,19 @@ pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
     ("base_fee_per_gas", "uint64", StorageKind::U64),
     ("size", "uint64", StorageKind::U64),
     ("transaction_count", "uint64", StorageKind::U64),
+    // **The L1 block an L2 block was sequenced against**, on chains that report one. Arbitrum puts
+    // `l1BlockNumber` in the header it already returns, so this costs nothing extra to keep - the
+    // same reasoning as every other column here.
+    //
+    // It is the only bridge between the two block spaces, and its absence is load-bearing:
+    // `EpochManager` counts epochs in **L1** blocks while an indexed log carries an **L2** block, so
+    // an epoch boundary has to be guessed from the first *observed* event instead, leaving a window
+    // of several thousand blocks whose contents are filed against the wrong epoch
+    // (nightswatchhq/nuthatch#1116).
+    //
+    // **0 on a chain that does not report it**, which is most of them, following `base_fee_per_gas`
+    // above: 0 is the honest value for "the field did not exist".
+    ("l1_block_number", "uint64", StorageKind::U64),
 ];
 
 /// The table name for [`BLOCK_COLUMNS`]. Unprefixed by an alias, because a block belongs to the chain
@@ -468,6 +481,12 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
         ),
         ("size".to_string(), Value::U64(hex("size"))),
         ("transaction_count".to_string(), Value::U64(tx_count)),
+        // `hex` already yields 0 for a key the endpoint does not send, which is the whole handling a
+        // non-Arbitrum chain needs.
+        (
+            "l1_block_number".to_string(),
+            Value::U64(hex("l1BlockNumber")),
+        ),
     ];
     Some(DecodedRow {
         table: BLOCKS_TABLE.to_string(),
