@@ -139,3 +139,58 @@ fn the_committed_list_names_jules_and_not_the_retired_signature_context() {
     assert!(listed.iter().any(|l| l == "Jules approval"), "{listed:?}");
     let _: PathBuf = manifest().to_path_buf();
 }
+
+/// #1119 - `main` reported `required-checks.txt is missing 'Jules approval'` against a file that
+/// plainly contains it. Every context in that file holds `·` (U+00B7), and `grep`/`sort` change
+/// behaviour on non-ASCII input with the locale: GNU grep can decline to match a line it considers an
+/// encoding error, and `sort` refuses an illegal byte sequence outright. A runner whose locale
+/// differs from a developer's therefore reads a healthy file as a broken one.
+///
+/// Not reproduced on macOS - every locale tried there passes - so this pins the behaviour rather than
+/// claiming a cure. What the test can do is stop the pin being removed by someone who does not know
+/// why it is there.
+#[test]
+fn the_script_pins_the_locale_so_a_runner_cannot_read_a_healthy_file_as_broken() {
+    let src = std::fs::read_to_string(manifest().join("scripts/check-required-contexts.sh"))
+        .expect("read the script");
+    // **Match a line of code, not a substring.** Commenting the pin out leaves the text in place, so
+    // a `contains` check passes against a script that no longer pins anything - which is exactly what
+    // it did when this test was first written and mutation-checked.
+    let pinned = src
+        .lines()
+        .map(str::trim)
+        .any(|l| l == "export LC_ALL=C" || l == "export LC_ALL=C.UTF-8");
+    assert!(
+        pinned,
+        "the context list is full of `·`, and grep/sort are locale-sensitive on it. Without a pin \
+         the same file reads differently on different runners, which is the #1119 failure:\n{src}"
+    );
+}
+
+/// An unreadable or empty file must say so, not report the file's *contents* as wrong. The message
+/// that sent #1119 to the wrong place blamed a missing context when nothing had been read at all.
+#[test]
+fn reading_nothing_is_reported_as_reading_nothing() {
+    // Empty.
+    let root = root_with("");
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an empty list must not pass: {out}");
+    assert!(out.contains("read no contexts"), "{out}");
+    assert!(
+        !out.contains("is missing 'Jules approval'"),
+        "an empty file is not a file with a missing context:\n{out}"
+    );
+
+    // Only comments - the same, and grep exiting 1 for no output must not be mistaken for an error.
+    let root = root_with("# just a comment\n# and another\n");
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "a comments-only list must not pass: {out}");
+    assert!(out.contains("read no contexts"), "{out}");
+
+    // Absent entirely.
+    let root = root_with(REQUIRED);
+    std::fs::remove_file(root.path().join(".github/required-checks.txt")).unwrap();
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an absent list must not pass: {out}");
+    assert!(out.contains("cannot read"), "{out}");
+}

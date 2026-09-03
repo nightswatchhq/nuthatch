@@ -22,6 +22,17 @@
 # `PROTECTION_READ_TOKEN` and passed in as `GH_TOKEN`.
 set -euo pipefail
 
+# **Byte semantics, not the runner's locale.** Every context in `.github/required-checks.txt` contains
+# `·` (U+00B7, the bytes C2 B7), and `grep`/`sort` change behaviour on non-ASCII input depending on
+# `LC_*`: GNU grep can decline to match a line it considers an encoding error, and `sort` refuses an
+# illegal byte sequence outright. A CI runner whose locale differs from a developer's would then read
+# a healthy file as one missing a context - which is the shape of the #1119 failure, where `main`
+# reported `required-checks.txt is missing 'Jules approval'` against a file that plainly contains it.
+#
+# Pinning to C makes the comparison byte-wise and identical everywhere. The contexts are compared for
+# exact equality, so collation order is irrelevant to the result.
+export LC_ALL=C
+
 offline=0
 for arg in "$@"; do
   case "$arg" in
@@ -32,7 +43,22 @@ done
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 file="$root/.github/required-checks.txt"
-expected=$(grep -v '^#' "$file" | grep -v '^$' | sort)
+# **An unreadable file must not be reported as a file with the wrong contents.** Any failure reading
+# the list yields an empty `expected`, and the very next check then says
+# `required-checks.txt is missing 'Jules approval'` - naming the file's *contents* as the fault when
+# nothing was read at all. That message sent a CI failure on `main` to the wrong place (#1119).
+if [ ! -r "$file" ]; then
+  echo "cannot read $file, so the committed list was never compared" >&2
+  exit 1
+fi
+# `grep -v` exits 1 when it prints nothing, which is not an error here - a file of only comments is a
+# legitimate thing to find and a bad thing to proceed from. Let the pipeline be quiet and let the
+# emptiness itself be the failure, so one message covers all the ways nothing gets read.
+expected=$(grep -v '^#' "$file" | grep -v '^$' | sort || true)
+if [ -z "$expected" ]; then
+  echo "read no contexts from $file - it is empty, all comments, or unreadable. Nothing was compared, so this is not a drift check" >&2
+  exit 1
+fi
 
 # The `reviewed-by signature` gate was retired: a PR is admitted by CI and Jules, not by a line of
 # text a party could type about itself. Asserted in the negative because re-adding the context
