@@ -7,9 +7,17 @@
 //! because a workflow that fails before it starts looks exactly like a workflow nobody watches.
 //!
 //! That is a whole-file, silent, indefinite failure caused by one word, and it is checkable offline
-//! from the tree. This is that check.
+//! from the tree.
+//!
+//! **This parses the YAML rather than scanning lines**, and the history is the argument for it.
+//! Three line-based revisions each missed a different valid spelling - the inline flow mapping
+//! `permissions: { … }`, the same with a trailing comment, the multi-line flow mapping, and a quoted
+//! `"permissions":` key. Every miss looked identical to success: the scanner reported no keys, so the
+//! test passed on a file GitHub would reject. `yaml-rust2` is already a dependency of this crate for
+//! subgraph manifests, so the real parser costs nothing and ends the guessing.
 
 use std::path::{Path, PathBuf};
+use yaml_rust2::{Yaml, YamlLoader};
 
 /// Every key GitHub accepts inside a workflow `permissions:` block.
 /// <https://docs.github.com/actions/using-jobs/assigning-permissions-to-jobs>
@@ -42,75 +50,47 @@ fn workflows() -> Vec<PathBuf> {
     v
 }
 
-/// What a `permissions:` line turned out to be.
-#[derive(Debug, PartialEq)]
-enum Perms {
-    /// Keys the scanner read, with their line numbers.
-    Keys(Vec<(usize, String)>),
-    /// A form this scanner does not understand. **Not the same as "no keys"**, and the difference is
-    /// the whole design: a scanner that silently reports nothing for a form it cannot read passes
-    /// the workflow GitHub is about to reject, which is the failure this file exists to prevent.
-    Unparseable(usize, String),
+/// Every key of every `permissions` mapping anywhere in the document.
+///
+/// Walks the whole tree rather than looking in the two places permissions are usually written, so a
+/// job-level block, a reusable-workflow call and anywhere GitHub adds them next are all covered
+/// without this test needing to know where to look.
+fn permission_keys(doc: &Yaml, out: &mut Vec<String>) {
+    match doc {
+        Yaml::Hash(h) => {
+            for (k, v) in h {
+                if k.as_str() == Some("permissions") {
+                    // A scalar - `read-all`, `write-all` - grants no individual keys.
+                    if let Yaml::Hash(perms) = v {
+                        for (pk, _) in perms {
+                            out.push(
+                                pk.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("{pk:?}")),
+                            );
+                        }
+                    }
+                }
+                permission_keys(v, out);
+            }
+        }
+        Yaml::Array(a) => {
+            for v in a {
+                permission_keys(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
-/// Scan every `permissions:` block in a workflow.
-///
-/// Deliberately line-based, matching `pr_review_harness.rs` and `release_provenance.rs`, which
-/// already read workflow files this way. Hand-parsing YAML is an arms race - block form, inline flow
-/// mapping, multi-line flow mapping, trailing comments - and this does not try to win it. It handles
-/// the forms it can prove it handles and **refuses the rest**, so the guarantee is bounded rather
-/// than optimistic.
-fn permission_lines(path: &Path) -> Perms {
+fn keys_in(path: &Path) -> Result<Vec<String>, String> {
     let text = std::fs::read_to_string(path).expect("read workflow");
+    let docs = YamlLoader::load_from_str(&text).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut block_indent: Option<usize> = None;
-
-    for (i, raw) in text.lines().enumerate() {
-        let line = i + 1;
-        let indent = raw.len() - raw.trim_start().len();
-        let trimmed = raw.trim();
-
-        if let Some(open) = block_indent {
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if indent <= open {
-                block_indent = None; // block ended; re-test this line below
-            } else if let Some((key, _)) = trimmed.split_once(':') {
-                out.push((line, key.trim().to_string()));
-                continue;
-            } else {
-                return Perms::Unparseable(line, trimmed.to_string());
-            }
-        }
-
-        let Some(rest) = trimmed.strip_prefix("permissions:") else {
-            continue;
-        };
-        // A trailing `# comment` is valid and must not turn a mapping into an unknown form.
-        let rest = rest.split('#').next().unwrap_or("").trim();
-
-        if rest.is_empty() {
-            block_indent = Some(indent);
-        } else if rest == "{}" || rest == "read-all" || rest == "write-all" {
-            // Scalar and empty forms carry no keys to check.
-        } else if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
-            for pair in inner.split(',') {
-                let pair = pair.trim();
-                if pair.is_empty() {
-                    continue;
-                }
-                match pair.split_once(':') {
-                    Some((key, _)) => out.push((line, key.trim().to_string())),
-                    None => return Perms::Unparseable(line, trimmed.to_string()),
-                }
-            }
-        } else {
-            // A flow mapping split across lines lands here, and so does anything else new.
-            return Perms::Unparseable(line, trimmed.to_string());
-        }
+    for d in &docs {
+        permission_keys(d, &mut out);
     }
-    Perms::Keys(out)
+    Ok(out)
 }
 
 #[test]
@@ -118,21 +98,17 @@ fn every_workflow_permission_key_is_one_github_accepts() {
     let mut bad = Vec::new();
     for wf in workflows() {
         let name = wf.file_name().unwrap().to_string_lossy().into_owned();
-        match permission_lines(&wf) {
-            Perms::Keys(keys) => {
-                for (line, key) in keys {
+        match keys_in(&wf) {
+            Ok(keys) => {
+                for key in keys {
                     if !VALID.contains(&key.as_str()) {
-                        bad.push(format!(
-                            "{name}:{line}: `{key}` is not a workflow permission"
-                        ));
+                        bad.push(format!("{name}: `{key}` is not a workflow permission"));
                     }
                 }
             }
-            Perms::Unparseable(line, text) => bad.push(format!(
-                "{name}:{line}: this scanner cannot read `{text}`, so it cannot vouch for the keys \
-                 in it. Rewrite it as a block mapping, or teach the scanner the form - reporting \
-                 nothing here would be the silent pass this test exists to prevent"
-            )),
+            // Unparseable YAML is its own failure: GitHub would reject it too, and a test that
+            // shrugged at it would be the silent pass this file exists to prevent.
+            Err(e) => bad.push(format!("{name}: is not valid YAML: {e}")),
         }
     }
     assert!(
@@ -145,57 +121,62 @@ fn every_workflow_permission_key_is_one_github_accepts() {
     );
 }
 
-/// The scanner must be able to see the fault it was written for, and must **refuse** what it cannot
-/// read. A test that would pass against the broken file is worth nothing, and this suite's own
-/// history is the argument: #1095's predecessor checked a string the scanner never matched.
+/// The parser must see the fault in every spelling a workflow may legally use. A test that would pass
+/// against the broken file is worth nothing, and this suite's own history is the argument: #1095's
+/// predecessor checked a string the scanner never matched.
 #[test]
-fn the_scanner_finds_the_key_that_caused_1095() {
+fn the_bad_key_is_found_in_every_yaml_spelling() {
     let dir = tempfile::tempdir().unwrap();
+    let cases: &[(&str, &str)] = &[
+        (
+            "block",
+            "name: x\npermissions:\n  contents: read\n  administration: read\n",
+        ),
+        (
+            "inline",
+            "name: x\npermissions: { contents: read, administration: read }\n",
+        ),
+        (
+            "inline with a trailing comment",
+            "name: x\npermissions: { administration: read } # why\n",
+        ),
+        (
+            "flow mapping across lines",
+            "name: x\npermissions: {\n  administration: read\n}\n",
+        ),
+        (
+            "quoted key",
+            "name: x\n\"permissions\": { administration: read }\n",
+        ),
+        (
+            "single-quoted key",
+            "name: x\n'permissions': { administration: read }\n",
+        ),
+        (
+            "nested under a job",
+            "name: x\njobs:\n  a:\n    permissions:\n      administration: read\n",
+        ),
+    ];
+    for (label, yaml) in cases {
+        let f = dir.path().join("w.yml");
+        std::fs::write(&f, yaml).unwrap();
+        let keys = keys_in(&f).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(
+            keys.iter().any(|k| k == "administration"),
+            "the {label} form hid the bad key: got {keys:?}"
+        );
+    }
 
-    let block = dir.path().join("block.yml");
-    std::fs::write(
-        &block,
-        "name: x\npermissions:\n  contents: read\n  administration: read\n\njobs:\n  a:\n    permissions:\n      issues: write\n",
-    )
-    .unwrap();
-    assert_eq!(
-        permission_lines(&block),
-        Perms::Keys(vec![
-            (3, "contents".into()),
-            (4, "administration".into()),
-            (9, "issues".into()),
-        ]),
-        "the scanner must read both the top-level and the job-level block"
-    );
-
-    // Inline flow mapping, with a trailing comment, which GitHub rejects just as hard.
-    let inline = dir.path().join("inline.yml");
-    std::fs::write(
-        &inline,
-        "name: y\npermissions: { contents: read, administration: read } # why\njobs:\n  a:\n    permissions: read-all\n",
-    )
-    .unwrap();
-    assert_eq!(
-        permission_lines(&inline),
-        Perms::Keys(vec![(2, "contents".into()), (2, "administration".into())]),
-        "an inline mapping must be scanned, a trailing comment must not hide it, and \
-         `permissions: read-all` has no keys to check"
-    );
-
-    // A flow mapping split across lines is valid YAML this scanner does not read. It must say so
-    // rather than report no keys, which would be a silent pass on a file GitHub will reject.
-    let multiline = dir.path().join("multiline.yml");
-    std::fs::write(
-        &multiline,
-        "name: z\npermissions: {\n  administration: read\n}\n",
-    )
-    .unwrap();
-    assert!(
-        matches!(permission_lines(&multiline), Perms::Unparseable(2, _)),
-        "an unreadable form must be refused, not silently treated as empty"
-    );
-
-    let empty = dir.path().join("empty.yml");
-    std::fs::write(&empty, "name: w\npermissions: {}\n").unwrap();
-    assert_eq!(permission_lines(&empty), Perms::Keys(vec![]));
+    // Forms that legitimately carry no individual keys.
+    for (label, yaml) in [
+        ("scalar", "name: x\npermissions: read-all\n"),
+        ("empty mapping", "name: x\npermissions: {}\n"),
+    ] {
+        let f = dir.path().join("w.yml");
+        std::fs::write(&f, yaml).unwrap();
+        assert!(
+            keys_in(&f).unwrap().is_empty(),
+            "the {label} form should yield no keys"
+        );
+    }
 }
