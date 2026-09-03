@@ -535,46 +535,47 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
                 % (nest_col, len(window), from_epoch)
             )
 
-    # **Every boundary must have teeth, and the claim it makes is precise: this is the *lowest* epoch
-    # at which the field's property holds.** So the test is whether the boundary could be lowered by
-    # one - if the property still holds with `from_epoch - 1` included, the boundary is excluding
-    # comparable data and a clean run above it proves less than it appears to.
+    # **The boundary's claim is that it is the *lowest* epoch at which the field's property holds, so
+    # the script computes that epoch and asserts the constant equals it.**
     #
-    # Not "does anything below agree", which was the first thing tried and is wrong in both
-    # directions: an epoch below with no fee activity at all agrees trivially and says nothing, while
-    # requiring the whole lower region to disagree would let a boundary sit several epochs too high.
-    # Lowering by exactly one tests the definition and nothing else.
+    # A one-step "could it be lowered by one" test is not enough, because the drift property is **not
+    # monotonic**: a disagreement at the nearest lower epoch can be unpaired on its own and become
+    # half of a pair once an earlier epoch is included too. Lowering by one can fail while lowering by
+    # two succeeds. Every candidate is cheap here - a few hundred epochs, six fields - so every
+    # candidate is tried rather than reasoned about.
     #
-    # Tested against `from_epoch`, the **measured** boundary, never against `cut`. An operator raising
-    # the floor to narrow the window is doing something this script supports, and testing the raised
-    # cut would reject it.
-    # The predecessor may be absent - an epoch in which nothing happened leaves no row at all, which
-    # the view's header warns about. Skipping the test then would leave a hardcoded constant
-    # unproven, and this script's own rule is that a failure to compare is not parity. So step down
-    # to the nearest epoch that *is* present, and if there is none the boundary sits at the bottom of
-    # the overlap and cannot be shown minimal at all.
-    lower = [e for e in overlap if int(e) < from_epoch]
-    if not lower:
+    # Evaluated at `from_epoch`, the **measured** boundary, never at `cut`. An operator raising the
+    # floor to narrow the window is doing something this script supports.
+    def property_holds(ids):
+        if klass == "gate":
+            return not deltas(ids, nest_col, sg_col)
+        return pairing_holds(ids, nest_col, sg_col)
+
+    lowest = None
+    for candidate in overlap:  # ascending
+        if property_holds([e for e in overlap if int(e) >= int(candidate)]):
+            lowest = candidate
+            break
+    if lowest is None:
         failed = True
         print(
-            "    BOUNDARY %s starts at %s with no epoch below it in the overlap, so it cannot be "
-            "shown to be the lowest comparable one" % (nest_col, from_epoch)
+            "    BOUNDARY %s: the property holds at no epoch in the overlap, so %s cannot be a "
+            "boundary at all" % (nest_col, from_epoch)
         )
-    else:
-        step_to = max(lower, key=int)
-        extended = [e for e in overlap if int(e) >= int(step_to)]
-        still_holds = (
-            not deltas(extended, nest_col, sg_col)
-            if klass == "gate"
-            else pairing_holds(extended, nest_col, sg_col)
-        )
-        if still_holds:
-            failed = True
-            print(
-                "    BOUNDARY %s still holds with epoch %s included, so %s is not the lowest "
-                "comparable epoch and the boundary must come down"
-                % (nest_col, step_to, from_epoch)
+    elif int(lowest) != from_epoch:
+        failed = True
+        print(
+            "    BOUNDARY %s: the lowest epoch at which the property holds is %s, not the configured "
+            "%s - the constant is %s"
+            % (
+                nest_col,
+                lowest,
+                from_epoch,
+                "too high and excludes comparable data"
+                if int(lowest) < from_epoch
+                else "too low and claims more than it can show",
             )
+        )
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
 
