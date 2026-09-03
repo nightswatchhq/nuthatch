@@ -214,3 +214,54 @@ fn reading_nothing_is_reported_as_reading_nothing() {
         "and it must never blame the contents:\n{out}"
     );
 }
+
+/// The sort-status guard, made reachable.
+///
+/// A `sort` over a handful of lines does not fail on its own, so the branch that catches a partial
+/// or killed sort had no test and a mutation left it green. Putting a stub `sort` earlier on `PATH`
+/// exercises it directly: it prints one line and exits 2, which is exactly the shape the guard
+/// exists for - **output produced, then failure**, leaving a list that is non-empty and wrong.
+#[test]
+fn a_sort_that_fails_after_partial_output_is_not_treated_as_a_short_list() {
+    let root = root_with(REQUIRED);
+    let bin = root.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sort = bin.join("sort");
+    std::fs::write(&sort, "#!/bin/sh\necho 'build release'\nexit 2\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sort, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(root.path().join("scripts/check-required-contexts.sh"))
+        .arg("--offline")
+        .env("PATH", path)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("bash must be on PATH");
+    let code = out.status.code().unwrap_or(-1);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_ne!(code, 0, "a failed sort must not pass: {text}");
+    assert!(
+        text.contains("sorting the 3 contexts") && text.contains("failed with status 2"),
+        "a sort that fails after emitting output must say so, and say how many contexts it was \
+         given, rather than let the truncated result reach the drift check:\n{text}"
+    );
+    assert!(
+        !text.contains("is missing 'Jules approval'"),
+        "and it must never blame the contents:\n{text}"
+    );
+}
