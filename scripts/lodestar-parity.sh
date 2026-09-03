@@ -7,7 +7,7 @@
 #
 # Exit status:
 #   0  parity CLEAN - every comparison ran and agreed
-#   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1113)
+#   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1116, #1114)
 #   1  anything else, including a genuine disagreement and any failure to compare
 # 0 is the only status that means parity. 2 exists so "agrees" is distinguishable from
 # "agrees on the parts we check", which is the distinction the epoch fields cost us.
@@ -17,7 +17,7 @@
 # This version compares:
 #   allocations  nest count vs subgraph allocations where isLegacy: false
 #   disputes     nest ids vs subgraph disputes where isLegacy: false
-#   epochs       field-by-field over the closed, comparable window (see EPOCH_PARITY_FROM).
+#   epochs       field-by-field, each field from its own measured comparability epoch.
 #                The reward trio is a hard gate. Three fields measure a different quantity
 #                from their subgraph namesakes and are reported KNOWN-DIFF (#1113), never OK.
 #                start/end block are L2 vs L1 and are INCOMPARABLE, not DIFF.
@@ -31,15 +31,18 @@ BLOCK=${PINNED_BLOCK:-}
 NETWORK_SG=DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp
 GATEWAY=${GRAPH_GATEWAY:-https://gateway-arbitrum.network.thegraph.com}
 
-# The nest indexes Horizon (`subgraph_service__*`) events only. Below epoch 1195 the network was
-# still paying legacy staking rewards the nest never sees, so the two sides describe different
-# populations there and a comparison would be the same category error as all-time
-# `allocationCount` vs Horizon-only allocations. 1195 is the first epoch at which the reward trio
-# agrees to the digit and keeps agreeing. The script asserts BOTH halves of that claim: agreement
-# above the boundary, and continued disagreement below it. A window widened until it goes green
-# therefore fails instead.
-EPOCH_PARITY_FROM=${EPOCH_PARITY_FROM:-1195}
-case "$EPOCH_PARITY_FROM" in
+# The nest indexes Horizon (`subgraph_service__*`) events only, so early epochs describe a different
+# population on each side and comparing them is the category error all-time `allocationCount` vs
+# Horizon-only allocations already illustrates. **Each field crosses into comparability at its own
+# epoch**, and those are measured constants in the python below rather than one number here - the
+# reward trio at 1195, signal at 1105, the two fee fields at 1302. Every boundary asserts both halves
+# of its claim: comparable above, and still disagreeing below. A boundary raised until a run goes
+# green therefore fails instead.
+#
+# This is an optional **floor** an operator may set to narrow the window further. It is never a way
+# to lower a measured boundary, and it defaults to unset.
+EPOCH_PARITY_FROM=${EPOCH_PARITY_FROM:-}
+case "${EPOCH_PARITY_FROM:-0}" in
   ''|*[!0-9]*) die_early=1 ;;
 esac
 
@@ -291,25 +294,36 @@ if only_sg:
     print("  subgraph-only: %s" % ", ".join(only_sg[:20]))
 
 # --- epochs: field-by-field at the pinned block ---
-# Two classes of field, and the difference is the whole point of #1113:
-#   gate       the reward trio, which is keyed by the event's own `currentEpoch` and is directly
-#              comparable. Any disagreement above EPOCH_PARITY_FROM fails the run.
-#   known-diff signalled_tokens, query_fees_collected and curator_query_fees, which measure a
-#              different quantity from their subgraph namesakes. They are compared and their
-#              disagreement is printed, but the count is not silently absorbed: the run cannot
-#              report OK on their behalf, and if one of them starts agreeing that is reported too,
-#              because it means #1113 moved and this script's classification is stale.
-EPOCH_GATE = [
-    ("total_rewards", "totalRewards"),
-    ("total_indexer_rewards", "totalIndexerRewards"),
-    ("total_delegator_rewards", "totalDelegatorRewards"),
+# **The six fields do not become comparable at the same epoch**, and pretending they did was what
+# made #1117 look like a missing-value defect. A single `EPOCH_PARITY_FROM` of 1195 was right for the
+# reward trio and wrong for the other three, so the fee fields carried a transition-era tail inside
+# the window and it read as a live shortfall of 1.7e23.
+#
+# Each boundary below is **measured**, not chosen: it is the lowest epoch above which every
+# disagreement in that field is an adjacent equal-and-opposite pair, i.e. pure boundary drift with
+# nothing lost. #1113's two definitional fixes are deployed, so all three former "known-diff" fields
+# now reconcile in exactly that way.
+#
+# Two classes:
+#   gate   directly comparable. **Any** disagreement above the boundary fails the run.
+#   drift  comparable, but subject to the observed-boundary problem in #1116: value filed one epoch
+#          out. A disagreement above the boundary is tolerated **only if it is half of an adjacent
+#          equal-and-opposite pair**. An unpaired one is a new defect and fails. That is the whole
+#          difference between a classification and an excuse.
+# (nest column, subgraph field, comparable-from epoch, class)
+EPOCH_FIELDS = [
+    ("total_rewards", "totalRewards", 1195, "gate"),
+    ("total_indexer_rewards", "totalIndexerRewards", 1195, "gate"),
+    ("total_delegator_rewards", "totalDelegatorRewards", 1195, "gate"),
+    ("signalled_tokens", "signalledTokens", 1105, "drift"),
+    ("query_fees_collected", "queryFeesCollected", 1302, "drift"),
+    ("curator_query_fees", "curatorQueryFees", 1302, "drift"),
 ]
-EPOCH_KNOWN_DIFF = [
-    ("signalled_tokens", "signalledTokens"),
-    ("query_fees_collected", "queryFeesCollected"),
-    ("curator_query_fees", "curatorQueryFees"),
-]
-epoch_from = int(os.environ["EPOCH_PARITY_FROM"])
+EPOCH_GATE = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "gate"]
+EPOCH_KNOWN_DIFF = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "drift"]
+# An optional floor an operator can raise, never lower: narrowing the window is a caller's business,
+# widening it past a measured boundary is how a green run stops meaning anything.
+epoch_floor = int(os.environ.get("EPOCH_PARITY_FROM") or 0)
 
 nest_epochs = {
     str(r["id"]): r
@@ -363,84 +377,210 @@ if not overlap:
     raise SystemExit(
         "no closed epoch is held by both sides at block %s, so nothing was compared" % block
     )
-gated = [e for e in overlap if int(e) >= epoch_from]
-below = [e for e in overlap if int(e) < epoch_from]
-if not gated:
-    raise SystemExit(
-        "EPOCH_PARITY_FROM=%s leaves no epoch to compare (overlap is %s..%s)"
-        % (epoch_from, overlap[0], overlap[-1])
-    )
+top_closed = max(overlap, key=int)
 
 print(
-    "lodestar_epochs nest=%s overlap=%s open_excluded=%s gated=%s (>=%s) below=%s"
-    % (len(nest_epochs), len(overlap) + 1, open_epoch, len(gated), epoch_from, len(below))
+    "lodestar_epochs nest=%s overlap=%s open_excluded=%s floor=%s"
+    % (len(nest_epochs), len(overlap) + 1, open_epoch, epoch_floor or "none")
 )
 
-def disagreements(ids, pairs):
+
+def cancels_into_open_epoch(nest_col, sg_col, top_delta):
+    """Is the top closed epoch's residue the other half of a pair that ends in the open epoch?
+
+    Exempting `top_closed` unconditionally was wrong (#1123 review): a genuine ingestion loss at the
+    newest closed epoch would have been waved through as an expected edge artefact. The claim is
+    testable, so it is tested - the open epoch is excluded from the *comparison* because its totals
+    still move, but its delta at this pin is a perfectly good witness for whether the residue
+    cancels. Measured at pin 501162197: epoch 1369 is high by 10194076412605471504 and 1370 is low by
+    exactly that.
+    """
+    # **Adjacency first.** A pair is two *neighbouring* epochs, and cancellation alone is not that.
+    # If the overlap is missing the real next closed epoch on either side, `top_closed` is older than
+    # it looks and a residue there could be cancelled by a non-adjacent open epoch and waved through
+    # as drift. The relationship has to hold, not just the arithmetic.
+    if int(open_epoch) != int(top_closed) + 1:
+        print(
+            "    epoch %s is not adjacent to the open epoch %s, so its residue cannot be an edge "
+            "artefact - the overlap is missing an epoch between them" % (top_closed, open_epoch)
+        )
+        return False
+    if open_epoch not in sg_epochs:
+        return False
+    a = str(nest_epochs[open_epoch][nest_col])
+    b = str(sg_epochs[open_epoch][sg_col])
+    return (int(a) - int(b)) == -top_delta
+
+
+def pairing_holds(ids, nest_col, sg_col):
+    """Is every disagreement in `ids` half of an adjacent equal-and-opposite pair?
+
+    This is the property that defines a `drift` field's boundary, so it is also what decides whether
+    that boundary could be lowered.
+    """
+    bad = deltas(ids, nest_col, sg_col)
+    seen = set()
+    for e in sorted(bad, key=int):
+        if e in seen:
+            continue
+        nxt = str(int(e) + 1)
+        if nxt in bad and bad[e] == -bad[nxt]:
+            seen.add(e)
+            seen.add(nxt)
+        elif e == top_closed and cancels_into_open_epoch(nest_col, sg_col, bad[e]):
+            seen.add(e)
+        else:
+            return False
+    return True
+
+
+def deltas(ids, nest_col, sg_col):
+    """Signed nest-minus-subgraph per epoch. Signed, because the sign is the diagnosis: a pair that
+    cancels is value in the wrong bucket, a residue that does not is value nobody has."""
     out = {}
-    for nest_col, sg_col in pairs:
-        bad = [
-            (e, str(nest_epochs[e][nest_col]), str(sg_epochs[e][sg_col]))
-            for e in ids
-            if str(nest_epochs[e][nest_col]) != str(sg_epochs[e][sg_col])
-        ]
-        out[nest_col] = bad
+    for e in ids:
+        a, b = str(nest_epochs[e][nest_col]), str(sg_epochs[e][sg_col])
+        if a != b:
+            out[e] = int(a) - int(b)
     return out
 
-gate_bad = disagreements(gated, EPOCH_GATE)
-for nest_col, _ in EPOCH_GATE:
-    bad = gate_bad[nest_col]
-    status = "OK" if not bad else "DIFF"
-    print("  %s %s/%s epochs agree %s" % (nest_col, len(gated) - len(bad), len(gated), status))
-    if bad:
-        failed = True
-        for e, a, b in bad[:20]:
-            print("    epoch %s nest=%s subgraph=%s" % (e, a, b))
 
-# The boundary must have teeth. If the reward trio also agrees below EPOCH_PARITY_FROM then the
-# window is not measuring what its comment claims, and a green run above it proves nothing.
-if below:
-    below_bad = disagreements(below, EPOCH_GATE)
-    if not any(below_bad[c] for c, _ in EPOCH_GATE):
+epoch_known_diff = []
+gate_windows = []
+for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
+    cut = max(from_epoch, epoch_floor)
+    window = [e for e in overlap if int(e) >= cut]
+    below = [e for e in overlap if int(e) < cut]
+    if not window:
+        raise SystemExit(
+            "%s: boundary %s leaves no epoch to compare (overlap is %s..%s)"
+            % (nest_col, cut, overlap[0], overlap[-1])
+        )
+    bad = deltas(window, nest_col, sg_col)
+
+    if klass == "gate":
+        gate_windows.append(len(window))
+        status = "OK" if not bad else "DIFF"
+        print(
+            "  %s %s/%s epochs agree from %s %s"
+            % (nest_col, len(window) - len(bad), len(window), cut, status)
+        )
+        if bad:
+            failed = True
+            for e in sorted(bad, key=int)[:20]:
+                print(
+                    "    epoch %s nest=%s subgraph=%s"
+                    % (e, nest_epochs[e][nest_col], sg_epochs[e][sg_col])
+                )
+    else:
+        # Pair each disagreement with its neighbour. The topmost closed epoch is exempt: its partner
+        # is the open epoch, which is excluded from the comparison, so its residue is an artefact of
+        # where the window ends rather than a defect.
+        paired, unpaired, edge = set(), [], []
+        for e in sorted(bad, key=int):
+            if e in paired:
+                continue
+            nxt = str(int(e) + 1)
+            if nxt in bad and bad[e] == -bad[nxt]:
+                paired.add(e)
+                paired.add(nxt)
+            elif e == top_closed and cancels_into_open_epoch(nest_col, sg_col, bad[e]):
+                edge.append(e)
+            else:
+                unpaired.append(e)
+        if unpaired:
+            failed = True
+            print(
+                "  %s %s of %s disagreements above %s are UNPAIRED, net %s - not boundary drift"
+                % (nest_col, len(unpaired), len(bad), cut, sum(bad[e] for e in unpaired))
+            )
+            for e in unpaired[:20]:
+                print("    epoch %s delta=%s" % (e, bad[e]))
+        elif bad:
+            epoch_known_diff.append(nest_col)
+            # Report the paired sum on its own. It must be exactly zero - that is the property that
+            # makes this drift rather than loss - and folding the exempt top epoch into the same
+            # number would hide the one figure worth checking behind a residue that is expected.
+            paired_sum = sum(bad[e] for e in paired)
+            print(
+                "  %s %s/%s epochs disagree from %s, %s in adjacent pairs summing to %s KNOWN-DIFF (#1116)"
+                % (nest_col, len(bad), len(window), cut, len(paired), paired_sum)
+            )
+            if paired_sum:
+                failed = True
+                print(
+                    "    PAIRS DO NOT CANCEL: sum is %s, so this is not boundary drift" % paired_sum
+                )
+            if edge:
+                print(
+                    "    epoch %s carries %s, cancelled by the open epoch %s - checked, not assumed"
+                    % (edge[0], bad[edge[0]], open_epoch)
+                )
+        elif deltas([e for e in overlap if int(e) >= from_epoch], nest_col, sg_col):
+            # Nothing in the *narrowed* window, but the measured window still disagrees. That is a
+            # caller narrowing the comparison, which is supported, and says nothing about the
+            # classification. Treating it as evidence would turn a legitimate `EPOCH_PARITY_FROM`
+            # into a spurious hard failure.
+            print(
+                "  %s agrees on all %s epochs from %s, though the measured window from %s still "
+                "drifts - narrowed by the floor, not reclassified"
+                % (nest_col, len(window), cut, from_epoch)
+            )
+        else:
+            # Agrees across the **measured** window too, so the classification really has moved.
+            # Not a failure of parity, but the boundary is now stale and must not go unnoticed.
+            failed = True
+            print(
+                "  %s agrees on all %s epochs from %s: #1116 has moved, reclassify it as a gate"
+                % (nest_col, len(window), from_epoch)
+            )
+
+    # **The boundary's claim is that it is the *lowest* epoch at which the field's property holds, so
+    # the script computes that epoch and asserts the constant equals it.**
+    #
+    # A one-step "could it be lowered by one" test is not enough, because the drift property is **not
+    # monotonic**: a disagreement at the nearest lower epoch can be unpaired on its own and become
+    # half of a pair once an earlier epoch is included too. Lowering by one can fail while lowering by
+    # two succeeds. Every candidate is cheap here - a few hundred epochs, six fields - so every
+    # candidate is tried rather than reasoned about.
+    #
+    # Evaluated at `from_epoch`, the **measured** boundary, never at `cut`. An operator raising the
+    # floor to narrow the window is doing something this script supports.
+    def property_holds(ids):
+        if klass == "gate":
+            return not deltas(ids, nest_col, sg_col)
+        return pairing_holds(ids, nest_col, sg_col)
+
+    lowest = None
+    for candidate in overlap:  # ascending
+        if property_holds([e for e in overlap if int(e) >= int(candidate)]):
+            lowest = candidate
+            break
+    if lowest is None:
         failed = True
         print(
-            "  BOUNDARY epochs below %s now agree too: EPOCH_PARITY_FROM excludes comparable data "
-            "and must be lowered" % epoch_from
+            "    BOUNDARY %s: the property holds at no epoch in the overlap, so %s cannot be a "
+            "boundary at all" % (nest_col, from_epoch)
         )
-    else:
+    elif int(lowest) != from_epoch:
+        failed = True
         print(
-            "  boundary holds: %s of %s epochs below %s still disagree (legacy staking rewards)"
+            "    BOUNDARY %s: the lowest epoch at which the property holds is %s, not the configured "
+            "%s - the constant is %s"
             % (
-                max(len(below_bad[c]) for c, _ in EPOCH_GATE),
-                len(below),
-                epoch_from,
+                nest_col,
+                lowest,
+                from_epoch,
+                "too high and excludes comparable data"
+                if int(lowest) < from_epoch
+                else "too low and claims more than it can show",
             )
         )
-
-known_bad = disagreements(gated, EPOCH_KNOWN_DIFF)
-epoch_known_diff = []
-for nest_col, _ in EPOCH_KNOWN_DIFF:
-    bad = known_bad[nest_col]
-    if bad:
-        epoch_known_diff.append(nest_col)
-        print(
-            "  %s %s/%s epochs disagree KNOWN-DIFF (#1113)"
-            % (nest_col, len(bad), len(gated))
-        )
-        for e, a, b in bad[:3]:
-            print("    epoch %s nest=%s subgraph=%s" % (e, a, b))
-    else:
-        # Not a failure, but the classification above is now wrong and must not go unnoticed.
-        failed = True
-        print(
-            "  %s now agrees on all %s epochs: #1113 has moved, reclassify it as a gate"
-            % (nest_col, len(gated))
-        )
-
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
 
-epoch_gated_n = len(gated)
+# The gate's window, reported in the summary. All three gate fields share a boundary.
+epoch_gated_n = min(gate_windows) if gate_windows else 0
 epoch_known_names = list(epoch_known_diff)
 
 # --- escrow: row-level, at the pinned block ---
@@ -679,6 +819,6 @@ fi
 # Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
 # the same fault this script was rewritten to remove, one level up: a known absence of proof reading
 # as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
-echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1113 and #1114"
+echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116 and #1114"
 echo "parity NOT CLEAN at block $BLOCK: gated comparisons agree, known differences outstanding"
 exit 2
