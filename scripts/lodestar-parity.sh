@@ -385,6 +385,23 @@ print(
 )
 
 
+def cancels_into_open_epoch(nest_col, sg_col, top_delta):
+    """Is the top closed epoch's residue the other half of a pair that ends in the open epoch?
+
+    Exempting `top_closed` unconditionally was wrong (#1123 review): a genuine ingestion loss at the
+    newest closed epoch would have been waved through as an expected edge artefact. The claim is
+    testable, so it is tested - the open epoch is excluded from the *comparison* because its totals
+    still move, but its delta at this pin is a perfectly good witness for whether the residue
+    cancels. Measured at pin 501162197: epoch 1369 is high by 10194076412605471504 and 1370 is low by
+    exactly that.
+    """
+    if open_epoch not in sg_epochs:
+        return False
+    a = str(nest_epochs[open_epoch][nest_col])
+    b = str(sg_epochs[open_epoch][sg_col])
+    return (int(a) - int(b)) == -top_delta
+
+
 def deltas(ids, nest_col, sg_col):
     """Signed nest-minus-subgraph per epoch. Signed, because the sign is the diagnosis: a pair that
     cancels is value in the wrong bucket, a residue that does not is value nobody has."""
@@ -435,7 +452,7 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
             if nxt in bad and bad[e] == -bad[nxt]:
                 paired.add(e)
                 paired.add(nxt)
-            elif e == top_closed:
+            elif e == top_closed and cancels_into_open_epoch(nest_col, sg_col, bad[e]):
                 edge.append(e)
             else:
                 unpaired.append(e)
@@ -464,8 +481,8 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
                 )
             if edge:
                 print(
-                    "    epoch %s carries %s, unpaired only because its neighbour is the open epoch"
-                    % (edge[0], bad[edge[0]])
+                    "    epoch %s carries %s, cancelled by the open epoch %s - checked, not assumed"
+                    % (edge[0], bad[edge[0]], open_epoch)
                 )
         else:
             # Not a failure, but the boundary is now stale and must not go unnoticed.
@@ -475,13 +492,20 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
                 % (nest_col, len(window), cut)
             )
 
-    # Every boundary must have teeth. If the field also agrees below its own cut then the cut is
-    # excluding comparable data, and a clean run above it proves less than it appears to.
-    if below and not deltas(below, nest_col, sg_col):
+    # Every boundary must have teeth. If the field also agrees below its own boundary then the
+    # boundary is excluding comparable data, and a clean run above it proves less than it appears to.
+    #
+    # Tested against `from_epoch`, the **measured** boundary, and never against `cut`. An operator
+    # who raises the floor to narrow the window is doing something this script explicitly supports,
+    # and testing the raised cut would reject it: a floor of 1302 would put every reward epoch from
+    # 1195 to 1301 "below" and fail all three gate fields for agreeing there, which is the one thing
+    # they are supposed to do.
+    measured_below = [e for e in overlap if int(e) < from_epoch]
+    if measured_below and not deltas(measured_below, nest_col, sg_col):
         failed = True
         print(
             "    BOUNDARY %s agrees below %s too, so the boundary excludes comparable data "
-            "and must be lowered" % (nest_col, cut)
+            "and must be lowered" % (nest_col, from_epoch)
         )
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
