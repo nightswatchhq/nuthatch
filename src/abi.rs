@@ -79,11 +79,14 @@ async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>
 /// it used to be at (#1138) - the second because the field has moved once already and the alias is a
 /// hint, so the cheap thing is to accept either rather than break on the next move.
 fn sourcify_contract_name(body: &Value) -> Option<String> {
-    body.pointer("/compilation/name")
-        .or_else(|| body.get("name"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    // The first *usable* value, not the first present one: an empty or non-string
+    // `compilation.name` must not shadow a legacy top-level name that is fine.
+    [body.pointer("/compilation/name"), body.get("name")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// The ABI out of a Sourcify v2 response body - split from the request so it is testable against
@@ -199,6 +202,22 @@ mod tests {
         assert_eq!(
             sourcify_contract_name(&json!({"compilation": {"name": ""}, "abi": []})),
             None
+        );
+        // An unusable `compilation.name` - empty, or not a string - must not shadow a legacy
+        // top-level name that is usable.
+        assert_eq!(
+            sourcify_contract_name(
+                &json!({"compilation": {"name": ""}, "name": "LegacyName", "abi": []})
+            )
+            .as_deref(),
+            Some("LegacyName")
+        );
+        assert_eq!(
+            sourcify_contract_name(
+                &json!({"compilation": {"name": 7}, "name": "LegacyName", "abi": []})
+            )
+            .as_deref(),
+            Some("LegacyName")
         );
         assert_eq!(
             sourcify_contract_name(&json!({"name": "", "abi": []})),
