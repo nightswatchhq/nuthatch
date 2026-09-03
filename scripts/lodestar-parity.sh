@@ -378,6 +378,7 @@ if not overlap:
         "no closed epoch is held by both sides at block %s, so nothing was compared" % block
     )
 top_closed = max(overlap, key=int)
+overlap_set = set(overlap)
 
 print(
     "lodestar_epochs nest=%s overlap=%s open_excluded=%s floor=%s"
@@ -400,6 +401,28 @@ def cancels_into_open_epoch(nest_col, sg_col, top_delta):
     a = str(nest_epochs[open_epoch][nest_col])
     b = str(sg_epochs[open_epoch][sg_col])
     return (int(a) - int(b)) == -top_delta
+
+
+def pairing_holds(ids, nest_col, sg_col):
+    """Is every disagreement in `ids` half of an adjacent equal-and-opposite pair?
+
+    This is the property that defines a `drift` field's boundary, so it is also what decides whether
+    that boundary could be lowered.
+    """
+    bad = deltas(ids, nest_col, sg_col)
+    seen = set()
+    for e in sorted(bad, key=int):
+        if e in seen:
+            continue
+        nxt = str(int(e) + 1)
+        if nxt in bad and bad[e] == -bad[nxt]:
+            seen.add(e)
+            seen.add(nxt)
+        elif e == top_closed and cancels_into_open_epoch(nest_col, sg_col, bad[e]):
+            seen.add(e)
+        else:
+            return False
+    return True
 
 
 def deltas(ids, nest_col, sg_col):
@@ -492,21 +515,34 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
                 % (nest_col, len(window), cut)
             )
 
-    # Every boundary must have teeth. If the field also agrees below its own boundary then the
-    # boundary is excluding comparable data, and a clean run above it proves less than it appears to.
+    # **Every boundary must have teeth, and the claim it makes is precise: this is the *lowest* epoch
+    # at which the field's property holds.** So the test is whether the boundary could be lowered by
+    # one - if the property still holds with `from_epoch - 1` included, the boundary is excluding
+    # comparable data and a clean run above it proves less than it appears to.
     #
-    # Tested against `from_epoch`, the **measured** boundary, and never against `cut`. An operator
-    # who raises the floor to narrow the window is doing something this script explicitly supports,
-    # and testing the raised cut would reject it: a floor of 1302 would put every reward epoch from
-    # 1195 to 1301 "below" and fail all three gate fields for agreeing there, which is the one thing
-    # they are supposed to do.
-    measured_below = [e for e in overlap if int(e) < from_epoch]
-    if measured_below and not deltas(measured_below, nest_col, sg_col):
-        failed = True
-        print(
-            "    BOUNDARY %s agrees below %s too, so the boundary excludes comparable data "
-            "and must be lowered" % (nest_col, from_epoch)
+    # Not "does anything below agree", which was the first thing tried and is wrong in both
+    # directions: an epoch below with no fee activity at all agrees trivially and says nothing, while
+    # requiring the whole lower region to disagree would let a boundary sit several epochs too high.
+    # Lowering by exactly one tests the definition and nothing else.
+    #
+    # Tested against `from_epoch`, the **measured** boundary, never against `cut`. An operator raising
+    # the floor to narrow the window is doing something this script supports, and testing the raised
+    # cut would reject it.
+    one_lower = str(from_epoch - 1)
+    if one_lower in overlap_set:
+        extended = [e for e in overlap if int(e) >= from_epoch - 1]
+        still_holds = (
+            not deltas(extended, nest_col, sg_col)
+            if klass == "gate"
+            else pairing_holds(extended, nest_col, sg_col)
         )
+        if still_holds:
+            failed = True
+            print(
+                "    BOUNDARY %s still holds with epoch %s included, so %s is not the lowest "
+                "comparable epoch and the boundary must come down"
+                % (nest_col, one_lower, from_epoch)
+            )
 # start_block/end_block are L2 observations here and L1 epoch boundaries there.
 print("  start_block/end_block INCOMPARABLE (nest L2 observed, subgraph L1 EpochManager)")
 
