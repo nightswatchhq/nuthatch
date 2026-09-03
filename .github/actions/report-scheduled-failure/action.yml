@@ -1,0 +1,78 @@
+name: Report a scheduled-run failure
+description: >
+  Open a GitHub issue when a scheduled run fails, so a red cron cannot sit unseen.
+
+# **Why this exists at all** (nightswatchhq/nuthatch#1130). `required contexts match protection`
+# failed on `main` every day from 2026-08-28 to 2026-09-02 and the streak was found only while
+# retiring an unrelated gate. Nobody was ignoring it; there was no surface on which it appeared:
+#
+#   - Required contexts gate **pull requests**. A `schedule:` run attaches its check to no PR, so
+#     marking the context required would not have surfaced this. That is worth stating because
+#     "make it required" is the intuitive fix and it does not work.
+#   - A red `main` shows on the commit only for workflows the push triggered. A nightly run lands
+#     against the same SHA later and is not what the branch badge reflects.
+#
+# So a scheduled check can be correct, useful and red indefinitely while the repo looks fine. An
+# open issue is a surface this firm already reads every day, and needs no credential we do not have
+# and no third-party service.
+
+runs:
+  using: composite
+  steps:
+    - name: Open the failure issue unless one is already open
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        WORKFLOW: ${{ github.workflow }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -uo pipefail
+        title="Scheduled check is failing: ${WORKFLOW}"
+
+        # `gh issue list --label` has returned zero for every label on this repository while REST
+        # returned the real rows, so this goes to the API directly.
+        #
+        # **`-X GET` is load-bearing and its absence is not a style nit.** `gh api` switches the
+        # method to POST as soon as any `-f` is present, so this same line without it sends `state`
+        # and `per_page` to *create-an-issue*. Both traps are recorded at length in
+        # `sprint-landed.yml`, where the second one shipped and survived only because the call 422'd.
+        rows="$(gh api --paginate -X GET "repos/${REPO}/issues" \
+                  -f state=open -f per_page=100 \
+                  --jq '.[] | select(.pull_request == null) | "\(.number)\t\(.title)"' 2>/dev/null)"
+        listed=$?
+
+        # The workflow name is arbitrary text, so the title is matched in awk rather than
+        # interpolated into the jq program - quoting it into a jq filter is how that goes wrong.
+        existing="$(printf '%s\n' "${rows}" | awk -F'\t' -v t="${title}" '$2 == t { print $1; exit }')"
+
+        if [ "${listed}" -ne 0 ]; then
+          # **Deliberately files anyway.** A duplicate issue is visible, cheap and closable; a
+          # missed failure is the entire bug this action exists to prevent. Failing open on noise
+          # rather than on silence.
+          echo "::warning::could not list open issues, so a duplicate is possible - filing regardless"
+        elif [ -n "${existing}" ]; then
+          echo "::notice::already open as #${existing} - not filing a duplicate"
+          exit 0
+        fi
+
+        body="$(printf '%s\n' \
+          "\`${WORKFLOW}\` failed on a **scheduled** run." \
+          "" \
+          "Run: ${RUN_URL}" \
+          "" \
+          "A scheduled run attaches its check to no pull request and is not what the branch badge" \
+          "reflects, so this issue is the only thing that will surface it. Filed automatically by" \
+          ".github/actions/report-scheduled-failure (nightswatchhq/nuthatch#1130)." \
+          "" \
+          "Close this once the check is green again. It will be refiled if it fails after that," \
+          "and no duplicate is filed while it stays open.")"
+
+        # The label is a courtesy, not a dependency. `gh issue create --label` fails outright if the
+        # label does not exist, and a reporter that cannot deliver because somebody renamed `bug` is
+        # the silent red this action exists to prevent. So: with the label, then without it, and only
+        # then fail the step so the run at least shows two red jobs instead of one.
+        if ! gh issue create --repo "${REPO}" --title "${title}" --label bug --body "${body}"; then
+          echo "::warning::could not file with the bug label - filing unlabelled"
+          gh issue create --repo "${REPO}" --title "${title}" --body "${body}"
+        fi
