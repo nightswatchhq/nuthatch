@@ -539,14 +539,16 @@ runtimes, bundles - is chain-agnostic and behaves exactly as it does on a built-
 If you are running an unlisted chain in anger, say so - a chain with real usage is a candidate for the
 built-in registry, which is where the tuned window and finality policy come from.
 
-### Monad: keep the `finalized` tag
+### Monad: a depth of eight, and why it is not the tag
 
-Monad (chain id `143`) ships with `FinalizedTag` finality, and the tag sits **one block behind tip**,
-about 300 ms. That looks like the case caveat 1 above warns about and is the opposite of it: on Monad
-`finalized` is close to the tip because MonadBFT finality genuinely takes two blocks, not because an
-endpoint aliases it to `latest`. One block is proposed per height, and a finalized block is
-irreversible without a hard fork. Switching a Monad nest to a depth policy by analogy with an L2 adds
-latency and no safety. Leave it (RFC-0051).
+Monad (chain id `143`) ships with `Depth(8)`: the seal boundary is eight blocks behind tip, about
+2.4 s. The `finalized` tag sits one block behind tip and is irreversible without a hard fork, so
+this is not a reorg margin - it is an **execution** margin. Monad executes a block up to three blocks
+after consensus finalises it, and a probe that reads logs for a block finalised but not yet executed
+would get an empty list, indistinguishable from an empty block. Every probe on 2026-09-03 found
+receipts complete at `latest`, but eight samples are not an invariant, so eight blocks buys the margin
+instead. Do not raise the depth by analogy with an L2 - anything past `finalized` is final - and do
+not lower it to the tag without the soak RFC-0051's addendum asks for.
 
 Three things to know before a Monad backfill, all measured on 2026-09-03:
 
@@ -558,7 +560,7 @@ Three things to know before a Monad backfill, all measured on 2026-09-03:
   from-genesis backfill of events works. A pinned `[[calls]]` at an old block (RFC-0023) fails with
   `Block requested not found` and needs an archive endpoint: `init ... --chain monad --rpc <url>` or
   `dev --rpc <url>`, either of which makes your endpoint the whole pool (the built-in name is still
-  used for the finality policy and window; only the chain id is never looked up over `--rpc`).
+  used for the seal depth and window; only the chain id is never looked up over `--rpc`).
   `rpc-mainnet.monadinfra.com` keeps state but refuses JSON-RPC batches, so it is not listed.
 - **`init` cannot detect a deployment block.** That probe is `eth_getCode` at old heights, which is a
   state read, so on the shipped endpoints it reports `deployment block undetected` and the backfill

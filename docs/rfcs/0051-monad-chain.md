@@ -2,8 +2,9 @@
 
 - Status: **Implemented** (2026-09-03). Recorded as a frozen draft in the morning and carved out
   in the afternoon: **carve-out three**, Chief's decision, recorded in `CLAUDE.md`, for this one
-  chain and nothing else. Shipped as a registry entry on the generic EVM path; the execution-lag
-  guard proposed below was **not built**, and the addendum's items 10 to 12 say why.
+  chain and nothing else. Shipped as a registry entry on the generic EVM path with a **depth of 8**
+  rather than the `finalized` tag; the execution-lag guard proposed below was **not built**, and the
+  addendum's items 10 to 14 say why, and what would move it to the tag.
 - Author: Pete
 - Date: September 2026
 - Tracking issue: [#1136](https://github.com/nightswatchhq/nuthatch/issues/1136)
@@ -388,3 +389,14 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
     dials to learn it), and `select_rpcs` then makes the given endpoints the entire pool, with nothing
     public appended. The README sentence now says that, and the operator note points a pinned-call or
     deployment-block user at it.
+14. **Shipped as `Depth(8)`, not the tag, and item 11 is narrowed.** Review of the implementation
+    made the point item 11 did not answer: eight samples at `latest` show finalized and executed were
+    coupled in those samples, not that they are coupled under provider load or a pipeline stall, and
+    a hole sealed on an empty answer for an unexecuted block cannot be repaired without mutating a
+    sealed segment. The remedy the review named is the one taken: a conservative offset until the
+    invariant is demonstrated. Eight blocks is 2.4 s at 300 ms, more than twice the `k = 3` deferral,
+    and every sealed block is at least six past `finalized`, so the body's crux still holds in the
+    sense that matters - nothing past the tag reorgs, so the depth is an execution margin, not a
+    finality one - and the cost against the tag is two seconds of seal latency. The way back to
+    `FinalizedTag` is a soak that reads `eth_getBlockReceipts` at `finalized` continuously for a day
+    on a shipped endpoint and never sees a short answer; a sample is not that.

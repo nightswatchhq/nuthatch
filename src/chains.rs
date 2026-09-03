@@ -274,10 +274,17 @@ const OPTIMISM: Chain = Chain {
 /// exceeds size limit"`. The first and third are in `classify_rpc_error` because of this chain; the
 /// third matched nothing before and would have been retried at the same width.
 ///
-/// **No execution-lag guard.** RFC-0051 proposed one, on the grounds that Monad finalises a block
-/// before executing it. Measured eight times at `latest` on 2026-09-03: every block's receipts and
-/// logs were complete on the first read (receipt count equal to transaction count), identical two
-/// seconds later, same hash. The RPC layer only serves executed blocks, so there is nothing to guard.
+/// **No execution-lag guard, and a depth rather than the tag, for now.** RFC-0051 proposed a guard on
+/// the grounds that Monad finalises a block before executing it (execution is deferred by `k = 3`
+/// blocks). Measured eight times at `latest` on 2026-09-03: every block's receipts and logs were
+/// complete on the first read (receipt count equal to transaction count), identical two seconds
+/// later, same hash - the RPC layer served only executed blocks. Eight samples are not an invariant
+/// under provider load or a pipeline stall, and the guard as drafted cannot tell an unexecuted block
+/// from an executed empty one, since both answer an empty list. So the seal boundary is a **depth of
+/// 8**: 2.4 s at 300 ms, more than twice the protocol's deferral, and every sealed block is at least
+/// six past the `finalized` tag, which itself is irreversible without a hard fork. That costs two
+/// seconds of seal latency against the tag and buys a margin no probe has to keep proving. Moving
+/// to `FinalizedTag` wants a soak that reads receipts at `finalized` continuously, not a sample.
 const MONAD: Chain = Chain {
     name: "monad",
     chain_id: 143,
@@ -289,12 +296,10 @@ const MONAD: Chain = Chain {
         "https://rpc3.monad.xyz",
     ],
     // MonadBFT: a block is final at the proposal of N+2, about 600 ms, and every shipped endpoint
-    // serves the tag one block behind tip. A depth policy here would add latency for no safety
-    // (RFC-0051, "the crux"). The fallback only runs on an endpoint that stops serving the tag, and
-    // 200 blocks is one minute at 300 ms - a hundred times the protocol's own finality.
-    finality: Finality::FinalizedTag {
-        fallback_depth: 200,
-    },
+    // serves the `finalized` tag one block behind tip. Eight blocks is not a reorg margin - nothing
+    // past `finalized` reorgs on Monad - it is an *execution* margin over the deferred pipeline, see
+    // the doc comment above. RFC-0051's body argues for the tag; its addendum item 14 says why not yet.
+    finality: Finality::Depth(8),
     // At the narrowest endpoint's documented range cap (QuickNode, 100), not above it: Monad blocks
     // are dense enough that the *result* cap is what bites on a busy contract, and RFC-0028's chunker
     // narrows from here on a cap it can see. `doctor` recommends 40 across the pool.
@@ -496,15 +501,21 @@ mod tests {
         assert_eq!(lookup("base-mainnet").unwrap().chain_id, 8453);
     }
 
-    /// RFC-0051: the first BFT single-slot-final chain in the registry. The tag policy is the point -
-    /// a depth policy would add a minute of latency for no safety - and the window sits at the
-    /// narrowest shipped endpoint's documented cap rather than above it, because Monad's blocks are
-    /// dense enough that the result cap, not the range cap, is what a busy contract hits.
+    /// RFC-0051: the first BFT single-slot-final chain in the registry. The seal boundary is a depth
+    /// of exactly eight blocks - 2.4 s, more than twice Monad's three-block execution deferral - not
+    /// the `finalized` tag, until a soak shows finalized and executed are coupled under load (RFC-0051
+    /// addendum, item 14). The window sits at the narrowest shipped endpoint's documented cap rather
+    /// than above it, because Monad's blocks are dense enough that the result cap, not the range cap,
+    /// is what a busy contract hits.
     #[test]
-    fn monad_is_registered_with_bft_tag_finality_at_the_narrowest_cap() {
+    fn monad_is_registered_with_an_execution_margin_at_the_narrowest_cap() {
         let c = lookup("monad").expect("monad in registry");
         assert_eq!(c.chain_id, 143);
-        assert!(matches!(c.finality, Finality::FinalizedTag { .. }));
+        assert_eq!(
+            c.finality,
+            Finality::Depth(8),
+            "an execution margin over k=3 deferred execution; the tag is a soak away, not a sample"
+        );
         assert_eq!(
             c.log_window, 100,
             "QuickNode's documented cap - see the entry's measurements before raising it"
