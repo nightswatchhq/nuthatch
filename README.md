@@ -118,8 +118,10 @@ nuthatch init 0xADDR --chain world-chain --rpc https://your-endpoint.example
 ```
 
 The chain id is read **from the endpoint itself**, so there is no id to look up and nothing to type
-wrong. A built-in chain never dials: `--rpc` is ignored for the eight names above. Omit `--rpc` on an
-unregistered name and the refusal tells you the remedy rather than just listing the built-ins.
+wrong. A built-in chain never dials to learn its id: on one of the eight names `--rpc` is not consulted
+for the chain id, but it **is** the pool - your endpoints replace the bundled public ones outright, and
+nothing public is appended after them. Omit `--rpc` on an unregistered name and the refusal tells you
+the remedy rather than just listing the built-ins.
 
 Public endpoints are a moving target, and the ones shipped here are measured rather than assumed -
 but a measurement is a snapshot, not a property. Run `nuthatch doctor --rpc <url>` before trusting a

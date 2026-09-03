@@ -381,3 +381,10 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
 12. **Ankr's refusal shape is classified.** `exceeds size limit` and `is limited to a` are in
     `classify_rpc_error`'s narrowable list and in the text fallback, with a test that fails without
     them. Item 7's reproduction is therefore no longer needed.
+13. **`--rpc` on a built-in name is honoured, and the README said otherwise.** The CLI section above
+    tells an operator to run `init 0xADDR --chain monad --rpc <url>` for a private endpoint, and the
+    README's "`--rpc` is ignored for the built-in names" read as a contradiction in review. The code is
+    the RFC's way: `chains::resolve` ignores `--rpc` only for the chain *id* (a built-in name never
+    dials to learn it), and `select_rpcs` then makes the given endpoints the entire pool, with nothing
+    public appended. The README sentence now says that, and the operator note points a pinned-call or
+    deployment-block user at it.

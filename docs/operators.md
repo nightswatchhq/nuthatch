@@ -556,8 +556,10 @@ Three things to know before a Monad backfill, all measured on 2026-09-03:
   `rpc1.monad.xyz` serves 640 address-filtered on its own.
 - **No shipped endpoint keeps historic state.** All three serve logs and blocks from block 1, so a
   from-genesis backfill of events works. A pinned `[[calls]]` at an old block (RFC-0023) fails with
-  `Block requested not found` and needs `--rpc` at an archive endpoint. `rpc-mainnet.monadinfra.com`
-  keeps state but refuses JSON-RPC batches, so it is not listed.
+  `Block requested not found` and needs an archive endpoint: `init ... --chain monad --rpc <url>` or
+  `dev --rpc <url>`, either of which makes your endpoint the whole pool (the built-in name is still
+  used for the finality policy and window; only the chain id is never looked up over `--rpc`).
+  `rpc-mainnet.monadinfra.com` keeps state but refuses JSON-RPC batches, so it is not listed.
 - **`init` cannot detect a deployment block.** That probe is `eth_getCode` at old heights, which is a
   state read, so on the shipped endpoints it reports `deployment block undetected` and the backfill
   starts from a tip offset. Set `start_block` in `nuthatch.toml`, or pass `--backfill <blocks>`, for
