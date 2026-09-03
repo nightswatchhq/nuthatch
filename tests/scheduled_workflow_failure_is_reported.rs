@@ -20,6 +20,13 @@
 //! recorded in this repo's own notes about tests that pass with the mechanism removed. So both the
 //! `failure()` and the `github.event_name == 'schedule'` halves are asserted.
 //!
+//! **And all three are asserted *inside the reporter job's own block*.** The first version of this
+//! file looked for the job name, the `uses:` and the guard independently anywhere in the workflow,
+//! which proves none of them belong together: a correctly-guarded reporter job whose action step had
+//! been moved into some other job would have passed. Worth recording rather than quietly fixing,
+//! because it is the structural form of the very mistake the paragraph above is about - the parts
+//! were all present and the association between them was unchecked.
+//!
 //! **Comments are stripped before anything is matched.** Two gates in this repo have passed while
 //! the guarded thing was deleted, because they matched the explanatory prose in a comment rather
 //! than the code. The prose above says `schedule:` and `report-scheduled-failure` several times;
@@ -97,12 +104,30 @@ fn is_scheduled(stripped: &str) -> bool {
     stripped.lines().any(|l| l.trim() == "schedule:")
 }
 
-/// The `if:` conditions in a workflow, trimmed of the key.
-fn if_conditions(stripped: &str) -> Vec<String> {
-    stripped
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("if:").map(|r| r.trim().to_owned()))
-        .collect()
+/// The lines of one named job, from its key up to the next key at the same indentation.
+///
+/// Everything below is asserted against *these* lines rather than the whole file, so a `uses:` or an
+/// `if:` sitting in a different job cannot vouch for this one.
+fn job_block<'a>(stripped: &'a str, job_key: &str) -> Option<Vec<&'a str>> {
+    let mut lines = stripped.lines();
+    let indent = lines
+        .by_ref()
+        .find(|l| l.trim() == job_key)
+        .map(|l| l.len() - l.trim_start().len())?;
+    let mut out = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            out.push(line);
+            continue;
+        }
+        let this = line.len() - line.trim_start().len();
+        // A sibling key ends the block. A deeper line, or a list item under it, is still ours.
+        if this <= indent {
+            break;
+        }
+        out.push(line);
+    }
+    Some(out)
 }
 
 #[test]
@@ -131,27 +156,34 @@ fn every_scheduled_workflow_reports_its_failures() {
 
     let mut failures = Vec::new();
     for (name, stripped) in &scheduled {
-        if !stripped.lines().any(|l| l.trim() == REPORTER_JOB) {
+        let Some(block) = job_block(stripped, REPORTER_JOB) else {
             failures.push(format!(
                 "{name}: runs on a schedule but has no `{REPORTER_JOB}` job"
             ));
             continue;
-        }
-        if !stripped.contains(REPORTER_USES) {
+        };
+        // A step in a list is `- uses: …`; a bare `uses:` appears under a job key. Both spellings,
+        // for the reason `actions_are_pinned.rs` gives: matching only the second undercounted 15 of
+        // 53 there, and it was a floor assertion that noticed.
+        if !block
+            .iter()
+            .any(|l| l.trim().trim_start_matches("- ").trim_start() == REPORTER_USES)
+        {
             failures.push(format!(
-                "{name}: has a `{REPORTER_JOB}` job that does not `{REPORTER_USES}`, so it \
-                 surfaces nothing"
+                "{name}: the `{REPORTER_JOB}` job does not itself `{REPORTER_USES}`, so it \
+                 surfaces nothing - a `uses:` elsewhere in the file does not count"
             ));
         }
         // Both halves, because either one missing makes the job useless in a different way: without
         // `failure()` it files an issue on every green run, and without the event check it files
         // one for a failing pull request that is already visible on the pull request.
-        let armed = if_conditions(stripped)
+        let armed = block
             .iter()
+            .filter_map(|l| l.trim().strip_prefix("if:"))
             .any(|c| c.contains("failure()") && c.contains("github.event_name == 'schedule'"));
         if !armed {
             failures.push(format!(
-                "{name}: no `if:` combining `failure()` with \
+                "{name}: the `{REPORTER_JOB}` job has no `if:` combining `failure()` with \
                  `github.event_name == 'schedule'`, so the reporter cannot fire on the case it \
                  exists for"
             ));
