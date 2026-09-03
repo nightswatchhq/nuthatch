@@ -51,8 +51,14 @@ pub async fn resolve(chain_id: u64, address: &str) -> Result<Resolved> {
 
 async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>)> {
     // Sourcify server API v2. The legacy /server/files endpoint is retired.
-    let url =
-        format!("https://sourcify.dev/server/v2/contract/{chain_id}/{address}?fields=abi,name");
+    //
+    // `compilation`, not `name` (#1138). The contract's identifier used to be a top-level field and
+    // is now `compilation.name`; asking for `name` gets HTTP 400 `Field selector name is not a valid
+    // field`, on every chain, which silently demoted this whole path to "Blockscout where wired,
+    // else an Etherscan key" for however long it stood.
+    let url = format!(
+        "https://sourcify.dev/server/v2/contract/{chain_id}/{address}?fields=abi,compilation"
+    );
     let resp = reqwest::get(&url)
         .await
         .context("Sourcify request failed")?;
@@ -66,10 +72,15 @@ async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>
     Ok((parse_sourcify(&body)?, sourcify_contract_name(&body)))
 }
 
-/// Sourcify v2 `name` - the verified contract's identifier, not an ABI field. Used as the default
-/// alias when `init`/`add` are not given `--alias` (#774).
+/// Sourcify v2's contract identifier - the verified contract's name, not an ABI field. Used as the
+/// default alias when `init`/`add` are not given `--alias` (#774).
+///
+/// Read from `compilation.name`, where the v2 schema keeps it today, and from the top-level `name`
+/// it used to be at (#1138) - the second because the field has moved once already and the alias is a
+/// hint, so the cheap thing is to accept either rather than break on the next move.
 fn sourcify_contract_name(body: &Value) -> Option<String> {
-    body.get("name")
+    body.pointer("/compilation/name")
+        .or_else(|| body.get("name"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -171,15 +182,49 @@ mod tests {
 
     #[test]
     fn sourcify_name_is_the_alias_hint_and_empty_is_absent() {
+        // Where v2 keeps it today (#1138): measured 2026-09-03, mainnet USDC answers
+        // `{"compilation": {"name": "FiatTokenProxy", "fullyQualifiedName": ...}, "abi": [...]}`.
+        assert_eq!(
+            sourcify_contract_name(
+                &json!({"compilation": {"name": "FiatTokenProxy", "language": "Solidity"}, "abi": []})
+            )
+            .as_deref(),
+            Some("FiatTokenProxy")
+        );
+        // Where it used to be, still accepted.
         assert_eq!(
             sourcify_contract_name(&json!({"name": "DelegationManager", "abi": []})).as_deref(),
             Some("DelegationManager")
+        );
+        assert_eq!(
+            sourcify_contract_name(&json!({"compilation": {"name": ""}, "abi": []})),
+            None
         );
         assert_eq!(
             sourcify_contract_name(&json!({"name": "", "abi": []})),
             None
         );
         assert_eq!(sourcify_contract_name(&json!({"abi": []})), None);
+    }
+
+    /// The request must not ask for a selector Sourcify refuses (#1138). Pinned as a string test
+    /// because the network half has no other test, and `fields=abi,name` was accepted when #774
+    /// wrote it and is HTTP 400 now.
+    #[test]
+    fn sourcify_request_asks_for_compilation_not_name() {
+        // The request line only, not the whole file: this test's own strings would otherwise match.
+        let request = include_str!("abi.rs")
+            .lines()
+            .find(|l| l.contains("sourcify.dev/server/v2/contract/"))
+            .expect("the v2 request URL line");
+        assert!(
+            request.contains("?fields=abi,compilation\""),
+            "the Sourcify v2 request must select `compilation`, where the contract name lives: {request}"
+        );
+        assert!(
+            !request.contains(",name"),
+            "`name` is not a valid v2 field selector any more and gets HTTP 400: {request}"
+        );
     }
 
     #[test]
