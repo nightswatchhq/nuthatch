@@ -71,8 +71,24 @@ fn permission_keys(path: &Path) -> Vec<(usize, String)> {
 
         if trimmed == "permissions:" {
             block_indent = Some(indent);
+        } else if let Some(rest) = trimmed.strip_prefix("permissions:") {
+            // The **inline flow mapping** - `permissions: { contents: read, administration: read }` -
+            // is valid YAML and was invisible to the first version of this scanner, which only opened
+            // a block on a bare `permissions:` line. It would have passed a workflow GitHub rejects,
+            // which is the exact failure the test exists to catch, one syntax along.
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                for pair in inner.split(',') {
+                    if let Some((key, _)) = pair.split_once(':') {
+                        let key = key.trim();
+                        if !key.is_empty() {
+                            out.push((i + 1, key.to_string()));
+                        }
+                    }
+                }
+            }
+            // A scalar form - `permissions: read-all` or `permissions: {}` - has no keys to check.
         }
-        // A scalar form - `permissions: read-all` or `permissions: {}` - has no keys to check.
     }
     out
 }
@@ -117,6 +133,20 @@ fn the_scanner_finds_the_key_that_caused_1095() {
         keys.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
         vec!["contents", "administration", "issues"],
         "the scanner must read both the top-level and the job-level block"
+    );
+
+    // The inline flow mapping is valid YAML and GitHub rejects it just as hard.
+    let g = dir.path().join("inline.yml");
+    std::fs::write(
+        &g,
+        "name: y\npermissions: { contents: read, administration: read }\njobs:\n  a:\n    permissions: read-all\n",
+    )
+    .unwrap();
+    let inline = permission_keys(&g);
+    assert_eq!(
+        inline.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
+        vec!["contents", "administration"],
+        "an inline mapping must be scanned, and `permissions: read-all` has no keys to check"
     );
     let invalid: Vec<&str> = keys
         .iter()
