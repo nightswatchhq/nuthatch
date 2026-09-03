@@ -139,3 +139,129 @@ fn the_committed_list_names_jules_and_not_the_retired_signature_context() {
     assert!(listed.iter().any(|l| l == "Jules approval"), "{listed:?}");
     let _: PathBuf = manifest().to_path_buf();
 }
+
+/// #1119 - `main` reported `required-checks.txt is missing 'Jules approval'` against a file that
+/// plainly contains it. Every context in that file holds `·` (U+00B7), and `grep`/`sort` change
+/// behaviour on non-ASCII input with the locale: GNU grep can decline to match a line it considers an
+/// encoding error, and `sort` refuses an illegal byte sequence outright. A runner whose locale
+/// differs from a developer's therefore reads a healthy file as a broken one.
+///
+/// Not reproduced on macOS - every locale tried there passes - so this pins the behaviour rather than
+/// claiming a cure. What the test can do is stop the pin being removed by someone who does not know
+/// why it is there.
+#[test]
+fn the_script_pins_the_locale_so_a_runner_cannot_read_a_healthy_file_as_broken() {
+    let src = std::fs::read_to_string(manifest().join("scripts/check-required-contexts.sh"))
+        .expect("read the script");
+    // **Match a line of code, not a substring.** Commenting the pin out leaves the text in place, so
+    // a `contains` check passes against a script that no longer pins anything - which is exactly what
+    // it did when this test was first written and mutation-checked.
+    let pinned = src
+        .lines()
+        .map(str::trim)
+        .any(|l| l == "export LC_ALL=C" || l == "export LC_ALL=C.UTF-8");
+    assert!(
+        pinned,
+        "the context list is full of `·`, and grep/sort are locale-sensitive on it. Without a pin \
+         the same file reads differently on different runners, which is the #1119 failure:\n{src}"
+    );
+}
+
+/// An unreadable or empty file must say so, not report the file's *contents* as wrong. The message
+/// that sent #1119 to the wrong place blamed a missing context when nothing had been read at all.
+#[test]
+fn reading_nothing_is_reported_as_reading_nothing() {
+    // Empty.
+    let root = root_with("");
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an empty list must not pass: {out}");
+    assert!(out.contains("read no contexts"), "{out}");
+    assert!(
+        !out.contains("is missing 'Jules approval'"),
+        "an empty file is not a file with a missing context:\n{out}"
+    );
+
+    // Only comments - the same, and grep exiting 1 for no output must not be mistaken for an error.
+    let root = root_with("# just a comment\n# and another\n");
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "a comments-only list must not pass: {out}");
+    assert!(out.contains("read no contexts"), "{out}");
+
+    // Absent entirely.
+    let root = root_with(REQUIRED);
+    std::fs::remove_file(root.path().join(".github/required-checks.txt")).unwrap();
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an absent list must not pass: {out}");
+    assert!(out.contains("cannot read"), "{out}");
+
+    // Readable but not readable *through*: a read that fails partway leaves a non-empty, incomplete
+    // list, and neither the existence test nor the emptiness test can see that. A directory in place
+    // of the file is the cheapest way to make the read itself fail. It must report a failed read
+    // rather than an empty one - under `pipefail` the filter pipeline reported this as "empty or all
+    // comments", because the rightmost stage exiting 1 on no input masked the real error upstream.
+    let root = root_with(REQUIRED);
+    let f = root.path().join(".github/required-checks.txt");
+    std::fs::remove_file(&f).unwrap();
+    std::fs::create_dir(&f).unwrap();
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_ne!(code, 0, "an unreadable list must not pass: {out}");
+    assert!(
+        out.contains("failed with status"),
+        "a failed read must say so, not be reported as an empty file:\n{out}"
+    );
+    assert!(
+        !out.contains("is missing 'Jules approval'"),
+        "and it must never blame the contents:\n{out}"
+    );
+}
+
+/// The sort-status guard, made reachable.
+///
+/// A `sort` over a handful of lines does not fail on its own, so the branch that catches a partial
+/// or killed sort had no test and a mutation left it green. Putting a stub `sort` earlier on `PATH`
+/// exercises it directly: it prints one line and exits 2, which is exactly the shape the guard
+/// exists for - **output produced, then failure**, leaving a list that is non-empty and wrong.
+#[test]
+fn a_sort_that_fails_after_partial_output_is_not_treated_as_a_short_list() {
+    let root = root_with(REQUIRED);
+    let bin = root.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sort = bin.join("sort");
+    std::fs::write(&sort, "#!/bin/sh\necho 'build release'\nexit 2\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sort, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(root.path().join("scripts/check-required-contexts.sh"))
+        .arg("--offline")
+        .env("PATH", path)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("bash must be on PATH");
+    let code = out.status.code().unwrap_or(-1);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_ne!(code, 0, "a failed sort must not pass: {text}");
+    assert!(
+        text.contains("sorting the 3 contexts") && text.contains("failed with status 2"),
+        "a sort that fails after emitting output must say so, and say how many contexts it was \
+         given, rather than let the truncated result reach the drift check:\n{text}"
+    );
+    assert!(
+        !text.contains("is missing 'Jules approval'"),
+        "and it must never blame the contents:\n{text}"
+    );
+}

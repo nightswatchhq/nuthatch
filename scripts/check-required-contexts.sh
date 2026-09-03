@@ -22,6 +22,17 @@
 # `PROTECTION_READ_TOKEN` and passed in as `GH_TOKEN`.
 set -euo pipefail
 
+# **Byte semantics, not the runner's locale.** Every context in `.github/required-checks.txt` contains
+# `·` (U+00B7, the bytes C2 B7), and `grep`/`sort` change behaviour on non-ASCII input depending on
+# `LC_*`: GNU grep can decline to match a line it considers an encoding error, and `sort` refuses an
+# illegal byte sequence outright. A CI runner whose locale differs from a developer's would then read
+# a healthy file as one missing a context - which is the shape of the #1119 failure, where `main`
+# reported `required-checks.txt is missing 'Jules approval'` against a file that plainly contains it.
+#
+# Pinning to C makes the comparison byte-wise and identical everywhere. The contexts are compared for
+# exact equality, so collation order is irrelevant to the result.
+export LC_ALL=C
+
 offline=0
 for arg in "$@"; do
   case "$arg" in
@@ -32,7 +43,61 @@ done
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 file="$root/.github/required-checks.txt"
-expected=$(grep -v '^#' "$file" | grep -v '^$' | sort)
+# **An unreadable file must not be reported as a file with the wrong contents.** Any failure reading
+# the list yields an empty `expected`, and the very next check then says
+# `required-checks.txt is missing 'Jules approval'` - naming the file's *contents* as the fault when
+# nothing was read at all. That message sent a CI failure on `main` to the wrong place (#1119).
+if [ ! -r "$file" ]; then
+  echo "cannot read $file, so the committed list was never compared" >&2
+  exit 1
+fi
+# **Read the whole file first, and check that it was read.** The case neither the `-r` test nor the
+# emptiness test below can see is a read that fails *after* emitting some lines: `expected` comes out
+# non-empty and **incomplete**, and the drift check then reports contexts missing from a file that
+# actually has them.
+#
+# A filter pipeline cannot answer "was the whole file read". Under `pipefail` the status is the
+# rightmost failure, so `grep -v '^#'` failing with 2 is masked by the next `grep -v '^$'` exiting 1
+# for empty input - which is how a directory in place of the file reported itself as "empty or all
+# comments". One `cat`, one status, one question answered.
+set +e
+raw=$(cat -- "$file")
+read_status=$?
+set -e
+if [ "$read_status" -ne 0 ]; then
+  echo "reading $file failed with status $read_status - the list may be truncated, so nothing here is a comparison" >&2
+  exit 1
+fi
+
+# **Filter in the shell, so there is no pipeline status to mask.** `... | sort || true` suppresses a
+# `sort` that dies after emitting partial output just as thoroughly as it suppresses `grep` exiting 1
+# for no output, and the two need opposite treatment: the first is a truncated list reported as a
+# file missing contexts, the second is an ordinary empty file. Under `pipefail` they are not even
+# distinguishable, because the status is the rightmost failure and a later stage exiting 1 on empty
+# input hides an earlier stage exiting 2.
+#
+# No subprocess, no pipeline, nothing to swallow. `sort` is then the only command left with a status
+# worth checking, and it is checked exactly.
+contexts=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in '#'*) continue ;; esac
+  contexts+=("$line")
+done <<< "$raw"
+
+if [ ${#contexts[@]} -eq 0 ]; then
+  echo "read no contexts from $file - it is empty or all comments. Nothing was compared, so this is not a drift check" >&2
+  exit 1
+fi
+
+set +e
+expected=$(printf '%s\n' "${contexts[@]}" | sort)
+sort_status=$?
+set -e
+if [ "$sort_status" -ne 0 ]; then
+  echo "sorting the ${#contexts[@]} contexts from $file failed with status $sort_status - the list may be incomplete, so nothing here is a comparison" >&2
+  exit 1
+fi
 
 # The `reviewed-by signature` gate was retired: a PR is admitted by CI and Jules, not by a line of
 # text a party could type about itself. Asserted in the negative because re-adding the context
