@@ -69,11 +69,33 @@ if [ "$read_status" -ne 0 ]; then
   exit 1
 fi
 
-# Now the filtering, where `grep -v` exiting 1 for no output is expected rather than an error: a file
-# of only comments is a legitimate thing to find and a bad thing to proceed from.
-expected=$(printf '%s\n' "$raw" | grep -v '^#' | grep -v '^$' | sort || true)
-if [ -z "$expected" ]; then
+# **Filter in the shell, so there is no pipeline status to mask.** `... | sort || true` suppresses a
+# `sort` that dies after emitting partial output just as thoroughly as it suppresses `grep` exiting 1
+# for no output, and the two need opposite treatment: the first is a truncated list reported as a
+# file missing contexts, the second is an ordinary empty file. Under `pipefail` they are not even
+# distinguishable, because the status is the rightmost failure and a later stage exiting 1 on empty
+# input hides an earlier stage exiting 2.
+#
+# No subprocess, no pipeline, nothing to swallow. `sort` is then the only command left with a status
+# worth checking, and it is checked exactly.
+contexts=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in '#'*) continue ;; esac
+  contexts+=("$line")
+done <<< "$raw"
+
+if [ ${#contexts[@]} -eq 0 ]; then
   echo "read no contexts from $file - it is empty or all comments. Nothing was compared, so this is not a drift check" >&2
+  exit 1
+fi
+
+set +e
+expected=$(printf '%s\n' "${contexts[@]}" | sort)
+sort_status=$?
+set -e
+if [ "$sort_status" -ne 0 ]; then
+  echo "sorting the ${#contexts[@]} contexts from $file failed with status $sort_status - the list may be incomplete, so nothing here is a comparison" >&2
   exit 1
 fi
 
