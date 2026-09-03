@@ -159,7 +159,7 @@ For Robinhood Chain the tags are well-defined and *not* dangerously close to the
 ### 6. RPC client configuration
 
 - Ship the **measured public endpoint** (`https://rpc.mainnet.chain.robinhood.com`) as the zero-setup default, explicitly documented as testing-only (rate-limited, no archive), consistent with how Nuthatch frames its other bundled public endpoints ("the on-ramp, not the road").
-- **Strongly steer real workloads to a paid/own endpoint** via `--rpc` (repeatable, round-robined with per-endpoint health tracking) or `rpc_urls` in `nuthatch.toml`. Recommend Alchemy / QuickNode / dRPC / Chainstack / Dwellir / Goldsky for archive + `eth_getLogs` at scale. All endpoints in a pool must be the same chain — Nuthatch verifies this at startup.
+- **Strongly steer real workloads to a paid/own endpoint** via `--rpc` (repeatable, round-robined with per-endpoint health tracking) or `rpc_urls` in `nuthatch.toml`. *(Maintainer note, 2026-09-03: this is `nuthatch dev --rpc` and the nest's `rpc_urls`, which override a built-in chain's shipped endpoints at run time - the production Arbitrum One nests run exactly this way. It is not `init --rpc`; see §8.)* Recommend Alchemy / QuickNode / dRPC / Chainstack / Dwellir / Goldsky for archive + `eth_getLogs` at scale. All endpoints in a pool must be the same chain — Nuthatch verifies this at startup.
 - **`eth_getLogs` window:** measure with `nuthatch doctor --rpc <url> --address 0xADDR` and set the built-in default to the measured widest range for the public endpoint; do **not** copy Arbitrum One's number blindly. A given block range covers far less wall-clock time on a 100ms chain but potentially more events per unit time, so window tuning is genuinely different from a 12s-block chain.
 - **Batch limits / rate limits:** the RFC-0028 ingestion hardening (split oversized `getLogs`, take provider-suggested ranges, classify rate-limit vs transport vs credential failures, split-once on unclassifiable failures) already covers the failure modes a busy 100ms chain will hit — including Alchemy's HTTP-400 oversized-range refusal that RFC-0029/v0.9.0 addressed. No new ingestion logic is needed; only defaults tuning.
 
@@ -173,7 +173,7 @@ For Robinhood Chain the tags are well-defined and *not* dangerously close to the
 
 - New built-in `--chain robinhood` (+ aliases), and optionally `--chain robinhood-testnet`.
 - Bytecode auto-probe (omit `--chain`) should include Robinhood Chain mainnet in the probe set; **exclude testnet from auto-probe** to avoid mis-selection.
-- `--rpc` remains ignored for the built-in name (per README: "a built-in chain never dials").
+- `init --rpc` remains ignored for the built-in name (per README: "a built-in chain never dials" - `init` takes the chain id from the registry rather than from the endpoint). This is `init` only: at `dev` time `--rpc` and `rpc_urls` override the shipped endpoints, which is how §6's paid-endpoint guidance is meant to be followed.
 - No new flags required; this is a registry addition.
 
 ### 9. Observability / metrics
@@ -271,9 +271,13 @@ the tree at `af875f9a` and the live endpoints on 2026-09-03; the body above is l
 1. **Registry file and schema (open question 1).** `src/chains.rs`, one `const Chain` per chain:
    `name`, `chain_id`, `rpc_urls`, `finality`, `log_window`, `topic0_only_getlogs`. `Finality` has
    exactly two variants, `Depth(u64)` and `FinalizedTag { fallback_depth }`. **There is no
-   `safe`-tag policy.** §4's recommendation therefore maps onto `FinalizedTag` with a fallback depth
-   sized for the 100 ms cadence, or a new `SafeTag` variant - which is a code change, not a data
-   entry, and changes the "registry entry, not an adapter" framing by one enum arm.
+   `safe`-tag policy, so the code cannot represent §4's recommendation today.** `FinalizedTag` seals
+   at the `finalized` tag - measured about 22 minutes behind tip here, against about 16 for `safe` -
+   and is not the same policy. Sealing at `safe` needs a new enum arm (say `SafeTag { fallback_depth }`)
+   and the seal loop taught to ask for it, which is a code change, not a data entry, and changes the
+   "registry entry, not an adapter" framing by exactly that much. The alternative is to change §4 to
+   recommend `FinalizedTag`, accepting the extra six minutes of seal latency for no code; that is a
+   decision for the carve-out, not for this addendum.
 2. **Arbitrum special-casing (open question 2).** None in the ingestion path. Every `42161` in
    `src/` outside `chains.rs` is a test fixture or a config string. Arbitrum One is
    `FinalizedTag { fallback_depth: 1800 }` with `log_window: 2000`.
@@ -281,8 +285,10 @@ the tree at `af875f9a` and the live endpoints on 2026-09-03; the body above is l
    `0xb626` = **46630**. The aggregator's 46646 is wrong.
 4. **Block tags, live, mainnet at 18:23 UTC.** `latest` 53,622,003; `safe` 53,612,513 (9,490
    blocks and 990 s behind: 9.6 blocks/s, i.e. the 100 ms cadence); `finalized` 53,609,116 (12,887
-   blocks and 1,343 s behind, about 22 minutes). Both tags are served by the public endpoint. A
-   `FinalizedTag` fallback depth for this chain is of the order of **15,000 blocks**, not 1,800.
+   blocks and 1,343 s behind, about 22 minutes). Both tags are served by the public endpoint. Whichever
+   tag policy is chosen, its **fallback depth** for this cadence is of the order of 15,000 blocks for
+   `finalized` or 10,000 for `safe`, not Arbitrum One's 1,800 - and the fallback is what runs on any
+   provider that does not serve the tag.
 5. **Public endpoint (open question 3).** `nuthatch doctor`, unfiltered: `getLogs` window up to
    163,840 blocks range-only (recommend `--window 320` until measured with `--address`); batch
    100+; **archive depth refused with HTTP 429** rather than answered. The RFC's own warning about
