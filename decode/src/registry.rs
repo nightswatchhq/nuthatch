@@ -1733,6 +1733,66 @@ mod stored_roundtrip {
 mod tests {
     use super::*;
 
+    /// nightswatchhq/nuthatch#1116 - the L1 block an L2 block was sequenced against.
+    ///
+    /// The bridge between the two block spaces. `EpochManager` counts epochs in L1 blocks while an
+    /// indexed log carries an L2 block, so without this an epoch boundary has to be guessed from the
+    /// first *observed* event, which files several thousand blocks' worth of activity against the
+    /// wrong epoch.
+    #[test]
+    fn a_block_row_keeps_the_l1_block_number_and_zeroes_it_where_absent() {
+        let arbitrum = serde_json::json!({
+            "hash": "0xaa",
+            "parentHash": "0xbb",
+            "miner": "0x0000000000000000000000000000000000000001",
+            "gasUsed": "0x10",
+            "gasLimit": "0x20",
+            "baseFeePerGas": "0x1",
+            "size": "0x30",
+            "timestamp": "0x64",
+            "l1BlockNumber": "0x18b23d3",
+            "transactions": [],
+        });
+        let row =
+            block_row(501_277_084, &arbitrum, true).expect("a header with a hash yields a row");
+        let l1 = row
+            .params
+            .iter()
+            .find(|(k, _)| k == "l1_block_number")
+            .map(|(_, v)| v.clone())
+            .expect("the column must be populated, not merely declared");
+        assert_eq!(l1, Value::U64(0x018b_23d3), "0x18b23d3 is 25,896,915");
+
+        // Mainnet does not report one. Zero, following `base_fee_per_gas` on a pre-London block:
+        // the honest value for "the field did not exist", not a failure of the whole window.
+        let mut mainnet = arbitrum.clone();
+        mainnet.as_object_mut().unwrap().remove("l1BlockNumber");
+        let row = block_row(1, &mainnet, true).expect("row");
+        assert_eq!(
+            row.params
+                .iter()
+                .find(|(k, _)| k == "l1_block_number")
+                .map(|(_, v)| v.clone()),
+            Some(Value::U64(0)),
+        );
+    }
+
+    /// The schema and the row builder read the same `BLOCK_COLUMNS`, and that constant's own comment
+    /// says the two must agree on every name and order. That only holds while every declared column
+    /// is actually emitted, so assert it rather than trusting the comment.
+    #[test]
+    fn every_declared_block_column_is_emitted_by_the_row_builder() {
+        let header = serde_json::json!({ "hash": "0xaa", "transactions": [] });
+        let row = block_row(1, &header, false).expect("row");
+        let emitted: Vec<&str> = row.params.iter().map(|(k, _)| k.as_str()).collect();
+        let declared: Vec<&str> = BLOCK_COLUMNS.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            emitted, declared,
+            "a column declared and not emitted is a null in every row, and one emitted and not \
+             declared is a row the schema cannot describe"
+        );
+    }
+
     #[test]
     fn is_transfer_shaped_gates_on_shape_not_name() {
         // Build a TableSchema from a name + its event-param Solidity types (implicit columns aside).
