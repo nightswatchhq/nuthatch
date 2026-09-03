@@ -328,6 +328,9 @@ pub(crate) fn looks_like_cap(body: &str) -> bool {
         "logs matched by query",
         "exceeds the limit",
         "block range",
+        // Monad public endpoints, 2026-09-03 (RFC-0051): Ankr and QuickNode respectively.
+        "exceeds size limit",
+        "is limited to a",
     ];
     CAP.iter().any(|m| s.contains(m))
 }
@@ -384,6 +387,14 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         "too many results",
         "limit exceeded",
         "query timeout exceeded",
+        // Measured on Monad's public endpoints, 2026-09-03 (RFC-0051 addendum, item 7). Ankr answers
+        // an over-wide `eth_getLogs` at HTTP **200** with `-32603 "response exceeds size limit"`, which
+        // matched nothing above and fell through to `Transient` - the same width, retried until the
+        // attempts ran out. QuickNode answers HTTP 413 `-32614 "eth_getLogs is limited to a 100
+        // range"`; the 413 already narrows by status, and the phrase is here so the same words
+        // classify the same way whatever status a provider wraps them in.
+        "exceeds size limit",
+        "is limited to a",
     ];
     const TERMINAL: &[&str] = &[
         "must be authenticated",
@@ -1917,6 +1928,31 @@ mod tests {
                     super::FailureClass::Narrowable { .. }
                 ),
                 "HTTP {status} carrying cap language must be narrowable"
+            );
+        }
+    }
+
+    /// Monad's Ankr endpoint refuses an over-wide `eth_getLogs` at HTTP 200 with a message that
+    /// matched nothing (RFC-0051 addendum, item 7), so the window would have been retried at the same
+    /// width until the attempts ran out. QuickNode's shape is included so it classifies the same at
+    /// any status, not only behind the 413 it happens to arrive with.
+    #[test]
+    fn monad_public_endpoint_cap_shapes_are_narrowable() {
+        for body in [
+            r#"{"code":-32603,"message":"response exceeds size limit"}"#,
+            r#"{"code":-32614,"message":"eth_getLogs is limited to a 100 range"}"#,
+        ] {
+            let err: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(
+                matches!(
+                    super::classify_rpc_error(&err),
+                    super::FailureClass::Narrowable { .. }
+                ),
+                "{body} must be narrowable, not transient"
+            );
+            assert!(
+                super::looks_like_cap(body),
+                "the text fallback must agree with the JSON-RPC classifier: {body}"
             );
         }
     }

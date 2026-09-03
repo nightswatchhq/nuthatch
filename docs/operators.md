@@ -489,7 +489,8 @@ bundle hash, so it neither invalidates segment reuse nor forces a re-index.
 
 ## Running an unlisted EVM chain
 
-Ethereum mainnet, Arbitrum One and Base are **built in**: keyless public endpoints, a tuned
+Ethereum mainnet, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism and Monad are **built in**:
+keyless public endpoints, a tuned
 `eth_getLogs` window, chain-appropriate finality, and bytecode probing so `init` can detect which of
 them a contract lives on.
 
@@ -537,6 +538,31 @@ runtimes, bundles - is chain-agnostic and behaves exactly as it does on a built-
 
 If you are running an unlisted chain in anger, say so - a chain with real usage is a candidate for the
 built-in registry, which is where the tuned window and finality policy come from.
+
+### Monad: keep the `finalized` tag
+
+Monad (chain id `143`) ships with `FinalizedTag` finality, and the tag sits **one block behind tip**,
+about 300 ms. That looks like the case caveat 1 above warns about and is the opposite of it: on Monad
+`finalized` is close to the tip because MonadBFT finality genuinely takes two blocks, not because an
+endpoint aliases it to `latest`. One block is proposed per height, and a finalized block is
+irreversible without a hard fork. Switching a Monad nest to a depth policy by analogy with an L2 adds
+latency and no safety. Leave it (RFC-0051).
+
+Three things to know before a Monad backfill, all measured on 2026-09-03:
+
+- **The shipped window is 100 blocks**, the documented cap on `rpc.monad.xyz`. Monad blocks are
+  dense - the busiest contract that day carried 77 logs per block - so on a busy address it is the
+  result cap you hit, and `nuthatch doctor --address <it>` recommends 40 across the pool. Alchemy's
+  `rpc1.monad.xyz` serves 640 address-filtered on its own.
+- **No shipped endpoint keeps historic state.** All three serve logs and blocks from block 1, so a
+  from-genesis backfill of events works. A pinned `[[calls]]` at an old block (RFC-0023) fails with
+  `Block requested not found` and needs `--rpc` at an archive endpoint. `rpc-mainnet.monadinfra.com`
+  keeps state but refuses JSON-RPC batches, so it is not listed.
+- **`init` cannot detect a deployment block.** That probe is `eth_getCode` at old heights, which is a
+  state read, so on the shipped endpoints it reports `deployment block undetected` and the backfill
+  starts from a tip offset. Set `start_block` in `nuthatch.toml`, or pass `--backfill <blocks>`, for
+  the history you actually want; at 300 ms a block a day is 288,000 blocks.
+- **Alert on tip lag in seconds, not blocks.** At 300 ms a block, twenty blocks behind is six seconds.
 
 ---
 

@@ -1,9 +1,9 @@
 # RFC-0051: Monad chain support
 
-- Status: **Draft. Under the 2026 feature freeze this is a proposal, not work to start.** A new
-  built-in chain is new capability, both carve-outs are spent, and implementing this needs a
-  carve-out recorded in `CLAUDE.md` first. Nothing in this document starts, reorders or unblocks
-  a slice.
+- Status: **Implemented** (2026-09-03). Recorded as a frozen draft in the morning and carved out
+  in the afternoon: **carve-out three**, Chief's decision, recorded in `CLAUDE.md`, for this one
+  chain and nothing else. Shipped as a registry entry on the generic EVM path; the execution-lag
+  guard proposed below was **not built**, and the addendum's items 10 to 12 say why.
 - Author: Pete
 - Date: September 2026
 - Tracking issue: [#1136](https://github.com/nightswatchhq/nuthatch/issues/1136)
@@ -359,3 +359,25 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
 9. **Not checked here.** The `k=3` execution delay, the `Verified` state, `monadLogs` and the
    MIP history are cited to Monad's own documentation in the body and were not independently
    measured.
+10. **Decision, later the same day.** The freeze was lifted for this chain and for nothing else:
+    carve-out three, recorded in `CLAUDE.md`. Shipped as `Finality::FinalizedTag { fallback_depth:
+    200 }` on the generic path, with `rpc1.monad.xyz`, `rpc.monad.xyz` and `rpc3.monad.xyz` in that
+    order and `log_window: 100`. The RFC-0030 §4 bar, re-run address-filtered against the busiest
+    contract of the day (7,831 logs in 101 blocks): five of five ten-block `eth_getLogs` 5,000 behind
+    tip, batch-of-5 served, `finalized` served, topic0-only served, on all three. Address-filtered
+    `doctor` windows 640 / 80 / 320, batch 200+ / 100+ / 10. `rpc-mainnet.monadinfra.com` is the one
+    keyless endpoint that keeps historic state, and it is not listed: it refuses JSON-RPC batches
+    (HTTP 403 `Restricted JSON RPC method`), which fails the bar's batch floor.
+11. **The execution-lag guard is not built, and the reviewer's objection to its design stands.**
+    As specified it cannot tell a finalized-but-unexecuted block from an executed block with no
+    matching logs, since both answer an empty list. It does not need to. Measured eight times at
+    `latest` on rpc1 on 2026-09-03: every block's receipts and logs were complete on the first read,
+    receipt count equal to transaction count, identical two seconds later, same hash. The public RPC
+    layer serves only executed blocks, so `Finalized` never runs ahead of what `eth_getLogs` can
+    answer, and there is nothing to guard. What the same probe did show is that a load-balanced URL
+    can answer `finalized` from a backend one or two blocks ahead of the one that answered `latest`;
+    the client already treats a request past the serving backend's head as "beyond current head"
+    rather than as a cap (#903).
+12. **Ankr's refusal shape is classified.** `exceeds size limit` and `is limited to a` are in
+    `classify_rpc_error`'s narrowable list and in the text fallback, with a test that fails without
+    them. Item 7's reproduction is therefore no longer needed.
