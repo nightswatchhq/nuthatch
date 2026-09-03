@@ -62,3 +62,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROTECTION_READ_TOKEN }}
         run: bash scripts/check-required-contexts.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # **A failed scheduled run is invisible, so it files an issue** (#1130). A `schedule:` run
+  # attaches its check to no pull request, and a red nightly is not what the branch badge reflects,
+  # so `required contexts match protection` sat red for six consecutive days unnoticed.
+  #
+  # Only `github.event_name == 'schedule'`: a failing `pull_request` or `push` run already surfaces
+  # itself on the PR or the commit, and filing an issue for those would be noise. Guarded by
+  # `tests/scheduled_workflow_failure_is_reported.rs`, which checks this condition rather than only
+  # the job's presence - a reporter that can never fire would otherwise pass a presence check.
+  report-scheduled-failure:
+    name: surface a failed scheduled run
+    needs: [drift]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # The reporter is a local composite action, so the tree has to be present to load it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/report-scheduled-failure
