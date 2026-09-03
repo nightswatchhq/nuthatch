@@ -474,21 +474,40 @@ max_rows = 1
 
     let _ = tokio::time::timeout(POLL_TIMEOUT, rt.ingest).await;
 
-    // The alert is enqueued to a durable outbox by the ingest loop; the delivery worker drains it.
-    // Drain it here rather than waiting on the worker's cadence.
+    // The alert is enqueued to a durable outbox by the ingest loop, and *two* things drain it: the
+    // nest's own delivery worker, and this explicit call. A single drain-then-check therefore raced
+    // three ways (#1119) - the ingest loop might not have produced the fault yet, since the `timeout`
+    // above is swallowed by `let _`; the worker might already have taken the entry, making a
+    // `delivered > 0` check on our own call wrong rather than right; and delivery itself takes a
+    // moment. Poll the observable outcome instead, re-draining as we go, and let the failure name the
+    // outbox depth so "never enqueued" is distinguishable from "enqueued and never delivered".
     let client = reqwest::Client::new();
-    let _ = nuthatch::alerts::deliver_pending(
-        store.as_ref(),
-        &client,
-        &std::collections::HashMap::new(),
-    )
-    .await;
+    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+    let mut got;
+    loop {
+        let _ = nuthatch::alerts::deliver_pending(
+            store.as_ref(),
+            &client,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        got = received.lock().unwrap().clone();
+        if got.iter().any(|a| a["kind"] == "entity_fault") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no entity_fault alert arrived within {POLL_TIMEOUT:?}: {} still pending in the outbox, \
+             {got:?} received",
+            store.outbox_len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
-    let got = received.lock().unwrap().clone();
     let alert = got
         .iter()
         .find(|a| a["kind"] == "entity_fault")
-        .unwrap_or_else(|| panic!("no entity_fault alert arrived: {got:?}"));
+        .expect("checked by the loop above");
     assert!(
         alert["event"].as_str().unwrap_or("").contains("received"),
         "the alert names the entity: {alert}"
