@@ -400,3 +400,27 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
     finality one - and the cost against the tag is two seconds of seal latency. The way back to
     `FinalizedTag` is a soak that reads `eth_getBlockReceipts` at `finalized` continuously for a day
     on a shipped endpoint and never sees a short answer; a sample is not that.
+15. **The invariant the depth rests on, demonstrated rather than assumed.** Review asked for an
+    execution-availability check with a conservative failure mode, or a protocol/RPC invariant that
+    makes a depth boundary safe. Three facts, two of them measured on all three shipped endpoints on
+    2026-09-03:
+    - *A node serves a height only once it has executed it.* Monad's RPC reference says `latest` is
+      "backed by speculative execution"; the `Proposed` block is executed on receipt, which is why
+      every probe at `latest` had complete receipts.
+    - *A height the node has not executed is answered with an error, never an empty list.* Alchemy:
+      `-32602 "block range extends beyond current head block"`; QuickNode and Ankr: `-32602 "Block
+      requested not found"`; `eth_getBlockReceipts` and `eth_getBlockByNumber` answer `null` or
+      `Unknown block`. The first is the #903 not-a-cap shape and the others match no marker, so all
+      classify `Transient` and the range is retried, which is the conservative failure mode: a short
+      answer cannot be sealed as an empty block, because it is not an answer.
+    - *The header's `logsBloom` is the block's own, not the delayed block's.* Tested by keccak
+      membership of every log-emitting address in a six-block window: 52 of 52 present in header N's
+      bloom, 32 of 52 in header N+3's. So the one-sided empty-case oracle RFC-0049 §1 describes is
+      available from headers the indexer already fetches when `block_timestamps` is on. It is not
+      wired in this change; it is the chain-agnostic follow-up, and it would protect every chain, not
+      only this one.
+    What remains outside the invariant is a load-balanced URL whose backend answering `eth_getLogs`
+    sits a block or two behind the one that answered `latest`, and silently truncates a range that
+    straddles its head instead of erroring. Alchemy errors on that; the other two could not be told
+    apart from the chain simply advancing during the probe. That risk is chain-agnostic and is
+    exactly RFC-0049 §1's open item; the depth of eight does not create it and does not close it.

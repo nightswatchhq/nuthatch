@@ -285,6 +285,16 @@ const OPTIMISM: Chain = Chain {
 /// six past the `finalized` tag, which itself is irreversible without a hard fork. That costs two
 /// seconds of seal latency against the tag and buys a margin no probe has to keep proving. Moving
 /// to `FinalizedTag` wants a soak that reads receipts at `finalized` continuously, not a sample.
+///
+/// What makes the depth safe rather than merely wide, measured 2026-09-03 on all three endpoints:
+/// a height a node has **not** executed is answered with an **error**, never an empty list -
+/// Alchemy `-32602 "block range extends beyond current head block"`, QuickNode and Ankr `-32602
+/// "Block requested not found"` - and both classify `Transient` and are retried, so a short answer
+/// cannot be mistaken for an empty block. Monad's own docs say `latest` is "backed by speculative
+/// execution", i.e. a node serves a height only once it has executed it. And the header's
+/// `logsBloom` is the block's **own** (52 of 52 log-emitting addresses present in header N's bloom,
+/// 32 in N+3's), so the RFC-0049 §1 empty-case oracle is available from headers already fetched
+/// when timestamps are on, should anyone want to wire it.
 const MONAD: Chain = Chain {
     name: "monad",
     chain_id: 143,
