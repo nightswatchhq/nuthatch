@@ -27,6 +27,15 @@
 //! because it is the structural form of the very mistake the paragraph above is about - the parts
 //! were all present and the association between them was unchecked.
 //!
+//! **And the `needs:` edge is asserted, because `failure()` observes ancestors and nothing else.**
+//! A reporter job with the right `uses:` and the right `if:` but no `needs:` has no ancestor whose
+//! failure `failure()` could report, so it is simply skipped on the exact scheduled failure it exists
+//! for. The gate therefore requires every other job in a scheduled workflow to be a transitive
+//! ancestor of the reporter: a job added later that can fail without the reporter observing it is
+//! the same silent red as the one this file is about. Found in review, after the paragraph above
+//! had already been written - the parts were present, the guard was armed, and the wire between the
+//! failing job and the reporter was still unchecked.
+//!
 //! **Comments are stripped before anything is matched.** Two gates in this repo have passed while
 //! the guarded thing was deleted, because they matched the explanatory prose in a comment rather
 //! than the code. The prose above says `schedule:` and `report-scheduled-failure` several times;
@@ -104,30 +113,95 @@ fn is_scheduled(stripped: &str) -> bool {
     stripped.lines().any(|l| l.trim() == "schedule:")
 }
 
-/// The lines of one named job, from its key up to the next key at the same indentation.
+/// Every job in the workflow's `jobs:` mapping, as `(key, lines of its block)`.
 ///
-/// Everything below is asserted against *these* lines rather than the whole file, so a `uses:` or an
-/// `if:` sitting in a different job cannot vouch for this one.
-fn job_block<'a>(stripped: &'a str, job_key: &str) -> Option<Vec<&'a str>> {
-    let mut lines = stripped.lines();
-    let indent = lines
-        .by_ref()
-        .find(|l| l.trim() == job_key)
-        .map(|l| l.len() - l.trim_start().len())?;
-    let mut out = Vec::new();
+/// A job's block runs from its key up to the next key at the same indentation. Everything below is
+/// asserted against *these* lines rather than the whole file, so a `uses:`, an `if:` or a `needs:`
+/// sitting in a different job cannot vouch for this one. Walking the `jobs:` mapping rather than
+/// searching for a key anywhere in the file also means the reporter has to *be* a job, not merely a
+/// key somebody spelled the same way further down.
+fn jobs(stripped: &str) -> Vec<(String, Vec<&str>)> {
+    let mut lines = stripped.lines().peekable();
+    if !lines.by_ref().any(|l| l == "jobs:") {
+        return Vec::new();
+    }
+    // The indentation of the first job key is the indentation of every job key.
+    let Some(indent) = lines
+        .peek()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Vec<&str>)> = Vec::new();
     for line in lines {
-        if line.trim().is_empty() {
-            out.push(line);
+        let this = line.len() - line.trim_start().len();
+        if line.trim().is_empty() || this > indent {
+            if let Some((_, block)) = out.last_mut() {
+                block.push(line);
+            }
             continue;
         }
-        let this = line.len() - line.trim_start().len();
-        // A sibling key ends the block. A deeper line, or a list item under it, is still ours.
-        if this <= indent {
+        if this < indent {
+            // A top-level key after `jobs:` ends the mapping.
             break;
         }
-        out.push(line);
+        match line.trim().strip_suffix(':') {
+            Some(key) => out.push((key.to_owned(), Vec::new())),
+            None => break,
+        }
     }
-    Some(out)
+    out
+}
+
+/// The jobs a block `needs:`, in all three YAML spellings: `needs: [a, b]`, `needs: a`, and a
+/// block sequence of `- a` lines under a bare `needs:`.
+fn needs_of(block: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_seq = false;
+    for line in block {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("needs:") {
+            let rest = rest.trim();
+            in_seq = rest.is_empty();
+            if let Some(list) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                out.extend(
+                    list.split(',')
+                        .map(|j| j.trim().to_owned())
+                        .filter(|j| !j.is_empty()),
+                );
+            } else if !rest.is_empty() {
+                out.push(rest.to_owned());
+            }
+            continue;
+        }
+        if in_seq {
+            match t.strip_prefix("- ") {
+                Some(job) => out.push(job.trim().to_owned()),
+                None => in_seq = false,
+            }
+        }
+    }
+    out
+}
+
+/// Every job whose failure `failure()` in `job` can observe: its `needs:`, transitively.
+fn ancestors(all: &[(String, Vec<&str>)], job: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut todo = vec![job.to_owned()];
+    while let Some(j) = todo.pop() {
+        let Some((_, block)) = all.iter().find(|(k, _)| *k == j) else {
+            continue;
+        };
+        for n in needs_of(block) {
+            if !seen.contains(&n) {
+                seen.push(n.clone());
+                todo.push(n);
+            }
+        }
+    }
+    seen.sort();
+    seen
 }
 
 #[test]
@@ -156,7 +230,9 @@ fn every_scheduled_workflow_reports_its_failures() {
 
     let mut failures = Vec::new();
     for (name, stripped) in &scheduled {
-        let Some(block) = job_block(stripped, REPORTER_JOB) else {
+        let all = jobs(stripped);
+        let reporter = REPORTER_JOB.trim_end_matches(':');
+        let Some((_, block)) = all.iter().find(|(k, _)| k == reporter) else {
             failures.push(format!(
                 "{name}: runs on a schedule but has no `{REPORTER_JOB}` job"
             ));
@@ -186,6 +262,37 @@ fn every_scheduled_workflow_reports_its_failures() {
                 "{name}: the `{REPORTER_JOB}` job has no `if:` combining `failure()` with \
                  `github.event_name == 'schedule'`, so the reporter cannot fire on the case it \
                  exists for"
+            ));
+        }
+        // `failure()` is true only when an *ancestor* job failed, so the reporter observes exactly
+        // its transitive `needs:` and nothing else. No `needs:` means no ancestor and a reporter that
+        // is skipped on the one event it exists for; a job outside the `needs:` closure can go red
+        // on a scheduled run with the reporter none the wiser, which is #1130 again with one more
+        // job in the file.
+        let observed = ancestors(&all, reporter);
+        for n in &observed {
+            if !all.iter().any(|(k, _)| k == n) {
+                failures.push(format!(
+                    "{name}: the `{REPORTER_JOB}` job needs `{n}`, which is not a job in this \
+                     workflow - GitHub would reject the file, and the reporter observes nothing"
+                ));
+            }
+        }
+        let unobserved: Vec<&String> = all
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| *k != reporter && !observed.contains(k))
+            .collect();
+        if !unobserved.is_empty() {
+            failures.push(format!(
+                "{name}: the `{REPORTER_JOB}` job does not `needs:` {} (directly or through \
+                 another job), so a scheduled failure there is invisible to it - `failure()` only \
+                 sees ancestors",
+                unobserved
+                    .iter()
+                    .map(|k| format!("`{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
