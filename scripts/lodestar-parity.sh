@@ -299,10 +299,22 @@ if only_sg:
 # reward trio and wrong for the other three, so the fee fields carried a transition-era tail inside
 # the window and it read as a live shortfall of 1.7e23.
 #
-# Each boundary below is **measured**, not chosen: it is the lowest epoch above which every
-# disagreement in that field is an adjacent equal-and-opposite pair, i.e. pure boundary drift with
-# nothing lost. #1113's two definitional fixes are deployed, so all three former "known-diff" fields
-# now reconcile in exactly that way.
+# Each boundary below is **measured**, not chosen: it is the lowest epoch above which the field's
+# class property holds - no disagreement at all for a gate, and every disagreement an adjacent
+# equal-and-opposite pair for a drift field.
+#
+# **The two fee fields were `drift` and are now `gate`** (2026-09-03). #1116's exact boundaries are
+# deployed: `epoch_boundaries.start_block` is read off EpochManager's L1 arithmetic for epochs 1105
+# to 1370 rather than guessed from the first observed event, so the pairs those two fields used to
+# carry are gone rather than tolerated. Measured against the network subgraph afterwards, both agree
+# on **every** epoch from 1302 with no residue, and 1302 is still the lowest epoch at which that
+# holds - so the constant does not move, only the class. This script asked for the change itself: a
+# `drift` field that stops drifting prints "reclassify it as a gate" and fails, deliberately, so a
+# stale classification cannot sit unnoticed.
+#
+# `signalled_tokens` stays `drift`. Not because value is still misfiled - every closed epoch from
+# 1105 now agrees - but because the newest closed epoch straddles the open one above it, which is a
+# property of comparing a live chain and will recur at every run.
 #
 # Two classes:
 #   gate   directly comparable. **Any** disagreement above the boundary fails the run.
@@ -316,8 +328,8 @@ EPOCH_FIELDS = [
     ("total_indexer_rewards", "totalIndexerRewards", 1195, "gate"),
     ("total_delegator_rewards", "totalDelegatorRewards", 1195, "gate"),
     ("signalled_tokens", "signalledTokens", 1105, "drift"),
-    ("query_fees_collected", "queryFeesCollected", 1302, "drift"),
-    ("curator_query_fees", "curatorQueryFees", 1302, "drift"),
+    ("query_fees_collected", "queryFeesCollected", 1302, "gate"),
+    ("curator_query_fees", "curatorQueryFees", 1302, "gate"),
 ]
 EPOCH_GATE = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "gate"]
 EPOCH_KNOWN_DIFF = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "drift"]
