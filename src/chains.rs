@@ -245,6 +245,78 @@ const OPTIMISM: Chain = Chain {
     topic0_only_getlogs: true,
 };
 
+/// Monad. A full-EVM-bytecode L1 with MonadBFT single-slot finality, and the first chain here whose
+/// `finalized` tag runs *one block* behind tip because finality genuinely is that fast, not because
+/// an endpoint aliases it to `latest` (RFC-0051). Blocks every 300 ms - measured 2026-09-03 at 302 ms
+/// over 100 blocks - and dense: the busiest contract that day carried 7,831 logs across 101 blocks.
+///
+/// Measured 2026-09-03 with `nuthatch doctor --address <that contract>` against the RFC-0030 §4 bar:
+///
+/// | endpoint                    | getLogs (addr) | batch | `finalized` | history              |
+/// |-----------------------------|----------------|-------|-------------|----------------------|
+/// | `rpc1.monad.xyz` (Alchemy)  | 640            | 200+  | yes         | logs + blocks from 1 |
+/// | `rpc.monad.xyz` (QuickNode) | 80 (cap 100)   | 100+  | yes         | logs + blocks from 1 |
+/// | `rpc3.monad.xyz` (Ankr)     | 320            | 10    | yes         | logs + blocks from 1 |
+///
+/// **`doctor` reports archive depth "no" on all three, and that verdict is right about what it
+/// measures and wrong about what a backfill needs.** Its probe is a pinned `eth_getBalance` a million
+/// blocks behind tip, and none of the three keeps historic *state* - Monad full nodes do not. All
+/// three serve historic *logs and blocks* from block 1 (probed at 1, 1,000,000, 40,000,000 and
+/// 50,000,000), which is what a from-genesis backfill reads. So backfills work on the shipped
+/// defaults; a pinned `[[calls]]` at an old block (RFC-0023) does not, and wants `--rpc` at an archive
+/// endpoint. `rpc-mainnet.monadinfra.com` is the one keyless endpoint that *does* keep state, and it
+/// is not listed because it refuses JSON-RPC batches outright (HTTP 403 `Restricted JSON RPC method`),
+/// which fails the bar's batch floor and would make every timestamp fetch a single-block request.
+///
+/// The three refuse an over-wide range in three different shapes, none of them the `-32602` the RFC
+/// draft expected: QuickNode HTTP 413 `-32614 "eth_getLogs is limited to a 100 range"`, Alchemy the
+/// RFC-0029 HTTP 400 `-32602 "Log response size exceeded"`, and Ankr HTTP 200 `-32603 "response
+/// exceeds size limit"`. The first and third are in `classify_rpc_error` because of this chain; the
+/// third matched nothing before and would have been retried at the same width.
+///
+/// **No execution-lag guard, and a depth rather than the tag, for now.** RFC-0051 proposed a guard on
+/// the grounds that Monad finalises a block before executing it (execution is deferred by `k = 3`
+/// blocks). Measured eight times at `latest` on 2026-09-03: every block's receipts and logs were
+/// complete on the first read (receipt count equal to transaction count), identical two seconds
+/// later, same hash - the RPC layer served only executed blocks. Eight samples are not an invariant
+/// under provider load or a pipeline stall, and the guard as drafted cannot tell an unexecuted block
+/// from an executed empty one, since both answer an empty list. So the seal boundary is a **depth of
+/// 8**: 2.4 s at 300 ms, more than twice the protocol's deferral, and every sealed block is at least
+/// six past the `finalized` tag, which itself is irreversible without a hard fork. That costs two
+/// seconds of seal latency against the tag and buys a margin no probe has to keep proving. Moving
+/// to `FinalizedTag` wants a soak that reads receipts at `finalized` continuously, not a sample.
+///
+/// What makes the depth safe rather than merely wide, measured 2026-09-03 on all three endpoints:
+/// a height a node has **not** executed is answered with an **error**, never an empty list -
+/// Alchemy `-32602 "block range extends beyond current head block"`, QuickNode and Ankr `-32602
+/// "Block requested not found"` - and both classify `Transient` and are retried, so a short answer
+/// cannot be mistaken for an empty block. Monad's own docs say `latest` is "backed by speculative
+/// execution", i.e. a node serves a height only once it has executed it. And the header's
+/// `logsBloom` is the block's **own** (52 of 52 log-emitting addresses present in header N's bloom,
+/// 32 in N+3's), so the RFC-0049 §1 empty-case oracle is available from headers already fetched
+/// when timestamps are on, should anyone want to wire it.
+const MONAD: Chain = Chain {
+    name: "monad",
+    chain_id: 143,
+    rpc_urls: &[
+        // Widest window and widest batch first; the canonical endpoint second, because its 100-block
+        // cap and 50 req/s limit make it the narrow one; Ankr third with its batch of 10.
+        "https://rpc1.monad.xyz",
+        "https://rpc.monad.xyz",
+        "https://rpc3.monad.xyz",
+    ],
+    // MonadBFT: a block is final at the proposal of N+2, about 600 ms, and every shipped endpoint
+    // serves the `finalized` tag one block behind tip. Eight blocks is not a reorg margin - nothing
+    // past `finalized` reorgs on Monad - it is an *execution* margin over the deferred pipeline, see
+    // the doc comment above. RFC-0051's body argues for the tag; its addendum item 14 says why not yet.
+    finality: Finality::Depth(8),
+    // At the narrowest endpoint's documented range cap (QuickNode, 100), not above it: Monad blocks
+    // are dense enough that the *result* cap is what bites on a busy contract, and RFC-0028's chunker
+    // narrows from here on a cap it can see. `doctor` recommends 40 across the pool.
+    log_window: 100,
+    topic0_only_getlogs: true,
+};
+
 pub fn lookup(name: &str) -> Option<&'static Chain> {
     match name {
         "mainnet" | "ethereum" | "eth" => Some(&MAINNET),
@@ -254,6 +326,7 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
         "polygon" | "matic" | "polygon-pos" | "polygon-mainnet" => Some(&POLYGON),
         "gnosis" | "xdai" | "gnosis-chain" => Some(&GNOSIS),
         "optimism" | "op" | "op-mainnet" | "optimism-mainnet" => Some(&OPTIMISM),
+        "monad" | "monad-mainnet" | "mon" => Some(&MONAD),
         _ => None,
     }
 }
@@ -362,6 +435,7 @@ pub fn all() -> &'static [&'static Chain] {
         &POLYGON,
         &BSC,
         &GNOSIS,
+        &MONAD,
     ]
 }
 
@@ -435,6 +509,32 @@ mod tests {
         assert!(matches!(c.finality, Finality::FinalizedTag { .. }));
         assert!(!c.rpc_urls.is_empty());
         assert_eq!(lookup("base-mainnet").unwrap().chain_id, 8453);
+    }
+
+    /// RFC-0051: the first BFT single-slot-final chain in the registry. The seal boundary is a depth
+    /// of exactly eight blocks - 2.4 s, more than twice Monad's three-block execution deferral - not
+    /// the `finalized` tag, until a soak shows finalized and executed are coupled under load (RFC-0051
+    /// addendum, item 14). The window sits at the narrowest shipped endpoint's documented cap rather
+    /// than above it, because Monad's blocks are dense enough that the result cap, not the range cap,
+    /// is what a busy contract hits.
+    #[test]
+    fn monad_is_registered_with_an_execution_margin_at_the_narrowest_cap() {
+        let c = lookup("monad").expect("monad in registry");
+        assert_eq!(c.chain_id, 143);
+        assert_eq!(
+            c.finality,
+            Finality::Depth(8),
+            "an execution margin over k=3 deferred execution; the tag is a soak away, not a sample"
+        );
+        assert_eq!(
+            c.log_window, 100,
+            "QuickNode's documented cap - see the entry's measurements before raising it"
+        );
+        assert!(
+            c.topic0_only_getlogs,
+            "measured 2026-09-03: an address-less topic0 getLogs is served by all three"
+        );
+        assert_eq!(lookup("monad-mainnet").unwrap().chain_id, 143);
     }
 
     #[test]
@@ -578,6 +678,7 @@ mod tests {
                 &["optimism", "op", "op-mainnet", "optimism-mainnet"][..],
                 10,
             ),
+            (&["monad", "monad-mainnet", "mon"][..], 143),
         ] {
             for a in aliases {
                 let c = lookup(a).unwrap_or_else(|| panic!("alias {a:?} resolves to nothing"));
@@ -601,7 +702,7 @@ mod tests {
     #[test]
     fn every_registered_chain_is_probed_by_auto_detect() {
         let probed: Vec<u64> = all().iter().map(|c| c.chain_id).collect();
-        for id in [1u64, 42161, 8453, 56, 137, 100, 10] {
+        for id in [1u64, 42161, 8453, 56, 137, 100, 10, 143] {
             assert!(
                 probed.contains(&id),
                 "chain {id} resolves via `lookup` but `all()` never probes it, so `init` without \
@@ -610,7 +711,7 @@ mod tests {
         }
         assert_eq!(
             probed.len(),
-            7,
+            8,
             "a chain was added to `all()` without being added to the alias table above: {probed:?}"
         );
     }

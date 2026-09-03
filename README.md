@@ -106,7 +106,7 @@ after a full dependency build with `error: could not compile dbsp` and installs 
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
 
-**Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis and Optimism are *built in*, with
+**Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism and Monad are *built in*, with
 measured public endpoints and tuned finality settings - **omit `--chain` and nuthatch probes each for
 your contract's bytecode and picks the one it lives on.** Point at your own node with `--rpc`.
 
@@ -118,8 +118,10 @@ nuthatch init 0xADDR --chain world-chain --rpc https://your-endpoint.example
 ```
 
 The chain id is read **from the endpoint itself**, so there is no id to look up and nothing to type
-wrong. A built-in chain never dials: `--rpc` is ignored for the seven names above. Omit `--rpc` on an
-unregistered name and the refusal tells you the remedy rather than just listing the built-ins.
+wrong. A built-in chain never dials to learn its id: on one of the eight names `--rpc` is not consulted
+for the chain id, but it **is** the pool - your endpoints replace the bundled public ones outright, and
+nothing public is appended after them. Omit `--rpc` on an unregistered name and the refusal tells you
+the remedy rather than just listing the built-ins.
 
 Public endpoints are a moving target, and the ones shipped here are measured rather than assumed -
 but a measurement is a snapshot, not a property. Run `nuthatch doctor --rpc <url>` before trusting a

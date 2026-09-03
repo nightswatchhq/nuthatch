@@ -113,6 +113,13 @@ jobs:
           for u in https://mainnet.base.org https://base.drpc.org https://base-pokt.nodies.app; do
             probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
           done
+          # Monad (RFC-0051): the busiest contract on 2026-09-03, 77 logs per block, so a window that
+          # survives it survives anything. No archive gate here on purpose - `doctor`'s archive probe
+          # is a state read, and no keyless Monad endpoint keeps state, while all three serve the log
+          # history a backfill needs (see the registry entry).
+          for u in https://rpc1.monad.xyz https://rpc.monad.xyz https://rpc3.monad.xyz; do
+            probe monad 0x34b6552d57a35a1d042ccae1951bd1c370112a6f "$u"
+          done
           # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).
           # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
           # silently breaks backfill even when its getLogs window is wide. That is what broke on

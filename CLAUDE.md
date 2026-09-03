@@ -169,7 +169,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > started. Treat a proposal for new capability the way the out-of-scope list below is treated: say
 > so, rather than quietly building it. The list survives as the record of how the product was built.
 >
-> **Two carve-outs, and only these two.** A carve-out is a decision Chief makes explicitly and
+> **Three carve-outs, and only these three.** A carve-out is a decision Chief makes explicitly and
 > records here. It is not a precedent for the next proposal, and an approved RFC is not a carve-out
 > until it appears in this list.
 >
@@ -210,11 +210,19 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    reopen RFC-0042 before it, not after**, because swapping the engine before durable grafting wires
 >    in costs nothing and after it costs a full recompute per derivation.
 >
->    **Both carve-outs are now spent, and the 2026 feature freeze applies again in full.** There is no
->    third. A proposal to resume RFC-0042 work is a proposal for a new carve-out and needs a §14 reopen
->    condition recorded first. Two items escaped the park because they are corrections and performance
->    rather than capability, and §14 names them: the false-serialisation correction, and revisiting
->    `SQL_MAX_CONCURRENCY`.
+>    **Both carve-outs are now spent, and the 2026 feature freeze applies again in full.** A third was
+>    taken on 2026-09-03, below, for one chain. A proposal to resume RFC-0042 work is a proposal for
+>    a new carve-out and needs a §14 reopen condition recorded first. Two items escaped the park
+>    because they are corrections and performance rather than capability, and §14 names them: the
+>    false-serialisation correction, and revisiting `SQL_MAX_CONCURRENCY`.
+>
+> 3. **RFC-0051, Monad as a built-in chain (2026-09-03).** Chief's decision, recorded the day it was
+>    made, tracking #1136. The freeze was lifted for **this one chain and nothing else**: a registry
+>    entry in `src/chains.rs` on the generic EVM path, its measured endpoints, the operator note, the
+>    live-endpoints probe, and the two over-wide-range refusal shapes its public endpoints answer with.
+>    The execution-lag guard the RFC draft proposed was **not built**; the seal boundary is a depth
+>    of eight blocks rather than the `finalized` tag, an execution margin the RFC's addendum explains. RFC-0050 (Robinhood Chain) is **not** carved
+>    out by this and stays a frozen draft. Spent when #1136 closes; there is no fourth.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
