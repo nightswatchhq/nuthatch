@@ -15,10 +15,25 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn dry_run(commits: Option<&Path>) -> String {
-    let base = root().join("target/pr-review-test.base");
+/// A scratch directory for the fixtures these tests hand the script.
+///
+/// **Not `<manifest>/target`**, which is where they used to go (#1128). `CARGO_MANIFEST_DIR` is the
+/// *worktree*, and `<worktree>/target` does not exist whenever `CARGO_TARGET_DIR` points elsewhere -
+/// which is exactly what building from a git worktree against a shared target directory does. The
+/// write then failed with `NotFound` and these two tests were **red locally and green in CI**, for a
+/// reason with nothing to do with the code under test. Two stray files were left in the shared target
+/// as evidence.
+///
+/// Nothing about these fixtures wants to outlive the test, so a tempdir is the right home for them
+/// and the path question stops existing.
+fn fixtures() -> tempfile::TempDir {
+    tempfile::tempdir().expect("a scratch directory for the fixtures")
+}
+
+fn dry_run_in(dir: &Path, commits: Option<&Path>) -> String {
+    let base = dir.join("base");
     std::fs::write(&base, "main").expect("write base");
-    let diff = root().join("target/pr-review-test.diff");
+    let diff = dir.join("diff");
     std::fs::write(&diff, "diff --git a/x b/x\n+one line\n").expect("write diff");
     let mut c = Command::new("python3");
     c.arg(root().join("scripts/pr-review.py"))
@@ -40,7 +55,8 @@ fn dry_run(commits: Option<&Path>) -> String {
 
 #[test]
 fn the_reviewer_is_given_the_commit_range_not_only_the_diff() {
-    let commits = root().join("target/pr-review-test.commits");
+    let dir = fixtures();
+    let commits = dir.path().join("commits");
     std::fs::write(
         &commits,
         "4bc5402e9 security: wasmtime 46.0.3 - RUSTSEC-2026-0268 and RUSTSEC-2026-0269\n\
@@ -48,7 +64,7 @@ fn the_reviewer_is_given_the_commit_range_not_only_the_diff() {
     )
     .expect("write commits");
 
-    let prompt = dry_run(Some(&commits));
+    let prompt = dry_run_in(dir.path(), Some(&commits));
     assert!(
         prompt.contains("wasmtime 46.0.3"),
         "the commit subjects are not in the prompt, so the reviewer would again report a security \
@@ -77,7 +93,8 @@ fn the_reviewer_is_given_the_commit_range_not_only_the_diff() {
 
 #[test]
 fn a_missing_commit_range_says_so_rather_than_looking_like_an_empty_branch() {
-    let prompt = dry_run(None);
+    let dir = fixtures();
+    let prompt = dry_run_in(dir.path(), None);
     assert!(
         prompt.contains("(not supplied)"),
         "with no commits file the prompt must say so explicitly. Rendering nothing would read as a \
