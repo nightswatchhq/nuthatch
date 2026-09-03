@@ -517,12 +517,23 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
                     "    epoch %s carries %s, cancelled by the open epoch %s - checked, not assumed"
                     % (edge[0], bad[edge[0]], open_epoch)
                 )
+        elif deltas([e for e in overlap if int(e) >= from_epoch], nest_col, sg_col):
+            # Nothing in the *narrowed* window, but the measured window still disagrees. That is a
+            # caller narrowing the comparison, which is supported, and says nothing about the
+            # classification. Treating it as evidence would turn a legitimate `EPOCH_PARITY_FROM`
+            # into a spurious hard failure.
+            print(
+                "  %s agrees on all %s epochs from %s, though the measured window from %s still "
+                "drifts - narrowed by the floor, not reclassified"
+                % (nest_col, len(window), cut, from_epoch)
+            )
         else:
-            # Not a failure, but the boundary is now stale and must not go unnoticed.
+            # Agrees across the **measured** window too, so the classification really has moved.
+            # Not a failure of parity, but the boundary is now stale and must not go unnoticed.
             failed = True
             print(
                 "  %s agrees on all %s epochs from %s: #1116 has moved, reclassify it as a gate"
-                % (nest_col, len(window), cut)
+                % (nest_col, len(window), from_epoch)
             )
 
     # **Every boundary must have teeth, and the claim it makes is precise: this is the *lowest* epoch
