@@ -147,8 +147,18 @@ depending on build flags is harder to diagnose than one that explains itself.
 
 The under-two-minutes claim. Use any contract on any supported chain; a busy ERC-20 is easiest.
 
-**Bring an RPC endpoint.** `--rpc <url>` *adds* to the pool rather than replacing it, so pass one and
-the built-in public endpoint stops being the bottleneck. On 2.4.0 with the mainnet default alone, this
+**Verified on Monad with 3.3.0, on both boxes (2026-09-03 macOS, 2026-09-04 Linux).** The published
+`x86_64-unknown-linux-gnu` tarball on the Hetzner box, checksum `OK`, keyless: `init` on the
+AgoraDollar proxy resolved the ABI through Sourcify in **1 s**, `dev --backfill 2000 --seal-direct`
+sealed 321 events in **1 s** and caught the tip in under a second, then followed about seven blocks
+(two seconds) behind with zero reorgs. On macOS the day before, 73 events, 1 s, 4 s to tip. The
+Sourcify step only passes on 3.3.0 or later: 3.2.0 and before asked for a field selector Sourcify
+had stopped accepting (#1138) and fell through to sources that need a key.
+
+**Bring an RPC endpoint.** `--rpc <url>` *replaces* the pool - it is the whole set of endpoints the
+run may contact, and nothing public is appended after it (an earlier version of this sentence said it
+"adds", which `select_rpcs` has never done) - so pass one and the built-in public endpoint stops being
+the bottleneck. On 2.4.0 with the mainnet default alone, this
 exact walk 429s on `eth_getBlockByNumber` and indexes **nothing** - the cursor holds position by design
 rather than sealing zeroed timestamps, so you get a live, queryable, empty API. The two-minute claim is
 about *API live and answering with provenance*, which it comfortably makes (17 s, measured on the

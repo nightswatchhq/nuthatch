@@ -2577,6 +2577,70 @@ fn shorten_store(url: &str) -> &str {
 /// finalized range to the same threshold without duplicating the number.
 pub const SEAL_DIRECT_BATCH: usize = 20_000;
 
+/// How many blocks at the end of every fetched window are asked for **again** with the next one
+/// (#1144, RFC-0049 §1).
+///
+/// Every way a provider answers a log range short lands at the *end* of the range: a load-balanced
+/// backend a block or two behind the one that answered `latest`, a height the node has finalised but
+/// not yet executed (Monad, RFC-0051), an answer truncated under load. All of them answer correctly a
+/// moment later. A list is a valid answer, so nothing at fetch time can tell a short one from an
+/// empty block - measured 2026-09-04, the header's `logsBloom` cannot either: on mainnet a sparse
+/// address tests positive in a quarter of the blocks it has nothing to do with. So the next window
+/// starts this many blocks *before* the cursor rather than at it, and rows are keyed by
+/// `(block, log_index)`, so the second pass adds what the first missed and duplicates nothing.
+///
+/// At tip the window is a block or two wide, so this widens the one call the poll already makes and
+/// adds none; in backfill it adds two blocks to a window of hundreds. Two covers the two-block skew
+/// measured on Alchemy's Monad pool; Monad's three-block execution deferral sits behind a seal depth
+/// of eight and never reaches the fetch.
+pub const FETCH_TAIL_OVERLAP: u64 = 2;
+
+/// Where a window's fetch starts: `FETCH_TAIL_OVERLAP` blocks before the cursor, never before the
+/// range began. The first window of a range has nothing behind it to refetch.
+fn overlap_from(next: u64, range_from: u64) -> u64 {
+    next.saturating_sub(FETCH_TAIL_OVERLAP).max(range_from)
+}
+
+/// The first block the *next* window will ask for again, given this window ended at `w_to`; rows at
+/// or past it are not final and must not be sealed yet. Unbounded once the range is complete.
+fn tail_hold(w_to: u64, range_to: u64) -> u64 {
+    if w_to >= range_to {
+        u64::MAX
+    } else {
+        w_to.saturating_sub(FETCH_TAIL_OVERLAP - 1)
+    }
+}
+
+/// A row waiting to be sealed: `(block, log_index, json)`. Keyed, not bare JSON, because the tail of
+/// the buffer is refetched and merged (#1144): a merge has to drop what it already holds and re-sort
+/// the block it touched, and the segment's content address depends on that order.
+pub(crate) type SealRow = (u64, u64, String);
+
+/// Merge one fetched window into the seal buffer (#1144).
+///
+/// Rows whose `(block, log_index)` the buffer already holds are dropped - they are the refetched
+/// tail answering the same as before. The rest are appended, and the region from `merge_from` on is
+/// re-sorted, so a row the first pass missed slots into its block in canonical order rather than
+/// after it. Returns how many rows were new.
+fn merge_window_rows(
+    buf: &mut Vec<SealRow>,
+    merge_from: u64,
+    rows: impl IntoIterator<Item = SealRow>,
+) -> u64 {
+    let start = buf.partition_point(|r| r.0 < merge_from);
+    let held: std::collections::HashSet<(u64, u64)> =
+        buf[start..].iter().map(|r| (r.0, r.1)).collect();
+    let mut added = 0u64;
+    for r in rows {
+        if !held.contains(&(r.0, r.1)) {
+            buf.push(r);
+            added += 1;
+        }
+    }
+    buf[start..].sort_by_key(|r| (r.0, r.1));
+    added
+}
+
 /// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
 /// window happened to stop (RFC-0028 §4).
 ///
@@ -2591,19 +2655,25 @@ pub const SEAL_DIRECT_BATCH: usize = 20_000;
 /// the whole block goes into this segment and the segment is simply larger.
 ///
 /// Returns `(rows, last_block)` and leaves the remainder in `buf`; `None` while the buffer is short.
-fn take_sealable(buf: &mut Vec<(u64, String)>) -> Option<(Vec<String>, u64)> {
-    if buf.len() < SEAL_DIRECT_BATCH {
+fn take_sealable(buf: &mut Vec<SealRow>, hold_from: u64) -> Option<(Vec<String>, u64)> {
+    // Only rows below `hold_from` are final: the blocks at or past it are the tail the next window
+    // asks for again (#1144), and a cut inside them would seal a block a later answer may still
+    // add to. The cut itself is unchanged - the block carrying the buffer past the threshold - it is
+    // simply not taken until that block is out of the tail, so segment identity is what a complete
+    // first answer would have produced.
+    let eligible = buf.partition_point(|r| r.0 < hold_from);
+    if eligible < SEAL_DIRECT_BATCH {
         return None;
     }
     let cut_block = buf[SEAL_DIRECT_BATCH - 1].0;
-    let n = buf.partition_point(|(b, _)| *b <= cut_block);
-    let rows = buf.drain(..n).map(|(_, j)| j).collect();
+    let n = buf.partition_point(|r| r.0 <= cut_block);
+    let rows = buf.drain(..n).map(|(_, _, j)| j).collect();
     Some((rows, cut_block))
 }
 
 /// Every buffered row, in order - the final flush when a range ends.
-fn drain_sealable(buf: &mut Vec<(u64, String)>) -> Vec<String> {
-    buf.drain(..).map(|(_, j)| j).collect()
+fn drain_sealable(buf: &mut Vec<SealRow>) -> Vec<String> {
+    buf.drain(..).map(|(_, _, j)| j).collect()
 }
 
 /// Drain every currently-sealable prefix from `buf` one segment at a time via `f`.
@@ -2618,10 +2688,11 @@ fn drain_sealable(buf: &mut Vec<(u64, String)>) -> Vec<String> {
 /// segments are sealed and dropped one by one without accumulating multiple
 /// segments in memory concurrently.
 fn drain_all_sealable(
-    buf: &mut Vec<(u64, String)>,
+    buf: &mut Vec<SealRow>,
+    hold_from: u64,
     mut f: impl FnMut(Vec<String>, u64) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
-    while let Some((rows, seal_to)) = take_sealable(buf) {
+    while let Some((rows, seal_to)) = take_sealable(buf, hold_from) {
         f(rows, seal_to)?;
     }
     Ok(())
@@ -2903,7 +2974,7 @@ pub async fn backfill_direct(
     adaptive: bool,
 ) -> Result<u64> {
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
-    let mut buf: Vec<(u64, String)> = Vec::new();
+    let mut buf: Vec<SealRow> = Vec::new();
     let mut batch_from = from;
     let mut next = from;
     let mut total = 0u64;
@@ -2949,9 +3020,11 @@ pub async fn backfill_direct(
         //
         // The condition used to be spelled out here, and separately at each other fetch. It is now
         // `LogFilter::new` returning `None` (#432), so the sites that forgot it cannot.
+        // The tail of the previous window is asked for again (#1144); see `FETCH_TAIL_OVERLAP`.
+        let fetch_from = overlap_from(next, from);
         let logs = match LogFilter::new(addresses, topic0s) {
             None => Vec::new(),
-            Some(filter) => match source.logs(&filter, next, chunk_to).await {
+            Some(filter) => match source.logs(&filter, fetch_from, chunk_to).await {
                 Ok(logs) => {
                     if let Some(c) = &mut chunker {
                         c.observed(logs.len() as u64);
@@ -3026,10 +3099,12 @@ pub async fn backfill_direct(
             rows.extend(call_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
         }
-        for r in &rows {
-            buf.push((r.block_number, r.to_json().to_string()));
-            total += 1;
-        }
+        total += merge_window_rows(
+            &mut buf,
+            fetch_from,
+            rows.iter()
+                .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+        );
 
         // RFC-0036 §4.2: one row per block in the window, for a nest that declares `[extract] blocks`.
         //
@@ -3051,10 +3126,13 @@ pub async fn backfill_direct(
             // Same canonical ordering rule as above: segment bytes, and therefore the content
             // address, depend on row order.
             block_rows.sort_by_key(|r| r.block_number);
-            for r in &block_rows {
-                buf.push((r.block_number, r.to_json().to_string()));
-                total += 1;
-            }
+            total += merge_window_rows(
+                &mut buf,
+                fetch_from,
+                block_rows
+                    .iter()
+                    .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+            );
         }
 
         next = chunk_to + 1;
@@ -3069,7 +3147,7 @@ pub async fn backfill_direct(
         // the operator-dependent segmentation RFC-0028 §4 exists to prevent and what RFC-0019
         // bundles and RFC-0020 segment reuse both rest on. Draining fully restores it: 6 segments at
         // every window.
-        drain_all_sealable(&mut buf, |rows, seal_to| {
+        drain_all_sealable(&mut buf, tail_hold(chunk_to, to), |rows, seal_to| {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
             Ok(())
@@ -3499,6 +3577,8 @@ pub async fn backfill_direct_pipelined(
             // produce no signal, or every run would cap itself on its final chunk.
             let mut served_width = 0u64;
             let mut whole_width = 0u64;
+            // The tail of the previous window is asked for again (#1144).
+            let fetch_from = overlap_from(w_from, from);
             let logs = match &filter {
                 // Nothing to match on either half means nothing to ask for - and asking anyway is
                 // asking for every log on the chain (#432). The window still flows through the rest
@@ -3508,12 +3588,12 @@ pub async fn backfill_direct_pipelined(
                     // Tracked, so the controller learns what actually worked (#672). Without it the
                     // window grows on a success the splitter manufactured by cutting the range up.
                     let (logs, served) = retry_transient(
-                        &format!("seal-direct getLogs {w_from}..={w_to}"),
+                        &format!("seal-direct getLogs {fetch_from}..={w_to}"),
                         BACKFILL_RETRY_BASE,
-                        || fetch_logs_splitting_tracked(source, f, w_from, w_to),
+                        || fetch_logs_splitting_tracked(source, f, fetch_from, w_to),
                     )
                     .await?;
-                    if served < w_to - w_from + 1 {
+                    if served < w_to - fetch_from + 1 {
                         served_width = served;
                     } else {
                         whole_width = served;
@@ -3579,9 +3659,9 @@ pub async fn backfill_direct_pipelined(
             }
             // Carry each row's block so the consumer can seal on a data-determined boundary
             // (RFC-0028 §4) instead of at whichever window filled the buffer.
-            let mut json: Vec<(u64, String)> = rows
+            let mut json: Vec<SealRow> = rows
                 .iter()
-                .map(|r| (r.block_number, r.to_json().to_string()))
+                .map(|r| (r.block_number, r.log_index, r.to_json().to_string()))
                 .collect();
             // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
             // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
@@ -3606,10 +3686,11 @@ pub async fn backfill_direct_pipelined(
                 json.extend(
                     block_rows
                         .iter()
-                        .map(|r| (r.block_number, r.to_json().to_string())),
+                        .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
                 );
             }
-            Ok::<(u64, u64, u64, u64, Vec<(u64, String)>), anyhow::Error>((
+            Ok::<(u64, u64, u64, u64, u64, Vec<SealRow>), anyhow::Error>((
+                fetch_from,
                 w_to,
                 fetched,
                 served_width,
@@ -3623,11 +3704,11 @@ pub async fn backfill_direct_pipelined(
     let mut stream = std::pin::pin!(stream);
 
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
-    let mut buf: Vec<(u64, String)> = Vec::new();
+    let mut buf: Vec<SealRow> = Vec::new();
     let mut batch_from = from;
     let mut total = 0u64;
     while let Some(res) = stream.next().await {
-        let (w_to, fetched, served_width, whole_width, json) = res?;
+        let (fetch_from, w_to, fetched, served_width, whole_width, json) = res?;
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
         // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
@@ -3645,13 +3726,14 @@ pub async fn backfill_direct_pipelined(
             }
             ctl.observed(fetched);
         }
-        let n = json.len() as u64;
+        // Windows complete in order (`buffered`, not `buffer_unordered`), so a window's refetched
+        // tail is merged after the previous window's own rows are in the buffer (#1144).
+        let n = merge_window_rows(&mut buf, fetch_from, json);
         total += n;
-        buf.extend(json);
         on_progress(w_to, n);
         // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
-        drain_all_sealable(&mut buf, |rows, seal_to| {
+        drain_all_sealable(&mut buf, tail_hold(w_to, to), |rows, seal_to| {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
             on_seal(seal_to)?;
@@ -3703,7 +3785,7 @@ pub async fn backfill_direct_factory(
     let empty_ts = std::collections::HashMap::new();
 
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
-    let mut buf: Vec<(u64, String)> = Vec::new();
+    let mut buf: Vec<SealRow> = Vec::new();
     let mut batch_from = from;
     let mut next = from;
     let mut total = 0u64;
@@ -3777,7 +3859,14 @@ pub async fn backfill_direct_factory(
             let logs1 = match LogFilter::new(&current, topic0s) {
                 None => Vec::new(),
                 Some(pass1) => {
-                    match logs_with_retry(source, &pass1, next, chunk_to, BACKFILL_RETRY_BASE).await
+                    match logs_with_retry(
+                        source,
+                        &pass1,
+                        overlap_from(next, from),
+                        chunk_to,
+                        BACKFILL_RETRY_BASE,
+                    )
+                    .await
                     {
                         Ok(l) => {
                             chunker.observed(l.len() as u64);
@@ -3822,7 +3911,7 @@ pub async fn backfill_direct_factory(
                 let more = match logs_with_retry(
                     source,
                     &child_filter,
-                    next,
+                    overlap_from(next, from),
                     chunk_to,
                     BACKFILL_RETRY_BASE,
                 )
@@ -3893,18 +3982,20 @@ pub async fn backfill_direct_factory(
             rows.extend(call_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
         }
-        let row_count = rows.len();
-        for r in &rows {
-            buf.push((r.block_number, r.to_json().to_string()));
-            total += 1;
-        }
+        let row_count = merge_window_rows(
+            &mut buf,
+            overlap_from(next, from),
+            rows.iter()
+                .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+        );
+        total += row_count;
         next = chunk_to + 1;
-        on_progress(chunk_to, row_count as u64);
+        on_progress(chunk_to, row_count);
 
         // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path - including
         // `drain_all_sealable`'s `while` rather than `if` (#980, #1015), so segment identity does
         // not depend on `--window`.
-        drain_all_sealable(&mut buf, |rows, seal_to| {
+        drain_all_sealable(&mut buf, tail_hold(chunk_to, to), |rows, seal_to| {
             // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
             seal::seal_range_with_snapshot(
                 dir,
@@ -4470,6 +4561,19 @@ impl NestIngest {
             logs,
             &empty_ts,
         );
+        // Rows below the cursor are the refetched tail (#1144). Any the store already holds have
+        // already been folded into every view and entity; folding them again would double-count, so
+        // they are dropped here, before the fold, and only the rows the first answer missed go on.
+        // Checked only below `next`, so the ordinary window costs no store reads.
+        rows.retain(|r| {
+            r.block_number >= next
+                || self
+                    .store
+                    .get_entity(&Store::entity_key(r.block_number, r.log_index))
+                    .ok()
+                    .flatten()
+                    .is_none()
+        });
         // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row
         // with `block_timestamp = 0` seals that zero permanently once it finalizes (H4). Sampled
         // blocks join the timestamp fetch rather than being handled after it.
@@ -5058,6 +5162,9 @@ async fn index_loop(
         window,
     )
     .await?;
+    // The floor for the refetched tail (#1144): never before the block this run started at, so a
+    // cold start does not reach behind its own start block.
+    let range_start = next;
 
     // Adaptive getLogs sizing (RFC-0004 §2), seeded from the chain's default window.
     //
@@ -5160,7 +5267,9 @@ async fn index_loop(
         // fall-through matters more once #447 lands than it does today.
         let filter = LogFilter::new(&nest.addresses, &nest.topic0s);
         let fetched = match &filter {
-            Some(f) => source.logs(f, next, to).await,
+            // The tail of the previous window is asked for again (#1144); `process_window` drops
+            // the rows the store already holds before anything is folded into a view.
+            Some(f) => source.logs(f, overlap_from(next, range_start), to).await,
             None => Ok(Vec::new()),
         };
         match fetched {
@@ -6036,17 +6145,26 @@ mod tests {
     /// Everything a run produces: the segments, and the unsealed remainder.
     type SealRun = (Vec<Segment>, Vec<String>);
 
-    fn seal_through_windows(rows: &[(u64, String)], last_block: u64, window: u64) -> SealRun {
-        let mut buf: Vec<(u64, String)> = Vec::new();
+    fn seal_through_windows(rows: &[SealRow], last_block: u64, window: u64) -> SealRun {
+        let mut buf: Vec<SealRow> = Vec::new();
         let mut segments = Vec::new();
         let mut from = 0u64;
         while from <= last_block {
             let to = (from + window - 1).min(last_block);
-            buf.extend(rows.iter().filter(|(b, _)| *b >= from && *b <= to).cloned());
+            // Every window refetches the tail of the one before it, exactly as production does
+            // (#1144), through the production merge.
+            let fetch_from = overlap_from(from, 0);
+            merge_window_rows(
+                &mut buf,
+                fetch_from,
+                rows.iter()
+                    .filter(|r| r.0 >= fetch_from && r.0 <= to)
+                    .cloned(),
+            );
             from = to + 1;
             // Production drain, not a copy of it (#1015). Reverting `drain_all_sealable`'s
             // `while` to `if` is this test going red.
-            let _ = drain_all_sealable(&mut buf, |rows, seal_to| {
+            let _ = drain_all_sealable(&mut buf, tail_hold(to, last_block), |rows, seal_to| {
                 segments.push((rows, seal_to));
                 Ok(())
             });
@@ -6056,11 +6174,11 @@ mod tests {
 
     /// Rows in `(block, log_index)` order with an uneven number per block, so a cut cannot land on a
     /// tidy multiple and a block genuinely straddles the seal threshold.
-    fn corpus(blocks: u64) -> Vec<(u64, String)> {
+    fn corpus(blocks: u64) -> Vec<SealRow> {
         let mut rows = Vec::new();
         for b in 0..blocks {
             for i in 0..((b % 7) + 1) {
-                rows.push((b, format!("{{\"block\":{b},\"i\":{i}}}")));
+                rows.push((b, i, format!("{{\"block\":{b},\"i\":{i}}}")));
             }
         }
         rows
@@ -6166,7 +6284,10 @@ mod tests {
         let mut denser = corpus(blocks);
         // 600 extra rows in block 0 shifts which block sits at index SEAL_DIRECT_BATCH - 1.
         for i in 0..600 {
-            denser.insert(0, (0, format!("{{\"block\":0,\"i\":{}}}", 100 + i)));
+            denser.insert(
+                0,
+                (0, 100 + i, format!("{{\"block\":0,\"i\":{}}}", 100 + i)),
+            );
         }
         let moved = seal_through_windows(&denser, blocks - 1, 512);
         assert_ne!(
@@ -6220,13 +6341,13 @@ mod tests {
         let mut json = Vec::new();
         for b in 0..30_000u64 {
             for i in 0..((b % 7) + 1) {
-                rows.push((b, format!("{b}:{i}")));
+                rows.push((b, i, format!("{b}:{i}")));
                 json.push(entity_json(b, i));
             }
         }
         assert!(json.len() > SEAL_DIRECT_BATCH);
 
-        let backfill_cut = take_sealable(&mut rows).map(|(_, b)| b);
+        let backfill_cut = take_sealable(&mut rows, u64::MAX).map(|(_, b)| b);
         let tip_cut = tip_seal_cut(&json);
         assert_eq!(
             tip_cut, backfill_cut,
@@ -9187,6 +9308,243 @@ template = "pool"
         }
     }
 
+    /// A source that answers a window short **once** (#1144): the first ask whose `to` is in
+    /// `short_top` comes back without the logs of the block *below* the top - a backend two blocks
+    /// behind the head it was asked for - and every later ask is complete. Dropping the block below
+    /// the top rather than the top itself is deliberate: its rows then arrive after the top block's
+    /// rows are already in the buffer, which is the case the merge's re-sort exists for.
+    struct ShortThenCompleteSource {
+        logs: Vec<crate::rpc::Log>,
+        short_top: std::sync::Mutex<std::collections::HashSet<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ShortThenCompleteSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let drop_top = self.short_top.lock().unwrap().remove(&to);
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .filter(|l| !(drop_top && l.block_number + 1 == to))
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    fn erc20_registry_with_filters() -> (DecodeRegistry, Vec<String>, Vec<String>) {
+        use crate::registry::ContractSpec;
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let addr: alloy_primitives::Address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            .parse()
+            .unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: addr,
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        (reg, addresses, topic0s)
+    }
+
+    /// `(rows, hashes)` of every sealed segment, for comparing two runs.
+    fn sealed(dir: &std::path::Path) -> (usize, Vec<(String, String)>) {
+        let m = seal::load_manifest(dir).unwrap();
+        let rows = m.tables.values().flatten().map(|s| s.rows).sum();
+        let mut hashes: Vec<(String, String)> = m
+            .tables
+            .iter()
+            .flat_map(|(t, segs)| segs.iter().map(move |s| (t.clone(), s.hash.clone())))
+            .collect();
+        hashes.sort();
+        (rows, hashes)
+    }
+
+    /// #1144: a provider that answers a window's top block short is corrected by the next window,
+    /// which asks for that block again; the rows land once, in order, and the sealed segments are
+    /// byte-identical to a run against a provider that never answered short.
+    ///
+    /// Windows of five over 10..=39 end at 14, 19, 24, 29, 34 and 39; the source drops block 23 from
+    /// the third window's first answer and 33 from the fifth's. Without the overlap the run seals 56
+    /// rows and calls it done; without the dedup it seals more than 60; without the re-sort the rows
+    /// are all there and the content addresses differ, because 23's rows sit after 24's.
+    #[tokio::test]
+    async fn a_short_top_block_is_completed_by_the_next_window_and_sealed_exactly_once() {
+        let (reg, addresses, topic0s) = erc20_registry_with_filters();
+        let logs: Vec<_> = (10u64..40)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        let honest = MockSource { logs: logs.clone() };
+        let short = || ShortThenCompleteSource {
+            logs: logs.clone(),
+            short_top: std::sync::Mutex::new([24u64, 34].into_iter().collect()),
+        };
+
+        let d_honest = tempfile::tempdir().unwrap();
+        let n_honest = backfill_direct(
+            &honest,
+            &reg,
+            d_honest.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+        let d_short = tempfile::tempdir().unwrap();
+        let n_short = backfill_direct(
+            &short(),
+            &reg,
+            d_short.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n_honest, 60);
+        assert_eq!(
+            n_short, 60,
+            "the two short answers must be completed by the next window"
+        );
+        assert_eq!(
+            sealed(d_short.path()),
+            sealed(d_honest.path()),
+            "the short run must seal the same rows under the same content addresses"
+        );
+
+        // The pipelined path merges windows that were fetched concurrently, in order.
+        let d_pipe = tempfile::tempdir().unwrap();
+        let n_pipe = backfill_direct_pipelined(
+            &short(),
+            &reg,
+            d_pipe.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            4,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(n_pipe, 60);
+        assert_eq!(sealed(d_pipe.path()), sealed(d_honest.path()));
+    }
+
+    /// #1144: the cut never enters the tail the next window will ask for again. With the tail held
+    /// the buffer waits; once the tail is final (the range is complete) the same cut is taken.
+    #[test]
+    fn take_sealable_holds_the_refetched_tail_back() {
+        let mut buf = corpus(30_000);
+        let would_cut = buf[SEAL_DIRECT_BATCH - 1].0;
+        // Hold from a block at or below the cut: nothing is sealable yet.
+        assert!(take_sealable(&mut buf, would_cut).is_none());
+        assert!(take_sealable(&mut buf, would_cut.saturating_sub(1)).is_none());
+        // Hold from past the cut: the cut is exactly the one the data dictates.
+        let (rows, cut) =
+            take_sealable(&mut buf, would_cut + 1).expect("sealable once the tail is out");
+        assert_eq!(cut, would_cut);
+        assert!(rows.len() >= SEAL_DIRECT_BATCH);
+        assert!(buf.iter().all(|r| r.0 > cut));
+    }
+
+    /// #1144: a refetched row the store already holds is dropped before the fold, so the balance view
+    /// and the entity store both see it once. The second window here asks for blocks 11 and 12
+    /// again, exactly as the tip loop does.
+    #[tokio::test]
+    async fn the_tip_path_folds_a_refetched_row_exactly_once() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+
+        let first: Vec<_> = (10u64..=12)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        nest.process_window(source.as_ref(), &first, 10, 12, 100)
+            .await
+            .unwrap()
+            .expect("first window commits");
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        let after_first = nest
+            .balances
+            .balance(recipient)
+            .expect("recipient was credited");
+        assert!(after_first > 0);
+
+        // Cursor at 13; the fetch started at 11 (the tail), so 11 and 12 arrive a second time.
+        let second: Vec<_> = (11u64..=15)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        nest.process_window(source.as_ref(), &second, 13, 15, 100)
+            .await
+            .unwrap()
+            .expect("second window commits");
+        let after_second = nest.balances.balance(recipient).unwrap();
+        assert_eq!(
+            after_second,
+            after_first * 2,
+            "three new blocks after three: the two refetched blocks must not be folded again"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(
+            store.entity_keys().unwrap().len(),
+            12,
+            "six blocks of two rows, each stored exactly once"
+        );
+    }
+
     fn transfer_log(block: u64, li: u64) -> crate::rpc::Log {
         crate::rpc::Log {
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
@@ -11388,8 +11746,10 @@ template="pool"
         let rt_plain_nest = build_test_nest(d_rt_plain.path(), addr).await;
         let rt_plain_widest = widest_runtime_window_over_a_backlog(rt_plain_nest).await;
 
+        // The request is the window plus the refetched tail (#1144): the tail buys no headers,
+        // since headers are fetched for the window `next..=to` and never for the overlap.
         assert!(
-            blocks_widest <= crate::chunker::HEADER_WINDOW_CAP,
+            blocks_widest <= crate::chunker::HEADER_WINDOW_CAP + FETCH_TAIL_OVERLAP,
             "a blocks nest pays one header request per block, so the tip loop must not grow its \
              window past {} - grew to {blocks_widest}",
             crate::chunker::HEADER_WINDOW_CAP
@@ -11401,7 +11761,7 @@ template="pool"
             crate::chunker::HEADER_WINDOW_CAP
         );
         assert!(
-            rt_blocks_widest <= crate::chunker::HEADER_WINDOW_CAP,
+            rt_blocks_widest <= crate::chunker::HEADER_WINDOW_CAP + FETCH_TAIL_OVERLAP,
             "the runtime cursor must cap a live blocks nest's window at {} - grew to \
              {rt_blocks_widest}",
             crate::chunker::HEADER_WINDOW_CAP

@@ -36,7 +36,7 @@ remaining three are open, and they are open in the same direction; §9 says what
 
 | § | Shape | Verdict here |
 |---|---|---|
-| §1 | The reference list is never itself checked | **Open** - and only the empty case is cheaply answerable |
+| §1 | The reference list is never itself checked | **Closed for the short-at-the-end case by #1144** (2026-09-04): every window refetches the previous window's last two blocks and the seal cut never enters that tail. The short-by-a-few-in-the-middle case stays where `verification.md` puts it |
 | §2 | The decoder's drops are invisible | **Open** |
 | §3 | Configured-but-empty means off, and the surface still says on | **Partly** - one case, and it is the compliance one |
 | §4 | The check that cannot fire | **Partly** - the mechanism exists, its coverage does not reach the risky code |
@@ -100,6 +100,19 @@ invocation the binary does not accept. This is the same idea pointed at the laye
 **Verdict: open, and only partly answerable.** The empty case has an affordable check and does not
 need a second endpoint or a consensus client. The short-by-a-few case does not, and stays where
 `verification.md`'s "what we do not claim" section already puts it.
+
+**2026-09-04, #1144: the affordable check turned out not to be the bloom, and the mechanism that
+landed is cheaper than a check.** Measured on mainnet, a sparse address tests positive in the
+`logsBloom` of a quarter of the blocks it has nothing to do with (1,381 of 2,048 bits set), so a
+bloom-gated refetch would retry forever on exactly the dense chains this section is about. What
+landed instead: every fetched window starts `FETCH_TAIL_OVERLAP` (two) blocks before the cursor, the
+seal buffer is keyed by `(block, log_index)` and deduplicates the merged tail, the cut is held back
+until the tail is out of the refetch range, and the tip path drops rows the store already holds
+before they reach a view. A window answered short at its end is completed by the next window; the
+sealed rows and their content addresses are identical to a run against a provider that never
+answered short, and both facts are tested by mutation. At tip this widens the one call the poll
+already makes and adds none. A hole strictly inside a window, and a range short by a few rows within
+a block, remain outside it, as the paragraph above says.
 
 ## §2 - The decoder's drops are invisible
 
