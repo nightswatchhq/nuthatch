@@ -2626,6 +2626,14 @@ pub(crate) type SealRow = (u64, u64, String);
 /// tail answering the same as before. The rest are appended, and the region from `merge_from` on is
 /// re-sorted, so a row the first pass missed slots into its block in canonical order rather than
 /// after it. Returns how many rows were new.
+///
+/// `(block, log_index)` is the row's identity **everywhere**, not only here: it is `Store::entity_key`
+/// in the hot store and the sort key of every sealed segment. Rows that descend from no log - block
+/// rows, pinned call results, decoded top-level calls, IPFS documents - live in the reserved band
+/// `500_000..=999_999` of `log_index` (`registry::BLOCK_ROW_LOG_INDEX` and friends), which a real
+/// log cannot reach, precisely because #642 was a block row at index `0` overwriting the first event
+/// of its block in the store. So a block row and an event row of the same block never share a key
+/// here either; `blocks_and_event_rows_keep_distinct_identities_through_the_merge` holds that.
 fn merge_window_rows(
     buf: &mut Vec<SealRow>,
     merge_from: u64,
@@ -9399,6 +9407,25 @@ template = "pool"
         ) -> Result<std::collections::HashMap<u64, u64>> {
             Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
         }
+        /// One header per block, enough for `block_row` (`hash` is all it requires), so a nest with
+        /// `[extract] blocks` produces a block row alongside the block's events.
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        serde_json::json!({
+                            "hash": format!("0x{:064x}", b),
+                            "timestamp": format!("0x{:x}", b * 1000),
+                        }),
+                    )
+                })
+                .collect())
+        }
     }
 
     fn erc20_registry_with_filters() -> (DecodeRegistry, Vec<String>, Vec<String>) {
@@ -9534,6 +9561,101 @@ template = "pool"
         .unwrap();
         assert_eq!(n_pipe, 60);
         assert_eq!(sealed(d_pipe.path()), sealed(d_honest.path()));
+    }
+
+    /// #1144, review: a block row and an event row of the same block are distinct rows to the merge,
+    /// because block rows sit at `BLOCK_ROW_LOG_INDEX` in the reserved band (#642) and events cannot.
+    #[test]
+    fn a_block_row_and_the_first_event_of_its_block_both_survive_the_merge() {
+        let mut buf: Vec<SealRow> = Vec::new();
+        let block_row = (
+            7u64,
+            crate::registry::BLOCK_ROW_LOG_INDEX,
+            "{\"block\":7}".to_string(),
+        );
+        let event = (7u64, 0u64, "{\"event\":0}".to_string());
+        assert_eq!(
+            merge_window_rows(&mut buf, 7, vec![event.clone(), block_row.clone()]),
+            2
+        );
+        // The refetched tail brings both again; neither is new.
+        assert_eq!(merge_window_rows(&mut buf, 7, vec![block_row, event]), 0);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(
+            buf[0].1, 0,
+            "the event sorts before the block row that summarises it"
+        );
+    }
+
+    /// #1144, review: a nest with `[extract] blocks` seals one block row per block *and* every
+    /// event, through the refetch and the final pass, identically to an honest run.
+    #[tokio::test]
+    async fn blocks_and_event_rows_keep_distinct_identities_through_the_merge() {
+        let (reg, addresses, topic0s) = erc20_registry_with_filters();
+        let reg = reg.with_blocks(true);
+        let logs: Vec<_> = (10u64..40)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        let with_short = |short: &[u64]| ShortThenCompleteSource {
+            logs: logs.clone(),
+            short_top: std::sync::Mutex::new(short.iter().copied().collect()),
+        };
+        let per_table = |dir: &std::path::Path| -> Vec<(String, usize)> {
+            let m = seal::load_manifest(dir).unwrap();
+            let mut v: Vec<(String, usize)> = m
+                .tables
+                .iter()
+                .map(|(t, segs)| (t.clone(), segs.iter().map(|s| s.rows).sum()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let d_honest = tempfile::tempdir().unwrap();
+        backfill_direct(
+            &with_short(&[]),
+            &reg,
+            d_honest.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+        let d_short = tempfile::tempdir().unwrap();
+        backfill_direct(
+            &with_short(&[24, 34, 39]),
+            &reg,
+            d_short.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            per_table(d_honest.path()),
+            vec![
+                ("blocks".to_string(), 30),
+                ("usdc__transfer".to_string(), 60)
+            ],
+            "thirty blocks, one block row each, plus sixty events"
+        );
+        assert_eq!(per_table(d_short.path()), per_table(d_honest.path()));
+        assert_eq!(sealed(d_short.path()), sealed(d_honest.path()));
     }
 
     /// #1144: the cut never enters the tail the next window will ask for again. With the tail held
