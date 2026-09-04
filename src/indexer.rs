@@ -2601,10 +2601,14 @@ fn overlap_from(next: u64, range_from: u64) -> u64 {
     next.saturating_sub(FETCH_TAIL_OVERLAP).max(range_from)
 }
 
-/// The first block the *next* window will ask for again, given this window ended at `w_to`; rows at
-/// or past it are not final and must not be sealed yet. Unbounded once the range is complete.
-fn tail_hold(w_to: u64, range_to: u64) -> u64 {
-    if w_to >= range_to {
+/// The first block a later window will ask for again, given this window ended at `w_to`; rows at
+/// or past it are not final and must not be sealed yet. Unbounded only once the final pass - the
+/// refetch of the range's own last tail - has run, because until then even the range's last block
+/// is still owed another answer. Lifting it at the range end instead let a buffer that happened to
+/// hold exactly `SEAL_DIRECT_BATCH` rows seal its tail, and the final pass then found nothing to
+/// deduplicate against and sealed two rows twice.
+fn tail_hold(w_to: u64, final_pass_done: bool) -> u64 {
+    if final_pass_done {
         u64::MAX
     } else {
         w_to.saturating_sub(FETCH_TAIL_OVERLAP - 1)
@@ -2978,6 +2982,10 @@ pub async fn backfill_direct(
     let mut batch_from = from;
     let mut next = from;
     let mut total = 0u64;
+    // The last window has no window after it to refetch its tail (#1144), so the range's last
+    // `FETCH_TAIL_OVERLAP` blocks are asked for once more, as a window of their own, before the
+    // final flush. Set when that pass is the one in flight.
+    let mut final_pass = false;
     // Adaptively size the getLogs range around the target response budget (RFC-0004 §2), starting
     // from the chain's default window - so dense and sparse ranges self-tune and provider result
     // caps are handled by shrink-and-retry rather than a hard failure.
@@ -3021,7 +3029,11 @@ pub async fn backfill_direct(
         // The condition used to be spelled out here, and separately at each other fetch. It is now
         // `LogFilter::new` returning `None` (#432), so the sites that forgot it cannot.
         // The tail of the previous window is asked for again (#1144); see `FETCH_TAIL_OVERLAP`.
-        let fetch_from = overlap_from(next, from);
+        let fetch_from = if final_pass {
+            next
+        } else {
+            overlap_from(next, from)
+        };
         let logs = match LogFilter::new(addresses, topic0s) {
             None => Vec::new(),
             Some(filter) => match source.logs(&filter, fetch_from, chunk_to).await {
@@ -3136,6 +3148,11 @@ pub async fn backfill_direct(
         }
 
         next = chunk_to + 1;
+        if next > to && !final_pass {
+            final_pass = true;
+            next = overlap_from(to + 1, from);
+            continue;
+        }
 
         // Flush on a data-determined boundary (RFC-0028 §4), not on the fetch window's end.
         //
@@ -3147,11 +3164,15 @@ pub async fn backfill_direct(
         // the operator-dependent segmentation RFC-0028 §4 exists to prevent and what RFC-0019
         // bundles and RFC-0020 segment reuse both rest on. Draining fully restores it: 6 segments at
         // every window.
-        drain_all_sealable(&mut buf, tail_hold(chunk_to, to), |rows, seal_to| {
-            seal::seal_range(dir, &rows, batch_from, seal_to)?;
-            batch_from = seal_to + 1;
-            Ok(())
-        })?;
+        drain_all_sealable(
+            &mut buf,
+            tail_hold(chunk_to, final_pass),
+            |rows, seal_to| {
+                seal::seal_range(dir, &rows, batch_from, seal_to)?;
+                batch_from = seal_to + 1;
+                Ok(())
+            },
+        )?;
         if next > to && !buf.is_empty() {
             seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
             batch_from = next;
@@ -3554,20 +3575,29 @@ pub async fn backfill_direct_pipelined(
     // returning `None` is the contract-free nest that must not fetch at all (#432).
     let filter = LogFilter::new(addresses, topic0s);
     let filter = &filter;
-    let windows = futures::stream::unfold((from, chunker.clone()), move |(next, ch)| async move {
-        if next > to {
-            return None;
-        }
-        let w = ch.lock().expect("window controller").window();
-        let chunk_to = (next.saturating_add(w - 1)).min(to);
-        Some(((next, chunk_to), (chunk_to + 1, ch)))
-    });
+    let windows = futures::stream::unfold(
+        (from, chunker.clone(), false),
+        move |(next, ch, final_done)| async move {
+            if next > to {
+                if final_done {
+                    return None;
+                }
+                // The last window has no window after it to refetch its tail (#1144): one more
+                // window over the range's last `FETCH_TAIL_OVERLAP` blocks, flagged so it is not
+                // widened again.
+                return Some(((overlap_from(to + 1, from), to, true), (to + 1, ch, true)));
+            }
+            let w = ch.lock().expect("window controller").window();
+            let chunk_to = (next.saturating_add(w - 1)).min(to);
+            Some(((next, chunk_to, false), (chunk_to + 1, ch, final_done)))
+        },
+    );
 
     // Each window future fetches logs + timestamps and returns its decoded rows as JSON. Borrows
     // (`source`, `registry`, filters) are shared across the concurrent futures - fine, they run on
     // one task; `buffered` yields them back in window order.
     let stream = windows
-        .map(|(w_from, w_to)| async move {
+        .map(|(w_from, w_to, final_pass)| async move {
             // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
             // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
             // blip) so one bad window doesn't abort the run.
@@ -3578,7 +3608,11 @@ pub async fn backfill_direct_pipelined(
             let mut served_width = 0u64;
             let mut whole_width = 0u64;
             // The tail of the previous window is asked for again (#1144).
-            let fetch_from = overlap_from(w_from, from);
+            let fetch_from = if final_pass {
+                w_from
+            } else {
+                overlap_from(w_from, from)
+            };
             let logs = match &filter {
                 // Nothing to match on either half means nothing to ask for - and asking anyway is
                 // asking for every log on the chain (#432). The window still flows through the rest
@@ -3689,9 +3723,10 @@ pub async fn backfill_direct_pipelined(
                         .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
                 );
             }
-            Ok::<(u64, u64, u64, u64, u64, Vec<SealRow>), anyhow::Error>((
+            Ok::<(u64, u64, bool, u64, u64, u64, Vec<SealRow>), anyhow::Error>((
                 fetch_from,
                 w_to,
+                final_pass,
                 fetched,
                 served_width,
                 whole_width,
@@ -3708,7 +3743,7 @@ pub async fn backfill_direct_pipelined(
     let mut batch_from = from;
     let mut total = 0u64;
     while let Some(res) = stream.next().await {
-        let (fetch_from, w_to, fetched, served_width, whole_width, json) = res?;
+        let (fetch_from, w_to, final_pass, fetched, served_width, whole_width, json) = res?;
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
         // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
@@ -3733,7 +3768,7 @@ pub async fn backfill_direct_pipelined(
         on_progress(w_to, n);
         // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
-        drain_all_sealable(&mut buf, tail_hold(w_to, to), |rows, seal_to| {
+        drain_all_sealable(&mut buf, tail_hold(w_to, final_pass), |rows, seal_to| {
             seal::seal_range(dir, &rows, batch_from, seal_to)?;
             batch_from = seal_to + 1;
             on_seal(seal_to)?;
@@ -3798,8 +3833,16 @@ pub async fn backfill_direct_factory(
     };
     // Labelled because the two-pass body below has to be able to restart the *chunk* from inside the
     // pass-2 fixpoint loop when the provider refuses an over-large response.
+    // See `backfill_direct`: the range's last `FETCH_TAIL_OVERLAP` blocks are fetched once more as
+    // a window of their own before the final flush (#1144).
+    let mut final_pass = false;
     'chunk: while next <= to {
         let chunk_to = (next + chunker.window() - 1).min(to);
+        let fetch_from = if final_pass {
+            next
+        } else {
+            overlap_from(next, from)
+        };
 
         // Filter flip (RFC-0009 §4): a forced override or a discovered set past the threshold switches
         // this chunk from the address-list two-pass to a single topic0-only fetch + local filtering.
@@ -3823,7 +3866,8 @@ pub async fn backfill_direct_factory(
             all_logs = match LogFilter::new(&[], topic0s) {
                 None => Vec::new(),
                 Some(wide) => {
-                    match logs_with_retry(source, &wide, next, chunk_to, BACKFILL_RETRY_BASE).await
+                    match logs_with_retry(source, &wide, fetch_from, chunk_to, BACKFILL_RETRY_BASE)
+                        .await
                     {
                         Ok(l) => {
                             chunker.observed(l.len() as u64);
@@ -3859,14 +3903,8 @@ pub async fn backfill_direct_factory(
             let logs1 = match LogFilter::new(&current, topic0s) {
                 None => Vec::new(),
                 Some(pass1) => {
-                    match logs_with_retry(
-                        source,
-                        &pass1,
-                        overlap_from(next, from),
-                        chunk_to,
-                        BACKFILL_RETRY_BASE,
-                    )
-                    .await
+                    match logs_with_retry(source, &pass1, fetch_from, chunk_to, BACKFILL_RETRY_BASE)
+                        .await
                     {
                         Ok(l) => {
                             chunker.observed(l.len() as u64);
@@ -3911,7 +3949,7 @@ pub async fn backfill_direct_factory(
                 let more = match logs_with_retry(
                     source,
                     &child_filter,
-                    overlap_from(next, from),
+                    fetch_from,
                     chunk_to,
                     BACKFILL_RETRY_BASE,
                 )
@@ -3984,30 +4022,39 @@ pub async fn backfill_direct_factory(
         }
         let row_count = merge_window_rows(
             &mut buf,
-            overlap_from(next, from),
+            fetch_from,
             rows.iter()
                 .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
         );
         total += row_count;
         next = chunk_to + 1;
         on_progress(chunk_to, row_count);
+        if next > to && !final_pass {
+            final_pass = true;
+            next = overlap_from(to + 1, from);
+            continue 'chunk;
+        }
 
         // Data-determined seal boundary (RFC-0028 §4), same as the non-factory path - including
         // `drain_all_sealable`'s `while` rather than `if` (#980, #1015), so segment identity does
         // not depend on `--window`.
-        drain_all_sealable(&mut buf, tail_hold(chunk_to, to), |rows, seal_to| {
-            // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
-            seal::seal_range_with_snapshot(
-                dir,
-                &rows,
-                batch_from,
-                seal_to,
-                Some(&children.hash()),
-            )?;
-            batch_from = seal_to + 1;
-            on_seal(seal_to)?;
-            Ok(())
-        })?;
+        drain_all_sealable(
+            &mut buf,
+            tail_hold(chunk_to, final_pass),
+            |rows, seal_to| {
+                // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
+                seal::seal_range_with_snapshot(
+                    dir,
+                    &rows,
+                    batch_from,
+                    seal_to,
+                    Some(&children.hash()),
+                )?;
+                batch_from = seal_to + 1;
+                on_seal(seal_to)?;
+                Ok(())
+            },
+        )?;
         if next > to && !buf.is_empty() {
             seal::seal_range_with_snapshot(
                 dir,
@@ -5162,9 +5209,10 @@ async fn index_loop(
         window,
     )
     .await?;
-    // The floor for the refetched tail (#1144): never before the block this run started at, so a
-    // cold start does not reach behind its own start block.
-    let range_start = next;
+    // The floor for the refetched tail (#1144): the nest's configured start, so a resume reaches
+    // back across the restart into the previous run's unrefetched tail, and a cold start never
+    // reaches behind an explicit `start_block`.
+    let range_floor = nest.start_block.unwrap_or(0);
 
     // Adaptive getLogs sizing (RFC-0004 §2), seeded from the chain's default window.
     //
@@ -5269,7 +5317,7 @@ async fn index_loop(
         let fetched = match &filter {
             // The tail of the previous window is asked for again (#1144); `process_window` drops
             // the rows the store already holds before anything is folded into a view.
-            Some(f) => source.logs(f, overlap_from(next, range_start), to).await,
+            Some(f) => source.logs(f, overlap_from(next, range_floor), to).await,
             None => Ok(Vec::new()),
         };
         match fetched {
@@ -6164,10 +6212,14 @@ mod tests {
             from = to + 1;
             // Production drain, not a copy of it (#1015). Reverting `drain_all_sealable`'s
             // `while` to `if` is this test going red.
-            let _ = drain_all_sealable(&mut buf, tail_hold(to, last_block), |rows, seal_to| {
-                segments.push((rows, seal_to));
-                Ok(())
-            });
+            let _ = drain_all_sealable(
+                &mut buf,
+                tail_hold(to, to >= last_block),
+                |rows, seal_to| {
+                    segments.push((rows, seal_to));
+                    Ok(())
+                },
+            );
         }
         (segments, drain_sealable(&mut buf))
     }
@@ -9397,9 +9449,11 @@ template = "pool"
     /// byte-identical to a run against a provider that never answered short.
     ///
     /// Windows of five over 10..=39 end at 14, 19, 24, 29, 34 and 39; the source drops block 23 from
-    /// the third window's first answer and 33 from the fifth's. Without the overlap the run seals 56
-    /// rows and calls it done; without the dedup it seals more than 60; without the re-sort the rows
-    /// are all there and the content addresses differ, because 23's rows sit after 24's.
+    /// the third window's first answer, 33 from the fifth's, and 38 from the last's - which has no
+    /// window after it and is completed by the final pass. Without the overlap the run seals 56 rows
+    /// and calls it done; without the final pass 58; without the dedup more than 60; without the
+    /// re-sort the rows are all there and the content addresses differ, because 23's rows sit after
+    /// 24's.
     #[tokio::test]
     async fn a_short_top_block_is_completed_by_the_next_window_and_sealed_exactly_once() {
         let (reg, addresses, topic0s) = erc20_registry_with_filters();
@@ -9407,9 +9461,10 @@ template = "pool"
             .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
             .collect();
         let honest = MockSource { logs: logs.clone() };
+        // 39 is the range's end: its short answer has no next window, so it is the final-pass case.
         let short = || ShortThenCompleteSource {
             logs: logs.clone(),
-            short_top: std::sync::Mutex::new([24u64, 34].into_iter().collect()),
+            short_top: std::sync::Mutex::new([24u64, 34, 39].into_iter().collect()),
         };
 
         let d_honest = tempfile::tempdir().unwrap();
