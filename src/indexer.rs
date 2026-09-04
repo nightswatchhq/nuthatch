@@ -2634,23 +2634,39 @@ pub(crate) type SealRow = (u64, u64, String);
 /// log cannot reach, precisely because #642 was a block row at index `0` overwriting the first event
 /// of its block in the store. So a block row and an event row of the same block never share a key
 /// here either; `blocks_and_event_rows_keep_distinct_identities_through_the_merge` holds that.
+///
+/// A held key whose refetched content **differs** is not a duplicate and not a second row: the
+/// store could hold only one of them, so it is the provider answering the same block two ways
+/// between one ask and the next. That is refused, by name, rather than resolved by whichever came
+/// first - the range is retried, and if it keeps happening the backfill fails loudly instead of
+/// sealing a segment nobody can reproduce.
 fn merge_window_rows(
     buf: &mut Vec<SealRow>,
     merge_from: u64,
     rows: impl IntoIterator<Item = SealRow>,
-) -> u64 {
+) -> Result<u64> {
     let start = buf.partition_point(|r| r.0 < merge_from);
-    let held: std::collections::HashSet<(u64, u64)> =
-        buf[start..].iter().map(|r| (r.0, r.1)).collect();
-    let mut added = 0u64;
+    let held: std::collections::HashMap<(u64, u64), &str> = buf[start..]
+        .iter()
+        .map(|r| ((r.0, r.1), r.2.as_str()))
+        .collect();
+    let mut fresh = Vec::new();
     for r in rows {
-        if !held.contains(&(r.0, r.1)) {
-            buf.push(r);
-            added += 1;
+        match held.get(&(r.0, r.1)) {
+            None => fresh.push(r),
+            Some(json) if *json == r.2 => {}
+            Some(_) => anyhow::bail!(
+                "block {} log {} came back with different content on refetch - the provider \
+                 answered the same block two ways, refusing to seal either",
+                r.0,
+                r.1
+            ),
         }
     }
+    let added = fresh.len() as u64;
+    buf.extend(fresh);
     buf[start..].sort_by_key(|r| (r.0, r.1));
-    added
+    Ok(added)
 }
 
 /// Split a full seal buffer at a block boundary chosen from the **data**, not from wherever a fetch
@@ -3124,7 +3140,7 @@ pub async fn backfill_direct(
             fetch_from,
             rows.iter()
                 .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
-        );
+        )?;
 
         // RFC-0036 §4.2: one row per block in the window, for a nest that declares `[extract] blocks`.
         //
@@ -3152,7 +3168,7 @@ pub async fn backfill_direct(
                 block_rows
                     .iter()
                     .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
-            );
+            )?;
         }
 
         next = chunk_to + 1;
@@ -3771,7 +3787,7 @@ pub async fn backfill_direct_pipelined(
         }
         // Windows complete in order (`buffered`, not `buffer_unordered`), so a window's refetched
         // tail is merged after the previous window's own rows are in the buffer (#1144).
-        let n = merge_window_rows(&mut buf, fetch_from, json);
+        let n = merge_window_rows(&mut buf, fetch_from, json)?;
         total += n;
         on_progress(w_to, n);
         // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
@@ -4033,7 +4049,7 @@ pub async fn backfill_direct_factory(
             fetch_from,
             rows.iter()
                 .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
-        );
+        )?;
         total += row_count;
         next = chunk_to + 1;
         on_progress(chunk_to, row_count);
@@ -6250,7 +6266,8 @@ mod tests {
                 rows.iter()
                     .filter(|r| r.0 >= fetch_from && r.0 <= to)
                     .cloned(),
-            );
+            )
+            .unwrap();
             from = to + 1;
             // Production drain, not a copy of it (#1015). Reverting `drain_all_sealable`'s
             // `while` to `if` is this test going red.
@@ -9609,16 +9626,32 @@ template = "pool"
         );
         let event = (7u64, 0u64, "{\"event\":0}".to_string());
         assert_eq!(
-            merge_window_rows(&mut buf, 7, vec![event.clone(), block_row.clone()]),
+            merge_window_rows(&mut buf, 7, vec![event.clone(), block_row.clone()]).unwrap(),
             2
         );
         // The refetched tail brings both again; neither is new.
-        assert_eq!(merge_window_rows(&mut buf, 7, vec![block_row, event]), 0);
+        assert_eq!(
+            merge_window_rows(&mut buf, 7, vec![block_row, event]).unwrap(),
+            0
+        );
         assert_eq!(buf.len(), 2);
         assert_eq!(
             buf[0].1, 0,
             "the event sorts before the block row that summarises it"
         );
+    }
+
+    /// #1144, review: a refetched row under a held key with *different* content is neither a
+    /// duplicate nor a second row - the store could hold only one - so the merge refuses it by name
+    /// rather than keeping whichever answer came first.
+    #[test]
+    fn a_refetched_row_with_different_content_under_a_held_key_is_refused() {
+        let mut buf: Vec<SealRow> = Vec::new();
+        merge_window_rows(&mut buf, 7, vec![(7u64, 3u64, "{\"v\":1}".to_string())]).unwrap();
+        let err = merge_window_rows(&mut buf, 7, vec![(7u64, 3u64, "{\"v\":2}".to_string())])
+            .expect_err("different content under the same key must not merge");
+        assert!(err.to_string().contains("block 7 log 3"), "{err}");
+        assert_eq!(buf.len(), 1, "nothing was added or replaced");
     }
 
     /// #1144, review: a nest with `[extract] blocks` seals one block row per block *and* every
