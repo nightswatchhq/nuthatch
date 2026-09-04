@@ -207,6 +207,10 @@ pub fn seal_range_with_snapshot(
         .with_context(|| format!("cannot create {}", seg_dir.display()))?;
     let mut manifest = load_manifest(dir)?;
     let mut summary = SealSummary::default();
+    // Per-nest provisional files a fold has replaced. Removed only once the manifest that no longer
+    // names them is durably installed (below), never before: a crash between the two would leave
+    // a manifest pointing at a file that is gone, and the folded rows would read as missing.
+    let mut folded_away: Vec<PathBuf> = Vec::new();
 
     for (table, rows) in by_table {
         let batch = rows_to_batch(&rows)?;
@@ -262,12 +266,8 @@ pub fn seal_range_with_snapshot(
             None => {
                 std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
                 if let Some(prev) = &replaced {
-                    // Only after the replacement is on disk, and only this nest's own copy.
-                    let old = seg_dir.join(&prev.file);
-                    if old.exists() {
-                        std::fs::remove_file(&old)
-                            .with_context(|| format!("removing folded segment {}", prev.file))?;
-                    }
+                    // This nest's own copy, and not yet: see `folded_away`.
+                    folded_away.push(seg_dir.join(&prev.file));
                 }
             }
         }
@@ -289,6 +289,19 @@ pub fn seal_range_with_snapshot(
     }
 
     save_manifest(dir, &manifest)?;
+    // The manifest is installed and fsynced; nothing references these any more. A failure here is
+    // a stray file, which is disk and not data, so it is logged rather than returned: the seal
+    // itself has already happened.
+    for old in folded_away {
+        if let Err(e) = std::fs::remove_file(&old) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "folded provisional segment {} not removed: {e}",
+                    old.display()
+                );
+            }
+        }
+    }
     Ok(Some(summary))
 }
 
@@ -1879,6 +1892,48 @@ mod tests {
         let after = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
         assert_eq!((after.hash, after.rows), (before.hash, 2));
         assert_eq!(parquet_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_fold_that_cannot_install_its_manifest_leaves_the_provisional_file_in_place() {
+        // The crash window Jules named on #1153: the replacement file written, the old file
+        // removed, and then the process dies before the manifest is installed. The manifest on
+        // disk would name a file that is gone and the folded rows would read as missing. So the
+        // old file goes only after `save_manifest` returns - and this makes `save_manifest` fail
+        // in the middle of a fold, which is the only order in which that property is observable.
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let first = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let first_path = dir.path().join(SEGMENTS_DIR).join(&first.file);
+        assert!(first_path.exists());
+
+        // `save_manifest` writes `manifest.json.tmp` then renames it; a directory in the way of
+        // the temp file fails the write before anything is installed.
+        let tmp = dir.path().join(SEGMENTS_DIR).join("manifest.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let err = seal_range(dir.path(), &[transfer(11, 0, "2")], 11, 11).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("manifest"),
+            "the fixture must fail at the manifest, not earlier: {err:#}"
+        );
+        assert!(
+            first_path.exists(),
+            "the provisional file was removed before the manifest that drops it was installed - \
+             a crash here loses every row in it"
+        );
+        assert_eq!(
+            only(&load_manifest(dir.path()).unwrap(), "usdc__transfer").hash,
+            first.hash,
+            "the on-disk manifest still names the file that is still there"
+        );
+
+        // With the way clear the same fold completes, and only then is the old file gone.
+        std::fs::remove_dir(&tmp).unwrap();
+        seal_range(dir.path(), &[transfer(11, 0, "2")], 11, 11).unwrap();
+        let folded = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        assert_eq!(folded.rows, 2);
+        assert!(!first_path.exists());
+        assert_eq!(parquet_files(dir.path()), vec![folded.file]);
     }
 
     #[test]
