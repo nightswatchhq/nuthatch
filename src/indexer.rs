@@ -4620,15 +4620,49 @@ impl NestIngest {
         // already been folded into every view and entity; folding them again would double-count, so
         // they are dropped here, before the fold, and only the rows the first answer missed go on.
         // Checked only below `next`, so the ordinary window costs no store reads.
+        //
+        // "Already holds" means the same row, not merely the same key: the stored row's `block_hash`
+        // must match. The loop runs `handle_reorg` before every fetch, so a reorged tail block has
+        // been rolled back before its refetch arrives and this never fires in practice - but if it
+        // ever does, the stale row must not be mistaken for the current one and silently kept. The
+        // window is refused instead and asked for again on the next poll, by which time the reorg
+        // handler has run over it.
+        let mut stale_tail: Option<(u64, u64)> = None;
         rows.retain(|r| {
-            r.block_number >= next
-                || self
-                    .store
-                    .get_entity(&Store::entity_key(r.block_number, r.log_index))
-                    .ok()
-                    .flatten()
-                    .is_none()
+            if r.block_number >= next {
+                return true;
+            }
+            match self
+                .store
+                .get_entity(&Store::entity_key(r.block_number, r.log_index))
+                .ok()
+                .flatten()
+            {
+                None => true,
+                Some(stored) => {
+                    let same_block = serde_json::from_str::<serde_json::Value>(&stored)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("block_hash")
+                                .and_then(|h| h.as_str())
+                                .map(str::to_string)
+                        })
+                        .is_some_and(|h| h == r.block_hash);
+                    if !same_block {
+                        stale_tail = Some((r.block_number, r.log_index));
+                    }
+                    false
+                }
+            }
         });
+        if let Some((b, i)) = stale_tail {
+            tracing::warn!(
+                "refetched tail row ({b}, {i}) is already stored under a different block hash: a \
+                 reorg the handler has not yet rolled back - refusing this window, retrying"
+            );
+            sleep_secs(2).await;
+            return Ok(None);
+        }
         // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row
         // with `block_timestamp = 0` seals that zero permanently once it finalizes (H4). Sampled
         // blocks join the timestamp fetch rather than being handled after it.
@@ -9720,6 +9754,50 @@ template = "pool"
             12,
             "six blocks of two rows, each stored exactly once"
         );
+    }
+
+    /// #1144, review: a refetched tail row that is already stored under a *different* block hash is
+    /// a reorg the handler has not yet rolled back. The window is refused and nothing is folded or
+    /// stored, rather than the stale row being kept as if it were current.
+    #[tokio::test]
+    async fn a_refetched_tail_row_under_a_different_block_hash_refuses_the_window() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let first: Vec<_> = (10u64..=12)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        nest.process_window(source.as_ref(), &first, 10, 12, 100)
+            .await
+            .unwrap()
+            .expect("first window commits");
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        let before = nest.balances.balance(recipient).unwrap();
+
+        // The tail comes back for blocks 11 and 12 under another hash: those blocks were reorged.
+        let mut second: Vec<_> = (11u64..=15)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        for l in second.iter_mut().filter(|l| l.block_number <= 12) {
+            l.block_hash = "0xreorged".into();
+        }
+        let outcome = nest
+            .process_window(source.as_ref(), &second, 13, 15, 100)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "a stale tail must refuse the window, not store around it"
+        );
+        assert_eq!(
+            nest.balances.balance(recipient).unwrap(),
+            before,
+            "nothing folded"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(store.entity_keys().unwrap().len(), 6, "nothing stored");
     }
 
     fn transfer_log(block: u64, li: u64) -> crate::rpc::Log {
