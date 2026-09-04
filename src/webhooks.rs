@@ -182,6 +182,15 @@ mod tests {
     #[test]
     fn registration_since_suppresses_backfill_history() {
         let dir = tempfile::tempdir().unwrap();
+        // Two segments, not one folded (#1150). Not for the cursor logic, which is indifferent, but
+        // for the dev-profile DuckDB: one file holding rows on both sides of `block_number > 100`
+        // under an ORDER BY trips `D_ASSERT(min_val <= input)` in its compressed materialisation
+        // and aborts the test binary. The release library answers the same query correctly
+        // (measured 2026-09-04, six shapes); the assertion is a debug-build invariant on a
+        // filtered-then-sorted scan, not a wrong answer (#1152). Two files let the zone map drop
+        // the history file before the sort sees it, which is the shape this test had before the
+        // floor.
+        crate::seal::test_set_table_floor(dir.path(), 0);
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         let webhooks = vec![wh("w", "t__transfer", "registration")];
         // Registered at tip 100.

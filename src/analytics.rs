@@ -2787,6 +2787,8 @@ template="pool"
         // A segment listed in the manifest but gone from disk (quarantined as corrupt / removed) must
         // not fail the whole query - its cold data is skipped, the surviving segment still answers.
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a missing file, not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         let row = |b: u64| {
             format!(
                 r#"{{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":{b},"tx_hash":"0xt","log_index":0}}"#
@@ -4298,6 +4300,8 @@ template="pool"
     #[test]
     fn a_corrupt_sealed_segment_reduces_the_table_rather_than_deleting_it() {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         // A schema, so that dropping *every* sealed file still yields the empty **typed** view rather
         // than no view at all. Without it the rebuild-from-nothing case deletes the table, and the
         // assertions below could not tell "rebuilt from the good segment" from "rebuilt from nothing" -
@@ -4396,6 +4400,8 @@ template="pool"
     fn a_page_corrupt_segment_with_an_intact_footer_reduces_the_table_rather_than_failing_the_query(
     ) {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         // A schema, for the reason the #419 test above gives: it makes "rebuilt from the good segment"
         // distinguishable from "rebuilt from nothing".
         std::fs::write(
@@ -4464,6 +4470,9 @@ template="pool"
     /// corruption - a control built separately could differ in some other way and stop controlling.
     fn two_segment_nest() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal, or "two segments" is one: these fixtures are about a damaged file,
+        // not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         std::fs::write(
             dir.path().join("schema.json"),
             r#"{"tables":[{"table":"t__transfer","columns":[
@@ -4611,6 +4620,8 @@ template="pool"
     /// whichever table it wants degraded - this fixture ships both intact.
     fn two_table_nest() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal, as `two_segment_nest` (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         std::fs::write(
             dir.path().join("schema.json"),
             r#"{"tables":[
@@ -4946,6 +4957,8 @@ template="pool"
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         std::fs::write(
             dir.path().join("schema.json"),
             r#"{"tables":[{"table":"t__transfer","columns":[
@@ -5143,6 +5156,8 @@ template="pool"
     #[test]
     fn a_page_corrupt_segment_under_an_authored_view_still_reduces() {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        crate::seal::test_set_table_floor(dir.path(), 0);
         std::fs::write(
             dir.path().join("schema.json"),
             r#"{"tables":[{"table":"t__transfer","columns":[
