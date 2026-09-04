@@ -187,6 +187,19 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
         .threads(MAX_THREADS)
         .context("duckdb threads")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
+    // Debug builds only (#1152). The bundled DuckDB is compiled with its assertions on in the dev
+    // profile, and one of them - `D_ASSERT(min_val <= input)` in compressed materialisation -
+    // fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet file holding
+    // rows on both sides of the filter. The optimiser compresses the sort key against the minimum
+    // the filter promised, and a row the filter has not yet removed reaches it. The release
+    // library, with no assertions, answers the same queries correctly (six shapes measured on
+    // 2026-09-04), so this is a debug-build abort and not a wrong result - but an abort kills the
+    // process, test binary or debug nest alike, so the optimiser is switched off where the
+    // assertion exists and left alone where it does not. Every sealed segment of more than one
+    // block has this shape once a cursor sits inside it; #1150's fold only made a test notice.
+    #[cfg(debug_assertions)]
+    conn.execute_batch("SET disabled_optimizers='compressed_materialization';")
+        .context("failed to disable compressed materialisation in a debug build")?;
     let lockdown = format!(
         "SET allowed_directories=[{}]; SET enable_external_access=false; SET lock_configuration=true;",
         allowed.join(", ")
