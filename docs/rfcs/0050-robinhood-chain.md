@@ -336,7 +336,13 @@ the tree at `af875f9a` and the live endpoints on 2026-09-03; the body above is l
    answered them, the logs and the tip lookup, with 429. Scaffolded again with `--no-timestamps`,
    `--backfill 2000 --window 100` indexed **23,953 transfers over 2,000 blocks in 16 s at 1,264
    events/s, zero 429s**. The operator note says so: the keyless demo is timestamp-free, and
-   timestamps want a keyed endpoint.
+   timestamps want a keyed endpoint - measured too: the timestamped nest through a keyed Alchemy
+   endpoint (`dev --rpc`, the whole pool) did 2,000 blocks in 14 s at 2,286 events/s and sealed
+   them. Left following on the public endpoint, the keyless nest sealed its first two cuts at the
+   `finalized` tag within 25 minutes, 40,014 rows, zero reorgs, the delay being the tag's lag past
+   the start block plus the 20,000-row batch; so `FinalizedTag` is exercised on this chain, not
+   copied from Arbitrum One on trust. At ten blocks a second, ten blocks share a one-second
+   `block_timestamp`.
 9. **Item 5's `--address` re-probe: what the chain's logs are.** 1,000 blocks sampled across two
    hours: **148,213 logs from 3,059 emitters, 148 a block**. USDG (Global Dollar, 13.5%) and WETH
    (9.6%) lead, both verified on Sourcify through their EIP-1967 implementations; then an unverified

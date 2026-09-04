@@ -591,7 +591,13 @@ Three things to know, measured on 2026-09-04:
   them 429: a keyless `dev` with timestamps on spent two minutes retrying its first window and
   indexed nothing. The same nest scaffolded with `init --no-timestamps` backfilled 2,000 blocks
   (23,953 USDG transfers) in 16 s with not one 429. So the zero-setup demo on this chain is
-  `--no-timestamps`; timestamps want a keyed endpoint, whose batch limit is not 5.
+  `--no-timestamps`; timestamps want a keyed endpoint, whose batch limit is not 5 - the same
+  nest with timestamps on, `dev --rpc <Alchemy>`, did 2,000 blocks in 14 s at 2,286 events/s. One
+  thing to know about those timestamps: at ten blocks a second, about ten blocks share each
+  one-second `block_timestamp`, so it orders blocks only to the second.
+- **The tag policy was exercised, not assumed.** The keyless nest above, left following, sealed
+  its first two cuts at the `finalized` tag inside 25 minutes (40,014 rows, `nuthatch_reorgs_total`
+  0), the delay being the tag's own lag past the nest's start block plus the 20,000-row batch.
 - **Keyless `init` works where Sourcify does.** USDG and WETH, the two busiest contracts, are
   verified through their proxies. The Stock Tokens (`MSTR`, `AMC`, `SPY`, ...) are 283-byte proxies
   that are not, and the explorer's Blockscout API sits behind a Cloudflare challenge, so it is not
