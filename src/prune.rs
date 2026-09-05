@@ -435,6 +435,7 @@ mod tests {
             rows: 1,
             file: format!("t-{h}.parquet"),
             registry_snapshot: None,
+            provisional: false,
         };
         for (nid_, hashes) in [
             (&keep, vec![shared_hash.clone()]),
