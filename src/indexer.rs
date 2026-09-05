@@ -4101,8 +4101,8 @@ pub async fn backfill_direct_factory(
 /// Where a direct seal's watermark goes: the progress counter, the `sealed_through` gauge, and the
 /// store's durable key, in that order. Every place that states "sealed through" reads one of the
 /// three. The gauge is the one that was missing (#1163): `/ready` and `nuthatch_sealed_through` read
-/// it, the nest seeds it from the store at construction - before the direct seal has written anything
-/// - and only the tip-follower's own seal ever set it afterwards. On 8107 that meant 460M sealed
+/// it, the nest seeds it from the store at construction, before the direct seal has written anything,
+/// and only the tip-follower's own seal ever set it afterwards. On 8107 that meant 460M sealed
 /// blocks reporting `sealed_through 0` for the hours until the finalized head crossed the hot store's
 /// start; an operator's switch script read that as an unfit nest.
 fn publish_direct_seal(
@@ -10748,7 +10748,7 @@ template="pool"
     #[test]
     fn a_direct_seal_publishes_its_watermark_to_the_gauge_ready_reads() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::open(dir.path()).unwrap();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
         let m = crate::metrics::METRICS.nest("direct-seal-watermark-1163");
         assert_eq!(m.sealed_through(), 0, "fresh nest metrics start at 0");
         publish_direct_seal(&m, &store, 501_993_721).unwrap();
