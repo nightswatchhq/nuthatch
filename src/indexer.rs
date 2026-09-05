@@ -2591,8 +2591,10 @@ pub const SEAL_DIRECT_BATCH: usize = 20_000;
 ///
 /// At tip the window is a block or two wide, so this widens the one call the poll already makes and
 /// adds none; in backfill it adds two blocks to a window of hundreds. Two covers the two-block skew
-/// measured on Alchemy's Monad pool; Monad's three-block execution deferral sits behind a seal depth
-/// of eight and never reaches the fetch.
+/// measured on Alchemy's Monad pool. Monad's three-block execution deferral is one block wider than
+/// that, and is kept from the fetch by the RPC layer itself - an unexecuted height is answered with
+/// an error, not an empty list, and a day's soak at `finalized` found no exception (#1145, the
+/// `MONAD` doc comment in `chains.rs`) - so this overlap is its backstop, not its guard.
 pub const FETCH_TAIL_OVERLAP: u64 = 2;
 
 /// Where a window's fetch starts: `FETCH_TAIL_OVERLAP` blocks before the cursor, never before the

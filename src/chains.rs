@@ -289,15 +289,27 @@ const OPTIMISM: Chain = Chain {
 /// depth only runs on an endpoint that stops serving the tag: 200 blocks is one minute at 300 ms, a
 /// hundred times the protocol's own finality and sixty times the execution deferral.
 ///
-/// What makes the depth safe rather than merely wide, measured 2026-09-03 on all three endpoints:
-/// a height a node has **not** executed is answered with an **error**, never an empty list -
-/// Alchemy `-32602 "block range extends beyond current head block"`, QuickNode and Ankr `-32602
-/// "Block requested not found"` - and both classify `Transient` and are retried, so a short answer
-/// cannot be mistaken for an empty block. Monad's own docs say `latest` is "backed by speculative
-/// execution", i.e. a node serves a height only once it has executed it. And the header's
-/// `logsBloom` is the block's **own** (52 of 52 log-emitting addresses present in header N's bloom,
-/// 32 in N+3's), so the RFC-0049 §1 empty-case oracle is available from headers already fetched
-/// when timestamps are on, should anyone want to wire it.
+/// **What stands between a finalised-but-unexecuted block and a sealed segment, now that the depth
+/// is gone.** A day of polling is evidence, not an invariant, so the tag does not rest on the soak
+/// alone. Three things, in the order they would fire:
+///
+/// 1. The RPC layer's own behaviour, measured 2026-09-03 on all three endpoints: a height a node has
+///    **not** executed is answered with an **error**, never an empty list - Alchemy `-32602 "block
+///    range extends beyond current head block"`, QuickNode and Ankr `-32602 "Block requested not
+///    found"` - and both classify `Transient` and are retried at the same height. Monad's own docs
+///    say `latest` is "backed by speculative execution", i.e. a node serves a height only once it
+///    has executed it, and the soak found the same of `finalized` 648,532 times.
+/// 2. The tail refetch (#1144, `indexer::FETCH_TAIL_OVERLAP`), in the base since 3.3.1 and chain
+///    agnostic: every window is asked for again two blocks back by the next one, rows are keyed by
+///    `(block, log_index)` so the second pass adds what the first missed, and **the seal cut is held
+///    back until the tail has been asked for again**. Should an endpoint ever answer an unexecuted
+///    height with an empty list rather than the error above, that is the shape this guard exists
+///    for. Two blocks covers the two-block skew it was sized on; the `k = 3` deferral is one block
+///    wider, so the refetch is the backstop for the first two of those three blocks and not, on its
+///    own, the proof. The proof is item 1 plus the soak.
+/// 3. The header's `logsBloom` is the block's **own** (52 of 52 log-emitting addresses present in
+///    header N's bloom, 32 in N+3's), so the RFC-0049 §1 empty-case oracle is available from headers
+///    already fetched when timestamps are on, should anyone want to wire it. Not wired.
 const MONAD: Chain = Chain {
     name: "monad",
     chain_id: 143,
