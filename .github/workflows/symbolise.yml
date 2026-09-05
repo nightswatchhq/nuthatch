@@ -46,7 +46,8 @@ jobs:
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - name: symbolise
         env:
-          OFFSETS: ${{ inputs.offsets || '0x3097ef0' }}
+          # the shipped ip, and the same .text-relative offset in this build (.text starts 0xdc0 earlier here)
+          OFFSETS: ${{ inputs.offsets || '0x3097ef0 0x3097130' }}
         run: |
           set -euo pipefail
           B=target/x86_64-unknown-linux-gnu/release/nuthatch
@@ -57,6 +58,8 @@ jobs:
             addr2line -f -C -e "$B" "$off" || true
             echo "-- nearest symbol below (nm):"
             nm -C --defined-only "$B" | awk -v o="$off" 'BEGIN{t=strtonum(o)} $2 ~ /^[tTwW]$/ {a=strtonum("0x"$1); if (a<=t && a>best) {best=a; sym=$0}} END{printf "%s  (+0x%x)\n", sym, t-best}'
+            echo "-- every function within 8 KB either side (layout differs from the shipped binary by a few KB):"
+            nm -C --defined-only "$B" | awk -v o="$off" 'BEGIN{t=strtonum(o)} $2 ~ /^[tTwW]$/ {a=strtonum("0x"$1); if (a>=t-8192 && a<=t+8192) print $0}' | sort | cut -c1-160
             echo "-- disassembly around it:"
             objdump -d -C --start-address=$(printf '0x%x' $(( off - 64 ))) --stop-address=$(printf '0x%x' $(( off + 48 ))) "$B" | tail -40 || true
           done
