@@ -424,3 +424,32 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
     straddles its head instead of erroring. Alchemy errors on that; the other two could not be told
     apart from the chain simply advancing during the probe. That risk is chain-agnostic and is
     exactly RFC-0049 §1's open item; the depth of eight does not create it and does not close it.
+
+16. **The soak item 14 asked for ran and passed; the boundary stays at `Depth(8)` (2026-09-05,
+    #1145, PR #1154 parked).** On the Hetzner box, one reader per shipped endpoint, from 07:05 UTC on
+    2026-09-04 for 24 hours: read `eth_getBlockByNumber("finalized")`, then `eth_getBlockReceipts`
+    for that height, record `(height, tx_count, receipt_count, bloom_nonzero, log_count)`, and
+    re-read any height a later read disagreed with. A short answer is `receipt_count < tx_count`, or
+    `log_count == 0` under a non-zero bloom. The cadence was 300 ms; Alchemy's `rpc1` answered that
+    with 429s and was restarted at 1 s, so it covers the same day at a third of the reads.
+
+    | endpoint | reads | short | disagree | transport errors |
+    |---|---:|---:|---:|---:|
+    | `rpc.monad.xyz` (QuickNode) | 278,268 | 0 | 0 | 2 |
+    | `rpc3.monad.xyz` (Ankr) | 283,936 | 0 | 0 | 2 |
+    | `rpc1.monad.xyz` (Alchemy) | 86,328 | 0 | 0 | 1 |
+
+    648,532 reads, no block ever served at `finalized` ahead of its receipts, on any endpoint, for
+    a day; the five errors were transport failures the reader counts apart from answers. PR #1154
+    proposed `FinalizedTag { fallback_depth: 200 }` on that evidence and was refused twice by the
+    merge-safety review, at 32/100 the second time, on a ground that is correct as a matter of fact:
+    #1144's tail refetch re-asks two blocks, the execution deferral is three, and the runtime holds no
+    invariant covering the third block. A day of clean reads is evidence about three endpoints, not a
+    guarantee; what protects the seal is item 15's first two facts, and nothing in the runtime
+    enforces them. The board parked the PR rather than widen the refetch for every chain or build the
+    completeness check §5 proposed, both of which are seal-loop changes outside carve-out three.
+    Nobody pays for 1.8 s of seal latency on a chain with no nest yet in the field; the case for the
+    tag is to be made again once #1148's nest has run at depth for a month, and this item is the
+    evidence it starts from. What item 15 left outside the invariant - a load-balanced backend
+    silently truncating a range at its own head - stays outside it and stays RFC-0049 §1's, now
+    covered on the fetch side by #1144's tail refetch.
