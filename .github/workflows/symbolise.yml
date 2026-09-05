@@ -8,6 +8,10 @@
 # function and source line at each offset into the job log. Manual only; nothing is published.
 name: symbolise
 on:
+  # A push to this branch runs it too: `workflow_dispatch` only resolves workflows that exist on
+  # the default branch, and this one is wanted before it has been through review.
+  push:
+    branches: [pete/1165-symbols]
   workflow_dispatch:
     inputs:
       ref:
@@ -27,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || 'v3.4.0' }}
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           targets: x86_64-unknown-linux-gnu
@@ -41,7 +45,7 @@ jobs:
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - name: symbolise
         env:
-          OFFSETS: ${{ inputs.offsets }}
+          OFFSETS: ${{ inputs.offsets || '0x3097ef0' }}
         run: |
           set -euo pipefail
           B=target/x86_64-unknown-linux-gnu/release/nuthatch
