@@ -1,0 +1,74 @@
+name: rss band (dense multi-nest, on the enforcing runner)
+
+# Re-establishes the run-to-run noise band behind `REGRESSION_MB` in ci.yml's `per-cursor RAM budget`
+# job, on the hardware that enforces it (#1156). The ceiling was set from a single run in #1098 and
+# main then peaked within 17 MB of it; a docs-only PR read 472 MB and 402 MB on two runs of the same
+# code. `scripts/multinest-rss-spread.sh` is the committed tool for this, and its header says why a
+# band from any other machine is not this machine's band - which is why this is a workflow rather than
+# a thing someone runs on a laptop.
+#
+# Advisory: it never fails on the numbers. Its output is the band and a suggested ceiling; moving
+# `REGRESSION_MB` is a reviewed change to ci.yml that quotes this run by id.
+#
+# Dispatch it by hand, or push to an `rss-band/**` branch (which is how a run happens before the
+# workflow file is on main - `workflow_dispatch` only sees workflows on the default branch).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: how many sequential runs of the scenario, 1 to 20 (the script defaults to 7)
+        default: "7"
+        required: false
+  push:
+    branches: ['rss-band/**']
+
+permissions:
+  contents: read
+
+jobs:
+  band:
+    name: ${{ inputs.runs || 7 }} sequential runs of the dense multi-nest scenario
+    runs-on: ubuntu-latest
+    # A cold release build is up to 45 minutes (ci.yml's build-release), and the scenario is about
+    # 4.5 minutes a run, sequential by construction: 20 runs is 90 minutes, so the ceiling on `runs`
+    # below is 20 and this is sized for it with setup and a slow runner allowed for.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+      - name: build release
+        run: cargo build --release --locked
+      - name: run the spread script bare
+        env:
+          BIN: target/release/nuthatch
+          # `mktemp -d` honours this, so the per-run logs and reports land somewhere the next step
+          # can upload from. Nothing else is exported: every scenario knob falls through to the
+          # harness's defaults, which are what the CI gate enforces (#395).
+          TMPDIR: ${{ runner.temp }}/spread
+          # The dispatch input reaches the shell only through this variable, never by interpolation
+          # into the script text, and it is validated below before anything runs with it.
+          RUNS_INPUT: ${{ inputs.runs || '7' }}
+        run: |
+          set -euo pipefail
+          case "$RUNS_INPUT" in
+            ''|*[!0-9]*) echo "::error::runs must be a whole number, got '$RUNS_INPUT'"; exit 1 ;;
+          esac
+          if [ "$RUNS_INPUT" -lt 1 ] || [ "$RUNS_INPUT" -gt 20 ]; then
+            echo "::error::runs must be between 1 and 20 (the job's timeout is sized for 20), got $RUNS_INPUT"; exit 1
+          fi
+          mkdir -p "$TMPDIR"
+          echo "runner: $(nproc) cpus, $(free -m | awk '/^Mem:/{print $2}') MB, $(uname -r)"
+          # pipefail above: a failed run inside the script fails this step, and does not upload a
+          # partial band under a green tick.
+          bash scripts/multinest-rss-spread.sh "$RUNS_INPUT" | tee "$TMPDIR/band.txt"
+      - name: upload per-run logs and reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rss-band-${{ github.run_id }}
+          path: ${{ runner.temp }}/spread
+          retention-days: 30

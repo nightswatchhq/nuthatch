@@ -701,20 +701,22 @@ jobs:
         env:
           BIN: bin/nuthatch
           MAX_RSS_MB: "2048"
-          # 466, re-baselined on this runner for #1067. The tip path now holds until
-          # SEAL_DIRECT_BATCH (20,000 rows) before sealing. This scenario is 12,010 rows/nest,
-          # so nothing seals and the whole 240,200 rows stay in the hot store.
+          # 602, from a seven-run band on this runner (#1156; rss-band.yml run 33956127005,
+          # 2026-09-05, ubuntu-latest, 4 cpus, 16 GB). The previous 466 came from a SINGLE run at
+          # 372 MB (#1067), and main then peaked between 381 and 449 MB in six consecutive runs
+          # while a docs-only PR read 472 MB and 402 MB on two runs of the same code - a 70 MB
+          # spread against 17 MB of headroom, which is a gate that fires at random.
           #
-          #   runner after #1067        372 MB     CI run 33602467469, this PR
-          #   REGRESSION_MB             466 MB     372 * 1.25 + 1, the spread script's formula
-          #   MAX_RSS_MB               2048 MB     unchanged; 1676 MB of budget still free
+          #   run 1..7 (sequential)     447 429 419 481 387 413 434 MB
+          #   min / median / max        387 / 429 / 481 MB   (band 94 MB)
+          #   REGRESSION_MB             602 MB     481 * 1.25 + 1, the spread script's formula
+          #   MAX_RSS_MB               2048 MB     unchanged; 1446 MB of budget still free
           #
-          # The previous 180 / 131 / 323 numbers described the old tip path, which sealed every
-          # finality advance and left almost nothing hot. They are not this scenario any more.
-          # A same-shaped +192 MB leak on the new baseline would land around 564 MB, which 466
-          # still catches. A 7-run band on the runner (scripts/multinest-rss-spread.sh) is the
-          # follow-up if this number starts to flake; do not lower it from a smaller local run.
-          REGRESSION_MB: "466"
+          # The scenario is unchanged: 12,010 rows/nest, nothing seals, 240,200 rows stay hot.
+          # A same-shaped +192 MB leak on the median would land around 621 MB, which 602 still
+          # catches. Re-run `rss-band.yml` (workflow_dispatch) whenever this number moves, and
+          # quote the run id here; do not set it from a local run or from one CI sample.
+          REGRESSION_MB: "602"
           REPORT: multinest-footprint.json
         run: |
           chmod +x bin/nuthatch
