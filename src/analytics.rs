@@ -38,8 +38,11 @@ const DUCK_BUDGET_MB: u64 = 1024;
 /// permits now share one budget. At the default of two permits nothing changes (512 MB each); at four
 /// it is 256, at sixteen 64, and the surface's DuckDB memory is a gigabyte in every case.
 fn duck_memory_limit_mb(permits: usize) -> u64 {
-    let permits = permits.max(1) as u64;
-    MEM_LIMIT_MB.min(DUCK_BUDGET_MB / permits).max(64)
+    // The gate never admits more than the ceiling, so neither does the divisor: a caller passing a
+    // larger number gets the ceiling's share, and the budget holds for any input rather than for the
+    // inputs the gate happens to produce.
+    let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
+    MEM_LIMIT_MB.min(DUCK_BUDGET_MB / permits)
 }
 const MAX_THREADS: i64 = 2;
 
@@ -2978,9 +2981,15 @@ template="pool"
             512,
             "a zero permit count is treated as one"
         );
-        for p in [1usize, 2, 3, 4, 8, 16] {
+        assert_eq!(
+            duck_memory_limit_mb(64),
+            64,
+            "above the gate's ceiling the ceiling's share applies"
+        );
+        for p in [1usize, 2, 3, 4, 8, 16, 17, 64] {
+            let admitted = p.min(crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
             assert!(
-                duck_memory_limit_mb(p) * p as u64 <= DUCK_BUDGET_MB,
+                duck_memory_limit_mb(p) * admitted <= DUCK_BUDGET_MB,
                 "{p} permits exceed the budget"
             );
         }
