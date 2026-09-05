@@ -2303,7 +2303,14 @@ async fn build_nest(
     };
 
     let state_rpc = if config.state_rpc_urls.is_empty() {
-        if !config.calls.is_empty() {
+        if !config.calls.is_empty() && config.read_only_role {
+            // #1167: `serve` resolves nothing; the call tables it serves were sealed by `dev`.
+            tracing::info!(
+                "this nest declares {} `[[calls]]` entr{}; the serve role samples none, so no archive endpoint is needed",
+                config.calls.len(),
+                if config.calls.len() == 1 { "y" } else { "ies" },
+            );
+        } else if !config.calls.is_empty() {
             anyhow::bail!(
                 "this nest declares {} `[[calls]]` entr{}, which need historical `eth_call` and \
                  therefore an archive endpoint.\n\n\
@@ -2462,8 +2469,10 @@ async fn build_nest(
 /// compose file mounts the nest directory into the FE.
 pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
-    let config = Config::load(&dir)
+    let mut config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
+    // #1167: this role samples no calls, so `build_nest` must not demand the archive endpoint `dev` needs.
+    config.read_only_role = true;
 
     // Resolved here, not left to `build_nest`'s `None` branch (issue #520): that branch is
     // `Store::open`, which *creates* the store and commits a write txn - correct for the writer
@@ -10743,6 +10752,56 @@ template="pool"
     /// #745: `backfill_direct_factory` is the third seal-direct path. The other two go red if their
     /// `state_rpc` branch is deleted. This one did not: 659 tests still passed. A factory nest
     /// with `[[calls]]` is the production shape that reaches it.
+    /// #1167: `serve` over a `[[calls]]` nest exited with "pass `--state-rpc`", a flag `serve` does not
+    /// have, so a nest with calls could not be served read-only at all. The role samples nothing;
+    /// the check is `dev`'s. Both halves pinned: the read-only role builds without an archive
+    /// endpoint, and `dev` (the default role) is still refused.
+    #[tokio::test]
+    async fn the_serve_role_builds_a_calls_nest_without_an_archive_endpoint_and_dev_is_still_refused(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_calls_nest(dir.path());
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let mut config = Config::load(dir.path()).unwrap();
+        assert!(config.state_rpc_urls.is_empty() && !config.calls.is_empty());
+        let refused = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await;
+        let msg = format!(
+            "{:#}",
+            refused
+                .err()
+                .expect("dev without an archive endpoint is refused")
+        );
+        assert!(msg.contains("archive endpoint"), "{msg}");
+        config.read_only_role = true;
+        let (nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("the serve role has no call to resolve and must not be refused");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        drop(nest);
+        drop(state);
+    }
+
     /// #1163: the gauge `/ready` reports is seeded from the store when the nest is built, which is
     /// before a direct seal has written anything, and the ordinary seal is the only other writer. So
     /// the direct seal must publish to it itself - this is the one seam both its per-segment callback
