@@ -22,7 +22,28 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
-const MEM_LIMIT: &str = "512MB";
+/// Per-connection DuckDB ceiling before the permit count is applied; see [`duck_memory_limit_mb`].
+const MEM_LIMIT_MB: u64 = 512;
+/// What the whole analytical surface may hold in DuckDB at once, across every permit (#1165).
+const DUCK_BUDGET_MB: u64 = 1024;
+
+/// The `max_memory` each DuckDB connection is opened with, in MB: the smaller of [`MEM_LIMIT_MB`] and
+/// [`DUCK_BUDGET_MB`] divided by the live permit count.
+///
+/// #1165: a nest on an 8 GB box shared with nine others segfaulted six times in twenty minutes under
+/// two concurrent analytical queries, each exit at a 2.0 to 2.8 GB peak with the machine in swap and
+/// the kernel logging a page allocation failure. Two permits at 512 MB each, plus the materialised
+/// results and the hot store, put the SQL surface alone over the 2 GB cursor budget, and nothing
+/// bounded the sum: `NUTHATCH_SQL_MAX_CONCURRENCY=16` would have opened sixteen 512 MB engines. The
+/// permits now share one budget. At the default of two permits nothing changes (512 MB each); at four
+/// it is 256, at sixteen 64, and the surface's DuckDB memory is a gigabyte in every case.
+fn duck_memory_limit_mb(permits: usize) -> u64 {
+    // The gate never admits more than the ceiling, so neither does the divisor: a caller passing a
+    // larger number gets the ceiling's share, and the budget holds for any input rather than for the
+    // inputs the gate happens to produce.
+    let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
+    MEM_LIMIT_MB.min(DUCK_BUDGET_MB / permits)
+}
 const MAX_THREADS: i64 = 2;
 
 /// Open an in-memory DuckDB whose file access is pinned to the nest's data dirs (#289).
@@ -181,8 +202,12 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
     // way round is refused: "Cannot change allowed_directories when enable_external_access is
     // disabled". The flag is *not* startup-only on 1.10504.0; a `SET` after open works, which is
     // why this was inert until now - we set the list and never flipped the flag.
+    let mem_limit = format!(
+        "{}MB",
+        duck_memory_limit_mb(crate::serve::sql_max_concurrency())
+    );
     let config = Config::default()
-        .max_memory(MEM_LIMIT)
+        .max_memory(&mem_limit)
         .context("duckdb max_memory")?
         .threads(MAX_THREADS)
         .context("duckdb threads")?;
@@ -2936,6 +2961,38 @@ template="pool"
         // existing missing-file behaviour; on a live nest it would instead see the folded segment.
         assert_eq!(n[0]["n"], Value::from(1u64));
         test_set_remove_after_define(dir.path(), None);
+    }
+
+    /// #1165: the permits share one DuckDB budget. The default is unchanged; raising the permit count
+    /// lowers each engine's ceiling rather than multiplying the surface's footprint.
+    #[test]
+    fn duckdb_memory_limit_shares_one_budget_across_the_permits() {
+        assert_eq!(duck_memory_limit_mb(1), 512);
+        assert_eq!(
+            duck_memory_limit_mb(2),
+            512,
+            "the default permit count keeps today's ceiling"
+        );
+        assert_eq!(duck_memory_limit_mb(4), 256);
+        assert_eq!(duck_memory_limit_mb(8), 128);
+        assert_eq!(duck_memory_limit_mb(16), 64);
+        assert_eq!(
+            duck_memory_limit_mb(0),
+            512,
+            "a zero permit count is treated as one"
+        );
+        assert_eq!(
+            duck_memory_limit_mb(64),
+            64,
+            "above the gate's ceiling the ceiling's share applies"
+        );
+        for p in [1usize, 2, 3, 4, 8, 16, 17, 64] {
+            let admitted = p.min(crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
+            assert!(
+                duck_memory_limit_mb(p) * admitted <= DUCK_BUDGET_MB,
+                "{p} permits exceed the budget"
+            );
+        }
     }
 
     #[test]
