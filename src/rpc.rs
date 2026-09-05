@@ -395,6 +395,11 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         // classify the same way whatever status a provider wraps them in.
         "exceeds size limit",
         "is limited to a",
+        // Robinhood Chain's public endpoint, 2026-09-04 (RFC-0050 addendum, item 8): HTTP 200
+        // `-32000 "logs matched by query exceeds limit of 10000"`. The phrase was in the text
+        // fallback's cap list and not here, so the JSON-RPC classifier called it `Transient` and
+        // the same width went round again - found by the test that pins it, before a backfill did.
+        "logs matched by query",
     ];
     const TERMINAL: &[&str] = &[
         "must be authenticated",
@@ -1936,6 +1941,25 @@ mod tests {
     /// matched nothing (RFC-0051 addendum, item 7), so the window would have been retried at the same
     /// width until the attempts ran out. QuickNode's shape is included so it classifies the same at
     /// any status, not only behind the 413 it happens to arrive with.
+    /// Robinhood Chain's public endpoint (RFC-0050) refuses an over-wide `eth_getLogs` at HTTP 200
+    /// with `-32000 "logs matched by query exceeds limit of 10000"`, measured 2026-09-04 on a
+    /// 300,000-block address-filtered ask. It was already narrowable on the `logs matched by query`
+    /// marker; this pins that the shape stays so, because the registry's 320-block window relies
+    /// on the chunker narrowing from it on a busy token.
+    #[test]
+    fn robinhood_public_endpoint_cap_shape_is_narrowable() {
+        let body = r#"{"code":-32000,"message":"logs matched by query exceeds limit of 10000"}"#;
+        let err: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            matches!(
+                super::classify_rpc_error(&err),
+                super::FailureClass::Narrowable { .. }
+            ),
+            "{body} must be narrowable, not transient"
+        );
+        assert!(super::looks_like_cap(body));
+    }
+
     #[test]
     fn monad_public_endpoint_cap_shapes_are_narrowable() {
         for body in [

@@ -317,6 +317,58 @@ const MONAD: Chain = Chain {
     topic0_only_getlogs: true,
 };
 
+/// Robinhood Chain. Robinhood's Arbitrum Orbit L2 on the Nitro stack - the same execution stack and
+/// the same settlement shape as Arbitrum One, so it rides the generic EVM path with no special-casing
+/// (RFC-0050; the addendum confirms every `42161` outside this file is a fixture). Chain id 4663,
+/// mainnet since 2026-07-01, 100 ms blocks (measured 9.9 blocks/s on 2026-09-04), and busy: 148 logs
+/// per block over 1,000 sampled blocks from 3,059 emitters, the top of the list being USDG, WETH and
+/// the Stock Tokens (MSTR, AMC, SPY, ...) - ERC-20s, which is exactly the shape `init` was built for.
+///
+/// Measured 2026-09-04 with `nuthatch doctor --address <USDG>` against the RFC-0030 §4 bar. Three
+/// keyless hosts answer `eth_chainId` with 4663; one of them can back a nest:
+///
+/// | endpoint                          | getLogs (addr) | batch | archive        | verdict |
+/// |-----------------------------------|----------------|-------|----------------|---------|
+/// | `rpc.mainnet.chain.robinhood.com` | 640            | 5     | refused (429)  | shipped |
+/// | `robinhood.drpc.org`              | -              | -     | -              | no `eth_blockNumber` (`-32601`) |
+/// | `robinhood-rpc.publicnode.com`    | 0 - 403        | 200+  | token required | the archive-token policy its siblings have |
+///
+/// The shipped endpoint is rate-limited, and the limit is per second rather than per day: the same
+/// `doctor` run that read 640 above read **40** and `batching unusable at 2` when it ran straight
+/// after a thousand-block sampling pass, and every failure was HTTP 429. A backfill on it works at
+/// the shipped window; anything in anger wants `--rpc` at a keyed provider (Alchemy, QuickNode and
+/// Chainstack all list the chain). The over-wide refusal is HTTP 200 `-32000 "logs matched by query
+/// exceeds limit of 10000"`, which `classify_rpc_error` already narrows on.
+///
+/// **`FinalizedTag`, not the `safe` tag the RFC's body recommends.** Both tags are served: at
+/// 15:08 UTC `safe` was 7,765 blocks (784 s) behind `latest` and `finalized` 11,921 blocks (1,207 s,
+/// about twenty minutes). `Finality` has no `safe` arm, and adding one is a seal-loop change rather
+/// than a registry entry, so the carve-out takes the tag the code has and pays about seven minutes
+/// of seal latency for it - the same policy Arbitrum One runs. The fallback depth is sized for the
+/// cadence, not copied from Arbitrum One's 1,800: 15,000 blocks is twenty-five minutes at 10 blocks/s,
+/// a margin over the measured `finalized` lag, and it only runs on an endpoint that stops serving
+/// the tag.
+const ROBINHOOD: Chain = Chain {
+    name: "robinhood",
+    chain_id: 4663,
+    rpc_urls: &[
+        // The only keyless endpoint that passed the bar on 2026-09-04; see the table above for the
+        // two that did not.
+        "https://rpc.mainnet.chain.robinhood.com",
+    ],
+    finality: Finality::FinalizedTag {
+        fallback_depth: 15_000,
+    },
+    // Half of what the public endpoint sustained address-filtered on the busiest token, which is
+    // what `doctor` recommends. The result cap is 10,000 logs, and a busy token here carries about
+    // 20 a block, so 320 sits under it with room; RFC-0028's chunker narrows from here on the cap
+    // it can see.
+    log_window: 320,
+    // Address-less windows are served: the 2026-09-04 emitter sample was 20 unfiltered 50-block
+    // windows, every one answered.
+    topic0_only_getlogs: true,
+};
+
 pub fn lookup(name: &str) -> Option<&'static Chain> {
     match name {
         "mainnet" | "ethereum" | "eth" => Some(&MAINNET),
@@ -327,6 +379,7 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
         "gnosis" | "xdai" | "gnosis-chain" => Some(&GNOSIS),
         "optimism" | "op" | "op-mainnet" | "optimism-mainnet" => Some(&OPTIMISM),
         "monad" | "monad-mainnet" | "mon" => Some(&MONAD),
+        "robinhood" | "robinhood-chain" | "robinhood-mainnet" | "rh" => Some(&ROBINHOOD),
         _ => None,
     }
 }
@@ -436,6 +489,7 @@ pub fn all() -> &'static [&'static Chain] {
         &BSC,
         &GNOSIS,
         &MONAD,
+        &ROBINHOOD,
     ]
 }
 
@@ -537,6 +591,40 @@ mod tests {
         assert_eq!(lookup("monad-mainnet").unwrap().chain_id, 143);
     }
 
+    /// RFC-0050: an Arbitrum Nitro L2, so it takes Arbitrum One's tag policy, with the fallback
+    /// depth sized for 100 ms blocks rather than copied. The RFC's body asks for the `safe` tag;
+    /// `Finality` has no such arm, and the carve-out took the tag the code has rather than a
+    /// seal-loop change. The window is what `doctor` recommended on the busiest token, under a
+    /// 10,000-log result cap the endpoint names in its refusal.
+    #[test]
+    fn robinhood_is_registered_on_the_nitro_tag_policy_with_a_cadence_sized_fallback() {
+        let c = lookup("robinhood").expect("robinhood in registry");
+        assert_eq!(c.chain_id, 4663);
+        assert_eq!(
+            c.finality,
+            Finality::FinalizedTag {
+                fallback_depth: 15_000
+            },
+            "finalized runs about 12,000 blocks behind tip at 10 blocks/s; 1,800 is Arbitrum One's \
+             number and would fall short of the tag by ten minutes"
+        );
+        assert_eq!(
+            c.log_window, 320,
+            "doctor's recommendation on 2026-09-04 against USDG; the result cap is 10,000 logs"
+        );
+        assert!(
+            c.topic0_only_getlogs,
+            "measured 2026-09-04: address-less getLogs windows are served"
+        );
+        assert_eq!(
+            c.rpc_urls.len(),
+            1,
+            "one keyless endpoint passed the RFC-0030 §4 bar; the two others are recorded in the \
+             entry's doc comment with why not"
+        );
+        assert_eq!(lookup("robinhood-chain").unwrap().chain_id, 4663);
+    }
+
     #[test]
     fn unknown_chain_is_none() {
         assert!(lookup("dogechain").is_none());
@@ -582,12 +670,20 @@ mod tests {
         // chain that breaks it was not in the list the rule iterates. A short list hid a real RFC-0030
         // §4 violation.
         //
-        // The exception announces its own obsolescence. It asserts BSC has **exactly one** endpoint,
-        // so the day somebody adds a second this test fails and whoever does it deletes this block
-        // rather than leaving a stale carve-out behind.
-        const SINGLE_ENDPOINT_EXCEPTION: &str = "bsc";
+        // Robinhood Chain is the second, recorded the same way (RFC-0050 addendum, item 8). Seven
+        // keyless hosts were tried on 2026-09-04 and one cleared the bar: `robinhood.drpc.org`
+        // answers the chain id but has no `eth_blockNumber` (`-32601`), `robinhood-rpc.publicnode.com`
+        // wants an archive token even for a 10-block getLogs, `rpc.ankr.com/robinhood` is 403,
+        // `1rpc.io/robinhood` is `unknown network`, thirdweb's two hosts say `Invalid chain`,
+        // Tenderly's gateway is 404, and the explorer's `eth-rpc` sits behind a Cloudflare challenge.
+        // The chain is two months old; re-probe before the entry's next measurement.
+        //
+        // Each exception announces its own obsolescence. It asserts the chain has **exactly one**
+        // endpoint, so the day somebody adds a second this test fails and whoever does it deletes
+        // that name rather than leaving a stale carve-out behind.
+        const SINGLE_ENDPOINT_EXCEPTIONS: &[&str] = &["bsc", "robinhood"];
         for c in all() {
-            if c.name == SINGLE_ENDPOINT_EXCEPTION {
+            if SINGLE_ENDPOINT_EXCEPTIONS.contains(&c.name) {
                 assert_eq!(
                     c.rpc_urls.len(),
                     1,
@@ -679,6 +775,10 @@ mod tests {
                 10,
             ),
             (&["monad", "monad-mainnet", "mon"][..], 143),
+            (
+                &["robinhood", "robinhood-chain", "robinhood-mainnet", "rh"][..],
+                4663,
+            ),
         ] {
             for a in aliases {
                 let c = lookup(a).unwrap_or_else(|| panic!("alias {a:?} resolves to nothing"));
@@ -702,7 +802,7 @@ mod tests {
     #[test]
     fn every_registered_chain_is_probed_by_auto_detect() {
         let probed: Vec<u64> = all().iter().map(|c| c.chain_id).collect();
-        for id in [1u64, 42161, 8453, 56, 137, 100, 10, 143] {
+        for id in [1u64, 42161, 8453, 56, 137, 100, 10, 143, 4663] {
             assert!(
                 probed.contains(&id),
                 "chain {id} resolves via `lookup` but `all()` never probes it, so `init` without \
@@ -711,7 +811,7 @@ mod tests {
         }
         assert_eq!(
             probed.len(),
-            8,
+            9,
             "a chain was added to `all()` without being added to the alias table above: {probed:?}"
         );
     }

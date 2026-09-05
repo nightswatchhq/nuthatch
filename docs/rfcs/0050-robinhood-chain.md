@@ -1,9 +1,10 @@
 # RFC-0050: Robinhood Chain support
 
-- Status: **Draft. Under the 2026 feature freeze this is a proposal, not work to start.** A new
-  built-in chain is new capability, both carve-outs are spent, and implementing this needs a
-  carve-out recorded in `CLAUDE.md` first. Nothing in this document starts, reorders or unblocks
-  a slice.
+- Status: **Implemented (2026-09-04), carve-out four.** Chief unfroze #1133 on 2026-09-04 and the
+  carve-out is recorded in `CLAUDE.md`, for this one chain and nothing else. Shipped as a registry
+  entry on the generic EVM path with `FinalizedTag { fallback_depth: 15_000 }`, not the `safe` tag
+  §4 recommends - addendum item 7 says why. The body below is left as drafted; the addendum is
+  what was measured.
 - Author: Pete
 - Date: September 2026
 - Tracking issue: [#1133](https://github.com/nightswatchhq/nuthatch/issues/1133)
@@ -296,3 +297,62 @@ the tree at `af875f9a` and the live endpoints on 2026-09-03; the body above is l
    `log_window`.
 6. **Open question 5** stays open: the other seven ship keyless public endpoints measured against
    the RFC-0030 §4 bar, and this one rate-limited a single doctor run.
+
+### Implementation addendum (2026-09-04, carve-out four, #1133)
+
+7. **The registry entry, and the finality decision item 1 left open.** `FinalizedTag { fallback_depth:
+   15_000 }`, `log_window: 320`, `topic0_only_getlogs: true`, one endpoint. Both tags were re-read
+   at 15:08 UTC: `latest` 54,359,997, `safe` 54,352,232 (7,765 blocks, 784 s), `finalized`
+   54,348,076 (11,921 blocks, 1,207 s), so the cadence is 9.9 blocks/s and the tag policy costs
+   about seven minutes of seal latency against §4's `safe`. That is the trade the carve-out took: a
+   `SafeTag` arm is a seal-loop change, not a data entry, and Arbitrum One - the same stack - runs on
+   the `finalized` tag today. Sealing later than necessary is never a correctness cost. The fallback
+   depth is sized for the cadence, as item 4 asked: 15,000 blocks is twenty-five minutes at 10
+   blocks/s, over the measured `finalized` lag with margin, and runs only on an endpoint that stops
+   serving the tag.
+8. **Open question 5, answered.** Three keyless hosts answer `eth_chainId` with 4663.
+   `nuthatch doctor --address <USDG>`, clean run, one after another with a pause:
+
+   | endpoint | getLogs (addr) | batch | archive |
+   |---|---|---|---|
+   | `rpc.mainnet.chain.robinhood.com` | **640** (recommend 320) | 5 | refused, HTTP 429 |
+   | `robinhood.drpc.org` | - | - | `eth_blockNumber does not exist` (`-32601`) |
+   | `robinhood-rpc.publicnode.com` | 0 (HTTP 403) | 200+ | `Archive requests require a personal token` |
+
+   So the public endpoint is the built-in default, alone. It is rate-limited **per second**: the
+   same `doctor` run straight after a thousand-block sampling pass read a window of 40 and
+   `batching unusable at 2`, every failure HTTP 429; the live-endpoints probe's retry covers that,
+   and anything in anger wants `--rpc` at a keyed provider. The over-wide refusal is HTTP 200
+   `-32000 "logs matched by query exceeds limit of 10000"`. It was in the text fallback's cap list
+   and **not** in the JSON-RPC classifier's, so it classified `Transient` and would have been
+   retried at the same width; the test that pins the shape found that, and the marker is now in
+   both.
+
+   **Phase 0, run as a stranger would.** `init 0x5fc5…d168 --chain robinhood` resolved USDG's ABI
+   through its proxy via Sourcify, keyless, in 2.5 s, and scaffolded 46 tables; the deployment
+   block was undetected (`metadata is not found`, the endpoint prunes state), as on Monad. `dev
+   --backfill 3000 --seal-direct` with timestamps on then spent two minutes on its first window:
+   the batch limit of 5 turns one window's timestamp fetch into 64 calls and the per-second limit
+   answered them, the logs and the tip lookup, with 429. Scaffolded again with `--no-timestamps`,
+   `--backfill 2000 --window 100` indexed **23,953 transfers over 2,000 blocks in 16 s at 1,264
+   events/s, zero 429s**. The operator note says so: the keyless demo is timestamp-free, and
+   timestamps want a keyed endpoint - measured too: the timestamped nest through a keyed Alchemy
+   endpoint (`dev --rpc`, the whole pool) did 2,000 blocks in 14 s at 2,286 events/s and sealed
+   them. Left following on the public endpoint, the keyless nest sealed its first two cuts at the
+   `finalized` tag within 25 minutes, 40,014 rows, zero reorgs, the delay being the tag's lag past
+   the start block plus the 20,000-row batch; so `FinalizedTag` is exercised on this chain, not
+   copied from Arbitrum One on trust. At ten blocks a second, ten blocks share a one-second
+   `block_timestamp`.
+9. **Item 5's `--address` re-probe: what the chain's logs are.** 1,000 blocks sampled across two
+   hours: **148,213 logs from 3,059 emitters, 148 a block**. USDG (Global Dollar, 13.5%) and WETH
+   (9.6%) lead, both verified on Sourcify through their EIP-1967 implementations; then an unverified
+   24 KB contract (8.1%), and the Stock Tokens - MSTR, AMC, SPCX, SPY at 2 to 3% each - which are
+   283-byte proxies not verified on Sourcify, with names of the shape `Strategy Inc. • Robinhood
+   Token`. So keyless `init` on USDG or WETH works via Sourcify; a Stock Token needs its
+   implementation verified or `--abi`, and the ERC-20 ABI is the one ABI nobody needs to fetch.
+10. **Blockscout is not wired for 4663.** `robinhoodchain.blockscout.com/api` answers a plain
+    client with a Cloudflare challenge (HTTP 403, "Just a moment..."), so `abi::blockscout_api` does
+    not list it: a keyless source that only a browser can reach is not a keyless source.
+11. **Not built, on purpose.** No testnet entry (46630), no sequencer-feed head tracker, no
+    `arbitrum-nitro` chain-family refactor, no `SafeTag`. Each is new capability beyond a registry
+    entry and the carve-out is one chain.
