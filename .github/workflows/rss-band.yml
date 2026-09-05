@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       runs:
-        description: how many sequential runs of the scenario (the script defaults to 7)
+        description: how many sequential runs of the scenario, 1 to 20 (the script defaults to 7)
         default: "7"
         required: false
   push:
@@ -31,8 +31,9 @@ jobs:
     name: ${{ inputs.runs || 7 }} sequential runs of the dense multi-nest scenario
     runs-on: ubuntu-latest
     # A cold release build is up to 45 minutes (ci.yml's build-release), and the scenario is about
-    # 4.5 minutes a run, sequential by construction.
-    timeout-minutes: 120
+    # 4.5 minutes a run, sequential by construction: 20 runs is 90 minutes, so the ceiling on `runs`
+    # below is 20 and this is sized for it with setup and a slow runner allowed for.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -56,8 +57,8 @@ jobs:
           case "$RUNS_INPUT" in
             ''|*[!0-9]*) echo "::error::runs must be a whole number, got '$RUNS_INPUT'"; exit 1 ;;
           esac
-          if [ "$RUNS_INPUT" -lt 1 ] || [ "$RUNS_INPUT" -gt 30 ]; then
-            echo "::error::runs must be between 1 and 30, got $RUNS_INPUT"; exit 1
+          if [ "$RUNS_INPUT" -lt 1 ] || [ "$RUNS_INPUT" -gt 20 ]; then
+            echo "::error::runs must be between 1 and 20 (the job's timeout is sized for 20), got $RUNS_INPUT"; exit 1
           fi
           mkdir -p "$TMPDIR"
           echo "runner: $(nproc) cpus, $(free -m | awk '/^Mem:/{print $2}') MB, $(uname -r)"
