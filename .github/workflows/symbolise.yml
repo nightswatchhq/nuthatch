@@ -1,0 +1,57 @@
+# Name the instruction behind a fault offset in a shipped release (#1165).
+#
+# Release binaries are stripped, so a kernel line like
+#   segfault at … ip 00005cd9e3f7fef0 … in nuthatch-3.4.0[…,5cd9e0ee8000+4a70000]
+# gives an offset (ip - load base) and nothing else. This rebuilds the same ref with the same
+# profile on the same runner image, keeping symbols and line tables (neither changes code layout),
+# checks that `.text` has the same address and size as the shipped binary would, and prints the
+# function and source line at each offset into the job log. Manual only; nothing is published.
+name: symbolise
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: the tag or commit the shipped binary was built from
+        required: true
+        default: v3.4.0
+      offsets:
+        description: space-separated hex offsets into the binary (ip minus load base)
+        required: true
+        default: "0x3097ef0"
+permissions:
+  contents: read
+jobs:
+  symbolise:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-x86_64-unknown-linux-gnu
+      - name: build with symbols kept
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: symbolise
+        env:
+          OFFSETS: ${{ inputs.offsets }}
+        run: |
+          set -euo pipefail
+          B=target/x86_64-unknown-linux-gnu/release/nuthatch
+          echo "== sections (compare .text to the shipped binary's: addr 15d7f00 size 4a6d290 for v3.4.0)"
+          readelf -SW "$B" | awk '$2 ~ /^\.(text|rodata|eh_frame)$/ {print $2, $4, $6}'
+          for off in $OFFSETS; do
+            echo "== $off"
+            addr2line -f -C -i -e "$B" "$off" || true
+            echo "-- nearest symbol below (nm):"
+            nm -C --defined-only "$B" | awk -v o="$off" 'BEGIN{t=strtonum(o)} $2 ~ /^[tTwW]$/ {a=strtonum("0x"$1); if (a<=t && a>best) {best=a; sym=$0}} END{printf "%s  (+0x%x)\n", sym, t-best}'
+            echo "-- disassembly around it:"
+            objdump -d -C --start-address=$(printf '0x%x' $(( off - 64 ))) --stop-address=$(printf '0x%x' $(( off + 48 ))) "$B" | tail -40 || true
+          done
