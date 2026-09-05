@@ -220,8 +220,9 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    made, tracking #1136. The freeze was lifted for **this one chain and nothing else**: a registry
 >    entry in `src/chains.rs` on the generic EVM path, its measured endpoints, the operator note, the
 >    live-endpoints probe, and the two over-wide-range refusal shapes its public endpoints answer with.
->    The execution-lag guard the RFC draft proposed was **not built**; the seal boundary is a depth
->    of eight blocks rather than the `finalized` tag, an execution margin the RFC's addendum explains. RFC-0050 (Robinhood Chain) is **not** carved
+>    The execution-lag guard the RFC draft proposed was **not built**; the seal boundary shipped as a
+>    depth of eight blocks, an execution margin, and moved to the `finalized` tag on 2026-09-05 after
+>    the day-long soak #1145 asked for found zero short answers on all three endpoints. RFC-0050 (Robinhood Chain) is **not** carved
 >    out by this and stays a frozen draft. Spent when #1136 closes; there is no fourth.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,

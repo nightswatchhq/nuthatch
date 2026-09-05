@@ -539,16 +539,21 @@ runtimes, bundles - is chain-agnostic and behaves exactly as it does on a built-
 If you are running an unlisted chain in anger, say so - a chain with real usage is a candidate for the
 built-in registry, which is where the tuned window and finality policy come from.
 
-### Monad: a depth of eight, and why it is not the tag
+### Monad: the `finalized` tag, one block behind tip, after a day's soak
 
-Monad (chain id `143`) ships with `Depth(8)`: the seal boundary is eight blocks behind tip, about
-2.4 s. The `finalized` tag sits one block behind tip and is irreversible without a hard fork, so
-this is not a reorg margin - it is an **execution** margin. Monad executes a block up to three blocks
-after consensus finalises it, and a probe that reads logs for a block finalised but not yet executed
-would get an empty list, indistinguishable from an empty block. Every probe on 2026-09-03 found
-receipts complete at `latest`, but eight samples are not an invariant, so eight blocks buys the margin
-instead. Do not raise the depth by analogy with an L2 - anything past `finalized` is final - and do
-not lower it to the tag without the soak RFC-0051's addendum asks for.
+Monad (chain id `143`) seals at the node's `finalized` tag, which sits one block behind tip and is
+irreversible without a hard fork, so sealed Parquet is written about 600 ms after a block. 3.3.0
+shipped `Depth(8)` instead - 2.4 s, an **execution** margin: Monad executes a block up to three
+blocks after consensus finalises it, and a probe that read logs for a finalised-but-unexecuted block
+would get an empty list, indistinguishable from an empty block. Eight samples on 2026-09-03 found
+receipts complete at `latest`, which is not an invariant, so the tag waited for a soak: every 300 ms
+for 24 hours on each shipped endpoint, read `finalized` and then its receipts, and count the block
+whose receipts were short of its transactions or whose logs were empty under a non-empty bloom. Zero
+such blocks, and zero disagreements between two reads of one height, on all three endpoints
+(RFC-0051 addendum item 16, #1145). The fallback depth of 200 blocks - a minute at 300 ms - only
+runs on an endpoint that stops serving the tag. Do not put a depth back by analogy with an L2:
+anything past `finalized` is final here, and the execution gap the depth guarded against did not
+show itself in a day of looking.
 
 Three things to know before a Monad backfill, all measured on 2026-09-03:
 

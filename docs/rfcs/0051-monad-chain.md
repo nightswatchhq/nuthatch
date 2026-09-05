@@ -424,3 +424,25 @@ live endpoints on 2026-09-03; the body above is left as written. The probes are 
     straddles its head instead of erroring. Alchemy errors on that; the other two could not be told
     apart from the chain simply advancing during the probe. That risk is chain-agnostic and is
     exactly RFC-0049 §1's open item; the depth of eight does not create it and does not close it.
+16. **The soak item 14 asked for ran, and the entry is `FinalizedTag` (2026-09-05, #1145).** On the
+    Hetzner box, one reader per shipped endpoint, from 07:05 UTC on 2026-09-04 for 24 hours: read
+    `eth_getBlockByNumber("finalized")`, then `eth_getBlockReceipts` for that height, record
+    `(height, tx_count, receipt_count, bloom_nonzero, log_count)`, and re-read any height a later
+    read disagreed with. A short answer is `receipt_count < tx_count`, or `log_count == 0` under a
+    non-zero bloom. The cadence was 300 ms; Alchemy's `rpc1` answered that with 429s and was
+    restarted at 1 s, so it covers the same day at a third of the reads.
+
+    | endpoint | reads | short | disagree | transport errors |
+    |---|---:|---:|---:|---:|
+    | `rpc.monad.xyz` (QuickNode) | 278,268 | 0 | 0 | 2 |
+    | `rpc3.monad.xyz` (Ankr) | 283,936 | 0 | 0 | 2 |
+    | `rpc1.monad.xyz` (Alchemy) | 86,328 | 0 | 0 | 1 |
+
+    648,532 reads, no block ever served at `finalized` ahead of its receipts, on any endpoint, for
+    a day. That is the invariant item 14 declined to take from eight samples, and with it the depth
+    is an execution margin against nothing. The entry is `FinalizedTag { fallback_depth: 200 }`:
+    the body's crux, two seconds of seal latency given back, the fallback a minute at 300 ms and
+    reached only on an endpoint that stops serving the tag. The five errors were transport failures
+    the reader counts separately from answers; none was a short answer. What item 15 left outside
+    the invariant - a load-balanced backend silently truncating a range at its own head - stays
+    outside it and stays RFC-0049 §1's, now covered on the fetch side by #1144's tail refetch.
