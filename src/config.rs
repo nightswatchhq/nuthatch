@@ -61,6 +61,13 @@ pub struct Config {
     /// string.
     #[serde(skip)]
     pub state_rpc_urls: Vec<String>,
+    /// The `serve` role: reads a store and sealed segments something else wrote, samples no calls and
+    /// seals nothing, so it has no use for an archive endpoint and must not be refused for lacking
+    /// one (#1167: `serve` over a `[[calls]]` nest exited telling the operator to pass a flag it does
+    /// not have). Set by `serve_role` before `build_nest`; carried here for the same reason as
+    /// `state_rpc_urls`, and `#[serde(skip)]` because a role is not data identity.
+    #[serde(skip)]
+    pub read_only_role: bool,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -651,6 +658,7 @@ impl Config {
         let v1: V1 = toml::from_str(raw)?;
         Ok(Config {
             state_rpc_urls: Vec::new(),
+            read_only_role: false,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -722,6 +730,7 @@ mod tests {
     fn roundtrips_a_v2_file() {
         let cfg = Config {
             state_rpc_urls: Vec::new(),
+            read_only_role: false,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {

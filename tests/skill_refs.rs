@@ -317,6 +317,7 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     // the excuse expired and `[[calls]]` is documented in the reference instead.
     ("Config.state_rpc_urls", "`#[serde(skip)]` - the tier-3 archive endpoint comes from `--state-rpc` and is deliberately never a config key, because it carries an API key and this file is pinned into the nest's content address"),
     ("Config.ipfs_gateways", "`#[serde(skip)]` - IPFS gateways come from `--ipfs`. A gateway is an *access path*: two operators resolving one CID through different gateways must get the same bytes, so it must not enter the nest's content address"),
+    ("Config.read_only_role", "`#[serde(skip)]` - the `serve` role, set by `serve_role` before `build_nest` so a `[[calls]]` nest it will never sample is not refused for lacking an archive endpoint (#1167). A role is not data identity and is never a config key."),
 ];
 
 #[test]

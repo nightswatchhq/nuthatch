@@ -128,6 +128,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
 
     let config = Config {
         state_rpc_urls: Vec::new(),
+        read_only_role: false,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
@@ -674,6 +675,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
     let config = Config {
         state_rpc_urls: Vec::new(),
+        read_only_role: false,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
