@@ -4098,8 +4098,8 @@ pub async fn backfill_direct_factory(
 /// argument list so a later change can drive many nests from one cursor (RFC-0012). This is a pure
 /// mechanical grouping - the loop's behaviour is unchanged. The `Source` is deliberately NOT a field:
 /// it is shared (`Arc<dyn Source>`) and stays borrowed into the two methods below.
-/// Where a direct seal's watermark goes: the progress counter, the `sealed_through` gauge, and the
-/// store's durable key, in that order. Every place that states "sealed through" reads one of the
+/// Where a direct seal's watermark goes: the store's durable key, then the progress counter and the
+/// `sealed_through` gauge, in that order, so the gauges never run ahead of what is persisted. Every place that states "sealed through" reads one of the
 /// three. The gauge is the one that was missing (#1163): `/ready` and `nuthatch_sealed_through` read
 /// it, the nest seeds it from the store at construction, before the direct seal has written anything,
 /// and only the tip-follower's own seal ever set it afterwards. On 8107 that meant 460M sealed
@@ -4110,9 +4110,12 @@ fn publish_direct_seal(
     store: &dyn crate::store::HotStore,
     sealed_to: u64,
 ) -> Result<()> {
+    // The durable key first: if the store write fails, nothing in memory has claimed a watermark that
+    // was never persisted, and `/ready` keeps saying what the last successful write said.
+    store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())?;
     metrics.set_seal_direct_completed(sealed_to);
     metrics.set_sealed_through(sealed_to);
-    store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())
+    Ok(())
 }
 
 pub struct NestIngest {
