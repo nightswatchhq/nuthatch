@@ -397,6 +397,43 @@ fn test_first_attempt_delays() -> &'static Mutex<HashMap<PathBuf, u64>> {
     DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// #1162 reproduction: a segment file to remove *after* the plan has named it and *before* DuckDB
+/// executes - the window a seal's fold cleanup lands in on a live nest.
+#[cfg(test)]
+fn test_remove_after_define() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static HOOK: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
+    let mut m = test_remove_after_define().lock().unwrap();
+    match file {
+        Some(f) => {
+            m.insert(dir.to_path_buf(), f);
+        }
+        None => {
+            m.remove(dir);
+        }
+    }
+}
+
+/// The plan named a segment file that was gone by the time DuckDB opened it. On a live nest that is a
+/// seal folding a provisional segment: the new file is written, the manifest installed, the old file
+/// removed - and a query that planned against the old manifest a moment earlier is still holding the
+/// old name (#1162, three of ~40 queries during one backfill). DuckDB reports it at prepare
+/// ("No files found that match the pattern") or at execution ("Cannot open file"), always naming a
+/// path under the segments directory; nothing else on this surface produces either wording with that
+/// path in it.
+fn segment_vanished(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    let marker = format!("/{}/", crate::seal::SEGMENTS_DIR);
+    text.contains(&marker)
+        && (text.contains("No files found that match the pattern")
+            || text.contains("Cannot open file")
+            || text.contains("No such file or directory"))
+}
+
 #[cfg(test)]
 pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
     if ms == 0 {
@@ -425,7 +462,7 @@ fn run(
     // attempts and the sweep makes `guard.timeout` the actual wall-clock ceiling on the whole call.
     let deadline = guard.map(|g| Instant::now() + g.timeout);
     let nothing_excluded = std::collections::BTreeSet::new();
-    let (e, tables) = match attempt(
+    let first = attempt(
         dir,
         sql,
         guard,
@@ -434,7 +471,40 @@ fn run(
         &nothing_excluded,
         deadline,
         declared,
-    )? {
+    );
+    // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
+    // missing: a seal replaced the file under the query, and planning again reads the manifest as it
+    // now is. Once - a second vanish inside one query is not a race, and the ordinary error then
+    // says what happened. The integrity sweep below is for a different fault (a file that is present
+    // and wrong) and would find nothing here.
+    let vanished = match &first {
+        Err(e) => segment_vanished(e),
+        Ok(Attempt::DiedExecuting { error, .. }) => segment_vanished(error),
+        Ok(Attempt::Ok(_)) => false,
+    };
+    if vanished {
+        if let Some(secs) = timed_out(guard, deadline) {
+            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        }
+        tracing::info!(
+            "a segment the plan named was gone by execution - a seal replaced it under the query \
+             (#1162); planning again against the current manifest"
+        );
+        return match attempt(
+            dir,
+            sql,
+            guard,
+            hot,
+            sealed_through,
+            &nothing_excluded,
+            deadline,
+            declared,
+        )? {
+            Attempt::Ok(out) => Ok(out),
+            Attempt::DiedExecuting { error, .. } => Err(error),
+        };
+    }
+    let (e, tables) = match first? {
         Attempt::Ok(out) => return Ok(out),
         Attempt::DiedExecuting { error, tables } => (error, tables),
     };
@@ -665,6 +735,10 @@ fn attempt(
             (tx, join)
         });
 
+        #[cfg(test)]
+        if let Some(f) = test_remove_after_define().lock().unwrap().remove(dir) {
+            std::fs::remove_file(&f).expect("test hook: remove the planned segment");
+        }
         let cap = guard.map(|g| g.max_rows);
         let outcome = collect(conn, sql, cap);
 
@@ -2823,6 +2897,56 @@ template="pool"
             Value::from(1u64),
             "surviving segment still queryable"
         );
+    }
+
+    /// #1162: on a live nest a seal folds a provisional segment - new file written, manifest
+    /// installed, old file removed - while a query that planned against the old manifest is still
+    /// holding the old name. The hook removes the planned file between planning and execution, which
+    /// is exactly that window. The query must answer from what the manifest now says, not fail.
+    #[test]
+    fn query_replans_once_when_a_planned_segment_vanishes_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let row = |b: u64| {
+            format!(
+                r#"{{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":{b},"tx_hash":"0xt","log_index":0}}"#
+            )
+        };
+        crate::seal::seal_range(dir.path(), &[row(10)], 10, 10).unwrap();
+        crate::seal::seal_range(dir.path(), &[row(11)], 11, 11).unwrap();
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let gone = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
+        assert!(gone.exists());
+        test_set_remove_after_define(dir.path(), Some(gone.clone()));
+
+        let n = query(dir.path(), r#"SELECT count(*) AS n FROM "usdc__transfer""#)
+            .expect("the query replans against the current manifest instead of failing");
+        assert!(!gone.exists(), "the hook fired: the planned file was removed mid-query");
+        // The second plan saw the file missing and reduced the table to the survivor, which is the
+        // existing missing-file behaviour; on a live nest it would instead see the folded segment.
+        assert_eq!(n[0]["n"], Value::from(1u64));
+        test_set_remove_after_define(dir.path(), None);
+    }
+
+    #[test]
+    fn segment_vanished_recognises_both_of_duckdbs_wordings_and_nothing_else() {
+        let prep = anyhow::anyhow!(
+            "IO Error: No files found that match the pattern \"/data/x/segments/staking__tokens_delegated-10468dbbf8a613da.parquet\""
+        )
+        .context("failed to prepare query");
+        let exec = anyhow::anyhow!(
+            "IO Error: Cannot open file \"/data/x/segments/staking__tokens_undelegated-efb41c8f.parquet\": No such file or directory"
+        )
+        .context("query failed");
+        assert!(segment_vanished(&prep));
+        assert!(segment_vanished(&exec));
+        // A missing file that is not a segment (a view, a label snapshot) is not this fault.
+        let other = anyhow::anyhow!("IO Error: Cannot open file \"/data/x/views/90-x.sql\"").context("query failed");
+        assert!(!segment_vanished(&other));
+        // A segment named in an unrelated error is not this fault either.
+        let unrelated = anyhow::anyhow!("Invalid Error: don't know what type: /data/x/segments/a-b.parquet");
+        assert!(!segment_vanished(&unrelated));
     }
 
     #[test]

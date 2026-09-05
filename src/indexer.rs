@@ -4252,6 +4252,10 @@ impl NestIngest {
                     let store = store.clone();
                     move |sealed_to: u64| {
                         metrics.set_seal_direct_completed(sealed_to);
+                        // `/ready` and `nuthatch_sealed_through` read this gauge, not the store's
+                        // watermark. Left unset, a nest with 460M sealed blocks reported 0 until the
+                        // tip-follower sealed its first window, hours later (#1163).
+                        metrics.set_sealed_through(sealed_to);
                         metrics.mark_poll_ok();
                         store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())
                     }
@@ -4325,6 +4329,7 @@ impl NestIngest {
                 let _ = sealed;
                 prog.finish(finalized_through, false);
                 self.metrics.end_seal_direct();
+                self.metrics.set_sealed_through(finalized_through);
                 self.store
                     .set_meta(SEALED_THROUGH_KEY, &finalized_through.to_string())?;
                 self.store
@@ -10715,6 +10720,25 @@ template="pool"
             m.tables.contains_key("oracle_answer"),
             "the [[calls]] table must appear in the sealed manifest; got tables: {:?}",
             m.tables.keys().collect::<Vec<_>>()
+        );
+        // #1163: what `/ready` reports as `sealed_through` is the metric, and the direct seal must
+        // leave it at the watermark it wrote to the store, not at 0.
+        let sealed_to = m
+            .tables
+            .values()
+            .flatten()
+            .map(|s| s.to_block)
+            .max()
+            .expect("something was sealed");
+        assert_eq!(
+            nest.metrics.sealed_through(),
+            sealed_to,
+            "the sealed_through gauge must carry the direct seal's watermark"
+        );
+        assert_eq!(
+            nest.store.sealed_through(),
+            sealed_to,
+            "the store's watermark and the gauge must agree"
         );
 
         drop(nest);
