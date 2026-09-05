@@ -40,8 +40,9 @@ jobs:
           key: release-x86_64-unknown-linux-gnu
       - name: build with symbols kept
         env:
+          # symbols only: line tables changed codegen (run 33977378161 had .text at 0x17d2080, 1.4 MB
+          # larger than the shipped 0x15d7f00 / 0x4a6d290, and named a scaffolding function)
           CARGO_PROFILE_RELEASE_STRIP: "false"
-          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - name: symbolise
         env:
@@ -53,7 +54,7 @@ jobs:
           readelf -SW "$B" | awk '$2 ~ /^\.(text|rodata|eh_frame)$/ {print $2, $4, $6}'
           for off in $OFFSETS; do
             echo "== $off"
-            addr2line -f -C -i -e "$B" "$off" || true
+            addr2line -f -C -e "$B" "$off" || true
             echo "-- nearest symbol below (nm):"
             nm -C --defined-only "$B" | awk -v o="$off" 'BEGIN{t=strtonum(o)} $2 ~ /^[tTwW]$/ {a=strtonum("0x"$1); if (a<=t && a>best) {best=a; sym=$0}} END{printf "%s  (+0x%x)\n", sym, t-best}'
             echo "-- disassembly around it:"
