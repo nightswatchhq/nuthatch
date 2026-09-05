@@ -4098,6 +4098,26 @@ pub async fn backfill_direct_factory(
 /// argument list so a later change can drive many nests from one cursor (RFC-0012). This is a pure
 /// mechanical grouping - the loop's behaviour is unchanged. The `Source` is deliberately NOT a field:
 /// it is shared (`Arc<dyn Source>`) and stays borrowed into the two methods below.
+/// Where a direct seal's watermark goes: the store's durable key, then the progress counter and the
+/// `sealed_through` gauge, in that order, so the gauges never run ahead of what is persisted. Every place that states "sealed through" reads one of the
+/// three. The gauge is the one that was missing (#1163): `/ready` and `nuthatch_sealed_through` read
+/// it, the nest seeds it from the store at construction, before the direct seal has written anything,
+/// and only the tip-follower's own seal ever set it afterwards. On 8107 that meant 460M sealed
+/// blocks reporting `sealed_through 0` for the hours until the finalized head crossed the hot store's
+/// start; an operator's switch script read that as an unfit nest.
+fn publish_direct_seal(
+    metrics: &crate::metrics::NestMetrics,
+    store: &dyn crate::store::HotStore,
+    sealed_to: u64,
+) -> Result<()> {
+    // The durable key first: if the store write fails, nothing in memory has claimed a watermark that
+    // was never persisted, and `/ready` keeps saying what the last successful write said.
+    store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())?;
+    metrics.set_seal_direct_completed(sealed_to);
+    metrics.set_sealed_through(sealed_to);
+    Ok(())
+}
+
 pub struct NestIngest {
     /// The nest's configured name - the label a quarantine is reported under (RFC-0026 §5) and the
     /// key its metrics are already registered by.
@@ -4251,9 +4271,8 @@ impl NestIngest {
                     let metrics = metrics.clone();
                     let store = store.clone();
                     move |sealed_to: u64| {
-                        metrics.set_seal_direct_completed(sealed_to);
                         metrics.mark_poll_ok();
-                        store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())
+                        publish_direct_seal(&metrics, store.as_ref(), sealed_to)
                     }
                 };
                 // Live feedback for the multi-minute bulk seal (RFC-0015 slice 3).
@@ -4325,8 +4344,7 @@ impl NestIngest {
                 let _ = sealed;
                 prog.finish(finalized_through, false);
                 self.metrics.end_seal_direct();
-                self.store
-                    .set_meta(SEALED_THROUGH_KEY, &finalized_through.to_string())?;
+                publish_direct_seal(&self.metrics, self.store.as_ref(), finalized_through)?;
                 self.store
                     .set_meta(LAST_BLOCK_KEY, &finalized_through.to_string())?;
                 if let Err(e) = rebuild_views(
@@ -10725,6 +10743,31 @@ template="pool"
     /// #745: `backfill_direct_factory` is the third seal-direct path. The other two go red if their
     /// `state_rpc` branch is deleted. This one did not: 659 tests still passed. A factory nest
     /// with `[[calls]]` is the production shape that reaches it.
+    /// #1163: the gauge `/ready` reports is seeded from the store when the nest is built, which is
+    /// before a direct seal has written anything, and the ordinary seal is the only other writer. So
+    /// the direct seal must publish to it itself - this is the one seam both its per-segment callback
+    /// and its completion go through. (The end-to-end seal-direct fixture above cannot pin this: its
+    /// ordinary seal runs afterwards and sets the gauge regardless.)
+    #[test]
+    fn a_direct_seal_publishes_its_watermark_to_the_gauge_ready_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+        let m = crate::metrics::METRICS.nest("direct-seal-watermark-1163");
+        assert_eq!(m.sealed_through(), 0, "fresh nest metrics start at 0");
+        publish_direct_seal(&m, &store, 501_993_721).unwrap();
+        assert_eq!(
+            m.sealed_through(),
+            501_993_721,
+            "the gauge carries the direct seal's watermark"
+        );
+        assert_eq!(m.seal_direct_completed(), 501_993_721);
+        assert_eq!(
+            store.sealed_through(),
+            501_993_721,
+            "and so does the durable key"
+        );
+    }
+
     #[tokio::test]
     async fn seal_direct_factory_with_declared_calls_resolves_them() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
