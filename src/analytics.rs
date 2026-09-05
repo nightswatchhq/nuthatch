@@ -2922,7 +2922,10 @@ template="pool"
 
         let n = query(dir.path(), r#"SELECT count(*) AS n FROM "usdc__transfer""#)
             .expect("the query replans against the current manifest instead of failing");
-        assert!(!gone.exists(), "the hook fired: the planned file was removed mid-query");
+        assert!(
+            !gone.exists(),
+            "the hook fired: the planned file was removed mid-query"
+        );
         // The second plan saw the file missing and reduced the table to the survivor, which is the
         // existing missing-file behaviour; on a live nest it would instead see the folded segment.
         assert_eq!(n[0]["n"], Value::from(1u64));
@@ -2942,10 +2945,12 @@ template="pool"
         assert!(segment_vanished(&prep));
         assert!(segment_vanished(&exec));
         // A missing file that is not a segment (a view, a label snapshot) is not this fault.
-        let other = anyhow::anyhow!("IO Error: Cannot open file \"/data/x/views/90-x.sql\"").context("query failed");
+        let other = anyhow::anyhow!("IO Error: Cannot open file \"/data/x/views/90-x.sql\"")
+            .context("query failed");
         assert!(!segment_vanished(&other));
         // A segment named in an unrelated error is not this fault either.
-        let unrelated = anyhow::anyhow!("Invalid Error: don't know what type: /data/x/segments/a-b.parquet");
+        let unrelated =
+            anyhow::anyhow!("Invalid Error: don't know what type: /data/x/segments/a-b.parquet");
         assert!(!segment_vanished(&unrelated));
     }
 
