@@ -120,6 +120,12 @@ jobs:
           for u in https://rpc1.monad.xyz https://rpc.monad.xyz https://rpc3.monad.xyz; do
             probe monad 0x34b6552d57a35a1d042ccae1951bd1c370112a6f "$u"
           done
+          # Robinhood Chain (RFC-0050): USDG, the busiest emitter on 2026-09-04 at about 20 logs per
+          # block. One shipped endpoint, and it rate-limits per second rather than per day - a doctor
+          # run straight after a sampling pass read 40 where a clean one read 640 - which is what the
+          # retry above is for. No archive gate, same reason as Monad: the public endpoint answers
+          # the state probe with 429, and a backfill reads logs, not state.
+          probe robinhood 0x5fc5360d0400a0fd4f2af552add042d716f1d168 https://rpc.mainnet.chain.robinhood.com
           # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).
           # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
           # silently breaks backfill even when its getLogs window is wide. That is what broke on

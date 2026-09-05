@@ -182,6 +182,10 @@ mod tests {
     #[test]
     fn registration_since_suppresses_backfill_history() {
         let dir = tempfile::tempdir().unwrap();
+        // The two seals below fold into one segment under the table floor (#1150), which is the
+        // shape that aborted the dev-profile DuckDB before `analytics` switched off compressed
+        // materialisation in debug builds (#1152). This test runs on one folded file on purpose:
+        // it is the regression test for that guard as much as for the cursor.
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         let webhooks = vec![wh("w", "t__transfer", "registration")];
         // Registered at tip 100.

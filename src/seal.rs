@@ -90,6 +90,65 @@ pub struct Segment {
     /// static (non-factory) nest. Absent in pre-RFC-0009 manifests (serde default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_snapshot: Option<String>,
+    /// This table's rows since its last full segment, held under [`SEAL_TABLE_FLOOR`] (#1150). A
+    /// provisional segment is a real, content-addressed, queryable Parquet file like any other; the
+    /// one thing that distinguishes it is that the table's **next** seal folds it in rather than
+    /// sitting beside it, and the file it replaces is removed. At most one per table. Absent in
+    /// manifests written before this existed, which reads as `false` - every segment sealed then
+    /// was final.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
+}
+
+/// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
+///
+/// The cut is global and data-determined (`indexer::take_sealable`): every `SEAL_DIRECT_BATCH` rows
+/// across all tables, at a block boundary the chain chose. That keeps segment identity independent
+/// of the operator's window, and it is kept. What it also did, on a nest with many tables, was write
+/// one file **per table per cut**, so a table seeing three events in twenty thousand got a three-row
+/// Parquet file every cut - measured on the Perpl backfill at 9.3%: 15,977 files, 4,702 under 8 KB,
+/// and a query pays about 0.15 ms per file it opens (docs/bench/segment-layout.md). Sealed segments
+/// are never compacted, so that only grew.
+///
+/// So a table whose pending rows at a cut are under this floor is sealed **provisionally** and folded
+/// into its own next cut, until it has this many. The rule is stated in the same terms as the cut -
+/// rows, counted from the data - so two operators still produce identical files; and it changes
+/// identity only for tables under the floor, since a table that clears it at every cut is sealed
+/// exactly as before. At 20,000 rows a cut that is every table with a share of 5% or more.
+///
+/// One thousand is a segment whose footer is no longer most of it (about 90 bytes a row on the
+/// nests measured, so ~90 KB), and it turns a 0.015% table's file count from one per cut into one
+/// per 333 cuts. A row rather than byte floor, because bytes depend on the writer version and rows
+/// do not.
+pub const SEAL_TABLE_FLOOR: usize = 1_000;
+
+/// The floor `seal_range` applies for `dir`: the constant, unless a test has set otherwise.
+fn table_floor(dir: &Path) -> usize {
+    #[cfg(test)]
+    if let Some(&n) = test_table_floors().lock().unwrap().get(dir) {
+        return n;
+    }
+    let _ = dir;
+    SEAL_TABLE_FLOOR
+}
+
+/// Test-only knob (#1150), keyed by `dir` like the sweep knobs below so no test's setting leaks
+/// into another's tempdir. A floor of `0` makes every seal final, which is the behaviour before the
+/// floor existed - the corruption and quarantine tests seal one row per call and damage one
+/// segment of several, and they are about what a bad file does to a table, not about how many
+/// files a table gets. They say so where they set it. Tests about the floor use the real one.
+#[cfg(test)]
+fn test_table_floors() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static FLOORS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    FLOORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_table_floor(dir: &Path, rows: usize) {
+    test_table_floors()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), rows);
 }
 
 /// The segment catalogue: per-table lists of sealed segments.
@@ -148,19 +207,48 @@ pub fn seal_range_with_snapshot(
         .with_context(|| format!("cannot create {}", seg_dir.display()))?;
     let mut manifest = load_manifest(dir)?;
     let mut summary = SealSummary::default();
+    // Per-nest provisional files a fold has replaced. Removed only once the manifest that no longer
+    // names them is durably installed (below), never before: a crash between the two would leave
+    // a manifest pointing at a file that is gone, and the folded rows would read as missing.
+    let mut folded_away: Vec<PathBuf> = Vec::new();
 
     for (table, rows) in by_table {
         let batch = rows_to_batch(&rows)?;
         let bytes = write_parquet(&batch)?;
         let hash = hex::encode(Sha256::digest(&bytes));
-        let file = format!("{table}-{hash}.parquet");
-        let segments = manifest.tables.entry(table).or_default();
+        let segments = manifest.tables.entry(table.clone()).or_default();
         // Content-addressed idempotency: an identical segment (same table + hash) is already
         // catalogued, so re-sealing the same rows - e.g. re-running `nuthatch screen` over a range to
-        // re-audit - is a no-op rather than a double-listed (double-counted) segment.
+        // re-audit - is a no-op rather than a double-listed (double-counted) segment. Checked on the
+        // incoming rows alone, before any fold, so the rule is the same one it always was.
         if segments.iter().any(|s| s.hash == hash) {
             continue;
         }
+        let new_rows = rows.len();
+
+        // Fold this table's provisional segment in, if it has one (#1150): its rows come first,
+        // being from earlier cuts, and its `from_block` is the segment's. Read back from the
+        // Parquet it was written to rather than kept anywhere else, so there is one copy of the
+        // truth and the folded file is byte-identical to sealing all of those rows at once
+        // (`a_folded_segment_is_byte_identical_to_sealing_all_its_rows_at_once`).
+        let pending = segments.iter().position(|s| s.provisional);
+        let (rows, from, bytes, hash, replaced) = match pending {
+            None => (rows, from, bytes, hash, None),
+            Some(i) => {
+                let prev = segments.remove(i);
+                let mut all = read_segment_rows(&segment_path(dir, &prev.file, &prev.hash))
+                    .with_context(|| {
+                        format!("reading provisional segment {} to fold it", prev.file)
+                    })?;
+                all.extend(rows);
+                let bytes = write_parquet(&rows_to_batch(&all)?)?;
+                let hash = hex::encode(Sha256::digest(&bytes));
+                (all, prev.from_block, bytes, hash, Some(prev))
+            }
+        };
+        let provisional = rows.len() < table_floor(dir);
+        let file = format!("{table}-{hash}.parquet");
+
         // Write once, into the shared store when this dataset belongs to a runtime (RFC-0033 §11a).
         // Content-addressed, so a second nest sealing byte-identical rows finds it already there and
         // the write is a no-op rather than a duplicate.
@@ -171,25 +259,103 @@ pub fn seal_range_with_snapshot(
                 if !shared.exists() {
                     std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
                 }
+                // The folded file is left for `nuthatch prune`, which reclaims what no manifest
+                // references: another dataset in the store may hold the same bytes under the same
+                // hash, and this nest cannot know.
             }
             None => {
                 std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
+                if let Some(prev) = &replaced {
+                    // This nest's own copy, and not yet: see `folded_away`.
+                    folded_away.push(seg_dir.join(&prev.file));
+                }
             }
         }
         summary.tables += 1;
-        summary.rows += rows.len();
+        // New rows only: the folded ones were counted when they were first sealed, and
+        // `nuthatch_rows_sealed_total` is a count of rows, not of writes.
+        summary.rows += new_rows;
         segments.push(Segment {
             hash,
             from_block: from,
             to_block: to,
             rows: rows.len(),
             file,
+            // A folded segment records the snapshot at its last write. Discovery is append-only,
+            // so the latest snapshot covers every row in the file; the earlier ones covered less.
             registry_snapshot: registry_snapshot.map(str::to_string),
+            provisional,
         });
     }
 
     save_manifest(dir, &manifest)?;
+    // The manifest is installed and fsynced; nothing references these any more. A failure here is
+    // a stray file, which is disk and not data, so it is logged rather than returned: the seal
+    // itself has already happened.
+    for old in folded_away {
+        if let Err(e) = std::fs::remove_file(&old) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "folded provisional segment {} not removed: {e}",
+                    old.display()
+                );
+            }
+        }
+    }
     Ok(Some(summary))
+}
+
+/// A segment's rows back as the JSON objects `rows_to_batch` was given, so a provisional segment
+/// can be folded by re-sealing (#1150). The inverse of `rows_to_batch` exactly: a `UInt64` column
+/// becomes a number, a `Utf8` value a string, and a null is an absent key - which is what
+/// `rows_to_batch` maps an absent key *to*, so a fold round-trips to the bytes a single seal of the
+/// same rows produces. Nothing else needs this; `read_table_rows` is the typed reader.
+fn read_segment_rows(path: &Path) -> Result<Vec<Value>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file =
+        std::fs::File::open(path).with_context(|| format!("opening segment {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .context("reading segment metadata")?
+        .build()
+        .context("building segment reader")?;
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.context("reading segment batch")?;
+        let schema = batch.schema();
+        for i in 0..batch.num_rows() {
+            let mut obj = serde_json::Map::new();
+            for (c, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(c);
+                if col.is_null(i) {
+                    continue;
+                }
+                let v = match field.data_type() {
+                    DataType::UInt64 => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .context("UInt64 column of the wrong array type")?;
+                        Value::from(a.value(i))
+                    }
+                    DataType::Utf8 => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("Utf8 column of the wrong array type")?;
+                        Value::from(a.value(i))
+                    }
+                    other => anyhow::bail!(
+                        "segment {} has a {other} column, which this project never writes",
+                        path.display()
+                    ),
+                };
+                obj.insert(field.name().clone(), v);
+            }
+            out.push(Value::Object(obj));
+        }
+    }
+    Ok(out)
 }
 
 /// Build an Arrow batch from a table's JSON rows. `block_number`/`log_index` are UInt64; every other
@@ -949,6 +1115,8 @@ mod sealed_rows {
     #[test]
     fn segments_come_back_in_block_order_not_manifest_order() {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal, or there is only one segment and no order to get wrong (#1150).
+        test_set_table_floor(dir.path(), 0);
         let schema = schema();
         // Three, not two: with two, reversing the manifest happens to produce the sorted order, so
         // a reader that reversed instead of sorting would pass. Sealed 20, then 10, then 30.
@@ -1081,6 +1249,8 @@ mod tests {
     #[test]
     fn segments_failing_verification_catches_page_corruption_that_still_binds() {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        test_set_table_floor(dir.path(), 0);
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
         seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
         let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
@@ -1255,6 +1425,8 @@ mod tests {
     #[test]
     fn sweep_stops_at_its_deadline_instead_of_running_to_completion() {
         let dir = tempfile::tempdir().unwrap();
+        // Three segments, so the deadline has something to stop short of (#1150).
+        test_set_table_floor(dir.path(), 0);
         for (block, value) in [(100u64, "1"), (101, "2"), (102, "3")] {
             seal_range(dir.path(), &[transfer(block, 0, value)], block, block).unwrap();
         }
@@ -1294,6 +1466,8 @@ mod tests {
     #[test]
     fn verify_quarantines_a_corrupt_segment_and_leaves_intact_ones() {
         let dir = tempfile::tempdir().unwrap();
+        // One segment per seal: this is about a damaged file, not about the table floor (#1150).
+        test_set_table_floor(dir.path(), 0);
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
         seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
         let manifest = load_manifest(dir.path()).unwrap();
@@ -1499,5 +1673,324 @@ mod tests {
                 "segment hash differs for {table} between direct and via-hot-store paths"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // #1150 - a table under the floor is sealed provisionally and folded into its own next cut.
+    //
+    // Every test here seals through `seal_range` into a real directory and reads the manifest and
+    // the files back, because the property is about what is on disk: how many files a sparse table
+    // gets, whether a busy one is untouched, and whether the folded bytes are the bytes a single
+    // seal would have written.
+    // ---------------------------------------------------------------------------------------
+
+    fn transfers(from_block: u64, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| transfer(from_block + (i / 4) as u64, (i % 4) as u64, &i.to_string()))
+            .collect()
+    }
+
+    fn only(manifest: &Manifest, table: &str) -> Segment {
+        let segs = &manifest.tables[table];
+        assert_eq!(
+            segs.len(),
+            1,
+            "{table} has {} segments where exactly one was expected: {segs:?}",
+            segs.len()
+        );
+        segs[0].clone()
+    }
+
+    fn parquet_files(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir.join(SEGMENTS_DIR))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".parquet"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_table_under_the_floor_is_sealed_provisionally_and_still_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![
+            transfer(10, 0, "1"),
+            transfer(10, 1, "2"),
+            transfer(11, 0, "3"),
+        ];
+        assert!(rows.len() < SEAL_TABLE_FLOOR);
+        let summary = seal_range(dir.path(), &rows, 10, 11).unwrap().unwrap();
+        assert_eq!((summary.tables, summary.rows), (1, 3));
+
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        assert!(
+            seg.provisional,
+            "three rows is under SEAL_TABLE_FLOOR={SEAL_TABLE_FLOOR}, so this segment must be \
+             marked for folding rather than sealed as final"
+        );
+        assert_eq!((seg.from_block, seg.to_block, seg.rows), (10, 11, 3));
+        // Queryable exactly as a final segment is: the typed reader sees it.
+        let back = read_segment_rows(&dir.path().join(SEGMENTS_DIR).join(&seg.file)).unwrap();
+        assert_eq!(
+            back.iter()
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 10, 11]
+        );
+    }
+
+    #[test]
+    fn a_provisional_segment_folds_into_the_tables_next_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let first = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let summary = seal_range(
+            dir.path(),
+            &[transfer(11, 0, "2"), transfer(12, 0, "3")],
+            11,
+            12,
+        )
+        .unwrap()
+        .unwrap();
+
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = only(&m, "usdc__transfer");
+        assert!(seg.provisional, "still under the floor, still folding");
+        assert_eq!(
+            (seg.from_block, seg.to_block, seg.rows),
+            (10, 12, 3),
+            "the folded segment spans from the first provisional cut to this one and holds every row"
+        );
+        assert_ne!(seg.hash, first.hash);
+        assert_eq!(
+            summary.rows, 2,
+            "rows sealed counts the rows that arrived, not the rows re-written: the metric would \
+             otherwise double-count every fold"
+        );
+        assert_eq!(
+            parquet_files(dir.path()),
+            vec![seg.file.clone()],
+            "the file the fold replaced must be gone from disk, or the fold only moved the small \
+             files problem from the manifest to the directory"
+        );
+        let back = read_segment_rows(&dir.path().join(SEGMENTS_DIR).join(&seg.file)).unwrap();
+        assert_eq!(
+            back.iter()
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn a_folded_segment_is_byte_identical_to_sealing_all_its_rows_at_once() {
+        // The fold reads the provisional Parquet back and re-seals; if that round trip lost or
+        // reshaped anything, the two operators - one who sealed in two cuts, one who sealed in
+        // one - would hold different content addresses for the same rows.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let first = vec![
+            transfer(10, 0, "1"),
+            transfer(10, 1, "2"),
+            approval(10, 2),
+            transfer(11, 0, "3"),
+        ];
+        let second = vec![approval(12, 0), transfer(12, 1, "4")];
+        seal_range(a.path(), &first, 10, 11).unwrap();
+        seal_range(a.path(), &second, 12, 12).unwrap();
+        let all: Vec<String> = first.iter().chain(second.iter()).cloned().collect();
+        seal_range(b.path(), &all, 10, 12).unwrap();
+
+        let ma = load_manifest(a.path()).unwrap();
+        let mb = load_manifest(b.path()).unwrap();
+        for table in ["usdc__transfer", "usdc__approval"] {
+            let folded = only(&ma, table);
+            let once = only(&mb, table);
+            assert_eq!(
+                folded.hash, once.hash,
+                "{table}: two cuts then a fold != one seal of the same rows"
+            );
+            assert_eq!(
+                (folded.from_block, folded.to_block, folded.rows),
+                (once.from_block, once.to_block, once.rows)
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_the_floor_makes_the_segment_final_and_the_next_cut_starts_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let half = SEAL_TABLE_FLOOR / 2;
+        seal_range(dir.path(), &transfers(1_000, half), 1_000, 1_999).unwrap();
+        assert!(only(&load_manifest(dir.path()).unwrap(), "usdc__transfer").provisional);
+
+        seal_range(dir.path(), &transfers(2_000, half), 2_000, 2_999).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let sealed = only(&m, "usdc__transfer");
+        assert!(
+            !sealed.provisional,
+            "{} rows is the floor, so the folded segment is final",
+            SEAL_TABLE_FLOOR
+        );
+        assert_eq!(
+            (sealed.from_block, sealed.to_block, sealed.rows),
+            (1_000, 2_999, SEAL_TABLE_FLOOR)
+        );
+
+        // A final segment is never reopened: the next handful of rows starts a new provisional
+        // beside it, which is what keeps the sealed layer append-only.
+        seal_range(dir.path(), &[transfer(3_000, 0, "x")], 3_000, 3_000).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let segs = &m.tables["usdc__transfer"];
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].hash, sealed.hash, "the final segment is untouched");
+        assert!(segs[1].provisional);
+        assert_eq!(
+            (segs[1].from_block, segs[1].to_block, segs[1].rows),
+            (3_000, 3_000, 1)
+        );
+        assert_eq!(parquet_files(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_busy_table_is_sealed_exactly_as_before_whatever_its_co_tenants_do() {
+        // The identity guarantee the floor must not touch: a table that clears the floor at a cut
+        // gets the same file, hash and range with a sparse table beside it as without one.
+        let with = tempfile::tempdir().unwrap();
+        let without = tempfile::tempdir().unwrap();
+        let busy = transfers(500, SEAL_TABLE_FLOOR + 7);
+        let mut mixed = busy.clone();
+        mixed.push(approval(600, 0));
+        seal_range(with.path(), &mixed, 500, 600).unwrap();
+        seal_range(without.path(), &busy, 500, 600).unwrap();
+
+        let a = only(&load_manifest(with.path()).unwrap(), "usdc__transfer");
+        let b = only(&load_manifest(without.path()).unwrap(), "usdc__transfer");
+        assert!(!a.provisional && !b.provisional);
+        assert_eq!(
+            (a.hash, a.file, a.from_block, a.to_block, a.rows),
+            (b.hash, b.file, b.from_block, b.to_block, b.rows)
+        );
+        assert!(
+            only(&load_manifest(with.path()).unwrap(), "usdc__approval").provisional,
+            "the one-row co-tenant is the one that folds"
+        );
+    }
+
+    #[test]
+    fn re_sealing_identical_rows_into_a_provisional_table_is_still_a_no_op() {
+        // The idempotency rule `nuthatch screen` re-audits rely on, checked before the fold: the
+        // same rows again must not be folded in a second time as if they were new.
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![transfer(10, 0, "1"), transfer(10, 1, "2")];
+        seal_range(dir.path(), &rows, 10, 10).unwrap();
+        let before = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let again = seal_range(dir.path(), &rows, 10, 10).unwrap().unwrap();
+        assert_eq!((again.tables, again.rows), (0, 0));
+        let after = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        assert_eq!((after.hash, after.rows), (before.hash, 2));
+        assert_eq!(parquet_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_fold_that_cannot_install_its_manifest_leaves_the_provisional_file_in_place() {
+        // The crash window Jules named on #1153: the replacement file written, the old file
+        // removed, and then the process dies before the manifest is installed. The manifest on
+        // disk would name a file that is gone and the folded rows would read as missing. So the
+        // old file goes only after `save_manifest` returns - and this makes `save_manifest` fail
+        // in the middle of a fold, which is the only order in which that property is observable.
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let first = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let first_path = dir.path().join(SEGMENTS_DIR).join(&first.file);
+        assert!(first_path.exists());
+
+        // `save_manifest` writes `manifest.json.tmp` then renames it; a directory in the way of
+        // the temp file fails the write before anything is installed.
+        let tmp = dir.path().join(SEGMENTS_DIR).join("manifest.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let err = seal_range(dir.path(), &[transfer(11, 0, "2")], 11, 11).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("manifest"),
+            "the fixture must fail at the manifest, not earlier: {err:#}"
+        );
+        assert!(
+            first_path.exists(),
+            "the provisional file was removed before the manifest that drops it was installed - \
+             a crash here loses every row in it"
+        );
+        assert_eq!(
+            only(&load_manifest(dir.path()).unwrap(), "usdc__transfer").hash,
+            first.hash,
+            "the on-disk manifest still names the file that is still there"
+        );
+
+        // With the way clear the same fold completes, and only then is the old file gone.
+        std::fs::remove_dir(&tmp).unwrap();
+        seal_range(dir.path(), &[transfer(11, 0, "2")], 11, 11).unwrap();
+        let folded = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        assert_eq!(folded.rows, 2);
+        assert!(!first_path.exists());
+        assert_eq!(parquet_files(dir.path()), vec![folded.file]);
+    }
+
+    #[test]
+    fn a_fold_in_a_shared_store_leaves_the_replaced_bytes_for_prune() {
+        // RFC-0033 §11a: bytes in the shared store may be another dataset's too, so a fold writes
+        // the new file and deletes nothing; the manifest stops referencing the old hash and
+        // `nuthatch prune` reclaims it from that.
+        let root = tempfile::tempdir().unwrap();
+        let nest = root.path().join(crate::runtime::DATA_DIR).join("nid-1");
+        std::fs::create_dir_all(&nest).unwrap();
+        seal_range(&nest, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let first = only(&load_manifest(&nest).unwrap(), "usdc__transfer");
+        seal_range(&nest, &[transfer(11, 0, "2")], 11, 11).unwrap();
+        let folded = only(&load_manifest(&nest).unwrap(), "usdc__transfer");
+        assert_ne!(first.hash, folded.hash);
+        let store = root.path().join(SEGMENTS_DIR);
+        assert!(store.join(format!("{}.parquet", first.hash)).exists());
+        assert!(store.join(format!("{}.parquet", folded.hash)).exists());
+        assert_eq!(folded.rows, 2);
+    }
+
+    #[test]
+    fn the_floor_is_measured_in_rows_a_table_holds_not_rows_a_cut_carries() {
+        // A cut of SEAL_DIRECT_BATCH rows where one table has all but three of them: the busy
+        // table is final at that cut, the sparse one is provisional, and stays provisional across
+        // as many cuts as it takes to reach the floor - one file, not one per cut.
+        let dir = tempfile::tempdir().unwrap();
+        let cuts = 5u64;
+        for c in 0..cuts {
+            let from = 1_000 * (c + 1);
+            let mut rows = transfers(from, SEAL_TABLE_FLOOR);
+            rows.push(approval(from + 500, 0));
+            rows.push(approval(from + 500, 1));
+            rows.push(approval(from + 501, 0));
+            rows.sort_by_key(|r| {
+                let v: Value = serde_json::from_str(r).unwrap();
+                (
+                    v["block_number"].as_u64().unwrap(),
+                    v["log_index"].as_u64().unwrap(),
+                )
+            });
+            seal_range(dir.path(), &rows, from, from + 999).unwrap();
+        }
+        let m = load_manifest(dir.path()).unwrap();
+        assert_eq!(
+            m.tables["usdc__transfer"].len(),
+            cuts as usize,
+            "the busy table gets one final segment per cut, as it always did"
+        );
+        assert!(m.tables["usdc__transfer"].iter().all(|s| !s.provisional));
+        let sparse = only(&m, "usdc__approval");
+        assert!(sparse.provisional);
+        assert_eq!(
+            (sparse.from_block, sparse.to_block, sparse.rows),
+            (1_000, 5_999, 3 * cuts as usize),
+            "five cuts of three rows is one fifteen-row file, not five three-row files"
+        );
+        assert_eq!(parquet_files(dir.path()).len(), cuts as usize + 1);
     }
 }

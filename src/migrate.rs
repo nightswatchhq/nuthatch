@@ -1128,6 +1128,7 @@ mod tests {
                     rows: 1,
                     file,
                     registry_snapshot: None,
+                    provisional: false,
                 }],
             );
             std::fs::write(
@@ -1210,6 +1211,7 @@ mod tests {
                     rows: 1,
                     file,
                     registry_snapshot: None,
+                    provisional: false,
                 }],
             );
             std::fs::write(

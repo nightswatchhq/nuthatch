@@ -6410,6 +6410,136 @@ mod tests {
         );
     }
 
+    /// #1150 - the window-independence property, end to end, on a nest of **many tables** with the
+    /// table floor in play. The three tests above prove the *cut* is a function of the data through
+    /// the in-memory drain; this one carries the same drain through the real `seal_range` into a
+    /// directory per operator, with a busy table and two sparse ones, and compares what lands on
+    /// disk: every segment's hash, range and provisional flag, per table. A sparse table folds
+    /// across cuts, and the fold must be as window-independent as the cut is - which it is only
+    /// because both are stated in rows counted from the data.
+    #[test]
+    fn many_table_seal_output_is_identical_across_fetch_windows_with_the_floor_in_play() {
+        let blocks = 30_000u64;
+        let mut rows: Vec<SealRow> = Vec::new();
+        for b in 0..blocks {
+            for i in 0..((b % 7) + 1) {
+                rows.push((
+                    b,
+                    i,
+                    format!(r#"{{"table":"busy","block_number":{b},"log_index":{i},"v":"{i}"}}"#),
+                ));
+            }
+            // About one row in 200 of the busy table's: under the floor at every cut, so it folds.
+            if b % 50 == 0 {
+                rows.push((
+                    b,
+                    10,
+                    format!(r#"{{"table":"sparse_a","block_number":{b},"log_index":10}}"#),
+                ));
+            }
+            // Rarer still: a handful of rows across the whole corpus, one provisional file at the end.
+            if b % 700 == 0 {
+                rows.push((
+                    b,
+                    11,
+                    format!(r#"{{"table":"sparse_b","block_number":{b},"log_index":11}}"#),
+                ));
+            }
+        }
+        assert!(rows.len() > SEAL_DIRECT_BATCH * 3);
+
+        /// One segment as it lands in the manifest: `(hash, from_block, to_block, rows, provisional)`.
+        type Landed = (String, u64, u64, usize, bool);
+        let run = |window: u64| -> std::collections::BTreeMap<String, Vec<Landed>> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut buf: Vec<SealRow> = Vec::new();
+            let mut from = 0u64;
+            let mut batch_from = 0u64;
+            while from < blocks {
+                let to = (from + window - 1).min(blocks - 1);
+                let fetch_from = overlap_from(from, 0);
+                merge_window_rows(
+                    &mut buf,
+                    fetch_from,
+                    rows.iter()
+                        .filter(|r| r.0 >= fetch_from && r.0 <= to)
+                        .cloned(),
+                )
+                .unwrap();
+                from = to + 1;
+                drain_all_sealable(
+                    &mut buf,
+                    tail_hold(to, to >= blocks - 1),
+                    |json, seal_to| {
+                        seal::seal_range(dir.path(), &json, batch_from, seal_to)?;
+                        batch_from = seal_to + 1;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            if !buf.is_empty() {
+                seal::seal_range(
+                    dir.path(),
+                    &drain_sealable(&mut buf),
+                    batch_from,
+                    blocks - 1,
+                )
+                .unwrap();
+            }
+            seal::load_manifest(dir.path())
+                .unwrap()
+                .tables
+                .into_iter()
+                .map(|(t, segs)| {
+                    (
+                        t,
+                        segs.into_iter()
+                            .map(|s| (s.hash, s.from_block, s.to_block, s.rows, s.provisional))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+
+        let reference = run(320);
+        // The premise: the floor did something here. `busy` is final at every cut; each sparse
+        // table is a single file that folded across many cuts rather than one file per cut.
+        let cuts = reference["busy"].len();
+        assert!(
+            cuts > 3,
+            "the corpus crossed the threshold only {cuts} times"
+        );
+        // Every cut of the busy table is final; only the range-end flush of its remainder may be
+        // provisional, and that one folds into the next cut when the nest carries on.
+        assert!(
+            reference["busy"][..cuts - 1].iter().all(|s| !s.4),
+            "busy is final at every cut"
+        );
+        for t in ["sparse_a", "sparse_b"] {
+            assert_eq!(
+                reference[t].len(),
+                1,
+                "{t} should be one folded file across {cuts} cuts, not one per cut: {:?}",
+                reference[t]
+            );
+            assert!(
+                reference[t][0].4,
+                "{t} is under the floor and so provisional"
+            );
+        }
+        assert_eq!(reference["sparse_a"][0].3, (blocks / 50) as usize);
+
+        for window in [7u64, 4_999, 163_840] {
+            let got = run(window);
+            assert_eq!(
+                got, reference,
+                "window={window} produced different segments from window=320 on a many-table \
+                 nest - the fold, not only the cut, has to be a function of the data (#1150)"
+            );
+        }
+    }
+
     fn entity_json(block: u64, i: u64) -> String {
         format!(r#"{{"table":"t__x","block_number":{block},"log_index":{i},"v":"{i}"}}"#)
     }

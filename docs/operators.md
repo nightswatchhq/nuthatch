@@ -489,7 +489,7 @@ bundle hash, so it neither invalidates segment reuse nor forces a re-index.
 
 ## Running an unlisted EVM chain
 
-Ethereum mainnet, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism and Monad are **built in**:
+Ethereum mainnet, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism, Monad and Robinhood Chain are **built in**:
 keyless public endpoints, a tuned
 `eth_getLogs` window, chain-appropriate finality, and bytecode probing so `init` can detect which of
 them a contract lives on.
@@ -572,6 +572,45 @@ Three things to know before a Monad backfill, all measured on 2026-09-03:
   starts from a tip offset. Set `start_block` in `nuthatch.toml`, or pass `--backfill <blocks>`, for
   the history you actually want; at 300 ms a block a day is 288,000 blocks.
 - **Alert on tip lag in seconds, not blocks.** At 300 ms a block, twenty blocks behind is six seconds.
+
+### Robinhood Chain: Arbitrum's policy, one endpoint, and a rate limit per second
+
+Robinhood Chain (chain id `4663`) is an Arbitrum Nitro L2 and ships with Arbitrum One's policy:
+`FinalizedTag`, sealing at the node's `finalized` tag, which ran about twenty minutes (12,000
+blocks) behind tip on 2026-09-04. The `safe` tag is served too and runs about seven minutes closer;
+nuthatch has no `safe` policy, so it does not use it, and the difference is latency rather than
+safety. The fallback depth, which only runs on an endpoint that stops serving the tag, is 15,000
+blocks: this chain does ten blocks a second, so a depth copied from a slower chain would sit inside
+the unfinalised window.
+
+Three things to know, measured on 2026-09-04:
+
+- **One shipped endpoint, `rpc.mainnet.chain.robinhood.com`, and it throttles per second.** It
+  serves a 640-block address-filtered window on the busiest token and a batch of 5, and it answers
+  the archive probe with HTTP 429. Hit it hard and every call is 429 for a while: a `doctor` run
+  straight after a sampling pass read a window of 40. The shipped window is 320. For a backfill in
+  anger bring `--rpc` at a keyed provider; the two other keyless hosts that answer the chain id
+  cannot back a nest (one lacks `eth_blockNumber`, the other wants an archive token).
+- **Timestamps are what the throttle bites on.** The endpoint's batch limit is 5, so a 320-block
+  window's `block_timestamps` fetch is 64 batch calls, and the per-second limit answers most of
+  them 429: a keyless `dev` with timestamps on spent two minutes retrying its first window and
+  indexed nothing. The same nest scaffolded with `init --no-timestamps` backfilled 2,000 blocks
+  (23,953 USDG transfers) in 16 s with not one 429. So the zero-setup demo on this chain is
+  `--no-timestamps`; timestamps want a keyed endpoint, whose batch limit is not 5 - the same
+  nest with timestamps on, `dev --rpc <Alchemy>`, did 2,000 blocks in 14 s at 2,286 events/s. One
+  thing to know about those timestamps: at ten blocks a second, about ten blocks share each
+  one-second `block_timestamp`, so it orders blocks only to the second.
+- **The tag policy was exercised, not assumed.** The keyless nest above, left following, sealed
+  its first two cuts at the `finalized` tag inside 25 minutes (40,014 rows, `nuthatch_reorgs_total`
+  0), the delay being the tag's own lag past the nest's start block plus the 20,000-row batch.
+- **Keyless `init` works where Sourcify does.** USDG and WETH, the two busiest contracts, are
+  verified through their proxies. The Stock Tokens (`MSTR`, `AMC`, `SPY`, ...) are 283-byte proxies
+  that are not, and the explorer's Blockscout API sits behind a Cloudflare challenge, so it is not
+  wired as a keyless source. A Stock Token is an ERC-20: `--abi` with the standard ERC-20 ABI
+  indexes its transfers, and that is the ABI nobody needs to fetch.
+- **The chain is busy.** About 148 logs a block from three thousand emitters, and a window of 320
+  blocks on a busy token sits under the endpoint's 10,000-log result cap with room; on a busier one
+  the chunker narrows from the refusal, which the endpoint states in words.
 
 ---
 
