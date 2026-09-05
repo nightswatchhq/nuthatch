@@ -2846,9 +2846,18 @@ mod tests {
         async fn max_in_flight(parallel: bool) -> usize {
             // When each request was inside the server. Concurrency then becomes a question about
             // these intervals rather than about the instant a counter happened to be read.
-            static INTERVALS: std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>> =
-                std::sync::Mutex::new(Vec::new());
+            // Entry recorded the moment a request arrives, exit filled in when it is answered - or
+            // never, for a request the client abandoned. An open entry is a request still in
+            // flight, which is exactly what the count below needs it to be.
+            type Intervals = Vec<(std::time::Instant, Option<std::time::Instant>)>;
+            static INTERVALS: std::sync::Mutex<Intervals> = std::sync::Mutex::new(Vec::new());
+            // How many half-sized requests have entered the server so far in this leg; what a held
+            // half watches for its peer. `HALF` is the size of one half of `blocks` below.
+            static HALVES_ENTERED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            const HALF: usize = 4;
             INTERVALS.lock().unwrap().clear();
+            HALVES_ENTERED.store(0, std::sync::atomic::Ordering::SeqCst);
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = l.local_addr().unwrap();
             tokio::spawn(async move {
@@ -2876,18 +2885,67 @@ mod tests {
                         // the server stops the client dispatching B, so the barrier never trips and a
                         // genuinely concurrent client looks sequential - measured, not theorised.
                         //
-                        // Overlap of *recorded intervals* has neither problem. Nothing blocks, so the
-                        // client behaves normally, and the answer does not depend on when anything is
-                        // sampled - only on whether two requests were actually inside the server at
-                        // the same time, which is the property being asserted.
+                        // Overlap of *recorded intervals* has neither problem. Nothing blocks the
+                        // client, and the answer does not depend on when anything is sampled - only
+                        // on whether two requests were actually inside the server at the same time,
+                        // which is the property being asserted.
+                        //
+                        // What that version still had was a **fixed 50 ms hold** to give each
+                        // interval width, and a fixed hold is a race with a wider margin, not the
+                        // absence of one: on a loaded scheduler the second request can take longer
+                        // than 50 ms to reach the server, the first has already left, and the mark
+                        // reads 1. It did, in two of three full parallel `cargo test --lib` runs on
+                        // a 2026-09-05 macOS box, on branches that do not touch this file (#1155).
+                        //
+                        // So the hold is now **until the peer has entered, or a deadline**, and it
+                        // applies to the two requests that are meant to be concurrent and to no
+                        // other. The descent this server provokes is: the whole eight-block batch
+                        // fails alone, then the two four-block halves go out (together under
+                        // `parallel=true`, one after the other under `false`), then each half
+                        // descends serially to twos and ones. Only the halves can ever overlap, and
+                        // the server can tell a half by its size. Holding anything else waits for a
+                        // peer that by construction cannot arrive until the held request returns -
+                        // which is what the `Barrier` above ran into, and what a first cut of this
+                        // version did too, holding the eight-block batch for the full deadline and
+                        // reading 1 every time.
+                        //
+                        // In the parallel leg the second half's arrival releases the first, so the
+                        // first interval necessarily contains the second's entry and the overlap is
+                        // 2 by construction, whatever the scheduler is doing, as long as the peer
+                        // turns up inside the deadline. In the sequential leg no peer comes while a
+                        // half is held - that is the property - so it waits out the deadline, and
+                        // the two intervals are disjoint. The deadline is the only wall-clock number
+                        // left and it is on the safe side: a slow peer makes the parallel leg wait
+                        // longer, not read wrong, unless it is slower than a second and a half. The
+                        // cost is the sequential leg, which pays the deadline once: the held half
+                        // descends to a one-block failure and the client gives up before the other
+                        // half is ever dispatched.
+                        //
+                        // Entries are recorded **on arrival**, exits when answered, because the
+                        // client does not wait for the held half: the released half descends to a
+                        // one-block failure in three round trips, `try_join!` returns that error and
+                        // drops the held half's request, and the test computes its answer while the
+                        // held half is still inside its poll. Recorded at exit, that half's interval
+                        // did not exist yet and the parallel leg read 1 - measured, not theorised, on
+                        // the first cut of this version. Recorded at entry, it is an open interval
+                        // that contains the peer's arrival, whatever happens to it afterwards.
+                        const PEER_WAIT: std::time::Duration =
+                            std::time::Duration::from_millis(1500);
                         let entered = std::time::Instant::now();
-                        // A modest hold so each interval has width; without it two genuinely
-                        // concurrent requests can both be instantaneous and never be seen to overlap.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        INTERVALS
-                            .lock()
-                            .unwrap()
-                            .push((entered, std::time::Instant::now()));
+                        let slot = {
+                            let mut iv = INTERVALS.lock().unwrap();
+                            iv.push((entered, None));
+                            iv.len() - 1
+                        };
+                        if n_items == HALF {
+                            HALVES_ENTERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            while HALVES_ENTERED.load(std::sync::atomic::Ordering::SeqCst) < 2
+                                && entered.elapsed() < PEER_WAIT
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                        }
+                        INTERVALS.lock().unwrap()[slot].1 = Some(std::time::Instant::now());
                         let items: Vec<String> = (0..n_items)
                             .map(|i| format!(
                                 r#"{{"jsonrpc":"2.0","id":{i},"error":{{"code":-32000,"message":"requested block is not available on this node"}}}}"#
@@ -2905,15 +2963,25 @@ mod tests {
             });
             let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
             let blocks: Vec<u64> = (1..=8).collect();
+            assert_eq!(
+                blocks.len(),
+                2 * HALF,
+                "the server recognises a half by its size"
+            );
             let _ = c.fetch_timestamp_batch(&blocks, false, parallel).await;
 
-            // The most intervals open at any one moment, computed from the record - so it cannot
-            // miss an overlap by looking at the wrong time.
+            // The most requests in flight at any one moment, computed from the record - so it
+            // cannot miss an overlap by looking at the wrong time. A request is in flight at an
+            // instant if it had entered and had not yet been answered; one never answered is in
+            // flight from its entry onwards. Closed at both ends, so a request answered at once
+            // still counts as in flight at its own entry.
             let iv = INTERVALS.lock().unwrap().clone();
             iv.iter()
                 .map(|(a_in, _)| {
                     iv.iter()
-                        .filter(|(b_in, b_out)| b_in <= a_in && a_in < b_out)
+                        .filter(|(b_in, b_out)| {
+                            b_in <= a_in && b_out.is_none_or(|b_out| *a_in <= b_out)
+                        })
                         .count()
                 })
                 .max()
