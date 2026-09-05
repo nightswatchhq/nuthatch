@@ -547,13 +547,12 @@ this is not a reorg margin - it is an **execution** margin. Monad executes a blo
 after consensus finalises it, and a probe that reads logs for a block finalised but not yet executed
 would get an empty list, indistinguishable from an empty block. Every probe on 2026-09-03 found
 receipts complete at `latest`, but eight samples are not an invariant, so eight blocks buys the margin
-instead. Do not raise the depth by analogy with an L2 - anything past `finalized` is final - and do
-not lower it to the tag by analogy either. The soak RFC-0051's addendum asked for ran on 2026-09-04:
-24 hours, three endpoints,
-648,532 reads of `finalized` and its receipts, zero short answers, and the boundary still stays at
-eight, because the tail refetch covers two blocks of a three-block execution deferral and a day of
-clean reads is evidence about three endpoints rather than a runtime guarantee (RFC-0051 addendum
-item 16).
+instead. Do not raise the depth by analogy with an L2 - anything past `finalized` is final - and do not lower
+it to the tag by analogy either. The soak RFC-0051's addendum asked for ran on 2026-09-04: 24 hours,
+three endpoints, 648,532 reads of `finalized` and its receipts, zero short answers, and the boundary
+still stays at eight, because the tail refetch covers two blocks of a three-block execution deferral
+and a day of clean reads is evidence about three endpoints rather than a runtime guarantee (RFC-0051
+addendum item 16).
 
 Three things to know before a Monad backfill, all measured on 2026-09-03:
 
