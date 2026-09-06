@@ -129,6 +129,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
     let config = Config {
         state_rpc_urls: Vec::new(),
         read_only_role: false,
+        freshness: Default::default(),
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
@@ -676,6 +677,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let config = Config {
         state_rpc_urls: Vec::new(),
         read_only_role: false,
+        freshness: Default::default(),
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {

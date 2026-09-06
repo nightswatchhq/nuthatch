@@ -56,6 +56,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // takes `&Config`, and `#[serde(skip)]` keeps them out of `nuthatch.toml` and so out of the NID.
     config.state_rpc_urls = args.state_rpc.clone();
     config.ipfs_gateways = args.ipfs.clone();
+    // The freshness dial (RFC-0040) rides the same way: an operator's cadence is not the nest's identity.
+    config.freshness = crate::freshness::Freshness {
+        poll_interval: args.poll_interval,
+        finality_only: args.finality_only,
+    };
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
     // touching the nest's config on disk.
@@ -1516,6 +1521,9 @@ async fn runtime_index_loop(
 
     let mut chunker = AdaptiveWindow::for_window(window);
     let mut poll_failures = 0u32;
+    // One dial per cursor (RFC-0040). Every nest on it was mounted by the same operator flags, so
+    // they agree; if they ever did not, the cursor is as fresh as its most demanding nest needs.
+    let freshness = cursor_freshness(nests.iter().flatten());
     // Same periodic "at tip / N behind" restatement as the solo loop (issue #302), against the
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
@@ -1603,9 +1611,17 @@ async fn runtime_index_loop(
         // Only live nests take part: a quarantined nest is not a valid reorg reference (its store
         // stopped advancing) and must not be rolled back (RFC-0026 §3.1).
         let max_next = live.iter().map(|&i| nexts[i]).max().unwrap();
-        if max_next > 0 {
-            // Any caught-up nest is a valid checkpoint reference; use one at the max height.
-            let reference = *live.iter().find(|&&i| nexts[i] == max_next).unwrap();
+        // Any caught-up nest is a valid checkpoint reference; use one at the max height. It also
+        // names the chain's finality policy, which under `--finality-only` is the cursor's ceiling.
+        let reference = *live.iter().find(|&&i| nexts[i] == max_next).unwrap();
+        let ceiling = cursor_ceiling(
+            source.as_ref(),
+            live_ref(&nests, reference).finality,
+            freshness,
+            tip,
+        )
+        .await;
+        if max_next > 0 && reorg_check_due(freshness, max_next, ceiling) {
             match detect_reorg(
                 source.as_ref(),
                 &live_ref(&nests, reference).store,
@@ -1628,8 +1644,8 @@ async fn runtime_index_loop(
         // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
         let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         heartbeat.maybe_log(global_next, tip);
-        if global_next > tip {
-            sleep_secs(2).await;
+        if global_next > ceiling {
+            sleep_for(freshness.poll_interval).await;
             continue;
         }
         // A blocks nest pays one header request per block, so a window that is cheap in logs can still
@@ -1656,7 +1672,7 @@ async fn runtime_index_loop(
             crate::chunker::MAX_WINDOW
         };
         chunker.set_max(window_cap);
-        let to = (global_next + chunker.window() - 1).min(tip);
+        let to = (global_next + chunker.window() - 1).min(ceiling);
 
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
@@ -2333,6 +2349,7 @@ async fn build_nest(
 
     let shared_store = store.clone();
     let nest = NestIngest {
+        freshness: config.freshness,
         name: config.nest.name.clone(),
         dir: dir.clone(),
         store: shared_store.clone(),
@@ -2418,6 +2435,7 @@ async fn build_nest(
     });
 
     let app_state = serve::AppState {
+        freshness: config.freshness,
         store: shared_store.clone(),
         // Not `primary()?`: that errors "nest has no contracts", which turned a field the summary
         // renders into a hard refusal to build a contract-free blocks nest (#445).
@@ -4187,6 +4205,9 @@ pub struct NestIngest {
     /// Tier 3 needs archive state and RFC-0024 is explicit that it comes from the operator, so it is
     /// its own client and its absence is refused at startup rather than discovered mid-backfill.
     state_rpc: Option<Arc<crate::rpc::RpcClient>>,
+    /// The freshness dial (RFC-0040): the poll interval and whether the cursor stops at finality.
+    /// Operator setting, never identity - see `Config::freshness`.
+    freshness: crate::freshness::Freshness,
 }
 
 impl NestIngest {
@@ -5363,21 +5384,33 @@ async fn index_loop(
         };
         nest.metrics.set_tip(tip);
 
-        if let Some(new_next) = nest.handle_reorg(source.as_ref(), next).await? {
-            next = new_next;
-            continue;
+        // RFC-0040 §3 knob 2. Under `--finality-only` the cursor's ceiling is the finality boundary,
+        // not the tip. Nothing at or below it can be reorged, so once the store holds no row above
+        // it the reorg check is not paid either; until then - a nest switched into this mode with
+        // unfinalised rows still in its hot store - the check runs exactly as before, because those
+        // rows are as exposed as they ever were.
+        let ceiling = cursor_ceiling(source.as_ref(), nest.finality, nest.freshness, tip).await;
+        if reorg_check_due(nest.freshness, next, ceiling) {
+            if let Some(new_next) = nest.handle_reorg(source.as_ref(), next).await? {
+                next = new_next;
+                continue;
+            }
         }
 
         heartbeat.maybe_log(next, tip);
 
-        if next > tip {
-            // Reached the tip. If this was the initial backfill, announce it once and latch.
+        if next > ceiling {
+            // Reached the ceiling - the tip, or the finality boundary under `--finality-only`. If this
+            // was the initial backfill, announce it once and latch.
             if let Some(p) = progress.take() {
                 p.finish(next.saturating_sub(1), true);
             }
             caught_up = true;
-            // Poll for new blocks.
-            sleep_secs(2).await;
+            // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
+            // when a window commits, a reorg check, a checkpoint hash and a `finalized` probe -
+            // whether or not any block carried an event. At two seconds that is the whole bill of a
+            // sparse nest; at five minutes it is a hundredth of it, for the same rows.
+            sleep_for(nest.freshness.poll_interval).await;
             continue;
         }
 
@@ -5387,7 +5420,7 @@ async fn index_loop(
             progress
                 .get_or_insert_with(|| crate::progress::Backfill::new("backfilling", next, tip));
         }
-        let to = (next + chunker.window() - 1).min(tip);
+        let to = (next + chunker.window() - 1).min(ceiling);
         // A contract-free nest (`blocks = true`, no `[[contracts]]` - OBIB case 3) has both halves of
         // its filter empty, which asks a node for every log on the chain. #421 and #429 guarded the
         // backfill paths and left this one, which is the worse of the two: it repeats for as long as
@@ -6209,6 +6242,56 @@ fn rebuild_children(
 
 async fn sleep_secs(s: u64) {
     tokio::time::sleep(std::time::Duration::from_secs(s)).await;
+}
+
+async fn sleep_for(d: std::time::Duration) {
+    tokio::time::sleep(d).await;
+}
+
+/// The highest block a cursor may index this iteration (RFC-0040 §3 knob 2). The tip unless the
+/// dial says finality-only, in which case the chain policy's boundary for this tip - one `finalized`
+/// probe when the policy has the tag, no call at all for a depth policy.
+async fn cursor_ceiling(
+    source: &dyn Source,
+    finality: Finality,
+    freshness: crate::freshness::Freshness,
+    tip: u64,
+) -> u64 {
+    if !freshness.finality_only {
+        return tip;
+    }
+    let finalized_tag = match finality {
+        Finality::FinalizedTag { .. } => source.finalized().await.ok().flatten(),
+        Finality::Depth(_) => None,
+    };
+    freshness.ceiling(tip, seal_ceiling(finality, tip, finalized_tag))
+}
+
+/// Whether this iteration pays for a reorg check. Always on the tip path. Under finality-only, only
+/// while the store still holds a block above the ceiling - `next - 1` is the last block committed,
+/// and a block at or below finality cannot be reorged, so once the cursor has been inside the
+/// boundary for one window the check is pure cost.
+fn reorg_check_due(freshness: crate::freshness::Freshness, next: u64, ceiling: u64) -> bool {
+    !freshness.finality_only || next.saturating_sub(1) > ceiling
+}
+
+/// The dial a shared cursor runs at: the shortest interval any of its nests asked for, and
+/// finality-only only if every nest asked for it - a nest that wants the tip must not be held at
+/// finality by a co-tenant that does not.
+fn cursor_freshness<'a>(
+    nests: impl Iterator<Item = &'a NestIngest>,
+) -> crate::freshness::Freshness {
+    let mut out: Option<crate::freshness::Freshness> = None;
+    for n in nests {
+        out = Some(match out {
+            None => n.freshness,
+            Some(acc) => crate::freshness::Freshness {
+                poll_interval: acc.poll_interval.min(n.freshness.poll_interval),
+                finality_only: acc.finality_only && n.freshness.finality_only,
+            },
+        });
+    }
+    out.unwrap_or_default()
 }
 
 /// Log a failed tip poll with escalating severity and return the incremented consecutive-failure count
@@ -12377,6 +12460,219 @@ template="pool"
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         f()
+    }
+
+    // ---- RFC-0040, the freshness dial (#1173) ----------------------------------------------
+
+    /// A chain at 1,000 whose `finalized` tag sits at 900. Records every `getLogs` span and counts
+    /// tip polls and finality probes, so a test can see which boundary the loop indexed to and how
+    /// often it asked.
+    struct FinalityRecordingSource {
+        tops: std::sync::Mutex<Vec<u64>>,
+        tip_polls: std::sync::atomic::AtomicUsize,
+        finalized_probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FinalityRecordingSource {
+        const TIP: u64 = 1_000;
+        const FINALIZED: u64 = 900;
+        fn new() -> Self {
+            FinalityRecordingSource {
+                tops: std::sync::Mutex::new(Vec::new()),
+                tip_polls: std::sync::atomic::AtomicUsize::new(0),
+                finalized_probes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn highest_asked(&self) -> Option<u64> {
+            self.tops.lock().unwrap().iter().copied().max()
+        }
+        fn windows(&self) -> usize {
+            self.tops.lock().unwrap().len()
+        }
+        fn polls(&self) -> usize {
+            self.tip_polls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn probes(&self) -> usize {
+            self.finalized_probes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FinalityRecordingSource {
+        async fn tip(&self) -> Result<u64> {
+            self.tip_polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Self::TIP)
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            self.finalized_probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(Self::FINALIZED))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.tops.lock().unwrap().push(to);
+            Ok(Vec::new())
+        }
+    }
+
+    /// A plain one-contract nest on a `FinalizedTag` chain (Arbitrum One), built through the real
+    /// constructor with the dial set the way `dev()` sets it from the flags.
+    async fn build_dialled_nest(
+        dir: &std::path::Path,
+        freshness: crate::freshness::Freshness,
+    ) -> NestIngest {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir).unwrap();
+        assert!(
+            matches!(config_finality(&config), Finality::FinalizedTag { .. }),
+            "the fixture chain must use the `finalized` tag, or finality-only has no probe to make"
+        );
+        config.freshness = freshness;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest
+    }
+
+    fn config_finality(config: &Config) -> Finality {
+        crate::chains::lookup(&config.nest.chain)
+            .map(|c| c.finality)
+            .unwrap_or(Finality::Depth(0))
+    }
+
+    /// Drive `index_loop` from 200 blocks behind until it has stopped asking, then report the highest
+    /// block any `getLogs` covered.
+    async fn highest_block_indexed(nest: NestIngest) -> (u64, usize) {
+        let src = Arc::new(FinalityRecordingSource::new());
+        let recorder = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(200),
+            false,
+            1,
+            50,
+        ));
+        // The loop is at its ceiling once the windows stop arriving: wait for the first, then for a
+        // quiet second with no new one.
+        assert!(
+            within_deadline(|| recorder.windows() >= 1).await,
+            "no window was ever fetched"
+        );
+        let mut seen = recorder.windows();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let now = recorder.windows();
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+        task.abort();
+        (recorder.highest_asked().unwrap_or(0), recorder.probes())
+    }
+
+    /// `--finality-only` caps the cursor at the chain's `finalized` block (RFC-0040 §3 knob 2): a
+    /// source at 1,000 with finality at 900 is indexed to 900 and no further, and the boundary was
+    /// asked for rather than assumed. The control below is the same nest on the tip path reaching
+    /// 1,000, so a ceiling that quietly reverted to `tip` fails this test rather than passing it.
+    #[tokio::test]
+    async fn finality_only_indexes_to_the_finalized_block_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(
+            tmp.path(),
+            crate::freshness::Freshness {
+                finality_only: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (highest, probes) = highest_block_indexed(nest).await;
+        assert_eq!(
+            highest,
+            FinalityRecordingSource::FINALIZED,
+            "finality-only asked for blocks above the finalized boundary"
+        );
+        assert!(
+            probes >= 1,
+            "finality-only never asked the source where finality is"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tip_path_still_indexes_to_the_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
+        let (highest, _probes) = highest_block_indexed(nest).await;
+        assert_eq!(highest, FinalityRecordingSource::TIP);
+    }
+
+    /// `--poll-interval` is how long a caught-up cursor waits before asking again (knob 1). Under a
+    /// paused clock an hour passes in an instant, so the count of tip polls is the cadence itself:
+    /// twelve-ish at five minutes, where the two-second default would have made ~1,800. The tolerance
+    /// covers the catch-up polls before the cursor first reaches the tip.
+    #[tokio::test(start_paused = true)]
+    async fn a_caught_up_cursor_polls_at_the_interval_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(
+            tmp.path(),
+            crate::freshness::Freshness {
+                poll_interval: std::time::Duration::from_secs(300),
+                finality_only: false,
+            },
+        )
+        .await;
+        let src = Arc::new(FinalityRecordingSource::new());
+        let recorder = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(10),
+            false,
+            1,
+            50,
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+        task.abort();
+        let polls = recorder.polls();
+        assert!(
+            (10..=20).contains(&polls),
+            "expected roughly twelve tip polls in a virtual hour at a five-minute interval, got {polls}"
+        );
     }
 
     /// `index_loop` writes one block row per block for a tip window on a blocks nest, including
