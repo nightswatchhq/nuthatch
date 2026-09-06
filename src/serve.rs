@@ -2061,7 +2061,7 @@ fn sql_response(
             // A caller citing this answer needs to know both. Absent when the statement
             // referenced no entity, and absent when the parse was unavailable - see
             // `QueryOutput::referenced_tables`, which is why this is not an empty array.
-            "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref(), &watermarks),
+            "entities": sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
         },
     }))
     .into_response()
