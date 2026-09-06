@@ -75,10 +75,11 @@ a matter of trimming. Two facts decide the shape of the work:
    average; a 45-second sample of a five-minute cursor sees zero polls or one depending on where it
    starts, and normalising that to a minute proves nothing. The closing measurement is the
    difference in `nuthatch_rpc_methods_total` per method between two scrapes **at least one hour
-   apart** (twelve or more intervals, so phase is noise), divided by the elapsed minutes, and
-   repeated over a full day before the number is written down. The sprint's number is that table.
+   apart** (twelve or more intervals, so phase is noise), divided by the elapsed minutes. One hour,
+   not a day: Chief's rule of 2026-09-06 is that no test or measurement in this sprint runs longer than
+   an hour, and the sprint closes today. The sprint's number is that table.
 3. **#1165 - the 3.4.0 segfaults.** 3.4.1 has held on 8107 since the evening of 2026-09-05 with the
-   concurrency permit at one. Close when 3.5.0 has run a day on 8107 and the replay soak
+   concurrency permit at one. Close when 3.5.0 has run an hour on 8107 with four permits and the replay soak
    (`replay-soak.py`, the 44 captured statements, concurrency four) completes without a crash under
    the memory budget. A day without a crash under a single permit is not that evidence.
 4. **#1160 and #1078 - Lodestar without the key.** Every `NUTHATCH_*` flag has been on in production
@@ -106,9 +107,11 @@ a matter of trimming. Two facts decide the shape of the work:
 8. **#1147 and #1148 - Monad in the field, and the Perpl nest.** The nest exists and is 26% through
    its backfill (seal_direct_completed 67,004,198 of 102,151,917). It does **not** restart on the
    Alchemy key. After #1170 lands it restarts on the three public Monad endpoints its config already
-   lists, with a poll interval, and either finishes the backfill for nothing or produces the evidence
-   that public Monad endpoints cannot sustain it - in which case both issues are parked with that
-   measurement attached, and the park is the close.
+   lists, with a poll interval, and is watched for an hour. If the public endpoints carry the
+   backfill, it continues on them for nothing; if within that hour they cannot (429s collapsing the
+   window, or a rate below what finishes in days), Chief's 2026-09-06 decision applies: the Alchemy
+   Monad key may be used for the backfill, knowingly, at the measured rate (~57k CU/min while it
+   runs), and both issues close when the backfill reaches tip and #1147's criteria are checked.
 
 ## The call
 
@@ -116,7 +119,8 @@ a matter of trimming. Two facts decide the shape of the work:
 is either the cost work itself, the evidence the cost work needs, or the migration's last mile.
 
 **The number that closes the sprint is measured, not projected.** Step 2's table - counter deltas
-over at least an hour, then a day, never a 45-second sample of a five-minute cursor - with the
+over one hour, never a 45-second sample of a five-minute cursor and never longer than the hour
+Chief allowed - with the
 Lodestar nests under 1,000 CU a minute between them. At Alchemy's rates that is under $20 a month;
 the $100 target has headroom for a second key or a worse month.
 
