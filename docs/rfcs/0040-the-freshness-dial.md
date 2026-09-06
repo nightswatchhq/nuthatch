@@ -103,3 +103,27 @@ An indie dev with one contract and a free RPC key is the golden path. Today that
 tip-following bill sized for a production feed, with a 7x rate-limit multiplier on top, whether or
 not anybody reads the data more than once a day. **Fastest is a benchmark. Cheapest is whether
 somebody can afford to keep it running.**
+
+## §6 - Addendum, 2026-09-06: what the measurement said about §3's order
+
+Knobs 1 and 2 shipped under carve-out 5 (#1173). Before a line was written, the bill was measured on
+the Lodestar box against a paid endpoint: the allocations nest at tip spent 268 `eth_getBlockByNumber`,
+61 `eth_getLogs` and 84 `eth_blockNumber` a minute, ~9,900 CU a minute. Of that day's 345,600
+Arbitrum blocks, **95** carried a Graph event.
+
+§1 attributed the header term to `block_timestamps`. That was already false when it was written: #765
+buys headers only for blocks that produced a kept row. The header per block is the poll loop's own -
+a reorg check on every two-second poll, a checkpoint hash and a `finalized` probe on every committed
+window - so the bill is the cadence, not the data.
+
+That inverts §3's ordering. **Knob 1, the poll interval, is the big one**: at five minutes the same
+nest spends on the order of 100 CU a minute for the same rows. Knob 2, finality-only, is worth having
+for what it removes from the reorg surface - nothing held can reorg, so the check is not paid and the
+hot store carries only rows waiting to seal - but its saving over knob 1 alone is small, and it costs
+Arbitrum's fifteen-to-twenty-minute `finalized` lag. Knob 4 is #1170. Knob 3 stays out, per §4.
+
+§4 holds as built: `/ready` reports `freshness.mode` and `freshness.poll_interval_secs` and scales its
+stall thresholds to the interval; nothing is interpolated; sealing is untouched. One honesty about the
+third condition: two tip-following runs already cut segments at different block ranges, because a
+segment boundary depends on when finality advanced relative to a window. What is byte-identical is a
+segment's content for a given range and set of rows, and that is what the condition means.

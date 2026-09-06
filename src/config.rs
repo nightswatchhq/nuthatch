@@ -68,6 +68,12 @@ pub struct Config {
     /// `state_rpc_urls`, and `#[serde(skip)]` because a role is not data identity.
     #[serde(skip)]
     pub read_only_role: bool,
+    /// How often the cursor asks for the tip, and whether it stops at finality (RFC-0040, #1173).
+    /// Set from `--poll-interval` / `--finality-only`; `#[serde(skip)]` because how often an operator
+    /// asks is not what the nest is: two nests differing only in cadence hold identical rows and must
+    /// share one content address. Rides on `Config` for the same reason `state_rpc_urls` does.
+    #[serde(skip)]
+    pub freshness: crate::freshness::Freshness,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -659,6 +665,7 @@ impl Config {
         Ok(Config {
             state_rpc_urls: Vec::new(),
             read_only_role: false,
+            freshness: Default::default(),
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -731,6 +738,7 @@ mod tests {
         let cfg = Config {
             state_rpc_urls: Vec::new(),
             read_only_role: false,
+            freshness: Default::default(),
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {

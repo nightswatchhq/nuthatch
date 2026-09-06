@@ -41,6 +41,7 @@ pub mod entity_view;
 pub mod exposure;
 pub mod factory;
 pub mod flags;
+pub mod freshness;
 pub mod graft;
 pub mod health;
 pub mod help;

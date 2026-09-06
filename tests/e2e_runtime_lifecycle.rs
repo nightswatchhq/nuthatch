@@ -103,6 +103,7 @@ async fn two_nest_roost(
             admin_enabled: false,
             admin_token: None,
             max_rss_mb: 2048,
+            freshness: Default::default(),
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -417,6 +418,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             admin_enabled: false,
             admin_token: None,
             max_rss_mb: 2048,
+            freshness: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -580,6 +582,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             admin_enabled: true,
             admin_token: Some(TOKEN.to_string()),
             max_rss_mb: 2048,
+            freshness: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);

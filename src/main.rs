@@ -102,6 +102,10 @@ async fn main() -> Result<()> {
                     args.window,
                     args.no_admin,
                     args.fail_fast,
+                    nuthatch::freshness::Freshness {
+                        poll_interval: args.poll_interval,
+                        finality_only: args.finality_only,
+                    },
                 )
                 .await
             } else {

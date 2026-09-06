@@ -201,6 +201,10 @@ pub struct AppState {
     /// **Not a new flag.** `serve_role` already knows - its own comment says "No `Source` is ever
     /// polled on this role" - it simply never told this endpoint.
     pub cursorless: bool,
+    /// The cursor's freshness dial (RFC-0040), so `/ready` can say how stale the nest is meant to be
+    /// and scale its stall thresholds to the interval rather than reporting a five-minute cursor
+    /// stalled at ninety seconds.
+    pub freshness: crate::freshness::Freshness,
     /// The SQL surface this mount exposes (RFC-0034). Default is [`Open`](crate::allowlist::SqlAccess::Open) -
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
@@ -1099,7 +1103,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             last_progress,
             started_at,
             now,
-            READINESS_PROGRESS_STALL_SECS,
+            s.freshness
+                .stall_threshold_secs(READINESS_PROGRESS_STALL_SECS),
             lag,
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
@@ -1132,7 +1137,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     } else {
         !seal_direct_active
             && (initial_failure
-                || poll_stalled(last_poll, started_at, now, READINESS_STALL_SECS)
+                || poll_stalled(
+                    last_poll,
+                    started_at,
+                    now,
+                    s.freshness.stall_threshold_secs(READINESS_STALL_SECS),
+                )
                 || wedged)
     };
     let stalled = seal_stalled || entities_stalled || cursor_stalled;
@@ -1148,6 +1158,13 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "last_block": last,
         "lag_blocks": if s.cursorless { serde_json::Value::Null } else { lag.into() },
         "cursorless": s.cursorless,
+        // RFC-0040 §4: a deliberately stale cursor says so here. `lag_blocks` above is then the
+        // distance the operator chose, and the stall thresholds behind `ready` are scaled to
+        // `poll_interval_secs`, so a quiet five-minute cursor is not reported as a dead one.
+        "freshness": {
+            "mode": s.freshness.mode(),
+            "poll_interval_secs": s.freshness.poll_interval.as_secs(),
+        },
         "sealed_through": sealed,
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
@@ -2572,6 +2589,7 @@ mod tests {
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
             cursorless: false,
+            freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             surface: Arc::new(crate::allowlist::Surface::default()),
             nid: None,
