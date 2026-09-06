@@ -239,11 +239,8 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    refresh every 2 to 15 minutes. The carve-out covers §3's knobs 1, 2 and 4 - a finality-only mode,
 >    a poll interval, and backing the cursor off under rate limits - in that issue's order. Knob 3
 >    (timestamp interpolation) is **not** carved out. §4's conditions are the gate: no silent
->    staleness, no fabricated values, and sealing untouched - a segment covering a given block range
->    holds bytes identical to what tip following seals for that range, because a segment's content is
->    a function of its range and rows and nothing about the cadence reaches it. (Where two runs cut
->    their segment *boundaries* already differs on the tip path today, so boundary-for-boundary
->    identity between runs was never the guarantee.) Spent when #1173 closes; there is no sixth.
+>    staleness, no fabricated values, and sealed segments byte-identical to what tip following would
+>    have produced. Spent when #1173 closes; there is no sixth.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
