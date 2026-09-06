@@ -1,7 +1,7 @@
 # RFC-0040: The freshness dial - let an operator trade staleness for money
 
-- Status: **Proposed - design only.** No implementation. Under the 2026 feature freeze this is a
-  design to argue with, not work to start.
+- Status: **Accepted 2026-09-06, carve-out 5 of the 2026 freeze, tracking #1173.** Knobs 1, 2 and 4
+  of §3 are in scope, in the order #1173 gives; knob 3 is not. Proposed as design only on 2026-08-23.
 - Author: Jenny
 - Date: 2026-08-23
 - Depends on: RFC-0029 (the timestamp path this is mostly about), RFC-0028 (the window controller),

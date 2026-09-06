@@ -169,7 +169,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > started. Treat a proposal for new capability the way the out-of-scope list below is treated: say
 > so, rather than quietly building it. The list survives as the record of how the product was built.
 >
-> **Four carve-outs, and only these four.** A carve-out is a decision Chief makes explicitly and
+> **Five carve-outs, and only these five.** A carve-out is a decision Chief makes explicitly and
 > records here. It is not a precedent for the next proposal, and an approved RFC is not a carve-out
 > until it appears in this list.
 >
@@ -232,6 +232,15 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >    the `safe` tag the RFC's body recommends: `Finality` has no `safe` arm, adding one is a seal-loop
 >    change rather than a data entry, and the RFC's addendum records the trade. No testnet entry, no
 >    sequencer-feed head tracker, no chain-family refactor. Spent when #1133 closes.
+>
+> 5. **RFC-0040, the freshness dial (2026-09-06).** Chief's decision, recorded the day it was made,
+>    tracking #1173. Taken after the Alchemy bill: one Arbitrum cursor following tip was measured at
+>    ~9,900 compute units a minute (~430M a month, roughly $185 on pay-as-you-go), for panels that
+>    refresh every 2 to 15 minutes. The carve-out covers §3's knobs 1, 2 and 4 - a finality-only mode,
+>    a poll interval, and backing the cursor off under rate limits - in that issue's order. Knob 3
+>    (timestamp interpolation) is **not** carved out. §4's conditions are the gate: no silent
+>    staleness, no fabricated values, and sealed segments byte-identical to what tip following would
+>    have produced. Spent when #1173 closes; there is no sixth.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
