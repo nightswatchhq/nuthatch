@@ -1019,7 +1019,7 @@ async fn one_run(
                 window,
                 fs.force_topic0(),
                 |_| Ok(()),
-                |_, _| {},
+                |_, _, _| {},
             )
             .await?
         }
@@ -1041,8 +1041,8 @@ async fn one_run(
                 to,
                 window,
                 concurrency,
-                |_| Ok(()), // bench doesn't persist a resume watermark
-                |_, _| {},  // bench doesn't render progress
+                |_| Ok(()),   // bench doesn't persist a resume watermark
+                |_, _, _| {}, // bench doesn't render progress
             )
             .await?
         }

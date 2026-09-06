@@ -1069,6 +1069,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                     m.seal_direct_completed(),
                     m.seal_direct_target(),
                     m.last_seal_progress(),
+                    m.seal_direct_fetched(),
+                    m.fetch_window(),
                 ),
             ),
             None => (
@@ -1085,6 +1087,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                     METRICS.seal_direct_completed(),
                     METRICS.seal_direct_target(),
                     METRICS.last_seal_progress(),
+                    METRICS.seal_direct_fetched(),
+                    METRICS.fetch_window(),
                 ),
             ),
         };
@@ -1094,6 +1098,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         seal_direct_completed,
         seal_direct_target,
         last_seal_progress,
+        seal_direct_fetched,
+        fetch_window,
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
@@ -1171,6 +1177,14 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "seal_direct_active": seal_direct_active,
         "seal_direct_origin": seal_direct_origin,
         "seal_direct_completed": seal_direct_completed,
+        // The pass's fetch position (#1169). `seal_direct_completed` is what a restart resumes from;
+        // this is how far fetching has run ahead of it, which is exactly the work a restart redoes.
+        // They were one number until a restart on the gns nest redid 47.6M blocks the number had
+        // called done.
+        "seal_direct_fetched": seal_direct_fetched,
+        // The cursor's current getLogs span (#1170): a backfill crawling at ten blocks a window
+        // after a rate-limited hour is visible here, not only in its ETA.
+        "fetch_window_blocks": fetch_window,
         "seal_direct_target": seal_direct_target,
         "seal_direct_stalled": seal_stalled,
         "seconds_since_seal_progress": (seal_direct_active && last_seal_progress != 0)
