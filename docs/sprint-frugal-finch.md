@@ -1,15 +1,18 @@
 # Sprint: frugal-finch
 
-**Eight issues: every issue open on 2026-09-06.** A sprint is a labelled set, not a calendar. Filed
-the night the Alchemy bill arrived, on Chief's instruction that the next sprint cover the whole open
-backlog, and after the earlier sprint labels were taken off the open issues (they named sprints that
-had closed; a label that names a finished sprint is scenery).
+**Every open issue, including the ones opened while it runs.** A sprint is a labelled set, not a
+calendar. Filed the night the Alchemy bill arrived, on Chief's instruction that the next sprint cover
+the whole open backlog, and after the earlier sprint labels were taken off the open issues (they
+named sprints that had closed; a label that names a finished sprint is scenery). Chief's second
+instruction, the same morning: **a newly opened issue joins this sprint too.** There is no unlabelled
+queue beside it; whoever files an issue while frugal-finch is open labels it `frugal-finch`.
 
 ## Definition of done
 
-Every issue carrying the **`frugal-finch`** label is closed, and no open PR is for one of them. That
-is #1078, #1147, #1148, #1160, #1165, #1169, #1170 and #1173. Work discovered in flight is filed
-**unlabelled**; pulling it into scope needs a board reply.
+Every issue carrying the **`frugal-finch`** label is closed, and no open PR is for one of them. At
+filing that was #1078, #1147, #1148, #1160, #1165, #1169, #1170 and #1173; #1178 (bound the
+seal-direct refetch) joined the same morning, and anything opened while the sprint runs joins on
+filing. The label, not this list, is the record of scope.
 
 ## The theme
 
@@ -44,7 +47,8 @@ a matter of trimming. Two facts decide the shape of the work:
 
 ## The spine, in the order it has to run
 
-1. **#1173 - the freshness dial.** Carve-out 5 of the 2026 freeze (PR 1174 records it). Two operator
+1. **#1173 - the freshness dial.** Carve-out 5 of the 2026 freeze, recorded in CLAUDE.md by PR 1174
+   (this sprint's first merge; until it lands, the standing brief still reads four). Two operator
    flags, neither of them nest identity: `--poll-interval` (RFC-0040 §3 knob 1), how long a
    caught-up cursor waits before asking for the tip again, default the current two seconds; and
    `--finality-only` (knob 2), which caps the cursor at the chain's finality boundary so nothing it
@@ -78,7 +82,12 @@ a matter of trimming. Two facts decide the shape of the work:
 6. **#1169 - `seal_direct_completed` runs tens of millions of blocks ahead of the durable watermark.**
    A restart resumes from the watermark, so the counter is a claim the store cannot back. Make the
    counter follow durability or name it for what it is.
-7. **#1147 and #1148 - Monad in the field, and the Perpl nest.** The nest exists and is 26% through
+7. **#1178 - bound how far the seal-direct fetch runs ahead of the durable watermark.** Filed from
+   #1169's fix, which made the gap visible on `/ready` and deliberately did not bound it: cutting a
+   segment on block span as well as row count moves segment boundaries on sparse ranges, and a
+   boundary is part of a segment's identity. Weigh the three options in the issue and decide; the
+   47.6M-block redo on the gns nest is the cost of not deciding.
+8. **#1147 and #1148 - Monad in the field, and the Perpl nest.** The nest exists and is 26% through
    its backfill (seal_direct_completed 67,004,198 of 102,151,917). It does **not** restart on the
    Alchemy key. After #1170 lands it restarts on the three public Monad endpoints its config already
    lists, with a poll interval, and either finishes the backfill for nothing or produces the evidence
@@ -87,8 +96,8 @@ a matter of trimming. Two facts decide the shape of the work:
 
 ## The call
 
-**All eight stay.** The instruction was the whole backlog, and each one is either the cost work
-itself, the evidence the cost work needs, or the migration's last mile.
+**Everything stays, and everything new joins.** The instruction was the whole backlog, and each item
+is either the cost work itself, the evidence the cost work needs, or the migration's last mile.
 
 **The number that closes the sprint is measured, not projected.** Step 2's table, taken the same
 way as the one above, with the Lodestar nests under 1,000 CU a minute between them. At Alchemy's
@@ -98,14 +107,15 @@ rates that is under $20 a month; the $100 target has headroom for a second key o
 
 ## Explicitly not in this sprint
 
-- Every `frozen` issue. Five carve-outs are recorded in CLAUDE.md and this sprint spends the fifth.
+- Every `frozen` issue. The fifth carve-out (PR 1174) is the one this sprint spends; there is no sixth.
 - Hosting the Arbitrum nests behind one cursor (RFC-0021 mounts). Shipped capability and a real
   saving in RAM and public-endpoint pressure, but an operations job with its own issue if wanted;
   it does not move the Alchemy bill once the cadence is fixed.
 - A prefer-free, fall-back-to-paid order in `select_rpcs`. The pool round-robins evenly by design;
   an ordering is new capability and would need its own carve-out.
 - RFC-0040 §3 knob 3, timestamp interpolation. It changes sealed content.
-- New findings discovered while doing these eight, unless the board adds them explicitly.
+- Nothing found while doing this work is out of the sprint: a new finding is filed as an issue and
+  labelled `frugal-finch` on filing.
 
 ## How this sprint runs
 
