@@ -252,19 +252,37 @@ fn sweep_dead_spill_dirs() {
     }
 }
 
+/// The in-process half of a spill directory's name; the other half is the PID.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A directory no other DuckDB instance in this process (or any other) will write to.
+///
+/// Created **exclusively**: `create_dir`, not `create_dir_all`, and a name that already exists is
+/// skipped for the next sequence number. The name alone is not enough. A process that dies without
+/// dropping its static cache leaves its directories behind, the sweep keeps any whose PID is live,
+/// and a later process handed that same PID by the kernel would otherwise start its sequence at zero
+/// and write into the dead process's `-0` - the collision this whole change exists to remove, back
+/// through PID reuse. Refusing an existing path makes the directory this instance's by construction,
+/// whatever is left on disk.
 fn new_spill_dir() -> Result<SpillDir> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(sweep_dead_spill_dirs);
-    let path = std::env::temp_dir().join(format!(
-        "nuthatch-duckdb-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&path)
-        .with_context(|| format!("creating the DuckDB spill directory {}", path.display()))?;
-    Ok(SpillDir(path))
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "nuthatch-duckdb-{}-{}",
+            std::process::id(),
+            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(SpillDir(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("creating the DuckDB spill directory {}", path.display())
+                })
+            }
+        }
+    }
 }
 
 fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
@@ -6407,5 +6425,38 @@ events = ["Transfer"]
         )
         .expect_err("the guarded surface must refuse it too");
         assert!(format!("{err:#}").contains("not permitted"));
+    }
+
+    /// Jules on #1182: the spill path was keyed by PID and an in-process counter and created with
+    /// `create_dir_all`, so a directory left by a dead process whose PID the kernel handed back would
+    /// be reused, and two instances would share one spill directory again. A name that exists is
+    /// refused and the sequence advances; the pre-made directories stand in for the dead process's.
+    /// Mutation-checked: with `create_dir_all` back in place this fails.
+    #[test]
+    fn a_spill_directory_that_already_exists_is_never_reused() {
+        let next = SPILL_SEQ.load(Ordering::Relaxed);
+        let planted: Vec<PathBuf> = (next..next + 8)
+            .map(|n| {
+                std::env::temp_dir().join(format!("nuthatch-duckdb-{}-{n}", std::process::id()))
+            })
+            .collect();
+        for p in &planted {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("someone-elses.tmp"), b"x").unwrap();
+        }
+        let mine = new_spill_dir().unwrap();
+        assert!(
+            !planted.contains(&mine.0),
+            "an existing directory was handed out as a fresh spill directory: {}",
+            mine.0.display()
+        );
+        assert!(mine.0.exists() && mine.0.read_dir().unwrap().next().is_none());
+        for p in &planted {
+            assert!(
+                p.join("someone-elses.tmp").exists(),
+                "the other process's spill file was disturbed"
+            );
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }
