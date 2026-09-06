@@ -112,6 +112,17 @@ a matter of trimming. Two facts decide the shape of the work:
    window, or a rate below what finishes in days), Chief's 2026-09-06 decision applies: the Alchemy
    Monad key may be used for the backfill, knowingly, at the measured rate (~57k CU/min while it
    runs), and both issues close when the backfill reaches tip and #1147's criteria are checked.
+9. **#1183 - every `/sql` request re-bound every authored view.** Found the day Lodestar cut over,
+   from Chris's report that the indexer page loads slower than it did on the gateway. A `SELECT 1`
+   cost 1.2 s and 32,000 file opens on the allocations nest; `define_nest_views` was never given the
+   reachability set #896 gave `define_views`. Fixed in #1184; on production the 47 dashboard
+   statements went from 158 s to 89 s serially and the floor from 1.24 s to 20 ms. Closes when #1184
+   lands and 3.5.1 carries it.
+10. **#1186 - the dashboard's heavy views are whole-history folds recomputed on every request.** The
+    89 s that remain after #1183, 42 s of it in four statements. This is the query-time recomputation
+    RFC-0041 was written about, and the Lodestar nest declares views, not entities. The issue lists
+    three options (entities in the nest, a deterministic memo keyed on the inputs, cache warming in
+    Lodestar); weigh them and decide. None is a new capability.
 
 ## The call
 
