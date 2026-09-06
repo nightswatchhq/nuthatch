@@ -88,6 +88,9 @@ struct DuckCache {
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
     conn: Connection,
+    /// This instance's private spill directory, removed when the cached connection is dropped or
+    /// evicted (#1165). Held here so its lifetime is exactly the connection's.
+    _spill: SpillDir,
 }
 
 /// A content hash of one cache input, hex sha256 (#840).
@@ -191,10 +194,49 @@ fn duck_opens_for(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
+/// A DuckDB instance's private spill directory, removed when the instance is dropped (#1165).
+///
+/// DuckDB spills buffers past `max_memory` into `temp_directory`, whose files are named by *index*
+/// within that directory - `duckdb_temp_storage_DEFAULT-0.tmp`, `..._S128K-0.tmp`, and so on. The
+/// name says nothing about which instance wrote it, because DuckDB assumes one instance owns the
+/// directory. This process runs several: the connection cache hands its connection to a query for
+/// the query's whole duration, so a second concurrent query finds the cache empty and opens an
+/// instance of its own. With the default `temp_directory` - `.tmp` under the working directory,
+/// which for a nest service is the nest's own data directory - those instances write the same file
+/// names in one place and overwrite each other's spilled blocks.
+///
+/// Reading such a block back fails DuckDB's own check, `decompressed_size == buffer->AllocSize()` in
+/// `temporary_file_manager.cpp`, and the process dies. Reproduced 2026-09-06 against a copy of the
+/// production corpus: four threads replaying 51 captured statements, a segmentation fault inside
+/// fifteen seconds, every time. On the box it was 25 SEGVs in a minute at four permits and none at
+/// one, which is the same fault seen from the outside - one permit never has a second instance.
+struct SpillDir(PathBuf);
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A directory no other DuckDB instance in this process (or any other) will write to.
+fn new_spill_dir() -> Result<SpillDir> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "nuthatch-duckdb-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("creating the DuckDB spill directory {}", path.display()))?;
+    Ok(SpillDir(path))
+}
+
+fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     note_duck_open(dir);
+    let spill = new_spill_dir()?;
     let allowed: Vec<String> = allowed_read_dirs(dir)
         .into_iter()
+        .chain(std::iter::once(spill.0.clone()))
         .filter(|p| p.exists())
         .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
         .collect();
@@ -210,7 +252,11 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
         .max_memory(&mem_limit)
         .context("duckdb max_memory")?
         .threads(MAX_THREADS)
-        .context("duckdb threads")?;
+        .context("duckdb threads")?
+        // Set on the config rather than by a later `SET`, so no query can ever run against the
+        // shared default - and before `lock_configuration`, which freezes it (#1165).
+        .with("temp_directory", spill.0.display().to_string())
+        .context("duckdb temp_directory")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
@@ -237,7 +283,7 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    Ok(conn)
+    Ok((conn, spill))
 }
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
@@ -334,7 +380,8 @@ pub fn degraded_tables(
     dir: &Path,
     declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
-    let conn = open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    let (conn, _spill) =
+        open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
     define_views(
         &conn,
         dir,
@@ -684,13 +731,15 @@ fn attempt(
         c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
     });
     if !reusable {
+        let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
-            conn: open_locked_duckdb(dir).context("failed to open DuckDB")?,
+            conn,
+            _spill: spill,
         });
     }
     let mut slot = slot.expect("just inserted");
@@ -4297,7 +4346,7 @@ template="pool"
             "the denylist must still refuse read_text - it is the control in front"
         );
 
-        let conn = open_locked_duckdb(nest.path()).unwrap();
+        let (conn, _spill) = open_locked_duckdb(nest.path()).unwrap();
         let read_succeeded = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
             Err(_) => false,
@@ -4337,7 +4386,7 @@ template="pool"
         std::fs::create_dir_all(&shared).unwrap();
         let file = shared.join("ok.txt");
         std::fs::write(&file, "shared\n").unwrap();
-        let conn = open_locked_duckdb(&nid_dir).unwrap();
+        let (conn, _spill) = open_locked_duckdb(&nid_dir).unwrap();
         let sql = format!("SELECT content FROM read_text('{}')", file.display());
         let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
         let got: String = stmt
