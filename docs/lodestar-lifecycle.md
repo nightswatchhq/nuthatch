@@ -4,9 +4,11 @@
 five nests the [Lodestar dashboard](https://www.lodestar-dashboard.com) reads in production, so an
 operator considering hosting nuthatch nests knows what to expect before committing a box to it.
 
-**Provenance:** every figure was read off the live Hetzner VPS on **2026-09-06**, between 12:47 and
-13:20 UTC, against **nuthatch 3.5.0**. Nothing here is projected. Where a number comes from a short
-window, the window is stated, because a rate without one is not a number.
+**Provenance:** every figure was read off the live Hetzner VPS on **2026-09-06**, in two passes: one
+between 12:47 and 13:20 UTC against **3.5.0**, and one between 16:00 and 17:05 UTC against **3.5.1**,
+which went on the box at 15:06. The 3.5.1 pass is the current state and is what the tables below
+carry. Nothing here is projected. Where a number comes from a short window, the window is stated,
+because a rate without one is not a number.
 
 **The box:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carries six nuthatch
 processes, a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of
@@ -52,39 +54,42 @@ and finality probe, and that is what `--poll-interval` addresses (RFC-0040, carv
 
 **Measured before and after the dial, on the same nest:**
 
-| | poll every 2 s (2026-09-06, 45 s sample) | poll every 5 min (2026-09-06, 4 min since-restart) |
+| | poll every 2 s | poll every 5 min |
 |---|---:|---:|
-| RPC requests/min | 413 | **~3.6** |
-| Alchemy CU/min | ~9,900 | **~80** |
-| CU/month | ~430 M | **~3.5 M** |
-| pay-as-you-go | ~$185/month | **~$1.50/month** |
+| window | 45 s sample | **54 min, 15:06-16:00 UTC** |
+| RPC requests/min | 413 | **4.6** |
+| Alchemy CU/min | ~9,900 | **~110** |
+| CU/month | ~430 M | **~4.8 M** |
+| pay-as-you-go | ~$185/month | **~$2.10/month** |
 
-**The right-hand column is a four-minute window and should be read as an order of magnitude, not a
-figure.** A short sample of a five-minute cursor sees one poll or none depending on where it starts;
-the honest measurement is a counter delta over an hour or more, repeated across a day, which is what
-`docs/sprint-frugal-finch.md` step 2 asks for and what this page does not yet have. The three nests below,
-sampled over their full 88-minute uptimes, are the more trustworthy shape of the same result.
-
-That is a **~124x** reduction for a cursor that indexes exactly the same rows: the sealing path cuts
+That is a **~90x** reduction for a cursor that indexes exactly the same rows: the sealing path cuts
 segments where the rows say to, not where the clock says to, so the sealed output is byte-identical
 either side of the change. What it costs is freshness, and the ceiling is stated below.
 
-The other tip-following nests, over their full 88-minute uptimes at a 5-minute poll:
+The right-hand column is a clean 54-minute window taken after a rolling restart, with no traffic of
+mine in it. `docs/sprint-frugal-finch.md` step 2 asks for this repeated across a full day before the
+number is written down, and that has not been done.
+
+Every nest, over the same 54 minutes:
 
 | port | nest | RPC/min | `eth_getBlockByNumber` | `eth_getLogs` | `eth_blockNumber` | CU/min |
 |---:|---|---:|---:|---:|---:|---:|
-| | | | *calls / 88 min* | *calls / 88 min* | *calls / 88 min* | |
-| 8104 | dips | 3.7 | 194 | 54 | 72 | ~89 |
-| 8106 | dips-sepolia | 9.7 | 507 | 164 | 181 | ~247 |
-| 8113 | gns (**backfilling**) | 189 | 10,773 | 2,936 | 2,947 | ~4,774 |
+| | | | *calls / 54 min* | *calls / 54 min* | *calls / 54 min* | |
+| 8107 | allocations | 4.6 | 165 | 37 | 48 | **~110** |
+| 8104 | dips | 4.1 | 133 | 38 | 49 | ~100 |
+| 8106 | dips-sepolia | 10.4 | 332 | 109 | 118 | ~265 |
+| 8113 | gns (**backfilling**) | 150 | 5,442 | 1,359 | 1,367 | ~3,754 |
 | 8103 | legacy (archive) | **0** | 0 | 0 | 0 | **0** |
+
+The two Arbitrum One cursors Lodestar actually reads come to **210 CU a minute between them**,
+against the sprint's target of under 1,000.
 
 `eth_getBlockByNumber` is 60-65% of every bill, and it is the block-timestamp fetch. Turning
 `block_timestamps` off would remove it, and it is not available here: three of the allocations
 nest's views use `block_timestamp`, and flipping the flag is a breaking schema change that rewrites
 every sealed segment. Structural, not a config edit.
 
-**8113 is what a backfill costs.** A nest catching up spends roughly 50-60x a nest at tip. Budget for
+**8113 is what a backfill costs.** A nest catching up spends roughly 35x a nest at tip. Budget for
 it as a one-off, and note it is running on keyless public endpoints rather than a paid key.
 
 ---
@@ -93,10 +98,10 @@ it as a one-off, and note it is running on keyless public endpoints rather than 
 
 | port | nest | RSS | on disk | segments |
 |---:|---|---:|---:|---:|
-| 8107 | allocations | 253-364 MB | 661 MB | 1,924 Parquet files, 643 MB; redb 16 MB |
-| 8104 | dips | 217-270 MB | 104 MB | |
-| 8113 | gns | 68-70 MB | 53 MB | |
-| 8106 | dips-sepolia | 49 MB | 83 MB | |
+| 8107 | allocations | 245 MB | 661 MB | 1,924 Parquet files, 643 MB; redb 16 MB |
+| 8104 | dips | 220 MB | 104 MB | |
+| 8113 | gns | 67 MB | 53 MB | |
+| 8106 | dips-sepolia | 27 MB | 83 MB | |
 | 8103 | legacy archive | 39 MB | 100 MB | |
 
 Well inside the ≤2 GB per-cursor budget, with five cursors on one 7.7 GB box. **Do not read RSS
@@ -122,14 +127,14 @@ Lodestar's read pattern is the thing an operator is actually sizing for, and it 
 
 Every serving route sits behind a CDN cache: `s-maxage` runs from 30 s (votes) through 300 s (most
 panels) to 86,400 s (ENS). So the nest sees roughly **one read per route per TTL**, not one per
-visitor. Measured on the allocations nest: **~415 SQL queries admitted an hour, from ~590 attempted**, for a
-dashboard serving the public.
+visitor. Measured on the allocations nest over a clean 70-minute window: **380 queries, about 326 an
+hour, none refused**, for a dashboard serving the public.
 
 Two client-side disciplines make this work, and an operator hosting for someone else should insist
 on both:
 
-- **A one-slot gate.** `src/lib/nuthatch.ts` admits one query at a time per nest, from a cap of two,
-  so the consumer's own composition can never be the cause of a refusal. It bounds one Node process;
+- **A one-slot gate.** `src/lib/nuthatch.ts` admits one query at a time per nest, well under the
+  node's cap, so the consumer's own composition can never be the cause of a refusal. It bounds one Node process;
   serverless runs many, which is what the retry ladder is for.
 - **A readiness gate.** Serving routes go through `nuthatchSqlReady`, which probes `/ready` first and
   returns 503 rather than serving three-week-old rows from a stalled nest. Alerting crons may skip
@@ -139,34 +144,45 @@ on both:
 
 ## 5. Query performance, measured
 
-Three repetitions each, sequential, against the live production nest while it was also serving
-Lodestar. This is what a real consumer experiences, not a quiet-box benchmark.
+Three repetitions each, sequential, against the live production nest on **3.5.1** while it was also
+serving Lodestar. This is what a real consumer experiences, not a quiet-box benchmark. The 3.5.0
+column is the same script two hours earlier, on a build that was crashing and a busier box, so read
+it as the surrounding conditions rather than as a clean version comparison.
 
-| query | rows | observed |
-|---|---:|---|
-| `lodestar_network_params` | 1 | 1.26 / 1.31 / 1.31 s |
-| `count(*) lodestar_curators` | 1 | 0.13 / 1.20 / 1.26 s |
-| `count(*) lodestar_allocations` | 1 | 1.71 / 1.76 / 1.84 s |
-| `lodestar_epochs` top 100 | 100 | 2.74 / 2.76 / 2.81 s |
-| `lodestar_network` | 1 | 7.39 / 8.87 / 8.94 s |
-| `lodestar_indexers` top 100 | 98 | 6.39 / 8.03 / 10.32 s |
-| `count(*) lodestar_delegator_stakes` | - | **out of memory, then a segfault** |
+| query | rows | 3.5.1 | 3.5.0 |
+|---|---:|---|---|
+| `count(*) lodestar_curators` | 1 | 0.08 / 0.08 / 0.08 s | 0.13 / 1.20 / 1.26 s |
+| `lodestar_network_params` | 1 | 0.14 / 0.15 / 0.15 s | 1.26 / 1.31 / 1.31 s |
+| `count(*) lodestar_allocations` | 1 | 0.71 / 0.74 / 0.76 s | 1.71 / 1.76 / 1.84 s |
+| `lodestar_epochs` top 100 | 100 | 1.95 / 2.02 / 2.05 s | 2.74 / 2.76 / 2.81 s |
+| `lodestar_indexers` top 100 | 98 | 4.37 / 4.74 / 4.77 s | 6.39 / 8.03 / 10.32 s |
+| `lodestar_network` | 1 | 6.05 / 6.10 / 6.13 s | 7.39 / 8.87 / 8.94 s |
+| `count(*) lodestar_delegator_stakes` | - | **out of memory, 1.5-1.8 s, HTTP 400** | out of memory, then a segfault |
 
-**Set expectations at seconds, not milliseconds.** These are authored SQL views (RFC-0018 §1),
-evaluated at request time over hot ∪ sealed on every call. They are named queries, not materialised
-ones. The consumer's request timeout is 15 s and the node's own wall clock is 30 s, so the network
-view at 8.9 s has under 2x of headroom. RFC-0041's authored incremental entities are the answer to
-this and are shipped; these views have not been migrated onto them.
+**Set expectations at seconds, not milliseconds, for anything that aggregates.** These are authored
+SQL views (RFC-0018 §1), evaluated at request time over hot ∪ sealed on every call. They are named
+queries, not materialised ones. The consumer's request timeout is 15 s and the node's own wall clock
+is 30 s, so the network view at 6.1 s has under 2.5x of headroom. RFC-0041's authored incremental
+entities are the answer to this and are shipped; these views have not been migrated onto them.
 
-**Concurrency is two, and refusals are the normal state.** `/sql` admits two queries and refuses the
-rest in **1.7-3.2 ms** with `503 server busy: too many concurrent SQL queries`. This is
-`try_acquire_owned`: a caller past the limit is refused immediately rather than queued, which is
-deliberate self-protection. `nuthatch_sql_queries_total` and
-`nuthatch_sql_rejections_total` are disjoint - the rejection path returns before the admitted one
-increments - so attempts are the sum. In one 55-minute window the allocations nest admitted **381 and
-refused 159: 540 attempts, a 29% refusal rate**. During a 10-second query, everything else bounces. An operator should
-read a high rejection rate as the node working, and a consumer should read it as backpressure to
-retry, not an error to display.
+**A `count(*)` can exhaust the memory budget, and that is the guard working.** `max_memory` per
+DuckDB connection is `min(512 MB, 1024 MB / permits)`, so on this box it is **256 MB**, observed as
+`244.1 MiB` in the error text. The same query on 3.5.0 with two permits saw `488.2 MiB`. Raising
+`NUTHATCH_SQL_MAX_CONCURRENCY` therefore buys throughput by taking memory away from every individual
+query, which is the trade an operator is actually making.
+
+**Concurrency: the default is two, and this deployment sets four.** The unit carries
+`NUTHATCH_SQL_MAX_CONCURRENCY=4` (and `NUTHATCH_HOT_STORE_CACHE_BYTES=268435456`). Ten simultaneous
+requests over three rounds were admitted nine times and refused twenty-one, consistent with four
+permits partly occupied by the dashboard. A refusal is `503 server busy: too many concurrent SQL
+queries`, returned in **1.7-3.2 ms**: `try_acquire_owned`, so a caller past the limit is refused
+immediately rather than queued. That is deliberate self-protection.
+
+**Under ordinary dashboard load alone, refusals are zero.** The allocations nest admitted **380
+queries in 70 minutes with no rejections at all**. Refusals appear the moment a second independent
+caller arrives, and an earlier figure on this page of 159 refused against 381 admitted was measured
+with me as that second caller. An operator should read a rejection count as "someone else is also
+asking", not as a fault, and a consumer should read it as backpressure to retry.
 
 ---
 
@@ -190,18 +206,23 @@ Live on 8107 at the time of writing: `tip` 502,346,920, `sealed_through` 501,993
 
 Ranked by how likely an operator is to meet it.
 
-1. **Concurrency refusals under any real load.** Two slots. Expected, self-inflicted only if the
-   consumer fires a `Promise.all`. Fix it client-side.
-2. **A slow view against a tight client timeout.** 8.9 s against 15 s. A view that grows, or a box
+1. **Concurrency refusals as soon as there is a second caller.** Four permits here, two by default.
+   Expected, and self-inflicted only if the consumer fires a `Promise.all`. Fix it client-side.
+2. **The DuckDB memory budget bites on innocuous SQL.** `SELECT count(*)` on one view exhausted the
+   256 MB per-connection limit in 1.5 s. Four scalar subqueries in one statement did the same. The
+   guard is doing its job; the surprise is how cheap the query looked. On 3.5.1 this is a clean
+   `400` with the limit quoted in the error text.
+3. **A slow view against a tight client timeout.** 6.1 s against 15 s. A view that grows, or a box
    under contention, closes that gap without warning.
-3. **The DuckDB memory budget bites on innocuous SQL.** `SELECT count(*)` on one view exhausted the
-   488 MB limit. Four scalar subqueries in one statement did the same. The guard is doing its job;
-   the surprise is how cheap the query looked.
-4. **Segfaults on the serving path.** `graph-allocations-nest` took **31 SEGVs on 2026-09-06** on
-   3.5.0 - `tokio-rt-worker`, killed with `status=11/SEGV`. Tracked as
-   [#1165](https://github.com/nightswatchhq/nuthatch/issues/1165). `Restart=always` brings the unit
-   back in ~15 s and the data survives, so the visible cost is a brief 502; it is nonetheless the
-   open defect on this page.
+4. **Segfaults on the serving path, now fixed.** `graph-allocations-nest` took **31 SEGVs on
+   2026-09-06** on 3.5.0, `tokio-rt-worker` killed with `status=11/SEGV`. The cause was several
+   DuckDB instances in one process defaulting `temp_directory` to the nest's own data directory and
+   overwriting each other's spilled blocks
+   ([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165),
+   [#1182](https://github.com/nightswatchhq/nuthatch/pull/1182)). 3.5.1 gives each instance a private
+   spill directory. The box has recorded **no kernel segfault since 12:50 UTC** and `NRestarts=0`
+   across all four units since the 15:06 roll. The query that reliably killed 3.5.0 now returns a
+   clean out-of-memory instead.
 5. **Rate limiting on keyless endpoints.** Recovered from, and RFC-0040's knob 4 now widens the
    window again once refusals stop, so a throttled hour costs an hour rather than the rest of the
    backfill.
@@ -214,11 +235,12 @@ every production process on the box and once took it down for 80 minutes. Kill b
 
 ## 8. The summary an operator wants
 
-- **A tip-following cursor costs about $1.50 a month in RPC** at a 5-minute poll, and about $185 at
-  a 2-second one. The cadence is the bill.
+- **A tip-following cursor costs about $2 a month in RPC** at a 5-minute poll, and about $185 at a
+  2-second one. The cadence is the bill.
 - **A nest nobody reads costs the same as one under load.** Tip-following cost is independent of
   demand. Park a nest and it keeps billing; a `serve`-only archive bills nothing.
 - **Five cursors, 7.7 GB, 4 cores, 1 GB of nest data, load 0.63.** The hardware is not the
   constraint.
-- **Reads are seconds and concurrency is two.** Size the consumer's caching, not the box.
-- **Backfill is the expensive part.** Roughly 50x tip, once.
+- **Reads are sub-second to seconds, and concurrency is a handful.** Size the consumer's caching,
+  not the box, and know that raising the permit count takes memory from every individual query.
+- **Backfill is the expensive part.** Roughly 35x tip, once.

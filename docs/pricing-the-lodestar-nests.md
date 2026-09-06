@@ -2,7 +2,7 @@
 
 **What this is:** one page taking [RFC-0048](rfcs/0048-pricing-query-access.md)'s pricing design and
 running it against the nests actually in production, with the numbers measured on the box on
-**2026-09-06**. RFC-0048 §8 says its default admission threshold "needs a measured distribution of
+**2026-09-06** against **nuthatch 3.5.1**. RFC-0048 §8 says its default admission threshold "needs a measured distribution of
 named queries against real catalogues (Lodestar allocations nest is the obvious first), not a round
 number from this document". This is the first instalment of that measurement.
 
@@ -61,8 +61,9 @@ almost nothing" and "refuse the whole-nest scan".
 ## 3. The finding that matters most, and it is a caution
 
 The first thing I ran against the real corpus was `SELECT count(*) FROM lodestar_delegator_stakes`.
-It took 12.7 seconds and **exhausted DuckDB's 488 MB memory limit**. A second attempt segfaulted the
-process.
+It **exhausted DuckDB's per-connection memory limit** and returned an out-of-memory error rather
+than rows. On 3.5.0 the limit was `488.2 MiB` and a later attempt killed the process; on 3.5.1 it is
+`244.1 MiB` and the refusal is a clean `400` in 1.5 seconds.
 
 A Phase 0 byte-scan admission check would have **admitted that query.** Its scan bound is a fraction
 of 660 MB; the thing it exhausted was resident memory, on a `count(*)` returning one row.
@@ -74,11 +75,16 @@ above is the confirming case. **The bytes-to-resident expansion factor on this w
 and is not measured**, which is one of the three figures RFC-0047 owes and which nothing here
 supplies.
 
-The practical consequence for an operator: **the guard that will actually fire on these nests is the
-512 MB memory cap and the 30-second wall clock, not a byte threshold.** Pricing by bytes scanned
-would be pricing the dimension that is not binding.
+**And the guard moves with a knob that looks like a throughput setting.** Per-connection `max_memory`
+is `min(512 MB, 1024 MB / permits)`. This deployment sets `NUTHATCH_SQL_MAX_CONCURRENCY=4`, so every
+query gets 256 MB rather than 512. Raising concurrency to sell more queries therefore shrinks the
+budget of each one, and the set of named queries a nest can answer at all changes underneath the
+price list. RFC-0048 §3 already notes that raising that constant has a second cost; this is a third,
+and it argues for pinning permits in the pricing manifest alongside the coefficients.
 
----
+The practical consequence for an operator: **the guard that will actually fire on these nests is the
+per-connection memory limit and the 30-second wall clock, not a byte threshold.** Pricing by bytes
+scanned would be pricing the dimension that is not binding.
 
 ## 4. The rescan rule, and how many queries it refuses
 
@@ -101,37 +107,40 @@ Phase 0 would cost. **At most one query out of 42.** The rule is affordable on t
 
 ## 5. What the surface can actually earn
 
-The ceiling is not the price. It is throughput, and it is low.
+The ceiling is not the price. It is throughput.
 
-`/sql` admits **two** concurrent queries and refuses the rest in under 3 ms. Measured view latencies
-on this nest run **1.3 s to 10.3 s**, mean about 4 s. Two permits at 4 seconds is a hard ceiling of
-roughly **0.5 queries per second, or 1.3 M a month**, and the observed refusal rate on the live nest
-was **29%** (159 refused against 381 admitted, 540 attempts in one 55-minute window - the two
-counters are disjoint), so the practical figure is a fraction of that.
+`/sql` admits `NUTHATCH_SQL_MAX_CONCURRENCY` queries and refuses the rest in under 3 ms. The default
+is 2; this deployment sets **4**, measured by firing ten at once over three rounds and being admitted
+nine times. Latencies on 3.5.1 run **0.08 s to 6.1 s**, mean about 2 seconds across the sampled
+views. Four permits at two seconds is roughly **2 queries per second, or 5 M a month**, and every
+permit added takes memory from each query, so the ceiling and the answerable-query set move together.
 
-Actual demand, for a public dashboard: about **415 queries admitted an hour** from ~590 attempted,
-so ~303,000 admitted a month.
+**Under ordinary dashboard load there are no refusals at all**: 380 queries admitted in 70 minutes,
+zero rejected. Refusals appear the moment a second independent caller arrives, which is exactly what
+a paid surface would be. So the refusal rate is not a defect to fix before pricing; it is the shape
+of what selling access does to a node that protects itself.
 
-Against that, the measured cost of running all five nests: **RPC of roughly $1.50 a month per
+Actual demand, for a public dashboard: about **326 queries an hour**, ~238,000 a month, which is
+under 5% of the throughput ceiling.
+
+Against that, the measured cost of running all five nests: **RPC of roughly $2 a month per
 tip-following cursor** at a 5-minute poll, plus one 8 GB VPS carrying all five at load 0.63. Call the
-whole estimate a low-tens-of-dollars figure a month, and the marginal cost of a query effectively
-zero - the bill is the cursor, not the reads.
+whole thing a low-tens-of-dollars figure a month, and the marginal cost of a query effectively zero.
+The bill is the cursor, not the reads.
 
 So the operator's arithmetic is:
 
 ```
-revenue ceiling  = flat_price × min(demand, throughput_ceiling)
-                 = flat_price × 303,000 per month at current demand
-cost             = one VPS + ~$1.50 per cursor per month
+revenue ceiling  = flat_price x min(demand, throughput_ceiling)
+                 = flat_price x 238,000 per month at current demand
+cost             = one VPS + ~$2 per cursor per month
 ```
 
 At any plausible per-query price this clears its costs easily and never approaches a number worth
 building a payment path for on its own. **The reason to do this is not the revenue from one box.**
 That is worth writing down before anyone builds Phase 0, because the freeze is real and a slice
-justified by revenue arithmetic that does not survive contact with a throughput ceiling of 0.5 qps
-is a slice that should not start.
-
----
+justified by revenue arithmetic that does not survive contact with actual demand is a slice that
+should not start.
 
 ## 6. If it were ever built, the order for these nests
 
@@ -149,11 +158,12 @@ Following RFC-0048 §5, with what this corpus changes:
 5. **Phase 2's manifest is cheap here** - 42 statements, 13 views, one file.
 6. **Phase 3 is a gateway RFC**, not a nest one, and multi-host selection needs a second host.
 
-**Two things that are prerequisites and are not pricing work at all.** The segfaults
-([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165), 31 on 2026-09-06) and the
-29% refusal rate under two permits. A paid surface that refuses three callers in ten and falls over
-thirty-one times a day is not a product anybody should attach a price to, and neither defect is
-about payments.
+**One prerequisite, and it has just been met.** The serving path took 31 segfaults on 2026-09-06 on
+3.5.0 ([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165)); 3.5.1 gives each DuckDB
+instance a private spill directory ([#1182](https://github.com/nightswatchhq/nuthatch/pull/1182)) and
+the box has recorded none since 12:50 UTC. Nobody should attach a price to a surface that falls over
+thirty-one times a day, and as of 15:06 UTC that is no longer the surface. One day of quiet is not a
+proof, and the pricing question does not become live until it is.
 
 ---
 
