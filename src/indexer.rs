@@ -1711,6 +1711,11 @@ async fn runtime_index_loop(
                     tip,
                 )
                 .await?;
+                // Caught up as of this iteration's tip: wait the interval here as well as at the
+                // top, for the reason the solo loop gives (#1190).
+                if to == ceiling {
+                    sleep_for(freshness.poll_interval).await;
+                }
             }
             Err(e) if narrowing_can_help(&e, global_next, to) => {
                 if global_next >= to {
@@ -5469,6 +5474,16 @@ async fn index_loop(
                         no_progress = 0;
                         if let Some(p) = progress.as_mut() {
                             p.tick(to, n);
+                        }
+                        // Caught up **as of the tip this iteration polled** (#1190). Judged here and
+                        // not only at the top of the loop, because on a chain producing blocks
+                        // faster than the endpoint answers, a re-polled tip has always moved and
+                        // `next > ceiling` is never true: the gns nest on a free Arbitrum endpoint
+                        // polled every two seconds under `--poll-interval 5m` while `/ready`
+                        // reported 300. Reaching this iteration's ceiling is the moment the interval
+                        // was asked for; a window that fell short is a backlog and loops at once.
+                        if to == ceiling {
+                            sleep_for(nest.freshness.poll_interval).await;
                         }
                     }
                     // Timestamps were unavailable; the cursor stayed put, retry the same window.
@@ -12620,6 +12635,99 @@ template="pool"
 
     /// A plain one-contract nest on a `FinalizedTag` chain (Arbitrum One), built through the real
     /// constructor with the dial set the way `dev()` sets it from the flags.
+    /// A chain that has moved on by the time anyone asks again: every tip poll reports eight blocks
+    /// more than the last, the Arbitrum-against-a-slow-endpoint shape of #1190. Errors after a bounded
+    /// number of polls so a loop that never sleeps still lets a paused clock advance and the test
+    /// fail rather than hang.
+    struct RunawayTipSource {
+        tip: std::sync::atomic::AtomicU64,
+        tip_polls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RunawayTipSource {
+        const START: u64 = 1_000;
+        const STEP: u64 = 8;
+        const POLL_CAP: usize = 400;
+        fn new() -> Self {
+            RunawayTipSource {
+                tip: std::sync::atomic::AtomicU64::new(Self::START),
+                tip_polls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn polls(&self) -> usize {
+            self.tip_polls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RunawayTipSource {
+        async fn tip(&self) -> Result<u64> {
+            let n = self
+                .tip_polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= Self::POLL_CAP {
+                anyhow::bail!("poll cap reached: the loop is not sleeping");
+            }
+            Ok(self
+                .tip
+                .fetch_add(Self::STEP, std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            Ok(Some(
+                self.tip
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_sub(100),
+            ))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// **#1190.** The interval must hold on a chain that outruns the endpoint. With the tip moving on
+    /// every poll, the old loop never saw `next > ceiling`, never slept, and polled as fast as the
+    /// endpoint answered: 29 times a minute on the gns nest under `--poll-interval 5m`. Under a paused
+    /// clock an hour at five minutes is twelve-ish polls; the runaway source caps at 400 so the
+    /// unfixed loop fails here instead of spinning forever.
+    #[tokio::test(start_paused = true)]
+    async fn the_interval_holds_on_a_chain_that_outruns_the_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(
+            tmp.path(),
+            crate::freshness::Freshness {
+                poll_interval: std::time::Duration::from_secs(300),
+                finality_only: false,
+            },
+        )
+        .await;
+        let src = Arc::new(RunawayTipSource::new());
+        let recorder = src.clone();
+        let task = tokio::spawn(index_loop(
+            src as Arc<dyn Source>,
+            nest,
+            Some(10),
+            false,
+            1,
+            50,
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+        task.abort();
+        let polls = recorder.polls();
+        assert!(
+            (10..=30).contains(&polls),
+            "expected roughly twelve tip polls in a virtual hour at a five-minute interval on a \
+             chain that moves between polls, got {polls}"
+        );
+    }
+
     async fn build_dialled_nest(
         dir: &std::path::Path,
         freshness: crate::freshness::Freshness,

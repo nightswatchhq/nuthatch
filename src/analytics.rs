@@ -88,6 +88,9 @@ struct DuckCache {
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
     conn: Connection,
+    /// This instance's private spill directory, removed when the cached connection is dropped or
+    /// evicted (#1165). Held here so its lifetime is exactly the connection's.
+    _spill: SpillDir,
 }
 
 /// A content hash of one cache input, hex sha256 (#840).
@@ -191,10 +194,103 @@ fn duck_opens_for(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
+/// A DuckDB instance's private spill directory, removed when the instance is dropped (#1165).
+///
+/// DuckDB spills buffers past `max_memory` into `temp_directory`, whose files are named by *index*
+/// within that directory - `duckdb_temp_storage_DEFAULT-0.tmp`, `..._S128K-0.tmp`, and so on. The
+/// name says nothing about which instance wrote it, because DuckDB assumes one instance owns the
+/// directory. This process runs several: the connection cache hands its connection to a query for
+/// the query's whole duration, so a second concurrent query finds the cache empty and opens an
+/// instance of its own. With the default `temp_directory` - `.tmp` under the working directory,
+/// which for a nest service is the nest's own data directory - those instances write the same file
+/// names in one place and overwrite each other's spilled blocks.
+///
+/// Reading such a block back fails DuckDB's own check, `decompressed_size == buffer->AllocSize()` in
+/// `temporary_file_manager.cpp`, and the process dies. Reproduced 2026-09-06 against a copy of the
+/// production corpus: four threads replaying 51 captured statements, a segmentation fault inside
+/// fifteen seconds, every time. On the box it was 25 SEGVs in a minute at four permits and none at
+/// one, which is the same fault seen from the outside - one permit never has a second instance.
+struct SpillDir(PathBuf);
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Remove spill directories left by processes that are no longer running.
+///
+/// The cache lives in a `static`, and Rust does not drop statics at exit, so a cached connection's
+/// [`SpillDir`] guard never runs on the way out and its directory outlives the process. One empty
+/// directory per instance is not much, but a nest restarting every fifteen seconds under a fault -
+/// which is exactly what #1165 looked like - would leave one behind each time, with whatever it had
+/// spilled inside. Ownership is by pid: a directory whose pid still has a `/proc` entry belongs to a
+/// live process and is left alone. Where `/proc` is not there to ask (macOS, dev machines), nothing
+/// is swept, because guessing by age could delete a running instance's spill under it.
+fn sweep_dead_spill_dirs() {
+    if !Path::new("/proc").is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name
+            .to_string_lossy()
+            .strip_prefix("nuthatch-duckdb-")
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// The in-process half of a spill directory's name; the other half is the PID.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A directory no other DuckDB instance in this process (or any other) will write to.
+///
+/// Created **exclusively**: `create_dir`, not `create_dir_all`, and a name that already exists is
+/// skipped for the next sequence number. The name alone is not enough. A process that dies without
+/// dropping its static cache leaves its directories behind, the sweep keeps any whose PID is live,
+/// and a later process handed that same PID by the kernel would otherwise start its sequence at zero
+/// and write into the dead process's `-0` - the collision this whole change exists to remove, back
+/// through PID reuse. Refusing an existing path makes the directory this instance's by construction,
+/// whatever is left on disk.
+fn new_spill_dir() -> Result<SpillDir> {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(sweep_dead_spill_dirs);
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "nuthatch-duckdb-{}-{}",
+            std::process::id(),
+            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(SpillDir(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("creating the DuckDB spill directory {}", path.display())
+                })
+            }
+        }
+    }
+}
+
+fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     note_duck_open(dir);
+    let spill = new_spill_dir()?;
     let allowed: Vec<String> = allowed_read_dirs(dir)
         .into_iter()
+        .chain(std::iter::once(spill.0.clone()))
         .filter(|p| p.exists())
         .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
         .collect();
@@ -210,7 +306,11 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
         .max_memory(&mem_limit)
         .context("duckdb max_memory")?
         .threads(MAX_THREADS)
-        .context("duckdb threads")?;
+        .context("duckdb threads")?
+        // Set on the config rather than by a later `SET`, so no query can ever run against the
+        // shared default - and before `lock_configuration`, which freezes it (#1165).
+        .with("temp_directory", spill.0.display().to_string())
+        .context("duckdb temp_directory")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
@@ -237,7 +337,7 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    Ok(conn)
+    Ok((conn, spill))
 }
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
@@ -334,7 +434,8 @@ pub fn degraded_tables(
     dir: &Path,
     declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
-    let conn = open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    let (conn, _spill) =
+        open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
     define_views(
         &conn,
         dir,
@@ -684,13 +785,15 @@ fn attempt(
         c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
     });
     if !reusable {
+        let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
-            conn: open_locked_duckdb(dir).context("failed to open DuckDB")?,
+            conn,
+            _spill: spill,
         });
     }
     let mut slot = slot.expect("just inserted");
@@ -726,7 +829,7 @@ fn attempt(
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
-        define_nest_views(conn, dir);
+        define_nest_views(conn, dir, wanted.as_ref());
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
         define_labels_view(conn, dir);
@@ -2212,7 +2315,25 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// tables. Best-effort: a view over a table with no sealed segment yet - or a bad statement - is
 /// skipped with a debug log rather than failing the whole query. Nest SQL is authored by the nest
 /// you chose to consume; it runs read-only in this ephemeral in-memory DuckDB, same trust as `/sql`.
-fn define_nest_views(conn: &Connection, dir: &Path) {
+///
+/// `wanted` is the same reachability set `define_views` narrows by (#896): only a view whose name is
+/// in it is (re)defined, and `None` defines every view as before. **The narrowing has to reach here
+/// too, not only the base tables, and it did not.** DuckDB binds a `CREATE OR REPLACE VIEW` eagerly,
+/// and on the pooled connection the previous request's base-table views are still in the catalogue,
+/// so every authored view bound in full on every request: each bind re-reads the footer of every
+/// segment behind every table the view touches, through the `allowed_directories` path check.
+/// Measured on the Lodestar nest (1,924 segments, 12 view files, 2026-09-06): `SELECT 1` cost
+/// 1.2 s and 32,000 `openat` calls with 640,000 `fstat`/`readlink` behind them, on a statement that
+/// reads nothing; the same statement on the same nest was 14 ms before any dashboard view had left
+/// its base tables defined. That fixed cost sat under every one of the dashboard's statements.
+/// `reachable_tables` already carries the intermediate view names in its closure, so a view a
+/// statement reaches through another view is still defined, in file order, before the one that
+/// reads it.
+fn define_nest_views(
+    conn: &Connection,
+    dir: &Path,
+    wanted: Option<&std::collections::BTreeSet<String>>,
+) {
     for v in nest_view_files(dir) {
         // **Per statement, not per file** (issue #241 item 4). `execute_batch` runs the whole file as
         // one unit, so a single view referencing a table that has never fired - `TaskCancelled`, a
@@ -2221,6 +2342,13 @@ fn define_nest_views(conn: &Connection, dir: &Path) {
         // uncommenting them once the event fired, which is a poor trade for a fault-isolation gain
         // that was never needed at this granularity.
         for stmt in split_sql_statements(&v.sql) {
+            // A statement this one cannot name (not a `CREATE VIEW`) runs as before: the point is
+            // to skip work that is known to be unreachable, never to skip what is not understood.
+            if let (Some(wanted), Some(name)) = (wanted, view_name(&stmt)) {
+                if !wanted.contains(&name) {
+                    continue;
+                }
+            }
             if let Err(e) = conn.execute_batch(&with_or_replace_view(&stmt)) {
                 tracing::debug!("nest view {} statement skipped: {e}", v.file);
             }
@@ -4297,7 +4425,7 @@ template="pool"
             "the denylist must still refuse read_text - it is the control in front"
         );
 
-        let conn = open_locked_duckdb(nest.path()).unwrap();
+        let (conn, _spill) = open_locked_duckdb(nest.path()).unwrap();
         let read_succeeded = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
             Err(_) => false,
@@ -4337,7 +4465,7 @@ template="pool"
         std::fs::create_dir_all(&shared).unwrap();
         let file = shared.join("ok.txt");
         std::fs::write(&file, "shared\n").unwrap();
-        let conn = open_locked_duckdb(&nid_dir).unwrap();
+        let (conn, _spill) = open_locked_duckdb(&nid_dir).unwrap();
         let sql = format!("SELECT content FROM read_text('{}')", file.display());
         let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
         let got: String = stmt
@@ -5548,7 +5676,7 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         // The base table exists as an empty typed view…
         let n: i64 = conn
@@ -5561,6 +5689,107 @@ template="pool"
             .query_row("SELECT count(*) FROM big_transfers", [], |r| r.get(0))
             .expect("an authored view on an empty table must resolve to zero rows, not fail");
         assert_eq!(n, 0);
+    }
+
+    /// **The #896 narrowing has to reach the authored views too.** `define_views` stopped defining
+    /// base tables a statement cannot reach; `define_nest_views` carried on redefining every authored
+    /// view on every request, and on the pooled connection each one bound in full against the base
+    /// views a previous request left behind. On the Lodestar nest that was 1.2 s and 32,000 file
+    /// opens under a `SELECT 1`. The positive control is here on purpose: an absence assertion whose
+    /// mechanism is missing passes for the wrong reason.
+    #[test]
+    fn a_view_the_statement_cannot_reach_is_not_redefined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/10-a.sql"),
+            "CREATE VIEW a AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/20-b.sql"),
+            "CREATE VIEW b AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &HotRows::new(),
+            u64::MAX,
+            &Default::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let wanted: std::collections::BTreeSet<String> =
+            ["a".to_string(), "tok__transfer".to_string()]
+                .into_iter()
+                .collect();
+        define_nest_views(&conn, dir.path(), Some(&wanted));
+        assert!(
+            conn.prepare("SELECT * FROM a").is_ok(),
+            "the view the statement reaches is defined"
+        );
+        assert!(
+            conn.prepare("SELECT * FROM b").is_err(),
+            "a view the statement cannot reach must not be bound - that bind, over every segment \
+             behind every table it touches, was the fixed cost under every request"
+        );
+
+        // The positive control: `None` still defines everything, as the warm-restart callers rely on.
+        define_nest_views(&conn, dir.path(), None);
+        assert!(
+            conn.prepare("SELECT * FROM b").is_ok(),
+            "with no reachability set every authored view is defined"
+        );
+    }
+
+    /// A statement that reaches a view only through another view still answers. `reachable_tables`
+    /// carries the intermediate view's name in its closure, so narrowing `define_nest_views` to that
+    /// set defines the chain in file order - the one the statement names last, the one it builds on
+    /// first. Defining only the named view would leave it unbound and this query failing.
+    #[test]
+    fn a_view_reached_through_another_view_is_still_defined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"tok__transfer","from":"0xa","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/10-a.sql"),
+            "CREATE VIEW a AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/20-c.sql"),
+            "CREATE VIEW c AS SELECT \"from\" FROM a;",
+        )
+        .unwrap();
+
+        let rows = query(dir.path(), "SELECT \"from\" FROM c")
+            .expect("a view on a view must still resolve under the narrowed definition");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["from"], "0xa");
     }
 
     /// The other half of the same mechanism: **without** a schema there are no columns, so the empty
@@ -5589,7 +5818,7 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         assert!(
             conn.query_row("SELECT count(*) FROM big_transfers", [], |r| r
@@ -5692,7 +5921,7 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path());
+            define_nest_views(&conn, dir.path(), None);
             assert!(
                 conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
                     .get::<_, i64>(0))
@@ -5716,7 +5945,7 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path());
+            define_nest_views(&conn, dir.path(), None);
             let row = conn
                 .query_row(
                     "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
@@ -5858,7 +6087,7 @@ events = ["Minted", "Withdrawn"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
         let row = conn
             .query_row(
                 "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
@@ -6089,7 +6318,7 @@ events = ["Transfer"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         for v in ["ok_one", "ok_two"] {
             conn.query_row(&format!("SELECT count(*) FROM {v}"), [], |r| {
@@ -6322,5 +6551,38 @@ events = ["Transfer"]
         )
         .expect_err("the guarded surface must refuse it too");
         assert!(format!("{err:#}").contains("not permitted"));
+    }
+
+    /// Jules on #1182: the spill path was keyed by PID and an in-process counter and created with
+    /// `create_dir_all`, so a directory left by a dead process whose PID the kernel handed back would
+    /// be reused, and two instances would share one spill directory again. A name that exists is
+    /// refused and the sequence advances; the pre-made directories stand in for the dead process's.
+    /// Mutation-checked: with `create_dir_all` back in place this fails.
+    #[test]
+    fn a_spill_directory_that_already_exists_is_never_reused() {
+        let next = SPILL_SEQ.load(Ordering::Relaxed);
+        let planted: Vec<PathBuf> = (next..next + 8)
+            .map(|n| {
+                std::env::temp_dir().join(format!("nuthatch-duckdb-{}-{n}", std::process::id()))
+            })
+            .collect();
+        for p in &planted {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("someone-elses.tmp"), b"x").unwrap();
+        }
+        let mine = new_spill_dir().unwrap();
+        assert!(
+            !planted.contains(&mine.0),
+            "an existing directory was handed out as a fresh spill directory: {}",
+            mine.0.display()
+        );
+        assert!(mine.0.exists() && mine.0.read_dir().unwrap().next().is_none());
+        for p in &planted {
+            assert!(
+                p.join("someone-elses.tmp").exists(),
+                "the other process's spill file was disturbed"
+            );
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }

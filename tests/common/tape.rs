@@ -255,6 +255,8 @@ pub struct TapeSource {
     /// aliases return the same rows would pass just as happily with two identical backfills running
     /// side by side - which is the bug, not the fix.
     logs_calls: std::sync::atomic::AtomicUsize,
+    /// Every `logs` call's `(from, to)`, in order - see [`TapeSource::logs_ranges`].
+    logs_windows: std::sync::Mutex<Vec<(u64, u64)>>,
     /// When set, every [`Source`] call fails - the tape is "dark".
     ///
     /// This models the ordinary operational fault, not an exotic one: every RPC endpoint for this
@@ -280,6 +282,7 @@ impl TapeSource {
                 finalized: 0,
             }),
             logs_calls: std::sync::atomic::AtomicUsize::new(0),
+            logs_windows: std::sync::Mutex::new(Vec::new()),
             dark: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -287,6 +290,16 @@ impl TapeSource {
     /// How many `logs` calls have been made against this tape.
     pub fn logs_call_count(&self) -> usize {
         self.logs_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The `(from, to)` of every `logs` call, in order.
+    ///
+    /// A bare count cannot tell a *duplicate* fetch from an extra tip-following window, and once the
+    /// cursor is paced by `--poll-interval` (#1190) the number of following windows before a test's
+    /// wait predicate flips is a fact about the machine's load, not about the code. The ranges say
+    /// which blocks were actually asked for, which is what a "did it backfill twice" guard means.
+    pub fn logs_ranges(&self) -> Vec<(u64, u64)> {
+        self.logs_windows.lock().unwrap().clone()
     }
 
     /// Take this chain's provider offline: every subsequent [`Source`] call returns an error, exactly
@@ -397,6 +410,7 @@ impl Source for TapeSource {
         self.online()?;
         self.logs_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.logs_windows.lock().unwrap().push((from, to));
         let t = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for (_, fixture) in t.blocks.range(from..=to) {

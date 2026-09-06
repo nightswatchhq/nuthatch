@@ -112,6 +112,17 @@ a matter of trimming. Two facts decide the shape of the work:
    window, or a rate below what finishes in days), Chief's 2026-09-06 decision applies: the Alchemy
    Monad key may be used for the backfill, knowingly, at the measured rate (~57k CU/min while it
    runs), and both issues close when the backfill reaches tip and #1147's criteria are checked.
+9. **#1183 - every `/sql` request re-bound every authored view.** Found the day Lodestar cut over,
+   from Chris's report that the indexer page loads slower than it did on the gateway. A `SELECT 1`
+   cost 1.2 s and 32,000 file opens on the allocations nest; `define_nest_views` was never given the
+   reachability set #896 gave `define_views`. Fixed in #1184; on production the 47 dashboard
+   statements went from 158 s to 89 s serially and the floor from 1.24 s to 20 ms. Closes when #1184
+   lands and 3.5.1 carries it.
+10. **#1186 - the dashboard's heavy views are whole-history folds recomputed on every request.** The
+    89 s that remain after #1183, 42 s of it in four statements. This is the query-time recomputation
+    RFC-0041 was written about, and the Lodestar nest declares views, not entities. The issue lists
+    three options (entities in the nest, a deterministic memo keyed on the inputs, cache warming in
+    Lodestar); weigh them and decide. None is a new capability.
 
 ## The call
 
@@ -125,6 +136,34 @@ Lodestar nests under 1,000 CU a minute between them. At Alchemy's rates that is 
 the $100 target has headroom for a second key or a worse month.
 
 **Perpl does not cost money again.** If public Monad endpoints cannot carry it, it parks.
+
+## The result, measured
+
+One clean hour, 13:55 to 14:55 UTC on 2026-09-06, every Lodestar nest on 3.5.x with `--poll-interval
+5m`, no restart inside the hour, counter deltas from `/metrics` priced at Alchemy's rates (20/60/10 CU
+for `eth_getBlockByNumber`/`eth_getLogs`/`eth_blockNumber`):
+
+| nest | endpoint | CU/min | CU/month | at $0.45 per M |
+|---|---|---|---|---|
+| 8107 allocations (`/alloc`, 33 dashboard call sites) | Alchemy, the only paid one | 121 | 5.2M | $2.35, inside the 30M free tier |
+| 8113 gns (`/gns`) | arb1 public | 4,377 | 189M | $0 - and #1190 explains the number |
+| 8104 dips (`/dips`) | public | 80 | 3.5M | $0 |
+| 8106 dips-sepolia | public | 214 | 9.2M | $0 |
+
+Against the ~9,900 CU/min (~$185 a month) one Arbitrum cursor at tip was measured at before the dial,
+the paid figure is 121 CU/min, an 82x reduction, and the month lands inside Alchemy's free tier. The
+$100 target is met with over 40x headroom on the paid figure. The Perpl nest, the other paid consumer at
+~57k CU/min, is parked (#1147, #1148, Chief's decision).
+
+The gns figure is the one honest surprise: 29 tip polls a minute under a five-minute interval. That
+is #1190, found from this table - the interval only ever engaged when a re-polled tip had stood
+still, which on Arbitrum behind a slow free endpoint is never. It costs nothing here because the
+endpoint is free; it would have been the whole bill back on a paid one the day that endpoint slowed.
+Fixed in #1191.
+
+The two things the cutover found the same day - a 1.2 s floor under every `/sql` request (#1183,
+fixed and shipped in 3.5.1) and the dashboard's whole-history views (#1186, the memo in #1189) - are
+items 9 and 10 above.
 
 ## Explicitly not in this sprint
 
