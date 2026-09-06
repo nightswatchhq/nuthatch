@@ -195,8 +195,17 @@ impl AdaptiveWindow {
     /// clamped down live, so growth back up after a ceiling is lifted goes through `observed`'s own
     /// 4x-per-step damping instead of jumping straight to wherever it had silently drifted.
     pub fn set_max(&mut self, max: u64) {
-        self.max = max.max(self.min);
-        self.hard_max = self.max;
+        // The configured ceiling moves; a ceiling a refusal taught (`max < hard_max`, #672) is kept
+        // underneath it rather than overwritten, or a caller re-applying its cap every iteration -
+        // as the runtime loop does - would undo the lesson the moment it was learnt (#1170). A
+        // controller that has learnt nothing follows the configured ceiling exactly as before.
+        let learned = self.max < self.hard_max;
+        self.hard_max = max.max(self.min);
+        self.max = if learned {
+            self.max.min(self.hard_max)
+        } else {
+            self.hard_max
+        };
         self.window = self.window.min(self.max);
     }
 }
@@ -557,6 +566,39 @@ mod tests {
         );
         w.served_whole(10);
         assert_eq!(w.ceiling(), 20);
+    }
+
+    /// #1170, review: the runtime loop re-applies its configured cap on every iteration. That must
+    /// move the configured ceiling and leave a refusal-taught one alone, or the lesson is undone
+    /// before the recovery streak can start; and a cap set *below* the learnt ceiling still binds.
+    #[test]
+    fn reapplying_the_configured_cap_keeps_a_learned_ceiling() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        w.set_max(100_000);
+        assert_eq!(
+            w.ceiling(),
+            10,
+            "re-applying the same cap wiped the learnt ceiling"
+        );
+        w.set_max(5);
+        assert_eq!(
+            w.ceiling(),
+            5,
+            "a cap below the learnt ceiling must still bind"
+        );
+        // Recovery climbs towards the configured cap that is current, not the one at construction.
+        w.set_max(40);
+        for _ in 0..(RECOVERY_STREAK * 8) {
+            w.served_whole(w.ceiling());
+        }
+        assert_eq!(w.ceiling(), 40);
+        // A controller that learnt nothing follows the configured ceiling exactly, both ways.
+        let mut u = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        u.set_max(800);
+        assert_eq!(u.ceiling(), 800);
+        u.set_max(100_000);
+        assert_eq!(u.ceiling(), 100_000);
     }
 
     #[test]
