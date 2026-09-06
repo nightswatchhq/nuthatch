@@ -54,10 +54,13 @@ a matter of trimming. Two facts decide the shape of the work:
    `--finality-only` (knob 2), which caps the cursor at the chain's finality boundary so nothing it
    indexes can reorg and the reorg check is not paid. Both loops, solo and runtime. `/ready` states
    the mode and the interval, and its stall threshold scales with the interval so a five-minute
-   cursor is not reported stalled at ninety seconds. Acceptance: the same rows as tip-following for
-   the same blocks, and each sealed segment's content address a function of its block range and
-   rows alone - which is what today's tip path already guarantees, since segment boundaries there
-   already depend on when finality advanced relative to a window. **Mutate it**: fake the ceiling
+   cursor is not reported stalled at ninety seconds. Acceptance, stated so that only one
+   implementation satisfies it: (a) a nest run under either flag holds exactly the rows a
+   tip-following run holds for the same blocks; (b) sealing is untouched, so a segment's content
+   address remains what it is today - a deterministic function of the block range it covers and the
+   rows in it. Byte-identical segment *files* between two runs are **not** the criterion and never
+   were: on the tip path a segment's boundaries already depend on when finality advanced relative to
+   a window, so two tip-following runs cut different files today. **Mutate it**: fake the ceiling
    back to `tip` under `--finality-only` and the test must go red; quote the failure in the PR.
    Knob 3 (timestamp interpolation) is not in scope, and knob 4 is #1170 below.
 2. **Release 3.5.0** carrying #1173, the DuckDB memory budget that landed after 3.4.1 (PR 1172) and the
@@ -75,10 +78,12 @@ a matter of trimming. Two facts decide the shape of the work:
 
 ## What runs in parallel, and does not wait for the spine
 
-5. **#1170 - the window collapses to ten blocks after 429s and never widens.** RFC-0040 §3 knob 4: a
-   pool being rate-limited should slow the cursor, not retry the batch harder, and the chunker must
-   grow back when the refusals stop. This is the fix that makes public endpoints usable for a
-   backfill, which is what 6 needs.
+5. **#1170 - after an hour of 429s the window had collapsed to ten blocks and stayed there.** That
+   is the observed fault, not the requirement. Required: a refusal may lower the window (RFC-0040 §3
+   knob 4 - slow the cursor rather than retry the batch harder), and once refusals stop the ceiling
+   **must** widen again on its own, so a rate-limited hour costs an hour and not the rest of the
+   backfill. An implementation that leaves the window at ten fails this item. This is the fix that
+   makes public endpoints usable for a backfill, which is what 7 needs.
 6. **#1169 - `seal_direct_completed` runs tens of millions of blocks ahead of the durable watermark.**
    A restart resumes from the watermark, so the counter is a claim the store cannot back. Make the
    counter follow durability or name it for what it is.
