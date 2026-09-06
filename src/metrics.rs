@@ -680,6 +680,21 @@ impl Metrics {
             self.sql_rejections.load(Relaxed),
         ));
         s.push_str(&counter(
+            "nuthatch_sql_memo_hits_total",
+            "Analytical /sql queries answered from the deterministic memo (#1186).",
+            crate::sqlmemo::hits(),
+        ));
+        s.push_str(&counter(
+            "nuthatch_sql_memo_misses_total",
+            "Analytical /sql queries that computed because no remembered answer matched their inputs.",
+            crate::sqlmemo::misses(),
+        ));
+        s.push_str(&gauge(
+            "nuthatch_sql_memo_bytes",
+            "Serialized rows the memo currently holds, bounded by NUTHATCH_SQL_MEMO_BYTES.",
+            crate::sqlmemo::bytes() as u64,
+        ));
+        s.push_str(&counter(
             "nuthatch_rpc_requests_total",
             "Outbound HTTP POSTs to JSON-RPC endpoints (one per request or batch envelope, including failover retries). Not a method count; see nuthatch_rpc_methods_total.",
             self.rpc_requests.load(Relaxed),

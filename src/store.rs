@@ -237,6 +237,14 @@ impl std::error::Error for HotScanTooLarge {}
 /// config, not by a trait method) and the other is a pure function of its arguments.
 #[async_trait::async_trait]
 pub trait HotStore: Send + Sync {
+    /// A counter that moves on every committed write and never otherwise, or `None` where the
+    /// backend cannot say. Two reads that return the same value saw the same rows, which is what
+    /// lets the analytical memo (#1186) answer a repeated statement without re-scanning anything.
+    /// A backend that returns `None` simply has no memo.
+    fn write_generation(&self) -> Option<u64> {
+        None
+    }
+
     // ---- entities ---------------------------------------------------------------------------
     fn put_entity(&self, key: &str, json: &str) -> Result<()>;
     fn get_entity(&self, key: &str) -> Result<Option<String>>;
@@ -339,6 +347,10 @@ pub struct Store {
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
+    /// Committed write transactions since this store was opened, shared across clones. The
+    /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
+    /// same hot rows, and it is this counter rather than a scan of them that says so.
+    writes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
@@ -437,7 +449,18 @@ impl Store {
         Ok(Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Commit a write transaction and count it. Every write this handle makes goes through here, so
+    /// `write_generation` moves on every commit and only on a commit - a rolled-back transaction
+    /// changed nothing a reader could see.
+    fn commit(&self, wtx: redb::WriteTransaction) -> Result<()> {
+        wtx.commit()?;
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     fn from_db(db: Database) -> Result<Store> {
@@ -454,6 +477,7 @@ impl Store {
         Ok(Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -473,7 +497,7 @@ impl Store {
             let mut ob = wtx.open_table(OUTBOX)?;
             ob.insert(Self::outbox_key(seq).as_str(), payload)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(seq)
     }
 
@@ -505,7 +529,7 @@ impl Store {
             let mut t = wtx.open_table(OUTBOX)?;
             t.remove(Self::outbox_key(seq).as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -544,7 +568,7 @@ impl Store {
                 dropped += 1;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(dropped)
     }
 
@@ -572,7 +596,7 @@ impl Store {
             let mut t = wtx.open_table(ENTITIES)?;
             t.insert(key, json)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -602,7 +626,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert("last_block", last_block.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -795,7 +819,7 @@ impl Store {
             let mut t = wtx.open_table(META)?;
             t.insert(key, value)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -807,7 +831,7 @@ impl Store {
             let mut t = wtx.open_table(BLOCKS)?;
             t.insert(Self::block_key(block).as_str(), hash)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -880,7 +904,7 @@ impl Store {
                 blocks.remove(k.as_str())?;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -934,7 +958,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -960,7 +984,7 @@ impl Store {
                 removed += 1;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -996,7 +1020,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -1087,6 +1111,10 @@ impl Store {
 
 #[async_trait::async_trait]
 impl HotStore for Store {
+    fn write_generation(&self) -> Option<u64> {
+        Some(self.writes.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         Store::put_entity(self, key, json)
     }
@@ -1175,7 +1203,7 @@ impl HotStore for Store {
             // Recorded for operators reading the store directly; the fence is what enforces.
             t.insert("owner", owner)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         self.held.store(next, std::sync::atomic::Ordering::SeqCst);
         Ok(next)
     }
@@ -1207,7 +1235,7 @@ impl HotStore for Store {
             t.insert(LEASE_OWNER, owner)?;
             t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         self.held.store(next, std::sync::atomic::Ordering::SeqCst);
         Ok(Lease {
             owner: owner.to_string(),
@@ -1227,7 +1255,7 @@ impl HotStore for Store {
             let mut t = wtx.open_table(META)?;
             t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(Lease {
             owner: holder,
             fence,
@@ -1244,7 +1272,7 @@ impl HotStore for Store {
             // for an operator to find than an empty row.
             t.insert(LEASE_EXPIRES_AT, "0")?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 

@@ -78,6 +78,7 @@ pub mod serve;
 pub mod skill;
 pub mod source;
 pub mod sql_errors;
+pub mod sqlmemo;
 pub mod store;
 pub mod subgraph_import;
 pub mod tape;
