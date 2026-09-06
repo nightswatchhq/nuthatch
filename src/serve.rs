@@ -1627,7 +1627,13 @@ async fn run_sql_query(
     if let Some((key, ..)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             METRICS.inc_sql();
-            return sql_response(&s, &hit.out, &hit.watermarks, true);
+            return sql_response(
+                &s,
+                &hit.out,
+                &hit.watermarks,
+                (hit.as_of, hit.sealed_through),
+                true,
+            );
         }
     }
     // Fail fast when the analytical surface is saturated rather than queue: a backlog of pending
@@ -1716,21 +1722,29 @@ async fn run_sql_query(
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
         let after = (store.write_generation(), store.sealed_through());
+        // Provenance from the same task as the query, for the same reason as the watermarks: read
+        // out on the response path it can name a newer state than the rows came from.
+        let as_of = store
+            .get_meta("last_block")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok());
         // The watermarks ride out with the result: they describe the rows this query was answered
         // from, and re-reading them out here is the race #932 is about.
-        Ok((out, watermarks, after))
+        Ok((out, watermarks, after, as_of))
     })
     .await;
     match result {
         // Provenance stamp (RFC-0016 §4): an agent can cite its answer against content-addressed data -
         // as of which block, what's sealed, and the registry it decoded with.
-        Ok(Ok((out, watermarks, after))) => {
+        Ok(Ok((out, watermarks, after, as_of))) => {
+            let provenance = (as_of, after.1);
             if let Some((key, generation, sealed_through, before)) = memo {
                 if after == (Some(generation), sealed_through) && watermarks == before {
-                    crate::sqlmemo::put(key, &out, &watermarks);
+                    crate::sqlmemo::put(key, &out, &watermarks, provenance);
                 }
             }
-            sql_response(&s, &out, &watermarks, false)
+            sql_response(&s, &out, &watermarks, provenance, false)
         }
         // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
         // the node is refusing to spend the memory - so a caller should retry later or narrow to
@@ -2015,6 +2029,7 @@ fn sql_response(
     s: &AppState,
     out: &crate::analytics::QueryOutput,
     watermarks: &std::collections::BTreeMap<String, u64>,
+    (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
 ) -> axum::response::Response {
     Json(json!({
@@ -2049,9 +2064,8 @@ fn sql_response(
         // adoption is correct, and the old stamp could not express it. `nid` closes that: an agent
         // citing an answer can now name the dataset, not just the decode.
         "provenance": {
-            "as_of": s.store.get_meta("last_block").ok().flatten()
-                .and_then(|v| v.parse::<u64>().ok()),
-            "sealed_through": s.store.sealed_through(),
+            "as_of": as_of,
+            "sealed_through": sealed_through,
             "source": "hot+sealed",
             "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
             "nid": s.nid.as_deref(),

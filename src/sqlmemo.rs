@@ -81,6 +81,12 @@ impl Inputs<'_> {
 pub struct Entry {
     pub out: QueryOutput,
     pub watermarks: BTreeMap<String, u64>,
+    /// The provenance the rows were computed under - `last_block` and the sealed watermark read in
+    /// the same blocking task as the query. A hit cites these, never the live store: the store may
+    /// have moved between the lookup and the response, and a citation that names a newer state for
+    /// older rows is false even when every row in it is right (Jules on #1189).
+    pub as_of: Option<u64>,
+    pub sealed_through: u64,
     bytes: usize,
 }
 
@@ -150,6 +156,7 @@ impl Memo {
         key: Key,
         out: &QueryOutput,
         watermarks: &BTreeMap<String, u64>,
+        provenance: (Option<u64>, u64),
         cap: usize,
     ) -> bool {
         if cap == 0 || out.degraded() || out.tip_unavailable {
@@ -185,6 +192,8 @@ impl Memo {
                 Arc::new(Entry {
                     out: out.clone(),
                     watermarks: watermarks.clone(),
+                    as_of: provenance.0,
+                    sealed_through: provenance.1,
                     bytes,
                 }),
                 tick,
@@ -221,8 +230,13 @@ pub fn max_bytes() -> usize {
 pub fn get(key: &Key) -> Option<Arc<Entry>> {
     GLOBAL.get(key, max_bytes())
 }
-pub fn put(key: Key, out: &QueryOutput, watermarks: &BTreeMap<String, u64>) -> bool {
-    GLOBAL.put(key, out, watermarks, max_bytes())
+pub fn put(
+    key: Key,
+    out: &QueryOutput,
+    watermarks: &BTreeMap<String, u64>,
+    provenance: (Option<u64>, u64),
+) -> bool {
+    GLOBAL.put(key, out, watermarks, provenance, max_bytes())
 }
 pub fn bytes() -> usize {
     GLOBAL.bytes()
@@ -331,10 +345,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm));
+        assert!(!put(Key([1; 32]), &out, &wm, (None, 0)));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm));
+        assert!(!put(Key([2; 32]), &out, &wm, (None, 0)));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -350,14 +364,14 @@ mod tests {
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, cap));
+            assert!(m.put(k(n), &rows(10), &wm, (None, 0), cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, cap));
+        assert!(m.put(k(5), &rows(10), &wm, (None, 0), cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -378,10 +392,13 @@ mod tests {
         let wm = BTreeMap::new();
         let out = rows(10);
         let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, cap));
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, (None, 0), cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, cap + 1));
-        assert!(!m.put(Key([0xb3; 32]), &out, &wm, 0), "zero disables");
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, (None, 0), cap + 1));
+        assert!(
+            !m.put(Key([0xb3; 32]), &out, &wm, (None, 0), 0),
+            "zero disables"
+        );
         assert!(
             m.get(&Key([0xb2; 32]), 0).is_none(),
             "zero disables reads too"
