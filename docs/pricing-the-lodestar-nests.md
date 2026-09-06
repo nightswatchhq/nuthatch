@@ -1,0 +1,168 @@
+# Pricing the Lodestar nests: RFC-0048 applied to a real corpus
+
+**What this is:** one page taking [RFC-0048](rfcs/0048-pricing-query-access.md)'s pricing design and
+running it against the nests actually in production, with the numbers measured on the box on
+**2026-09-06**. RFC-0048 §8 says its default admission threshold "needs a measured distribution of
+named queries against real catalogues (Lodestar allocations nest is the obvious first), not a round
+number from this document". This is the first instalment of that measurement.
+
+**What this is not.** RFC-0048 is a draft, design only, and **not a carve-out**; RFC-0046 is accepted
+in principle, design only. Under the 2026 feature freeze neither is work to start. There is **no x402
+in the nuthatch tree** - the working buyer and seller live in Lodestar's TypeScript. Nothing below
+is a plan to build. It is the arithmetic an operator would need before anyone did.
+
+The companion page, [the Lodestar lifecycle](lodestar-lifecycle.md), carries the cost and
+performance figures this one prices against.
+
+---
+
+## 1. The corpus is small, fixed and reviewed, which is the whole reason this is tractable
+
+RFC-0048 does not price open `/sql`; it prices **named queries on a bounded surface** (RFC-0034).
+What that surface actually contains here:
+
+| | count |
+|---|---:|
+| SQL builders exported by Lodestar's `nest-queries.ts` | **42** |
+| distinct views they read | **13** |
+| authored view files on `graph-allocations-nest` | 12 |
+| decoded tables the nest exposes | 81 |
+| nests behind one host | 5 |
+
+Forty-two statements is a corpus a human can review one at a time, which is exactly the property
+that makes a per-operator cold bound reviewable rather than aspirational. It is also small enough
+that a pricing manifest (Phase 2) is a short data file, not a DSL - the Agora lesson made cheap.
+
+---
+
+## 2. The two terms, with the real numbers
+
+RFC-0048 Phase 0: `bound = cold_scan_bytes + hot_scan_bytes`, one unit throughout, source bytes read.
+
+**Cold.** `graph-allocations-nest` holds **1,924 Parquet segments totalling 643 MB**. A worst-case
+unpartitioned scan of the entire nest is therefore 643 MB, and every per-table bound is a fraction of
+it. That is a small number by the standards RFC-0048 worries about - BigQuery's failure mode is a
+petabyte, ours is two thirds of a gigabyte - and it means a Phase 0 threshold sized to refuse a
+runaway scan on this corpus has little work to do.
+
+**Hot.** The redb hot store is **16 MB on disk**, holding roughly 353,000 unsealed blocks (about a
+day of Arbitrum). RFC-0048 concedes that on today's serving path there is only one scan class, the
+unbounded hot scan, because `analytics.rs` copies every hot row into a temp table before any key
+predicate applies. **That concession costs almost nothing here.** The pessimistic default term is
+16 MB. The redb key/range pushdown that Phase 1's hot tier is blocked on would be a correctness and
+latency improvement on these nests, not a pricing one.
+
+**So the total Phase 0 bound for the worst named query on this nest is order 660 MB**, and for a
+typical one, far less. An operator sizing a threshold on this corpus is choosing between "refuse
+almost nothing" and "refuse the whole-nest scan".
+
+---
+
+## 3. The finding that matters most, and it is a caution
+
+The first thing I ran against the real corpus was `SELECT count(*) FROM lodestar_delegator_stakes`.
+It took 12.7 seconds and **exhausted DuckDB's 488 MB memory limit**. A second attempt segfaulted the
+process.
+
+A Phase 0 byte-scan admission check would have **admitted that query.** Its scan bound is a fraction
+of 660 MB; the thing it exhausted was resident memory, on a `count(*)` returning one row.
+
+This is RFC-0048 §3's central caution demonstrated on live data rather than argued: *"a scan-byte
+bound is not the RAM guard, and Phase 0 does not add one."* Two earlier drafts of that RFC mixed
+scan bytes with resident bytes and the RFC keeps both on the record for this reason. The measurement
+above is the confirming case. **The bytes-to-resident expansion factor on this workload is not small
+and is not measured**, which is one of the three figures RFC-0047 owes and which nothing here
+supplies.
+
+The practical consequence for an operator: **the guard that will actually fire on these nests is the
+512 MB memory cap and the 30-second wall clock, not a byte threshold.** Pricing by bytes scanned
+would be pricing the dimension that is not binding.
+
+---
+
+## 4. The rescan rule, and how many queries it refuses
+
+RFC-0048 rule 3b refuses to publish any named query whose plan contains a sealed scan that can be
+re-executed - nested-loop inner sides, correlated subqueries, laterals, recursive CTEs - because one
+operator can mean thousands of passes and a per-operator sum charges it once.
+
+Against the 42 builders: **one** carries a correlated scalar subquery in its SQL text,
+`indexerActiveAllocationsSql`, which sums allocations per deployment against the outer row
+(`nest-queries.ts:347`). One is a CTE with a `LEFT JOIN`, `poiAllocationsSql`. The rest are flat
+selects, aggregates and joins.
+
+**That is not the same as one refusal, and the difference is the rule.** Rule 1 says take the
+physical plan, not the SQL text, and DuckDB decorrelates scalar subqueries into hash joins as a
+matter of course. Whether `indexerActiveAllocationsSql` is publishable is a question for `EXPLAIN`,
+not for a grep - and the grep is the answer to a different question, which is how much rewriting a
+Phase 0 would cost. **At most one query out of 42.** The rule is affordable on this corpus.
+
+---
+
+## 5. What the surface can actually earn
+
+The ceiling is not the price. It is throughput, and it is low.
+
+`/sql` admits **two** concurrent queries and refuses the rest in under 3 ms. Measured view latencies
+on this nest run **1.3 s to 10.3 s**, mean about 4 s. Two permits at 4 seconds is a hard ceiling of
+roughly **0.5 queries per second, or 1.3 M a month**, and the observed refusal rate on the live nest
+was **29%** (159 refused against 381 admitted, 540 attempts in one 55-minute window - the two
+counters are disjoint), so the practical figure is a fraction of that.
+
+Actual demand, for a public dashboard: about **415 queries admitted an hour** from ~590 attempted,
+so ~303,000 admitted a month.
+
+Against that, the measured cost of running all five nests: **RPC of roughly $1.50 a month per
+tip-following cursor** at a 5-minute poll, plus one 8 GB VPS carrying all five at load 0.63. Call the
+whole estimate a low-tens-of-dollars figure a month, and the marginal cost of a query effectively
+zero - the bill is the cursor, not the reads.
+
+So the operator's arithmetic is:
+
+```
+revenue ceiling  = flat_price × min(demand, throughput_ceiling)
+                 = flat_price × 303,000 per month at current demand
+cost             = one VPS + ~$1.50 per cursor per month
+```
+
+At any plausible per-query price this clears its costs easily and never approaches a number worth
+building a payment path for on its own. **The reason to do this is not the revenue from one box.**
+That is worth writing down before anyone builds Phase 0, because the freeze is real and a slice
+justified by revenue arithmetic that does not survive contact with a throughput ceiling of 0.5 qps
+is a slice that should not start.
+
+---
+
+## 6. If it were ever built, the order for these nests
+
+Following RFC-0048 §5, with what this corpus changes:
+
+1. **A boundary test first** (RFC-0046 slice 0): delete every payment feature and a self-hoster
+   loses nothing. `CLAUDE.md` §3 binds the artefact, not the operator.
+2. **Flat price per named query, plus the byte-scan admission check.** On this corpus the check is
+   nearly inert, and §3 above is why. Ship it for the pathological case, not for these queries.
+3. **Do not size the threshold in bytes until the expansion factor is measured.** The binding guard
+   here is memory. A byte threshold that admits the query which OOMs the node is a check that reads
+   as a guarantee.
+4. **Skip Phase 1's hot tier.** Its premise is a distinction worth pricing, and with a 16 MB hot
+   store there is no meaningful price difference between a point read and a full hot scan.
+5. **Phase 2's manifest is cheap here** - 42 statements, 13 views, one file.
+6. **Phase 3 is a gateway RFC**, not a nest one, and multi-host selection needs a second host.
+
+**Two things that are prerequisites and are not pricing work at all.** The segfaults
+([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165), 31 on 2026-09-06) and the
+29% refusal rate under two permits. A paid surface that refuses three callers in ten and falls over
+thirty-one times a day is not a product anybody should attach a price to, and neither defect is
+about payments.
+
+---
+
+## 7. What remains unmeasured
+
+- **The bytes-to-resident expansion factor** for a hot temp table on this workload. §3's finding
+  says it is the number that matters and nobody has it.
+- **The per-query DuckDB working set** across all 42 statements, not the six sampled here.
+- **A byte-scan distribution** across the corpus. This page establishes the ceiling (660 MB) and one
+  outlier; it does not establish the spread, which is what §3's "leave Phase 0" benchmark keys on.
+- **Whether `max_row_bytes` is enforced at write time** in the hot store. RFC-0048 calls this slice
+  zero work and a precondition for Phase 1; nothing here checked it.
