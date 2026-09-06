@@ -418,6 +418,48 @@ own published pay-as-you-go rates, checked 2026-08-22. Sources:
 
 A nest sitting at tip on Arbitrum costs on the order of **~$134/month** against a paid provider (with ~$93 of that being the header fetches). That figure is this computation, not a measurement - the reference deployment itself paid nothing for it, because it runs against a free endpoint.
 
+**Measured against a paid endpoint, 2026-09-06** ([#1173](https://github.com/nightswatchhq/nuthatch/issues/1173)):
+the allocations nest on the Lodestar box, at tip on Alchemy, over 45 seconds - 268 `eth_getBlockByNumber`,
+61 `eth_getLogs` and 84 `eth_blockNumber` a minute, **~9,900 CU a minute, ~430M a month, roughly $185**.
+The computation above had the shape right and the attribution wrong. Headers are bought only for blocks
+that produced a kept row (#765), and of that day's 345,600 Arbitrum blocks **95** did. The header per
+block is the **poll loop's own**: a reorg check on every two-second poll, then a checkpoint hash and a
+`finalized` probe on every committed window. The rows were a rounding error; the cadence was the bill.
+
+### Turning the dial: `--poll-interval` and `--finality-only`
+
+That is why the dial is on the cadence ([RFC-0040](rfcs/0040-the-freshness-dial.md) §3, knobs 1 and 2).
+Both are `nuthatch dev` flags, never `nuthatch.toml` fields: how often you ask is not what the nest is,
+and two nests differing only in cadence hold identical rows under one content address.
+
+```sh
+# Same rows, five minutes later, for roughly a hundredth of the requests.
+nuthatch dev --dir . --poll-interval 5m
+
+# Never index past the chain's finality boundary: nothing you hold can reorg.
+nuthatch dev --dir . --poll-interval 5m --finality-only
+```
+
+- **`--poll-interval <DURATION>`** (`2s` default; `5m`, `1h`, or bare seconds) is how long a caught-up
+  cursor waits before asking for the tip again. Every poll costs a tip call and, when a window commits,
+  a reorg check, a checkpoint and a `finalized` probe, whether or not a block carried an event. At five
+  minutes the allocations nest above drops from ~9,900 CU a minute to the order of **100** - a few
+  dollars a month - and holds exactly the same rows. Match it to your consumers: a dashboard on a
+  five-minute cron cannot see the difference between a two-second cursor and a five-minute one.
+- **`--finality-only`** caps the cursor at the chain's finality boundary instead of the tip. Nothing it
+  indexes can be reorged, so the reorg check stops once the hot store holds no unfinalised row, and
+  the hot store only ever carries rows waiting to seal. On Arbitrum the `finalized` tag runs roughly
+  fifteen to twenty minutes behind the tip; that lag is the price, and it is deliberate.
+
+**Nothing about this is silent.** `/ready` carries a `freshness` object - `{"mode": "tip" | "finality",
+"poll_interval_secs": N}` - and `lag_blocks` is then the distance you chose. Its stall thresholds scale
+with the interval (at least three intervals), so a quiet five-minute cursor is not reported as a dead
+one, and a dead pool is still reported inside a quarter of an hour.
+
+**What does not change.** The rows, the decode, the sealing, and a segment's content address, which is
+a function of its block range and rows alone. A slower cursor returns the same data later; it never
+returns a substitute. Backfill is unaffected - the dial only applies once the cursor has caught up.
+
 ---
 
 ## Configuration surface
