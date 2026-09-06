@@ -35,6 +35,49 @@ pub const ENV_MAX_BYTES: &str = "NUTHATCH_SQL_MEMO_BYTES";
 /// everything else for the benefit of one caller.
 const MAX_ENTRY_SHARE: usize = 4;
 
+/// DuckDB functions whose value is not a function of the indexed state, so a statement calling one
+/// is not a fact about the nest and is never remembered (Jules on #1189). Matched on identifiers, so
+/// `random_walks` the column is not `random` the function; a column merely *named* `now` loses its
+/// statement a memo hit and nothing else.
+const VOLATILE: &[&str] = &[
+    "random",
+    "setseed",
+    "uuid",
+    "gen_random_uuid",
+    "uuidv4",
+    "uuidv7",
+    "now",
+    "today",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "current_localtime",
+    "current_localtimestamp",
+    "localtime",
+    "localtimestamp",
+    "transaction_timestamp",
+    "get_current_timestamp",
+    "get_current_time",
+];
+
+/// Whether a statement's answer is a function of the indexed state alone. `false` for one that
+/// names a volatile function anywhere in its text; such a statement computes every time and is
+/// never remembered. Conservative on purpose: a false `false` costs a hit, a false `true` would
+/// cost the guarantee.
+pub fn is_deterministic(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let mut ident = String::new();
+    let mut idents = Vec::new();
+    for c in lower.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else if !ident.is_empty() {
+            idents.push(std::mem::take(&mut ident));
+        }
+    }
+    !idents.iter().any(|i| VOLATILE.contains(&i.as_str()))
+}
+
 /// The identity of an answer: a hash over every input it depends on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Key([u8; 32]);
@@ -337,6 +380,26 @@ mod tests {
         );
         let d2 = std::path::PathBuf::from("/m");
         assert_ne!(base, inputs(&d2, "SELECT 1", 3, &wm, &files).key(), "nest");
+    }
+
+    /// `random()` is not a fact about the nest. Identifier-matched, so the column `random_walks` is
+    /// still a deterministic statement and the bare keyword `current_timestamp` is still caught.
+    #[test]
+    fn a_statement_calling_a_volatile_function_is_not_deterministic() {
+        assert!(!is_deterministic("SELECT random()"));
+        assert!(!is_deterministic("SELECT RANDOM() * 2 AS r"));
+        assert!(!is_deterministic("SELECT current_timestamp"));
+        assert!(!is_deterministic(
+            "select id from t where ts < now() - interval 1 day"
+        ));
+        assert!(!is_deterministic("SELECT gen_random_uuid()"));
+        assert!(is_deterministic("SELECT random_walks FROM t"));
+        assert!(is_deterministic(
+            "SELECT count(*) AS n FROM t WHERE block_number > 5"
+        ));
+        assert!(is_deterministic(
+            "SELECT id, CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_indexers"
+        ));
     }
 
     /// A degraded answer describes a fault, not the data, and is not remembered.

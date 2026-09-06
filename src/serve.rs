@@ -1603,27 +1603,31 @@ async fn run_sql_query(
     // remembered answer for that identity is the answer, and it is returned before the permit gate,
     // because a hit costs no DuckDB and the gate exists to bound DuckDB. `None` where the store
     // cannot report a write generation; that backend simply computes every time.
-    let memo = s.store.write_generation().map(|generation| {
-        let watermarks: std::collections::BTreeMap<String, u64> = s
-            .entities
-            .iter()
-            .filter(|e| e.unavailable().is_none() && e.fault().is_none())
-            .map(|e| (e.name().to_string(), e.applied_through()))
-            .collect();
-        let files = crate::analytics::duck_inputs(&s.dir);
-        let sealed_through = s.store.sealed_through();
-        let key = crate::sqlmemo::Inputs {
-            dir: &s.dir,
-            sql: &q.q,
-            max_rows,
-            sealed_through,
-            write_generation: generation,
-            entity_watermarks: &watermarks,
-            files: &files,
-        }
-        .key();
-        (key, generation, sealed_through, watermarks)
-    });
+    let memo = s
+        .store
+        .write_generation()
+        .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
+        .map(|generation| {
+            let watermarks: std::collections::BTreeMap<String, u64> = s
+                .entities
+                .iter()
+                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+                .map(|e| (e.name().to_string(), e.applied_through()))
+                .collect();
+            let files = crate::analytics::duck_inputs(&s.dir);
+            let sealed_through = s.store.sealed_through();
+            let key = crate::sqlmemo::Inputs {
+                dir: &s.dir,
+                sql: &q.q,
+                max_rows,
+                sealed_through,
+                write_generation: generation,
+                entity_watermarks: &watermarks,
+                files: &files,
+            }
+            .key();
+            (key, generation, sealed_through, watermarks)
+        });
     if let Some((key, ..)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             METRICS.inc_sql();
@@ -3957,6 +3961,27 @@ mod tests {
             third["rows"][0]["n"], 3,
             "and the answer is the new state, not the old one"
         );
+    }
+
+    /// A statement whose value is not a function of the indexed state is computed every time: the
+    /// memo would otherwise hand the first `random()` to every later caller as a fact.
+    #[tokio::test]
+    async fn a_volatile_statement_is_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        let (st, first) = sql_json(&state, "SELECT random() AS r").await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        assert_eq!(first["cached"], false);
+        let (st, second) = sql_json(&state, "SELECT random() AS r").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            second["cached"], false,
+            "random() is not a fact about the nest"
+        );
+        let (_, third) = sql_json(&state, "SELECT current_timestamp AS t").await;
+        assert_eq!(third["cached"], false);
+        let (_, fourth) = sql_json(&state, "SELECT current_timestamp AS t").await;
+        assert_eq!(fourth["cached"], false);
     }
 
     /// A remembered answer costs no DuckDB, so it is served past a saturated permit gate - that is
