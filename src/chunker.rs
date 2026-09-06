@@ -107,12 +107,18 @@ impl AdaptiveWindow {
     /// at most 4× per step so a single sparse (0-log) or spiky window doesn't swing the window wildly.
     /// A range the provider served **whole** at this width. Raises the evidence ceiling that bounds
     /// growth (#672), and - when the ceiling itself was lowered by a refusal - counts towards lifting
-    /// it again (#1170): [`RECOVERY_STREAK`] windows served whole at the ceiling double it, up to the
-    /// ceiling the controller was built with. A window served whole *below* the ceiling says nothing
-    /// about the ceiling and does not count.
+    /// it again (#1170): [`RECOVERY_STREAK`] windows served whole **at exactly** the ceiling double
+    /// it, up to the ceiling the controller was built with.
+    ///
+    /// Exactly, not at least. A window served whole *below* the ceiling says nothing about the
+    /// ceiling. A window *wider* than the ceiling can only have been issued before the refusal that
+    /// lowered it - the pipelined backfill keeps several windows in flight, and the ones already out
+    /// when a refusal lands still come back - so it is evidence about the provider before the
+    /// pressure, not after it, and four of those arriving together must not double the ceiling the
+    /// refusal has only just set.
     pub fn served_whole(&mut self, width: u64) {
         self.served_whole = self.served_whole.max(width);
-        if self.max < self.hard_max && width >= self.max {
+        if self.max < self.hard_max && width == self.max {
             self.whole_streak += 1;
             if self.whole_streak >= RECOVERY_STREAK {
                 self.max = self.max.saturating_mul(2).min(self.hard_max);
@@ -494,6 +500,29 @@ mod tests {
             w.served_whole(w.ceiling());
         }
         assert_eq!(w.ceiling(), 100_000);
+    }
+
+    /// The pipelined path keeps `concurrency` windows in flight, so when a refusal lowers the ceiling
+    /// the wider windows already issued still complete. They were served before the pressure and say
+    /// nothing about the provider under it; counted, four of them would double a ceiling the refusal
+    /// had set a moment earlier.
+    #[test]
+    fn stale_wider_windows_completing_after_a_refusal_are_not_recovery_evidence() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        for _ in 0..(RECOVERY_STREAK * 2) {
+            w.served_whole(6_250);
+        }
+        assert_eq!(
+            w.ceiling(),
+            10,
+            "in-flight wider windows from before the refusal lifted the ceiling"
+        );
+        // Windows sized at the new ceiling are the evidence that counts.
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(10);
+        }
+        assert_eq!(w.ceiling(), 20);
     }
 
     #[test]
