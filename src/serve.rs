@@ -4009,6 +4009,53 @@ mod tests {
         assert_eq!(fourth["cached"], false);
     }
 
+    /// **Jules on #1189, and the answer is the ordering.** The concern was that a statement reading
+    /// something outside the nest - `read_csv_auto('/tmp/x.csv')` and friends - has no stamp in the
+    /// memo key, so changing that file would leave a remembered answer standing.
+    ///
+    /// It cannot, because such a statement never produces an answer to remember: `/sql` refuses every
+    /// file-reading table function (SEC-2's denylist and the parser-derived allowlist, both in
+    /// `analytics::attempt`), and only the `Ok` arm calls `sqlmemo::put`. Confirmed against the live
+    /// Lodestar nest on 2026-09-06 - `read_csv_auto`, `read_parquet`, `glob` and `read_text` each
+    /// answered `400`.
+    ///
+    /// That is an argument about the order of two guards, which is exactly the kind that stops being
+    /// true when someone moves one. So this pins it: the statement is refused, and nothing is
+    /// remembered under it, asserted through the handler rather than by reading the code.
+    #[tokio::test]
+    async fn a_statement_reading_outside_the_nest_is_refused_and_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        let outside = tmp.path().join("outside.csv");
+        std::fs::write(&outside, "n\n1\n").unwrap();
+        let q = format!(
+            "SELECT count(*) AS n FROM read_csv_auto('{}')",
+            outside.display()
+        );
+
+        let before = crate::sqlmemo::entries();
+        let (st, body) = sql_json(&state, &q).await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "a file-reading statement must be refused: {body}"
+        );
+        assert_eq!(
+            crate::sqlmemo::entries(),
+            before,
+            "a refused statement must leave nothing in the memo"
+        );
+
+        // And again, so a second identical request cannot be answered from an entry the first left.
+        let (st, body) = sql_json(&state, &q).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["cached"],
+            Value::Null,
+            "a refusal carries no cached flag: {body}"
+        );
+    }
+
     /// A remembered answer costs no DuckDB, so it is served past a saturated permit gate - that is
     /// most of the point under a dashboard's burst. A statement with no remembered answer is still
     /// refused, so the gate still bounds what it was built to bound.
