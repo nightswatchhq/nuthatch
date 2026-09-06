@@ -1408,6 +1408,7 @@ pub async fn dev(
     window_override: Option<u64>,
     no_admin: bool,
     fail_fast: bool,
+    freshness: crate::freshness::Freshness,
 ) -> Result<()> {
     let mounts = MountTable::load(&dir)?;
     if mounts.mount_refs().is_empty() {
@@ -1439,7 +1440,12 @@ pub async fn dev(
     }
 
     let multi_tenant = mounts.is_multi_tenant();
-    let mounted = load_mounted(&dir, &datasets, multi_tenant)?;
+    let mut mounted = load_mounted(&dir, &datasets, multi_tenant)?;
+    // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
+    // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
+    for (_, _, config) in &mut mounted {
+        config.freshness = freshness;
+    }
     let groups = group_by_chain(&endpoints, mounted)?;
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
@@ -1711,6 +1717,7 @@ pub async fn dev(
             admin_enabled,
             admin_token: admin_token.clone(),
             max_rss_mb: max_rss,
+            freshness,
         },
     }));
 
@@ -2042,6 +2049,9 @@ pub struct MountContext {
     pub admin_token: Option<String>,
     /// The per-cursor RSS ceiling a mount must not breach (`CLAUDE.md`; RFC-0021 §0).
     pub max_rss_mb: u64,
+    /// The runtime's freshness dial (RFC-0040), stamped onto a hot-mounted nest's config so it runs
+    /// at the cadence its co-tenants do.
+    pub freshness: crate::freshness::Freshness,
 }
 
 /// Why a mount was refused (RFC-0027 §3). Typed so the control surface can map each to its status
@@ -2148,8 +2158,9 @@ impl RuntimeHandles {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
-        let config = Config::load(&dir)
+        let mut config = Config::load(&dir)
             .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
+        config.freshness = self.mount_ctx.freshness;
         let chain = config.nest.chain.clone();
 
         let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
