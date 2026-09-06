@@ -37,7 +37,24 @@ pub struct AdaptiveWindow {
     ///
     /// One 4x step past proven capacity is exploration. Four steps past it is guessing.
     served_whole: u64,
+    /// The ceiling the controller was constructed with (or last given by [`set_max`](Self::set_max)).
+    /// `max` may sit below it after [`served_by_splitting`](Self::served_by_splitting) lowered it;
+    /// recovery climbs back towards this, never past it.
+    hard_max: u64,
+    /// Consecutive windows served whole *at the lowered ceiling* (#1170). The evidence that the
+    /// ceiling is too low now, whatever it was when a refusal set it.
+    whole_streak: u32,
 }
+
+/// How many consecutive windows must be served whole at a lowered ceiling before it doubles (#1170).
+///
+/// A refusal halves in one step; recovery doubles in four. The asymmetry is deliberate: a ceiling
+/// set by a provider's genuine result cap should stay put, and four clean windows at it are what
+/// distinguishes "the pressure has passed" from one lucky answer. Measured on the gns nest,
+/// 2026-09-05: an hour of pool-wide 429s from a co-tenant walked the ceiling down to ~10 blocks, and
+/// with no path back up the backfill ran a hundred times slower for the next three hours until an
+/// operator restarted it. This is that path.
+pub const RECOVERY_STREAK: u32 = 4;
 
 impl AdaptiveWindow {
     /// Start from `initial` (typically the chain's default window), targeting `target` logs/response.
@@ -48,6 +65,8 @@ impl AdaptiveWindow {
             min: min.max(1),
             max,
             served_whole: 0,
+            hard_max: max,
+            whole_streak: 0,
         }
     }
 
@@ -87,9 +106,25 @@ impl AdaptiveWindow {
     /// Feed back how many logs the last response held; adjust toward the target. Change is damped to
     /// at most 4× per step so a single sparse (0-log) or spiky window doesn't swing the window wildly.
     /// A range the provider served **whole** at this width. Raises the evidence ceiling that bounds
-    /// growth (#672).
+    /// growth (#672), and - when the ceiling itself was lowered by a refusal - counts towards lifting
+    /// it again (#1170): [`RECOVERY_STREAK`] windows served whole at the ceiling double it, up to the
+    /// ceiling the controller was built with. A window served whole *below* the ceiling says nothing
+    /// about the ceiling and does not count.
     pub fn served_whole(&mut self, width: u64) {
         self.served_whole = self.served_whole.max(width);
+        if self.max < self.hard_max && width >= self.max {
+            self.whole_streak += 1;
+            if self.whole_streak >= RECOVERY_STREAK {
+                self.max = self.max.saturating_mul(2).min(self.hard_max);
+                self.whole_streak = 0;
+            }
+        }
+    }
+
+    /// The current ceiling: the constructed one, or a lower one a refusal taught (#672) that
+    /// [`served_whole`](Self::served_whole) has not yet lifted back (#1170).
+    pub fn ceiling(&self) -> u64 {
+        self.max
     }
 
     pub fn observed(&mut self, logs: u64) {
@@ -135,11 +170,14 @@ impl AdaptiveWindow {
             self.max = w;
             self.window = self.window.min(self.max);
         }
+        // A refusal is fresh evidence the ceiling is real; the recovery count starts again (#1170).
+        self.whole_streak = 0;
     }
 
     /// The provider rejected the range as too large - halve hard and (the caller) retry the range.
     pub fn too_large(&mut self) {
         self.window = (self.window / 2).max(self.min);
+        self.whole_streak = 0;
     }
 
     /// Re-bound the ceiling for one iteration (RFC-0036, #458). A caller whose ceiling changes
@@ -152,6 +190,7 @@ impl AdaptiveWindow {
     /// 4x-per-step damping instead of jumping straight to wherever it had silently drifted.
     pub fn set_max(&mut self, max: u64) {
         self.max = max.max(self.min);
+        self.hard_max = self.max;
         self.window = self.window.min(self.max);
     }
 }
@@ -424,5 +463,79 @@ mod tests {
                 "{msg:?} is not a size cap and must not trigger a shrink"
             );
         }
+    }
+
+    /// #1170. A refusal lowers the ceiling in one step (`served_by_splitting`); a run of windows
+    /// served whole *at that ceiling* lifts it again, doubling per `RECOVERY_STREAK`, and never past
+    /// the ceiling the controller was built with. Before this the ceiling only ever went down.
+    #[test]
+    fn a_ceiling_lowered_by_a_refusal_recovers_after_clean_windows() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        assert_eq!(w.ceiling(), 10);
+        assert_eq!(w.window(), 10);
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(10);
+        }
+        assert_eq!(
+            w.ceiling(),
+            20,
+            "four clean windows at the ceiling must double it"
+        );
+        // The window itself climbs through `observed`'s own damping, now that the ceiling allows it.
+        w.observed(0);
+        assert_eq!(w.window(), 20);
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(20);
+        }
+        assert_eq!(w.ceiling(), 40);
+        // Recovery is bounded by the constructed ceiling, never the sky.
+        for _ in 0..200 {
+            w.served_whole(w.ceiling());
+        }
+        assert_eq!(w.ceiling(), 100_000);
+    }
+
+    #[test]
+    fn a_window_served_whole_below_the_ceiling_is_not_evidence_about_the_ceiling() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(100);
+        for _ in 0..(RECOVERY_STREAK * 3) {
+            w.served_whole(50);
+        }
+        assert_eq!(
+            w.ceiling(),
+            100,
+            "a narrower success says nothing about a wider cap"
+        );
+    }
+
+    #[test]
+    fn a_fresh_refusal_restarts_the_recovery_count() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        for _ in 0..(RECOVERY_STREAK - 1) {
+            w.served_whole(10);
+        }
+        w.too_large();
+        for _ in 0..(RECOVERY_STREAK - 1) {
+            w.served_whole(10);
+        }
+        assert_eq!(
+            w.ceiling(),
+            10,
+            "a refusal in the run must reset the count, not pause it"
+        );
+        w.served_whole(10);
+        assert_eq!(w.ceiling(), 20);
+    }
+
+    #[test]
+    fn an_unlowered_ceiling_does_not_grow_past_its_construction() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 5_000);
+        for _ in 0..(RECOVERY_STREAK * 4) {
+            w.served_whole(5_000);
+        }
+        assert_eq!(w.ceiling(), 5_000);
     }
 }

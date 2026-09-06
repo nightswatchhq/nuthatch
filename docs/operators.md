@@ -797,13 +797,16 @@ per-nest series below.
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |
 | `nuthatch_last_poll_unixtime` | liveness of the ingest loop itself |
+| `nuthatch_fetch_window_blocks` | the block span of the cursor's latest `eth_getLogs` window. A backfill whose window sat at ~10 blocks for three hours after a rate-limited hour (#1170) shows here long before it shows in its ETA; the controller now widens again after four clean windows at the lowered ceiling |
+| `nuthatch_seal_direct_fetched` vs `nuthatch_seal_direct_completed` | the seal-direct pass's fetch position against its durable watermark (#1169). A restart resumes from `completed`; the gap is the work it redoes, which on a sparse range can be tens of millions of blocks |
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
 
 Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operable:
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
-`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_health` (1 indexing /
-0 quarantined), `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
+`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_seal_direct_fetched`,
+`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined),
+`nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
 
 Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,
 `nuthatch_transform_effectful`.

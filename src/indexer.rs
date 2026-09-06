@@ -1657,6 +1657,11 @@ async fn runtime_index_loop(
         };
         chunker.set_max(window_cap);
         let to = (global_next + chunker.window() - 1).min(tip);
+        for &i in &live {
+            live_ref(&nests, i)
+                .metrics
+                .set_fetch_window(chunker.window());
+        }
 
         // Union over live nests only - a quarantined nest consumes nothing, so paying `getLogs`
         // bandwidth for its addresses is waste (and a quarantined factory nest would keep forcing the
@@ -3570,7 +3575,7 @@ pub async fn backfill_direct_pipelined(
     // Called per completed window with (block reached, rows decoded) - drives the live progress line
     // (RFC-0015 slice 3). Fires every window, so a sparse range still shows honest block-position
     // movement between the (rare) seals. Pure presentation; must not touch stored state.
-    mut on_progress: impl FnMut(u64, u64),
+    mut on_progress: impl FnMut(u64, u64, u64),
 ) -> Result<u64> {
     use futures::stream::StreamExt;
 
@@ -3798,7 +3803,8 @@ pub async fn backfill_direct_pipelined(
         // tail is merged after the previous window's own rows are in the buffer (#1144).
         let n = merge_window_rows(&mut buf, fetch_from, json)?;
         total += n;
-        on_progress(w_to, n);
+        let window_now = chunker.lock().expect("window controller").window();
+        on_progress(w_to, n, window_now);
         // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
         drain_all_sealable(&mut buf, tail_hold(w_to, final_pass), |rows, seal_to| {
@@ -3842,7 +3848,7 @@ pub async fn backfill_direct_factory(
     // is what prevents a re-run from re-sealing overlapping ranges under new hashes (duplicate data).
     mut on_seal: impl FnMut(u64) -> Result<()>,
     // Per-chunk live progress (RFC-0015 slice 3): (block reached, rows decoded). See the pipelined path.
-    mut on_progress: impl FnMut(u64, u64),
+    mut on_progress: impl FnMut(u64, u64, u64),
 ) -> Result<u64> {
     use std::collections::HashSet;
     let base: Vec<String> = registry
@@ -4061,7 +4067,7 @@ pub async fn backfill_direct_factory(
         )?;
         total += row_count;
         next = chunk_to + 1;
-        on_progress(chunk_to, row_count);
+        on_progress(chunk_to, row_count, chunker.window());
         if next > to && !final_pass {
             final_pass = true;
             next = overlap_from(to + 1, from);
@@ -4114,6 +4120,16 @@ pub async fn backfill_direct_factory(
 /// and only the tip-follower's own seal ever set it afterwards. On 8107 that meant 460M sealed
 /// blocks reporting `sealed_through 0` for the hours until the finalized head crossed the hot store's
 /// start; an operator's switch script read that as an unfit nest.
+/// What a seal-direct progress tick is allowed to touch (#1169): the *fetch* position and the live
+/// window. Never `seal_direct_completed` - that is the durable watermark, set by
+/// [`publish_direct_seal`] when a segment is on disk and only then. The two used to be one counter,
+/// and on the gns nest it ran 47,599,977 blocks ahead of what a restart could resume from, so every
+/// progress figure read off `/ready` that day was a fetch figure presented as a sealed one.
+fn note_seal_direct_progress(metrics: &crate::metrics::NestMetrics, fetched_to: u64, window: u64) {
+    metrics.set_seal_direct_fetched(fetched_to);
+    metrics.set_fetch_window(window);
+}
+
 fn publish_direct_seal(
     metrics: &crate::metrics::NestMetrics,
     store: &dyn crate::store::HotStore,
@@ -4319,8 +4335,8 @@ impl NestIngest {
                         window,
                         fs.force_topic0(),
                         on_seal,
-                        |blk, n| {
-                            metrics.set_seal_direct_completed(blk);
+                        |blk, n, window| {
+                            note_seal_direct_progress(&metrics, blk, window);
                             prog.tick(blk, n);
                         },
                     )
@@ -4343,8 +4359,8 @@ impl NestIngest {
                         window,
                         concurrency,
                         on_seal,
-                        |blk, n| {
-                            metrics.set_seal_direct_completed(blk);
+                        |blk, n, window| {
+                            note_seal_direct_progress(&metrics, blk, window);
                             prog.tick(blk, n);
                         },
                     )
@@ -5388,6 +5404,7 @@ async fn index_loop(
                 .get_or_insert_with(|| crate::progress::Backfill::new("backfilling", next, tip));
         }
         let to = (next + chunker.window() - 1).min(tip);
+        nest.metrics.set_fetch_window(chunker.window());
         // A contract-free nest (`blocks = true`, no `[[contracts]]` - OBIB case 3) has both halves of
         // its filter empty, which asks a node for every log on the chain. #421 and #429 guarded the
         // backfill paths and left this one, which is the worse of the two: it repeats for as long as
@@ -7355,7 +7372,7 @@ template="pool"
             100,
             false,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -7557,7 +7574,7 @@ template="pool"
             64,
             false,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .expect("pass 2 must shrink and finish, not abort");
@@ -7704,7 +7721,7 @@ template="pool"
                 100,
                 force_topic0,
                 |_| Ok(()),
-                |_, _| {},
+                |_, _, _| {},
             )
             .await
             .unwrap();
@@ -9763,12 +9780,89 @@ template = "pool"
             5,
             4,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
         assert_eq!(n_pipe, 60);
         assert_eq!(sealed(d_pipe.path()), sealed(d_honest.path()));
+    }
+
+    /// #1169 / #1170. What the pipelined backfill tells its caller: every progress tick carries the
+    /// block it *fetched* to and the window it is asking with, and a seal is only ever published for
+    /// a block the fetch has already passed. `prepare` routes a tick through
+    /// `note_seal_direct_progress` (tested below) and a seal through `publish_direct_seal`; this pins
+    /// what the two callbacks are handed.
+    #[tokio::test]
+    async fn pipelined_progress_reports_the_fetched_block_and_a_window_and_seals_behind_it() {
+        let (reg, addresses, topic0s) = erc20_registry_with_filters();
+        let logs: Vec<_> = (10u64..40)
+            .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+            .collect();
+        let src = MockSource { logs };
+        let dir = tempfile::tempdir().unwrap();
+        let progress = std::sync::Mutex::new(Vec::<(u64, u64)>::new());
+        let seals = std::sync::Mutex::new(Vec::<u64>::new());
+        backfill_direct_pipelined(
+            &src,
+            &reg,
+            dir.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            39,
+            5,
+            2,
+            |sealed_to| {
+                seals.lock().unwrap().push(sealed_to);
+                Ok(())
+            },
+            |blk, _rows, window| progress.lock().unwrap().push((blk, window)),
+        )
+        .await
+        .unwrap();
+        let progress = progress.into_inner().unwrap();
+        let seals = seals.into_inner().unwrap();
+        assert!(
+            progress.len() >= 2,
+            "a 30-block range in 5-block windows must tick more than once"
+        );
+        assert!(
+            progress.iter().all(|&(_, w)| w >= 1),
+            "every tick must carry the live window, not zero: {progress:?}"
+        );
+        assert_eq!(
+            progress.iter().map(|&(b, _)| b).max(),
+            Some(39),
+            "the last tick is the range's end"
+        );
+        for &s in &seals {
+            let fetched_first = progress.iter().position(|&(b, _)| b >= s);
+            assert!(
+                fetched_first.is_some(),
+                "a seal through {s} was published before any tick had fetched that far"
+            );
+        }
+    }
+
+    /// #1169. A progress tick moves the fetch position and the window, and leaves the watermark
+    /// where the last published seal put it. If this passes with the tick routed to
+    /// `set_seal_direct_completed`, `/ready` is once again calling fetched blocks sealed.
+    #[test]
+    fn a_progress_tick_moves_the_fetch_position_not_the_watermark() {
+        let m = crate::metrics::NestMetrics::default();
+        m.begin_seal_direct(100, 1_000);
+        note_seal_direct_progress(&m, 600, 250);
+        assert_eq!(m.seal_direct_fetched(), 600);
+        assert_eq!(m.fetch_window(), 250);
+        assert_eq!(
+            m.seal_direct_completed(),
+            99,
+            "a progress tick moved the durable watermark; a restart would trust a block never sealed"
+        );
     }
 
     /// #1144, review: a block row and an event row of the same block are distinct rows to the merge,
@@ -10074,7 +10168,7 @@ template = "pool"
             5,
             8,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -10324,7 +10418,7 @@ template="pool"
             100,
             true,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -11938,7 +12032,7 @@ template="pool"
             5,
             4,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -12000,7 +12094,7 @@ template="pool"
             5,
             4,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -13123,7 +13217,7 @@ rpc_urls = ["https://rpc.example"]
             1_000,
             4,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -13200,7 +13294,7 @@ rpc_urls = ["https://rpc.example"]
             1_000, // a fixed 1,000-block window would need 200 requests
             4,
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -13255,7 +13349,7 @@ rpc_urls = ["https://rpc.example"]
             1_000,
             1, // sequential, so every window's feedback lands before the next is generated
             |_| Ok(()),
-            |_, _| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();

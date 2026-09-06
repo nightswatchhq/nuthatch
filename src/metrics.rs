@@ -55,6 +55,13 @@ pub struct NestMetrics {
     seal_direct_origin: AtomicU64,
     seal_direct_completed: AtomicU64,
     seal_direct_target: AtomicU64,
+    /// The seal-direct pass's *fetch* position (#1169): the highest block whose logs have been fetched
+    /// and decoded into the seal buffer. Distinct from `seal_direct_completed`, which is the durable
+    /// watermark a restart resumes from; the gap between them is work a restart redoes.
+    seal_direct_fetched: AtomicU64,
+    /// The block span the cursor last asked `eth_getLogs` for (#1170), so a window that a rate-limited
+    /// hour collapsed to ten blocks is visible before the backfill's ETA is.
+    fetch_window: AtomicU64,
     /// When the seal-direct watermark last actually moved (#846). `seal_direct_completed` is a block
     /// number and says nothing about time, so without this a pass that has died and a pass that is
     /// legitimately slow are the same observation - and `/ready` suppresses every other stall term
@@ -175,6 +182,8 @@ impl NestMetrics {
         self.seal_direct_completed
             .store(origin.saturating_sub(1), Relaxed);
         self.seal_direct_target.store(target, Relaxed);
+        self.seal_direct_fetched
+            .store(origin.saturating_sub(1), Relaxed);
         self.last_seal_progress.store(now_unix(), Relaxed);
         METRICS.begin_seal_direct(origin, target);
     }
@@ -186,6 +195,26 @@ impl NestMetrics {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
         METRICS.set_seal_direct_completed(block);
+    }
+    /// The fetch position of the seal-direct pass (#1169). Advancing it is progress for the pass's
+    /// liveness clock - a pass that is fetching is alive even when a sparse range has not yet filled
+    /// a segment - but it is *not* the watermark, and `/ready` reports the two side by side.
+    pub fn set_seal_direct_fetched(&self, block: u64) {
+        if block > self.seal_direct_fetched.swap(block, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
+        METRICS.set_seal_direct_fetched(block);
+    }
+    pub fn seal_direct_fetched(&self) -> u64 {
+        self.seal_direct_fetched.load(Relaxed)
+    }
+    /// The block span the cursor is currently asking for (#1170).
+    pub fn set_fetch_window(&self, blocks: u64) {
+        self.fetch_window.store(blocks, Relaxed);
+        METRICS.set_fetch_window(blocks);
+    }
+    pub fn fetch_window(&self) -> u64 {
+        self.fetch_window.load(Relaxed)
     }
     pub fn last_seal_progress(&self) -> u64 {
         self.last_seal_progress.load(Relaxed)
@@ -201,6 +230,7 @@ impl NestMetrics {
         self.seal_direct_active.store(false, Relaxed);
         let target = self.seal_direct_target.load(Relaxed);
         self.seal_direct_completed.store(target, Relaxed);
+        self.seal_direct_fetched.store(target, Relaxed);
         METRICS.end_seal_direct();
     }
     pub fn seal_direct_active(&self) -> bool {
@@ -273,6 +303,13 @@ pub struct Metrics {
     seal_direct_origin: AtomicU64,
     seal_direct_completed: AtomicU64,
     seal_direct_target: AtomicU64,
+    /// The seal-direct pass's *fetch* position (#1169): the highest block whose logs have been fetched
+    /// and decoded into the seal buffer. Distinct from `seal_direct_completed`, which is the durable
+    /// watermark a restart resumes from; the gap between them is work a restart redoes.
+    seal_direct_fetched: AtomicU64,
+    /// The block span the cursor last asked `eth_getLogs` for (#1170), so a window that a rate-limited
+    /// hour collapsed to ten blocks is visible before the backfill's ETA is.
+    fetch_window: AtomicU64,
     /// #846, the solo-runtime copy of the seal clock. See `NestMetrics::last_seal_progress`.
     last_seal_progress: AtomicU64,
     /// #812: per-endpoint RPC health. Keyed by a host[:port] label, never a URL.
@@ -321,6 +358,8 @@ impl Metrics {
             seal_direct_origin: AtomicU64::new(0),
             seal_direct_completed: AtomicU64::new(0),
             seal_direct_target: AtomicU64::new(0),
+            seal_direct_fetched: AtomicU64::new(0),
+            fetch_window: AtomicU64::new(0),
             last_seal_progress: AtomicU64::new(0),
             rpc_endpoints: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
@@ -445,12 +484,28 @@ impl Metrics {
         self.seal_direct_completed
             .store(origin.saturating_sub(1), Relaxed);
         self.seal_direct_target.store(target, Relaxed);
+        self.seal_direct_fetched
+            .store(origin.saturating_sub(1), Relaxed);
         self.last_seal_progress.store(now_unix(), Relaxed);
     }
     pub fn set_seal_direct_completed(&self, block: u64) {
         if block > self.seal_direct_completed.swap(block, Relaxed) {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
+    }
+    pub fn set_seal_direct_fetched(&self, block: u64) {
+        if block > self.seal_direct_fetched.swap(block, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
+    }
+    pub fn seal_direct_fetched(&self) -> u64 {
+        self.seal_direct_fetched.load(Relaxed)
+    }
+    pub fn set_fetch_window(&self, blocks: u64) {
+        self.fetch_window.store(blocks, Relaxed);
+    }
+    pub fn fetch_window(&self) -> u64 {
+        self.fetch_window.load(Relaxed)
     }
     pub fn last_seal_progress(&self) -> u64 {
         self.last_seal_progress.load(Relaxed)
@@ -463,6 +518,7 @@ impl Metrics {
         self.seal_direct_active.store(false, Relaxed);
         let target = self.seal_direct_target.load(Relaxed);
         self.seal_direct_completed.store(target, Relaxed);
+        self.seal_direct_fetched.store(target, Relaxed);
     }
     pub fn seal_direct_active(&self) -> bool {
         self.seal_direct_active.load(Relaxed)
@@ -683,6 +739,16 @@ impl Metrics {
             self.seal_direct_completed.load(Relaxed),
         ));
         s.push_str(&gauge(
+            "nuthatch_seal_direct_fetched",
+            "Highest block fetched and decoded by the current or last seal-direct pass (#1169). Ahead of nuthatch_seal_direct_completed by the work a restart would redo.",
+            self.seal_direct_fetched.load(Relaxed),
+        ));
+        s.push_str(&gauge(
+            "nuthatch_fetch_window_blocks",
+            "Block span of the cursor's most recent eth_getLogs window (#1170). A window stuck at a handful of blocks after a rate-limited hour is the collapse #1170 describes.",
+            self.fetch_window.load(Relaxed),
+        ));
+        s.push_str(&gauge(
             "nuthatch_seal_direct_target",
             "Final block of the current or last seal-direct pass (preserved after handoff).",
             self.seal_direct_target.load(Relaxed),
@@ -797,6 +863,18 @@ impl Metrics {
                 "Highest block sealed in this nest's current or last seal-direct pass.",
                 "gauge",
                 &|m| m.seal_direct_completed.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_seal_direct_fetched",
+                "Highest block fetched and decoded by this nest's seal-direct pass (#1169).",
+                "gauge",
+                &|m| m.seal_direct_fetched.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_fetch_window_blocks",
+                "Block span of this nest's most recent eth_getLogs window (#1170).",
+                "gauge",
+                &|m| m.fetch_window.load(Relaxed),
             );
         }
         s
@@ -1222,5 +1300,31 @@ mod tests {
         let out = m.render();
         assert!(out.contains("nuthatch_seal_direct_active 1"));
         assert!(out.contains("nuthatch_seal_direct_completed 5"));
+    }
+
+    /// #1169. The fetch position and the durable watermark are two counters. Fetching ahead must
+    /// not move `seal_direct_completed`, which is what a restart resumes from; only a published seal
+    /// does. Both are rendered, so the gap between them is a number an operator can read.
+    #[test]
+    fn fetching_ahead_does_not_move_the_seal_direct_watermark() {
+        let m = Metrics::new();
+        m.begin_seal_direct(100, 1_000);
+        m.set_seal_direct_fetched(600);
+        assert_eq!(m.seal_direct_fetched(), 600);
+        assert_eq!(
+            m.seal_direct_completed(),
+            99,
+            "a fetched block was reported as sealed; a restart from here would redo 500 blocks"
+        );
+        m.set_seal_direct_completed(300);
+        assert_eq!(m.seal_direct_completed(), 300);
+        m.set_fetch_window(64);
+        let out = m.render();
+        assert!(out.contains("nuthatch_seal_direct_fetched 600"));
+        assert!(out.contains("nuthatch_seal_direct_completed 300"));
+        assert!(out.contains("nuthatch_fetch_window_blocks 64"));
+        m.end_seal_direct();
+        assert_eq!(m.seal_direct_fetched(), 1_000);
+        assert_eq!(m.seal_direct_completed(), 1_000);
     }
 }
