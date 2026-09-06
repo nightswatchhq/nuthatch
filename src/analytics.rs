@@ -88,6 +88,9 @@ struct DuckCache {
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
     conn: Connection,
+    /// This instance's private spill directory, removed when the cached connection is dropped or
+    /// evicted (#1165). Held here so its lifetime is exactly the connection's.
+    _spill: SpillDir,
 }
 
 /// A content hash of one cache input, hex sha256 (#840).
@@ -191,10 +194,103 @@ fn duck_opens_for(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
+/// A DuckDB instance's private spill directory, removed when the instance is dropped (#1165).
+///
+/// DuckDB spills buffers past `max_memory` into `temp_directory`, whose files are named by *index*
+/// within that directory - `duckdb_temp_storage_DEFAULT-0.tmp`, `..._S128K-0.tmp`, and so on. The
+/// name says nothing about which instance wrote it, because DuckDB assumes one instance owns the
+/// directory. This process runs several: the connection cache hands its connection to a query for
+/// the query's whole duration, so a second concurrent query finds the cache empty and opens an
+/// instance of its own. With the default `temp_directory` - `.tmp` under the working directory,
+/// which for a nest service is the nest's own data directory - those instances write the same file
+/// names in one place and overwrite each other's spilled blocks.
+///
+/// Reading such a block back fails DuckDB's own check, `decompressed_size == buffer->AllocSize()` in
+/// `temporary_file_manager.cpp`, and the process dies. Reproduced 2026-09-06 against a copy of the
+/// production corpus: four threads replaying 51 captured statements, a segmentation fault inside
+/// fifteen seconds, every time. On the box it was 25 SEGVs in a minute at four permits and none at
+/// one, which is the same fault seen from the outside - one permit never has a second instance.
+struct SpillDir(PathBuf);
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Remove spill directories left by processes that are no longer running.
+///
+/// The cache lives in a `static`, and Rust does not drop statics at exit, so a cached connection's
+/// [`SpillDir`] guard never runs on the way out and its directory outlives the process. One empty
+/// directory per instance is not much, but a nest restarting every fifteen seconds under a fault -
+/// which is exactly what #1165 looked like - would leave one behind each time, with whatever it had
+/// spilled inside. Ownership is by pid: a directory whose pid still has a `/proc` entry belongs to a
+/// live process and is left alone. Where `/proc` is not there to ask (macOS, dev machines), nothing
+/// is swept, because guessing by age could delete a running instance's spill under it.
+fn sweep_dead_spill_dirs() {
+    if !Path::new("/proc").is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name
+            .to_string_lossy()
+            .strip_prefix("nuthatch-duckdb-")
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// The in-process half of a spill directory's name; the other half is the PID.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A directory no other DuckDB instance in this process (or any other) will write to.
+///
+/// Created **exclusively**: `create_dir`, not `create_dir_all`, and a name that already exists is
+/// skipped for the next sequence number. The name alone is not enough. A process that dies without
+/// dropping its static cache leaves its directories behind, the sweep keeps any whose PID is live,
+/// and a later process handed that same PID by the kernel would otherwise start its sequence at zero
+/// and write into the dead process's `-0` - the collision this whole change exists to remove, back
+/// through PID reuse. Refusing an existing path makes the directory this instance's by construction,
+/// whatever is left on disk.
+fn new_spill_dir() -> Result<SpillDir> {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(sweep_dead_spill_dirs);
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "nuthatch-duckdb-{}-{}",
+            std::process::id(),
+            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(SpillDir(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("creating the DuckDB spill directory {}", path.display())
+                })
+            }
+        }
+    }
+}
+
+fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     note_duck_open(dir);
+    let spill = new_spill_dir()?;
     let allowed: Vec<String> = allowed_read_dirs(dir)
         .into_iter()
+        .chain(std::iter::once(spill.0.clone()))
         .filter(|p| p.exists())
         .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
         .collect();
@@ -210,7 +306,11 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
         .max_memory(&mem_limit)
         .context("duckdb max_memory")?
         .threads(MAX_THREADS)
-        .context("duckdb threads")?;
+        .context("duckdb threads")?
+        // Set on the config rather than by a later `SET`, so no query can ever run against the
+        // shared default - and before `lock_configuration`, which freezes it (#1165).
+        .with("temp_directory", spill.0.display().to_string())
+        .context("duckdb temp_directory")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
@@ -237,7 +337,7 @@ fn open_locked_duckdb(dir: &Path) -> Result<Connection> {
     );
     conn.execute_batch(&lockdown)
         .context("failed to lock down DuckDB filesystem access")?;
-    Ok(conn)
+    Ok((conn, spill))
 }
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
@@ -334,7 +434,8 @@ pub fn degraded_tables(
     dir: &Path,
     declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
-    let conn = open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    let (conn, _spill) =
+        open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
     define_views(
         &conn,
         dir,
@@ -684,13 +785,15 @@ fn attempt(
         c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
     });
     if !reusable {
+        let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
-            conn: open_locked_duckdb(dir).context("failed to open DuckDB")?,
+            conn,
+            _spill: spill,
         });
     }
     let mut slot = slot.expect("just inserted");
@@ -4297,7 +4400,7 @@ template="pool"
             "the denylist must still refuse read_text - it is the control in front"
         );
 
-        let conn = open_locked_duckdb(nest.path()).unwrap();
+        let (conn, _spill) = open_locked_duckdb(nest.path()).unwrap();
         let read_succeeded = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
             Err(_) => false,
@@ -4337,7 +4440,7 @@ template="pool"
         std::fs::create_dir_all(&shared).unwrap();
         let file = shared.join("ok.txt");
         std::fs::write(&file, "shared\n").unwrap();
-        let conn = open_locked_duckdb(&nid_dir).unwrap();
+        let (conn, _spill) = open_locked_duckdb(&nid_dir).unwrap();
         let sql = format!("SELECT content FROM read_text('{}')", file.display());
         let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
         let got: String = stmt
@@ -6322,5 +6425,38 @@ events = ["Transfer"]
         )
         .expect_err("the guarded surface must refuse it too");
         assert!(format!("{err:#}").contains("not permitted"));
+    }
+
+    /// Jules on #1182: the spill path was keyed by PID and an in-process counter and created with
+    /// `create_dir_all`, so a directory left by a dead process whose PID the kernel handed back would
+    /// be reused, and two instances would share one spill directory again. A name that exists is
+    /// refused and the sequence advances; the pre-made directories stand in for the dead process's.
+    /// Mutation-checked: with `create_dir_all` back in place this fails.
+    #[test]
+    fn a_spill_directory_that_already_exists_is_never_reused() {
+        let next = SPILL_SEQ.load(Ordering::Relaxed);
+        let planted: Vec<PathBuf> = (next..next + 8)
+            .map(|n| {
+                std::env::temp_dir().join(format!("nuthatch-duckdb-{}-{n}", std::process::id()))
+            })
+            .collect();
+        for p in &planted {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("someone-elses.tmp"), b"x").unwrap();
+        }
+        let mine = new_spill_dir().unwrap();
+        assert!(
+            !planted.contains(&mine.0),
+            "an existing directory was handed out as a fresh spill directory: {}",
+            mine.0.display()
+        );
+        assert!(mine.0.exists() && mine.0.read_dir().unwrap().next().is_none());
+        for p in &planted {
+            assert!(
+                p.join("someone-elses.tmp").exists(),
+                "the other process's spill file was disturbed"
+            );
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }
