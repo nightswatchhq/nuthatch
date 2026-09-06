@@ -829,7 +829,7 @@ fn attempt(
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
-        define_nest_views(conn, dir);
+        define_nest_views(conn, dir, wanted.as_ref());
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
         define_labels_view(conn, dir);
@@ -2315,7 +2315,25 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// tables. Best-effort: a view over a table with no sealed segment yet - or a bad statement - is
 /// skipped with a debug log rather than failing the whole query. Nest SQL is authored by the nest
 /// you chose to consume; it runs read-only in this ephemeral in-memory DuckDB, same trust as `/sql`.
-fn define_nest_views(conn: &Connection, dir: &Path) {
+///
+/// `wanted` is the same reachability set `define_views` narrows by (#896): only a view whose name is
+/// in it is (re)defined, and `None` defines every view as before. **The narrowing has to reach here
+/// too, not only the base tables, and it did not.** DuckDB binds a `CREATE OR REPLACE VIEW` eagerly,
+/// and on the pooled connection the previous request's base-table views are still in the catalogue,
+/// so every authored view bound in full on every request: each bind re-reads the footer of every
+/// segment behind every table the view touches, through the `allowed_directories` path check.
+/// Measured on the Lodestar nest (1,924 segments, 12 view files, 2026-09-06): `SELECT 1` cost
+/// 1.2 s and 32,000 `openat` calls with 640,000 `fstat`/`readlink` behind them, on a statement that
+/// reads nothing; the same statement on the same nest was 14 ms before any dashboard view had left
+/// its base tables defined. That fixed cost sat under every one of the dashboard's statements.
+/// `reachable_tables` already carries the intermediate view names in its closure, so a view a
+/// statement reaches through another view is still defined, in file order, before the one that
+/// reads it.
+fn define_nest_views(
+    conn: &Connection,
+    dir: &Path,
+    wanted: Option<&std::collections::BTreeSet<String>>,
+) {
     for v in nest_view_files(dir) {
         // **Per statement, not per file** (issue #241 item 4). `execute_batch` runs the whole file as
         // one unit, so a single view referencing a table that has never fired - `TaskCancelled`, a
@@ -2324,6 +2342,13 @@ fn define_nest_views(conn: &Connection, dir: &Path) {
         // uncommenting them once the event fired, which is a poor trade for a fault-isolation gain
         // that was never needed at this granularity.
         for stmt in split_sql_statements(&v.sql) {
+            // A statement this one cannot name (not a `CREATE VIEW`) runs as before: the point is
+            // to skip work that is known to be unreachable, never to skip what is not understood.
+            if let (Some(wanted), Some(name)) = (wanted, view_name(&stmt)) {
+                if !wanted.contains(&name) {
+                    continue;
+                }
+            }
             if let Err(e) = conn.execute_batch(&with_or_replace_view(&stmt)) {
                 tracing::debug!("nest view {} statement skipped: {e}", v.file);
             }
@@ -5651,7 +5676,7 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         // The base table exists as an empty typed view…
         let n: i64 = conn
@@ -5664,6 +5689,107 @@ template="pool"
             .query_row("SELECT count(*) FROM big_transfers", [], |r| r.get(0))
             .expect("an authored view on an empty table must resolve to zero rows, not fail");
         assert_eq!(n, 0);
+    }
+
+    /// **The #896 narrowing has to reach the authored views too.** `define_views` stopped defining
+    /// base tables a statement cannot reach; `define_nest_views` carried on redefining every authored
+    /// view on every request, and on the pooled connection each one bound in full against the base
+    /// views a previous request left behind. On the Lodestar nest that was 1.2 s and 32,000 file
+    /// opens under a `SELECT 1`. The positive control is here on purpose: an absence assertion whose
+    /// mechanism is missing passes for the wrong reason.
+    #[test]
+    fn a_view_the_statement_cannot_reach_is_not_redefined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/10-a.sql"),
+            "CREATE VIEW a AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/20-b.sql"),
+            "CREATE VIEW b AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        define_views(
+            &conn,
+            dir.path(),
+            &HotRows::new(),
+            u64::MAX,
+            &Default::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let wanted: std::collections::BTreeSet<String> =
+            ["a".to_string(), "tok__transfer".to_string()]
+                .into_iter()
+                .collect();
+        define_nest_views(&conn, dir.path(), Some(&wanted));
+        assert!(
+            conn.prepare("SELECT * FROM a").is_ok(),
+            "the view the statement reaches is defined"
+        );
+        assert!(
+            conn.prepare("SELECT * FROM b").is_err(),
+            "a view the statement cannot reach must not be bound - that bind, over every segment \
+             behind every table it touches, was the fixed cost under every request"
+        );
+
+        // The positive control: `None` still defines everything, as the warm-restart callers rely on.
+        define_nest_views(&conn, dir.path(), None);
+        assert!(
+            conn.prepare("SELECT * FROM b").is_ok(),
+            "with no reachability set every authored view is defined"
+        );
+    }
+
+    /// A statement that reaches a view only through another view still answers. `reachable_tables`
+    /// carries the intermediate view's name in its closure, so narrowing `define_nest_views` to that
+    /// set defines the chain in file order - the one the statement names last, the one it builds on
+    /// first. Defining only the named view would leave it unbound and this query failing.
+    #[test]
+    fn a_view_reached_through_another_view_is_still_defined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"tok__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit","storage":"u64","indexed":false},
+                {"name":"from","sol_type":"address","storage":"address","indexed":true}]}]}"#,
+        )
+        .unwrap();
+        crate::seal::seal_range(
+            dir.path(),
+            &[r#"{"table":"tok__transfer","from":"0xa","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/10-a.sql"),
+            "CREATE VIEW a AS SELECT \"from\" FROM tok__transfer;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/20-c.sql"),
+            "CREATE VIEW c AS SELECT \"from\" FROM a;",
+        )
+        .unwrap();
+
+        let rows = query(dir.path(), "SELECT \"from\" FROM c")
+            .expect("a view on a view must still resolve under the narrowed definition");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["from"], "0xa");
     }
 
     /// The other half of the same mechanism: **without** a schema there are no columns, so the empty
@@ -5692,7 +5818,7 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         assert!(
             conn.query_row("SELECT count(*) FROM big_transfers", [], |r| r
@@ -5795,7 +5921,7 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path());
+            define_nest_views(&conn, dir.path(), None);
             assert!(
                 conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
                     .get::<_, i64>(0))
@@ -5819,7 +5945,7 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path());
+            define_nest_views(&conn, dir.path(), None);
             let row = conn
                 .query_row(
                     "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
@@ -5961,7 +6087,7 @@ events = ["Minted", "Withdrawn"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
         let row = conn
             .query_row(
                 "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
@@ -6192,7 +6318,7 @@ events = ["Transfer"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path());
+        define_nest_views(&conn, dir.path(), None);
 
         for v in ["ok_one", "ok_two"] {
             conn.query_row(&format!("SELECT count(*) FROM {v}"), [], |r| {
