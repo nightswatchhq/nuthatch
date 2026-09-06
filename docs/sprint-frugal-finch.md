@@ -152,7 +152,7 @@ for `eth_getBlockByNumber`/`eth_getLogs`/`eth_blockNumber`):
 
 Against the ~9,900 CU/min (~$185 a month) one Arbitrum cursor at tip was measured at before the dial,
 the paid figure is 121 CU/min, an 82x reduction, and the month lands inside Alchemy's free tier. The
-$100 target is met with two orders of magnitude to spare. The Perpl nest, the other paid consumer at
+$100 target is met with over 40x headroom on the paid figure. The Perpl nest, the other paid consumer at
 ~57k CU/min, is parked (#1147, #1148, Chief's decision).
 
 The gns figure is the one honest surprise: 29 tip polls a minute under a five-minute interval. That
