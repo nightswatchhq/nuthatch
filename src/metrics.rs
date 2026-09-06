@@ -200,7 +200,9 @@ impl NestMetrics {
     /// liveness clock - a pass that is fetching is alive even when a sparse range has not yet filled
     /// a segment - but it is *not* the watermark, and `/ready` reports the two side by side.
     pub fn set_seal_direct_fetched(&self, block: u64) {
-        if block > self.seal_direct_fetched.swap(block, Relaxed) {
+        // A high-water mark, never a last-seen: `fetch_max` so a tick for an older block - two
+        // callers, or a pipeline that stops yielding in order - cannot walk it backwards.
+        if block > self.seal_direct_fetched.fetch_max(block, Relaxed) {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
         METRICS.set_seal_direct_fetched(block);
@@ -494,7 +496,7 @@ impl Metrics {
         }
     }
     pub fn set_seal_direct_fetched(&self, block: u64) {
-        if block > self.seal_direct_fetched.swap(block, Relaxed) {
+        if block > self.seal_direct_fetched.fetch_max(block, Relaxed) {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
     }
@@ -1318,6 +1320,9 @@ mod tests {
         );
         m.set_seal_direct_completed(300);
         assert_eq!(m.seal_direct_completed(), 300);
+        // A tick for an older block is not progress and must not move the mark backwards.
+        m.set_seal_direct_fetched(550);
+        assert_eq!(m.seal_direct_fetched(), 600);
         m.set_fetch_window(64);
         let out = m.render();
         assert!(out.contains("nuthatch_seal_direct_fetched 600"));
