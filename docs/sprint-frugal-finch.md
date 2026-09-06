@@ -137,6 +137,34 @@ the $100 target has headroom for a second key or a worse month.
 
 **Perpl does not cost money again.** If public Monad endpoints cannot carry it, it parks.
 
+## The result, measured
+
+One clean hour, 13:55 to 14:55 UTC on 2026-09-06, every Lodestar nest on 3.5.x with `--poll-interval
+5m`, no restart inside the hour, counter deltas from `/metrics` priced at Alchemy's rates (20/60/10 CU
+for `eth_getBlockByNumber`/`eth_getLogs`/`eth_blockNumber`):
+
+| nest | endpoint | CU/min | CU/month | at $0.45 per M |
+|---|---|---|---|---|
+| 8107 allocations (`/alloc`, 33 dashboard call sites) | Alchemy, the only paid one | 121 | 5.2M | $2.35, inside the 30M free tier |
+| 8113 gns (`/gns`) | arb1 public | 4,377 | 189M | $0 - and #1190 explains the number |
+| 8104 dips (`/dips`) | public | 80 | 3.5M | $0 |
+| 8106 dips-sepolia | public | 214 | 9.2M | $0 |
+
+Against the ~9,900 CU/min (~$185 a month) one Arbitrum cursor at tip was measured at before the dial,
+the paid figure is 121 CU/min, an 82x reduction, and the month lands inside Alchemy's free tier. The
+$100 target is met with two orders of magnitude to spare. The Perpl nest, the other paid consumer at
+~57k CU/min, is parked (#1147, #1148, Chief's decision).
+
+The gns figure is the one honest surprise: 29 tip polls a minute under a five-minute interval. That
+is #1190, found from this table - the interval only ever engaged when a re-polled tip had stood
+still, which on Arbitrum behind a slow free endpoint is never. It costs nothing here because the
+endpoint is free; it would have been the whole bill back on a paid one the day that endpoint slowed.
+Fixed in #1191.
+
+The two things the cutover found the same day - a 1.2 s floor under every `/sql` request (#1183,
+fixed and shipped in 3.5.1) and the dashboard's whole-history views (#1186, the memo in #1189) - are
+items 9 and 10 above.
+
 ## Explicitly not in this sprint
 
 - Every `frozen` issue. The fifth carve-out (PR 1174) is the one this sprint spends; there is no sixth.
