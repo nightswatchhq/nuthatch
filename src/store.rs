@@ -238,9 +238,10 @@ impl std::error::Error for HotScanTooLarge {}
 #[async_trait::async_trait]
 pub trait HotStore: Send + Sync {
     /// A counter that moves on every committed write and never otherwise, or `None` where the
-    /// backend cannot say. Two reads that return the same value saw the same rows, which is what
-    /// lets the analytical memo (#1186) answer a repeated statement without re-scanning anything.
-    /// A backend that returns `None` simply has no memo.
+    /// backend cannot say - including, for the redb store, the moment a commit is in flight. Two
+    /// reads that both return `Some(g)`, one before a query and one after, prove no commit began
+    /// between them, which is what lets the analytical memo (#1186) remember that query's answer as
+    /// the answer for generation `g`. A backend that returns `None` simply has no memo.
     fn write_generation(&self) -> Option<u64> {
         None
     }
@@ -453,10 +454,25 @@ impl Store {
         })
     }
 
-    /// Commit a write transaction and count it. Every write this handle makes goes through here, so
-    /// `write_generation` moves on every commit and only on a commit - a rolled-back transaction
-    /// changed nothing a reader could see.
+    /// Commit a write transaction, bracketed by the generation counter. Every write this handle
+    /// makes goes through here.
+    ///
+    /// The counter is bumped **before** the commit and again after it, so it is odd exactly while a
+    /// commit may be becoming visible and even at rest. That is what makes the memo's fence exact
+    /// (#1186, Jules on #1189): an atomic counter cannot be made simultaneous with redb's commit, so
+    /// a reader that saw the old even value before its query and the same even value after it has
+    /// proved that no commit *began* in between - the first bump would have shown. A reader that
+    /// sees an odd value is told nothing (`write_generation` returns `None`) and computes without
+    /// remembering. Bumping only after the commit left a window in which committed rows were visible
+    /// under the old generation; bumping only before would let a pre-commit snapshot be remembered
+    /// under the new one. Both bumps close both windows.
+    ///
+    /// A commit that fails leaves the counter odd, which disables the memo for the store's remaining
+    /// life. That is the safe direction, and a failed redb commit is not a state this process carries
+    /// on from in any case.
     fn commit(&self, wtx: redb::WriteTransaction) -> Result<()> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         wtx.commit()?;
         self.writes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1112,7 +1128,9 @@ impl Store {
 #[async_trait::async_trait]
 impl HotStore for Store {
     fn write_generation(&self) -> Option<u64> {
-        Some(self.writes.load(std::sync::atomic::Ordering::SeqCst))
+        // Odd means a commit is in flight: see `Store::commit`.
+        let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
+        g.is_multiple_of(2).then_some(g)
     }
 
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
@@ -1472,6 +1490,33 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The memo's fence (#1186): even at rest, `None` while a commit is in flight, and one commit
+    /// moves it by exactly two, so a reader comparing two `Some` values across a query has proved
+    /// no commit began between them.
+    #[test]
+    fn write_generation_is_even_at_rest_and_moves_by_two_per_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let g0 = store
+            .write_generation()
+            .expect("a store at rest reports a generation");
+        assert_eq!(g0 % 2, 0);
+        store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        let g1 = store.write_generation().expect("at rest again");
+        assert_eq!(g1, g0 + 2, "one commit, two bumps");
+        // An in-flight commit is odd, and odd reads as `None`.
+        store
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.write_generation(), None);
+        store
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.write_generation(), Some(g1 + 2));
+    }
 
     fn temp_store() -> (Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
