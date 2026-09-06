@@ -85,7 +85,7 @@ async fn concurrent_queries_over_a_sealed_segment_do_not_corrupt_the_process() {
     // The rows, not their count: `LIMIT 200` makes a count of 200 satisfiable by rows from the wrong
     // blocks, in the wrong order, or with corrupted values (Jules on #1181). Corruption that keeps the
     // count is exactly the kind a spill collision produces.
-    let expected = rows;
+    let expected = Arc::new(rows);
 
     // Four threads is where production died; the loop is long enough to have crossed that window
     // several times over.
@@ -93,11 +93,12 @@ async fn concurrent_queries_over_a_sealed_segment_do_not_corrupt_the_process() {
     for _ in 0..4 {
         let d = dir.path().to_path_buf();
         let q = sql.to_string();
+        let expected = Arc::clone(&expected);
         handles.push(std::thread::spawn(move || {
             for _ in 0..25 {
                 let got = analytics::query(&d, &q).expect("concurrent query");
                 assert_eq!(
-                    got, expected,
+                    got, *expected,
                     "a concurrent query returned different rows than the same query alone"
                 );
             }
