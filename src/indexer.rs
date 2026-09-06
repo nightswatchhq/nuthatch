@@ -10109,6 +10109,11 @@ template = "pool"
             .unwrap()
             .expect("first window commits");
         let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        // `balances.apply` posts a batch to the view's channel and the circuit folds it on its own
+        // thread; `flush` is what waits for that. Reading the balance straight after
+        // `process_window` returns is a race a fast machine wins and a loaded runner loses - seen as
+        // `recipient was credited` failing on CI's `exex` leg while passing locally every time.
+        nest.balances.flush();
         let after_first = nest
             .balances
             .balance(recipient)
@@ -10123,6 +10128,7 @@ template = "pool"
             .await
             .unwrap()
             .expect("second window commits");
+        nest.balances.flush();
         let after_second = nest.balances.balance(recipient).unwrap();
         assert_eq!(
             after_second,
@@ -10155,6 +10161,7 @@ template = "pool"
             .unwrap()
             .expect("first window commits");
         let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        nest.balances.flush();
         let before = nest.balances.balance(recipient).unwrap();
 
         // The tail comes back for blocks 11 and 12 under another hash: those blocks were reorged.
@@ -10173,7 +10180,10 @@ template = "pool"
             "a stale tail must refuse the window, not store around it"
         );
         assert_eq!(
-            nest.balances.balance(recipient).unwrap(),
+            {
+                nest.balances.flush();
+                nest.balances.balance(recipient).unwrap()
+            },
             before,
             "nothing folded"
         );
