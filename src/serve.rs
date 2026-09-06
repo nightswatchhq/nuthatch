@@ -1645,6 +1645,12 @@ async fn run_sql_query(
             if s.store.write_generation() == Some(*generation)
                 && s.store.sealed_through() == *sealed_through
                 && still == *before
+                // And the cold side the answer was computed over is the one still on disk: a
+                // sealed segment is immutable by construction, so nothing the node does changes
+                // it, but a disk fault or a half-finished restore does - and the answer over it
+                // then differs while every input the node knows about is unchanged. See
+                // `sqlmemo::segment_stamps`.
+                && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
             {
                 METRICS.inc_sql();
                 return sql_response(
@@ -1762,7 +1768,9 @@ async fn run_sql_query(
             let provenance = (as_of, after.1);
             if let Some((key, generation, sealed_through, before)) = memo {
                 if after == (Some(generation), sealed_through) && watermarks == before {
-                    crate::sqlmemo::put(key, &out, &watermarks, provenance);
+                    let segments =
+                        crate::sqlmemo::segment_stamps(&s.dir, out.referenced_tables.as_ref());
+                    crate::sqlmemo::put(key, &out, &watermarks, provenance, segments);
                 }
             }
             sql_response(&s, &out, &watermarks, provenance, false)

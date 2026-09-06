@@ -84,6 +84,57 @@ pub struct Key([u8; 32]);
 
 /// Everything a `/sql` answer is a function of. Building one is cheap - the file stamps are the
 /// hashes `analytics::duck_inputs` already computes per request - and none of it needs a permit.
+/// A stamp of every sealed segment behind `tables` (or behind every table, when the statement's
+/// reach is unknown): path, length, and modification time in nanoseconds.
+///
+/// **Why the cold side needs its own check at all.** The rest of the key describes state the node
+/// itself moves - a commit, a seal, an edited view. A sealed segment is immutable by construction, so
+/// it is not in that set; but a file on a disk can still change without the node doing anything, and
+/// when one does, the answer over it changes. Without this, a segment scribbled over under a running
+/// node would be served from the memo as the healthy answer it used to be, because every input the
+/// node knows about is unchanged (`e2e_solo.rs`, the corrupt-segment-over-HTTP case).
+///
+/// A `stat` per segment on a hit, not a hash: hashing 645 MB to save an 8-second query would defeat
+/// the point, and this is a different fault from the one `content_stamp` exists for. That one is
+/// **the node rewriting its own small files in rapid succession**, where the mtime clock's ~3 ms
+/// granularity loses same-tick edits (#840). This one is a disk fault or an operator's half-finished
+/// restore, arbitrarily later than the seal that wrote the file. What remains undetectable is a
+/// same-length rewrite landing inside the same timestamp tick as the write before it, which for a
+/// rotting sector is not a case that occurs; the periodic integrity sweep is what covers the rest.
+pub fn segment_stamps(
+    dir: &Path,
+    tables: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<(PathBuf, u64, i64)> {
+    let Ok(manifest) = crate::seal::load_manifest(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (table, segs) in &manifest.tables {
+        if tables.is_some_and(|t| !t.contains(&table.to_ascii_lowercase())) {
+            continue;
+        }
+        for seg in segs {
+            let path = crate::seal::segment_path(dir, &seg.file, &seg.hash);
+            let (len, mtime) = match std::fs::metadata(&path) {
+                // A file that is gone stamps as absent rather than being skipped: a quarantined
+                // segment is a change to the cold side, and the answer over it is different.
+                Err(_) => (u64::MAX, i64::MIN),
+                Ok(m) => (
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                ),
+            };
+            out.push((path, len, mtime));
+        }
+    }
+    out.sort();
+    out
+}
+
 pub struct Inputs<'a> {
     pub dir: &'a Path,
     pub sql: &'a str,
@@ -124,6 +175,10 @@ impl Inputs<'_> {
 pub struct Entry {
     pub out: QueryOutput,
     pub watermarks: BTreeMap<String, u64>,
+    /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
+    /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
+    pub tables: Option<std::collections::BTreeSet<String>>,
+    pub segments: Vec<(PathBuf, u64, i64)>,
     /// The provenance the rows were computed under - `last_block` and the sealed watermark read in
     /// the same blocking task as the query. A hit cites these, never the live store: the store may
     /// have moved between the lookup and the response, and a citation that names a newer state for
@@ -194,12 +249,14 @@ impl Memo {
     /// Remember `out` under `key`. Returns whether it was kept: a degraded or tip-less answer is not,
     /// and neither is one larger than a quarter of the ceiling. Evicts least recently used entries
     /// until the total fits.
+    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
         key: Key,
         out: &QueryOutput,
         watermarks: &BTreeMap<String, u64>,
         provenance: (Option<u64>, u64),
+        segments: Vec<(PathBuf, u64, i64)>,
         cap: usize,
     ) -> bool {
         if cap == 0 || out.degraded() || out.tip_unavailable {
@@ -235,6 +292,8 @@ impl Memo {
                 Arc::new(Entry {
                     out: out.clone(),
                     watermarks: watermarks.clone(),
+                    tables: out.referenced_tables.clone(),
+                    segments,
                     as_of: provenance.0,
                     sealed_through: provenance.1,
                     bytes,
@@ -278,8 +337,9 @@ pub fn put(
     out: &QueryOutput,
     watermarks: &BTreeMap<String, u64>,
     provenance: (Option<u64>, u64),
+    segments: Vec<(PathBuf, u64, i64)>,
 ) -> bool {
-    GLOBAL.put(key, out, watermarks, provenance, max_bytes())
+    GLOBAL.put(key, out, watermarks, provenance, segments, max_bytes())
 }
 pub fn bytes() -> usize {
     GLOBAL.bytes()
@@ -408,10 +468,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm, (None, 0)));
+        assert!(!put(Key([1; 32]), &out, &wm, (None, 0), Vec::new()));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm, (None, 0)));
+        assert!(!put(Key([2; 32]), &out, &wm, (None, 0), Vec::new()));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -427,14 +487,14 @@ mod tests {
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, (None, 0), cap));
+            assert!(m.put(k(n), &rows(10), &wm, (None, 0), Vec::new(), cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, (None, 0), cap));
+        assert!(m.put(k(5), &rows(10), &wm, (None, 0), Vec::new(), cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -455,11 +515,11 @@ mod tests {
         let wm = BTreeMap::new();
         let out = rows(10);
         let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, (None, 0), cap));
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, (None, 0), Vec::new(), cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, (None, 0), cap + 1));
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, (None, 0), Vec::new(), cap + 1));
         assert!(
-            !m.put(Key([0xb3; 32]), &out, &wm, (None, 0), 0),
+            !m.put(Key([0xb3; 32]), &out, &wm, (None, 0), Vec::new(), 0),
             "zero disables"
         );
         assert!(
