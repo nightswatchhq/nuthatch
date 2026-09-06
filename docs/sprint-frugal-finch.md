@@ -56,11 +56,13 @@ a matter of trimming. Two facts decide the shape of the work:
    the mode and the interval, and its stall threshold scales with the interval so a five-minute
    cursor is not reported stalled at ninety seconds. Acceptance, stated so that only one
    implementation satisfies it: (a) a nest run under either flag holds exactly the rows a
-   tip-following run holds for the same blocks; (b) sealing is untouched, so a segment's content
-   address remains what it is today - a deterministic function of the block range it covers and the
-   rows in it. Byte-identical segment *files* between two runs are **not** the criterion and never
-   were: on the tip path a segment's boundaries already depend on when finality advanced relative to
-   a window, so two tip-following runs cut different files today. **Mutate it**: fake the ceiling
+   tip-following run holds for the same blocks; (b) sealing is untouched, so a segment covering a
+   given block range holds bytes identical to what tip following seals for that range - the content
+   is a function of range and rows and nothing about the cadence reaches it. That is the sense in
+   which CLAUDE.md's carve-out entry says "byte-identical", and the entry now says so in those words.
+   What is *not* promised, by either mode or by today's tip path, is that two runs cut their segment
+   boundaries in the same places: a boundary depends on when finality advanced relative to a window,
+   so two tip-following runs already cut different files. **Mutate it**: fake the ceiling
    back to `tip` under `--finality-only` and the test must go red; quote the failure in the PR.
    Knob 3 (timestamp interpolation) is not in scope, and knob 4 is #1170 below.
 2. **Release 3.5.0** carrying #1173, the DuckDB memory budget that landed after 3.4.1 (PR 1172) and the
