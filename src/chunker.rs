@@ -127,7 +127,12 @@ impl AdaptiveWindow {
             self.whole_streak += 1;
             if self.whole_streak >= RECOVERY_STREAK {
                 self.max = self.max.saturating_mul(2).min(self.hard_max);
-                self.learned = (self.max < self.hard_max).then_some(self.max);
+                // The lesson moves only when recovery has climbed *past* it. Under a cap that sits
+                // below the remembered width, reaching the cap says nothing about the refusal
+                // (#1170, review): the width the provider refused is still the width it refused.
+                if self.learned.is_none_or(|l| self.max > l) {
+                    self.learned = (self.max < self.hard_max).then_some(self.max);
+                }
                 self.whole_streak = 0;
             }
         }
@@ -603,6 +608,21 @@ mod tests {
             w.served_whole(w.ceiling());
         }
         assert_eq!(w.ceiling(), 40);
+        // Recovery under a cap that sits *below* the lesson reaches the cap and no further, and
+        // does not forget the lesson: lifting the cap afterwards returns to the refused width.
+        let mut v = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        v.served_by_splitting(10);
+        v.set_max(5);
+        for _ in 0..(RECOVERY_STREAK * 3) {
+            v.served_whole(v.ceiling());
+        }
+        assert_eq!(v.ceiling(), 5);
+        v.set_max(100_000);
+        assert_eq!(
+            v.ceiling(),
+            10,
+            "recovery that only reached a temporary cap erased the refusal-taught width"
+        );
         // A controller that learnt nothing follows the configured ceiling exactly, both ways.
         let mut u = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
         u.set_max(800);
