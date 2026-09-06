@@ -1612,7 +1612,7 @@ async fn run_sql_query(
                 .entities
                 .iter()
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
-                .map(|e| (e.name().to_string(), e.applied_through()))
+                .map(|e| (e.name().to_string(), e.fence_watermark()))
                 .collect();
             let files = crate::analytics::duck_inputs(&s.dir);
             let sealed_through = s.store.sealed_through();
@@ -1640,7 +1640,7 @@ async fn run_sql_query(
                 .entities
                 .iter()
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
-                .map(|e| (e.name().to_string(), e.applied_through()))
+                .map(|e| (e.name().to_string(), e.fence_watermark()))
                 .collect();
             if s.store.write_generation() == Some(*generation)
                 && s.store.sealed_through() == *sealed_through
