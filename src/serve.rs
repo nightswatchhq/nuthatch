@@ -1628,16 +1628,33 @@ async fn run_sql_query(
             .key();
             (key, generation, sealed_through, watermarks)
         });
-    if let Some((key, ..)) = &memo {
+    if let Some((key, generation, sealed_through, before)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
-            METRICS.inc_sql();
-            return sql_response(
-                &s,
-                &hit.out,
-                &hit.watermarks,
-                (hit.as_of, hit.sealed_through),
-                true,
-            );
+            // Re-read the fence after the lookup, as the computing path does after its query: a
+            // commit that landed between building the key and finding the entry has moved the store
+            // past the state this entry describes, and the request computes instead. What remains
+            // is the interval between this check and the response, which is the interval every
+            // computed answer has between its last read and its response - no memo could narrow it
+            // further, and no caller could tell the two apart (Jules on #1189).
+            let still: std::collections::BTreeMap<String, u64> = s
+                .entities
+                .iter()
+                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+                .map(|e| (e.name().to_string(), e.applied_through()))
+                .collect();
+            if s.store.write_generation() == Some(*generation)
+                && s.store.sealed_through() == *sealed_through
+                && still == *before
+            {
+                METRICS.inc_sql();
+                return sql_response(
+                    &s,
+                    &hit.out,
+                    &hit.watermarks,
+                    (hit.as_of, hit.sealed_through),
+                    true,
+                );
+            }
         }
     }
     // Fail fast when the analytical surface is saturated rather than queue: a backlog of pending
