@@ -70,14 +70,22 @@ async fn concurrent_queries_over_a_sealed_segment_do_not_corrupt_the_process() {
 
     // The shape from the crash reports, and one that must read the segment rather than a summary:
     // a filter that the segment spans, ordered by the filtered column.
+    //
+    // `value` repeats across blocks (100*b + i collides for neighbouring b), so the order is made
+    // total with the row's own coordinates: otherwise two correct answers could differ in the order
+    // of tied rows and the comparison below would call a healthy process corrupt.
     let sql = "SELECT block_number, log_index, value FROM usdc__transfer \
-               WHERE CAST(value AS HUGEINT) > 3000 ORDER BY CAST(value AS HUGEINT) DESC LIMIT 200";
+               WHERE CAST(value AS HUGEINT) > 3000 \
+               ORDER BY CAST(value AS HUGEINT) DESC, block_number, log_index LIMIT 200";
     let rows = analytics::query(dir.path(), sql).expect("the query answers at all");
     assert!(
         !rows.is_empty(),
         "the fixture must return rows, or the concurrency proves nothing"
     );
-    let expected = rows.len();
+    // The rows, not their count: `LIMIT 200` makes a count of 200 satisfiable by rows from the wrong
+    // blocks, in the wrong order, or with corrupted values (Jules on #1181). Corruption that keeps the
+    // count is exactly the kind a spill collision produces.
+    let expected = rows;
 
     // Four threads is where production died; the loop is long enough to have crossed that window
     // several times over.
@@ -89,9 +97,8 @@ async fn concurrent_queries_over_a_sealed_segment_do_not_corrupt_the_process() {
             for _ in 0..25 {
                 let got = analytics::query(&d, &q).expect("concurrent query");
                 assert_eq!(
-                    got.len(),
-                    expected,
-                    "a concurrent query returned a different row count than the same query alone"
+                    got, expected,
+                    "a concurrent query returned different rows than the same query alone"
                 );
             }
         }));
