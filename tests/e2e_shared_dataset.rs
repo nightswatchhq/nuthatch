@@ -26,6 +26,10 @@ use nuthatch::{analytics, health::RuntimeHealth, indexer, migrate, runtime};
 
 use common::tape::*;
 
+/// The tip the fixture backfills to before anything advances it: the boundary between "this was the
+/// backfill" and "this was tip-following", which is what the fetch guard below is measured over.
+const TIP: u64 = 6;
+
 /// A one-nest mounts in the pre-2.0 layout, migrated, then given a second alias onto the same
 /// identity - which is exactly what a second tenant mounting the same nest produces.
 fn two_mounts_one_nest(root: &Path) -> String {
@@ -100,7 +104,7 @@ async fn bring_up(
         }
         tape.insert_block(b, fx);
     }
-    tape.advance_tip_to(6);
+    tape.advance_tip_to(TIP);
 
     let mounted: Vec<_> = datasets
         .iter()
@@ -207,7 +211,7 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
 
     // --- The runtime: index once, serve twice. ---
     let (states, tape, estimates) = bring_up(root).await;
-    let calls_shared = tape.logs_call_count();
+    let shared_ranges = tape.logs_ranges();
 
     // The alias must not be charged a footprint the dataset already paid, or the per-cursor budget
     // would refuse a mount that costs nothing.
@@ -252,11 +256,36 @@ async fn two_mounts_of_one_nest_share_a_single_dataset() {
     migrate::run(solo_root, false, false).unwrap();
     let (_, solo_tape, _) = bring_up(solo_root).await;
 
+    // Compared over the **backfill span** (`to <= TIP`) and by range, not by call count. A second
+    // backfill re-asks for blocks that have already been fetched, which shows up here as a repeated
+    // range or as more ranges than the single-mount control needed; a window fetched after the tip
+    // moved is ordinary tip-following, and how many of those land before the wait predicate flips is
+    // a fact about the machine's load once the cursor is paced by `--poll-interval` (#1190). The old
+    // assertion compared bare counts and duly failed under a loaded runner with 3 against 2, both of
+    // them one backfill and a different number of following windows.
+    let backfill_of = |ranges: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
+        ranges.into_iter().filter(|&(_, to)| to <= TIP).collect()
+    };
+    let shared = backfill_of(shared_ranges);
+    let solo = backfill_of(solo_tape.logs_ranges());
+    let mut seen = std::collections::HashSet::new();
+    for r in &shared {
+        assert!(
+            seen.insert(*r),
+            "the shared run fetched blocks {}..={} twice - a second backfill is running \
+             (ranges: {shared:?})",
+            r.0,
+            r.1
+        );
+    }
     assert!(
-        calls_shared <= solo_tape.logs_call_count(),
-        "mounting the same nest twice cost more log fetches than mounting it once \
-         ({calls_shared} vs {}) - a second backfill is running",
-        solo_tape.logs_call_count()
+        !shared.is_empty() && !solo.is_empty(),
+        "both runs must have backfilled something, or this guard is vacuous"
+    );
+    assert!(
+        shared.len() <= solo.len(),
+        "mounting the same nest twice cost more backfill fetches than mounting it once \
+         ({shared:?} vs {solo:?}) - a second backfill is running"
     );
 }
 
