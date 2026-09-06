@@ -65,7 +65,12 @@ a matter of trimming. Two facts decide the shape of the work:
    Knob 3 (timestamp interpolation) is not in scope, and knob 4 is #1170 below.
 2. **Release 3.5.0** carrying #1173, the DuckDB memory budget that landed after 3.4.1 (PR 1172) and the
    `serve` role fix (PR 1171). Roll onto 8107, 8113 and 8104 with `--poll-interval 5m`. Then
-   measure again, the same way: CU/min per nest over 45 seconds. The sprint's number is that table.
+   measure again - but not the same way. A 45-second sample of a two-second cursor is a fair
+   average; a 45-second sample of a five-minute cursor sees zero polls or one depending on where it
+   starts, and normalising that to a minute proves nothing. The closing measurement is the
+   difference in `nuthatch_rpc_methods_total` per method between two scrapes **at least one hour
+   apart** (twelve or more intervals, so phase is noise), divided by the elapsed minutes, and
+   repeated over a full day before the number is written down. The sprint's number is that table.
 3. **#1165 - the 3.4.0 segfaults.** 3.4.1 has held on 8107 since the evening of 2026-09-05 with the
    concurrency permit at one. Close when 3.5.0 has run a day on 8107 and the replay soak
    (`replay-soak.py`, the 44 captured statements, concurrency four) completes without a crash under
@@ -104,9 +109,10 @@ a matter of trimming. Two facts decide the shape of the work:
 **Everything stays, and everything new joins.** The instruction was the whole backlog, and each item
 is either the cost work itself, the evidence the cost work needs, or the migration's last mile.
 
-**The number that closes the sprint is measured, not projected.** Step 2's table, taken the same
-way as the one above, with the Lodestar nests under 1,000 CU a minute between them. At Alchemy's
-rates that is under $20 a month; the $100 target has headroom for a second key or a worse month.
+**The number that closes the sprint is measured, not projected.** Step 2's table - counter deltas
+over at least an hour, then a day, never a 45-second sample of a five-minute cursor - with the
+Lodestar nests under 1,000 CU a minute between them. At Alchemy's rates that is under $20 a month;
+the $100 target has headroom for a second key or a worse month.
 
 **Perpl does not cost money again.** If public Monad endpoints cannot carry it, it parks.
 
