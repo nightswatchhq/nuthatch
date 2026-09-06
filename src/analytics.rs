@@ -218,9 +218,45 @@ impl Drop for SpillDir {
     }
 }
 
+/// Remove spill directories left by processes that are no longer running.
+///
+/// The cache lives in a `static`, and Rust does not drop statics at exit, so a cached connection's
+/// [`SpillDir`] guard never runs on the way out and its directory outlives the process. One empty
+/// directory per instance is not much, but a nest restarting every fifteen seconds under a fault -
+/// which is exactly what #1165 looked like - would leave one behind each time, with whatever it had
+/// spilled inside. Ownership is by pid: a directory whose pid still has a `/proc` entry belongs to a
+/// live process and is left alone. Where `/proc` is not there to ask (macOS, dev machines), nothing
+/// is swept, because guessing by age could delete a running instance's spill under it.
+fn sweep_dead_spill_dirs() {
+    if !Path::new("/proc").is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name
+            .to_string_lossy()
+            .strip_prefix("nuthatch-duckdb-")
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// A directory no other DuckDB instance in this process (or any other) will write to.
 fn new_spill_dir() -> Result<SpillDir> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(sweep_dead_spill_dirs);
     let path = std::env::temp_dir().join(format!(
         "nuthatch-duckdb-{}-{}",
         std::process::id(),
