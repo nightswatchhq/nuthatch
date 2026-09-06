@@ -41,6 +41,10 @@ pub struct AdaptiveWindow {
     /// `max` may sit below it after [`served_by_splitting`](Self::served_by_splitting) lowered it;
     /// recovery climbs back towards this, never past it.
     hard_max: u64,
+    /// The width a refusal taught, if any (#672), kept apart from `max` so a configured cap that
+    /// dips below it and lifts again does not erase the lesson (#1170, review). `None` once recovery
+    /// has climbed back to the configured ceiling, or when nothing was ever refused.
+    learned: Option<u64>,
     /// Consecutive windows served whole *at the lowered ceiling* (#1170). The evidence that the
     /// ceiling is too low now, whatever it was when a refusal set it.
     whole_streak: u32,
@@ -66,6 +70,7 @@ impl AdaptiveWindow {
             max,
             served_whole: 0,
             hard_max: max,
+            learned: None,
             whole_streak: 0,
         }
     }
@@ -122,6 +127,7 @@ impl AdaptiveWindow {
             self.whole_streak += 1;
             if self.whole_streak >= RECOVERY_STREAK {
                 self.max = self.max.saturating_mul(2).min(self.hard_max);
+                self.learned = (self.max < self.hard_max).then_some(self.max);
                 self.whole_streak = 0;
             }
         }
@@ -176,6 +182,7 @@ impl AdaptiveWindow {
             self.max = w;
             self.window = self.window.min(self.max);
         }
+        self.learned = Some(self.learned.map_or(w, |l| l.min(w)));
         // A refusal is fresh evidence the ceiling is real; the recovery count starts again (#1170).
         self.whole_streak = 0;
     }
@@ -195,17 +202,13 @@ impl AdaptiveWindow {
     /// clamped down live, so growth back up after a ceiling is lifted goes through `observed`'s own
     /// 4x-per-step damping instead of jumping straight to wherever it had silently drifted.
     pub fn set_max(&mut self, max: u64) {
-        // The configured ceiling moves; a ceiling a refusal taught (`max < hard_max`, #672) is kept
-        // underneath it rather than overwritten, or a caller re-applying its cap every iteration -
-        // as the runtime loop does - would undo the lesson the moment it was learnt (#1170). A
-        // controller that has learnt nothing follows the configured ceiling exactly as before.
-        let learned = self.max < self.hard_max;
+        // The configured ceiling moves; the width a refusal taught (#672) is remembered on its own
+        // and re-applied beneath whatever the cap now is, so a caller re-applying its cap every
+        // iteration - as the runtime loop does - cannot undo the lesson, and neither can a cap that
+        // dips below the lesson and lifts again (#1170, review). A controller that has learnt
+        // nothing follows the configured ceiling exactly as before.
         self.hard_max = max.max(self.min);
-        self.max = if learned {
-            self.max.min(self.hard_max)
-        } else {
-            self.hard_max
-        };
+        self.max = self.learned.map_or(self.hard_max, |l| l.min(self.hard_max));
         self.window = self.window.min(self.max);
     }
 }
@@ -586,6 +589,13 @@ mod tests {
             w.ceiling(),
             5,
             "a cap below the learnt ceiling must still bind"
+        );
+        // Lifting the cap again does not forget the refusal: the ceiling returns to what was learnt.
+        w.set_max(100_000);
+        assert_eq!(
+            w.ceiling(),
+            10,
+            "a cap that dipped below the lesson and lifted again forgot it"
         );
         // Recovery climbs towards the configured cap that is current, not the one at construction.
         w.set_max(40);
