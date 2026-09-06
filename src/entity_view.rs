@@ -547,6 +547,24 @@ impl EntityView {
         self.state.read().map(|s| s.through).unwrap_or(0)
     }
 
+    /// The applied-through watermark **for a fence, never for a label** (#1186).
+    ///
+    /// The same number [`applied_through`](Self::applied_through) returns, under a different name on
+    /// purpose. #932 is that a watermark read separately from the rows it describes can label an
+    /// answer more current than the rows in it, and `entity_provenance_is_atomic.rs` is a source gate
+    /// that keeps bare `applied_through()` out of the serving path so nobody reintroduces it by
+    /// accident. The analytical memo needs a watermark for a different job: deciding whether the
+    /// state has moved since a remembered answer was computed. That value is compared and discarded -
+    /// it never reaches a response, where the label always comes from `rows_as_json_with_watermark`
+    /// beside the rows themselves.
+    ///
+    /// So the gate keeps meaning exactly what it says, and a value that must never be reported has a
+    /// name that says so. If you find yourself putting this into a response body, you want
+    /// `rows_as_json_with_watermark`, and you are about to reintroduce #932.
+    pub fn fence_watermark(&self) -> u64 {
+        self.applied_through()
+    }
+
     /// When the applied-through watermark last moved, in unix seconds; `0` before the first batch.
     pub fn last_progress(&self) -> u64 {
         self.state.read().map(|s| s.progress_at).unwrap_or(0)

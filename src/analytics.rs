@@ -142,7 +142,7 @@ pub fn invalidate_duck_cache(dir: &Path) {
     duck_cache_lock().remove(dir);
 }
 
-fn duck_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, DuckInputStamp> {
+pub(crate) fn duck_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, DuckInputStamp> {
     let mut paths = vec![dir.join(crate::config::CONFIG_FILE)];
     if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
         paths.extend(
@@ -386,7 +386,7 @@ pub struct QueryGuard {
 /// that named none of them, or name none and repeat #472's silence. `QueryOutput` itself never sets
 /// this field - the hot scan happens in the caller, above `query_hot_cold` - so a caller that scans the
 /// tip assigns it after the query returns.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
     pub truncated: bool,

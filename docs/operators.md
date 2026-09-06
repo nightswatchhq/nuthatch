@@ -334,6 +334,25 @@ events, not chain history: a nest tracking a few events on a few contracts stays
 
 ---
 
+### The analytical memo
+
+A `/sql` answer is a function of its inputs: the statement and its row cap, the sealed watermark, the
+hot store's write generation, each maintained entity's watermark, and the content of `nuthatch.toml`,
+`views/*.sql` and `labels/*.json`. Since 3.6.0 the nest remembers answers under a hash of exactly
+those, so a statement repeated while none of them has moved is answered from memory - before the
+permit gate, since it costs no DuckDB - and reports `"cached": true`. One commit, one seal, one
+edited view changes the key and the next request computes. It is not a TTL and cannot serve a stale
+row: same key, same inputs, same rows. What it does is turn a dashboard's fifth request for the same
+fold from seconds into microseconds, on a cursor that commits a handful of times an hour.
+
+Measured on the Lodestar allocations nest, whose dashboard's 47 distinct statements took 89 s serially
+after #1183: the four heaviest are whole-history folds at 5 to 16 s each, and every one of them repeats
+within the panel's refresh. A degraded answer (a table reduced by an unreadable segment, a tip that
+would not scan) is never remembered, and an answer larger than a quarter of the ceiling is declined
+rather than evicting everything else. `NUTHATCH_SQL_MEMO_BYTES` sets the ceiling; `0` disables it.
+The memo lives inside the same RSS budget as everything else - 64 MiB by default, which is why the
+default is what it is and not larger.
+
 ## What a nest costs at tip
 
 Capacity above is about RAM. This section is about a different bill: **RPC requests**, which is what
@@ -474,6 +493,7 @@ SQL surfaces). Full key reference:
 | Variable | Purpose |
 |---|---|
 | `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
+| `NUTHATCH_SQL_MEMO_BYTES` | ceiling on the analytical memo's remembered rows, in serialized bytes (default 64 MiB; `0` turns it off). See *The analytical memo* under capacity and sizing. |
 
 **Runtime flags that matter operationally** (`dev` and `bench backfill`):
 
@@ -835,6 +855,7 @@ per-nest series below.
 | `nuthatch_sealed_through` | cold-layer watermark |
 | `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
+| `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |

@@ -1595,6 +1595,74 @@ async fn run_sql_query(
         q: sql_text,
         max_rows: requested_max_rows,
     };
+    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
+    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
+    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
+    // The deterministic memo (#1186): the identity of this answer is the statement plus every input
+    // it reads - sealed watermark, hot-store write generation, entity watermarks, authored files. A
+    // remembered answer for that identity is the answer, and it is returned before the permit gate,
+    // because a hit costs no DuckDB and the gate exists to bound DuckDB. `None` where the store
+    // cannot report a write generation; that backend simply computes every time.
+    let memo = s
+        .store
+        .write_generation()
+        .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
+        .map(|generation| {
+            let watermarks: std::collections::BTreeMap<String, u64> = s
+                .entities
+                .iter()
+                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+                .map(|e| (e.name().to_string(), e.fence_watermark()))
+                .collect();
+            let files = crate::analytics::duck_inputs(&s.dir);
+            let sealed_through = s.store.sealed_through();
+            let key = crate::sqlmemo::Inputs {
+                dir: &s.dir,
+                sql: &q.q,
+                max_rows,
+                sealed_through,
+                write_generation: generation,
+                entity_watermarks: &watermarks,
+                files: &files,
+            }
+            .key();
+            (key, generation, sealed_through, watermarks)
+        });
+    if let Some((key, generation, sealed_through, before)) = &memo {
+        if let Some(hit) = crate::sqlmemo::get(key) {
+            // Re-read the fence after the lookup, as the computing path does after its query: a
+            // commit that landed between building the key and finding the entry has moved the store
+            // past the state this entry describes, and the request computes instead. What remains
+            // is the interval between this check and the response, which is the interval every
+            // computed answer has between its last read and its response - no memo could narrow it
+            // further, and no caller could tell the two apart (Jules on #1189).
+            let still: std::collections::BTreeMap<String, u64> = s
+                .entities
+                .iter()
+                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+                .map(|e| (e.name().to_string(), e.fence_watermark()))
+                .collect();
+            if s.store.write_generation() == Some(*generation)
+                && s.store.sealed_through() == *sealed_through
+                && still == *before
+                // And the cold side the answer was computed over is the one still on disk: a
+                // sealed segment is immutable by construction, so nothing the node does changes
+                // it, but a disk fault or a half-finished restore does - and the answer over it
+                // then differs while every input the node knows about is unchanged. See
+                // `sqlmemo::segment_stamps`.
+                && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
+            {
+                METRICS.inc_sql();
+                return sql_response(
+                    &s,
+                    &hit.out,
+                    &hit.watermarks,
+                    (hit.as_of, hit.sealed_through),
+                    true,
+                );
+            }
+        }
+    }
     // Fail fast when the analytical surface is saturated rather than queue: a backlog of pending
     // DuckDB queries would itself exhaust memory/threads.
     let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
@@ -1618,9 +1686,6 @@ async fn run_sql_query(
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
-    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
-    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
-    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
                               // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
@@ -1681,58 +1746,35 @@ async fn run_sql_query(
             &tables,
         )?;
         out.tip_unavailable = tip_unavailable;
+        // The state after the query, for the memo: an answer is remembered only if nothing it reads
+        // moved while it ran, so a remembered answer always describes exactly the state its key names.
+        let after = (store.write_generation(), store.sealed_through());
+        // Provenance from the same task as the query, for the same reason as the watermarks: read
+        // out on the response path it can name a newer state than the rows came from.
+        let as_of = store
+            .get_meta("last_block")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok());
         // The watermarks ride out with the result: they describe the rows this query was answered
         // from, and re-reading them out here is the race #932 is about.
-        Ok((out, watermarks))
+        Ok((out, watermarks, after, as_of))
     })
     .await;
     match result {
         // Provenance stamp (RFC-0016 §4): an agent can cite its answer against content-addressed data -
         // as of which block, what's sealed, and the registry it decoded with.
-        Ok(Ok((out, watermarks))) => Json(json!({
-            "count": out.rows.len(),
-            "truncated": out.truncated,
-            // Cold data was incomplete when this answer was computed (#435): a sealed segment the
-            // manifest lists could not be read, so its table was *reduced* and the query succeeded
-            // with quietly less data. Reduction is the right policy (#430) - a bad segment must not
-            // delete a table - but it is only defensible if the caller is told, or `SUM(value)`
-            // comes back wrong rather than absent. Always present, so a caller cannot mistake the
-            // healthy shape for an older build that never reported it.
-            //
-            // `degraded_tables` names the tables and nothing else. Table names are already public on
-            // this surface (`/schema` lists them, and you must name one to query it); segment paths
-            // and content addresses are not, and must never appear here - `/sql` is untrusted, which
-            // is the same reason errors go through `sanitize_sql_error`.
-            "degraded": out.degraded(),
-            "degraded_tables": out.degraded_tables,
-            // Tip failure, not per-table cold reduction (#472): the hot-tip scan itself errored, so
-            // this answer is sealed-history-only regardless of what `degraded_tables` says. Distinct
-            // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
-            // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
-            "tip_unavailable": out.tip_unavailable,
-            "rows": out.rows,
-            // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
-            // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
-            // cutoff a result may legitimately come from data a *different* identity produced - the
-            // adoption is correct, and the old stamp could not express it. `nid` closes that: an agent
-            // citing an answer can now name the dataset, not just the decode.
-            "provenance": {
-                "as_of": s.store.get_meta("last_block").ok().flatten()
-                    .and_then(|v| v.parse::<u64>().ok()),
-                "sealed_through": s.store.sealed_through(),
-                "source": "hot+sealed",
-                "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
-                "nid": s.nid.as_deref(),
-                // **#822 criterion 9, on the analytical route.** `source: hot+sealed` describes the
-                // fact tables; it says nothing about a maintained relation, whose rows came from a
-                // circuit rather than from a scan and are current only as far as its own watermark.
-                // A caller citing this answer needs to know both. Absent when the statement
-                // referenced no entity, and absent when the parse was unavailable - see
-                // `QueryOutput::referenced_tables`, which is why this is not an empty array.
-                "entities": sql_entity_provenance(&s, out.referenced_tables.as_ref(), &watermarks),
-            },
-        }))
-        .into_response(),
+        Ok(Ok((out, watermarks, after, as_of))) => {
+            let provenance = (as_of, after.1);
+            if let Some((key, generation, sealed_through, before)) = memo {
+                if after == (Some(generation), sealed_through) && watermarks == before {
+                    let segments =
+                        crate::sqlmemo::segment_stamps(&s.dir, out.referenced_tables.as_ref());
+                    crate::sqlmemo::put(key, &out, &watermarks, provenance, segments);
+                }
+            }
+            sql_response(&s, &out, &watermarks, provenance, false)
+        }
         // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
         // the node is refusing to spend the memory - so a caller should retry later or narrow to
         // sealed data, not rewrite their SQL.
@@ -2010,6 +2052,64 @@ fn dataset_head(s: &AppState) -> u64 {
 /// by construction. Returns `Value::Null` when no entity was referenced or when the set is unknown:
 /// an empty array would assert "this query touched no maintained state", which is a claim the `None`
 /// case has no basis to make.
+/// The `/sql` response for an answer, computed or remembered. One place, so a memo hit and a fresh
+/// computation cannot drift apart in shape or provenance (#1186).
+fn sql_response(
+    s: &AppState,
+    out: &crate::analytics::QueryOutput,
+    watermarks: &std::collections::BTreeMap<String, u64>,
+    (as_of, sealed_through): (Option<u64>, u64),
+    cached: bool,
+) -> axum::response::Response {
+    Json(json!({
+        "count": out.rows.len(),
+        "truncated": out.truncated,
+        // Cold data was incomplete when this answer was computed (#435): a sealed segment the
+        // manifest lists could not be read, so its table was *reduced* and the query succeeded
+        // with quietly less data. Reduction is the right policy (#430) - a bad segment must not
+        // delete a table - but it is only defensible if the caller is told, or `SUM(value)`
+        // comes back wrong rather than absent. Always present, so a caller cannot mistake the
+        // healthy shape for an older build that never reported it.
+        //
+        // `degraded_tables` names the tables and nothing else. Table names are already public on
+        // this surface (`/schema` lists them, and you must name one to query it); segment paths
+        // and content addresses are not, and must never appear here - `/sql` is untrusted, which
+        // is the same reason errors go through `sanitize_sql_error`.
+        "degraded": out.degraded(),
+        "degraded_tables": out.degraded_tables,
+        // Tip failure, not per-table cold reduction (#472): the hot-tip scan itself errored, so
+        // this answer is sealed-history-only regardless of what `degraded_tables` says. Distinct
+        // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
+        // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
+        "tip_unavailable": out.tip_unavailable,
+        "rows": out.rows,
+        // Answered from the deterministic memo (#1186): the same rows this statement produced the
+        // last time every input it reads was in this state. Never stale by construction; here so a
+        // caller measuring the nest can tell a computed answer from a remembered one.
+        "cached": cached,
+        // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
+        // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
+        // cutoff a result may legitimately come from data a *different* identity produced - the
+        // adoption is correct, and the old stamp could not express it. `nid` closes that: an agent
+        // citing an answer can now name the dataset, not just the decode.
+        "provenance": {
+            "as_of": as_of,
+            "sealed_through": sealed_through,
+            "source": "hot+sealed",
+            "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
+            "nid": s.nid.as_deref(),
+            // **#822 criterion 9, on the analytical route.** `source: hot+sealed` describes the
+            // fact tables; it says nothing about a maintained relation, whose rows came from a
+            // circuit rather than from a scan and are current only as far as its own watermark.
+            // A caller citing this answer needs to know both. Absent when the statement
+            // referenced no entity, and absent when the parse was unavailable - see
+            // `QueryOutput::referenced_tables`, which is why this is not an empty array.
+            "entities": sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
+        },
+    }))
+    .into_response()
+}
+
 fn sql_entity_provenance(
     s: &AppState,
     referenced: Option<&std::collections::BTreeSet<String>>,
@@ -3825,6 +3925,163 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::OK
+        );
+    }
+
+    async fn sql_json(state: &AppState, q: &str) -> (StatusCode, Value) {
+        let resp = sql(
+            State(state.clone()),
+            Query(SqlQuery {
+                q: q.into(),
+                max_rows: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// **#1186, the memo's contract.** A repeated statement over an unchanged store is answered from
+    /// the memo, and one committed write is enough to make the next request compute again. The third
+    /// request asserts the *rows*, not only the `cached` flag: with the write generation left out of
+    /// the key, or never bumped, the flag would still read `true` and the count would still read 2 -
+    /// which is the stale answer this memo must never give.
+    #[tokio::test]
+    async fn a_repeated_statement_is_remembered_until_the_store_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        for b in 1..=2u64 {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b}).to_string(),
+                )
+                .unwrap();
+        }
+        let q = "SELECT count(*) AS n FROM t";
+
+        let (st, first) = sql_json(&state, q).await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        assert_eq!(first["cached"], false);
+        assert_eq!(first["rows"][0]["n"], 2);
+
+        let (st, second) = sql_json(&state, q).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(second["cached"], true, "same inputs, remembered answer");
+        assert_eq!(second["rows"], first["rows"]);
+
+        state
+            .store
+            .put_entity("k3", &json!({"table": "t", "block_number": 3}).to_string())
+            .unwrap();
+        let (st, third) = sql_json(&state, q).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(third["cached"], false, "one commit is a new identity");
+        assert_eq!(
+            third["rows"][0]["n"], 3,
+            "and the answer is the new state, not the old one"
+        );
+    }
+
+    /// A statement whose value is not a function of the indexed state is computed every time: the
+    /// memo would otherwise hand the first `random()` to every later caller as a fact.
+    #[tokio::test]
+    async fn a_volatile_statement_is_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        let (st, first) = sql_json(&state, "SELECT random() AS r").await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        assert_eq!(first["cached"], false);
+        let (st, second) = sql_json(&state, "SELECT random() AS r").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            second["cached"], false,
+            "random() is not a fact about the nest"
+        );
+        let (_, third) = sql_json(&state, "SELECT current_timestamp AS t").await;
+        assert_eq!(third["cached"], false);
+        let (_, fourth) = sql_json(&state, "SELECT current_timestamp AS t").await;
+        assert_eq!(fourth["cached"], false);
+    }
+
+    /// **Jules on #1189, and the answer is the ordering.** The concern was that a statement reading
+    /// something outside the nest - `read_csv_auto('/tmp/x.csv')` and friends - has no stamp in the
+    /// memo key, so changing that file would leave a remembered answer standing.
+    ///
+    /// It cannot, because such a statement never produces an answer to remember: `/sql` refuses every
+    /// file-reading table function (SEC-2's denylist and the parser-derived allowlist, both in
+    /// `analytics::attempt`), and only the `Ok` arm calls `sqlmemo::put`. Confirmed against the live
+    /// Lodestar nest on 2026-09-06 - `read_csv_auto`, `read_parquet`, `glob` and `read_text` each
+    /// answered `400`.
+    ///
+    /// That is an argument about the order of two guards, which is exactly the kind that stops being
+    /// true when someone moves one. So this pins it: the statement is refused, and nothing is
+    /// remembered under it, asserted through the handler rather than by reading the code.
+    #[tokio::test]
+    async fn a_statement_reading_outside_the_nest_is_refused_and_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        let outside = tmp.path().join("outside.csv");
+        std::fs::write(&outside, "n\n1\n").unwrap();
+        let q = format!(
+            "SELECT count(*) AS n FROM read_csv_auto('{}')",
+            outside.display()
+        );
+
+        let before = crate::sqlmemo::entries();
+        let (st, body) = sql_json(&state, &q).await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "a file-reading statement must be refused: {body}"
+        );
+        assert_eq!(
+            crate::sqlmemo::entries(),
+            before,
+            "a refused statement must leave nothing in the memo"
+        );
+
+        // And again, so a second identical request cannot be answered from an entry the first left.
+        let (st, body) = sql_json(&state, &q).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["cached"],
+            Value::Null,
+            "a refusal carries no cached flag: {body}"
+        );
+    }
+
+    /// A remembered answer costs no DuckDB, so it is served past a saturated permit gate - that is
+    /// most of the point under a dashboard's burst. A statement with no remembered answer is still
+    /// refused, so the gate still bounds what it was built to bound.
+    #[tokio::test]
+    async fn a_memo_hit_needs_no_permit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let (st, first) = sql_json(&state, "SELECT 41 + 1 AS n").await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        assert_eq!(first["cached"], false);
+
+        let _held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let (st, again) = sql_json(&state, "SELECT 41 + 1 AS n").await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a hit is answered with the only permit held elsewhere"
+        );
+        assert_eq!(again["cached"], true);
+        assert_eq!(again["rows"][0]["n"], 42);
+
+        let (st, fresh) = sql_json(&state, "SELECT 43 AS n").await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a statement that must compute still waits on the gate: {fresh}"
         );
     }
 }

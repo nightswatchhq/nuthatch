@@ -56,6 +56,12 @@ fn the_serving_path_does_not_reread_the_watermark() {
 
     // The two legitimate ones: the standalone /metrics gauge, which reports no rows beside it, and
     // the `unwrap_or_else` fallback for an entity that contributed no rows to the query.
+    //
+    // A third shape exists and deliberately does not read `applied_through()` at all: the analytical
+    // memo's fence (#1186) calls `fence_watermark()`, which is the same number under a name that says
+    // it is compared and discarded rather than reported. That is not an exemption carved into this
+    // gate - it is a different call, and if its value ever reached a response body this gate would be
+    // the wrong place to catch it anyway.
     let violations: Vec<&(usize, String)> = calls
         .iter()
         .filter(|(_, l)| !l.contains("unwrap_or_else") && !l.starts_with("e.applied_through()"))

@@ -237,6 +237,15 @@ impl std::error::Error for HotScanTooLarge {}
 /// config, not by a trait method) and the other is a pure function of its arguments.
 #[async_trait::async_trait]
 pub trait HotStore: Send + Sync {
+    /// A counter that moves on every committed write and never otherwise, or `None` where the
+    /// backend cannot say - including, for the redb store, the moment a commit is in flight. Two
+    /// reads that both return `Some(g)`, one before a query and one after, prove no commit began
+    /// between them, which is what lets the analytical memo (#1186) remember that query's answer as
+    /// the answer for generation `g`. A backend that returns `None` simply has no memo.
+    fn write_generation(&self) -> Option<u64> {
+        None
+    }
+
     // ---- entities ---------------------------------------------------------------------------
     fn put_entity(&self, key: &str, json: &str) -> Result<()>;
     fn get_entity(&self, key: &str) -> Result<Option<String>>;
@@ -339,6 +348,10 @@ pub struct Store {
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
+    /// Committed write transactions since this store was opened, shared across clones. The
+    /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
+    /// same hot rows, and it is this counter rather than a scan of them that says so.
+    writes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
@@ -437,7 +450,33 @@ impl Store {
         Ok(Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Commit a write transaction, bracketed by the generation counter. Every write this handle
+    /// makes goes through here.
+    ///
+    /// The counter is bumped **before** the commit and again after it, so it is odd exactly while a
+    /// commit may be becoming visible and even at rest. That is what makes the memo's fence exact
+    /// (#1186, Jules on #1189): an atomic counter cannot be made simultaneous with redb's commit, so
+    /// a reader that saw the old even value before its query and the same even value after it has
+    /// proved that no commit *began* in between - the first bump would have shown. A reader that
+    /// sees an odd value is told nothing (`write_generation` returns `None`) and computes without
+    /// remembering. Bumping only after the commit left a window in which committed rows were visible
+    /// under the old generation; bumping only before would let a pre-commit snapshot be remembered
+    /// under the new one. Both bumps close both windows.
+    ///
+    /// A commit that fails leaves the counter odd, which disables the memo for the store's remaining
+    /// life. That is the safe direction, and a failed redb commit is not a state this process carries
+    /// on from in any case.
+    fn commit(&self, wtx: redb::WriteTransaction) -> Result<()> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        wtx.commit()?;
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     fn from_db(db: Database) -> Result<Store> {
@@ -454,6 +493,7 @@ impl Store {
         Ok(Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -473,7 +513,7 @@ impl Store {
             let mut ob = wtx.open_table(OUTBOX)?;
             ob.insert(Self::outbox_key(seq).as_str(), payload)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(seq)
     }
 
@@ -505,7 +545,7 @@ impl Store {
             let mut t = wtx.open_table(OUTBOX)?;
             t.remove(Self::outbox_key(seq).as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -544,7 +584,7 @@ impl Store {
                 dropped += 1;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(dropped)
     }
 
@@ -572,7 +612,7 @@ impl Store {
             let mut t = wtx.open_table(ENTITIES)?;
             t.insert(key, json)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -602,7 +642,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert("last_block", last_block.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -795,7 +835,7 @@ impl Store {
             let mut t = wtx.open_table(META)?;
             t.insert(key, value)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -807,7 +847,7 @@ impl Store {
             let mut t = wtx.open_table(BLOCKS)?;
             t.insert(Self::block_key(block).as_str(), hash)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -880,7 +920,7 @@ impl Store {
                 blocks.remove(k.as_str())?;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -934,7 +974,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -960,7 +1000,7 @@ impl Store {
                 removed += 1;
             }
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -996,7 +1036,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(removed)
     }
 
@@ -1087,6 +1127,12 @@ impl Store {
 
 #[async_trait::async_trait]
 impl HotStore for Store {
+    fn write_generation(&self) -> Option<u64> {
+        // Odd means a commit is in flight: see `Store::commit`.
+        let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
+        g.is_multiple_of(2).then_some(g)
+    }
+
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         Store::put_entity(self, key, json)
     }
@@ -1175,7 +1221,7 @@ impl HotStore for Store {
             // Recorded for operators reading the store directly; the fence is what enforces.
             t.insert("owner", owner)?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         self.held.store(next, std::sync::atomic::Ordering::SeqCst);
         Ok(next)
     }
@@ -1207,7 +1253,7 @@ impl HotStore for Store {
             t.insert(LEASE_OWNER, owner)?;
             t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         self.held.store(next, std::sync::atomic::Ordering::SeqCst);
         Ok(Lease {
             owner: owner.to_string(),
@@ -1227,7 +1273,7 @@ impl HotStore for Store {
             let mut t = wtx.open_table(META)?;
             t.insert(LEASE_EXPIRES_AT, until.to_string().as_str())?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(Lease {
             owner: holder,
             fence,
@@ -1244,7 +1290,7 @@ impl HotStore for Store {
             // for an operator to find than an empty row.
             t.insert(LEASE_EXPIRES_AT, "0")?;
         }
-        wtx.commit()?;
+        self.commit(wtx)?;
         Ok(())
     }
 
@@ -1444,6 +1490,33 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The memo's fence (#1186): even at rest, `None` while a commit is in flight, and one commit
+    /// moves it by exactly two, so a reader comparing two `Some` values across a query has proved
+    /// no commit began between them.
+    #[test]
+    fn write_generation_is_even_at_rest_and_moves_by_two_per_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let g0 = store
+            .write_generation()
+            .expect("a store at rest reports a generation");
+        assert_eq!(g0 % 2, 0);
+        store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        let g1 = store.write_generation().expect("at rest again");
+        assert_eq!(g1, g0 + 2, "one commit, two bumps");
+        // An in-flight commit is odd, and odd reads as `None`.
+        store
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.write_generation(), None);
+        store
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.write_generation(), Some(g1 + 2));
+    }
 
     fn temp_store() -> (Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
