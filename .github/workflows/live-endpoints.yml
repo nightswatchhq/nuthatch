@@ -103,36 +103,70 @@ jobs:
               fail=1
             fi
           }
-          # Contracts chosen for being busy on each chain, so a window that works here works generally.
-          for u in https://eth-pokt.nodies.app https://eth.drpc.org https://eth.api.onfinality.io/public; do
-            probe mainnet 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 "$u"
-          done
-          for u in https://arb1.arbitrum.io/rpc https://arbitrum.drpc.org https://arb-pokt.nodies.app; do
-            probe arbitrum-one 0xaf88d065e77c8cC2239327C5EDb3A432268e5831 "$u"
-          done
-          for u in https://mainnet.base.org https://base.drpc.org https://base-pokt.nodies.app; do
-            probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
-          done
+          # **The list of endpoints comes from `src/chains.rs`, not from this file.** A copy goes stale
+          # in both directions and did: on 2026-09-07 (#1196) this job was still probing
+          # `arbitrum.drpc.org` and `base.drpc.org`, removed on 2026-08-06 under #267, and
+          # `eth.api.onfinality.io/public`, removed on 2026-08-23 under #761 - so the weekly run
+          # reddened on endpoints we had deliberately stopped shipping, which is the loudest possible
+          # way to say nothing. Meanwhile BSC, Optimism and Gnosis ship five endpoints between them
+          # and this job probed none of them, and one of the five had been unable to serve a backfill
+          # for at least nineteen days.
+          #
+          # The addresses below stay hard-coded on purpose. They are a choice - a busy contract on each
+          # chain, so a window that works here works generally - rather than a fact about what we ship,
+          # and nothing rots if they stay put.
+          # The extractor exits non-zero on a `Chain` block it cannot read, and writes whatever it had
+          # got to before that. Judge the exit status, not the file: a partial list looks exactly like
+          # a complete one, and the chain that fell out of it is the one nobody would probe.
+          if ! python3 .github/workflows/shipped-endpoints.py > /tmp/shipped.tsv; then
+            echo "::error::could not extract the shipped endpoints from src/chains.rs - see the message above; this job cannot judge anything until it can read the registry"
+            exit 1
+          fi
+          echo "== the endpoints we ship =="
+          cat /tmp/shipped.tsv
+          probed=""
+          probe_chain() {  # probe_chain <chain> <busy-contract>
+            local urls
+            urls=$(awk -F'\t' -v c="$1" '$1 == c { print $2 }' /tmp/shipped.tsv)
+            # Allowlist again, same reasoning as the gate inside `probe`: an extractor that matched
+            # nothing must red the job rather than probe an empty list and look healthy doing it.
+            if [ -z "$urls" ]; then
+              echo "::error::no shipped endpoints extracted for $1 - this job would have judged that chain by probing nothing"
+              fail=1
+              return
+            fi
+            probed="$probed $1"
+            for u in $urls; do
+              probe "$1" "$2" "$u"
+            done
+          }
+          probe_chain mainnet 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+          probe_chain arbitrum-one 0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+          probe_chain base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+          # BSC ships one endpoint by recorded exception (see `every_chain_ships_at_least_two_endpoints`),
+          # so this probe is the whole of its failover story. USDT, the busiest emitter measured
+          # 2026-09-07 at ~1,745 logs in ten blocks.
+          probe_chain bsc 0x55d398326f99059fF775485246999027B3197955
+          # Optimism and Gnosis, probed here for the first time on 2026-09-07. Native USDC on
+          # Optimism (~230 logs in ten blocks) and WXDAI on Gnosis.
+          probe_chain optimism 0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85
+          probe_chain gnosis 0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d
           # Monad (RFC-0051): the busiest contract on 2026-09-03, 77 logs per block, so a window that
           # survives it survives anything. No archive gate here on purpose - `doctor`'s archive probe
           # is a state read, and no keyless Monad endpoint keeps state, while all three serve the log
           # history a backfill needs (see the registry entry).
-          for u in https://rpc1.monad.xyz https://rpc.monad.xyz https://rpc3.monad.xyz; do
-            probe monad 0x34b6552d57a35a1d042ccae1951bd1c370112a6f "$u"
-          done
+          probe_chain monad 0x34b6552d57a35a1d042ccae1951bd1c370112a6f
           # Robinhood Chain (RFC-0050): USDG, the busiest emitter on 2026-09-04 at about 20 logs per
           # block. One shipped endpoint, and it rate-limits per second rather than per day - a doctor
           # run straight after a sampling pass read 40 where a clean one read 640 - which is what the
           # retry above is for. No archive gate, same reason as Monad: the public endpoint answers
           # the state probe with 429, and a backfill reads logs, not state.
-          probe robinhood 0x5fc5360d0400a0fd4f2af552add042d716f1d168 https://rpc.mainnet.chain.robinhood.com
+          probe_chain robinhood 0x5fc5360d0400a0fd4f2af552add042d716f1d168
           # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).
           # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
           # silently breaks backfill even when its getLogs window is wide. That is what broke on
           # 2026-08-20 - polygon-bor-rpc.publicnode.com (non-archive) was first.
-          for u in https://polygon.drpc.org https://polygon-bor-rpc.publicnode.com; do
-            probe polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 "$u"
-          done
+          probe_chain polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
           # Archive-depth gate for the first (archive) endpoint. Allowlist, not denylist, for the same
           # reason as the getLogs gate above: a doctor run that never printed an "archive depth" line -
           # because it never ran, errored, or the endpoint refused and doctor reported UNKNOWN - must
@@ -140,20 +174,42 @@ jobs:
           # present, then require it read "yes" exactly. Same retry budget as the getLogs probes above,
           # for the same reason: this is the same live-provider dependency, just a different question.
           echo "== polygon archive check =="
-          retry "archive depth    yes" "https://polygon.drpc.org (archive)" /tmp/polygon-archive-out \
-            ./target/release/nuthatch doctor --rpc https://polygon.drpc.org \
+          # Whichever endpoint the registry lists *first* for polygon, since "first" is the whole point
+          # of this gate. Taken from the same extraction as the probes above so that reordering the
+          # list in `src/chains.rs` moves the gate with it.
+          polygon_first=$(awk -F'\t' '$1 == "polygon" { print $2; exit }' /tmp/shipped.tsv)
+          if [ -z "$polygon_first" ]; then
+            echo "::error::no polygon endpoints extracted - the archive gate judged nothing"
+            fail=1
+          else
+          retry "archive depth    yes" "$polygon_first (archive)" /tmp/polygon-archive-out \
+            ./target/release/nuthatch doctor --rpc "$polygon_first" \
             --address 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
           if [ "$RETRY_OK" -eq 1 ]; then
             if [ "$RETRY_ATTEMPTS" -gt 1 ]; then
-              echo "::warning::polygon.drpc.org needed $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts to confirm archive depth - a provider having a moment, not counted as dead"
+              echo "::warning::$polygon_first needed $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts to confirm archive depth - a provider having a moment, not counted as dead"
             fi
           elif ! grep -q "archive depth" /tmp/polygon-archive-out; then
-            echo "::error::doctor produced no archive-depth line for polygon.drpc.org in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - the probe did not run, so this gate judged nothing"
+            echo "::error::doctor produced no archive-depth line for $polygon_first in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - the probe did not run, so this gate judged nothing"
             fail=1
           else
-            echo "::error::polygon.drpc.org is not archive (or refused to say) in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - it cannot be the primary endpoint for polygon"
+            echo "::error::$polygon_first is not archive (or refused to say) in $RETRY_ATTEMPTS/$MAX_ATTEMPTS attempts - it cannot be the primary endpoint for polygon"
             fail=1
           fi
+          fi
+          # Every chain in the registry must have been probed by something above. This is the gate for
+          # the drift that hid the Optimism failure: a chain landing in `src/chains.rs` with no line
+          # here rots exactly as Optimism's second endpoint did, and the job stays green throughout.
+          echo "== every shipped chain was probed =="
+          for c in $(cut -f1 /tmp/shipped.tsv | sort -u); do
+            case " $probed " in
+              *" $c "*) echo "  $c" ;;
+              *)
+                echo "::error::$c ships endpoints and this job probes none of them - add a probe_chain line for it"
+                fail=1
+                ;;
+            esac
+          done
           # Deliberately fails the job rather than warning. A dead default is a broken promise for
           # every new user of that chain, and a warning nobody reads is how this one survived a month.
           exit $fail
