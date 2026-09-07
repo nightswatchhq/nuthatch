@@ -84,7 +84,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.6.0
+  ghcr.io/nightswatchhq/nuthatch:3.6.1
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -121,7 +121,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.6.0-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.6.1-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -683,7 +683,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 |---|---|
 | `GET /` | summary: nest identity, heights, table count |
 | `GET /health` | liveness. `200 "ok"` while the process serves |
-| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, or the cursor stops advancing (`wedged`) |
+| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold |
 | `GET /schema` | the full data model |
@@ -894,6 +894,21 @@ Get this right in your supervisor and your load balancer:
 - **`/health`** is liveness. `200` while the process serves. Restart on failure.
 - **`/ready`** is readiness. Runtime root: `200` only when **every** cursor and nest is indexing; `503`
   with a body naming what is quarantined. Per-nest `/<name>/ready` answers only for that nest.
+
+**A cursor at tip is not the same claim as a seal that is keeping up**, and since 3.6.1 `/ready`
+answers both. `lag_blocks` describes *following*; `seal_lag_blocks` is how far the sealed watermark
+trails what the cursor has indexed, and `tip_seal_stalled` is the verdict on it. Before 3.6.1 the only
+seal fields on this endpoint described the bulk `--seal-direct` backfill, so a nest that had quietly
+stopped sealing at tip answered `ready: true` with `lag_blocks: 0` indefinitely - measured at 739,192
+blocks behind on a live nest (#1199). `seal_lag_blocks` is `null` for a `serve`-only role, and `null`
+before anything has sealed at all, so read `sealed_through: 0` beside it as "nothing sealed yet"
+rather than as a caught-up seal.
+
+**What to expect from it.** A healthy nest cuts a segment at least once per the chain's seal span,
+about six hours of chain time, so `seal_lag_blocks` should oscillate rather than climb. It trending up
+without bound over a day is the shape of the #1199 defect and worth a look even on an older binary,
+where the field does not exist and the comparison has to be `last_block` against `sealed_through` by
+hand.
 
 Readiness is **advice to a supervisor, not a traffic gate**. A runtime with one quarantined nest reports
 `503` at the root while its healthy nests keep serving correct data on their own prefixes. Wire root
