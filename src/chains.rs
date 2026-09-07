@@ -231,12 +231,29 @@ const GNOSIS: Chain = Chain {
 /// (window 1,280), both **archive**, both batch-of-5 OK. `optimism.drpc.org` is excluded for failing
 /// batch-of-5 - the identical failure that removed `arbitrum.drpc.org` and `base.drpc.org` under
 /// issue #267, which is now three chains in a row.
+///
+/// Re-measured 2026-09-07 (#1196), and `optimism-rpc.publicnode.com` is **gone**: it now answers an
+/// address-filtered `eth_getLogs` only within ~20 blocks of tip and refuses anything ~200 back with
+/// `-32602 Archive requests require a personal token`. Measured at depths 20 / 200 / 1,000 / 5,000 /
+/// 20,000 behind tip: served, refused, refused, refused, refused. That is the same allnodes archive
+/// policy that removed `ethereum-rpc.publicnode.com` and `arbitrum-one-rpc.publicnode.com` on
+/// 2026-07-31, and it was listed *second*, so round-robin handed it real backfill traffic. Its BSC
+/// sibling is unaffected and stays.
+///
+/// `op-pokt.nodies.app` replaces it, measured the same day against the RFC-0030 §4 bar: archive
+/// state 1M blocks back OK, `eth_getLogs` 5/5 at 5,000 behind tip, logs at 1M behind tip, batch-of-5
+/// OK, `finalized` OK. Same family as the pokt endpoints already shipped for mainnet, Arbitrum and
+/// Base. It goes second; the official sequencer RPC stays first.
+///
+/// This one was invisible for nineteen days because the live-endpoints probe never covered Optimism.
+/// It covers every shipped chain now, and reads the list from this file rather than a copy.
 const OPTIMISM: Chain = Chain {
     name: "optimism",
     chain_id: 10,
     rpc_urls: &[
         "https://mainnet.optimism.io",
-        "https://optimism-rpc.publicnode.com",
+        "https://op-pokt.nodies.app",
+        // Removed 2026-09-07 (#1196): `optimism-rpc.publicnode.com` - archive token, tip-only.
     ],
     finality: Finality::FinalizedTag {
         fallback_depth: 900,
