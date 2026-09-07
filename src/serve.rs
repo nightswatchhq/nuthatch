@@ -1172,6 +1172,28 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             "poll_interval_secs": s.freshness.poll_interval.as_secs(),
         },
         "sealed_through": sealed,
+        // **How far the sealed watermark trails what the cursor has indexed** (#1199).
+        //
+        // `lag_blocks` above describes *following*, which is a different question, and on both Graph
+        // protocol nests it read 0 while the seal sat 739,192 blocks back. A stalled seal and a
+        // healthy one were indistinguishable through this endpoint, so Lodestar's health check passed
+        // for days while every tattler receipt pinned a watermark two days stale.
+        //
+        // **A fact, not a verdict.** This deliberately does not feed `stalled`. `maybe_seal` holds a
+        // finalized range until SEAL_DIRECT_BATCH rows accumulate, so on a sparse nest the lag grows
+        // without bound *by construction* and any threshold worth having would refuse service on
+        // nests that are answering correctly. The verdict belongs with the fix to that holding rule,
+        // not ahead of it.
+        //
+        // Null rather than 0 when nothing has sealed: `sealed_through` defaults to 0, so the
+        // subtraction would report a nest's entire indexed history as lag during its first minutes.
+        // `sealed_through: 0` beside a null lag reads as "nothing sealed yet"; a 0 there would be a
+        // claim that the seal is caught up (the #1020 lesson, on this surface).
+        "seal_lag_blocks": if s.cursorless || sealed == 0 {
+            serde_json::Value::Null
+        } else {
+            last.saturating_sub(sealed).into()
+        },
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
         "seal_direct_active": seal_direct_active,
@@ -3111,6 +3133,86 @@ mod tests {
         assert_eq!(json["seal_direct_stalled"], json!(false));
         assert_eq!(json["seconds_since_seal_progress"], json!(60));
         handle.end_seal_direct();
+    }
+
+    /// #1199: **a stalled seal and a healthy one read identically through `/ready`.** Reproduces the
+    /// live shape measured on `graph-allocations-nest` at 2026-09-07 16:20 UTC: the cursor at the
+    /// chain's tip, `lag_blocks` 0, and the sealed watermark 739,192 blocks (~51 h) behind it. Every
+    /// seal field on this endpoint belongs to the seal-*direct* backfill, which was never running, so
+    /// `seal_direct_stalled` was false because the pass had not started rather than because it was
+    /// keeping up - and Lodestar's `check-nest-health` cron passed on that.
+    ///
+    /// The assertion here is the number, not the verdict. `ready` stays true on purpose: see the
+    /// `seal_lag_blocks` comment in `ready` for why the verdict cannot land before `maybe_seal`'s
+    /// holding rule is fixed.
+    #[tokio::test]
+    async fn ready_reports_how_far_the_seal_trails_the_cursor() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "trailing-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let handle = METRICS.nest(name);
+        handle.set_tip(502_732_913);
+        handle.set_last_block(502_732_913);
+        handle.set_sealed_through(501_993_721);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(crate::metrics::now_unix());
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(code, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["lag_blocks"],
+            json!(0),
+            "the cursor is at tip - this is the field that read healthy throughout"
+        );
+        assert_eq!(
+            json["seal_lag_blocks"],
+            json!(739_192),
+            "a caller must be able to tell a stalled seal from a healthy one without comparing \
+             three ports by hand (#1199): {json}"
+        );
+        assert_eq!(
+            json["seal_direct_stalled"],
+            json!(false),
+            "the seal-direct fields describe a pass that never started, and always did"
+        );
+    }
+
+    /// The half that would have made the new field useless: a nest that has sealed nothing yet must
+    /// not report its whole indexed history as seal lag. `sealed_through` is 0 by default, and a
+    /// subtraction against it would have read 502,732,913 blocks behind on a healthy first minute -
+    /// which is how a new field becomes a false alarm nobody trusts and everybody filters out.
+    #[tokio::test]
+    async fn ready_reports_no_seal_lag_before_anything_has_sealed() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "nothing-sealed";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let handle = METRICS.nest(name);
+        handle.set_tip(502_732_913);
+        handle.set_last_block(502_732_913);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(crate::metrics::now_unix());
+
+        let (_, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(json["sealed_through"], json!(0));
+        assert_eq!(
+            json["seal_lag_blocks"],
+            serde_json::Value::Null,
+            "nothing sealed yet is not a 502-million-block lag: {json}"
+        );
     }
 
     /// The watermark is a block number and carries no clock of its own, so the stamp must move only

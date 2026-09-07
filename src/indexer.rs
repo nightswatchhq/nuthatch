@@ -6924,6 +6924,65 @@ mod tests {
         );
     }
 
+    /// #1199: **the watermark ratchets shut on a sparse nest.** A finalized range holding *any* rows
+    /// below `SEAL_DIRECT_BATCH` takes the "held, not drained" arm and returns without moving
+    /// `sealed_through`. `from` is pinned at the watermark, so the range only ever grows, and the
+    /// empty-range arm that would otherwise have advanced it can never be reached again: one
+    /// finalized row is enough to freeze the watermark until 20,000 have accumulated.
+    ///
+    /// On the Graph allocations nest that is roughly 95 event-carrying blocks a day against a
+    /// 20,000-row threshold. The watermark had not moved in 739,192 blocks (~51 h) while the cursor
+    /// followed tip perfectly and `/ready` answered `ready: true`.
+    #[tokio::test]
+    async fn maybe_seal_ratchets_shut_on_a_sparse_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+        // A hundred rows in the first hundred blocks - far below the threshold, and all this nest
+        // produces for a long while.
+        load_rows(&store, 100);
+        // Now follow tip across 800,000 blocks that carry nothing, sealing on every poll exactly as
+        // `index_loop` does.
+        for ceiling in [100_000u64, 300_000, 500_000, 800_000] {
+            store
+                .commit_window(&[], Some((ceiling, "bb")), ceiling)
+                .unwrap();
+            maybe_seal(tmp.path(), &store, &HashOnly, ceiling, None, &metrics)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap(),
+            None,
+            "800,000 blocks finalized over four polls and the watermark never moved. 100 rows, \
+             below SEAL_DIRECT_BATCH={SEAL_DIRECT_BATCH}, pin `from`, so the range only grows and \
+             the empty-range arm is unreachable for ever (#1199)."
+        );
+    }
+
+    /// The discriminator, and why two nests on one box behaved differently. A finalized range with
+    /// **no** rows at all takes the empty arm and advances to the ceiling on every poll, so a nest
+    /// that never sees an event tracks finality exactly - which is how `dips-nest` sat 18 minutes
+    /// behind while its sibling sat 51 hours behind, same binary, same box, same minute of restart.
+    /// The difference between the two is one row.
+    #[tokio::test]
+    async fn maybe_seal_advances_freely_when_the_range_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+        store
+            .commit_window(&[], Some((800_000, "bb")), 800_000)
+            .unwrap();
+        maybe_seal(tmp.path(), &store, &HashOnly, 800_000, None, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+            Some("800000"),
+            "an empty finalized range must advance the watermark to the ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn retry_transient_recovers_after_transient_failures() {
         use std::sync::atomic::{AtomicUsize, Ordering};
