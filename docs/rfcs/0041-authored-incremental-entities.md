@@ -496,14 +496,18 @@ measurement rather than a proposal: the 2026 feature freeze stands, and none of 
 is carved out.
 
 Profiling the Lodestar dashboard on production nest 8107 (3.5.1, 2026-09-06) put
-`lodestar_indexer_ledger` at 2.4 s, of which the fourteen plain union arms are 0.11 s and two ASOF
-arms are the rest:
+`lodestar_indexer_ledger` at 2.4 s, of which two ASOF arms are 2.02 s:
 
 | part | time |
 |---|---|
 | the fourteen plain union arms, aggregated | 0.11 s |
 | `legacy_reward_share`, two ASOF joins over a windowed share series | 1.04 s |
 | `legacy_path_share`, the same shape plus an `IN` subquery | 0.98 s |
+
+The three rows account for 2.13 s of the 2.4 s. The remaining ~0.27 s is unattributed: the arms were
+timed individually and the whole statement was timed once, so assembly, planning and measurement
+overhead all sit in that gap. Nothing turns on it, and inventing a fourth row for it would be worse
+than leaving it named.
 
 Both arms describe the legacy staking era, which ended at the Horizon upgrade. `legacy_reward_share`
 is explicitly bounded by `WHERE r.bn < (SELECT MIN(block_number) FROM staking__horizon_stake_deposited)`,
