@@ -488,3 +488,51 @@ materialisation.
    together with atomic commit, verification, pruning and grafting.
 5. Should `Manifest::data_identity()` be renamed to `fact_identity()` in the next breaking release,
    or retain the name and document the now-sharper meaning?
+
+## §13 - What v1 cannot express, measured on a real nest
+
+Added 2026-09-07 from nightswatchhq/nuthatch#1193, which is closed in favour of this section. It is a
+measurement rather than a proposal: the 2026 feature freeze stands, and none of the three shapes below
+is carved out.
+
+Profiling the Lodestar dashboard on production nest 8107 (3.5.1, 2026-09-06) put
+`lodestar_indexer_ledger` at 2.4 s, of which the fourteen plain union arms are 0.11 s and two ASOF
+arms are the rest:
+
+| part | time |
+|---|---|
+| the fourteen plain union arms, aggregated | 0.11 s |
+| `legacy_reward_share`, two ASOF joins over a windowed share series | 1.04 s |
+| `legacy_path_share`, the same shape plus an `IN` subquery | 0.98 s |
+
+Both arms describe the legacy staking era, which ended at the Horizon upgrade. `legacy_reward_share`
+is explicitly bounded by `WHERE r.bn < (SELECT MIN(block_number) FROM staking__horizon_stake_deposited)`,
+a fixed past block. The rows cannot change again, and the nest recomputes them on every miss. That 2 s
+sits under `lodestar_indexers`, `lodestar_network`, `lodestar_delegator_stakes`, and everything that
+joins them.
+
+**v1 cannot express it.** `entity_lower.rs` accepts one SELECT over one table or two INNER-JOINed,
+`GROUP BY`, and Count/Sum/Min/Max/Avg. No CTEs, no UNION, no window functions, no ASOF. The shape is
+inherently an as-of join against a running total, which is both what makes it expensive and what puts
+it outside the authoring contract in §3. So the two mechanisms an author has, a view recomputed per
+request and an entity maintained per block, have a gap between them exactly where a closed era sits.
+Every heavy view in that nest is a union of a legacy table and a Horizon table, and v1 can express
+none of them as written.
+
+Three shapes would each close it, recorded for whatever follows v1:
+
+1. **Widen the compiler** to the shapes real nests write: a UNION of era tables, a window or ASOF over
+   one partition.
+2. **Materialise past finality.** A view, or a marked part of one, whose inputs are all sealed below
+   the finality boundary is computed once and stored, invalidated by a reorg it cannot experience.
+   This is the smaller of the two and matches the segment model, since the answer is already
+   content-addressed by its inputs. Note that §11 rejects *caching query results* as the foundation
+   for incrementality; this is narrower, and rests on immutability rather than on noticing staleness.
+3. **Nothing, and lean on the memo.** #1189 shipped in 3.6.0 on 2026-09-06: a repeated statement whose
+   inputs have not changed is answered from the previous result, keyed on the statement, `sealed_through`
+   and the hot-store version. On a five-minute poll that is one recomputation per statement per commit
+   rather than one per request. Lodestar's own backend also coalesces identical in-flight reads as of
+   2026-09-07, so concurrent cold readers cost one fold between them. Together these are most of the
+   win for this deployment, and they are why the finding is recorded here rather than proposed as work.
+
+The cost itself is unchanged by any of that. A commit window still pays the fold once.
