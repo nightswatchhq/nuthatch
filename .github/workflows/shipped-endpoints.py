@@ -24,7 +24,22 @@ COMMENT = re.compile(r"(?<!:)//.*$")
 URL = re.compile(r'"(https://[^"]+)"')
 
 
+def check_comment_stripping() -> None:
+    """Prove the comment stripper leaves URLs alone, on every run.
+
+    `(?<!:)//` has been read as matching the *second* slash of `https://`, on the grounds that the
+    lookbehind there sees `/` rather than `:`. It cannot: a `//` match starting at the second slash
+    needs a further slash after it, and what is there is a letter. Asserting it costs nothing and is
+    cheaper than having the argument twice.
+    """
+    url = '        "https://eth-pokt.nodies.app",'
+    assert COMMENT.sub("", url) == url, "the comment stripper ate a URL"
+    assert COMMENT.sub("", '"https://x.example", // a spare').rstrip() == '"https://x.example",'
+    assert COMMENT.sub("", "// removed: https://gone.example").strip() == ""
+
+
 def main() -> int:
+    check_comment_stripping()
     source = open("src/chains.rs", encoding="utf-8").read()
     rows = 0
     chains = 0
