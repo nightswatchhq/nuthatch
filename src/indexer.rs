@@ -5822,7 +5822,38 @@ async fn maybe_seal(
         if ceiling < from {
             return Ok(());
         }
-        let entities = store.entities_in_range(from, ceiling)?;
+        let mut entities = store.entities_in_range(from, ceiling)?;
+        // **Advance across a leading stretch that carries no rows, before deciding anything.**
+        //
+        // Without this the span bound is `first_held_row + seal_span`, not `watermark + seal_span`,
+        // so a nest whose watermark sits at 10,800 and whose next event is at block 100,000 holds
+        // 89,200 finalized blocks and the bound is the event gap plus the span rather than the span.
+        // Found by review on #1200; the row anchor is deliberate (see `seal_cut`) and this is what
+        // makes it coincide with the watermark instead of drifting from it.
+        //
+        // Nothing is sealed here and no segment is written, because there is nothing in the range -
+        // it is the empty-range arm below applied to the empty *prefix* rather than only to a wholly
+        // empty range. `sealed_through` means "every row at or below this block is in cold storage",
+        // which is vacuously true of a range holding no rows. The checkpoint is pinned for the same
+        // reason the empty arm pins one: a later reorg walk must not skip past the watermark to an
+        // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
+        if let Some(first) = entities.first().and_then(|j| block_number_of(j)) {
+            if first > from {
+                if let Ok(Some(hash)) = source.block_hash(first - 1).await {
+                    store.set_block_hash(first - 1, &hash)?;
+                }
+                store.set_meta(SEALED_THROUGH_KEY, &(first - 1).to_string())?;
+                metrics.set_sealed_through(first - 1);
+                tracing::debug!(
+                    from,
+                    first,
+                    "blocks {from}..={} carried no rows; watermark advanced to the first held row",
+                    first - 1
+                );
+                from = first;
+                entities = store.entities_in_range(from, ceiling)?;
+            }
+        }
         let cut = match tip_seal_cut(&entities, ceiling, seal_span) {
             None if entities.is_empty() => {
                 // Finalized range with no transfers - just advance the watermark. Pinning a
@@ -7177,6 +7208,89 @@ mod tests {
             0,
             "sealed rows must be pruned from the hot store - a watermark that advances while redb \
              keeps growing fixes the receipt and not the RAM budget"
+        );
+    }
+
+    /// #1200 review: **the span must bound the watermark, not the oldest row.**
+    ///
+    /// The first version of the fix anchored the span on the oldest held row, which is right for
+    /// determinism and wrong for the bound. Jules' case: watermark at 10,800, next event at 100,000,
+    /// finality at 100,000. The held range is 10,801..=100,000 but `first` is 100,000, so the span
+    /// end lands at 110,799 and no cut fires - 89,200 finalized blocks held, and the real bound is
+    /// the event gap plus the span rather than the span. On a nest with month-long gaps that is not
+    /// a bound at all, and it would trip the new 12-hour readiness verdict on a healthy nest.
+    ///
+    /// Fixed by advancing across the empty prefix first, which makes the two anchors coincide rather
+    /// than choosing between them.
+    #[tokio::test]
+    async fn a_gap_larger_than_the_span_does_not_hold_the_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+
+        // A hundred rows in blocks 0..=99, then finality to 10,799 so the span cut fires.
+        let early: Vec<(String, String)> = (0..100u64)
+            .map(|b| (Store::entity_key(b, 0), entity_json(b, 0)))
+            .collect();
+        store.commit_window(&early, Some((99, "aa")), 99).unwrap();
+        store
+            .commit_window(&[], Some((10_799, "bb")), 10_799)
+            .unwrap();
+        maybe_seal(
+            tmp.path(),
+            &store,
+            &HashOnly,
+            10_799,
+            None,
+            &metrics,
+            SPAN_REAL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+            Some("10799"),
+            "the span cut must have fired first, or this fixture is not testing what it says"
+        );
+
+        // Now the next event, 89,201 blocks later - far more than one span.
+        store
+            .commit_window(
+                &[(Store::entity_key(100_000, 0), entity_json(100_000, 0))],
+                Some((100_000, "cc")),
+                100_000,
+            )
+            .unwrap();
+        maybe_seal(
+            tmp.path(),
+            &store,
+            &HashOnly,
+            100_000,
+            None,
+            &metrics,
+            SPAN_REAL,
+        )
+        .await
+        .unwrap();
+
+        let sealed = store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .expect("watermark")
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(
+            sealed,
+            99_999,
+            "the watermark stopped at {sealed} with the next row at 100,000, so it is holding \
+             {} finalized blocks that carry nothing. The span bounds the gap after the oldest row, \
+             not after the watermark, unless the empty prefix is skipped (#1199).",
+            100_000 - sealed - 1
+        );
+        assert_eq!(
+            store.entities_in_range(100_000, 100_000).unwrap().len(),
+            1,
+            "the row at the far side of the gap must still be held, not swallowed by the skip"
         );
     }
 
