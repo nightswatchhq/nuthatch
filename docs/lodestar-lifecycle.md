@@ -110,7 +110,9 @@ it as a one-off, and note it is running on keyless public endpoints rather than 
 | 8106 | dips-sepolia | 27 MB | 83 MB | |
 | 8103 | legacy archive | 39 MB | 100 MB | |
 
-Well inside the ≤2 GB per-cursor budget, with five cursors on one 7.7 GB box. **Do not read RSS
+Well inside the ≤2 GB per-cursor budget: **four tip-following cursors and one `serve`-only process**
+on one 7.7 GB box. 8103 carries no cursor at all, which is why it costs no RPC, and counting it as a
+fifth would overstate what the per-cursor budget is being asked to hold. **Do not read RSS
 straight after a restart** - the in-memory views have not rebuilt, and the figure is an order of
 magnitude low for the first few minutes.
 
@@ -267,8 +269,8 @@ every production process on the box and once took it down for 80 minutes. Kill b
   2-second one. The cadence is the bill.
 - **A nest nobody reads costs the same as one under load.** Tip-following cost is independent of
   demand. Park a nest and it keeps billing; a `serve`-only archive bills nothing.
-- **Five cursors, 7.7 GB, 4 cores, 1 GB of nest data, load 0.63.** The hardware is not the
-  constraint.
+- **Four cursors and a serving process, 7.7 GB, 4 cores, 1 GB of nest data, load 0.63.** The
+  hardware is not the constraint.
 - **Reads are sub-second to seconds, and concurrency is a handful.** Size the consumer's caching,
   not the box, and know that raising the permit count takes memory from every individual query.
 - **Backfill is the expensive part.** Roughly 35x tip, once.
