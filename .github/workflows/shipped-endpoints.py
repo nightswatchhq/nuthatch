@@ -27,18 +27,39 @@ URL = re.compile(r'"(https://[^"]+)"')
 def main() -> int:
     source = open("src/chains.rs", encoding="utf-8").read()
     rows = 0
+    chains = 0
     for chain in CHAIN.finditer(source):
+        chains += 1
         body = chain.group(1)
         name = NAME.search(body)
         urls = URLS.search(body)
+        # A `Chain` block this cannot read is a hard failure, never a skip. Skipping is the shape of
+        # bug this whole change exists to remove: the omitted chain vanishes from the probe list *and*
+        # from the coverage gate that is supposed to notice a chain nobody probes, so the job goes
+        # green while a shipped chain is unprobed. If a registry entry ever expresses its endpoints
+        # through a constant or a macro, this stops the run and someone teaches it that shape.
         if not name or not urls:
-            continue
+            print(
+                f"cannot read the Chain block at offset {chain.start()} in src/chains.rs: "
+                f"{'no name' if not name else 'no rpc_urls'}. Teach this script that shape rather "
+                "than letting the chain drop out of the probe list.",
+                file=sys.stderr,
+            )
+            return 1
+        found = 0
         for line in urls.group(1).splitlines():
             for url in URL.findall(COMMENT.sub("", line)):
                 print(f"{name.group(1)}\t{url}")
-                rows += 1
-    if rows == 0:
-        print("no endpoints extracted from src/chains.rs", file=sys.stderr)
+                found += 1
+        if found == 0:
+            print(
+                f"{name.group(1)} declares rpc_urls and this script read none of them",
+                file=sys.stderr,
+            )
+            return 1
+        rows += found
+    if chains == 0 or rows == 0:
+        print("no chains extracted from src/chains.rs", file=sys.stderr)
         return 1
     return 0
 
