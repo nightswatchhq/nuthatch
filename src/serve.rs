@@ -903,6 +903,22 @@ const READINESS_PROGRESS_STALL_SECS: u64 = 90;
 /// throughout, as long as it keeps sealing.
 const READINESS_SEAL_STALL_SECS: u64 = 900;
 
+/// How long the **tip path's** seal may go without advancing the watermark before `/ready` calls it
+/// stalled (#1199).
+///
+/// Twelve hours, and chain-independent on purpose. Every `chains::Chain::seal_span` is sized to
+/// about six hours of that chain's block time, so a healthy nest cuts a segment at least that often
+/// whatever the chain - the bound is written as a block span, but the guarantee it buys is a
+/// duration, and this is the surface where that duration is spent. Twice the span leaves room for a
+/// finality boundary that sulks for a while, or a poll interval an operator has widened under
+/// RFC-0040, without calling a working nest dead.
+///
+/// **Not `READINESS_SEAL_STALL_SECS` (15 minutes).** That one judges an *active bulk backfill*,
+/// which has work in hand and is never legitimately idle. A tip-path seal waits for finality and for
+/// rows as a matter of course, and fifteen minutes would refuse service on every sparse nest on the
+/// box.
+const READINESS_TIP_SEAL_STALL_SECS: u64 = 43_200;
+
 /// Has an active seal-direct pass stopped sealing?
 ///
 /// Mirrors [`progress_stalled`] but takes no `lag` guard, and the difference is the point. A tip
@@ -1129,6 +1145,26 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     // serving frozen derived state as healthy "a lie with a pleasant HTTP status", and a cursor
     // polling happily while an entity is dead is exactly that lie.
     let (entities, entities_stalled) = entity_readiness(&s, last, now);
+    // #1199: the tip path's own seal clock. `seal_stalled` above judges only a bulk backfill, so a
+    // nest whose *ordinary* sealing had stopped answered `ready: true` indefinitely - measured at
+    // 739,192 blocks behind on a cursor that was sitting at tip.
+    //
+    // Three guards, and each earns its place:
+    // - `!s.cursorless`, because a frozen archive seals nothing by design (#1025);
+    // - `!seal_direct_active`, because that pass owns the clock and `seal_stalled` already judges it;
+    // - `last > sealed`, the analogue of `wedged`'s `lag > 0`. A seal caught up to the cursor has
+    //   nothing to do and stops stamping, exactly as a cursor at tip stops stamping `last_progress`.
+    //   Without it, a fixed-range nest (`end_block`) whose range has completed and sealed reports
+    //   unready for ever - the same trap the `wedged` guard exists to avoid.
+    let tip_seal_stalled = !s.cursorless
+        && !seal_direct_active
+        && last > sealed
+        && seal_direct_stalled(
+            last_seal_progress,
+            started_at,
+            now,
+            READINESS_TIP_SEAL_STALL_SECS,
+        );
     // **A role with no cursor is judged on what it serves, not on a poll it never makes** (#1025).
     //
     // `initial_failure`, `poll_stalled` and `wedged` are all statements about a cursor. `nuthatch
@@ -1151,7 +1187,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                 )
                 || wedged)
     };
-    let stalled = seal_stalled || entities_stalled || cursor_stalled;
+    let stalled = seal_stalled || tip_seal_stalled || entities_stalled || cursor_stalled;
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
@@ -1172,6 +1208,28 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             "poll_interval_secs": s.freshness.poll_interval.as_secs(),
         },
         "sealed_through": sealed,
+        // **How far the sealed watermark trails what the cursor has indexed** (#1199).
+        //
+        // `lag_blocks` above describes *following*, which is a different question, and on both Graph
+        // protocol nests it read 0 while the seal sat 739,192 blocks back. A stalled seal and a
+        // healthy one were indistinguishable through this endpoint, so Lodestar's health check passed
+        // for days while every tattler receipt pinned a watermark two days stale.
+        //
+        // **A fact, not a verdict.** This deliberately does not feed `stalled`. `maybe_seal` holds a
+        // finalized range until SEAL_DIRECT_BATCH rows accumulate, so on a sparse nest the lag grows
+        // without bound *by construction* and any threshold worth having would refuse service on
+        // nests that are answering correctly. The verdict belongs with the fix to that holding rule,
+        // not ahead of it.
+        //
+        // Null rather than 0 when nothing has sealed: `sealed_through` defaults to 0, so the
+        // subtraction would report a nest's entire indexed history as lag during its first minutes.
+        // `sealed_through: 0` beside a null lag reads as "nothing sealed yet"; a 0 there would be a
+        // claim that the seal is caught up (the #1020 lesson, on this surface).
+        "seal_lag_blocks": if s.cursorless || sealed == 0 {
+            serde_json::Value::Null
+        } else {
+            last.saturating_sub(sealed).into()
+        },
         "last_poll_unixtime": last_poll,
         "seconds_since_poll": age,
         "seal_direct_active": seal_direct_active,
@@ -1187,7 +1245,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "fetch_window_blocks": fetch_window,
         "seal_direct_target": seal_direct_target,
         "seal_direct_stalled": seal_stalled,
-        "seconds_since_seal_progress": (seal_direct_active && last_seal_progress != 0)
+        // The tip path's verdict, reported beside the backfill's so an operator can tell which term
+        // took the nest unready without reading this source (#1199).
+        "tip_seal_stalled": tip_seal_stalled,
+        // No longer gated on `seal_direct_active`: the tip path stamps this clock too now, and the
+        // number was null on precisely the nests that needed it.
+        "seconds_since_seal_progress": (last_seal_progress != 0)
             .then(|| now.saturating_sub(last_seal_progress)),
         "entities": entities,
         "entities_stalled": entities_stalled,
@@ -3111,6 +3174,176 @@ mod tests {
         assert_eq!(json["seal_direct_stalled"], json!(false));
         assert_eq!(json["seconds_since_seal_progress"], json!(60));
         handle.end_seal_direct();
+    }
+
+    /// #1199: **a stalled seal and a healthy one read identically through `/ready`.** Reproduces the
+    /// live shape measured on `graph-allocations-nest` at 2026-09-07 16:20 UTC: the cursor at the
+    /// chain's tip, `lag_blocks` 0, and the sealed watermark 739,192 blocks (~51 h) behind it. Every
+    /// seal field on this endpoint belongs to the seal-*direct* backfill, which was never running, so
+    /// `seal_direct_stalled` was false because the pass had not started rather than because it was
+    /// keeping up - and Lodestar's `check-nest-health` cron passed on that.
+    ///
+    /// The assertion here is the number, not the verdict. `ready` stays true on purpose: see the
+    /// `seal_lag_blocks` comment in `ready` for why the verdict cannot land before `maybe_seal`'s
+    /// holding rule is fixed.
+    #[tokio::test]
+    async fn ready_reports_how_far_the_seal_trails_the_cursor() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "trailing-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let handle = METRICS.nest(name);
+        handle.set_tip(502_732_913);
+        handle.set_last_block(502_732_913);
+        handle.set_sealed_through(501_993_721);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(crate::metrics::now_unix());
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(code, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["lag_blocks"],
+            json!(0),
+            "the cursor is at tip - this is the field that read healthy throughout"
+        );
+        assert_eq!(
+            json["seal_lag_blocks"],
+            json!(739_192),
+            "a caller must be able to tell a stalled seal from a healthy one without comparing \
+             three ports by hand (#1199): {json}"
+        );
+        assert_eq!(
+            json["seal_direct_stalled"],
+            json!(false),
+            "the seal-direct fields describe a pass that never started, and always did"
+        );
+    }
+
+    /// #1199 ask 2: a tip-path seal that has stopped advancing must stop reporting ready.
+    ///
+    /// Before this, every seal term on `/ready` was gated on `seal_direct_active`, so a nest doing
+    /// ordinary tip-following sealing had no clock at all. Measured live: two nests 739,192 and
+    /// 405,093 blocks behind on `sealed_through`, both answering `ready: true`, both passing a cron
+    /// health check for days while their tattler receipts pinned a two-day-old watermark.
+    #[tokio::test]
+    async fn a_tip_seal_that_stopped_advancing_reports_unready() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "frozen-tip-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        handle.set_tip(502_732_913);
+        handle.set_last_block(502_732_913);
+        handle.set_sealed_through(501_993_721);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now);
+        // Sealed once, then nothing for thirteen hours - past READINESS_TIP_SEAL_STALL_SECS. Set
+        // after `set_sealed_through`, which now stamps this clock itself.
+        handle.set_last_seal_progress_for_test(now.saturating_sub(46_800));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a seal frozen for 13h on a cursor at tip must not read ready: {json}"
+        );
+        assert_eq!(json["tip_seal_stalled"], json!(true));
+        assert_eq!(json["seal_lag_blocks"], json!(739_192));
+        assert_eq!(
+            json["seconds_since_seal_progress"],
+            json!(46_800),
+            "the tip path must report its own seal clock, not null - it was null on exactly the \
+             nests that needed it"
+        );
+        assert_eq!(
+            json["seal_direct_stalled"],
+            json!(false),
+            "the backfill term must stay false: no pass was ever running, and conflating the two \
+             is what hid this"
+        );
+    }
+
+    /// The half that must not regress, and the one that would take a healthy nest down.
+    ///
+    /// A seal caught up to the cursor has nothing left to seal, so it stops stamping its clock -
+    /// exactly as a cursor at tip stops stamping `last_progress`. A fixed-range nest (`end_block`)
+    /// that has finished and sealed sits here permanently. Without the `last > sealed` guard it
+    /// would report unready twelve hours later and stay that way, which is the trap `wedged`'s
+    /// `lag > 0` guard already exists to avoid.
+    #[tokio::test]
+    async fn a_seal_caught_up_to_the_cursor_is_not_stalled() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "caught-up-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        handle.set_tip(1_000_000);
+        handle.set_last_block(1_000_000);
+        handle.set_sealed_through(1_000_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now);
+        // A whole day since anything sealed, because there has been nothing to seal.
+        handle.set_last_seal_progress_for_test(now.saturating_sub(86_400));
+
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "a seal with nothing left to seal is not a stalled one: {json}"
+        );
+        assert_eq!(json["tip_seal_stalled"], json!(false));
+        assert_eq!(json["seal_lag_blocks"], json!(0));
+    }
+
+    /// The half that would have made the new field useless: a nest that has sealed nothing yet must
+    /// not report its whole indexed history as seal lag. `sealed_through` is 0 by default, and a
+    /// subtraction against it would have read 502,732,913 blocks behind on a healthy first minute -
+    /// which is how a new field becomes a false alarm nobody trusts and everybody filters out.
+    #[tokio::test]
+    async fn ready_reports_no_seal_lag_before_anything_has_sealed() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "nothing-sealed";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let handle = METRICS.nest(name);
+        handle.set_tip(502_732_913);
+        handle.set_last_block(502_732_913);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(crate::metrics::now_unix());
+
+        let (_, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(json["sealed_through"], json!(0));
+        assert_eq!(
+            json["seal_lag_blocks"],
+            serde_json::Value::Null,
+            "nothing sealed yet is not a 502-million-block lag: {json}"
+        );
     }
 
     /// The watermark is a block number and carries no clock of its own, so the stamp must move only

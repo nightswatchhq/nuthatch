@@ -157,8 +157,17 @@ impl NestMetrics {
     pub fn sealed_through(&self) -> u64 {
         self.sealed_through.load(Relaxed)
     }
+    /// Stamps `last_seal_progress` when the watermark actually advances (#1199).
+    ///
+    /// Only the seal-*direct* path used to touch that clock, so the tip path's watermark moved
+    /// without it and a tip-path seal that had stopped had no clock to be judged against. On the two
+    /// Graph protocol nests that meant `/ready` could not distinguish a seal 739,192 blocks behind
+    /// from a healthy one. Same discipline as `set_seal_direct_completed`: only on a real advance,
+    /// because re-reporting a block is not progress and must not refresh its own deadline.
     pub fn set_sealed_through(&self, v: u64) {
-        self.sealed_through.store(v, Relaxed);
+        if v > self.sealed_through.swap(v, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
         METRICS.set_sealed_through(v);
     }
     pub fn add_rows_decoded(&self, n: u64) {
@@ -402,8 +411,12 @@ impl Metrics {
     pub fn set_last_progress_for_test(&self, t: u64) {
         self.last_progress.store(t, Relaxed);
     }
+    /// The solo-runtime copy. Stamps the seal clock on a real advance, exactly as the per-nest
+    /// handle does (#1199).
     pub fn set_sealed_through(&self, v: u64) {
-        self.sealed_through.store(v, Relaxed);
+        if v > self.sealed_through.swap(v, Relaxed) {
+            self.last_seal_progress.store(now_unix(), Relaxed);
+        }
     }
     /// Record a successful source poll - call it on every tip fetch that returns (the tip loop does),
     /// so readiness reflects "we can still reach the chain", independent of whether we're behind.
@@ -1346,5 +1359,47 @@ mod tests {
         m.end_seal_direct();
         assert_eq!(m.seal_direct_fetched(), 1_000);
         assert_eq!(m.seal_direct_completed(), 1_000);
+    }
+
+    /// #1199: **the tip path must stamp the seal clock, or `/ready` has nothing to judge it by.**
+    ///
+    /// Only `begin_seal_direct`, `set_seal_direct_completed` and `set_seal_direct_fetched` used to
+    /// touch `last_seal_progress`, so a nest doing ordinary tip-following sealing left it at zero
+    /// for ever. `serve`'s stall term reads that clock, and a handler test that sets it by hand
+    /// passes whether or not anything in the runtime ever moves it - which is exactly what this
+    /// mutation-checked to prove: removing the stamp below left every `/ready` test green.
+    #[test]
+    fn advancing_the_sealed_watermark_stamps_the_seal_clock() {
+        let m = NestMetrics::default();
+        assert_eq!(
+            m.last_seal_progress(),
+            0,
+            "a fresh handle has no seal clock"
+        );
+
+        m.set_sealed_through(100);
+        let stamped = m.last_seal_progress();
+        assert_ne!(
+            stamped, 0,
+            "the tip path advanced the watermark and the seal clock did not move, so `/ready` \
+             judges a tip-path seal against a clock nothing winds (#1199)"
+        );
+
+        // Re-reporting the same block is not progress and must not refresh its own deadline - the
+        // same discipline `set_seal_direct_completed` already keeps (#846).
+        m.set_last_seal_progress_for_test(stamped.saturating_sub(500));
+        m.set_sealed_through(100);
+        assert_eq!(
+            m.last_seal_progress(),
+            stamped.saturating_sub(500),
+            "re-reporting block 100 refreshed the clock, so a frozen seal keeps itself alive by \
+             saying nothing has changed"
+        );
+
+        m.set_sealed_through(200);
+        assert!(
+            m.last_seal_progress() >= stamped,
+            "a real advance must stamp the clock"
+        );
     }
 }

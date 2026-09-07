@@ -978,6 +978,15 @@ async fn one_run(
         TapeMode::Replay(path) => BenchSource::Replay(crate::tape::ReplaySource::open(path)?),
     };
     let source = bench_source.as_source();
+    // **Seal on the rule production seals on** (#1199). A harness that cuts segments differently
+    // from `dev` measures a cadence nobody runs, and this one is a CI gate. Looked up by id because
+    // that is what the harness threads; an unregistered chain gets the same default `prepare` uses.
+    // On a dense bench contract the row threshold is reached long before the span, so `seal_cut`
+    // takes the row cut and this changes nothing - which is the point of checking rather than
+    // assuming.
+    let seal_span = crate::chains::lookup_by_id(chain_id)
+        .map(|c| c.seal_span)
+        .unwrap_or(crate::chains::DEFAULT_SEAL_SPAN);
     // Normally a throwaway work dir per run (redb and/or Parquet segments) - never the nest's own
     // database. `--keep` points it somewhere durable instead, because a case whose criterion is a
     // ROW COUNT cannot be answered by a harness that deletes its rows: OBIB case 3 asks for 100,001
@@ -1017,6 +1026,7 @@ async fn one_run(
                 from,
                 to,
                 window,
+                seal_span,
                 fs.force_topic0(),
                 |_| Ok(()),
                 |_, _, _| {},
@@ -1040,6 +1050,7 @@ async fn one_run(
                 from,
                 to,
                 window,
+                seal_span,
                 concurrency,
                 |_| Ok(()),   // bench doesn't persist a resume watermark
                 |_, _, _| {}, // bench doesn't render progress
@@ -1064,6 +1075,7 @@ async fn one_run(
                 from,
                 to,
                 window,
+                seal_span,
                 window_adaptive,
             )
             .await?
