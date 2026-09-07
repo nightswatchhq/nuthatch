@@ -98,6 +98,36 @@ jobs:
           # prompt's "Commits on this branch (N)" count it as a commit, so a two-commit PR announced
           # three - a number stated to be trustworthy that was wrong by one. Review of #1056.
           printf '%s' "$base" > pr.base
+          # **What the base already carries since the last release** (#1201). The commit list above
+          # is this branch's own, which answers a different question: a release branch cut *after*
+          # its fix merged holds the version bump and nothing else, so the reviewer reads the
+          # release note, finds no implementation beside it, and reports the fix missing from a
+          # release that contains it. It did exactly that three times running on the 3.6.1 PR, at
+          # certainty 100, while the code sat one commit below on `main`. #1056 fixed the same
+          # blindness from the other side and could not have caught this one.
+          #
+          # The compare endpoint returns at most 250 commits but always the true `total_commits`, so
+          # both numbers are stated and a truncated range cannot pass for a whole one - the same
+          # rule the branch list follows.
+          prev_tag="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          if [ -z "$prev_tag" ]; then
+            # No release to compare against is a fact, not a failure - it is true of a repository
+            # before its first tag. Say so; do not leave an empty file that reads as an empty range.
+            printf '%s' "(no previous release to compare against)" > pr.base_range
+            : > pr.base_commits
+          else
+            # NOT swallowed, for the reason stated above the branch list: an error that becomes an
+            # empty file renders as `(not supplied)` and the review proceeds from the diff alone,
+            # recreating the failure this exists to prevent.
+            if ! gh api "repos/$REPO/compare/$prev_tag...$base" > compare.json; then
+              echo "::error::could not compare $prev_tag...$base; refusing to review a release without knowing what it contains"
+              exit 1
+            fi
+            jq -r '.commits[] | "\(.sha[0:9]) \(.commit.message | split("\n")[0])"' compare.json > pr.base_commits
+            listed="$(wc -l < pr.base_commits | tr -d ' ')"
+            total="$(jq -r '.total_commits' compare.json)"
+            printf '%s...%s (%s of %s commits listed)' "$prev_tag" "$base" "$listed" "$total" > pr.base_range
+          fi
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
@@ -146,7 +176,9 @@ jobs:
           title="Jules could not complete the review"
           summary="The review failed closed. Fix the workflow or credentials, then comment /re-review."
           if python3 scripts/pr-review.py --diff pr.diff --title "$(cat pr.title)" \
-              --body-file pr.body --commits-file pr.commits --base-file pr.base --json > review.json; then
+              --body-file pr.body --commits-file pr.commits --base-file pr.base \
+              --base-commits-file pr.base_commits --base-range "$(cat pr.base_range)" \
+              --json > review.json; then
             {
               echo '<!-- pr-review:luna -->'
               jq -r '"### Jules · merge-safety \(.confidence)/100\n\nverdict: **\(.verdict)**\n\n\(.summary)\n"' review.json

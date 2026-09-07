@@ -93,6 +93,15 @@ a copyleft dependency is a defect regardless of how well it is written.
 {claude_md}
 --- end CLAUDE.md ---
 
+**A release is a range, and the range includes what is already on the base.** You are told which \
+commits sit on the base branch since the previous release, as well as which sit on this branch. A \
+release pull request legitimately contains nothing but a version bump, a release note and the \
+documentation that moves with it - the fix it announces landed earlier, on its own pull request, and \
+was reviewed there. "The implementation is not in this diff" is a description of a diff, not a \
+finding about a release: check the two commit lists before you write it, and if the change is named \
+in either, the release contains it. It is a finding only when it appears in neither list, or when no \
+lists were supplied at all - and then say which of those two it is.
+
 Review the diff you are given. Judge the change that is there, not the change you would have made. \
 Rank correctness above style; a naming quibble is not a finding. Prefer one concrete failure \
 scenario - specific inputs or state producing a specific wrong result - over three vague concerns. \
@@ -267,6 +276,21 @@ def main():
              "which is how the 3.1.0 release PR was told its security fix was missing (#1056).",
     )
     ap.add_argument("--base-file", type=Path, help="file holding the PR's base branch name")
+    ap.add_argument(
+        "--base-commits-file",
+        type=Path,
+        help="file holding the commit subjects already on the base since the previous release, one "
+             "per line. The commit list above covers this branch only, which is not the same "
+             "question: a release branch cut *after* its fix merged carries the version bump and "
+             "nothing else, and the reviewer then reports the fix missing from a release that "
+             "contains it. That is #1056 again by another route, and it is what blocked 3.6.1.",
+    )
+    ap.add_argument(
+        "--base-range",
+        default="",
+        help="what the base commit list covers, e.g. 'v3.6.0...main (12 of 12 commits listed)'. "
+             "Stated rather than implied, because a truncated range must not pass for a whole one.",
+    )
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--json", action="store_true", help="print the raw structured review instead")
     ap.add_argument(
@@ -300,11 +324,21 @@ def main():
 
     commits = args.commits_file.read_text(errors="replace").strip() if args.commits_file else ""
     base = args.base_file.read_text(errors="replace").strip() if args.base_file else ""
+    base_commits = (
+        args.base_commits_file.read_text(errors="replace").strip()
+        if args.base_commits_file
+        else ""
+    )
     user = (
         f"Pull request title: {args.title}\n\n"
         f"Description:\n{body or '(none)'}\n\n"
         f"Base branch: {base or '(not supplied)'}\n\n"
         f"Commits on this branch ({len(commits.splitlines())}):\n{commits or '(not supplied)'}\n\n"
+        # Merging this branch ships both lists. Rendered separately from the branch's own commits so
+        # the reviewer can tell "this pull request wrote it" from "this release contains it".
+        f"Already on the base, and therefore in this release "
+        f"[{args.base_range or 'range not supplied'}] "
+        f"({len(base_commits.splitlines())}):\n{base_commits or '(not supplied)'}\n\n"
         f"Diff:\n```diff\n{diff}\n```"
     )
     if args.dry_run:

@@ -31,6 +31,15 @@ fn fixtures() -> tempfile::TempDir {
 }
 
 fn dry_run_in(dir: &Path, commits: Option<&Path>) -> String {
+    dry_run_with_base(dir, commits, None)
+}
+
+/// As above, plus what the base already carries since the previous release (#1201).
+fn dry_run_with_base(
+    dir: &Path,
+    commits: Option<&Path>,
+    base_commits: Option<(&Path, &str)>,
+) -> String {
     let base = dir.join("base");
     std::fs::write(&base, "main").expect("write base");
     let diff = dir.join("diff");
@@ -43,6 +52,11 @@ fn dry_run_in(dir: &Path, commits: Option<&Path>) -> String {
     c.arg("--base-file").arg(&base);
     if let Some(p) = commits {
         c.arg("--commits-file").arg(p);
+    }
+    if let Some((p, range)) = base_commits {
+        c.arg("--base-commits-file")
+            .arg(p)
+            .args(["--base-range", range]);
     }
     let out = c.output().expect("run pr-review.py");
     assert!(
@@ -157,6 +171,110 @@ fn the_commit_list_is_paginated_rather_than_capped_at_one_page() {
     assert!(
         !code.contains("--json commits"),
         "still using `gh pr view --json commits`, which caps at 100 with no indication it did"
+    );
+}
+
+/// #1201: **a release branch cut after its fix merged carries the version bump and nothing else.**
+///
+/// #1056 taught the reviewer this branch's commits, which fixed the case where the fix was an
+/// earlier commit *on the branch*. It cannot help when the fix landed on `main` first: the 3.6.1
+/// release PR was rejected three times running, at certainty 100, for "the claimed sealing fix is
+/// absent from the diff" - while that fix sat one commit below it on the base it was cut from.
+///
+/// So the reviewer is told what the base already carries since the previous release, and that list
+/// is what makes "absent from this diff" distinguishable from "absent from this release".
+#[test]
+fn the_reviewer_is_told_what_the_base_already_carries() {
+    let dir = fixtures();
+    let commits = dir.path().join("commits");
+    std::fs::write(
+        &commits,
+        "cad64d1b release: 3.6.1 - a sparse nest stopped sealing\n",
+    )
+    .expect("write commits");
+    let base_commits = dir.path().join("base_commits");
+    std::fs::write(
+        &base_commits,
+        "df792e80 fix(#1199): bound a held finalized range by a per-chain seal span\n         947a8f41 fix(#1196): probe the endpoints we ship\n",
+    )
+    .expect("write base commits");
+
+    let prompt = dry_run_with_base(
+        dir.path(),
+        Some(&commits),
+        Some((&base_commits, "v3.6.0...main (2 of 2 commits listed)")),
+    );
+    assert!(
+        prompt.contains("per-chain seal span"),
+        "the base's commits are not in the prompt, so the reviewer would again report a fix missing \
+         from a release that contains it:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("v3.6.0...main (2 of 2 commits listed)"),
+        "the range is not stated, so a truncated compare cannot be told from a whole one - the \
+         compare endpoint caps its commit array at 250 and this is the only place that shows \
+         it:\n{prompt}"
+    );
+    // The two lists answer different questions and must not be run together: one is what this pull
+    // request wrote, the other is what merging it ships.
+    assert!(
+        prompt.contains("Commits on this branch (1)") && prompt.contains("release: 3.6.1"),
+        "the branch's own commit list was lost or merged into the base list:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("```diff"),
+        "the diff is gone from the prompt:\n{prompt}"
+    );
+}
+
+/// The instruction has to travel with the data. A reviewer handed a second commit list and no rule
+/// about it can still write "the implementation is not in this diff" and be red about it.
+#[test]
+fn the_reviewer_is_told_that_a_release_may_legitimately_hold_no_implementation() {
+    let script = std::fs::read_to_string(root().join("scripts/pr-review.py")).expect("read");
+    let idx = script.find("SYSTEM = ").expect("the system prompt");
+    let system = &script[idx..script[idx..].find("SCHEMA = ").expect("end of system") + idx];
+    assert!(
+        system.contains("A release is a range"),
+        "the system prompt never tells the reviewer that a release contains what is on its base, so \
+         the second commit list is data it has no rule for (#1201)"
+    );
+    assert!(
+        system.contains("not in this diff"),
+        "the system prompt does not name the exact sentence this exists to stop the reviewer \
+         writing about a release"
+    );
+}
+
+/// The workflow has to actually fetch and pass it. The script growing an argument nothing supplies
+/// would satisfy every assertion above while the reviewer sees no more than it did before.
+#[test]
+fn the_workflow_fetches_and_passes_the_base_range() {
+    let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
+    // Comments stripped: this file explains the fault at length beside the fix, and an assertion
+    // that matches the prose passes with the code deleted - a fault this repo has found before.
+    let code: String = wf
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("--base-commits-file pr.base_commits"),
+        "the workflow does not pass the base's commit list, so the script's new argument is never \
+         supplied and nothing changes for the reviewer"
+    );
+    assert!(
+        code.contains("--base-range"),
+        "the range is not passed, so the prompt cannot say what the base list covers"
+    );
+    assert!(
+        code.contains("/compare/") && code.contains("total_commits"),
+        "the base range is not fetched from the compare endpoint with its true total, so a range \
+         capped at 250 commits would read as a complete one"
+    );
+    assert!(
+        code.contains("releases/latest"),
+        "nothing determines the previous release, so there is no range to compare against"
     );
 }
 
