@@ -6,8 +6,9 @@ operator considering hosting nuthatch nests knows what to expect before committi
 
 **Provenance:** every figure was read off the live Hetzner VPS on **2026-09-06**, in two passes: one
 between 12:47 and 13:20 UTC against **3.5.0**, and one between 16:00 and 17:05 UTC against **3.5.1**,
-which went on the box at 15:06. The 3.5.1 pass is the current state and is what the tables below
-carry. Nothing here is projected. Where a number comes from a short window, the window is stated,
+which went on the box at 15:06. The 3.5.1 pass is the later of the two and is what the tables below
+carry. **It is a measurement of 3.5.1, not of the current release**: 3.6.0 went out the same evening
+and changes what a repeated statement costs, as section 5 says. Nothing here is projected. Where a number comes from a short window, the window is stated,
 because a rate without one is not a number.
 
 **One thing changed the day after.** On 2026-09-07 Lodestar's read API became a long-lived Rust
