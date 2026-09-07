@@ -144,21 +144,27 @@ That is worth writing down before anyone builds Phase 0, because the freeze is r
 justified by revenue arithmetic that does not survive contact with actual demand is a slice that
 should not start.
 
-## 6. If it were ever built, the order for these nests
+## 6. What this corpus says about RFC-0048's phases
 
-Following RFC-0048 §5, with what this corpus changes:
+RFC-0048 §5 sets out an order. Measured against this corpus, several of its assumptions read
+differently. This section records what the measurements say about that design and is **not a
+recommendation to build any of it**: billing, metering and paid access are out of scope in
+`CLAUDE.md`, the RFC is a draft, and nothing here is a carve-out.
 
-1. **A boundary test first** (RFC-0046 slice 0): delete every payment feature and a self-hoster
-   loses nothing. `CLAUDE.md` §3 binds the artefact, not the operator.
-2. **Flat price per named query, plus the byte-scan admission check.** On this corpus the check is
-   nearly inert, and §3 above is why. Ship it for the pathological case, not for these queries.
-3. **Do not size the threshold in bytes until the expansion factor is measured.** The binding guard
-   here is memory. A byte threshold that admits the query which OOMs the node is a check that reads
-   as a guarantee.
-4. **Skip Phase 1's hot tier.** Its premise is a distinction worth pricing, and with a 16 MB hot
-   store there is no meaningful price difference between a point read and a full hot scan.
-5. **Phase 2's manifest is cheap here** - 42 statements, 13 views, one file.
-6. **Phase 3 is a gateway RFC**, not a nest one, and multi-host selection needs a second host.
+1. **The boundary test (RFC-0046 slice 0) is undisturbed by this corpus.** Delete every payment
+   feature and a self-hoster of these nests loses nothing. `CLAUDE.md` §3 binds the artefact, not the
+   operator.
+2. **The byte-scan admission check is nearly inert here.** It would bear on at most one query in 42,
+   and §3 above is why. Whatever value it has on this corpus is for the pathological case rather than
+   for these statements.
+3. **A byte threshold cannot be sized until the expansion factor is measured.** The binding guard
+   here is memory, and a byte threshold that admits the query which OOMs the node reads as a
+   guarantee without being one.
+4. **Phase 1's hot tier prices a distinction this corpus does not have.** With a 16 MB hot store
+   there is no meaningful difference between a point read and a full hot scan.
+5. **Phase 2's manifest would be cheap here** - 42 statements, 13 views, one file.
+6. **Phase 3 is a gateway question rather than a nest one**, and multi-host selection would need a
+   second host, which this deployment does not have.
 
 **One prerequisite, and it has just been met.** The serving path took 31 segfaults on 2026-09-06 on
 3.5.0 ([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165)); 3.5.1 gives each DuckDB
