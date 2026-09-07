@@ -16,9 +16,10 @@ alters the consumer described in section 4, and section 4 describes the new shap
 about the nests measured everywhere else on this page, and it did not move the cold query cost in
 section 5, because no runtime changes what a fold costs.
 
-**The box:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carries six nuthatch
-processes, a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of
-memory free. Nothing here needs a large machine.
+**The box:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carries the five nuthatch
+processes inventoried below - four tip-following cursors and one `serve`-only archive - together with
+a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of memory free.
+Nothing here needs a large machine.
 
 ---
 
