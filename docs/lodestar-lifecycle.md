@@ -10,6 +10,12 @@ which went on the box at 15:06. The 3.5.1 pass is the current state and is what 
 carry. Nothing here is projected. Where a number comes from a short window, the window is stated,
 because a rate without one is not a number.
 
+**One thing changed the day after.** On 2026-09-07 Lodestar's read API became a long-lived Rust
+process fronting these same nests, replacing per-request handlers on a serverless platform. That
+alters the consumer described in section 4, and section 4 describes the new shape. It alters nothing
+about the nests measured everywhere else on this page, and it did not move the cold query cost in
+section 5, because no runtime changes what a fold costs.
+
 **The box:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carries six nuthatch
 processes, a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of
 memory free. Nothing here needs a large machine.
@@ -113,7 +119,7 @@ magnitude low for the first few minutes.
 ## 4. The read side: how a consumer asks
 
 Lodestar's read pattern is the thing an operator is actually sizing for, and it is unremarkable:
-**17 cron schedules between 2 minutes and 6 hours**, plus page traffic behind a CDN.
+**17 cron schedules between 2 minutes and 6 hours**, plus page traffic behind a cache.
 
 | cadence | crons |
 |---|---|
@@ -125,17 +131,33 @@ Lodestar's read pattern is the thing an operator is actually sizing for, and it 
 | hourly | allocations, RAV, DIPS chain |
 | 6 hourly | disputes |
 
-Every serving route sits behind a CDN cache: `s-maxage` runs from 30 s (votes) through 300 s (most
-panels) to 86,400 s (ENS). So the nest sees roughly **one read per route per TTL**, not one per
-visitor. Measured on the allocations nest over a clean 70-minute window: **380 queries, about 326 an
-hour, none refused**, for a dashboard serving the public.
+Caching sits in front of the nest in two places, and which one carries the load changed on
+2026-09-07. The routes still served by Lodestar's Next handlers sit behind a CDN cache, `s-maxage`
+running from 30 s (votes) through 300 s (most panels) to 86,400 s (ENS). The thirty-five that moved
+to Lodestar's own long-lived backend are answered from that process's cache instead, on a freshness
+budget derived from how often the underlying data can actually change rather than a TTL picked by
+hand, and they carry `Cache-Control: no-store` so that no CDN can hold a protocol figure past that
+budget. Either way the nest sees roughly **one read per route per freshness window**, not one per
+visitor. Measured on the allocations nest over a clean 70-minute window on 2026-09-06, under the
+client that preceded the rewrite: **380 queries, about 326 an hour, none refused**, for a dashboard
+serving the public.
 
-Two client-side disciplines make this work, and an operator hosting for someone else should insist
-on both:
+Three client-side disciplines make this work, and an operator hosting for someone else should insist
+on all three:
 
-- **A one-slot gate.** `src/lib/nuthatch.ts` admits one query at a time per nest, well under the
-  node's cap, so the consumer's own composition can never be the cause of a refusal. It bounds one Node process;
-  serverless runs many, which is what the retry ladder is for.
+- **Match the consumer's permits to the nest's.** Lodestar's backend holds one semaphore per nest,
+  sized to the permit count that nest actually admits, with a narrower inner lane so that a cron can
+  never take the last slot from a page view. Its concurrency against a nest is then bounded by
+  construction rather than by the nest refusing work. What this page described until 2026-09-07 was
+  the shape that preceded it: one slot per nest inside a process the platform ran many copies of, so
+  the only thing actually bounding concurrency was the refusal, and a retry ladder was needed to
+  absorb it. Prefer the semaphore. The ladder is what you need in place of this discipline, not
+  alongside it.
+- **Coalesce identical in-flight reads.** Forty concurrent readers of one cold key should cost the
+  nest one fold rather than forty. Measured by the consumer against a stand-in nest carrying the
+  23,500 ms fold this deployment really has: **1 query issued, 40 of 40 readers answered**. On four
+  permits that is the difference between a traffic spike being a multiplier and being a no-op, and
+  it is worth more to the nest than any amount of client-side rate limiting.
 - **A readiness gate.** Serving routes go through `nuthatchSqlReady`, which probes `/ready` first and
   returns 503 rather than serving three-week-old rows from a stalled nest. Alerting crons may skip
   it; the page the user sees may not.
@@ -158,6 +180,12 @@ it as the surrounding conditions rather than as a clean version comparison.
 | `lodestar_indexers` top 100 | 98 | 4.37 / 4.74 / 4.77 s | 6.39 / 8.03 / 10.32 s |
 | `lodestar_network` | 1 | 6.05 / 6.10 / 6.13 s | 7.39 / 8.87 / 8.94 s |
 | `count(*) lodestar_delegator_stakes` | - | **out of memory, 1.5-1.8 s, HTTP 400** | out of memory, then a segfault |
+
+**These are first-request figures.** 3.6.0, which went out the evening of 2026-09-06, remembers the
+answer to a repeated statement whose inputs have not changed, so a second identical request inside
+one commit window is answered from the memo in single-digit milliseconds rather than re-folded. The
+table above is 3.5.1 and is what a *cold* statement costs; that number is the one to size for,
+because it is what every commit window pays once.
 
 **Set expectations at seconds, not milliseconds, for anything that aggregates.** These are authored
 SQL views (RFC-0018 §1), evaluated at request time over hot ∪ sealed on every call. They are named

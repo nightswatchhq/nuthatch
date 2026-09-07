@@ -121,7 +121,9 @@ a paid surface would be. So the refusal rate is not a defect to fix before prici
 of what selling access does to a node that protects itself.
 
 Actual demand, for a public dashboard: about **326 queries an hour**, ~238,000 a month, which is
-under 5% of the throughput ceiling.
+under 5% of the throughput ceiling. That was measured on 2026-09-06 against the client that preceded
+Lodestar's Rust backend, which did not coalesce identical in-flight reads; the one that replaced it
+on 2026-09-07 does, so demand per nest can only fall from that figure.
 
 Against that, the measured cost of running all five nests: **RPC of roughly $2 a month per
 tip-following cursor** at a 5-minute poll, plus one 8 GB VPS carrying all five at load 0.63. Call the
