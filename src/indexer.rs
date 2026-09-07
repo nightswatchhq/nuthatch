@@ -2216,9 +2216,9 @@ async fn build_nest(
         .collect();
 
     // Per-chain policy from the registry; a custom (unregistered) chain falls back to defaults.
-    let (finality, chain_window) = match chains::lookup(&config.nest.chain) {
-        Some(c) => (c.finality, c.log_window),
-        None => (DEFAULT_FINALITY, DEFAULT_WINDOW),
+    let (finality, chain_window, seal_span) = match chains::lookup(&config.nest.chain) {
+        Some(c) => (c.finality, c.log_window, c.seal_span),
+        None => (DEFAULT_FINALITY, DEFAULT_WINDOW, chains::DEFAULT_SEAL_SPAN),
     };
     // A `--window` override wins over the chain default (for sparse-contract long backfills).
     let window = effective_window(window_override, chain_window);
@@ -2377,6 +2377,7 @@ async fn build_nest(
         factory: factory.clone(),
         children: ChildRegistry::new(),
         finality,
+        seal_span,
         metrics: {
             let m = METRICS.nest(&config.nest.name);
             m.set_storage_paths(
@@ -2720,20 +2721,67 @@ fn merge_window_rows(
 /// the whole block goes into this segment and the segment is simply larger.
 ///
 /// Returns `(rows, last_block)` and leaves the remainder in `buf`; `None` while the buffer is short.
-fn take_sealable(buf: &mut Vec<SealRow>, hold_from: u64) -> Option<(Vec<String>, u64)> {
+fn take_sealable(
+    buf: &mut Vec<SealRow>,
+    hold_from: u64,
+    range_to: u64,
+    seal_span: u64,
+) -> Option<(Vec<String>, u64)> {
     // Only rows below `hold_from` are final: the blocks at or past it are the tail the next window
     // asks for again (#1144), and a cut inside them would seal a block a later answer may still
     // add to. The cut itself is unchanged - the block carrying the buffer past the threshold - it is
     // simply not taken until that block is out of the tail, so segment identity is what a complete
     // first answer would have produced.
     let eligible = buf.partition_point(|r| r.0 < hold_from);
-    if eligible < SEAL_DIRECT_BATCH {
+    if eligible == 0 {
         return None;
     }
-    let cut_block = buf[SEAL_DIRECT_BATCH - 1].0;
+    // **The frontier is a real block, never the tail sentinel.** `tail_hold` returns `u64::MAX` on
+    // the final pass to mean "nothing is held back", which is right for eligibility and catastrophic
+    // for the span cut: it made `frontier >= span_end` trivially true, so a nest whose whole history
+    // is eight blocks sealed a segment claiming to reach block 86,400 - Arbitrum's `seal_span` - and
+    // the rows went missing behind it. Caught by `authoring_eval_board`, which indexes exactly that
+    // chain. The frontier is the highest block that is both final and inside the range being sealed.
+    let frontier = hold_from.saturating_sub(1).min(range_to);
+    let cut_block = seal_cut(buf[0].0, eligible, |i| Some(buf[i].0), frontier, seal_span)?;
     let n = buf.partition_point(|r| r.0 <= cut_block);
     let rows = buf.drain(..n).map(|(_, _, j)| j).collect();
     Some((rows, cut_block))
+}
+
+/// The shared cut rule for both seal paths: the earlier of the row threshold and the span bound.
+///
+/// - `first` is the block of the oldest held row, `eligible` how many held rows are final, `block_at`
+///   reads the block of the *i*th held row, and `frontier` the highest block that is final.
+/// - **Row cut**, unchanged: the block carrying the buffer past `SEAL_DIRECT_BATCH` (RFC-0028 §4).
+/// - **Span cut** (#1199): `first + seal_span - 1`, once the frontier has reached it.
+///
+/// The span is anchored on the **oldest held row**, not on the previous watermark. That keeps it a
+/// property of the data, exactly like the row cut - so the two seal paths, which see the same rows
+/// and make the same earlier cuts, compute the same boundary - and it can never land before the
+/// first row, so a span cut never produces an empty segment.
+///
+/// Taking the **earlier** of the two is what makes the paths agree. A backfill has the whole history
+/// in hand and would otherwise reach the row threshold inside a window the tip path had already cut
+/// on span, and the same range would seal into different segments depending on which path got there.
+fn seal_cut(
+    first: u64,
+    eligible: usize,
+    block_at: impl Fn(usize) -> Option<u64>,
+    frontier: u64,
+    seal_span: u64,
+) -> Option<u64> {
+    let row_cut = (eligible >= SEAL_DIRECT_BATCH)
+        .then(|| block_at(SEAL_DIRECT_BATCH - 1))
+        .flatten();
+    let span_end = first.saturating_add(seal_span.saturating_sub(1));
+    let span_cut = (seal_span > 0 && frontier >= span_end).then_some(span_end);
+    match (row_cut, span_cut) {
+        (Some(r), Some(s)) => Some(r.min(s)),
+        (Some(r), None) => Some(r),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
 }
 
 /// Every buffered row, in order - the final flush when a range ends.
@@ -2755,9 +2803,11 @@ fn drain_sealable(buf: &mut Vec<SealRow>) -> Vec<String> {
 fn drain_all_sealable(
     buf: &mut Vec<SealRow>,
     hold_from: u64,
+    range_to: u64,
+    seal_span: u64,
     mut f: impl FnMut(Vec<String>, u64) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
-    while let Some((rows, seal_to)) = take_sealable(buf, hold_from) {
+    while let Some((rows, seal_to)) = take_sealable(buf, hold_from, range_to, seal_span) {
         f(rows, seal_to)?;
     }
     Ok(())
@@ -3036,6 +3086,9 @@ pub async fn backfill_direct(
     from: u64,
     to: u64,
     window: u64,
+    // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
+    // path cut at the same boundaries. See `chains::Chain::seal_span`.
+    seal_span: u64,
     adaptive: bool,
 ) -> Result<u64> {
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
@@ -3228,6 +3281,8 @@ pub async fn backfill_direct(
         drain_all_sealable(
             &mut buf,
             tail_hold(chunk_to, final_pass),
+            to,
+            seal_span,
             |rows, seal_to| {
                 seal::seal_range(dir, &rows, batch_from, seal_to)?;
                 batch_from = seal_to + 1;
@@ -3590,6 +3645,9 @@ pub async fn backfill_direct_pipelined(
     from: u64,
     to: u64,
     window: u64,
+    // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
+    // path cut at the same boundaries. See `chains::Chain::seal_span`.
+    seal_span: u64,
     concurrency: usize,
     // Called after each segment seals, with the highest block now durably sealed - the caller
     // persists it as a resume watermark so a mid-backfill failure resumes here instead of restarting
@@ -3830,12 +3888,18 @@ pub async fn backfill_direct_pipelined(
         on_progress(w_to, n, window_now);
         // `drain_all_sealable` is `while`, not `if` (#980, #1015) - see the note on the
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
-        drain_all_sealable(&mut buf, tail_hold(w_to, final_pass), |rows, seal_to| {
-            seal::seal_range(dir, &rows, batch_from, seal_to)?;
-            batch_from = seal_to + 1;
-            on_seal(seal_to)?;
-            Ok(())
-        })?;
+        drain_all_sealable(
+            &mut buf,
+            tail_hold(w_to, final_pass),
+            to,
+            seal_span,
+            |rows, seal_to| {
+                seal::seal_range(dir, &rows, batch_from, seal_to)?;
+                batch_from = seal_to + 1;
+                on_seal(seal_to)?;
+                Ok(())
+            },
+        )?;
     }
     if !buf.is_empty() {
         seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
@@ -3865,6 +3929,9 @@ pub async fn backfill_direct_factory(
     from: u64,
     to: u64,
     window: u64,
+    // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
+    // path cut at the same boundaries. See `chains::Chain::seal_span`.
+    seal_span: u64,
     force_topic0: bool,
     // Resume watermark callback - see [`backfill_direct_pipelined`]. The factory path uses an adaptive
     // window (non-deterministic boundaries), so resuming from the last sealed block instead of `from`
@@ -4103,6 +4170,8 @@ pub async fn backfill_direct_factory(
         drain_all_sealable(
             &mut buf,
             tail_hold(chunk_to, final_pass),
+            to,
+            seal_span,
             |rows, seal_to| {
                 // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
                 seal::seal_range_with_snapshot(
@@ -4191,6 +4260,9 @@ pub struct NestIngest {
     factory: Option<Arc<FactorySet>>,
     children: ChildRegistry,
     finality: Finality,
+    /// The chain's `seal_span` (#1199): the longest block span a finalized range may be held
+    /// unsealed before it is cut regardless of row count. See `chains::Chain::seal_span`.
+    seal_span: u64,
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
     /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
@@ -4359,6 +4431,7 @@ impl NestIngest {
                         resume_from,
                         finalized_through,
                         window,
+                        self.seal_span,
                         fs.force_topic0(),
                         on_seal,
                         |blk, n, window| {
@@ -4383,6 +4456,7 @@ impl NestIngest {
                         resume_from,
                         finalized_through,
                         window,
+                        self.seal_span,
                         concurrency,
                         on_seal,
                         |blk, n, window| {
@@ -5269,6 +5343,7 @@ impl NestIngest {
             finalized_through,
             snapshot.as_deref(),
             &self.metrics,
+            self.seal_span,
         )
         .await
         {
@@ -5684,16 +5759,20 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
 
 /// Block at which the tip path should cut a segment, or `None` to keep holding in the hot store.
 ///
-/// Same rule as [`take_sealable`]: wait until `SEAL_DIRECT_BATCH` rows have finalised, then cut at
-/// the block that carried the buffer past the threshold. The cut is a function of the rows, not of
-/// when finality advanced, so two operators whose tips move on different schedules still produce
-/// identical segments (#1067). A range with no rows is `None` as well; the caller advances the
-/// watermark in that case because there is nothing to batch.
-fn tip_seal_cut(entities: &[String]) -> Option<u64> {
-    if entities.len() < SEAL_DIRECT_BATCH {
-        return None;
-    }
-    block_number_of(&entities[SEAL_DIRECT_BATCH - 1])
+/// Same rule as [`take_sealable`], via the same [`seal_cut`]: the earlier of the `SEAL_DIRECT_BATCH`
+/// row threshold and the chain's `seal_span`. The cut is a function of the rows, not of when
+/// finality advanced, so two operators whose tips move on different schedules still produce
+/// identical segments (#1067, #1199). A range with no rows is `None` as well; the caller advances
+/// the watermark in that case because there is nothing to batch.
+fn tip_seal_cut(entities: &[String], ceiling: u64, seal_span: u64) -> Option<u64> {
+    let first = block_number_of(entities.first()?)?;
+    seal_cut(
+        first,
+        entities.len(),
+        |i| block_number_of(&entities[i]),
+        ceiling,
+        seal_span,
+    )
 }
 
 fn block_number_of(json: &str) -> Option<u64> {
@@ -5717,6 +5796,7 @@ async fn maybe_seal(
     finalized_through: u64,
     registry_snapshot: Option<&str>,
     metrics: &crate::metrics::NestMetrics,
+    seal_span: u64,
 ) -> Result<()> {
     if finalized_through == 0 {
         return Ok(());
@@ -5743,7 +5823,7 @@ async fn maybe_seal(
             return Ok(());
         }
         let entities = store.entities_in_range(from, ceiling)?;
-        let cut = match tip_seal_cut(&entities) {
+        let cut = match tip_seal_cut(&entities, ceiling, seal_span) {
             None if entities.is_empty() => {
                 // Finalized range with no transfers - just advance the watermark. Pinning a
                 // checkpoint at the new watermark is what stops a later reorg from walking past it
@@ -6416,6 +6496,8 @@ mod tests {
             let _ = drain_all_sealable(
                 &mut buf,
                 tail_hold(to, to >= last_block),
+                u64::MAX,
+                SPAN_OFF,
                 |rows, seal_to| {
                     segments.push((rows, seal_to));
                     Ok(())
@@ -6612,6 +6694,8 @@ mod tests {
                 drain_all_sealable(
                     &mut buf,
                     tail_hold(to, to >= blocks - 1),
+                    u64::MAX,
+                    SPAN_OFF,
                     |json, seal_to| {
                         seal::seal_range(dir.path(), &json, batch_from, seal_to)?;
                         batch_from = seal_to + 1;
@@ -6696,6 +6780,13 @@ mod tests {
         out
     }
 
+    /// The span bound switched off, for the tests that isolate the `SEAL_DIRECT_BATCH` row rule.
+    /// `u64::MAX` saturates `span_end` past any frontier, so `seal_cut` can only return a row cut.
+    const SPAN_OFF: u64 = u64::MAX;
+    /// A real shipped span, for the tests that must hold *with* the bound in play: Base, Optimism
+    /// and the unregistered-chain default all carry 10,800 (`chains::Chain::seal_span`).
+    const SPAN_REAL: u64 = 10_800;
+
     #[test]
     fn the_tip_path_holds_below_the_batch_threshold() {
         let short = entities_for(100, 3);
@@ -6704,14 +6795,14 @@ mod tests {
             "fixture accidentally crossed the threshold"
         );
         assert_eq!(
-            tip_seal_cut(&short),
+            tip_seal_cut(&short, 99, SPAN_OFF),
             None,
             "the tip path sealed {n} rows, below SEAL_DIRECT_BATCH={SEAL_DIRECT_BATCH}. \
              That is the 6 KB median: each finality advance becoming its own Parquet file (#1067).",
             n = short.len()
         );
         assert_eq!(
-            tip_seal_cut(&[]),
+            tip_seal_cut(&[], 99, SPAN_OFF),
             None,
             "an empty range must also return None so the caller can advance the watermark \
              without inventing a segment"
@@ -6729,14 +6820,71 @@ mod tests {
             }
         }
         assert!(json.len() > SEAL_DIRECT_BATCH);
+        let ceiling = block_number_of(json.last().expect("corpus")).expect("block");
 
-        let backfill_cut = take_sealable(&mut rows, u64::MAX).map(|(_, b)| b);
-        let tip_cut = tip_seal_cut(&json);
+        // Both spans, because #1199 added a second candidate to the cut rule and the paths have to
+        // agree on *its* boundary too. With SPAN_REAL the span end (10,799) lands well before the
+        // row threshold on this corpus, so this arm is the span cut, not the row cut - which is the
+        // arm a backfill holding the whole history could most easily have disagreed on.
+        for span in [SPAN_OFF, SPAN_REAL] {
+            let mut buf = rows.clone();
+            let backfill_cut = take_sealable(&mut buf, u64::MAX, ceiling, span).map(|(_, b)| b);
+            let tip_cut = tip_seal_cut(&json, ceiling, span);
+            assert_eq!(
+                tip_cut, backfill_cut,
+                "tip and backfill cuts disagree at seal_span={span}, so a nest that backfilled and \
+                 then followed the tip would produce a different segment than one that sealed the \
+                 same rows in one pass"
+            );
+        }
+        // This corpus averages four rows a block, so 20,000 rows land at block 5,001 - before the
+        // span end at 10,799 - and `seal_cut` takes the row cut. Pinned, because if it ever drifted
+        // past 10,799 both arms above would be the span cut and the row rule would go untested.
         assert_eq!(
-            tip_cut, backfill_cut,
-            "tip and backfill cuts disagree, so a nest that backfilled and then followed the tip \
-             would produce a different segment than one that sealed the same rows in one pass"
+            tip_seal_cut(&json, ceiling, SPAN_REAL),
+            Some(5_001),
+            "the dense corpus must cut on the row threshold, or both arms above prove the span rule \
+             and neither proves the row rule"
         );
+
+        // ...and the mirror of it. A sparse corpus never reaches the row threshold, so the span is
+        // the only candidate - which is the regime the two Graph protocol nests are actually in, and
+        // the one where a backfill holding the whole history could most easily have disagreed with a
+        // tip path seeing it a poll at a time.
+        let mut sparse_rows = Vec::new();
+        let mut sparse_json = Vec::new();
+        for b in (0..60_000u64).step_by(500) {
+            sparse_rows.push((b, 0u64, format!("{b}:0")));
+            sparse_json.push(entity_json(b, 0));
+        }
+        assert!(
+            sparse_json.len() < SEAL_DIRECT_BATCH,
+            "the sparse fixture crossed the row threshold, so it cannot isolate the span cut"
+        );
+        let sparse_ceiling = 59_999;
+        let sparse_backfill = take_sealable(
+            &mut sparse_rows,
+            sparse_ceiling + 1,
+            sparse_ceiling,
+            SPAN_REAL,
+        )
+        .map(|(_, b)| b);
+        let sparse_tip = tip_seal_cut(&sparse_json, sparse_ceiling, SPAN_REAL);
+        assert_eq!(
+            sparse_tip,
+            Some(10_799),
+            "a sparse range must cut at the span bound - without it the watermark never moves \
+             (#1199)"
+        );
+        assert_eq!(
+            sparse_tip, sparse_backfill,
+            "tip and backfill disagree on the span cut, so the same sparse era would seal into \
+             different segments depending on which path got there"
+        );
+
+        let backfill_cut = take_sealable(&mut rows, u64::MAX, u64::MAX, SPAN_OFF).map(|(_, b)| b);
+        let tip_cut = tip_seal_cut(&json, ceiling, SPAN_OFF);
+        assert_eq!(tip_cut, backfill_cut);
         let cut = tip_cut.expect("corpus crossed the threshold");
         let in_cut = json
             .iter()
@@ -6753,16 +6901,46 @@ mod tests {
         );
     }
 
+    /// #1199: **the span cut must never reach past the range being sealed.**
+    ///
+    /// `tail_hold` returns `u64::MAX` on the final pass to mean "nothing held back". Taking that as
+    /// the finality frontier made `frontier >= span_end` trivially true, so the span cut fired at
+    /// `first_row + seal_span - 1` no matter how short the history was: the authoring eval's
+    /// eight-block Arbitrum fixture sealed a segment claiming to reach block 86,400, and its eight
+    /// rows went missing behind it. `cargo test --lib` was green throughout - only the integration
+    /// board caught it.
+    ///
+    /// A range this short has nothing to cut. The final `drain_sealable` flush seals it at `to`.
+    #[test]
+    fn the_span_cut_does_not_reach_past_the_range() {
+        // The authoring eval's fixture chain exactly: blocks 1..=8, one row each, finalized at 8.
+        let mut buf: Vec<SealRow> = (1..=8u64).map(|b| (b, 0, format!("{b}:0"))).collect();
+        let arbitrum = chains::lookup("arbitrum-one").expect("registry").seal_span;
+        assert_eq!(arbitrum, 86_400, "the fixture's premise moved");
+        assert_eq!(
+            take_sealable(&mut buf, u64::MAX, 8, arbitrum),
+            None,
+            "an eight-block range cut on a span of 86,400 - the segment would claim block 86,400 \
+             and swallow every row on the way (#1199)"
+        );
+        assert_eq!(
+            buf.len(),
+            8,
+            "the rows must still be there for the final flush"
+        );
+    }
+
     #[test]
     fn two_tip_schedules_produce_the_same_cuts() {
         let json = entities_for(9_000, 5);
         assert!(json.len() > SEAL_DIRECT_BATCH * 2);
 
-        fn cuts_of(json: &[String]) -> Vec<u64> {
+        fn cuts_of(json: &[String], span: u64) -> Vec<u64> {
+            let ceiling = block_number_of(json.last().expect("corpus")).expect("block");
             let mut cuts = Vec::new();
             let mut start = 0usize;
             while start < json.len() {
-                match tip_seal_cut(&json[start..]) {
+                match tip_seal_cut(&json[start..], ceiling, span) {
                     None => break,
                     Some(cut) => {
                         let n = json[start..]
@@ -6780,7 +6958,7 @@ mod tests {
         // One schedule: finality advances one block at a time, so each call to
         // `tip_seal_cut` sees only the prefix that has finalized. The other: the
         // whole corpus is already finalized. #1067 requires those to agree.
-        fn cuts_as_finality_advances(json: &[String]) -> Vec<u64> {
+        fn cuts_as_finality_advances(json: &[String], span: u64) -> Vec<u64> {
             let mut cuts = Vec::new();
             let mut start = 0usize;
             let mut i = 0usize;
@@ -6789,7 +6967,9 @@ mod tests {
                 while i < json.len() && block_number_of(&json[i]) == Some(b) {
                     i += 1;
                 }
-                if let Some(cut) = tip_seal_cut(&json[start..i]) {
+                // The ceiling is the block finality has just reached, which is the whole point
+                // of this schedule: the span cut must not fire before the frontier reaches it.
+                if let Some(cut) = tip_seal_cut(&json[start..i], b, span) {
                     cuts.push(cut);
                     let n = json[start..i]
                         .iter()
@@ -6800,17 +6980,19 @@ mod tests {
             }
             cuts
         }
-        let by_one = cuts_as_finality_advances(&json);
-        let all_at_once = cuts_of(&json);
-        assert!(
-            !by_one.is_empty(),
-            "the schedule never crossed the threshold, so the comparison is vacuous"
-        );
-        assert_eq!(
-            by_one, all_at_once,
-            "tip-path cuts depend on how finality was reported, which is the thing #1067 exists \
-             to stop"
-        );
+        for span in [SPAN_OFF, SPAN_REAL] {
+            let by_one = cuts_as_finality_advances(&json, span);
+            let all_at_once = cuts_of(&json, span);
+            assert!(
+                !by_one.is_empty(),
+                "the schedule never cut at seal_span={span}, so the comparison is vacuous"
+            );
+            assert_eq!(
+                by_one, all_at_once,
+                "tip-path cuts depend on how finality was reported at seal_span={span}, which is \
+                 the thing #1067 exists to stop"
+            );
+        }
     }
 
     #[test]
@@ -6818,7 +7000,7 @@ mod tests {
         let short = entities_for(3, 10);
         assert!(short.len() < SEAL_DIRECT_BATCH);
         let old_rule_would_seal = !short.is_empty();
-        let new_rule_seals = tip_seal_cut(&short).is_some();
+        let new_rule_seals = tip_seal_cut(&short, 99, SPAN_OFF).is_some();
         assert!(
             old_rule_would_seal && !new_rule_seals,
             "the old tip path and the new one agree on a {n}-row range, so this suite cannot \
@@ -6862,7 +7044,7 @@ mod tests {
         let store = Store::open(&tmp.path().join("t.redb")).unwrap();
         load_rows(&store, 100);
         let metrics = crate::metrics::NestMetrics::default();
-        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics)
+        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, SPAN_REAL)
             .await
             .unwrap();
         assert_eq!(
@@ -6898,9 +7080,17 @@ mod tests {
         let n = SEAL_DIRECT_BATCH as u64 + 50;
         load_rows(&store, n);
         let metrics = crate::metrics::NestMetrics::default();
-        maybe_seal(tmp.path(), &store, &HashOnly, n - 1, None, &metrics)
-            .await
-            .unwrap();
+        maybe_seal(
+            tmp.path(),
+            &store,
+            &HashOnly,
+            n - 1,
+            None,
+            &metrics,
+            SPAN_OFF,
+        )
+        .await
+        .unwrap();
         let sealed = store
             .get_meta(SEALED_THROUGH_KEY)
             .unwrap()
@@ -6924,17 +7114,22 @@ mod tests {
         );
     }
 
-    /// #1199: **the watermark ratchets shut on a sparse nest.** A finalized range holding *any* rows
-    /// below `SEAL_DIRECT_BATCH` takes the "held, not drained" arm and returns without moving
-    /// `sealed_through`. `from` is pinned at the watermark, so the range only ever grows, and the
-    /// empty-range arm that would otherwise have advanced it can never be reached again: one
-    /// finalized row is enough to freeze the watermark until 20,000 have accumulated.
+    /// #1199: **the watermark must not ratchet shut on a sparse nest.**
     ///
-    /// On the Graph allocations nest that is roughly 95 event-carrying blocks a day against a
-    /// 20,000-row threshold. The watermark had not moved in 739,192 blocks (~51 h) while the cursor
-    /// followed tip perfectly and `/ready` answered `ready: true`.
+    /// The row rule alone did exactly that. A finalized range holding *any* rows below
+    /// `SEAL_DIRECT_BATCH` took the "held, not drained" arm and returned without moving
+    /// `sealed_through`; `from` is pinned at the watermark, so the range only grew and the
+    /// empty-range arm that would otherwise have advanced it became unreachable. One finalized row
+    /// was enough to freeze the watermark until 20,000 accumulated.
+    ///
+    /// Measured live on the Graph allocations nest - roughly 95 event-carrying blocks a day against
+    /// a 20,000-row threshold - `sealed_through` had not moved in 739,192 blocks (~51 h) while the
+    /// cursor followed tip perfectly and `/ready` answered `ready: true`.
+    ///
+    /// `seal_span` bounds it. This is the fixture that froze before the fix: 800,000 blocks
+    /// finalized over four polls carrying 100 rows between them.
     #[tokio::test]
-    async fn maybe_seal_ratchets_shut_on_a_sparse_nest() {
+    async fn maybe_seal_does_not_ratchet_shut_on_a_sparse_nest() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("t.redb")).unwrap();
         let metrics = crate::metrics::NestMetrics::default();
@@ -6947,16 +7142,41 @@ mod tests {
             store
                 .commit_window(&[], Some((ceiling, "bb")), ceiling)
                 .unwrap();
-            maybe_seal(tmp.path(), &store, &HashOnly, ceiling, None, &metrics)
-                .await
-                .unwrap();
+            maybe_seal(
+                tmp.path(),
+                &store,
+                &HashOnly,
+                ceiling,
+                None,
+                &metrics,
+                SPAN_REAL,
+            )
+            .await
+            .unwrap();
         }
+        let sealed = store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .expect(
+                "800,000 blocks finalized over four polls and the watermark never moved. 100 rows, \
+                 below SEAL_DIRECT_BATCH, pin `from`, the range only grows, and the empty-range arm \
+                 is unreachable for ever - the #1199 ratchet.",
+            )
+            .parse::<u64>()
+            .unwrap();
+        // The span cut fires at `first_held_row + SPAN_REAL - 1` = 10,799, and from there the range
+        // is empty, so the empty arm carries the watermark the rest of the way to the ceiling.
         assert_eq!(
-            store.get_meta(SEALED_THROUGH_KEY).unwrap(),
-            None,
-            "800,000 blocks finalized over four polls and the watermark never moved. 100 rows, \
-             below SEAL_DIRECT_BATCH={SEAL_DIRECT_BATCH}, pin `from`, so the range only grows and \
-             the empty-range arm is unreachable for ever (#1199)."
+            sealed, 800_000,
+            "the watermark is bounded but did not reach the finalized ceiling: {sealed}"
+        );
+        let manifest = seal::load_manifest(tmp.path()).expect("the span cut produced no segment");
+        assert!(!manifest.tables.is_empty(), "no segment was written");
+        assert_eq!(
+            store.entities_in_range(0, 800_000).unwrap().len(),
+            0,
+            "sealed rows must be pruned from the hot store - a watermark that advances while redb \
+             keeps growing fixes the receipt and not the RAM budget"
         );
     }
 
@@ -6973,9 +7193,17 @@ mod tests {
         store
             .commit_window(&[], Some((800_000, "bb")), 800_000)
             .unwrap();
-        maybe_seal(tmp.path(), &store, &HashOnly, 800_000, None, &metrics)
-            .await
-            .unwrap();
+        maybe_seal(
+            tmp.path(),
+            &store,
+            &HashOnly,
+            800_000,
+            None,
+            &metrics,
+            SPAN_REAL,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
             Some("800000"),
@@ -7527,6 +7755,7 @@ template="pool"
             10,
             20,
             100,
+            SPAN_OFF,
             false,
             |_| Ok(()),
             |_, _, _| {},
@@ -7729,6 +7958,7 @@ template="pool"
             0,
             40,
             64,
+            SPAN_OFF,
             false,
             |_| Ok(()),
             |_, _, _| {},
@@ -7876,6 +8106,7 @@ template="pool"
                 10,
                 20,
                 100,
+                SPAN_OFF,
                 force_topic0,
                 |_| Ok(()),
                 |_, _, _| {},
@@ -9889,6 +10120,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -9906,6 +10138,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -9935,6 +10168,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             4,
             |_| Ok(()),
             |_, _, _| {},
@@ -9972,6 +10206,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             2,
             |sealed_to| {
                 seals.lock().unwrap().push(sealed_to);
@@ -10099,6 +10334,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -10116,6 +10352,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -10140,11 +10377,11 @@ template = "pool"
         let mut buf = corpus(30_000);
         let would_cut = buf[SEAL_DIRECT_BATCH - 1].0;
         // Hold from a block at or below the cut: nothing is sealable yet.
-        assert!(take_sealable(&mut buf, would_cut).is_none());
-        assert!(take_sealable(&mut buf, would_cut.saturating_sub(1)).is_none());
+        assert!(take_sealable(&mut buf, would_cut, u64::MAX, SPAN_OFF).is_none());
+        assert!(take_sealable(&mut buf, would_cut.saturating_sub(1), u64::MAX, SPAN_OFF).is_none());
         // Hold from past the cut: the cut is exactly the one the data dictates.
-        let (rows, cut) =
-            take_sealable(&mut buf, would_cut + 1).expect("sealable once the tail is out");
+        let (rows, cut) = take_sealable(&mut buf, would_cut + 1, u64::MAX, SPAN_OFF)
+            .expect("sealable once the tail is out");
         assert_eq!(cut, would_cut);
         assert!(rows.len() >= SEAL_DIRECT_BATCH);
         assert!(buf.iter().all(|r| r.0 > cut));
@@ -10316,6 +10553,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -10333,6 +10571,7 @@ template = "pool"
             10,
             39,
             5,
+            SPAN_OFF,
             8,
             |_| Ok(()),
             |_, _, _| {},
@@ -10583,6 +10822,7 @@ template="pool"
             10,
             20,
             100,
+            SPAN_OFF,
             true,
             |_| Ok(()),
             |_, _, _| {},
@@ -10633,6 +10873,7 @@ template="pool"
             10,
             21,
             100,
+            SPAN_OFF,
             true,
         )
         .await
@@ -10653,6 +10894,7 @@ template="pool"
             10,
             21,
             100,
+            SPAN_OFF,
             true,
         )
         .await
@@ -12177,6 +12419,7 @@ template="pool"
             1,
             20,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -12197,6 +12440,7 @@ template="pool"
             1,
             20,
             5,
+            SPAN_OFF,
             4,
             |_| Ok(()),
             |_, _, _| {},
@@ -12240,6 +12484,7 @@ template="pool"
             1,
             20,
             5,
+            SPAN_OFF,
             true,
         )
         .await
@@ -12259,6 +12504,7 @@ template="pool"
             1,
             20,
             5,
+            SPAN_OFF,
             4,
             |_| Ok(()),
             |_, _, _| {},
@@ -13387,6 +13633,7 @@ template="pool"
             5,
             6,
             100,
+            SPAN_OFF,
             true,
         )
         .await
@@ -13688,6 +13935,7 @@ rpc_urls = ["https://rpc.example"]
             0,
             199_999,
             1_000,
+            SPAN_OFF,
             4,
             |_| Ok(()),
             |_, _, _| {},
@@ -13765,6 +14013,7 @@ rpc_urls = ["https://rpc.example"]
             0,
             199_999,
             1_000, // a fixed 1,000-block window would need 200 requests
+            SPAN_OFF,
             4,
             |_| Ok(()),
             |_, _, _| {},
@@ -13820,6 +14069,7 @@ rpc_urls = ["https://rpc.example"]
             0,
             19_999,
             1_000,
+            SPAN_OFF,
             1, // sequential, so every window's feedback lands before the next is generated
             |_| Ok(()),
             |_, _, _| {},

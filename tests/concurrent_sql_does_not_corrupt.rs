@@ -57,6 +57,7 @@ async fn sealed_nest(dir: &std::path::Path) {
         1,
         60,
         10,
+        nuthatch::chains::DEFAULT_SEAL_SPAN,
         false,
     )
     .await

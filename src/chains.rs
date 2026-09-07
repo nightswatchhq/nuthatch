@@ -54,7 +54,39 @@ pub struct Chain {
     /// `false` means the shipped default returns an error such as "Please specify an address"; a
     /// factory nest on that chain must not discover the refusal mid-backfill.
     pub topic0_only_getlogs: bool,
+    /// **The longest block span a finalized range may be held unsealed** (#1199).
+    ///
+    /// Both seal paths cut a segment once `SEAL_DIRECT_BATCH` rows have finalised. That rule alone
+    /// ratchets shut on a sparse nest: a range carrying *any* rows below the threshold is held, the
+    /// range only grows, and the empty-range arm that would otherwise advance the watermark becomes
+    /// unreachable. Measured live on the Graph allocations nest, which sees roughly 95
+    /// event-carrying blocks a day against a 20,000-row threshold: `sealed_through` had not moved in
+    /// 739,192 blocks (~51 h) while the cursor followed tip perfectly.
+    ///
+    /// So a held range is also cut at `from + seal_span - 1`, whichever comes first. The cut stays a
+    /// function of the previous watermark and a constant rather than of the clock, so two operators
+    /// still produce identical segments (RFC-0028 §4) - which is the whole reason this is a block
+    /// span and not a timer.
+    ///
+    /// **Sized per chain because one number cannot serve both ends.** Every value below is ~6 hours
+    /// of chain time, from block times measured against the shipped endpoints on 2026-09-07 over a
+    /// 10,000-block sample. A single constant would be six hours on Arbitrum and eleven weeks on
+    /// mainnet, or six hours on mainnet and ninety seconds on Robinhood Chain.
+    ///
+    /// Six hours is a judgement, not a measurement: long enough that a sparse nest is not cutting
+    /// near-empty segments all day (the sub-20 KB segment problem `SEAL_DIRECT_BATCH` was added to
+    /// fix), short enough that a tattler receipt pins a watermark within a working morning.
+    pub seal_span: u64,
 }
+
+/// `seal_span` for a chain not in this registry.
+///
+/// 10,800 is six hours at a two-second block, the modal L2 cadence and what Base, Optimism and
+/// Polygon all measure near. It is deliberately not sized for a fast chain: too small a default cuts
+/// near-empty segments every few minutes on a 100 ms chain, whereas too large merely leaves an
+/// unknown chain with a looser bound than a known one - and any bound at all is the fix. A custom
+/// chain on a cadence far from two seconds should carry its own registry entry.
+pub const DEFAULT_SEAL_SPAN: u64 = 10_800;
 
 const MAINNET: Chain = Chain {
     name: "mainnet",
@@ -83,6 +115,8 @@ const MAINNET: Chain = Chain {
     finality: Finality::Depth(64),
     log_window: 20,
     topic0_only_getlogs: true,
+    // 12.05 s measured, so 1,800 blocks is 6.0 h (#1199).
+    seal_span: 1_800,
 };
 
 const ARBITRUM_ONE: Chain = Chain {
@@ -116,6 +150,8 @@ const ARBITRUM_ONE: Chain = Chain {
     // backfill, which reads as slowness - so a busy contract wants `--window` set from `doctor`.
     log_window: 2000,
     topic0_only_getlogs: true,
+    // 0.2509 s measured, so 86,400 blocks is 6.0 h (#1199).
+    seal_span: 86_400,
 };
 
 const BASE: Chain = Chain {
@@ -143,6 +179,8 @@ const BASE: Chain = Chain {
     // cost of early retries.
     log_window: 1000,
     topic0_only_getlogs: true,
+    // 2.000 s measured, so 10,800 blocks is 6.0 h (#1199).
+    seal_span: 10_800,
 };
 
 /// BNB Smart Chain. **Tip-following of a static contract works out of the box; a from-deployment
@@ -173,6 +211,8 @@ const BSC: Chain = Chain {
     // with one endpoint there is no sibling to absorb a retry storm.
     log_window: 320,
     topic0_only_getlogs: false,
+    // 0.4501 s measured - not the 3 s of the old cadence - so 48,000 blocks is 6.0 h (#1199).
+    seal_span: 48_000,
 };
 
 /// Polygon PoS. Archive is available but narrow; the wide endpoint is not archive.
@@ -201,6 +241,8 @@ const POLYGON: Chain = Chain {
     // Measured 2026-08-20.
     log_window: 40,
     topic0_only_getlogs: true,
+    // 1.500 s measured, so 14,400 blocks is 6.0 h (#1199).
+    seal_span: 14_400,
 };
 
 /// Gnosis. The best-served of the four chains added here: two keyless **archive** endpoints, both
@@ -223,6 +265,8 @@ const GNOSIS: Chain = Chain {
     // without opening on a window neither can serve.
     log_window: 20_000,
     topic0_only_getlogs: true,
+    // 5.088 s measured, so 4,250 blocks is 6.0 h (#1199).
+    seal_span: 4_250,
 };
 
 /// Optimism. OP-stack L2, so the same finality reasoning as Base: the `finalized` tag is L1-aware.
@@ -260,6 +304,8 @@ const OPTIMISM: Chain = Chain {
     },
     log_window: 600,
     topic0_only_getlogs: true,
+    // 2.000 s measured, so 10,800 blocks is 6.0 h (#1199).
+    seal_span: 10_800,
 };
 
 /// Monad. A full-EVM-bytecode L1 with MonadBFT single-slot finality, and the first chain here whose
@@ -332,6 +378,8 @@ const MONAD: Chain = Chain {
     // narrows from here on a cap it can see. `doctor` recommends 40 across the pool.
     log_window: 100,
     topic0_only_getlogs: true,
+    // 0.3020 s measured, so 72,000 blocks is 6.0 h (#1199).
+    seal_span: 72_000,
 };
 
 /// Robinhood Chain. Robinhood's Arbitrum Orbit L2 on the Nitro stack - the same execution stack and
@@ -384,7 +432,18 @@ const ROBINHOOD: Chain = Chain {
     // Address-less windows are served: the 2026-09-04 emitter sample was 20 unfiltered 50-block
     // windows, every one answered.
     topic0_only_getlogs: true,
+    // 0.1008 s measured, so 216,000 blocks is 6.0 h (#1199).
+    seal_span: 216_000,
 };
+
+/// The registry entry for a chain id, if we ship one.
+///
+/// A by-id lookup exists for callers that have the id but not the name - `bench`, which threads
+/// `chain_id` through its harness. It matters because a benchmark that seals on a different rule
+/// from production measures a cadence nobody runs (#1199).
+pub fn lookup_by_id(chain_id: u64) -> Option<&'static Chain> {
+    all().iter().copied().find(|c| c.chain_id == chain_id)
+}
 
 pub fn lookup(name: &str) -> Option<&'static Chain> {
     match name {
