@@ -68,9 +68,8 @@ pub fn derived_ingestion_reservation_mb() -> u64 {
         .saturating_sub(crate::serve::SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB)
 }
 
-/// Read the live operator settings. Invalid values fall back to the shipped default and warn;
-/// a thread count above [`THREADS_CEILING`] clamps, matching `NUTHATCH_SQL_MAX_CONCURRENCY`.
-/// Over-budget valid values are the validator's job.
+/// Read the live operator settings. Invalid values fall back to the shipped default and warn.
+/// Over-budget valid values, and a thread count above [`THREADS_CEILING`], are the validator's job.
 pub fn from_env() -> AnalyticsConfig {
     AnalyticsConfig {
         memory_limit_mb: env_u64_memory(ENV_MEMORY_LIMIT, DEFAULT_MEMORY_LIMIT_MB),
@@ -164,20 +163,12 @@ fn env_optional_memory(key: &str) -> Option<u64> {
     }
 }
 
+/// `n >= 1` is kept as requested so [`validate_against`] can refuse n above [`THREADS_CEILING`].
 fn env_threads() -> i64 {
     match std::env::var(ENV_THREADS) {
         Err(_) => DEFAULT_THREADS,
         Ok(raw) => match raw.trim().parse::<i64>() {
-            Ok(n) if (1..=THREADS_CEILING).contains(&n) => n,
-            Ok(n) if n > THREADS_CEILING => {
-                tracing::warn!(
-                    requested = n,
-                    ceiling = THREADS_CEILING,
-                    "{ENV_THREADS} above the ceiling; clamping. DuckDB worker threads are not \
-                     an unconstrained config key"
-                );
-                THREADS_CEILING
-            }
+            Ok(n) if n >= 1 => n,
             _ => {
                 tracing::warn!(
                     value = %raw,
@@ -250,6 +241,24 @@ mod tests {
     use super::*;
     use crate::runtime::DEFAULT_MAX_RSS_MB;
     use crate::serve::{SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvRestore {
+        prev: Option<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prev.as_deref() {
+                Some(v) => std::env::set_var(ENV_THREADS, v),
+                None => std::env::remove_var(ENV_THREADS),
+            }
+        }
+    }
 
     #[test]
     fn defaults_equal_todays_constants() {
@@ -422,6 +431,34 @@ mod tests {
             SQL_MAX_CONCURRENCY,
         )
         .expect("the ceiling itself must still start");
+    }
+
+    #[test]
+    fn from_env_preserves_oversize_threads_for_the_validator() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_THREADS).ok();
+        std::env::set_var(ENV_THREADS, "17");
+        let _restore = EnvRestore { prev };
+        let cfg = from_env();
+        assert_eq!(
+            cfg.threads, 17,
+            "parsing must not clamp 17 to {THREADS_CEILING}"
+        );
+        let err = validate_against(&cfg, SQL_MAX_CONCURRENCY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("analytics.threads"),
+            "must name analytics.threads: {err}"
+        );
+        assert!(
+            err.contains(&THREADS_CEILING.to_string()),
+            "must name the ceiling: {err}"
+        );
+        assert!(
+            err.contains(ENV_THREADS),
+            "must name the env key an operator can actually set: {err}"
+        );
     }
 
     #[test]
