@@ -194,6 +194,23 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > **The out-of-scope list below is unchanged and still binds.** No hosted service, no token, no
 > non-EVM before EVM is airtight, no TEE or zk, no Kubernetes. The freeze ending widens what may be
 > built; it does not widen what the product is.
+>
+> **On the apparent conflict between that list and RFC-0046 / RFC-0048**, raised in review of the PR
+> that made this change and settled here rather than in an RFC a reader has to go and find. The list
+> forbids **us** running a hosted service and **us** billing and metering customers - the
+> become-a-data-service-company path - and per-tenant billing and authz remain the gateway's job. It
+> does not forbid an operator charging at their own endpoint. **That is the same line the tenancy
+> paragraph above already draws:** what nuthatch does about tenants, not who they are. The Nuthatch
+> Data Service has answered `402 TAP-Receipt header required` since long before this programme and
+> nobody read it as a violation, because the paywall is a deployment an operator chose rather than a
+> property of the binary. x402 is a second payment method for the same choice, and the §8 governance
+> question was put to Chief on 2026-08-30 and answered: cross the line deliberately.
+>
+> **What keeps that distinction honest is a test, not an assurance**, and it gates the whole payment
+> half: *delete every payment feature from the tree and a self-hoster loses nothing; enable one and
+> the binary still runs, unpriced, for anyone who did not.* A price that cannot be turned off, a
+> settlement path the binary requires to start, or a key we hold has crossed from operator choice
+> into gated product and violates §3. #1217 exists to fail if it ever does.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
