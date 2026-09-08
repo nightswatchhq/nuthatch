@@ -1644,7 +1644,7 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
                 );
                 continue;
             };
-            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class);
+            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class, &field_class);
             field_class.insert(key, (worst, citation, reason));
         }
     }
@@ -1688,12 +1688,16 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
         if propagate_fn_class(functions, &mut fn_class) {
             changed = true;
         }
+        for (key, sites) in &writers {
+            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class, &snapshot);
+            let new = (worst, citation, reason);
+            if field_class.get(key) != Some(&new) {
+                changed = true;
+            }
+            field_class.insert(key.clone(), new);
+        }
         if !changed {
             break;
-        }
-        for (key, sites) in &writers {
-            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class);
-            field_class.insert(key.clone(), (worst, citation, reason));
         }
     }
 
@@ -1742,12 +1746,13 @@ fn worst_writer(
     sites: &[(String, Assignment)],
     functions: &BTreeMap<String, FunctionInfo>,
     fn_class: &BTreeMap<String, Class>,
+    field_class: &BTreeMap<(String, String), (Class, Citation, String)>,
 ) -> (Class, Citation, String) {
     let mut worst = Class::Exact;
     let mut citation = sites[0].1.citation.clone();
     let mut reason = format!("assigned from `{}`", sites[0].1.expr);
     for (fn_name, asg) in sites {
-        let c = class_of_assignment(fn_name, asg, functions, fn_class);
+        let c = class_of_assignment(fn_name, asg, functions, fn_class, field_class);
         if c > worst {
             worst = c;
             citation = asg.citation.clone();
@@ -1762,6 +1767,7 @@ fn class_of_assignment(
     asg: &Assignment,
     functions: &BTreeMap<String, FunctionInfo>,
     fn_class: &BTreeMap<String, Class>,
+    field_class: &BTreeMap<(String, String), (Class, Citation, String)>,
 ) -> Class {
     let Some(func) = functions.get(fn_name) else {
         return Class::Exact;
@@ -1780,6 +1786,17 @@ fn class_of_assignment(
             }
         }
     }
+    // Only this assignment's RHS. A mixed event handler's fn_class is not applied
+    // to every write; an own-field fold next to a fixed-point copy stays exact.
+    for (ent, field) in &func.field_reads {
+        if expr_reads_field(&asg.expr, field)
+            && field_class
+                .get(&(ent.clone(), field.clone()))
+                .is_some_and(|(cl, _, _)| *cl == Class::FixedPoint)
+        {
+            c = c.max(Class::FixedPoint);
+        }
+    }
     c
 }
 
@@ -1793,6 +1810,33 @@ fn expr_calls(expr: &str, name: &str) -> bool {
             }
         }
         return true;
+    }
+    false
+}
+
+fn expr_reads_field(expr: &str, field: &str) -> bool {
+    let needle = format!(".{field}");
+    let bytes = expr.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = expr[from..].find(&needle) {
+        let at = from + rel;
+        let after = at + needle.len();
+        let boundary =
+            after == bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if boundary {
+            let mut n = after;
+            while n < bytes.len() && bytes[n].is_ascii_whitespace() {
+                n += 1;
+            }
+            let is_call = n < bytes.len() && bytes[n] == b'(';
+            let is_assign = n < bytes.len()
+                && bytes[n] == b'='
+                && !(n + 1 < bytes.len() && bytes[n + 1] == b'=');
+            if !is_call && !is_assign {
+                return true;
+            }
+        }
+        from = at + 1;
     }
     false
 }
@@ -2069,6 +2113,42 @@ export function handleSwap(event: SwapEvent): void {
             "fixed-point reason must say it will not reproduce, got {reason}"
         );
         assert!(reason.contains("pricing.ts") || reason.contains("findEthPerToken"));
+    }
+
+    #[test]
+    fn assignment_reading_fixed_point_field_is_fixed_point() {
+        let schema = r#"
+type Token @entity { id: ID! derivedETH: BigDecimal! }
+type Pool @entity { id: ID! usd: BigDecimal! }
+"#;
+        let mapping = r#"
+export function findEthPerToken(token: Token): BigDecimal {
+  let priceSoFar = ZERO_BD
+  for (let i = 0; i < 1; ++i) {
+    const pool = Pool.load(token.id)
+    if (pool) {
+      const other = Token.load(pool.id)
+      if (other) {
+        priceSoFar = other.derivedETH
+      }
+    }
+  }
+  return priceSoFar
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token = Token.load(event.address.toHex())!
+  token.derivedETH = findEthPerToken(token as Token)
+  token.save()
+  let pool = Pool.load(event.address.toHex())!
+  pool.usd = token.derivedETH
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "derivedETH"), Class::FixedPoint);
+        assert_eq!(class_of(&rows, "Pool", "usd"), Class::FixedPoint);
     }
 
     #[test]
