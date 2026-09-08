@@ -1242,6 +1242,8 @@ mod sealed_rows {
 mod tests {
     use super::*;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Compression;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::fs::File;
 
     fn transfer(block: u64, li: u64, value: &str) -> String {
@@ -1361,6 +1363,59 @@ mod tests {
         assert_eq!(check.hash_mismatch, vec![seg.file.clone()]);
         assert!(check.missing.is_empty());
         assert!(path.exists(), "the diagnostic must not quarantine");
+    }
+
+    /// RFC-0047 C3 / #1224. `write_parquet` sets SNAPPY and nothing else; crate defaults freeze
+    /// into every sealed file. The footer is the spec, read the same way `tools/pqmeta` reads it.
+    #[test]
+    fn a_sealed_segment_footer_matches_the_writer_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let manifest = load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let md = reader.metadata();
+
+        assert_eq!(
+            md.num_row_groups(),
+            1,
+            "one seal is one row group; a second group is a writer-config change"
+        );
+        let rg = md.row_group(0);
+        assert!(
+            rg.sorting_columns().is_none(),
+            "no sort metadata is written today; a sort is #1234, not a silent default"
+        );
+
+        let mut dictionary_pages = 0usize;
+        for col in rg.columns() {
+            assert_eq!(
+                col.compression(),
+                Compression::SNAPPY,
+                "{}: write_parquet hardcodes SNAPPY",
+                col.column_path()
+            );
+            assert!(
+                col.statistics().is_some(),
+                "{}: column statistics are the crate default and every column has them",
+                col.column_path()
+            );
+            assert!(
+                col.bloom_filter_offset().is_none(),
+                "{}: blooms are off; enabling them is #1234",
+                col.column_path()
+            );
+            if col.dictionary_page_offset().is_some() {
+                dictionary_pages += 1;
+            }
+        }
+        assert!(
+            dictionary_pages > 0,
+            "dictionary encoding is the crate default (on); a footer with no dictionary pages means it was switched off"
+        );
     }
 
     /// **Issue #433, the cost bound the review sent back.** The sweep may read only the segments of
