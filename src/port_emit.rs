@@ -108,6 +108,13 @@ fn calls_to_decls(
     let mut out = Vec::new();
     let mut used_names: BTreeSet<String> = BTreeSet::new();
     for call in raw {
+        if !call.args.is_empty() {
+            bail!(
+                "cannot emit parameterized call `{}` at {}: the mapping expression does not carry ABI parameter types; refusing to guess a Solidity signature. Add this [[calls]] stanza by hand with the ABI signature",
+                call.signature,
+                call.citation.display(),
+            );
+        }
         let Some(on) = table_for_handler(&call.handler, mappings, config) else {
             // No event table for this handler: inventing `on` would be a guess.
             continue;

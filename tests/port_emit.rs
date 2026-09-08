@@ -225,6 +225,30 @@ fn dropping_the_call_from_the_mapping_drops_the_calls_stanza() {
 }
 
 #[test]
+fn parameterized_call_is_refused_rather_than_emitted_with_a_guessed_signature() {
+    let subgraph = tempfile::tempdir().unwrap();
+    copy_dir(&one_call_dir(), subgraph.path());
+    let mapping = subgraph.path().join("src/mappings/core.ts");
+    let original = std::fs::read_to_string(&mapping).unwrap();
+    std::fs::write(
+        &mapping,
+        original.replace(
+            "contract.try_symbol()",
+            "contract.try_balanceOf(event.params.tokenId)",
+        ),
+    )
+    .unwrap();
+
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let err = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("parameterized call"), "{text}");
+    assert!(text.contains("refusing to guess"), "{text}");
+    assert!(text.contains("core.ts"), "{text}");
+}
+
+#[test]
 fn four_classes_exact_sqrt_price_lands_in_a_view() {
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), true);
