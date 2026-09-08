@@ -62,14 +62,16 @@ impl AnalyticsConfig {
     }
 }
 
-/// `2048 - (SQL_MAX_CONCURRENCY × DEFAULT_MEMORY_LIMIT_MB)`.
+/// Named ingest floor left after the shipped DuckDB split:
+/// `2048 - (SQL_MAX_CONCURRENCY × DEFAULT_MEMORY_LIMIT_MB)`. Not an ingest RSS cap.
 pub fn derived_ingestion_reservation_mb() -> u64 {
     crate::runtime::DEFAULT_MAX_RSS_MB
         .saturating_sub(crate::serve::SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB)
 }
 
 /// Read the live operator settings. Invalid values fall back to the shipped default and warn.
-/// Over-budget valid values, and a thread count above [`THREADS_CEILING`], are the validator's job.
+/// A DuckDB split that does not leave the named ingest floor, and a thread count above
+/// [`THREADS_CEILING`], are the validator's job.
 pub fn from_env() -> AnalyticsConfig {
     AnalyticsConfig {
         memory_limit_mb: env_u64_memory(ENV_MEMORY_LIMIT, DEFAULT_MEMORY_LIMIT_MB),
@@ -80,9 +82,10 @@ pub fn from_env() -> AnalyticsConfig {
     }
 }
 
-/// Startup refusal: `(sql_permits × analytics.memory_limit) + ingestion_reservation +
-/// runtime_headroom ≤ 2 GiB`. `sql_permits` is cursor-wide. `analytics.max_temp_size` is disk.
-/// `analytics.threads` above [`THREADS_CEILING`] is refused; it is not a term in that equation.
+/// Refuses a DuckDB split that does not leave the named ingest floor
+/// (`(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`)
+/// and a thread count above [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result
+/// materialisation; 2 GiB is the footprint CI job / process RSS wall.
 pub fn validate_cursor_budget() -> Result<()> {
     validate_against(&from_env(), crate::serve::sql_max_concurrency())
 }
@@ -116,10 +119,12 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     let ceiling = crate::runtime::DEFAULT_MAX_RSS_MB;
     if total > ceiling {
         bail!(
-            "cursor RAM budget exceeded: (sql_permits × analytics.memory_limit) + \
-             ingestion_reservation + runtime_headroom = ({permits} × {} MB) + {reservation} MB + \
-             {headroom} MB = {total} MB, which is above the {ceiling} MB per-cursor ceiling \
-             (RFC-0047 §2.4). Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
+            "DuckDB split does not leave the named ingest floor: (sql_permits × \
+             analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({permits} × \
+             {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above {ceiling} MB. \
+             This gate refuses that split; it does not cap ingest, DBSP, redb, or result \
+             materialisation. The 2 GiB cursor budget is the footprint CI job / process RSS wall, \
+             not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
              NUTHATCH_SQL_MAX_CONCURRENCY, or ingestion_reservation ({ENV_INGESTION_RESERVATION}). \
              analytics.max_temp_size is disk and does not buy RAM. A query that cannot run in its \
              budget fails; it never degrades block processing.",
