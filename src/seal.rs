@@ -446,7 +446,14 @@ fn sort_rows_for_seal(rows: &mut [Value]) {
 fn bloom_column(name: &str) -> bool {
     matches!(
         name,
-        "address" | "from" | "to" | "owner" | "spender" | "topic0" | "block_hash" | "tx_hash"
+        "address"
+            | "from"
+            | "to"
+            | "owner"
+            | "spender"
+            | "topic0"
+            | "block_hash"
+            | "tx_hash"
             | "hash"
     ) || name.ends_with("_hash")
         || name.ends_with("_address")
