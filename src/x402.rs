@@ -18,6 +18,16 @@ use serde::Deserialize;
 const TRANSFER_WITH_AUTHORIZATION_TYPEHASH: B256 =
     b256!("0x7c7c6cdb67a18743f49ec6fa9b35f50d52ed05cbed4cc592e13b44501c1a2267");
 
+/// n/2 for secp256k1, the ceiling OpenZeppelin's ECDSA enforces and therefore the one an EIP-3009
+/// token enforces. `n` itself is
+/// `0xffffffffffffffffffffffffffffffffbaaedce6af48a03bbfd25e8cd0364141`.
+const SECP256K1_HALF_N: U256 = U256::from_limbs([
+    0xdfe92f46681b20a0,
+    0x5d576e7357a4501d,
+    0xffffffffffffffff,
+    0x7fffffffffffffff,
+]);
+
 const DOMAIN_TYPE_HASH: B256 =
     b256!("0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f");
 
@@ -82,15 +92,23 @@ pub enum Refusal {
     NotBase64Json,
     NoAuthorization,
     UnsupportedScheme(String),
-    WrongNetwork { got: String, want: &'static str },
+    WrongNetwork {
+        got: String,
+        want: &'static str,
+    },
     MissingFields,
     PaysSomebodyElse,
     UnparseableAmount,
-    Insufficient { authorized: U256, price: U256 },
+    Insufficient {
+        authorized: U256,
+        price: U256,
+    },
     NotYetValid,
     Expired,
     SignatureDidNotRecover,
     SignatureDoesNotMatchPayer,
+    /// `s` above n/2. See [`SECP256K1_HALF_N`].
+    MalleableSignature,
 }
 
 impl std::fmt::Display for Refusal {
@@ -107,6 +125,9 @@ impl std::fmt::Display for Refusal {
             Self::UnparseableAmount => write!(f, "unparseable amount"),
             Self::Insufficient { authorized, price } => {
                 write!(f, "authorized {authorized}, price is {price}")
+            }
+            Self::MalleableSignature => {
+                write!(f, "signature has a high s and the token will refuse it")
             }
             Self::NotYetValid => write!(f, "authorization is not yet valid"),
             Self::Expired => write!(f, "authorization has expired"),
@@ -293,6 +314,16 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
 
     let digest = authorization_digest(&chain, from, to, amount, valid_after, valid_before, nonce);
     let signature = Signature::from_str(sig.trim()).map_err(|_| Refusal::SignatureDidNotRecover)?;
+    // **Before recovery, not after.** Every ECDSA signature has a second form `(r, n-s)` with the
+    // recovery bit flipped, which recovers to the same address. `recover_address_from_prehash`
+    // accepts both. EIP-3009 tokens do not: OpenZeppelin's ECDSA rejects `s > n/2`, and USDC uses
+    // it. Accepting the high-s twin would mean serving a gated answer against an authorisation the
+    // token will refuse at settlement - payment verified here, no payment there, and anyone holding
+    // one valid signature can mint the twin. Answering only what settles is the whole point of
+    // verifying locally (RFC-0046 §7).
+    if signature.s() > SECP256K1_HALF_N {
+        return Err(Refusal::MalleableSignature);
+    }
     let recovered = signature
         .recover_address_from_prehash(&digest)
         .map_err(|_| Refusal::SignatureDidNotRecover)?;
@@ -474,6 +505,75 @@ mod tests {
         let got = verify_payment(&cfg, &header, NOW).expect("independent signature must verify");
         assert_eq!(got.from, from);
         assert_eq!(got.value, U256::from(1000u64));
+    }
+
+    /// n/2 recomputed rather than trusted, the same rule the typehash follows. A constant that is
+    /// wrong high accepts the malleable twin; wrong low it refuses honest signatures, and neither
+    /// shows up as an error.
+    #[test]
+    fn the_half_order_is_the_one_secp256k1_defines() {
+        let n = U256::from_str_radix(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+            16,
+        )
+        .unwrap();
+        assert_eq!(SECP256K1_HALF_N, n / U256::from(2u64));
+    }
+
+    /// Jules on #1243. Every ECDSA signature has a twin `(r, n-s)` with the recovery bit flipped
+    /// that recovers to the same address. Alloy accepts it; an EIP-3009 token using OpenZeppelin's
+    /// ECDSA does not. Accepting it here would serve a gated answer against an authorisation that
+    /// cannot settle, and anyone holding one valid signature can mint the twin.
+    #[test]
+    fn the_malleable_twin_of_a_valid_signature_is_refused() {
+        let cfg = cfg();
+        let (_, from) = payer();
+        let auth = default_auth(from, &cfg);
+        let header = sign_authorization(&cfg, &auth);
+
+        // The honest one verifies, so the twin below is the only thing that changed.
+        let ok = verify_payment(&cfg, &header, NOW).expect("the low-s signature must verify");
+        assert_eq!(ok.from, from);
+
+        let obj = decode_header(&header);
+        let sig = Signature::from_str(obj["payload"]["signature"].as_str().unwrap()).unwrap();
+        assert!(
+            sig.s() <= SECP256K1_HALF_N,
+            "the signer must produce low-s, or this test is flipping the wrong way"
+        );
+        let n = U256::from_str_radix(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+            16,
+        )
+        .unwrap();
+        let twin = Signature::new(sig.r(), n - sig.s(), !sig.v());
+
+        // It really is the same payer: this is a bypass, not a broken signature.
+        let chain = cfg.network.params();
+        let digest = authorization_digest(
+            &chain,
+            auth.from,
+            auth.to,
+            auth.value,
+            auth.valid_after,
+            auth.valid_before,
+            auth.nonce,
+        );
+        assert_eq!(
+            twin.recover_address_from_prehash(&digest).unwrap(),
+            from,
+            "the twin recovers to the payer, which is exactly why refusing it has to be explicit"
+        );
+
+        let mut tampered = obj.clone();
+        tampered["payload"]["signature"] = serde_json::Value::String(twin.to_string());
+        let header =
+            base64::engine::general_purpose::STANDARD.encode(tampered.to_string().as_bytes());
+        assert_eq!(
+            verify_payment(&cfg, &header, NOW),
+            Err(Refusal::MalleableSignature),
+            "a high-s signature the token will refuse must not buy a response here"
+        );
     }
 
     #[test]
