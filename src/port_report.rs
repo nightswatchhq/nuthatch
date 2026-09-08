@@ -828,8 +828,12 @@ fn match_function_name(text: &str, i: usize) -> Option<std::ops::Range<usize>> {
 }
 
 fn match_ts_brace(text: &str, open: usize) -> Option<usize> {
+    match_ts_delim(text, open, b'{', b'}')
+}
+
+fn match_ts_delim(text: &str, open: usize, o: u8, c: u8) -> Option<usize> {
     let bytes = text.as_bytes();
-    if open >= bytes.len() || bytes[open] != b'{' {
+    if open >= bytes.len() || bytes[open] != o {
         return None;
     }
     let mut depth = 0;
@@ -853,9 +857,9 @@ fn match_ts_brace(text: &str, open: usize) -> Option<usize> {
             i += 1;
             continue;
         }
-        if b == b'{' {
+        if b == o {
             depth += 1;
-        } else if b == b'}' {
+        } else if b == c {
             depth -= 1;
             if depth == 0 {
                 return Some(i);
@@ -970,8 +974,7 @@ fn analyse_function(
     ));
     let calls = collect_calls(body);
     let contract_call = find_contract_call(body, file, body_start_line);
-    let has_loop = has_loop(body);
-    let has_load = body.contains(".load(");
+    let has_loop_load = loop_reads_a_loaded_entity_field(body, &bindings);
     let field_reads = collect_field_reads(body, &bindings);
     FunctionInfo {
         name,
@@ -979,7 +982,7 @@ fn analyse_function(
         assignments,
         calls,
         contract_call,
-        has_loop_load: has_loop && has_load,
+        has_loop_load,
         field_reads,
     }
 }
@@ -1596,24 +1599,66 @@ fn find_contract_call(body: &str, file: &str, body_start_line: usize) -> Option<
     })
 }
 
-fn has_loop(body: &str) -> bool {
+/// A fixed point is a loop that **reads entity state it has loaded**, not a body that merely
+/// contains a loop somewhere and a `.load(` somewhere.
+///
+/// `has_loop(body) && body.contains(".load(")` was body-wide, so a load outside every loop set the
+/// class, and a loop that only loads and saves - which reproduces exactly - set it too. Both
+/// report a field as non-reproducible when it is not, which is the wrong direction to be wrong in
+/// for a port report: the author does the work of hand-checking a field that was fine.
+///
+/// `findEthPerToken` is the shape this exists for. It loops over whitelisted pools, loads each, and
+/// reads a stored field off the loaded entity, so its answer depends on state derived from earlier
+/// blocks. A loop with no such read has no such dependency. A braceless single-statement loop is
+/// not treated as a fixed point rather than guessed at.
+fn loop_reads_a_loaded_entity_field(body: &str, bindings: &BTreeMap<String, String>) -> bool {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-            && (body[i..].starts_with("for") || body[i..].starts_with("while"))
-        {
-            let kw_len = if body[i..].starts_with("for") { 3 } else { 5 };
-            let after = i + kw_len;
-            if after >= bytes.len()
-                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
-            {
-                return true;
+        let at_word_start =
+            i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let kw = if body.is_char_boundary(i) && body[i..].starts_with("for") {
+            3
+        } else if body.is_char_boundary(i) && body[i..].starts_with("while") {
+            5
+        } else {
+            0
+        };
+        if at_word_start && kw > 0 {
+            let after = i + kw;
+            let boundary = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if boundary {
+                if let Some(inner) = loop_body(body, after) {
+                    if inner.contains(".load(") && !collect_field_reads(inner, bindings).is_empty()
+                    {
+                        return true;
+                    }
+                }
             }
         }
         i += 1;
     }
     false
+}
+
+/// The braced body of the loop whose keyword ends at `after`, or `None` when the header does not
+/// have the `( .. ) { .. }` shape. A nested loop is reached by the outer scan continuing past here.
+fn loop_body(body: &str, after: usize) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut k = after;
+    skip_ws_str(body, &mut k);
+    if k >= bytes.len() || bytes[k] != b'(' {
+        return None;
+    }
+    let close = match_ts_delim(body, k, b'(', b')')?;
+    let mut b = close + 1;
+    skip_ws_str(body, &mut b);
+    if b >= bytes.len() || bytes[b] != b'{' {
+        return None;
+    }
+    let end = match_ts_brace(body, b)?;
+    Some(&body[b + 1..end])
 }
 
 fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -2258,6 +2303,112 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    const LOOP_SCHEMA: &str = r#"
+type Token @entity {
+  id: ID!
+  derivedETH: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  token1Price: BigDecimal!
+  liquidity: BigInt!
+}
+"#;
+
+    /// Jules on #1242. `has_loop && body.contains(".load(")` was body-wide, so a `.load()` sitting
+    /// outside every loop still made the helper a fixed point and every field written from it
+    /// non-reproducible. The class only reaches a field through a call, so the helper is called.
+    #[test]
+    fn a_load_outside_every_loop_is_not_a_fixed_point() {
+        let mapping = r#"
+export function sumAmounts(event: Mint): BigDecimal {
+  const pool = Pool.load(event.address.toHex())
+  let total = ZERO_BD
+  for (let i = 0; i < event.params.amounts.length; ++i) {
+    total = total.plus(event.params.amounts[i])
+  }
+  return total
+}
+
+export function handleMint(event: Mint): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = sumAmounts(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::Exact,
+            "the load is outside the loop, so nothing depends on earlier-block state: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
+    }
+
+    /// A loop that loads and writes, reading nothing off what it loaded, reproduces exactly.
+    #[test]
+    fn a_loop_that_loads_without_reading_a_field_is_not_a_fixed_point() {
+        let mapping = r#"
+export function countPools(event: Sync): BigDecimal {
+  let n = ZERO_BD
+  for (let i = 0; i < event.params.pools.length; ++i) {
+    const pool = Pool.load(event.params.pools[i])
+    if (pool) {
+      n = n.plus(ONE_BD)
+    }
+  }
+  return n
+}
+
+export function handleSync(event: Sync): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = countPools(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::Exact,
+            "a loop that only loads and counts has no cross-block dependency: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
+    }
+
+    /// And the guard must not have removed the class: the same shape with a read of the loaded
+    /// entity's stored field is still a fixed point.
+    #[test]
+    fn a_loop_reading_a_loaded_entitys_field_is_still_a_fixed_point() {
+        let mapping = r#"
+export function priceFromPools(event: Sync): BigDecimal {
+  let priceSoFar = ZERO_BD
+  for (let i = 0; i < event.params.pools.length; ++i) {
+    const pool = Pool.load(event.params.pools[i])
+    if (pool) {
+      priceSoFar = priceSoFar.plus(pool.token1Price)
+    }
+  }
+  return priceSoFar
+}
+
+export function handleSync(event: Sync): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = priceFromPools(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::FixedPoint,
+            "reading pool.token1Price inside the loop is the dependency: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
     }
 
     #[test]
