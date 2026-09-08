@@ -87,6 +87,10 @@ fn strip_cfg_test_items(src: &str) -> String {
     out
 }
 
+fn skip_walk_dir(name: &str) -> bool {
+    matches!(name, "target" | ".git" | "fuzz")
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -95,7 +99,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = entry.path();
         if p.is_dir() {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if matches!(name, "target" | ".git") {
+            if skip_walk_dir(name) {
                 continue;
             }
             rust_files(&p, out);
@@ -113,7 +117,7 @@ fn cargo_tomls(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = entry.path();
         if p.is_dir() {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if matches!(name, "target" | ".git") {
+            if skip_walk_dir(name) {
                 continue;
             }
             cargo_tomls(&p, out);
@@ -121,6 +125,19 @@ fn cargo_tomls(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
+}
+
+fn production_rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut tomls = Vec::new();
+    cargo_tomls(root, &mut tomls);
+    let mut files = Vec::new();
+    for toml in &tomls {
+        let src = toml.parent().unwrap_or(toml).join("src");
+        if src.is_dir() {
+            rust_files(&src, &mut files);
+        }
+    }
+    files
 }
 
 fn filename_is_payment(path: &Path) -> bool {
@@ -218,9 +235,7 @@ fn payment_surface_files_exist_and_are_the_complete_set() {
         );
     }
 
-    let mut files = Vec::new();
-    rust_files(&root.join("src"), &mut files);
-    rust_files(&root.join("decode/src"), &mut files);
+    let files = production_rust_files(&root);
     assert!(
         files.len() > 40,
         "src walk found {} rust files; the scanner is not looking at the tree",
@@ -252,11 +267,40 @@ fn payment_surface_files_exist_and_are_the_complete_set() {
 }
 
 #[test]
+fn production_walk_covers_crate_src_beyond_the_root_and_decode() {
+    let root = root();
+    let files = production_rust_files(&root);
+    let rels: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/")
+        })
+        .collect();
+    let extra = ["tools/pqmeta/src", "tools/df-gate/src"];
+    let present: Vec<&str> = extra
+        .into_iter()
+        .filter(|p| root.join(p).is_dir())
+        .collect();
+    assert!(
+        !present.is_empty(),
+        "expected a tools crate src dir among {extra:?} so the walk can prove it is not only src and decode/src"
+    );
+    for dir in present {
+        assert!(
+            rels.iter().any(|r| r.starts_with(dir)),
+            "production walk missed {dir}; payment code there would not be on PAYMENT_SURFACE"
+        );
+    }
+}
+
+#[test]
 fn listed_payment_files_are_not_unconditional_modules() {
     let root = root();
-    let mut files = Vec::new();
-    rust_files(&root.join("src"), &mut files);
-    rust_files(&root.join("decode/src"), &mut files);
+    let files = production_rust_files(&root);
     for rel in PAYMENT_SURFACE {
         let stem = Path::new(rel)
             .file_stem()
