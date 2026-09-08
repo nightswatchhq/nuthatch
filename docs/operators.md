@@ -11,7 +11,9 @@ still honestly unfinished.
 
 **Companions:** [`prod-readiness.md`](prod-readiness.md) is the *release* gate - what must be true
 before a build ships. This document is the *run* guide - what must be true in your environment.
-What is deferred and why lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
+[Reading sealed segments without nuthatch](reading-segments.md) is the contract for pointing
+DuckDB, DataFusion, or another engine at the same Parquet directory. What is deferred and why
+lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
 (the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
 explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
@@ -992,6 +994,12 @@ duplicates.
 immutable, so they are safe to copy while the process runs. The hot store (`nuthatch.redb`) is a live
 redb file: snapshot it at the filesystem level, or stop the process for a consistent copy. Losing the
 hot store costs a re-index of the unsealed window, not history.
+
+**Reading sealed data without this binary.** The sealed directory is plain Parquet plus a catalogue.
+[Reading Nuthatch segments without Nuthatch](reading-segments.md) is the contract: layout, catalogue
+schema, ordering, and the 256-bit encoding (canonical decimal text in `Utf8`; `_dec` / `_overflow`
+are DuckDB view columns, not Parquet). Point another engine at the same files. Do not glob
+`segments/*.parquet`, and do not expect a narrowed numeric type in the file.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 
