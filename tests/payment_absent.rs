@@ -299,27 +299,36 @@ fn default_lockfile_has_no_x402_crate() {
     );
 }
 
+fn assert_arg_is_not_payment(where_: &str, arg: &clap::Arg) {
+    let mut bits = vec![arg.get_id().as_str().to_string()];
+    if let Some(long) = arg.get_long() {
+        bits.push(long.to_string());
+    }
+    if let Some(env) = arg.get_env() {
+        bits.push(env.to_string_lossy().into_owned());
+    }
+    let blob = bits.join(" ");
+    assert!(
+        !payment_token(&blob),
+        "{where_} grew a payment flag, so a key could become required to start \
+         (#1217): {bits:?}"
+    );
+}
+
 #[test]
 fn nuthatch_dev_and_serve_take_no_payment_flag() {
     let cmd = Cli::command();
+    // Root `global = true` args are accepted on every subcommand but are not in
+    // `sub.get_arguments()`; `nuthatch --x402 dev` would otherwise pass this test.
+    for arg in cmd.get_arguments() {
+        assert_arg_is_not_payment("nuthatch (global)", arg);
+    }
     for name in ["dev", "serve"] {
         let sub = cmd
             .find_subcommand(name)
             .unwrap_or_else(|| panic!("{name} subcommand missing"));
         for arg in sub.get_arguments() {
-            let mut bits = vec![arg.get_id().as_str().to_string()];
-            if let Some(long) = arg.get_long() {
-                bits.push(long.to_string());
-            }
-            if let Some(env) = arg.get_env() {
-                bits.push(env.to_string_lossy().into_owned());
-            }
-            let blob = bits.join(" ");
-            assert!(
-                !payment_token(&blob),
-                "`nuthatch {name}` grew a payment flag, so a key could become required to start \
-                 (#1217): {bits:?}"
-            );
+            assert_arg_is_not_payment(&format!("nuthatch {name}"), arg);
         }
     }
 }
