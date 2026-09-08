@@ -3132,6 +3132,78 @@ mod tests {
         assert_eq!(live_json["ready"], json!(true));
     }
 
+    /// #1204, the alias case, raised in review: a quarantined dataset reached through **two** mounts
+    /// must be reported once, as a quarantine, under both mount names - never as a quarantine under
+    /// the canonical name and a *stall* under the alias, which would be one fault wearing two
+    /// vocabularies.
+    ///
+    /// The mechanism that makes this hold is worth pinning because it is not obvious from
+    /// `roost_ready`: `register_alias` calls `register`, so an alias is a key in `chain_of`, and
+    /// `unhealthy()` resolves every one of those keys through `status()` - which follows `shares` to
+    /// the canonical mount. Both names are therefore already in the quarantine set the stall pass
+    /// filters against, and the alias is skipped rather than judged on the canonical nest's counters.
+    ///
+    /// The alias's state is pre-stamped with the **canonical** nest's name, which is what
+    /// `fan_out_aliases` produces when it clones the canonical state (`runtime.rs`, RFC-0032 §4). The
+    /// per-nest assertion at the end is what proves that stamp is behaving as the real path does.
+    #[tokio::test]
+    async fn a_quarantined_dataset_is_named_once_per_mount_and_never_as_a_stall() {
+        use crate::health::RuntimeHealth;
+        let dir = tempfile::tempdir().unwrap();
+        let (canonical, alias) = ("alias-q-canonical", "alias-q-alias");
+        std::fs::create_dir_all(dir.path().join(canonical)).unwrap();
+        let health = Arc::new(RuntimeHealth::new());
+        health.register(canonical, "arbitrum-one");
+        health.register_alias(alias, canonical, "arbitrum-one");
+
+        let mut state = test_state(&dir.path().join(canonical), 4);
+        state.runtime_health = Some((canonical.to_string(), health.clone()));
+        let nests = vec![
+            (canonical.to_string(), state.clone()),
+            // The alias carries the canonical nest's counters, exactly as `fan_out_aliases` leaves it.
+            (alias.to_string(), state),
+        ];
+        let roster = json!({"runtime": "t", "nests": [{"name": canonical}, {"name": alias}]});
+        let router = compose_runtime(roster, nests, health.clone());
+
+        // The dataset is quarantined *and* its counters are stale, so a root that judged the alias on
+        // its stall terms would have something to report and would report it.
+        crate::metrics::METRICS
+            .nest(canonical)
+            .set_last_poll_ok_for_test(crate::metrics::now_unix().saturating_sub(600));
+        health.quarantine_nest(
+            canonical,
+            "the endpoint pool is terminally dead".into(),
+            1,
+            None,
+        );
+
+        let (root_code, root_body) = get(router.clone(), "/ready").await;
+        let root: Value = serde_json::from_slice(&root_body).unwrap();
+        assert_eq!(root_code, StatusCode::SERVICE_UNAVAILABLE);
+        let names: Vec<&str> = root["quarantined"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q["nest"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&canonical) && names.contains(&alias),
+            "both mounts of a quarantined dataset are named: {root}"
+        );
+        assert_eq!(
+            root["stalled"].as_array().unwrap().len(),
+            0,
+            "a quarantined dataset must not also be reported stalled, under either name: {root}"
+        );
+
+        // …and the alias's own endpoint agrees, which is what proves the canonical stamp is live.
+        let (alias_code, alias_body) = get(router, &format!("/{alias}/ready")).await;
+        let alias_json: Value = serde_json::from_slice(&alias_body).unwrap();
+        assert_eq!(alias_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(alias_json["quarantined"], json!(true));
+    }
+
     /// #510: a nest whose RPC pool has been dead since before its very first successful poll must
     /// eventually answer `/ready` with `stalled`, not a permanent healthy-looking
     /// `{"stalled":false,"last_poll_unixtime":0}` - the exact body a fully dead pool served forever
