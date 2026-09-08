@@ -46,14 +46,45 @@ fn strip_line_comments_toml(src: &str) -> String {
         .join("\n")
 }
 
-/// Production text: full-line comments gone, and everything from the first `#[cfg(test)]` gone.
-/// Payment code in a test module is not a payment feature.
+/// Production text: full-line comments gone, and `#[cfg(test)]` items removed by brace matching
+/// rather than truncating the file. Rust allows production items after a test module.
 fn production_src(src: &str) -> String {
-    let stripped = strip_line_comments_rs(src);
-    match stripped.find("#[cfg(test)]") {
-        Some(i) => stripped[..i].to_string(),
-        None => stripped,
+    strip_cfg_test_items(&strip_line_comments_rs(src))
+}
+
+fn strip_cfg_test_items(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let needle = b"#[cfg(test)]";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(needle) {
+            i += needle.len();
+            while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b';' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b';' {
+                i += 1;
+                continue;
+            }
+            if i < bytes.len() && bytes[i] == b'{' {
+                let mut depth = 1;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
     }
+    out
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -223,18 +254,29 @@ fn payment_surface_files_exist_and_are_the_complete_set() {
 #[test]
 fn listed_payment_files_are_not_unconditional_modules() {
     let root = root();
-    let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let stems = unconditional_mod_stems(&lib);
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("decode/src"), &mut files);
     for rel in PAYMENT_SURFACE {
         let stem = Path::new(rel)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(rel);
-        assert!(
-            !stems.iter().any(|s| s == stem),
-            "{rel} is `mod {stem}` in src/lib.rs without a cfg - deleting it would stop the default \
-             binary compiling, which is the property S1 has to keep (#1217)"
-        );
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            let stems = unconditional_mod_stems(&src);
+            let where_ = f
+                .strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            assert!(
+                !stems.iter().any(|s| s == stem),
+                "{rel} is `mod {stem}` in {where_} without a cfg - deleting it would stop the default \
+                 binary compiling, which is the property S1 has to keep (#1217)"
+            );
+        }
     }
 }
 
