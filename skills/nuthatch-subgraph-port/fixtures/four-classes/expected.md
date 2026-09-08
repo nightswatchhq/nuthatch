@@ -44,8 +44,8 @@ Reads contract state at the row's block. Port as `[[calls]]` (RFC-0038 §3). Nee
 
 | Field | Citation | Why |
 |---|---|---|
-| `Token.decimals` | `src/mappings/core.ts:14` | `handlePoolCreated` reads contract state; assigned from `fetchTokenDecimals(event.params.token0)` |
-| `Token.symbol` | `src/mappings/core.ts:13` | `handlePoolCreated` reads contract state; assigned from `fetchTokenSymbol(event.params.token0)` |
+| `Token.decimals` | `src/common/token.ts:18` | `handlePoolCreated` reads contract state; assigned from `fetchTokenDecimals(event.params.token0)`; assigned at `src/mappings/core.ts:14` |
+| `Token.symbol` | `src/common/token.ts:5` | `handlePoolCreated` reads contract state; assigned from `fetchTokenSymbol(event.params.token0)`; assigned at `src/mappings/core.ts:13` |
 
 ## fixed point
 

@@ -1956,11 +1956,70 @@ fn worst_writer(
         let c = class_of_assignment(fn_name, asg, functions, fn_class, field_class);
         if c > worst {
             worst = c;
-            citation = asg.citation.clone();
+            // Cite the line that *decided* the class. For a call-derived field that is the
+            // `bind`/`try_` in some helper, not the `token.symbol = fetchTokenSymbol(..)` that
+            // called it: a reader following the assignment site finds no contract call there and
+            // cannot check the claim (#1210). The assignment stays in the reason, so the row still
+            // says where the field is written.
+            citation = deciding_call_citation(fn_name, asg, functions, fn_class)
+                .unwrap_or_else(|| asg.citation.clone());
             reason = reason_for(c, fn_name, asg, functions.get(fn_name));
+            if citation != asg.citation {
+                reason.push_str(&format!("; assigned at `{}`", asg.citation.display()));
+            }
         }
     }
     (worst, citation, reason)
+}
+
+/// The contract-call site that makes this assignment call-derived, following the helper chain.
+///
+/// `None` when the assignment's own expression carries the call (its citation is already the right
+/// line) or when nothing in the chain records one.
+fn deciding_call_citation(
+    fn_name: &str,
+    asg: &Assignment,
+    functions: &BTreeMap<String, FunctionInfo>,
+    fn_class: &BTreeMap<String, Class>,
+) -> Option<Citation> {
+    if expr_has_contract_call(&asg.expr) {
+        return None;
+    }
+    let func = functions.get(fn_name)?;
+    for callee in &func.calls {
+        if !expr_calls(&asg.expr, callee) {
+            continue;
+        }
+        if fn_class.get(callee) != Some(&Class::CallDerived) {
+            continue;
+        }
+        if let Some(c) = contract_call_in_chain(callee, functions, &mut BTreeSet::new()) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// First `contract_call` reachable from `name`, breadth of the call graph in name order so the
+/// answer does not depend on iteration luck. `seen` stops a cycle.
+fn contract_call_in_chain(
+    name: &str,
+    functions: &BTreeMap<String, FunctionInfo>,
+    seen: &mut BTreeSet<String>,
+) -> Option<Citation> {
+    if !seen.insert(name.to_string()) {
+        return None;
+    }
+    let func = functions.get(name)?;
+    if let Some(c) = &func.contract_call {
+        return Some(c.clone());
+    }
+    for callee in &func.calls {
+        if let Some(c) = contract_call_in_chain(callee, functions, seen) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 fn class_of_assignment(
@@ -2303,6 +2362,82 @@ export function handlePoolCreated(event: PoolCreated): void {
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert_eq!(class_of(&rows, "Token", "name"), Class::Exact);
         assert!(reason_of(&rows, "Token", "symbol").contains("fetchTokenSymbol"));
+    }
+
+    /// Jules on #1242. The citation must be the line that decided the class. For a call-derived
+    /// field that is the `bind`/`try_` inside the helper, possibly several calls down, not the
+    /// assignment that called it - a reader following the assignment site finds no contract call
+    /// there and cannot check the claim.
+    #[test]
+    fn a_call_derived_field_cites_the_contract_call_not_the_assignment() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        // Two hops: the assignment calls `fetchTokenSymbol`, which calls `readTokenSymbol`, and
+        // only the innermost one binds the contract.
+        let mapping = r#"
+function readTokenSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  return contract.try_symbol().value
+}
+
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  return readTokenSymbol(tokenAddress)
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.symbol = fetchTokenSymbol(event.params.token0)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        let row = rows
+            .iter()
+            .find(|r| r.entity == "Token" && r.field == "symbol")
+            .unwrap();
+        assert_eq!(
+            row.citation.line,
+            3,
+            "the citation must be the ERC20.bind line, not the assignment: {}",
+            row.citation.display()
+        );
+        assert!(
+            row.reason.contains("assigned at"),
+            "and the assignment site must not be lost from the row: {}",
+            row.reason
+        );
+    }
+
+    /// When the call is on the assignment's own line there is nothing to redirect to.
+    #[test]
+    fn an_inline_contract_call_still_cites_its_own_assignment() {
+        let schema = "type Token @entity {\n  id: ID!\n  symbol: String!\n}\n";
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.symbol = ERC20.bind(event.params.token0).try_symbol().value
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        let row = rows
+            .iter()
+            .find(|r| r.entity == "Token" && r.field == "symbol")
+            .unwrap();
+        assert_eq!(row.citation.line, 4, "{}", row.citation.display());
+        assert!(
+            !row.reason.contains("assigned at"),
+            "no redirection, so no second location to name: {}",
+            row.reason
+        );
     }
 
     #[test]
