@@ -461,32 +461,46 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     let dir = nest.join("checks");
     std::fs::create_dir_all(dir.join("expected"))
         .with_context(|| format!("create {}/checks/expected", nest.display()))?;
-    let sql = if views.is_empty() {
+    // **Structural, and deliberately not a row count.** `port-emit` is an overlay onto a nest that
+    // may already hold data, so an expectation of zero rows is true only until the nest indexes its
+    // first matching event and false for the whole rest of the nest's life. Each view is bound and
+    // projected under `LIMIT 0`: the query fails if a view is missing or its columns do not
+    // type-check, and its answer does not move as the nest fills. The aggregate is what guarantees
+    // one row per view - `SELECT true FROM (.. LIMIT 0)` would return none.
+    let mut labels: Vec<(String, String)> = views
+        .iter()
+        .map(|v| (v.entity.clone(), to_alias(&v.entity)))
+        .collect();
+    labels.sort();
+    let sql = if labels.is_empty() {
         "SELECT 1 AS port_ok;\n".to_string()
     } else {
         let mut s = String::from(
-            "-- Structural: the exact views bind. Expected is a fresh nest (zero rows) until a range is sealed.\n",
+            "-- Structural: every exact view binds and projects. Not a row count - this stays true \
+             once the nest holds data.\n",
         );
-        for (i, v) in views.iter().enumerate() {
-            let name = to_alias(&v.entity);
-            if i == 0 {
-                s.push_str(&format!("SELECT count(*) AS n FROM \"{name}\"\n"));
+        for (i, (entity, alias)) in labels.iter().enumerate() {
+            let head = if i == 0 {
+                format!("SELECT '{entity}' AS view, count(*) >= 0 AS binds")
             } else {
-                s.push_str(&format!("UNION ALL SELECT count(*) FROM \"{name}\"\n"));
-            }
+                format!("UNION ALL SELECT '{entity}', count(*) >= 0")
+            };
+            s.push_str(&format!(
+                "{head} FROM (SELECT * FROM \"{alias}\" LIMIT 0)\n"
+            ));
         }
-        s.push_str(";\n");
+        s.push_str("ORDER BY 1;\n");
         s
     };
     std::fs::write(dir.join("port_views.sql"), sql).context("write checks/port_views.sql")?;
-    // `nuthatch check` compares against this fixture. A fresh nest has empty views, so the
-    // counts are zero; `--update` after a real backfill is the author's next step.
-    let expected = if views.is_empty() {
+    // `nuthatch check` compares row for row, so the fixture is the same constant answer the query
+    // gives on an empty nest and on a fully backfilled one. Nothing here needs re-recording.
+    let expected = if labels.is_empty() {
         serde_json::json!([{ "port_ok": 1 }])
     } else {
-        let rows: Vec<serde_json::Value> = views
+        let rows: Vec<serde_json::Value> = labels
             .iter()
-            .map(|_| serde_json::json!({ "n": 0 }))
+            .map(|(entity, _)| serde_json::json!({ "view": entity, "binds": true }))
             .collect();
         serde_json::Value::Array(rows)
     };
@@ -501,6 +515,90 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(entity: &str) -> EmittedView {
+        EmittedView {
+            entity: entity.into(),
+            file: format!("{}.sql", to_alias(entity)),
+            sql: String::new(),
+            exact_fields: vec!["id".into()],
+        }
+    }
+
+    /// Jules on #1244: the emitted check used to expect `count(*) = 0` per view, so it passed on a
+    /// fresh nest and failed for good the moment the nest indexed one matching event. `port-emit`
+    /// is an overlay onto a nest that may already hold data, so the check has to answer the same
+    /// thing either way. Run against real DuckDB, empty and populated.
+    #[test]
+    fn the_emitted_check_answers_the_same_on_a_populated_nest() {
+        let dir = tempfile::tempdir().unwrap();
+        let views = [view("Token"), view("Pool")];
+        write_checks(dir.path(), &views).unwrap();
+
+        let sql = std::fs::read_to_string(dir.path().join("checks/port_views.sql")).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("checks/expected/port_views.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            expected,
+            serde_json::json!([
+                { "view": "Pool", "binds": true },
+                { "view": "Token", "binds": true },
+            ]),
+            "the fixture must be the constant answer, not a row count: {expected}"
+        );
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for alias in ["token", "pool"] {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {alias}_rows (id VARCHAR); \
+                 CREATE VIEW \"{alias}\" AS SELECT * FROM {alias}_rows;"
+            ))
+            .unwrap();
+        }
+
+        let answer = |conn: &duckdb::Connection| -> Vec<(String, bool)> {
+            let mut stmt = conn.prepare(sql.trim_end().trim_end_matches(';')).unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+
+        let empty = answer(&conn);
+        assert_eq!(
+            empty,
+            vec![("Pool".to_string(), true), ("Token".to_string(), true)],
+            "the check must bind on an empty nest"
+        );
+
+        conn.execute_batch(
+            "INSERT INTO token_rows VALUES ('0xaa'), ('0xbb'); \
+             INSERT INTO pool_rows VALUES ('0xcc');",
+        )
+        .unwrap();
+        assert_eq!(
+            answer(&conn),
+            empty,
+            "the check must give the same answer once the nest holds data"
+        );
+    }
+
+    /// A view the nest does not have must still fail the check - the point of it binding.
+    #[test]
+    fn the_emitted_check_fails_when_a_view_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checks(dir.path(), &[view("Token")]).unwrap();
+        let sql = std::fs::read_to_string(dir.path().join("checks/port_views.sql")).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        assert!(
+            conn.prepare(sql.trim_end().trim_end_matches(';')).is_err(),
+            "a check that binds nothing is not a check:\n{sql}"
+        );
+    }
 
     #[test]
     fn unique_call_name_distinguishes_columns() {
