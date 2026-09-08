@@ -103,6 +103,12 @@ proptest = "1"
 # `start_paused` for virtual time in tests. Dev-only, so the shipped binary is unchanged: it lets a
 # retry-pacing test assert *how long* a pause was without actually waiting for it (#361).
 tokio = { version = "1", features = ["test-util"] }
+# RFC-0046 S1: tests sign with alloy's EIP-712 hasher; the verifier recovers with k256. None of
+# these is on the default binary - `src/x402.rs` is `#[cfg(test)]`.
+alloy-primitives = { version = "1.6", features = ["k256"] }
+alloy-sol-types = "1.6"
+k256 = "0.13"
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"

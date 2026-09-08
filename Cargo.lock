@@ -3694,6 +3694,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2 0.10.9",
+ "signature",
 ]
 
 [[package]]
@@ -4223,11 +4224,13 @@ dependencies = [
  "alloy-dyn-abi",
  "alloy-json-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "arc-swap",
  "arrow",
  "async-trait",
  "axum",
+ "base64",
  "clap",
  "dbsp",
  "duckdb",
@@ -4236,6 +4239,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "hex",
+ "k256",
  "nuthatch-decode",
  "object_store",
  "parquet",
