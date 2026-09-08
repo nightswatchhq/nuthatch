@@ -33,6 +33,7 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 const KEY: &str = "NUTHATCH_SQL_MAX_CONCURRENCY";
+const MEM_KEY: &str = "NUTHATCH_ANALYTICS_MEMORY_LIMIT";
 
 /// Install a value and restore the previous one **on every path, including a panic**.
 ///
@@ -74,6 +75,28 @@ fn set_env(value: Option<&str>) {
         Some(v) => std::env::set_var(KEY, v),
         None => std::env::remove_var(KEY),
     }
+}
+
+struct MemRestore(Option<String>);
+
+impl Drop for MemRestore {
+    fn drop(&mut self) {
+        match self.0.as_deref() {
+            Some(v) => std::env::set_var(MEM_KEY, v),
+            None => std::env::remove_var(MEM_KEY),
+        }
+    }
+}
+
+/// A memory_limit that keeps `(permits × limit) + derived reservation` on the 2 GiB ceiling, so a
+/// concurrency measurement can still spawn. RFC-0047 C4 refuses the default 512 MB past two permits.
+#[must_use]
+fn install_fitting_memory(permits: usize) -> MemRestore {
+    let prev = std::env::var(MEM_KEY).ok();
+    let admitted = permits.clamp(1, SQL_MAX_CONCURRENCY_CEILING);
+    let mb = 1024 / admitted;
+    std::env::set_var(MEM_KEY, mb.to_string());
+    MemRestore(prev)
 }
 
 #[test]
@@ -153,6 +176,13 @@ use nuthatch::indexer;
 /// The caller already holds [`env_lock`]; this must not take it again or it would deadlock.
 async fn permits_with(value: Option<&str>) -> usize {
     let _restore = install_env(value);
+    let _mem = match value {
+        Some(v) => {
+            let n = v.parse::<usize>().unwrap_or(SQL_MAX_CONCURRENCY);
+            Some(install_fitting_memory(n))
+        }
+        None => None,
+    };
     let dir = tempfile::tempdir().unwrap();
     let tape = Arc::new(TapeSource::new());
     tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
@@ -223,6 +253,7 @@ async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
 async fn nests_on_one_cursor_share_one_gate() {
     let _guard = env_lock().lock().await;
     let _restore = install_env(Some("4"));
+    let _mem = install_fitting_memory(4);
 
     let health = Arc::new(nuthatch::health::RuntimeHealth::default());
     let tape = Arc::new(TapeSource::new());

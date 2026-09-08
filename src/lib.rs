@@ -9,6 +9,7 @@ pub mod abi;
 pub mod alerts;
 pub mod allowlist;
 pub mod analytics;
+pub mod analytics_budget;
 pub mod audit;
 pub mod authored_entity_spike;
 pub mod bench;

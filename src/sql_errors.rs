@@ -166,6 +166,31 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     // Deliberately without an integrity scan. Hashing the nest's segments would name the exact file,
     // but it would put an unbounded, caller-triggered sweep on the query path - the cost bound #476
     // and #478 are already about, reachable by anyone who can send a query.
+    // RFC-0047 C4: a query that cannot run in its budget names the keys. Ingestion is not degraded.
+    // Binder/parser/catalog echoes of the phrase are the caller's text, not an OOM.
+    if raw.contains("Out of Memory Error")
+        && !raw.contains("Binder Error")
+        && !raw.contains("Parser Error")
+        && !raw.contains("Catalog Error")
+    {
+        if raw.contains("max_temp_directory_size") {
+            return Some(
+                "this query exceeded analytics.max_temp_size (NUTHATCH_ANALYTICS_MAX_TEMP_SIZE). \
+                 It cannot run in its disk budget; block processing is not degraded. Raise \
+                 analytics.max_temp_size or reduce the query. That cap is disk, not RAM, and does \
+                 not change the 2 GiB cursor equation."
+                    .into(),
+            );
+        }
+        return Some(
+            "this query exceeded analytics.memory_limit (NUTHATCH_ANALYTICS_MEMORY_LIMIT, default \
+             512MB). It cannot run in its budget; block processing is not degraded. Lower the \
+             query, or raise analytics.memory_limit only if (sql_permits × analytics.memory_limit) \
+             + ingestion_reservation still fits the 2 GiB per-cursor ceiling."
+                .into(),
+        );
+    }
+
     if raw.contains("Invalid Error: don't know what type:") {
         // Case-folded, like the sibling `mentions_unquoted`: DuckDB resolves unquoted identifiers
         // case-insensitively, so `FROM USDC__Transfer` is a valid way to name `usdc__transfer`, and
@@ -622,6 +647,54 @@ mod tests {
     #[test]
     fn an_unrecognised_error_gets_no_hint() {
         assert!(enrich("Some internal error", "SELECT 1", &schema()).is_none());
+    }
+
+    #[test]
+    fn an_oom_names_analytics_memory_limit() {
+        let hint = enrich(
+            "Out of Memory Error: failed to allocate data of size 1.0 MiB (512.0 MiB/512.0 MiB used)",
+            "SELECT 1",
+            &schema(),
+        )
+        .unwrap();
+        assert!(
+            hint.contains("analytics.memory_limit"),
+            "must name the key: {hint}"
+        );
+        assert!(
+            hint.contains("block processing is not degraded"),
+            "ingestion liveness is the point: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_temp_size_oom_names_max_temp_size() {
+        let hint = enrich(
+            "Out of Memory Error: failed to offload data block of size 256.0 KiB (0 bytes/0 bytes used).\nThis limit was set by the 'max_temp_directory_size' setting.",
+            "SELECT 1",
+            &schema(),
+        )
+        .unwrap();
+        assert!(
+            hint.contains("analytics.max_temp_size"),
+            "must name the disk key: {hint}"
+        );
+        assert!(
+            !hint.contains("analytics.memory_limit") || hint.contains("max_temp_size"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn a_binder_echo_of_oom_is_not_a_budget_failure() {
+        let raw =
+            r#"Binder Error: Referenced column "Out of Memory Error" not found in FROM clause!"#;
+        let hint = enrich(raw, r#"SELECT "Out of Memory Error""#, &schema()).unwrap();
+        assert!(
+            hint.contains("no column"),
+            "must stay a missing-column hint: {hint}"
+        );
+        assert!(!hint.contains("analytics.memory_limit"), "{hint}");
     }
 
     #[test]

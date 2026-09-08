@@ -19,6 +19,7 @@ not to infer work that remains.
 - [Verification](verification.md)
 - [Production guide](production.md)
 - [Operator reference](operators.md)
+- [Reading sealed segments without nuthatch](reading-segments.md)
 - [Release notes](releases/README.md)
 
 ## Dated records

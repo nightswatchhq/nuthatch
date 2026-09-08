@@ -1108,4 +1108,10 @@ pub struct DoctorArgs {
     /// these fields, not on the wording of the human report (#716).
     #[arg(long)]
     pub json: bool,
+
+    /// Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not
+    /// quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`,
+    /// stdout is the catalogue check only, so the live-endpoints gate is unchanged.
+    #[arg(long)]
+    pub catalogue: bool,
 }

@@ -25,10 +25,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// How many analytical (DuckDB) queries may run at once across `/sql` and cold `/table` reads. Each
-/// DuckDB query is already capped at 512 MB / 2 threads (see `analytics`), so this bounds the whole
-/// analytical surface's worst-case footprint - the real DoS multiplier is *concurrency*, not any one
-/// query. Kept small to stay well inside the embedded RAM budget; this is node self-protection, not
-/// per-caller rate-limiting (that needs identity and belongs in a gateway).
+/// DuckDB query is capped at `analytics.memory_limit` / `analytics.threads` (defaults 512 MB / 2;
+/// see `analytics_budget`), so this bounds the whole analytical surface's worst-case footprint - the
+/// real DoS multiplier is *concurrency*, not any one query. Kept small to stay well inside the
+/// embedded RAM budget; this is node self-protection, not per-caller rate-limiting (that needs
+/// identity and belongs in a gateway). The permit count is not an unconstrained config key.
 pub const SQL_MAX_CONCURRENCY: usize = 2;
 
 /// Hard ceiling on the override below.
@@ -4627,5 +4628,177 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a statement that must compute still waits on the gate: {fresh}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // RFC-0046 S0 (#1217) - payment is absent, so the default surface does not charge.
+    //
+    // Driven through [`router`] (solo `nuthatch dev`) and [`compose_runtime`] (a mounts), not
+    // the handlers: a 402 layer on the composition is how a default-on price would actually
+    // land, and calling `sql(State(..))` would not see it.
+    // ---------------------------------------------------------------------------------------
+
+    const ENTITY_ID: &str = "k1";
+    const SQL_PATH: &str = "/sql?q=SELECT%201%20AS%20n";
+    const PAYMENT_REQ: &[(&str, &str)] = &[
+        (
+            "PAYMENT-SIGNATURE",
+            "eyJhbGciOiJub3QtYS1yZWFsLXBheW1lbnQifQ",
+        ),
+        ("payment-required", "should-be-ignored-when-unconfigured"),
+    ];
+
+    fn unpriced_state(dir: &std::path::Path, name: &str) -> AppState {
+        let mut st = test_state(dir, SQL_MAX_CONCURRENCY);
+        st.store
+            .put_entity(
+                ENTITY_ID,
+                &json!({"id": ENTITY_ID, "table": "t"}).to_string(),
+            )
+            .unwrap();
+        // Per-nest `/ready`, not the process globals: other tests stamp those and would
+        // make an unstamped fixture flake as 503, which is not a payment failure.
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        health.register(name, "ethereum");
+        st.runtime_health = Some((name.to_string(), health));
+        st
+    }
+
+    fn header_is_payment(name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        n.contains("payment") || n.contains("x402")
+    }
+
+    fn assert_no_payment_headers(headers: &axum::http::HeaderMap, path: &str) {
+        let hits: Vec<&str> = headers
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| header_is_payment(k))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "{path} sent a payment header with payment unconfigured: {hits:?}"
+        );
+    }
+
+    async fn probe(
+        router: Router,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder().uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = req.body(axum::body::Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    fn body_for_compare(body: &[u8]) -> Vec<u8> {
+        match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(mut v) if v.is_object() => {
+                let map = v.as_object_mut().unwrap();
+                for k in VOLATILE {
+                    map.remove(*k);
+                }
+                serde_json::to_vec(&v).unwrap()
+            }
+            _ => body.to_vec(),
+        }
+    }
+
+    async fn assert_unpriced(plain: Router, paying: Router, path: &str, want: StatusCode) {
+        let (s0, h0, b0) = probe(plain, path, &[]).await;
+        let (s1, h1, b1) = probe(paying, path, PAYMENT_REQ).await;
+        assert_ne!(
+            s0,
+            StatusCode::PAYMENT_REQUIRED,
+            "{path} returned 402 with payment unconfigured: {}",
+            String::from_utf8_lossy(&b0)
+        );
+        assert_eq!(
+            s0,
+            want,
+            "{path} must still serve, not merely avoid 402: {} {}",
+            s0,
+            String::from_utf8_lossy(&b0)
+        );
+        assert_no_payment_headers(&h0, path);
+        assert_eq!(
+            s0, s1,
+            "{path} changed status when a payment header was sent, so unconfigured payment code \
+             was reached: {s0} vs {s1}"
+        );
+        assert_eq!(
+            body_for_compare(&b0),
+            body_for_compare(&b1),
+            "{path} changed body when a payment header was sent"
+        );
+        assert_no_payment_headers(&h1, path);
+        assert_ne!(
+            s1,
+            StatusCode::PAYMENT_REQUIRED,
+            "{path} 402ed a paid request"
+        );
+    }
+
+    /// RFC-0046 S0 (#1217). An unconfigured nest does not charge on `/sql`, `/ready`, or
+    /// entity point-reads, through the real composition. A default-on 402 on any of those
+    /// turns this red; so does a layer that only fires when a payment header is present.
+    #[tokio::test]
+    async fn an_unpriced_nest_does_not_charge_on_the_default_surface() {
+        let entity = format!("/entity/{ENTITY_ID}");
+        let solo_paths = [
+            ("/health", StatusCode::OK),
+            ("/ready", StatusCode::OK),
+            (SQL_PATH, StatusCode::OK),
+            (entity.as_str(), StatusCode::OK),
+        ];
+
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let plain = router(SharedNest::new(unpriced_state(a.path(), "pay-abs-solo-a")));
+        let paying = router(SharedNest::new(unpriced_state(b.path(), "pay-abs-solo-b")));
+        for (path, want) in solo_paths {
+            assert_unpriced(plain.clone(), paying.clone(), path, want).await;
+        }
+
+        // Unique names: NestMetrics is process-global and shared by every test in the binary.
+        let name = "pay-abs-runtime";
+        let ca = tempfile::tempdir().unwrap();
+        let cb = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ca.path().join(name)).unwrap();
+        std::fs::create_dir_all(cb.path().join(name)).unwrap();
+        let compose = |dir: &std::path::Path, stamp: &str| {
+            let health = Arc::new(crate::health::RuntimeHealth::new());
+            let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+            compose_runtime(
+                roster,
+                vec![(name.to_string(), unpriced_state(&dir.join(name), stamp))],
+                health,
+            )
+        };
+        let plain = compose(ca.path(), "pay-abs-rt-a");
+        let paying = compose(cb.path(), "pay-abs-rt-b");
+        let runtime_paths = [
+            "/health".to_string(),
+            "/ready".to_string(),
+            "/nests".to_string(),
+            format!("/{name}/health"),
+            format!("/{name}/ready"),
+            format!("/{name}{SQL_PATH}"),
+            format!("/{name}{entity}"),
+        ];
+        for path in &runtime_paths {
+            assert_unpriced(plain.clone(), paying.clone(), path, StatusCode::OK).await;
+        }
     }
 }

@@ -21,31 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Cap DuckDB's working memory so `/sql` can't breach the embedded footprint budget.
-/// Per-connection DuckDB ceiling before the permit count is applied; see [`duck_memory_limit_mb`].
-const MEM_LIMIT_MB: u64 = 512;
-/// What the whole analytical surface may hold in DuckDB at once, across every permit (#1165).
-const DUCK_BUDGET_MB: u64 = 1024;
-
-/// The `max_memory` each DuckDB connection is opened with, in MB: the smaller of [`MEM_LIMIT_MB`] and
-/// [`DUCK_BUDGET_MB`] divided by the live permit count.
-///
-/// #1165: a nest on an 8 GB box shared with nine others segfaulted six times in twenty minutes under
-/// two concurrent analytical queries, each exit at a 2.0 to 2.8 GB peak with the machine in swap and
-/// the kernel logging a page allocation failure. Two permits at 512 MB each, plus the materialised
-/// results and the hot store, put the SQL surface alone over the 2 GB cursor budget, and nothing
-/// bounded the sum: `NUTHATCH_SQL_MAX_CONCURRENCY=16` would have opened sixteen 512 MB engines. The
-/// permits now share one budget. At the default of two permits nothing changes (512 MB each); at four
-/// it is 256, at sixteen 64, and the surface's DuckDB memory is a gigabyte in every case.
-fn duck_memory_limit_mb(permits: usize) -> u64 {
-    // The gate never admits more than the ceiling, so neither does the divisor: a caller passing a
-    // larger number gets the ceiling's share, and the budget holds for any input rather than for the
-    // inputs the gate happens to produce.
-    let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
-    MEM_LIMIT_MB.min(DUCK_BUDGET_MB / permits)
-}
-const MAX_THREADS: i64 = 2;
-
 /// Open an in-memory DuckDB whose file access is pinned to the nest's data dirs (#289).
 ///
 /// DuckDB's `allowed_directories` is an *addition* to the allow-list while `enable_external_access`
@@ -227,11 +202,11 @@ impl Drop for SpillDir {
 /// spilled inside. Ownership is by pid: a directory whose pid still has a `/proc` entry belongs to a
 /// live process and is left alone. Where `/proc` is not there to ask (macOS, dev machines), nothing
 /// is swept, because guessing by age could delete a running instance's spill under it.
-fn sweep_dead_spill_dirs() {
+fn sweep_dead_spill_dirs(parent: &Path) {
     if !Path::new("/proc").is_dir() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
     for e in entries.flatten() {
@@ -255,6 +230,12 @@ fn sweep_dead_spill_dirs() {
 /// The in-process half of a spill directory's name; the other half is the PID.
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn spill_parent() -> PathBuf {
+    crate::analytics_budget::from_env()
+        .temp_directory
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// A directory no other DuckDB instance in this process (or any other) will write to.
 ///
 /// Created **exclusively**: `create_dir`, not `create_dir_all`, and a name that already exists is
@@ -263,12 +244,25 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// and a later process handed that same PID by the kernel would otherwise start its sequence at zero
 /// and write into the dead process's `-0` - the collision this whole change exists to remove, back
 /// through PID reuse. Refusing an existing path makes the directory this instance's by construction,
-/// whatever is left on disk.
+/// whatever is left on disk. The parent is `analytics.temp_directory` when set, else the process
+/// temp dir; the instance name is unchanged (#1165).
 fn new_spill_dir() -> Result<SpillDir> {
     static SWEPT: std::sync::Once = std::sync::Once::new();
-    SWEPT.call_once(sweep_dead_spill_dirs);
+    SWEPT.call_once(|| {
+        sweep_dead_spill_dirs(&std::env::temp_dir());
+        if let Some(ref p) = crate::analytics_budget::from_env().temp_directory {
+            if *p != std::env::temp_dir() {
+                sweep_dead_spill_dirs(p);
+            }
+        }
+    });
+    let parent = spill_parent();
+    if !parent.exists() {
+        std::fs::create_dir_all(&parent)
+            .with_context(|| format!("creating the DuckDB spill parent {}", parent.display()))?;
+    }
     loop {
-        let path = std::env::temp_dir().join(format!(
+        let path = parent.join(format!(
             "nuthatch-duckdb-{}-{}",
             std::process::id(),
             SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -298,19 +292,22 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     // way round is refused: "Cannot change allowed_directories when enable_external_access is
     // disabled". The flag is *not* startup-only on 1.10504.0; a `SET` after open works, which is
     // why this was inert until now - we set the list and never flipped the flag.
-    let mem_limit = format!(
-        "{}MB",
-        duck_memory_limit_mb(crate::serve::sql_max_concurrency())
-    );
-    let config = Config::default()
+    let resources = crate::analytics_budget::from_env();
+    let mem_limit = format!("{}MB", resources.memory_limit_mb);
+    let mut config = Config::default()
         .max_memory(&mem_limit)
         .context("duckdb max_memory")?
-        .threads(MAX_THREADS)
+        .threads(resources.threads)
         .context("duckdb threads")?
         // Set on the config rather than by a later `SET`, so no query can ever run against the
         // shared default - and before `lock_configuration`, which freezes it (#1165).
         .with("temp_directory", spill.0.display().to_string())
         .context("duckdb temp_directory")?;
+    if let Some(ref size) = resources.max_temp_size {
+        config = config
+            .with("max_temp_directory_size", size)
+            .context("duckdb max_temp_directory_size")?;
+    }
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
@@ -3091,36 +3088,51 @@ template="pool"
         test_set_remove_after_define(dir.path(), None);
     }
 
-    /// #1165: the permits share one DuckDB budget. The default is unchanged; raising the permit count
-    /// lowers each engine's ceiling rather than multiplying the surface's footprint.
+    /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit
+    /// count no longer silently shrinks the per-connection ceiling: that product is the startup
+    /// validator's job (RFC-0047 C4).
     #[test]
-    fn duckdb_memory_limit_shares_one_budget_across_the_permits() {
-        assert_eq!(duck_memory_limit_mb(1), 512);
-        assert_eq!(
-            duck_memory_limit_mb(2),
-            512,
-            "the default permit count keeps today's ceiling"
+    fn unconfigured_duckdb_still_opens_at_todays_walls() {
+        let resources = crate::analytics_budget::from_env();
+        assert_eq!(resources.memory_limit_mb, 512);
+        assert_eq!(resources.threads, 2);
+        assert!(resources.temp_directory.is_none());
+        assert!(resources.max_temp_size.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, spill) = open_locked_duckdb(dir.path()).unwrap();
+        let mem: String = conn
+            .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
+            .unwrap();
+        let threads: i64 = conn
+            .query_row("SELECT current_setting('threads')", [], |r| r.get(0))
+            .unwrap();
+        let temp: String = conn
+            .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
+            .unwrap();
+        // DuckDB prints `512MB` as `488.2 MiB` (SI mega, not mebi). Either spelling is the wall.
+        assert!(
+            mem.to_ascii_uppercase().contains("512") || mem.contains("488"),
+            "unconfigured max_memory must still be 512MB, got {mem}"
         );
-        assert_eq!(duck_memory_limit_mb(4), 256);
-        assert_eq!(duck_memory_limit_mb(8), 128);
-        assert_eq!(duck_memory_limit_mb(16), 64);
         assert_eq!(
-            duck_memory_limit_mb(0),
-            512,
-            "a zero permit count is treated as one"
+            threads, 2,
+            "unconfigured threads must still be 2, got {threads}"
         );
         assert_eq!(
-            duck_memory_limit_mb(64),
-            64,
-            "above the gate's ceiling the ceiling's share applies"
+            PathBuf::from(&temp),
+            spill.0,
+            "spill must stay a private per-instance directory (#1165), got {temp}"
         );
-        for p in [1usize, 2, 3, 4, 8, 16, 17, 64] {
-            let admitted = p.min(crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
-            assert!(
-                duck_memory_limit_mb(p) * admitted <= DUCK_BUDGET_MB,
-                "{p} permits exceed the budget"
-            );
-        }
+        assert!(
+            spill
+                .0
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("nuthatch-duckdb-{}-", std::process::id())),
+            "spill name must stay nuthatch-duckdb-{{pid}}-{{seq}}: {}",
+            spill.0.display()
+        );
     }
 
     #[test]
