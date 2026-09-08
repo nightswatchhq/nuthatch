@@ -397,8 +397,8 @@ fn parse_field_line(line: &str) -> Option<(String, Option<&str>)> {
 fn strip_graphql_line_comment(line: &str) -> String {
     let mut out = String::new();
     let mut in_str = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars = line.chars().peekable();
+    for c in chars {
         if c == '"' {
             in_str = !in_str;
             out.push(c);
@@ -460,12 +460,10 @@ fn skip_ws_and_graphql_trivia(chars: &[(usize, char)], i: &mut usize) {
 }
 
 fn ident_at(chars: &[(usize, char)], i: usize, want: &str) -> bool {
-    let mut k = i;
-    for wc in want.chars() {
+    for (k, wc) in (i..).zip(want.chars()) {
         if k >= chars.len() || chars[k].1 != wc {
             return false;
         }
-        k += 1;
     }
     true
 }
