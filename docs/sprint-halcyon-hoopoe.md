@@ -19,8 +19,9 @@ stands.
 ## Definition of done
 
 Every issue carrying the **`halcyon-hoopoe`** label is closed, and no open PR is for one of them. At
-filing: **#1204, #1210, #1211, #1217, #1218, #1221, #1223, #1224, #1225**. The label, not this list,
-is the record of scope.
+filing: **#1204, #1210, #1211, #1217, #1218, #1221, #1223, #1224, #1225**. #1204 closed on 2026-09-08
+in #1232, and **#1234 joined the same day** under the sprint's own rule. The label, not this list, is
+the record of scope.
 
 ## The theme
 
@@ -39,17 +40,35 @@ behaviour the code does not have.
 
 ## The spine
 
-### 1. RFC-0047, the lakehouse commitments - #1221, #1223, #1224, #1225
+### 1. RFC-0047, the lakehouse commitments - #1221, #1223, #1224, #1225, #1234
 
 **First because it is the only item in the programme whose cost grows while we do not do it.**
 Segments are immutable. Row-group sizing, column order, sort, statistics, bloom filters and
 compression are fixed at seal and cannot be improved for data already sealed, so every month the
-writer runs on unaudited defaults is a month of segments carrying those defaults permanently. #1224
-is the sharp end and should land first inside this item.
+writer runs on unaudited defaults is a month of segments carrying those defaults permanently.
 
-The other three are documentation, specification and config over walls that already exist: the
-normative 256-bit contract and the "Reading Nuthatch segments without Nuthatch" page (#1221), a
-versioned catalogue spec (#1223), and operator-visible DuckDB resource governance (#1225).
+**The internal order changed on 2026-09-08, and the reason is worth stating.** `Segment.hash` is
+`sha256` of the Parquet file bytes (`src/seal.rs:218`) and `write_parquet` (`src/seal.rs:402`)
+hardcodes SNAPPY, so changing the codec changes the content address **for identical rows**. The claim
+that two operators indexing the same chain produce identical segments then holds only within one
+writer configuration - and that is a metadata problem rather than a release-notes one. So the writer
+change is split into **#1234 and blocked on #1223**: the manifest must name the profile before the
+profile changes. The precedent is already in the struct, where `registry_snapshot` records which
+factory-discovered set produced a segment for exactly this reason.
+
+That makes the order **#1223, then #1234**, with the rest independent. **#1224 is not blocked** and is
+still the right thing to pick up first: it is the audit half, writing down the settings as they
+actually are and running the one-time footer audit on a real nest by the #889 method. Any deviation
+between the spec table and the footer is a writer-config bug and gets its own issue.
+
+The remainder is documentation and config over walls that already exist: the normative 256-bit
+contract and the "Reading Nuthatch segments without Nuthatch" page (#1221), and operator-visible
+DuckDB resource governance (#1225).
+
+**The release shape is decided** (recorded on #1224): a minor version, not a major. Nothing already
+sealed changes, no configuration breaks, no operator action is required and there is no migration to
+run - RFC-0035's precedent for a major was breaking the operator surface, and this breaks nothing an
+operator does.
 
 **#1222 is deliberately not in this sprint.** Changing the physical Parquet type of 256-bit values is
 a segment-format version. It wants a decision of its own, taken slowly, not a sprint slot.
@@ -84,7 +103,9 @@ presents as a forged payment rather than as our bug.
 
 ### 4. #1204 - the runtime root `/ready` reports quarantine only
 
-Carried over from `guarded-goshawk`, and still the only defect on the board.
+**Closed 2026-09-08 in #1232**, before the sprint started; kept here because the reasoning below is
+what the rest of the sprint inherits. Carried over from `guarded-goshawk`, and the only defect on the
+board when this sprint was scoped.
 
 `roost_ready` (`src/serve.rs:520`) answers from the quarantine set alone, so `wedged`, `poll_stalled`,
 `initial_poll_failed`, `entities_stalled` and `tip_seal_stalled` are computed correctly per nest and
