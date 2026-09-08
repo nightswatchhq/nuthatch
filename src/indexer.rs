@@ -2004,6 +2004,7 @@ async fn build_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
+    crate::analytics_budget::validate_cursor_budget()?;
     // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
     // failure mode of starting is the worse one: `traces`/`state_diffs` would exist, answer queries,
     // and return nothing - and an empty table is indistinguishable from "no matching rows" to whoever
