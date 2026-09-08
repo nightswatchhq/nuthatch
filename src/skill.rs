@@ -159,5 +159,9 @@ mod tests {
             !r.contains("## `nuthatch port-report`"),
             "the port-report classifier hides itself"
         );
+        assert!(
+            !r.contains("## `nuthatch port-emit`"),
+            "the port-emit overlay hides itself"
+        );
     }
 }

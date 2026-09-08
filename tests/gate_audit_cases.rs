@@ -26,6 +26,7 @@ const EXPECTED_CASES: &[&str] = &[
     "skill_refs_authored",
     "skill_refs_stale",
     "port_report_fixture",
+    "port_emit_call",
     "tape_clean",
     "actions_pinned_tag",
     "actions_pinned_toolchain",
