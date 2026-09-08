@@ -22,6 +22,31 @@ how a measurement becomes an assumption:
 | row groups per file | **always 1** - each file is one seal |
 | writer | `parquet-rs version 58.3.0` |
 
+## Writer spec (RFC-0047 C3 / #1224)
+
+The table a footer must match. `a_sealed_segment_footer_matches_the_writer_spec` in `src/seal.rs`
+is the gate: it seals a fixture and reads the footer the same way `tools/pqmeta` does. Changing
+`write_parquet` without changing this table is a red test. Changing the table without a writer
+change is a spec lie. The proposed new-seal profile (zstd, blooms, sort) is #1234 and is not in
+this table.
+
+| Setting | Value | Source |
+| --- | --- | --- |
+| Compression | SNAPPY | `write_parquet` sets it; footer codec |
+| Statistics | every column | crate default `EnabledStatistics::Page`; footer |
+| Bloom filters | none | crate default off; footer offset absent |
+| Row groups | 1 per file | one seal is one group |
+| Dictionary | on | crate default `DEFAULT_DICTIONARY_ENABLED`; at least one dictionary page in the footer |
+| Sort metadata | none | crate default; footer `sorting_columns` absent |
+| Page header statistics | off | crate default `DEFAULT_WRITE_PAGE_HEADER_STATISTICS` |
+| Writer version | Parquet 1.0 | crate default |
+| `created_by` | `parquet-rs version 58.x` (unpinned) | crate stamps it; F-D3, not a contract across nuthatch versions |
+
+The 2026-08-29 Lodestar production sample (below) matched compression, statistics, blooms and row
+groups. Dictionary, sort metadata and page-header statistics were not printed by `pqmeta` then;
+the unit gate now covers them. A production re-read that disagrees with this table is a
+writer-config bug and gets its own issue, not a table edit.
+
 ## The layout, per nest
 
 | nest | files | total | median | p90 | max |
