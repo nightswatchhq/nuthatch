@@ -5,11 +5,11 @@
 //! (no payment crate, no payment source, no payment flag on `dev`/`serve`). The HTTP half lives
 //! next to the router it has to bind: `serve::tests::an_unpriced_nest_does_not_charge_on_the_default_surface`.
 //!
-//! `PAYMENT_SURFACE` is empty today because there is no payment code. S1 (#1218) adds files here.
-//! Deleting every listed file must leave the default binary serving - which is why a listed file
-//! may only be declared behind a feature a default `cargo build` leaves off. Merely having *a*
-//! cfg is not enough: `#[cfg(target_os = "linux")] mod payment;` is compiled by every default
-//! Linux build, and deleting the file would then break the binary.
+//! `PAYMENT_SURFACE` lists payment source. Deleting every listed file must leave the default
+//! binary serving - which is why a listed file may only be declared behind a feature a default
+//! `cargo build` leaves off. Merely having *a* cfg is not enough:
+//! `#[cfg(target_os = "linux")] mod payment;` is compiled by every default Linux build, and
+//! deleting the file would then break the binary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,8 +21,8 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Source files that implement payment. Empty until S1. Every path is repo-relative.
-const PAYMENT_SURFACE: &[&str] = &[];
+/// Source files that implement payment. Every path is repo-relative.
+const PAYMENT_SURFACE: &[&str] = &["src/x402.rs"];
 
 fn is_x402_crate(name: &str) -> bool {
     name.to_ascii_lowercase()
