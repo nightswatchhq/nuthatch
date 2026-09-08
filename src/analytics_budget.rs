@@ -70,7 +70,7 @@ pub fn derived_ingestion_reservation_mb() -> u64 {
 }
 
 /// Read the live operator settings. Invalid values fall back to the shipped default and warn.
-/// A DuckDB split that does not leave the named ingest floor, and a thread count above
+/// A DuckDB split that does not leave a non-zero named ingest floor, and a thread count above
 /// [`THREADS_CEILING`], are the validator's job.
 pub fn from_env() -> AnalyticsConfig {
     AnalyticsConfig {
@@ -82,7 +82,7 @@ pub fn from_env() -> AnalyticsConfig {
     }
 }
 
-/// Refuses a DuckDB split that does not leave the named ingest floor
+/// Refuses a DuckDB split that does not leave a non-zero named ingest floor
 /// (`(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`)
 /// and a thread count above [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result
 /// materialisation; 2 GiB is the footprint CI job / process RSS wall.
@@ -114,6 +114,9 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     }
     let duck = permits.saturating_mul(cfg.memory_limit_mb);
     let reservation = cfg.reservation_mb();
+    if reservation == 0 {
+        bail!("ingestion_reservation must be greater than zero (set {ENV_INGESTION_RESERVATION})");
+    }
     let headroom = RUNTIME_HEADROOM_MB;
     let total = duck.saturating_add(reservation).saturating_add(headroom);
     let ceiling = crate::runtime::DEFAULT_MAX_RSS_MB;
@@ -405,6 +408,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("analytics.memory_limit"), "{err}");
+    }
+
+    #[test]
+    fn zero_ingest_reservation_is_refused() {
+        let cfg = AnalyticsConfig {
+            memory_limit_mb: 2048,
+            ingestion_reservation_mb: Some(0),
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_against(&cfg, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("ingestion_reservation"),
+            "must name ingestion_reservation: {err}"
+        );
+        assert!(
+            err.contains(ENV_INGESTION_RESERVATION),
+            "must name the env key an operator can actually set: {err}"
+        );
+        validate_against(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY)
+            .expect("today's walls must still start");
     }
 
     #[test]
