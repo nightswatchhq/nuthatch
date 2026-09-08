@@ -44,6 +44,11 @@ __pycache__/
 /*.out
 /*.log
 
+# Alternate build trees from `CARGO_TARGET_DIR=target-<something>`, which is how two agents avoid
+# serving each other a stale binary out of one shared target dir. `**/target/` does not match these:
+# the directory is named `target-exex`, not `target`.
+/target-*/
+
 # Local experiment directories that are not artefacts of anything.
 /.vercel/
 /demo-usdc/
