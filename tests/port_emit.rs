@@ -404,6 +404,11 @@ events = ["PoolCreated", "TokenUpdated"]
         token.sql
     );
     assert!(
+        select.contains("GROUP BY") && (select.contains("last(") || select.contains("arg_max")),
+        "entity view must fold to last-per-id, not raw event rows:\n{}",
+        token.sql
+    );
+    assert!(
         !select.to_ascii_lowercase().contains(" join "),
         "must not invent a JOIN:\n{}",
         token.sql

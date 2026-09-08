@@ -2671,6 +2671,54 @@ pub(crate) fn strip_converters(expr: &str) -> String {
     s
 }
 
+/// Event column that identifies `entity` in this function: an `id` assignment, else
+/// `new Entity(event.params.x)` / `Entity.load(event.params.x)`.
+pub(crate) fn entity_id_event_column(entity: &str, func: &FunctionInfo) -> Option<String> {
+    for asg in &func.assignments {
+        if asg.entity == entity && asg.field == "id" {
+            if let Some(col) = assignment_event_column(asg, func) {
+                return Some(col);
+            }
+        }
+    }
+    id_from_new_or_load(entity, &func.body)
+}
+
+fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((_var, ent, next)) = match_let_new(body, i).or_else(|| match_bare_new(body, i))
+        {
+            if ent == entity {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                        return Some(col);
+                    }
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        if let Some((_var, ent, next)) = match_let_load(body, i) {
+            if ent == entity {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                        return Some(col);
+                    }
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Event-table column this assignment copies. Constructor ids (`new Token(event.params.token0)`)
 /// use the constructor argument; a local that only aliases that argument is chased for `id`.
 pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> Option<String> {

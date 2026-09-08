@@ -267,8 +267,8 @@ fn view_for_entity(
 ) -> ViewDraft {
     let view_name = to_alias(entity);
     let mut comments = Vec::new();
-    let mut selects: BTreeMap<String, (String, String)> = BTreeMap::new();
-    // field → (table, column)
+    // field → table → column. One field may be written from several triggering tables.
+    let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut exact_fields = Vec::new();
 
     for f in fields {
@@ -281,10 +281,15 @@ fn view_for_entity(
             f.citation.line,
             f.reason.replace('\n', " ")
         ));
-        if let Some((table, col)) = map_exact_field(f, mappings, config) {
-            selects.entry(f.field.clone()).or_insert((table, col));
+        for (table, col) in map_exact_field_tables(f, mappings, config) {
+            selects
+                .entry(f.field.clone())
+                .or_default()
+                .entry(table)
+                .or_insert(col);
         }
     }
+    fill_id_columns(entity, &mut selects, mappings, config);
 
     let mut sql = String::new();
     sql.push_str(&format!(
@@ -312,35 +317,63 @@ fn view_for_entity(
     ViewDraft { sql, exact_fields }
 }
 
-/// Project every mapped field. One table stays a single SELECT; several become UNION ALL
-/// so a guessed JOIN never hides a column. Unmapped Exact fields stay comments, not NULLs.
-fn exact_select_sql(selects: &BTreeMap<String, (String, String)>) -> String {
+/// Latest mapped value per entity id. Several tables overlay with UNION ALL (not a JOIN);
+/// `last() FILTER` skips a later arm's NULL so it cannot wipe an earlier write.
+fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> String {
     let mut tables = BTreeSet::new();
-    for (table, _) in selects.values() {
-        tables.insert(table.clone());
+    for by_table in selects.values() {
+        tables.extend(by_table.keys().cloned());
     }
     let fields: Vec<&str> = selects.keys().map(String::as_str).collect();
+    let fold = selects.contains_key("id");
     let arms: Vec<String> = tables
         .iter()
         .map(|table| {
-            let cols: Vec<String> = fields
+            let mut cols: Vec<String> = fields
                 .iter()
-                .map(|field| match selects.get(*field) {
-                    Some((t, col)) if t == table => format!("  \"{col}\" AS \"{field}\""),
-                    _ => format!("  NULL AS \"{field}\""),
-                })
+                .map(
+                    |field| match selects.get(*field).and_then(|m| m.get(table)) {
+                        Some(col) => format!("  \"{col}\" AS \"{field}\""),
+                        None => format!("  NULL AS \"{field}\""),
+                    },
+                )
                 .collect();
+            if fold {
+                cols.push("  \"block_number\"".into());
+                cols.push("  \"log_index\"".into());
+            }
             format!("SELECT\n{}\nFROM \"{table}\"", cols.join(",\n"))
         })
         .collect();
-    format!("{};", arms.join("\nUNION ALL\n"))
+    let inner = arms.join("\nUNION ALL\n");
+    if !fold {
+        return format!("{inner};");
+    }
+    let outer: Vec<String> = fields
+        .iter()
+        .map(|field| {
+            if *field == "id" {
+                "  \"id\"".into()
+            } else {
+                format!(
+                    "  last(\"{field}\" ORDER BY \"block_number\", \"log_index\") FILTER (WHERE \"{field}\" IS NOT NULL) AS \"{field}\""
+                )
+            }
+        })
+        .collect();
+    format!(
+        "SELECT\n{}\nFROM (\n{}\n)\nGROUP BY \"id\";",
+        outer.join(",\n"),
+        inner
+    )
 }
 
-fn map_exact_field(
+fn map_exact_field_tables(
     field: &crate::port_report::FieldRow,
     mappings: &crate::port_report::Mappings,
     config: &Config,
-) -> Option<(String, String)> {
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
     for func in mappings.functions.values() {
         if func.kind == crate::port_report::HandlerKind::Block {
             continue;
@@ -358,7 +391,60 @@ fn map_exact_field(
             let Some(table) = table_for_handler(&handler.name, mappings, config) else {
                 continue;
             };
-            return Some((table, col));
+            out.entry(table).or_insert(col);
+        }
+    }
+    out
+}
+
+/// A table that writes other Exact fields still needs an id column so UNION ALL can fold
+/// on the entity, not on a NULL-padded arm. `Token.load(event.params.token)` is that column.
+fn fill_id_columns(
+    entity: &str,
+    selects: &mut BTreeMap<String, BTreeMap<String, String>>,
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+) {
+    if !selects.contains_key("id") {
+        return;
+    }
+    let tables: Vec<String> = selects
+        .values()
+        .flat_map(|m| m.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for table in tables {
+        if selects.get("id").is_some_and(|m| m.contains_key(&table)) {
+            continue;
+        }
+        if let Some(col) = id_column_for_table(entity, &table, mappings, config) {
+            selects.entry("id".into()).or_default().insert(table, col);
+        }
+    }
+}
+
+fn id_column_for_table(
+    entity: &str,
+    table: &str,
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+) -> Option<String> {
+    for func in mappings.functions.values() {
+        if func.kind == crate::port_report::HandlerKind::Block {
+            continue;
+        }
+        let Some(handler) = event_handler_for(func, mappings) else {
+            continue;
+        };
+        let Some(t) = table_for_handler(&handler.name, mappings, config) else {
+            continue;
+        };
+        if t != table {
+            continue;
+        }
+        if let Some(col) = crate::port_report::entity_id_event_column(entity, func) {
+            return Some(col);
         }
     }
     None
@@ -439,48 +525,57 @@ mod tests {
         assert_ne!(n0, n1);
     }
 
+    fn put(
+        selects: &mut BTreeMap<String, BTreeMap<String, String>>,
+        field: &str,
+        table: &str,
+        col: &str,
+    ) {
+        selects
+            .entry(field.into())
+            .or_default()
+            .insert(table.into(), col.into());
+    }
+
     #[test]
     fn exact_select_keeps_fields_from_every_table() {
         let mut selects = BTreeMap::new();
-        selects.insert(
-            "symbol".into(),
-            ("factory__pool_created".into(), "token0".into()),
-        );
-        selects.insert(
-            "name".into(),
-            ("factory__token_updated".into(), "name".into()),
-        );
+        put(&mut selects, "id", "factory__pool_created", "token0");
+        put(&mut selects, "id", "factory__token_updated", "token");
+        put(&mut selects, "symbol", "factory__pool_created", "token0");
+        put(&mut selects, "name", "factory__token_updated", "name");
         let sql = exact_select_sql(&selects);
         assert!(sql.contains("UNION ALL"), "{sql}");
+        assert!(sql.contains("GROUP BY \"id\""), "{sql}");
+        assert!(
+            sql.contains("last(\"symbol\" ORDER BY \"block_number\", \"log_index\")")
+                && sql.contains("FILTER (WHERE \"symbol\" IS NOT NULL)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("last(\"name\" ORDER BY \"block_number\", \"log_index\")")
+                && sql.contains("FILTER (WHERE \"name\" IS NOT NULL)"),
+            "{sql}"
+        );
         assert!(sql.contains("\"token0\" AS \"symbol\""), "{sql}");
         assert!(sql.contains("\"name\" AS \"name\""), "{sql}");
         assert!(sql.contains("NULL AS \"symbol\""), "{sql}");
         assert!(sql.contains("NULL AS \"name\""), "{sql}");
         assert!(sql.contains("FROM \"factory__pool_created\""), "{sql}");
         assert!(sql.contains("FROM \"factory__token_updated\""), "{sql}");
-        let arms: Vec<&str> = sql.split("UNION ALL").collect();
-        assert_eq!(arms.len(), 2, "{sql}");
-        for arm in &arms {
-            let name_at = arm.find("AS \"name\"").expect(arm);
-            let symbol_at = arm.find("AS \"symbol\"").expect(arm);
-            assert!(name_at < symbol_at, "BTreeMap field order, got {arm}");
-        }
+        assert!(!sql.to_ascii_lowercase().contains(" join "), "{sql}");
     }
 
     #[test]
     fn exact_select_stays_one_table_when_all_columns_share_it() {
         let mut selects = BTreeMap::new();
-        selects.insert(
-            "id".into(),
-            ("factory__pool_created".into(), "token0".into()),
-        );
-        selects.insert(
-            "symbol".into(),
-            ("factory__pool_created".into(), "token0".into()),
-        );
+        put(&mut selects, "id", "factory__pool_created", "token0");
+        put(&mut selects, "symbol", "factory__pool_created", "token0");
         let sql = exact_select_sql(&selects);
         assert!(!sql.contains("UNION ALL"), "{sql}");
         assert!(!sql.contains("NULL AS"), "{sql}");
+        assert!(sql.contains("GROUP BY \"id\""), "{sql}");
+        assert!(sql.contains("last(\"symbol\""), "{sql}");
         assert!(sql.contains("\"token0\" AS \"id\""), "{sql}");
         assert!(sql.contains("\"token0\" AS \"symbol\""), "{sql}");
         assert!(sql.contains("FROM \"factory__pool_created\""), "{sql}");
