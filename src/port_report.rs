@@ -625,7 +625,7 @@ pub(crate) fn load_mappings(dir: &Path) -> Result<Mappings> {
         }
     }
     let mut files: BTreeSet<PathBuf> = yaml_files.into_iter().collect();
-    walk_ts(dir, dir, &mut files);
+    walk_ts(dir, &mut files);
     let mut functions = BTreeMap::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -769,7 +769,7 @@ impl Ord for HandlerKind {
     }
 }
 
-fn walk_ts(root: &Path, dir: &Path, files: &mut BTreeSet<PathBuf>) {
+fn walk_ts(dir: &Path, files: &mut BTreeSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -784,7 +784,7 @@ fn walk_ts(root: &Path, dir: &Path, files: &mut BTreeSet<PathBuf>) {
             ) {
                 continue;
             }
-            walk_ts(root, &path, files);
+            walk_ts(&path, files);
         } else if name.ends_with(".ts") || name.ends_with(".as") {
             files.insert(path);
         }
@@ -838,9 +838,7 @@ fn match_function_name(text: &str, i: usize) -> Option<std::ops::Range<usize>> {
     }
     let rest = &text[i..];
     // Word-boundary `function NAME`.
-    let Some(at) = rest.find("function") else {
-        return None;
-    };
+    let at = rest.find("function")?;
     if at != 0 {
         return None;
     }
@@ -1639,12 +1637,10 @@ fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(
                     let is_assign = n < bytes.len()
                         && bytes[n] == b'='
                         && !(n + 1 < bytes.len() && bytes[n + 1] == b'=');
-                    if !is_call && !is_assign {
-                        if var != "event" {
-                            if let Some(entity) = bindings.get(var) {
-                                if field != "id" && field != "save" {
-                                    out.push((entity.clone(), field.to_string()));
-                                }
+                    if !is_call && !is_assign && var != "event" {
+                        if let Some(entity) = bindings.get(var) {
+                            if field != "id" && field != "save" {
+                                out.push((entity.clone(), field.to_string()));
                             }
                         }
                     }
@@ -1688,7 +1684,8 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
     }
 
     // Return class of a helper: what `x = helper(...)` inherits. Not applied to every
-    // assignment inside a mixed event handler.
+    // assignment inside a mixed event handler. Walk the call graph so a wrapper around
+    // a contract-call helper is itself call-derived.
     let mut fn_class: BTreeMap<String, Class> = BTreeMap::new();
     for (name, func) in functions {
         let mut c = Class::Exact;
@@ -1703,6 +1700,7 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
         }
         fn_class.insert(name.clone(), c);
     }
+    propagate_fn_class(functions, &mut fn_class);
 
     let mut field_class: BTreeMap<(String, String), (Class, Citation, String)> = BTreeMap::new();
 
@@ -1772,18 +1770,16 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
                 }
             }
             for (field, owner) in &unique_fields {
-                if func
+                if (func
                     .assignments
                     .iter()
                     .any(|a| a.expr.contains(&format!(".{field}")))
-                    || func.field_reads.iter().any(|(_, f)| f == field)
-                {
-                    if snapshot
+                    || func.field_reads.iter().any(|(_, f)| f == field))
+                    && snapshot
                         .get(&(owner.clone(), field.clone()))
                         .is_some_and(|(c, _, _)| *c == Class::FixedPoint)
-                    {
-                        bump = true;
-                    }
+                {
+                    bump = true;
                 }
             }
             if bump {
@@ -1793,6 +1789,9 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
                     changed = true;
                 }
             }
+        }
+        if propagate_fn_class(functions, &mut fn_class) {
+            changed = true;
         }
         if !changed {
             break;
@@ -1815,6 +1814,33 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
         .collect();
     rows.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.field.cmp(&b.field)));
     rows
+}
+
+fn propagate_fn_class(
+    functions: &BTreeMap<String, FunctionInfo>,
+    fn_class: &mut BTreeMap<String, Class>,
+) -> bool {
+    let mut any = false;
+    for _ in 0..16 {
+        let mut changed = false;
+        for (name, func) in functions {
+            let mut c = fn_class.get(name).copied().unwrap_or(Class::Exact);
+            for callee in &func.calls {
+                if let Some(cc) = fn_class.get(callee) {
+                    c = c.max(*cc);
+                }
+            }
+            if fn_class.get(name).copied() != Some(c) {
+                fn_class.insert(name.clone(), c);
+                changed = true;
+                any = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    any
 }
 
 fn worst_writer(
@@ -2878,6 +2904,34 @@ export function fetchTokenSymbol(tokenAddress: Address): string {
 export function handlePoolCreated(event: PoolCreated): void {
   let token0 = new Token(event.params.token0.toHex())
   token0.symbol = fetchTokenSymbol(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    #[test]
+    fn nested_helper_is_call_derived() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let mapping = r#"
+export function readSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  return contract.try_symbol().value
+}
+export function fetchSymbol(tokenAddress: Address): string {
+  return readSymbol(tokenAddress)
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = fetchSymbol(event.params.token0)
   token0.save()
 }
 "#;
