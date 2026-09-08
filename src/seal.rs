@@ -77,6 +77,18 @@ pub fn segment_path(dir: &Path, file: &str, hash: &str) -> PathBuf {
 }
 pub const MANIFEST_FILE: &str = "manifest.json";
 
+/// Catalogue version this binary writes. Absent in a file on disk is version 0 (RFC-0047 C2).
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Writer settings this binary seals with: SNAPPY, crate-default dictionary and statistics, no
+/// blooms, no sort metadata. A segment whose field is missing deserialises as this, not as unknown
+/// (#1223 / #1234). Changing the settings is a new name, not a silent rewrite of this one.
+pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
+
+fn default_writer_profile() -> String {
+    ORIGINAL_WRITER_PROFILE.to_string()
+}
+
 /// One sealed Parquet file. `hash` is the content address (sha256 of the file bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
@@ -98,6 +110,10 @@ pub struct Segment {
     /// was final.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provisional: bool,
+    /// Which `write_parquet` settings produced these bytes. Missing deserialises as
+    /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
+    #[serde(default = "default_writer_profile")]
+    pub writer_profile: String,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
@@ -154,6 +170,10 @@ pub(crate) fn test_set_table_floor(dir: &Path, rows: usize) {
 /// The segment catalogue: per-table lists of sealed segments.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
+    /// 0 when the field is absent (every catalogue written before RFC-0047 C2). This binary writes
+    /// [`MANIFEST_VERSION`]. Additive fields bump nothing; a breaking catalogue change bumps this.
+    #[serde(default)]
+    pub manifest_version: u32,
     pub tables: BTreeMap<String, Vec<Segment>>,
 }
 
@@ -285,9 +305,11 @@ pub fn seal_range_with_snapshot(
             // so the latest snapshot covers every row in the file; the earlier ones covered less.
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
+            writer_profile: ORIGINAL_WRITER_PROFILE.to_string(),
         });
     }
 
+    manifest.manifest_version = MANIFEST_VERSION;
     save_manifest(dir, &manifest)?;
     // The manifest is installed and fsynced; nothing references these any more. A failure here is
     // a stray file, which is disk and not data, so it is logged rather than returned: the seal
@@ -991,6 +1013,47 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     Ok(quarantined)
 }
 
+/// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is
+/// [`verify_and_quarantine`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CatalogueCheck {
+    pub manifest_version: u32,
+    pub segments: usize,
+    pub missing: Vec<String>,
+    pub hash_mismatch: Vec<String>,
+}
+
+impl CatalogueCheck {
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty() && self.hash_mismatch.is_empty()
+    }
+}
+
+/// Every catalogue entry's file exists and hashes. A missing file or a hash mismatch is reported,
+/// not quarantined, so `nuthatch doctor --catalogue` cannot yank data.
+pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
+    let manifest = load_manifest(dir)?;
+    let mut out = CatalogueCheck {
+        manifest_version: manifest.manifest_version,
+        ..Default::default()
+    };
+    for segs in manifest.tables.values() {
+        for s in segs {
+            out.segments += 1;
+            let path = segment_path(dir, &s.file, &s.hash);
+            match std::fs::read(&path) {
+                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {}
+                Ok(_) => out.hash_mismatch.push(s.file.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    out.missing.push(s.file.clone())
+                }
+                Err(_) => out.hash_mismatch.push(s.file.clone()),
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary
@@ -1254,6 +1317,52 @@ mod tests {
             "9",
             "unpadded decimal text; as UTF-8, \"9\" > \"10\""
         );
+    }
+
+    /// RFC-0047 C2 / #1223. A catalogue written before this field existed is version 0, and every
+    /// segment in it was the original writer profile, not an unknown one.
+    #[test]
+    fn an_old_manifest_is_version_zero_and_names_the_original_writer_profile() {
+        let raw = r#"{"tables":{"t":[{"hash":"aa","from_block":1,"to_block":1,"rows":1,"file":"t.parquet"}]}}"#;
+        let m: Manifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.manifest_version, 0);
+        assert_eq!(
+            m.tables["t"][0].writer_profile, ORIGINAL_WRITER_PROFILE,
+            "a missing writer_profile is the original profile, not unknown"
+        );
+    }
+
+    #[test]
+    fn a_new_seal_writes_manifest_version_and_the_original_writer_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let m = load_manifest(dir.path()).unwrap();
+        assert_eq!(m.manifest_version, MANIFEST_VERSION);
+        assert_eq!(
+            m.tables["usdc__transfer"][0].writer_profile,
+            ORIGINAL_WRITER_PROFILE
+        );
+        assert!(check_catalogue(dir.path()).unwrap().ok());
+    }
+
+    /// `doctor --catalogue` reports; it does not move the file. Startup quarantine is a different
+    /// function, and a diagnostic that yanks data is the defect this exists to prevent.
+    #[test]
+    fn check_catalogue_reports_a_hash_mismatch_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = &m.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        std::fs::write(&path, b"not the bytes that were hashed").unwrap();
+        let check = check_catalogue(dir.path()).unwrap();
+        assert_eq!(check.hash_mismatch, vec![seg.file.clone()]);
+        assert!(check.missing.is_empty());
+        assert!(path.exists(), "the diagnostic must not quarantine");
     }
 
     /// RFC-0047 C3 / #1224. `write_parquet` sets SNAPPY and nothing else; crate defaults freeze

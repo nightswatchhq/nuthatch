@@ -130,6 +130,7 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--dir <DIR>` - Nest directory to read `rpc_urls` from when no `--rpc` is given
 - `--address <ADDRESS>` - Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one
 - `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
+- `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
 
 ## `nuthatch init`
 
