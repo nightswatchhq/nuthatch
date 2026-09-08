@@ -319,13 +319,19 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | DuckDB worker threads. Above 16 is refused; not a term in the RAM equation |
 | `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory) |
 | `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | unset (DuckDB's disk default) | spill bound; this is disk, not RAM, and does not buy room in the equation above |
-| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest. The 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6) |
+| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand DuckDB headroom against a reservation no code enforces |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 
 Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
 count, still capped at 16, and is **not** an unconstrained config key. `analytics.threads` shares
 that ceiling. Raising permits without lowering `analytics.memory_limit` is refused at startup:
 four permits at 512 MB each plus the derived ingest floor is 3072 MB.
+
+`ingestion_reservation` may be raised and not lowered, which is what makes the inequality worth
+having. The consequence is the property to hold onto: **no configuration this gate accepts gives
+DuckDB more RAM than the shipped default that the footprint CI job measures.** The gate is
+arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
+materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
 
 **Ingestion liveness outranks query completion.** A query that cannot run in its budget fails naming
 these keys. It never degrades block processing.

@@ -64,14 +64,25 @@ impl AnalyticsConfig {
 
 /// Named ingest floor left after the shipped DuckDB split:
 /// `2048 - (SQL_MAX_CONCURRENCY × DEFAULT_MEMORY_LIMIT_MB)`. Not an ingest RSS cap.
+///
+/// **It is a floor and not a slider**, which is the whole reason the inequality means anything.
+/// Nothing in the runtime caps ingest, DBSP, redb or result materialisation at this figure, so a
+/// config that lowered it would not shrink ingest by one byte - it would only buy DuckDB headroom
+/// against a promise no code keeps, and the cursor could then exceed 2 GiB with the gate green.
+/// `runtime_headroom` is inside this number for the same reason: it is unmeasured, so it cannot be
+/// a term an operator gets to spend. Raising the reservation is the conservative direction and is
+/// allowed; lowering it is refused by [`validate_against`]. The consequence is the property worth
+/// stating: **no accepted split hands DuckDB more RAM than the shipped default the footprint CI
+/// job actually measures.**
 pub fn derived_ingestion_reservation_mb() -> u64 {
     crate::runtime::DEFAULT_MAX_RSS_MB
         .saturating_sub(crate::serve::SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB)
 }
 
-/// Read the live operator settings. Invalid values fall back to the shipped default and warn.
-/// A DuckDB split that does not leave a non-zero named ingest floor, and a thread count above
-/// [`THREADS_CEILING`], are the validator's job.
+/// Read the live operator settings. Unparseable values fall back to the shipped default and warn.
+/// A DuckDB split that dips under the named ingest floor, and a thread count above
+/// [`THREADS_CEILING`], are the validator's job - including an explicit zero reservation, which is
+/// carried through as `Some(0)` so it is refused rather than read as "unset".
 pub fn from_env() -> AnalyticsConfig {
     AnalyticsConfig {
         memory_limit_mb: env_u64_memory(ENV_MEMORY_LIMIT, DEFAULT_MEMORY_LIMIT_MB),
@@ -82,10 +93,12 @@ pub fn from_env() -> AnalyticsConfig {
     }
 }
 
-/// Refuses a DuckDB split that does not leave a non-zero named ingest floor
-/// (`(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`)
-/// and a thread count above [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result
-/// materialisation; 2 GiB is the footprint CI job / process RSS wall.
+/// Refuses a DuckDB split that breaches
+/// `(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`,
+/// an `ingestion_reservation` below [`derived_ingestion_reservation_mb`], and a thread count above
+/// [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result materialisation - which is
+/// exactly why the reservation may only be raised. 2 GiB is the footprint CI job / process RSS
+/// wall; this is the arithmetic that keeps a config from being allowed to breach it quietly.
 pub fn validate_cursor_budget() -> Result<()> {
     validate_against(&from_env(), crate::serve::sql_max_concurrency())
 }
@@ -114,8 +127,17 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     }
     let duck = permits.saturating_mul(cfg.memory_limit_mb);
     let reservation = cfg.reservation_mb();
-    if reservation == 0 {
-        bail!("ingestion_reservation must be greater than zero (set {ENV_INGESTION_RESERVATION})");
+    let floor = derived_ingestion_reservation_mb();
+    if reservation < floor {
+        bail!(
+            "ingestion_reservation is {reservation} MB, below the floor of {floor} MB (set \
+             {ENV_INGESTION_RESERVATION}). It is a floor, not a slider: nothing caps ingest, DBSP, \
+             redb or result materialisation at this figure, so writing a smaller number does not \
+             shrink ingest - it only hands DuckDB headroom against a reservation no code enforces, \
+             and the cursor can then pass this gate and still exceed the 2 GiB budget. Raise it to \
+             give DuckDB less; lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
+             NUTHATCH_SQL_MAX_CONCURRENCY if you need room elsewhere."
+        );
     }
     let headroom = RUNTIME_HEADROOM_MB;
     let total = duck.saturating_add(reservation).saturating_add(headroom);
@@ -154,16 +176,19 @@ fn env_u64_memory(key: &str, default: u64) -> u64 {
     }
 }
 
+/// An explicit `0` is a *value*, and an invalid one - it must reach the validator and be refused
+/// there, naming the key. Folding it into `None` made it mean "unset", so the derived default
+/// applied and the process started, which is the opposite of what the operator wrote.
 fn env_optional_memory(key: &str) -> Option<u64> {
     match std::env::var(key) {
         Err(_) => None,
         Ok(raw) if raw.trim().is_empty() => None,
         Ok(raw) => match parse_memory_mb(&raw) {
-            Some(n) if n > 0 => Some(n),
-            _ => {
+            Some(n) => Some(n),
+            None => {
                 tracing::warn!(
                     value = %raw,
-                    "{key} is not a positive size in MB or GB; leaving ingestion_reservation unset"
+                    "{key} is not a size in MB or GB; leaving ingestion_reservation unset"
                 );
                 None
             }
@@ -362,14 +387,70 @@ mod tests {
         assert!(err.contains("ingestion_reservation"), "{err}");
     }
 
+    /// The finding on #1241: `2 × 768 + 512 = 2048` balances, and is still a cursor that can go
+    /// over 2 GiB, because the 512 reserves accounting space and caps nothing. A split may not buy
+    /// DuckDB room by writing down a smaller number for ingest.
     #[test]
-    fn explicit_lower_reservation_lets_memory_grow() {
+    fn lowering_the_reservation_to_buy_duckdb_memory_is_refused() {
         let cfg = AnalyticsConfig {
             memory_limit_mb: 768,
             ingestion_reservation_mb: Some(512),
             ..AnalyticsConfig::default()
         };
-        validate_against(&cfg, SQL_MAX_CONCURRENCY).expect("2 × 768 + 512 = 2048");
+        let err = validate_against(&cfg, SQL_MAX_CONCURRENCY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ingestion_reservation") && err.contains("floor"),
+            "must say the reservation is a floor: {err}"
+        );
+        assert!(err.contains(ENV_INGESTION_RESERVATION), "{err}");
+    }
+
+    /// Raising it is the conservative direction and stays allowed: DuckDB gets less, not more.
+    #[test]
+    fn raising_the_reservation_is_allowed_and_shrinks_duckdb() {
+        let cfg = AnalyticsConfig {
+            memory_limit_mb: 256,
+            ingestion_reservation_mb: Some(1536),
+            ..AnalyticsConfig::default()
+        };
+        validate_against(&cfg, SQL_MAX_CONCURRENCY).expect("2 × 256 + 1536 = 2048");
+    }
+
+    /// The property the floor buys, stated as a test rather than as a paragraph: whatever an
+    /// operator writes, an accepted split never hands DuckDB more than the shipped default that
+    /// the footprint CI job measures.
+    #[test]
+    fn no_accepted_split_gives_duckdb_more_than_the_measured_default() {
+        let shipped = SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB;
+        let mut accepted = 0;
+        for permits in 1..=SQL_MAX_CONCURRENCY_CEILING {
+            for memory_limit_mb in [64, 128, 256, 512, 768, 1024, 1536, 2048] {
+                for reservation in [0, 256, 512, 1023, 1024, 1536, 2048] {
+                    let cfg = AnalyticsConfig {
+                        memory_limit_mb,
+                        ingestion_reservation_mb: Some(reservation),
+                        ..AnalyticsConfig::default()
+                    };
+                    if validate_against(&cfg, permits).is_err() {
+                        continue;
+                    }
+                    accepted += 1;
+                    let duck = permits as u64 * memory_limit_mb;
+                    assert!(
+                        duck <= shipped,
+                        "accepted {permits} × {memory_limit_mb} MB = {duck} MB of DuckDB with a \
+                         {reservation} MB reservation, above the measured default of {shipped} MB"
+                    );
+                }
+            }
+        }
+        assert!(
+            accepted > 10,
+            "only {accepted} splits were accepted; the gate refuses everything and the assertion \
+             above is vacuous"
+        );
     }
 
     #[test]
@@ -413,7 +494,7 @@ mod tests {
     #[test]
     fn zero_ingest_reservation_is_refused() {
         let cfg = AnalyticsConfig {
-            memory_limit_mb: 2048,
+            memory_limit_mb: 512,
             ingestion_reservation_mb: Some(0),
             ..AnalyticsConfig::default()
         };
@@ -487,6 +568,41 @@ mod tests {
             err.contains(ENV_THREADS),
             "must name the env key an operator can actually set: {err}"
         );
+    }
+
+    /// The second finding on #1241. `NUTHATCH_INGESTION_RESERVATION=0` used to fall through to
+    /// `None`, so the derived 1024 applied and the process started - the documented knob could not
+    /// express the one value it is documented to reject.
+    #[test]
+    fn an_explicit_zero_reservation_reaches_the_validator() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_INGESTION_RESERVATION).ok();
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.as_deref() {
+                    Some(v) => std::env::set_var(ENV_INGESTION_RESERVATION, v),
+                    None => std::env::remove_var(ENV_INGESTION_RESERVATION),
+                }
+            }
+        }
+        std::env::set_var(ENV_INGESTION_RESERVATION, "0");
+        let _restore = Restore(prev);
+        let cfg = from_env();
+        assert_eq!(
+            cfg.ingestion_reservation_mb,
+            Some(0),
+            "an explicit 0 must not read as unset"
+        );
+        assert_ne!(
+            cfg.reservation_mb(),
+            derived_ingestion_reservation_mb(),
+            "a written 0 must not silently become the derived default"
+        );
+        let err = validate_against(&cfg, SQL_MAX_CONCURRENCY)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(ENV_INGESTION_RESERVATION), "{err}");
     }
 
     #[test]
