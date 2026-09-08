@@ -302,7 +302,33 @@ Nests live in their own repositories rather than in-tree; see the
 
 **The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. This
 is a CI-enforced ceiling, not an aspiration, and `dev` **refuses to start** a cursor whose
-projected footprint exceeds `max_rss_mb` (default 2048).
+projected footprint exceeds `max_rss_mb` (default 2048). It also refuses to start unless the
+analytical split itself fits that ceiling (RFC-0047 C4):
+
+```
+(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
+```
+
+`sql_permits` is cursor-wide (the same gate every nest on the cursor shares), default 2. The
+analytics knobs are **runtime**, not nest identity: they live in the environment, never in
+`nuthatch.toml`, so two operators with different RAM still share a nest content address.
+
+| Key | Env | Default | What it is |
+|---|---|---|---|
+| `analytics.memory_limit` | `NUTHATCH_ANALYTICS_MEMORY_LIMIT` | 512MB | DuckDB `max_memory` per connection |
+| `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 | DuckDB worker threads |
+| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory) |
+| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | unset (DuckDB's disk default) | spill bound; this is disk, not RAM, and does not buy room in the equation above |
+| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest. The 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6) |
+| `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
+
+Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
+count, still capped at 16, and is **not** an unconstrained config key. Raising it without lowering
+`analytics.memory_limit` is refused at startup: four permits at 512 MB each plus the derived ingest
+floor is 3072 MB.
+
+**Ingestion liveness outranks query completion.** A query that cannot run in its budget fails naming
+these keys. It never degrades block processing.
 
 The projection model (deliberately rough):
 
@@ -738,7 +764,8 @@ job:
 |---|---|---|
 | statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
 | max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
-| max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503` |
+| max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503`. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
+| DuckDB memory / threads | 512 MB / 2 | `analytics.memory_limit` / `analytics.threads`. Product with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
 

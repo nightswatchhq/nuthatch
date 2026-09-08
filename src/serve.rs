@@ -25,10 +25,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// How many analytical (DuckDB) queries may run at once across `/sql` and cold `/table` reads. Each
-/// DuckDB query is already capped at 512 MB / 2 threads (see `analytics`), so this bounds the whole
-/// analytical surface's worst-case footprint - the real DoS multiplier is *concurrency*, not any one
-/// query. Kept small to stay well inside the embedded RAM budget; this is node self-protection, not
-/// per-caller rate-limiting (that needs identity and belongs in a gateway).
+/// DuckDB query is capped at `analytics.memory_limit` / `analytics.threads` (defaults 512 MB / 2;
+/// see `analytics_budget`), so this bounds the whole analytical surface's worst-case footprint - the
+/// real DoS multiplier is *concurrency*, not any one query. Kept small to stay well inside the
+/// embedded RAM budget; this is node self-protection, not per-caller rate-limiting (that needs
+/// identity and belongs in a gateway). The permit count is not an unconstrained config key.
 pub const SQL_MAX_CONCURRENCY: usize = 2;
 
 /// Hard ceiling on the override below.
