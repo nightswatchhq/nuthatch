@@ -1337,12 +1337,13 @@ fn take_expr(text: &str, start: usize) -> String {
         } else if b == b';' && depth == 0 {
             break;
         } else if b == b'\n' && depth == 0 {
-            // one-line assignment; keep going if the next non-ws is a continuation operator
+            // Keep a wrapped RHS (`=\n  fetchTokenSymbol(...)`). Stop on a new
+            // assignment, `entity.save()`, or a blank line.
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() && bytes[j] != b'\n' {
                 j += 1;
             }
-            if j < bytes.len() && (bytes[j] == b'.' || bytes[j] == b'+' || bytes[j] == b'(') {
+            if continues_expr(text, j) {
                 i += 1;
                 continue;
             }
@@ -1351,6 +1352,46 @@ fn take_expr(text: &str, start: usize) -> String {
         i += 1;
     }
     text[start..i].trim().to_string()
+}
+
+fn continues_expr(text: &str, j: usize) -> bool {
+    let bytes = text.as_bytes();
+    if j >= bytes.len() {
+        return false;
+    }
+    let b = bytes[j];
+    if b == b'.' || b == b'+' || b == b'(' {
+        return true;
+    }
+    if !(b.is_ascii_alphabetic() || b == b'_') {
+        return false;
+    }
+    if match_assign(text, j).is_some() || is_entity_save(text, j) {
+        return false;
+    }
+    let mut k = j;
+    match take_ident_str(text, &mut k).as_deref() {
+        Some(
+            "let" | "const" | "var" | "return" | "if" | "for" | "while" | "function" | "export",
+        ) => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn is_entity_save(text: &str, i: usize) -> bool {
+    let mut k = i;
+    if take_ident_str(text, &mut k).is_none() {
+        return false;
+    }
+    skip_ws_str(text, &mut k);
+    let bytes = text.as_bytes();
+    if k >= bytes.len() || bytes[k] != b'.' {
+        return false;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    take_ident_str(text, &mut k).as_deref() == Some("save")
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -2064,6 +2105,35 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    #[test]
+    fn multiline_helper_rhs_is_call_derived() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+  name: String!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  return contract.try_symbol().value
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol =
+    fetchTokenSymbol(event.params.token0)
+  token0.name = event.params.name
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        assert_eq!(class_of(&rows, "Token", "name"), Class::Exact);
+        assert!(reason_of(&rows, "Token", "symbol").contains("fetchTokenSymbol"));
     }
 
     #[test]
