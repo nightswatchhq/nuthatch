@@ -360,6 +360,18 @@ fn view_for_entity(
 
 /// Latest mapped value per entity id. Several tables overlay with UNION ALL (not a JOIN);
 /// `last() FILTER` skips a later arm's NULL so it cannot wipe an earlier write.
+/// Prefix for the per-field presence marker in the inner union. `__` is reserved in GraphQL
+/// (introspection), so no entity field can collide with it.
+const PRESENT: &str = "__present__";
+
+/// The exact-field view: one arm per triggering table, folded to the last value per id.
+///
+/// **The fold filters on presence, not on NULL.** An arm for a table that does not carry a field
+/// has to emit something for it, and that something is NULL; folding with `FILTER (WHERE field IS
+/// NOT NULL)` stopped that structural NULL erasing a real value from another arm, but it could not
+/// tell it from a genuine one. A nullable entity field cleared by a later event kept its old value
+/// for good, and the view called that exact. The marker says which arm actually carried the field,
+/// so a real NULL wins the fold and a structural one still does not.
 fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> String {
     let mut tables = BTreeSet::new();
     for by_table in selects.values() {
@@ -372,10 +384,16 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
         .map(|table| {
             let mut cols: Vec<String> = fields
                 .iter()
-                .map(
+                .flat_map(
                     |field| match selects.get(*field).and_then(|m| m.get(table)) {
-                        Some(col) => format!("  \"{col}\" AS \"{field}\""),
-                        None => format!("  NULL AS \"{field}\""),
+                        Some(col) => [
+                            format!("  \"{col}\" AS \"{field}\""),
+                            format!("  TRUE AS \"{PRESENT}{field}\""),
+                        ],
+                        None => [
+                            format!("  NULL AS \"{field}\""),
+                            format!("  FALSE AS \"{PRESENT}{field}\""),
+                        ],
                     },
                 )
                 .collect();
@@ -397,7 +415,7 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
                 "  \"id\"".into()
             } else {
                 format!(
-                    "  last(\"{field}\" ORDER BY \"block_number\", \"log_index\") FILTER (WHERE \"{field}\" IS NOT NULL) AS \"{field}\""
+                    "  last(\"{field}\" ORDER BY \"block_number\", \"log_index\") FILTER (WHERE \"{PRESENT}{field}\") AS \"{field}\""
                 )
             }
         })
@@ -634,6 +652,69 @@ mod tests {
         );
     }
 
+    /// Jules on #1244. The fold used to filter on `field IS NOT NULL`, which cannot tell an arm
+    /// that never carried the field from an event that genuinely cleared it. A nullable field set
+    /// and then cleared kept its old value for good, and the view called that exact. Run against
+    /// real DuckDB, because the whole claim is about what the SQL returns.
+    #[test]
+    fn a_later_explicit_null_clears_the_field_and_a_missing_column_does_not() {
+        let mut selects = BTreeMap::new();
+        put(&mut selects, "id", "factory__pool_created", "token0");
+        put(&mut selects, "id", "factory__token_updated", "token");
+        put(&mut selects, "symbol", "factory__pool_created", "sym");
+        put(&mut selects, "name", "factory__token_updated", "name");
+        let sql = exact_select_sql(&selects);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE factory__pool_created (token0 VARCHAR, sym VARCHAR, \
+               block_number BIGINT, log_index BIGINT);
+             CREATE TABLE factory__token_updated (token VARCHAR, name VARCHAR, \
+               block_number BIGINT, log_index BIGINT);
+             INSERT INTO factory__pool_created VALUES ('0xaa', 'AAA', 1, 0);
+             INSERT INTO factory__token_updated VALUES ('0xaa', 'old name', 2, 0);",
+        )
+        .unwrap();
+
+        let read = |conn: &duckdb::Connection| -> (Option<String>, Option<String>) {
+            let mut stmt = conn.prepare(sql.trim_end().trim_end_matches(';')).unwrap();
+            let rows: Vec<(Option<String>, Option<String>)> = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>("name")?,
+                        r.get::<_, Option<String>>("symbol")?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1, "one id, one row: {rows:?}");
+            rows[0].clone()
+        };
+
+        let (name, symbol) = read(&conn);
+        assert_eq!(name.as_deref(), Some("old name"));
+        assert_eq!(
+            symbol.as_deref(),
+            Some("AAA"),
+            "the token_updated arm carries no symbol, and its structural NULL must not erase this"
+        );
+
+        // A later event clears the field. This is the one the old filter could not see.
+        conn.execute_batch("INSERT INTO factory__token_updated VALUES ('0xaa', NULL, 3, 0);")
+            .unwrap();
+        let (name, symbol) = read(&conn);
+        assert_eq!(
+            name, None,
+            "an explicit NULL at a later block clears the field; it returned {name:?}"
+        );
+        assert_eq!(
+            symbol.as_deref(),
+            Some("AAA"),
+            "and the other arm's value is still not erased"
+        );
+    }
+
     #[test]
     fn unique_call_name_distinguishes_columns() {
         let mut used = BTreeSet::new();
@@ -680,12 +761,12 @@ mod tests {
         assert!(sql.contains("GROUP BY \"id\""), "{sql}");
         assert!(
             sql.contains("last(\"symbol\" ORDER BY \"block_number\", \"log_index\")")
-                && sql.contains("FILTER (WHERE \"symbol\" IS NOT NULL)"),
+                && sql.contains("FILTER (WHERE \"__present__symbol\")"),
             "{sql}"
         );
         assert!(
             sql.contains("last(\"name\" ORDER BY \"block_number\", \"log_index\")")
-                && sql.contains("FILTER (WHERE \"name\" IS NOT NULL)"),
+                && sql.contains("FILTER (WHERE \"__present__name\")"),
             "{sql}"
         );
         assert!(sql.contains("\"token0\" AS \"symbol\""), "{sql}");
