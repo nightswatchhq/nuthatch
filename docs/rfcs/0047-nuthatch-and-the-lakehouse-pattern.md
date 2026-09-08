@@ -155,7 +155,8 @@ decision.
   not as a DuckDB trick, because it is the difference between a correct blockchain indexer and a
   plausible-looking one.
 - A page, **"Reading Nuthatch segments without Nuthatch"**, specifies directory layout, the
-  catalogue schema, ordering, and this encoding.
+  catalogue schema, ordering, and this encoding. The page is
+  [`docs/reading-segments.md`](../reading-segments.md).
 
 **What is a format version, and is not implied by the rest:**
 
