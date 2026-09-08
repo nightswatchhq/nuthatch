@@ -90,9 +90,9 @@ change requires mutating sealed segments, the design is wrong - go back.
   time over hot ∪ sealed. Not incremental.
 - Authored incremental entities: [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
   **shipped 2026-08-28** in 3.0.0-alpha, off the back of GraphOps feedback that a view recomputed on
-  every query gives the caller a name but no query-performance benefit. The 2026 feature freeze was
-  lifted for this work specifically and for nothing else, and that carve-out is now spent: the
-  ordered sequence in §9 is complete (#818, #820, #821, #822) and the freeze applies again in full.
+  every query gives the caller a name but no query-performance benefit. It was built under the 2026
+  feature freeze as the first of five carve-outs, and the ordered sequence in §9 is complete (#818,
+  #820, #821, #822). The freeze itself ended on 2026-09-08; see the build-order status below.
   An entity is declared in `entities.toml`, maintained by DBSP as blocks arrive, served from
   `/derived` and by name from `/sql`. Slice 3's criteria were measured against a copy of the real
   Lodestar nest: the panel it replaces went p50 2.15 s to 87.7 ms, and one block's update is flat at
@@ -162,85 +162,38 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 
 ## Build order (vertical slices; each ends runnable)
 
-> **Status 2026-08-20: slices 1-5 are shipped, and a feature freeze runs to the end of 2026.**
-> `docs/roadmap-2027.md` is the standing direction: no new capability this year, only bug fixes,
-> security, performance, maintenance, marketing, and making the delightful core (RFC-0015) best in
-> class. Slice 6 (ExEx, scaled mode) and the parked RFC work are **not cancelled** and not to be
-> started. Treat a proposal for new capability the way the out-of-scope list below is treated: say
-> so, rather than quietly building it. The list survives as the record of how the product was built.
+> **Status 2026-09-08: the 2026 feature freeze is over. Chief lifted it, in full, on 2026-09-08.**
+> Slices 1-5 are shipped. The freeze ran from 2026-08-20 and did what it was written to do: every
+> defect worth finding that quarter came from running the product rather than extending it. It ends
+> because there is now a body of design worth building, not because the discipline failed.
 >
-> **Five carve-outs, and only these five.** A carve-out is a decision Chief makes explicitly and
-> records here. It is not a precedent for the next proposal, and an approved RFC is not a carve-out
-> until it appears in this list.
+> **The carve-out mechanism is retired with it.** All five carve-outs were taken and all five are
+> spent: RFC-0041 (authored incremental entities, shipped 3.0.0-alpha), RFC-0042 (the no-DuckDB
+> investigation, closed KEEP DuckDB at §14), RFC-0051 (Monad), RFC-0050 (Robinhood Chain) and
+> RFC-0040 (the freshness dial, shipped 3.5.0). Their reasoning lives in those RFCs and in the
+> release notes; it is not repeated here. Nothing needs a carve-out any more, because nothing is
+> frozen that a decision has not separately deferred.
 >
-> 1. **RFC-0041, authored incremental entities (2026-08-24).** After GraphOps identified query-time
->    view recomputation as a product gap. Conditions in the entity-derivation section above.
-> 2. **RFC-0042, the Rust-native/no-DuckDB investigation (2026-08-25).** Was **sequenced behind
->    RFC-0041** - no slice until the entity work was done, because RFC-0042 §9 hands DuckDB four
->    roles inside RFC-0041 (parser, incremental reference, restart seed, entity serving) and moving
->    the engine while those roles were still being assigned would have made both unattributable.
+> **What the unfreeze is for.** One programme, chosen the day the freeze lifted: **RFC-0044 through
+> RFC-0048, in full.** The subgraph port skill, offchain data, x402 at the counter, the lakehouse
+> commitments, and pricing query access. They are one argument in five documents - the first RFCs
+> about what nuthatch guarantees to people who are not running it - and each proposes specifying
+> behaviour that already happens rather than inventing a mechanism. Every one of them leads with the
+> non-negotiable it appears to break and shows why it does not; **those arguments are load-bearing
+> and none of them is now waived.** RFC-0046 §1's test in particular is a build gate, not a
+> paragraph: *delete every payment feature from the tree and a self-hoster loses nothing.*
 >
->    **That condition is met: RFC-0041 shipped 2026-08-28.** The carve-out is **taken as of
->    2026-08-29, for slices 0 and 1 only** - the native bill of materials and role inventory (#935),
->    and the engine boundary plus parity corpus with DuckDB unchanged (#936). Sprint
->    `docs/sprint-exacting-egret.md`. **The product is byte-identical when those two close; nothing
->    is replaced.**
+> **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
+> `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
+> the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
+> RFC-0003, RFC-0023, RFC-0031, RFC-0033, RFC-0034 and RFC-0036 again on 2026-09-08, and closed
+> RFC-0013 and RFC-0021 the same day. Slice 6 below (ExEx, scaled mode) is not started. RFC-0042 is
+> parked to 2027-09-01 or a §14 trigger, and its fourth trigger still binds: **if RFC-0033 slice 4
+> (#357) is ever scheduled, reopen RFC-0042 before it, not after.**
 >
->    **Amended 2026-08-29: RFC-0042 is unfrozen in full**, board decision, taken with slices 0 and 1
->    complete and their findings on the table. It is the work that follows sprint `exacting-egret`.
->    Slices 2 to 6 - the DataFusion spike, the Turso spike, the composed path, the decision and the
->    native tail - no longer need a further carve-out.
->
->    **What does not change is the decision rule.** §0: *"There is no preferred answer. If evidence
->    says DuckDB remains best, it stays."* Unfreezing the work is not a decision to remove DuckDB, and
->    §7's no-sacrifice gate stands unaltered. **"Keep DuckDB, with these measured regressions" remains
->    a successful outcome**, and slice 0 already found evidence pointing that way: DuckDB is 10.6% of
->    clean build time while wasmtime and cranelift are 21.3%, so §1's premise that it *dominates* build
->    time is measured false, even though it is 93% of native artefact bytes.
->
->    §13's five conditions stop being a permission gate and become a **readiness checklist**. Four are
->    met; the outstanding one is the parity corpus (#945), which covers 7 of §6's shapes. A spike run
->    against a corpus that cannot see a chunk-seam defect would produce a number nobody should act on.
->
->    **CLOSED 2026-08-30. The decision is KEEP DuckDB, and this carve-out is spent.** Written as
->    **RFC-0042 §14**, on the six measured regressions listed there, at 78% confidence. Per §0 that is
->    one of the two admissible answers, not a failure to reach the other. The RFC is **parked, not
->    withdrawn**: §14 carries a reopen date of **2027-09-01** and four triggers, any one of which
->    reopens it earlier. Note the fourth especially - **if RFC-0033 slice 4 (#357) is ever scheduled,
->    reopen RFC-0042 before it, not after**, because swapping the engine before durable grafting wires
->    in costs nothing and after it costs a full recompute per derivation.
->
->    **Both carve-outs are now spent, and the 2026 feature freeze applies again in full.** A third and a
->    fourth were taken on 2026-09-03 and 2026-09-04, below, one chain each. A proposal to resume RFC-0042 work is a proposal for
->    a new carve-out and needs a §14 reopen condition recorded first. Two items escaped the park
->    because they are corrections and performance rather than capability, and §14 names them: the
->    false-serialisation correction, and revisiting `SQL_MAX_CONCURRENCY`.
->
-> 3. **RFC-0051, Monad as a built-in chain (2026-09-03).** Chief's decision, recorded the day it was
->    made, tracking #1136. The freeze was lifted for **this one chain and nothing else**: a registry
->    entry in `src/chains.rs` on the generic EVM path, its measured endpoints, the operator note, the
->    live-endpoints probe, and the two over-wide-range refusal shapes its public endpoints answer with.
->    The execution-lag guard the RFC draft proposed was **not built**; the seal boundary is a depth
->    of eight blocks rather than the `finalized` tag, an execution margin the RFC's addendum explains. RFC-0050 (Robinhood Chain) was **not** carved
->    out by this; it got its own, below. Spent when #1136 closed.
->
-> 4. **RFC-0050, Robinhood Chain as a built-in chain (2026-09-04).** Chief's decision, recorded the
->    day it was made, tracking #1133, by unfreezing the issue. Same shape and same limits as carve-out
->    three: a registry entry in `src/chains.rs` on the generic EVM path (the Arbitrum Nitro path
->    Arbitrum One already rides), its measured keyless endpoints, the operator note, the live-endpoints
->    probe. The seal boundary is `FinalizedTag` with a fallback depth sized for the 100 ms cadence, not
->    the `safe` tag the RFC's body recommends: `Finality` has no `safe` arm, adding one is a seal-loop
->    change rather than a data entry, and the RFC's addendum records the trade. No testnet entry, no
->    sequencer-feed head tracker, no chain-family refactor. Spent when #1133 closes.
->
-> 5. **RFC-0040, the freshness dial (2026-09-06).** Chief's decision, recorded the day it was made,
->    tracking #1173. Taken after the Alchemy bill: one Arbitrum cursor following tip was measured at
->    ~9,900 compute units a minute (~430M a month, roughly $185 on pay-as-you-go), for panels that
->    refresh every 2 to 15 minutes. The carve-out covers §3's knobs 1, 2 and 4 - a finality-only mode,
->    a poll interval, and backing the cursor off under rate limits - in that issue's order. Knob 3
->    (timestamp interpolation) is **not** carved out. §4's conditions are the gate: no silent
->    staleness, no fabricated values, and sealed segments byte-identical to what tip following would
->    have produced. Spent when #1173 closes; there is no sixth.
+> **The out-of-scope list below is unchanged and still binds.** No hosted service, no token, no
+> non-EVM before EVM is airtight, no TEE or zk, no Kubernetes. The freeze ending widens what may be
+> built; it does not widen what the product is.
 
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
