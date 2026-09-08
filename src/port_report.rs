@@ -1,0 +1,2216 @@
+//! RFC-0044 S1: classify a subgraph's `schema.graphql` and mappings, emit the port report.
+//!
+//! Nothing here runs in the data path and nothing executes AssemblyScript. The mappings are
+//! read as text. The report is the deliverable; scaffolding a nest is RFC-0044 S2.
+
+use anyhow::{bail, Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use yaml_rust2::{Yaml, YamlLoader};
+
+/// RFC-0044 §5a. Ordered so `max` is the most severe class a field can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    Exact,
+    CallDerived,
+    FixedPoint,
+    Unreachable,
+}
+
+impl Class {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::Exact => "exact",
+            Class::CallDerived => "call-derived",
+            Class::FixedPoint => "fixed-point",
+            Class::Unreachable => "unreachable",
+        }
+    }
+
+    pub fn heading(self) -> &'static str {
+        match self {
+            Class::Exact => "exact",
+            Class::CallDerived => "call-derived",
+            Class::FixedPoint => "fixed point",
+            Class::Unreachable => "unreachable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Citation {
+    pub file: String,
+    pub line: usize,
+}
+
+impl Citation {
+    fn display(&self) -> String {
+        format!("{}:{}", self.file, self.line)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldRow {
+    pub entity: String,
+    pub field: String,
+    pub class: Class,
+    pub citation: Citation,
+    pub reason: String,
+}
+
+impl FieldRow {
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.entity, self.field)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub source: String,
+    pub fields: Vec<FieldRow>,
+}
+
+impl Report {
+    pub fn counts(&self) -> [usize; 4] {
+        let mut n = [0; 4];
+        for f in &self.fields {
+            n[f.class as usize] += 1;
+        }
+        n
+    }
+}
+
+/// Classify `dir` and print the report to stdout. Hidden `nuthatch port-report` entry point.
+pub fn print_report(dir: &Path) -> Result<()> {
+    let report = classify_dir(dir)?;
+    print!("{}", render_report(&report));
+    Ok(())
+}
+
+/// Read `schema.graphql` and the mappings under `dir`, classify every entity field.
+pub fn classify_dir(dir: &Path) -> Result<Report> {
+    let schema_path = dir.join("schema.graphql");
+    let schema_text = std::fs::read_to_string(&schema_path)
+        .with_context(|| format!("read {}", schema_path.display()))?;
+    let schema = parse_schema(&schema_text)?;
+    let mappings = load_mappings(dir)?;
+    let fields = classify(&schema, &mappings);
+    let source = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(".")
+        .to_string();
+    Ok(Report { source, fields })
+}
+
+pub fn render_report(report: &Report) -> String {
+    let mut out = String::new();
+    out.push_str("# Port report\n\n");
+    out.push_str(
+        "Every entity field in `schema.graphql`, classified against the mappings. Nothing has been \
+         scaffolded. A field this report calls exact must match byte-for-byte; a field it names as \
+         fixed point, call-derived or unreachable will not reproduce, and the reason is on that row. \
+         An unpredicted divergence is a defect in this report.\n\n",
+    );
+    out.push_str(&format!("Source: `{}`\n\n", report.source));
+    out.push_str(
+        "Path: `--from-subgraph`. The proxy trap does not apply: the manifest pins implementation ABIs.\n\n",
+    );
+
+    let [exact, call, fixed, unreachable] = report.counts();
+    out.push_str("## Summary\n\n");
+    out.push_str("| Class | Count |\n|---|---:|\n");
+    out.push_str(&format!("| exact | {exact} |\n"));
+    out.push_str(&format!("| call-derived | {call} |\n"));
+    out.push_str(&format!("| fixed point | {fixed} |\n"));
+    out.push_str(&format!("| unreachable | {unreachable} |\n\n"));
+
+    let groups = [
+        (
+            Class::Exact,
+            "A pure function of decoded events. Port as a view or entity; byte-identical.",
+        ),
+        (
+            Class::CallDerived,
+            "Reads contract state at the row's block. Port as `[[calls]]` (RFC-0038 §3). Needs `--state-rpc`.",
+        ),
+        (
+            Class::FixedPoint,
+            "Reads back stored entity output. A nest can converge; the number will be different. This field will not reproduce.",
+        ),
+        (
+            Class::Unreachable,
+            "Will not be ported. This field will not reproduce.",
+        ),
+    ];
+    for (class, blurb) in groups {
+        out.push_str(&format!("## {}\n\n", class.heading()));
+        out.push_str(blurb);
+        out.push_str("\n\n");
+        let rows: Vec<&FieldRow> = report.fields.iter().filter(|f| f.class == class).collect();
+        if rows.is_empty() {
+            out.push_str("_none_\n\n");
+            continue;
+        }
+        out.push_str("| Field | Citation | Why |\n|---|---|---|\n");
+        for row in rows {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                row.name(),
+                row.citation.display(),
+                escape_table(&row.reason)
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Traps\n\n");
+    out.push_str(
+        "These are the ones the three hand ports paid for, and they apply on this path:\n\n",
+    );
+    out.push_str(
+        "- The proxy trap applies to `nuthatch init 0xAddr` and **not** to `--from-subgraph`. \
+         This report is the latter.\n",
+    );
+    out.push_str(
+        "- `[[factories]] watch` takes a contract alias or template name, never an address, \
+         whatever `config-reference.md` shows.\n",
+    );
+    out.push_str(
+        "- One proxy may need several ABIs across its history. Horizon renamed every staking \
+         event; a nest carrying only the current ABI loses 366 million blocks silently.\n",
+    );
+    out.push_str(
+        "- The snake_caser explodes acronyms: `ServiceURIUpdate` becomes `service_u_r_i_update`.\n",
+    );
+    out.push_str(
+        "- Verify against the chain (`cast call` on the canonical getters), not the gateway. \
+         On-chain sentinels (`deactivationRound = 2^256-1`) map to a view's `null`.\n",
+    );
+    out
+}
+
+fn escape_table(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+// ── Schema ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Schema {
+    entities: Vec<Entity>,
+    fulltext: Vec<Fulltext>,
+}
+
+#[derive(Debug, Clone)]
+struct Entity {
+    name: String,
+    fields: Vec<SchemaField>,
+}
+
+#[derive(Debug, Clone)]
+struct SchemaField {
+    name: String,
+    line: usize,
+    derived_from: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Fulltext {
+    name: String,
+    line: usize,
+}
+
+fn parse_schema(text: &str) -> Result<Schema> {
+    let mut entities = Vec::new();
+    let mut fulltext = Vec::new();
+    let chars: Vec<(usize, char)> = {
+        let mut line = 1usize;
+        let mut out = Vec::new();
+        for c in text.chars() {
+            out.push((line, c));
+            if c == '\n' {
+                line += 1;
+            }
+        }
+        out
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        skip_ws_and_graphql_trivia(&chars, &mut i);
+        if i >= chars.len() {
+            break;
+        }
+        if ident_at(&chars, i, "type") {
+            let after = i + 4;
+            if after < chars.len() && !is_ident_continue(chars[after].1) {
+                i = after;
+                skip_ws_and_graphql_trivia(&chars, &mut i);
+                let Some(name) = take_ident(&chars, &mut i) else {
+                    i += 1;
+                    continue;
+                };
+                let header_line = chars[i.min(chars.len() - 1)].0;
+                let header_end = find_char(&chars, i, '{').unwrap_or(chars.len());
+                let header: String = chars[i.min(chars.len())..header_end]
+                    .iter()
+                    .map(|(_, c)| *c)
+                    .collect();
+                if name == "_Schema_" {
+                    collect_fulltext(&header, header_line, &mut fulltext);
+                    if let Some(open) = find_char(&chars, i, '{') {
+                        if let Some(close) = match_brace(&chars, open) {
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    i = header_end;
+                    continue;
+                }
+                if !header.contains("@entity") {
+                    if let Some(open) = find_char(&chars, i, '{') {
+                        if let Some(close) = match_brace(&chars, open) {
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                let Some(open) = find_char(&chars, i, '{') else {
+                    i += 1;
+                    continue;
+                };
+                let Some(close) = match_brace(&chars, open) else {
+                    bail!("unclosed entity `{name}` in schema.graphql");
+                };
+                let body: String = chars[open + 1..close].iter().map(|(_, c)| *c).collect();
+                let body_start_line = chars[open].0;
+                let fields = parse_fields(&body, body_start_line);
+                entities.push(Entity { name, fields });
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if entities.is_empty() {
+        bail!("schema.graphql declares no @entity types");
+    }
+    Ok(Schema { entities, fulltext })
+}
+
+fn collect_fulltext(header: &str, header_line: usize, out: &mut Vec<Fulltext>) {
+    let mut rest = header;
+    while let Some(at) = rest.find("@fulltext") {
+        rest = &rest[at + "@fulltext".len()..];
+        if let Some(name) = directive_arg(rest, "name") {
+            let line = header_line + header[..header.len() - rest.len()].matches('\n').count();
+            out.push(Fulltext { name, line });
+        }
+    }
+}
+
+fn directive_arg(after_directive: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}:");
+    let at = after_directive.find(&pat)?;
+    let s = after_directive[at + pat.len()..].trim_start();
+    if let Some(stripped) = s.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        return Some(stripped[..end].to_string());
+    }
+    let ident: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
+fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
+    let mut fields = Vec::new();
+    let mut pending_name: Option<(String, usize)> = None;
+    let mut pending_dirs = String::new();
+    for (offset, raw) in body.lines().enumerate() {
+        let line_no = start_line + offset + 1;
+        let stripped = strip_graphql_line_comment(raw);
+        let line = stripped.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, ty_and_dir)) = parse_field_line(line) {
+            flush_field(&mut fields, pending_name.take(), &pending_dirs);
+            pending_dirs.clear();
+            if let Some(dir) = ty_and_dir {
+                pending_dirs.push_str(dir);
+            }
+            pending_name = Some((name, line_no));
+        } else if pending_name.is_some() && line.starts_with('@') {
+            pending_dirs.push(' ');
+            pending_dirs.push_str(line);
+        }
+    }
+    flush_field(&mut fields, pending_name, &pending_dirs);
+    fields
+}
+
+fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, dirs: &str) {
+    let Some((name, line)) = pending else {
+        return;
+    };
+    if name.starts_with('_') && name != "id" {
+        // skip graph-node internals if any
+    }
+    let derived_from = directive_arg(dirs, "field").filter(|_| dirs.contains("@derivedFrom"));
+    fields.push(SchemaField {
+        name,
+        line,
+        derived_from,
+    });
+}
+
+fn parse_field_line(line: &str) -> Option<(String, Option<&str>)> {
+    let line = line.trim();
+    if line.starts_with('@') || line.starts_with('}') || line.starts_with('#') {
+        return None;
+    }
+    let colon = line.find(':')?;
+    let name = line[..colon].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let rest = line[colon + 1..].trim();
+    let dir = rest.find('@').map(|i| rest[i..].trim());
+    Some((name.to_string(), dir))
+}
+
+fn strip_graphql_line_comment(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_str = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            in_str = !in_str;
+            out.push(c);
+            continue;
+        }
+        if !in_str && c == '#' {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn skip_ws_and_graphql_trivia(chars: &[(usize, char)], i: &mut usize) {
+    loop {
+        if *i >= chars.len() {
+            return;
+        }
+        let c = chars[*i].1;
+        if c.is_whitespace() {
+            *i += 1;
+            continue;
+        }
+        if c == '#' {
+            while *i < chars.len() && chars[*i].1 != '\n' {
+                *i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            // skip "..." or """..."""
+            if chars.get(*i + 1).map(|x| x.1) == Some('"')
+                && chars.get(*i + 2).map(|x| x.1) == Some('"')
+            {
+                *i += 3;
+                while *i + 2 < chars.len()
+                    && !(chars[*i].1 == '"' && chars[*i + 1].1 == '"' && chars[*i + 2].1 == '"')
+                {
+                    *i += 1;
+                }
+                *i = (*i + 3).min(chars.len());
+            } else {
+                *i += 1;
+                while *i < chars.len() && chars[*i].1 != '"' {
+                    if chars[*i].1 == '\\' {
+                        *i += 2;
+                    } else {
+                        *i += 1;
+                    }
+                }
+                if *i < chars.len() {
+                    *i += 1;
+                }
+            }
+            continue;
+        }
+        return;
+    }
+}
+
+fn ident_at(chars: &[(usize, char)], i: usize, want: &str) -> bool {
+    let mut k = i;
+    for wc in want.chars() {
+        if k >= chars.len() || chars[k].1 != wc {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+fn is_ident_continue(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn take_ident(chars: &[(usize, char)], i: &mut usize) -> Option<String> {
+    if *i >= chars.len() {
+        return None;
+    }
+    let c = chars[*i].1;
+    if !(c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+    let start = *i;
+    *i += 1;
+    while *i < chars.len() && is_ident_continue(chars[*i].1) {
+        *i += 1;
+    }
+    Some(chars[start..*i].iter().map(|(_, c)| *c).collect())
+}
+
+fn find_char(chars: &[(usize, char)], start: usize, want: char) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        skip_ws_and_graphql_trivia(chars, &mut i);
+        if i >= chars.len() {
+            return None;
+        }
+        if chars[i].1 == want {
+            return Some(i);
+        }
+        // Don't skip past `{` looking for `{` from a later token: if this isn't it, advance one.
+        if chars[i].1 == '{' || chars[i].1 == '}' {
+            return if chars[i].1 == want { Some(i) } else { None };
+        }
+        i += 1;
+    }
+    None
+}
+
+fn match_brace(chars: &[(usize, char)], open: usize) -> Option<usize> {
+    if open >= chars.len() || chars[open].1 != '{' {
+        return None;
+    }
+    let mut depth = 0;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i].1;
+        if c == '"' {
+            skip_ws_and_graphql_trivia(chars, &mut i);
+            continue;
+        }
+        if c == '#' {
+            while i < chars.len() && chars[i].1 != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+// ── Mappings ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandlerKind {
+    Event,
+    Call,
+    Block,
+    Helper,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionInfo {
+    name: String,
+    kind: HandlerKind,
+    assignments: Vec<Assignment>,
+    calls: BTreeSet<String>,
+    contract_call: Option<Citation>,
+    has_loop_load: bool,
+    field_reads: Vec<(String, String)>, // (entity, field)
+}
+
+#[derive(Debug, Clone)]
+struct Assignment {
+    entity: String,
+    field: String,
+    citation: Citation,
+    expr: String,
+}
+
+#[derive(Debug, Clone)]
+struct Mappings {
+    functions: BTreeMap<String, FunctionInfo>,
+}
+
+fn load_mappings(dir: &Path) -> Result<Mappings> {
+    let mut handler_kinds: BTreeMap<String, HandlerKind> = BTreeMap::new();
+    let mut yaml_files: Vec<PathBuf> = Vec::new();
+    for name in ["subgraph.yaml", "subgraph.yml"] {
+        let p = dir.join(name);
+        if p.exists() {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                collect_manifest_hints(dir, &text, &mut handler_kinds, &mut yaml_files);
+            }
+        }
+    }
+    let mut files: BTreeSet<PathBuf> = yaml_files.into_iter().collect();
+    walk_ts(dir, dir, &mut files);
+    let mut functions = BTreeMap::new();
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Node scripts (templatify, hardhat) sit next to mappings. They are not AssemblyScript.
+        if text.contains("require(\"") || text.contains("require('") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for mut func in parse_functions(&text, &rel) {
+            if let Some(kind) = handler_kinds.get(&func.name) {
+                func.kind = *kind;
+            }
+            functions.insert(func.name.clone(), func);
+        }
+    }
+    Ok(Mappings { functions })
+}
+
+fn collect_manifest_hints(
+    dir: &Path,
+    text: &str,
+    kinds: &mut BTreeMap<String, HandlerKind>,
+    files: &mut Vec<PathBuf>,
+) {
+    let Ok(docs) = YamlLoader::load_from_str(text) else {
+        return;
+    };
+    let Some(doc) = docs.first() else {
+        return;
+    };
+    for key in ["dataSources", "templates"] {
+        let Some(arr) = get_yaml(doc, key).and_then(|v| v.as_vec()) else {
+            continue;
+        };
+        for src in arr {
+            let Some(mapping) = get_yaml(src, "mapping") else {
+                continue;
+            };
+            if let Some(file) = mapping_file_path(dir, mapping) {
+                files.push(file);
+            }
+            take_handlers(mapping, "eventHandlers", HandlerKind::Event, kinds);
+            take_handlers(mapping, "callHandlers", HandlerKind::Call, kinds);
+            take_handlers(mapping, "blockHandlers", HandlerKind::Block, kinds);
+        }
+    }
+}
+
+fn get_yaml<'a>(y: &'a Yaml, key: &str) -> Option<&'a Yaml> {
+    y.as_hash()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+fn mapping_file_path(dir: &Path, mapping: &Yaml) -> Option<PathBuf> {
+    let file = get_yaml(mapping, "file")?;
+    let rel = match file {
+        Yaml::String(s) => s.clone(),
+        Yaml::Hash(_) => return None, // CID link; local tree has the path form
+        _ => return None,
+    };
+    let p = dir.join(rel.trim_start_matches("./"));
+    p.exists().then_some(p)
+}
+
+fn take_handlers(
+    mapping: &Yaml,
+    key: &str,
+    kind: HandlerKind,
+    kinds: &mut BTreeMap<String, HandlerKind>,
+) {
+    let Some(arr) = get_yaml(mapping, key).and_then(|v| v.as_vec()) else {
+        return;
+    };
+    for entry in arr {
+        if let Some(name) = get_yaml(entry, "handler").and_then(|v| v.as_str()) {
+            kinds
+                .entry(name.to_string())
+                .and_modify(|k| {
+                    if kind == HandlerKind::Block {
+                        *k = HandlerKind::Block;
+                    }
+                })
+                .or_insert(kind);
+        }
+    }
+}
+
+impl PartialOrd for HandlerKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HandlerKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(k: HandlerKind) -> u8 {
+            match k {
+                HandlerKind::Helper => 0,
+                HandlerKind::Event => 1,
+                HandlerKind::Call => 2,
+                HandlerKind::Block => 3,
+            }
+        }
+        rank(*self).cmp(&rank(*other))
+    }
+}
+
+fn walk_ts(root: &Path, dir: &Path, files: &mut BTreeSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if matches!(
+                name.as_ref(),
+                "node_modules" | "generated" | "build" | "tests" | ".git" | "abis"
+            ) {
+                continue;
+            }
+            walk_ts(root, &path, files);
+        } else if name.ends_with(".ts") || name.ends_with(".as") {
+            files.insert(path);
+        }
+    }
+}
+
+fn parse_functions(text: &str, file: &str) -> Vec<FunctionInfo> {
+    let stripped = strip_ts_comments(text);
+    let mut out = Vec::new();
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !stripped.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(name_range) = match_function_name(&stripped, i) {
+            let name = stripped[name_range.clone()].to_string();
+            let after_name = name_range.end;
+            if let Some(brace) = stripped[after_name..].find('{') {
+                let open = after_name + brace;
+                if let Some(close) = match_ts_brace(&stripped, open) {
+                    let sig = &stripped[after_name..open];
+                    let params = parse_params(sig);
+                    let body = &stripped[open + 1..close];
+                    let start_line = line_of(&stripped, open);
+                    out.push(analyse_function(name, file, body, start_line, params));
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i = after_name;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn match_function_name(text: &str, i: usize) -> Option<std::ops::Range<usize>> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    // Word-boundary `function NAME`.
+    let Some(at) = rest.find("function") else {
+        return None;
+    };
+    if at != 0 {
+        return None;
+    }
+    if i > 0 {
+        let prev = text.as_bytes()[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + 8;
+    let bytes = text.as_bytes();
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    let start = k;
+    if k >= bytes.len() || !(bytes[k].is_ascii_alphabetic() || bytes[k] == b'_') {
+        return None;
+    }
+    k += 1;
+    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+        k += 1;
+    }
+    Some(start..k)
+}
+
+fn match_ts_brace(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if open >= bytes.len() || bytes[open] != b'{' {
+        return None;
+    }
+    let mut depth = 0;
+    let mut i = open;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn line_of(text: &str, idx: usize) -> usize {
+    1 + text[..idx].bytes().filter(|b| *b == b'\n').count()
+}
+
+fn strip_ts_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            out.push(' ');
+            out.push(' ');
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+fn parse_params(sig: &str) -> BTreeMap<String, String> {
+    let start = match sig.find('(') {
+        Some(i) => i + 1,
+        None => return BTreeMap::new(),
+    };
+    let end = match sig[start..].find(')') {
+        Some(i) => start + i,
+        None => return BTreeMap::new(),
+    };
+    let mut out = BTreeMap::new();
+    for part in sig[start..end].split(',') {
+        let part = part.trim();
+        let Some(colon) = part.find(':') else {
+            continue;
+        };
+        let var = part[..colon].trim();
+        let ty = part[colon + 1..]
+            .trim()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("");
+        if !var.is_empty() && !ty.is_empty() {
+            out.insert(var.to_string(), ty.to_string());
+        }
+    }
+    out
+}
+
+fn analyse_function(
+    name: String,
+    file: &str,
+    body: &str,
+    body_start_line: usize,
+    params: BTreeMap<String, String>,
+) -> FunctionInfo {
+    let mut bindings = params;
+    bindings.extend(collect_bindings(body));
+    let mut assignments = collect_assignments(body, file, body_start_line, &bindings);
+    assignments.extend(collect_constructor_ids(
+        body,
+        file,
+        body_start_line,
+        &bindings,
+    ));
+    let calls = collect_calls(body);
+    let contract_call = find_contract_call(body, file, body_start_line);
+    let has_loop = has_loop(body);
+    let has_load = body.contains(".load(");
+    let field_reads = collect_field_reads(body, &bindings);
+    FunctionInfo {
+        name,
+        kind: HandlerKind::Helper,
+        assignments,
+        calls,
+        contract_call,
+        has_loop_load: has_loop && has_load,
+        field_reads,
+    }
+}
+
+fn collect_bindings(body: &str) -> BTreeMap<String, String> {
+    let mut bind = BTreeMap::new();
+    // function params live on the signature, which is outside `body`. Bindings from
+    // `let x = new Token` / `let x = Token.load` inside the body are what we get here.
+    // Parameter bindings are recovered in `parse_functions` via a second pass... so fold
+    // them in here by scanning a reconstructed head: callers pass body only. We also
+    // accept `changetype<Token>(...)`.
+    let re_new = regex_find(
+        body,
+        r"(?:let|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    );
+    for (var, ent) in re_new {
+        bind.insert(var, ent);
+    }
+    let re_load = regex_find(
+        body,
+        r"(?:let|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*load\s*\(",
+    );
+    for (var, ent) in re_load {
+        bind.insert(var, ent);
+    }
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((var, ent, next)) = match_bare_new(body, i) {
+            bind.insert(var, ent);
+            i = next;
+            continue;
+        }
+        if let Some((var, ent, next)) = match_let_create(body, i) {
+            bind.insert(var, ent);
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    bind
+}
+
+/// Tiny two-group finder. Not a general regex engine; the patterns above are fixed.
+fn regex_find(text: &str, kind: &str) -> Vec<(String, String)> {
+    // kind is a tag, not a regex, so the matchers stay reviewable.
+    let mut out = Vec::new();
+    match kind {
+        k if k.contains("new") => {
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if let Some((var, ent, next)) = match_let_new(text, i) {
+                    out.push((var, ent));
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        _ => {
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if let Some((var, ent, next)) = match_let_load(text, i) {
+                    out.push((var, ent));
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn match_let_new(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('=') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with("new ") {
+        return None;
+    }
+    k += 4;
+    skip_ws_str(text, &mut k);
+    let ent = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('(') {
+        return None;
+    }
+    Some((var, ent, k))
+}
+
+fn match_bare_new(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    if i > 0 {
+        let p = bytes[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('=') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with("new ") {
+        return None;
+    }
+    k += 4;
+    skip_ws_str(text, &mut k);
+    let ent = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('(') {
+        return None;
+    }
+    Some((var, ent, k))
+}
+
+fn match_let_create(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('=') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    if text[k..].starts_with("createOrLoad") {
+        k += "createOrLoad".len();
+    } else if text[k..].starts_with("create") {
+        k += "create".len();
+    } else {
+        return None;
+    }
+    let ent = take_ident_str(text, &mut k)?;
+    if ent.is_empty() || !ent.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('(') {
+        return None;
+    }
+    Some((var, ent, k))
+}
+
+fn match_let_load(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('=') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    let ent = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('.') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with("load") {
+        return None;
+    }
+    k += 4;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('(') {
+        return None;
+    }
+    Some((var, ent, k))
+}
+
+fn take_ident_str(text: &str, i: &mut usize) -> Option<String> {
+    if !text.is_char_boundary(*i) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    if *i >= bytes.len() {
+        return None;
+    }
+    if !(bytes[*i].is_ascii_alphabetic() || bytes[*i] == b'_') {
+        return None;
+    }
+    let start = *i;
+    *i += 1;
+    while *i < bytes.len() && (bytes[*i].is_ascii_alphanumeric() || bytes[*i] == b'_') {
+        *i += 1;
+    }
+    Some(text[start..*i].to_string())
+}
+
+fn skip_ws_str(text: &str, i: &mut usize) {
+    let bytes = text.as_bytes();
+    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+}
+
+fn collect_assignments(
+    body: &str,
+    file: &str,
+    body_start_line: usize,
+    bindings: &BTreeMap<String, String>,
+) -> Vec<Assignment> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((var, field, eq_at)) = match_assign(body, i) {
+            let entity = bindings.get(&var).cloned().unwrap_or_default();
+            let expr = resolve_local(body, &take_expr(body, eq_at + 1));
+            let line = body_start_line + line_of(body, eq_at) - 1;
+            out.push(Assignment {
+                entity,
+                field,
+                citation: Citation {
+                    file: file.to_string(),
+                    line,
+                },
+                expr: collapse_ws(&expr),
+            });
+            i = eq_at + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn match_assign(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    if i > 0 {
+        let p = bytes[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if k >= bytes.len() || bytes[k] != b'.' {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    let field = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if k >= bytes.len() || bytes[k] != b'=' {
+        return None;
+    }
+    if k + 1 < bytes.len() && (bytes[k + 1] == b'=' || bytes[k + 1] == b'>') {
+        return None;
+    }
+    Some((var, field, k))
+}
+
+fn take_expr(text: &str, start: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'(' || b == b'[' || b == b'{' {
+            depth += 1;
+        } else if b == b')' || b == b']' || b == b'}' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else if b == b';' && depth == 0 {
+            break;
+        } else if b == b'\n' && depth == 0 {
+            // one-line assignment; keep going if the next non-ws is a continuation operator
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'.' || bytes[j] == b'+' || bytes[j] == b'(') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    text[start..i].trim().to_string()
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `const decimals = fetchTokenDecimals(addr); token.decimals = decimals` should still
+/// see the helper, not the local name.
+fn resolve_local(body: &str, expr: &str) -> String {
+    let ident = expr.trim();
+    if ident.is_empty()
+        || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || ident.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return expr.to_string();
+    }
+    let mut i = 0;
+    while i < body.len() {
+        if !body.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &body[i..];
+        let kw = if rest.starts_with("let ") {
+            4
+        } else if rest.starts_with("const ") {
+            6
+        } else if rest.starts_with("var ") {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+        if i > 0 {
+            let p = body.as_bytes()[i - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut k = i + kw;
+        let Some(var) = take_ident_str(body, &mut k) else {
+            i += 1;
+            continue;
+        };
+        if var != ident {
+            i += 1;
+            continue;
+        }
+        skip_ws_str(body, &mut k);
+        if !body[k..].starts_with('=') {
+            i += 1;
+            continue;
+        }
+        let rhs = take_expr(body, k + 1);
+        if rhs != ident {
+            return collapse_ws(&rhs);
+        }
+        i += 1;
+    }
+    expr.to_string()
+}
+
+fn collect_constructor_ids(
+    body: &str,
+    file: &str,
+    body_start_line: usize,
+    _bindings: &BTreeMap<String, String>,
+) -> Vec<Assignment> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let hit = match_let_new(body, i).or_else(|| match_bare_new(body, i));
+        if let Some((var, ent, next)) = hit {
+            let _ = var;
+            let mut k = next;
+            skip_ws_str(body, &mut k);
+            if body[k..].starts_with('(') {
+                let expr = take_expr(body, k + 1);
+                let line = body_start_line + line_of(body, k) - 1;
+                out.push(Assignment {
+                    entity: ent,
+                    field: "id".into(),
+                    citation: Citation {
+                        file: file.to_string(),
+                        line,
+                    },
+                    expr: collapse_ws(&expr),
+                });
+            }
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn collect_calls(body: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.'))
+            && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+        {
+            let mut k = i + 1;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            let mut j = k;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                let name = &body[i..k];
+                if !matches!(
+                    name,
+                    "if" | "for"
+                        | "while"
+                        | "switch"
+                        | "return"
+                        | "new"
+                        | "load"
+                        | "save"
+                        | "BigInt"
+                        | "BigDecimal"
+                        | "Address"
+                        | "Bytes"
+                        | "changetype"
+                        | "require"
+                ) {
+                    out.insert(name.to_string());
+                }
+            }
+            i = k;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn find_contract_call(body: &str, file: &str, body_start_line: usize) -> Option<Citation> {
+    let needles = [".bind(", "ethereum.call(", ".try_"];
+    let mut best: Option<usize> = None;
+    for n in needles {
+        if let Some(at) = body.find(n) {
+            best = Some(best.map_or(at, |b| b.min(at)));
+        }
+    }
+    best.map(|at| Citation {
+        file: file.to_string(),
+        line: body_start_line + line_of(body, at) - 1,
+    })
+}
+
+fn has_loop(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && (body[i..].starts_with("for") || body[i..].starts_with("while"))
+        {
+            let kw_len = if body[i..].starts_with("for") { 3 } else { 5 };
+            let after = i + kw_len;
+            if after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+        {
+            let mut k = i + 1;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            let var = &body[i..k];
+            let mut j = k;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'.' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                if j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+                    j += 1;
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    let field = &body[start..j];
+                    let mut n = j;
+                    while n < bytes.len() && bytes[n].is_ascii_whitespace() {
+                        n += 1;
+                    }
+                    let is_call = n < bytes.len() && bytes[n] == b'(';
+                    let is_assign = n < bytes.len()
+                        && bytes[n] == b'='
+                        && !(n + 1 < bytes.len() && bytes[n + 1] == b'=');
+                    if !is_call && !is_assign {
+                        if var != "event" {
+                            if let Some(entity) = bindings.get(var) {
+                                if field != "id" && field != "save" {
+                                    out.push((entity.clone(), field.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = k;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+// ── Classify ────────────────────────────────────────────────────────────────
+
+fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
+    let entity_names: BTreeSet<&str> = schema.entities.iter().map(|e| e.name.as_str()).collect();
+    let unique_fields = unique_field_owners(schema);
+    let functions = &mappings.functions;
+
+    let mut writers: BTreeMap<(String, String), Vec<(String, Assignment)>> = BTreeMap::new();
+    for func in functions.values() {
+        for a in &func.assignments {
+            let entity = if entity_names.contains(a.entity.as_str()) {
+                a.entity.clone()
+            } else if let Some(owner) = unique_fields.get(&a.field) {
+                owner.clone()
+            } else {
+                continue;
+            };
+            if !entity_names.contains(entity.as_str()) {
+                continue;
+            }
+            let mut a2 = a.clone();
+            a2.entity = entity.clone();
+            writers
+                .entry((entity, a.field.clone()))
+                .or_default()
+                .push((func.name.clone(), a2));
+        }
+    }
+
+    // Return class of a helper: what `x = helper(...)` inherits. Not applied to every
+    // assignment inside a mixed event handler.
+    let mut fn_class: BTreeMap<String, Class> = BTreeMap::new();
+    for (name, func) in functions {
+        let mut c = Class::Exact;
+        if func.contract_call.is_some() {
+            c = Class::CallDerived;
+        }
+        if func.has_loop_load {
+            c = c.max(Class::FixedPoint);
+        }
+        if func.kind == HandlerKind::Block {
+            c = Class::Unreachable;
+        }
+        fn_class.insert(name.clone(), c);
+    }
+
+    let mut field_class: BTreeMap<(String, String), (Class, Citation, String)> = BTreeMap::new();
+
+    for ft in &schema.fulltext {
+        field_class.insert(
+            ("_Schema_".into(), ft.name.clone()),
+            (
+                Class::Unreachable,
+                Citation {
+                    file: "schema.graphql".into(),
+                    line: ft.line,
+                },
+                format!("`@fulltext` search index `{}`", ft.name),
+            ),
+        );
+    }
+
+    for ent in &schema.entities {
+        for f in &ent.fields {
+            let key = (ent.name.clone(), f.name.clone());
+            if let Some(src) = &f.derived_from {
+                field_class.insert(
+                    key,
+                    (
+                        Class::Exact,
+                        Citation {
+                            file: "schema.graphql".into(),
+                            line: f.line,
+                        },
+                        format!("`@derivedFrom(field: \"{src}\")` - reverse lookup, a SQL join"),
+                    ),
+                );
+                continue;
+            }
+            let Some(sites) = writers.get(&key) else {
+                field_class.insert(
+                    key,
+                    (
+                        Class::Unreachable,
+                        Citation {
+                            file: "schema.graphql".into(),
+                            line: f.line,
+                        },
+                        "no mapping writes this field".into(),
+                    ),
+                );
+                continue;
+            };
+            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class);
+            field_class.insert(key, (worst, citation, reason));
+        }
+    }
+
+    // A helper that reads a fixed-point field returns a fixed-point value. Call-derived
+    // (decimals as a scale factor) does not leak: RFC-0038 §6a prices stay exact.
+    for _ in 0..16 {
+        let mut changed = false;
+        let snapshot = field_class.clone();
+        for (name, func) in functions {
+            let mut bump = false;
+            for (ent, field) in &func.field_reads {
+                if snapshot
+                    .get(&(ent.clone(), field.clone()))
+                    .is_some_and(|(c, _, _)| *c == Class::FixedPoint)
+                {
+                    bump = true;
+                }
+            }
+            for (field, owner) in &unique_fields {
+                if func
+                    .assignments
+                    .iter()
+                    .any(|a| a.expr.contains(&format!(".{field}")))
+                    || func.field_reads.iter().any(|(_, f)| f == field)
+                {
+                    if snapshot
+                        .get(&(owner.clone(), field.clone()))
+                        .is_some_and(|(c, _, _)| *c == Class::FixedPoint)
+                    {
+                        bump = true;
+                    }
+                }
+            }
+            if bump {
+                let cur = fn_class.get(name).copied().unwrap_or(Class::Exact);
+                if cur < Class::FixedPoint {
+                    fn_class.insert(name.clone(), Class::FixedPoint);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+        for (key, sites) in &writers {
+            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class);
+            field_class.insert(key.clone(), (worst, citation, reason));
+        }
+    }
+
+    let mut rows: Vec<FieldRow> = field_class
+        .into_iter()
+        .map(|((entity, field), (class, citation, reason))| FieldRow {
+            entity,
+            field,
+            class,
+            citation,
+            reason,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.field.cmp(&b.field)));
+    rows
+}
+
+fn worst_writer(
+    sites: &[(String, Assignment)],
+    functions: &BTreeMap<String, FunctionInfo>,
+    fn_class: &BTreeMap<String, Class>,
+) -> (Class, Citation, String) {
+    let mut worst = Class::Exact;
+    let mut citation = sites[0].1.citation.clone();
+    let mut reason = format!("assigned from `{}`", sites[0].1.expr);
+    for (fn_name, asg) in sites {
+        let c = class_of_assignment(fn_name, asg, functions, fn_class);
+        if c > worst {
+            worst = c;
+            citation = asg.citation.clone();
+            reason = reason_for(c, fn_name, asg, functions.get(fn_name));
+        }
+    }
+    (worst, citation, reason)
+}
+
+fn class_of_assignment(
+    fn_name: &str,
+    asg: &Assignment,
+    functions: &BTreeMap<String, FunctionInfo>,
+    fn_class: &BTreeMap<String, Class>,
+) -> Class {
+    let Some(func) = functions.get(fn_name) else {
+        return Class::Exact;
+    };
+    if func.kind == HandlerKind::Block {
+        return Class::Unreachable;
+    }
+    let mut c = Class::Exact;
+    if expr_has_contract_call(&asg.expr) {
+        c = Class::CallDerived;
+    }
+    for callee in &func.calls {
+        if expr_calls(&asg.expr, callee) {
+            if let Some(cc) = fn_class.get(callee) {
+                c = c.max(*cc);
+            }
+        }
+    }
+    c
+}
+
+fn expr_calls(expr: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    if let Some(at) = expr.find(&needle) {
+        if at > 0 {
+            let p = expr.as_bytes()[at - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' || p == b'.' {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn expr_has_contract_call(expr: &str) -> bool {
+    expr.contains(".bind(") || expr.contains("ethereum.call(") || expr.contains(".try_")
+}
+
+fn unique_field_owners(schema: &Schema) -> BTreeMap<String, String> {
+    let mut counts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in &schema.entities {
+        for f in &e.fields {
+            counts
+                .entry(f.name.clone())
+                .or_default()
+                .push(e.name.clone());
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(f, ents)| {
+            if ents.len() == 1 {
+                Some((f, ents[0].clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn reason_for(
+    class: Class,
+    fn_name: &str,
+    asg: &Assignment,
+    func: Option<&FunctionInfo>,
+) -> String {
+    match class {
+        Class::Unreachable if func.is_some_and(|f| f.kind == HandlerKind::Block) => {
+            format!("written from blockHandler `{fn_name}`; nuthatch indexes logs")
+        }
+        Class::CallDerived => {
+            if let Some(c) = func.and_then(|f| f.contract_call.as_ref()) {
+                format!("`{fn_name}` reads contract state (`{}`)", c.display())
+            } else {
+                format!(
+                    "`{fn_name}` reads contract state; assigned from `{}`",
+                    asg.expr
+                )
+            }
+        }
+        Class::FixedPoint => {
+            format!(
+                "`{fn_name}` reads stored entity output (`{}`); a nest can converge, this will not reproduce",
+                asg.expr
+            )
+        }
+        Class::Exact => format!("assigned from `{}`", asg.expr),
+        Class::Unreachable => format!("assigned in `{fn_name}` from `{}`", asg.expr),
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_and_mappings(schema: &str, file: &str, mapping: &str) -> (Schema, Mappings) {
+        let schema = parse_schema(schema).unwrap();
+        let mut functions = BTreeMap::new();
+        for func in parse_functions(mapping, file) {
+            functions.insert(func.name.clone(), func);
+        }
+        (schema, Mappings { functions })
+    }
+
+    fn class_of(rows: &[FieldRow], entity: &str, field: &str) -> Class {
+        rows.iter()
+            .find(|r| r.entity == entity && r.field == field)
+            .unwrap_or_else(|| panic!("missing {entity}.{field}"))
+            .class
+    }
+
+    fn reason_of(rows: &[FieldRow], entity: &str, field: &str) -> String {
+        rows.iter()
+            .find(|r| r.entity == entity && r.field == field)
+            .unwrap()
+            .reason
+            .clone()
+    }
+
+    #[test]
+    fn event_assignment_is_exact() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.amount0 = event.params.amount0
+  swap.timestamp = event.block.timestamp
+  swap.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/mappings/core.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Swap", "amount0"), Class::Exact);
+        assert_eq!(class_of(&rows, "Swap", "timestamp"), Class::Exact);
+        assert_eq!(class_of(&rows, "Swap", "id"), Class::Exact);
+        assert!(reason_of(&rows, "Swap", "amount0").contains("event.params.amount0"));
+    }
+
+    #[test]
+    fn local_holding_a_call_is_still_call_derived() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(tokenAddress: Address): BigInt {
+  let contract = ERC20.bind(tokenAddress)
+  return contract.try_decimals().value
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  const decimals = fetchTokenDecimals(event.params.token0)
+  token0.decimals = decimals
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/factory.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "decimals"), Class::CallDerived);
+    }
+
+    #[test]
+    fn create_or_load_binds_the_entity() {
+        let schema = r#"
+type Transcoder @entity {
+  id: ID!
+  serviceURI: String!
+}
+"#;
+        let mapping = r#"
+export function serviceURIUpdate(event: ServiceURIUpdate): void {
+  let transcoder = createOrLoadTranscoder(event.params.addr.toHex())
+  transcoder.serviceURI = event.params.serviceURI
+  transcoder.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/serviceRegistry.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Transcoder", "serviceURI"), Class::Exact);
+        assert!(reason_of(&rows, "Transcoder", "serviceURI").contains("event.params.serviceURI"));
+    }
+
+    #[test]
+    fn contract_try_is_call_derived() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  let result = contract.try_symbol()
+  if (!result.reverted) {
+    return result.value
+  }
+  return 'unknown'
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = fetchTokenSymbol(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    #[test]
+    fn find_eth_per_token_is_fixed_point() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  derivedETH: BigDecimal!
+  whitelistPools: [Pool!]!
+}
+type Pool @entity {
+  id: ID!
+  token0: Token!
+  token1: Token!
+  token0Price: BigDecimal!
+  token1Price: BigDecimal!
+  totalValueLockedToken0: BigDecimal!
+  totalValueLockedToken1: BigDecimal!
+  liquidity: BigInt!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function findEthPerToken(token: Token): BigDecimal {
+  let whiteList = token.whitelistPools
+  let priceSoFar = ZERO_BD
+  for (let i = 0; i < whiteList.length; ++i) {
+    const pool = Pool.load(whiteList[i])
+    if (pool) {
+      if (pool.token0 == token.id) {
+        const token1 = Token.load(pool.token1)
+        if (token1) {
+          priceSoFar = pool.token1Price.times(token1.derivedETH as BigDecimal)
+        }
+      }
+    }
+  }
+  return priceSoFar
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = Token.load(event.address.toHex())!
+  token0.derivedETH = findEthPerToken(token0 as Token)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "derivedETH"), Class::FixedPoint);
+        let reason = reason_of(&rows, "Token", "derivedETH");
+        assert!(
+            reason.contains("will not reproduce"),
+            "fixed-point reason must say it will not reproduce, got {reason}"
+        );
+        assert!(reason.contains("pricing.ts") || reason.contains("findEthPerToken"));
+    }
+
+    #[test]
+    fn get_eth_price_is_exact() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  token0: Token!
+  token1Price: BigDecimal!
+  token0Price: BigDecimal!
+}
+type Token @entity { id: ID! }
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function getEthPriceInUSD(): BigDecimal {
+  let usdcPool = Pool.load(Address.fromString(stablePool))
+  if (usdcPool) {
+    if (usdcPool.token0 == Address.fromString(REFERENCE_TOKEN)) return usdcPool.token1Price
+    else return usdcPool.token0Price
+  }
+  return ZERO_BD
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = getEthPriceInUSD()
+  bundle.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Bundle", "ethPriceUSD"), Class::Exact);
+    }
+
+    #[test]
+    fn derived_from_is_exact_with_schema_citation() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  swaps: [Swap!]! @derivedFrom(field: "pool")
+}
+type Swap @entity {
+  id: ID!
+  pool: Pool!
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/x.ts", "");
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Pool", "swaps"), Class::Exact);
+        let row = rows.iter().find(|r| r.field == "swaps").unwrap();
+        assert_eq!(row.citation.file, "schema.graphql");
+        assert!(row.reason.contains("@derivedFrom"));
+    }
+
+    #[test]
+    fn fulltext_is_unreachable() {
+        let schema = r#"
+type _Schema_
+  @fulltext(
+    name: "tokenSearch"
+    language: en
+    algorithm: rank
+    include: [{ entity: "Token", fields: [{ name: "symbol" }] }]
+  )
+
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/x.ts", "");
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "_Schema_", "tokenSearch"),
+            Class::Unreachable
+        );
+        assert!(reason_of(&rows, "_Schema_", "tokenSearch").contains("@fulltext"));
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::Unreachable);
+        assert!(reason_of(&rows, "Token", "symbol").contains("no mapping writes"));
+    }
+
+    #[test]
+    fn fold_of_own_field_with_event_stays_exact() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  totalValueLockedToken0: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let pool = Pool.load(event.address.toHex())!
+  pool.totalValueLockedToken0 = pool.totalValueLockedToken0.plus(event.params.amount0)
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/core.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Pool", "totalValueLockedToken0"),
+            Class::Exact
+        );
+    }
+
+    #[test]
+    fn worst_class_wins_across_writers() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  derivedETH: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  token1: Token!
+  token1Price: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function findEthPerToken(token: Token): BigDecimal {
+  for (let i = 0; i < 1; ++i) {
+    const pool = Pool.load(token.id)
+    const token1 = Token.load(pool.token1)
+    return pool.token1Price.times(token1.derivedETH)
+  }
+  return ZERO_BD
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.derivedETH = ZERO_BD
+  token0.save()
+}
+export function handleSwap(event: SwapEvent): void {
+  let token0 = Token.load(event.address.toHex())!
+  token0.derivedETH = findEthPerToken(token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "derivedETH"), Class::FixedPoint);
+    }
+
+    #[test]
+    fn report_names_every_schema_field() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/x.ts", "");
+        let rows = classify(&schema, &mappings);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn render_says_non_exact_will_not_reproduce() {
+        let schema = r#"
+type Token @entity { id: ID! leftover: String! }
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/x.ts", "");
+        let rows = classify(&schema, &mappings);
+        let report = Report {
+            source: "fixture".into(),
+            fields: rows,
+        };
+        let text = render_report(&report);
+        assert!(text.contains("will not reproduce"));
+        assert!(text.contains("--from-subgraph"));
+        assert!(text.contains("watch"));
+        assert!(text.contains("service_u_r_i_update"));
+        assert!(!text.contains("nuthatch init 0x") || text.contains("not"));
+    }
+
+    #[test]
+    fn schema_parse_rejects_empty() {
+        assert!(parse_schema("enum Foo { A }").is_err());
+    }
+
+    #[test]
+    fn citation_is_the_assignment_line() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+}
+"#;
+        let mapping = "export function handleSwap(event: SwapEvent): void {\n  let swap = new Swap('x')\n  swap.amount0 = event.params.amount0\n}\n";
+        let (schema, mappings) = schema_and_mappings(schema, "src/core.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let row = rows.iter().find(|r| r.field == "amount0").unwrap();
+        assert_eq!(row.citation.file, "src/core.ts");
+        assert_eq!(row.citation.line, 3);
+    }
+}

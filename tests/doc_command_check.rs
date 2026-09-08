@@ -15,8 +15,8 @@
 //! flag is only checked when it appears inside such an invocation - the wider doc set (RFCs,
 //! benchmarks, operator runbooks) mentions plenty of non-nuthatch `--flags` (docker, curl, grep,
 //! cargo) that a blind whole-text scan would flag as fiction. `tests/skill_refs.rs` already runs
-//! that blind scan, safely, because its scope is `skills/nuthatch-builder/*.md` alone - a skill
-//! that is entirely about nuthatch usage. This file does not widen that one.
+//! that blind scan, safely, because its scope is the authored skill packages (builder + subgraph
+//! port). This file does not widen that one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -178,29 +178,21 @@ impl Finding {
 }
 
 /// Doc files in scope: `README.md`, every `.md` under `docs/`, and the authored files of
-/// `skills/nuthatch-builder/` (RFC-0017's builder skill - the thing `init` scaffolds into a new
-/// project's `.claude/skills/`). `cli-reference.md` itself is excluded: it's rendered from
-/// `Cli::command()` by `src/skill.rs`, the same ground truth this file checks against, so it can't
-/// drift by construction - `tests/skill_refs.rs::committed_cli_reference_is_not_stale` is the gate
-/// for that file specifically. `tests/skill_refs.rs` already drift-checks the *other* skill files'
-/// flags against the reference, both directions - walking them here too is a second, weaker copy of
-/// half of that check, but the only one that also validates subcommand *names*, which the
-/// flags-only check can't.
+/// `skills/nuthatch-builder/` and `skills/nuthatch-subgraph-port/` (RFC-0017 / RFC-0044).
+/// `cli-reference.md` itself is excluded: it's rendered from `Cli::command()` by `src/skill.rs`,
+/// the same ground truth this file checks against, so it can't drift by construction -
+/// `tests/skill_refs.rs::committed_cli_reference_is_not_stale` is the gate for that file
+/// specifically. `tests/skill_refs.rs` already drift-checks the *other* skill files' flags against
+/// the reference, both directions - walking them here too is a second, weaker copy of half of that
+/// check, but the only one that also validates subcommand *names*, which the flags-only check can't.
 fn doc_files() -> Vec<PathBuf> {
     let root = repo_root();
     let mut out = vec![root.join("README.md")];
     collect_md(&root.join("docs"), &mut out);
-    for entry in std::fs::read_dir(root.join(nuthatch::skill::SKILL_DIR))
-        .expect("skills/nuthatch-builder must exist")
-        .flatten()
-    {
-        let path = entry.path();
-        let is_generated_reference =
-            path.file_name().and_then(|n| n.to_str()) == Some("cli-reference.md");
-        if path.extension().and_then(|e| e.to_str()) == Some("md") && !is_generated_reference {
-            out.push(path);
-        }
+    for dir in nuthatch::skill::AUTHORED_SKILL_DIRS {
+        collect_md(&root.join(dir), &mut out);
     }
+    out.retain(|p| p.file_name().and_then(|n| n.to_str()) != Some("cli-reference.md"));
     out
 }
 
