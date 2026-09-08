@@ -77,6 +77,18 @@ pub fn segment_path(dir: &Path, file: &str, hash: &str) -> PathBuf {
 }
 pub const MANIFEST_FILE: &str = "manifest.json";
 
+/// Catalogue version this binary writes. Absent in a file on disk is version 0 (RFC-0047 C2).
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Writer settings this binary seals with: SNAPPY, crate-default dictionary and statistics, no
+/// blooms, no sort metadata. A segment whose field is missing deserialises as this, not as unknown
+/// (#1223 / #1234). Changing the settings is a new name, not a silent rewrite of this one.
+pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
+
+fn default_writer_profile() -> String {
+    ORIGINAL_WRITER_PROFILE.to_string()
+}
+
 /// One sealed Parquet file. `hash` is the content address (sha256 of the file bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
@@ -98,6 +110,10 @@ pub struct Segment {
     /// was final.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provisional: bool,
+    /// Which `write_parquet` settings produced these bytes. Missing deserialises as
+    /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
+    #[serde(default = "default_writer_profile")]
+    pub writer_profile: String,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
@@ -154,6 +170,10 @@ pub(crate) fn test_set_table_floor(dir: &Path, rows: usize) {
 /// The segment catalogue: per-table lists of sealed segments.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
+    /// 0 when the field is absent (every catalogue written before RFC-0047 C2). This binary writes
+    /// [`MANIFEST_VERSION`]. Additive fields bump nothing; a breaking catalogue change bumps this.
+    #[serde(default)]
+    pub manifest_version: u32,
     pub tables: BTreeMap<String, Vec<Segment>>,
 }
 
@@ -285,9 +305,11 @@ pub fn seal_range_with_snapshot(
             // so the latest snapshot covers every row in the file; the earlier ones covered less.
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
+            writer_profile: ORIGINAL_WRITER_PROFILE.to_string(),
         });
     }
 
+    manifest.manifest_version = MANIFEST_VERSION;
     save_manifest(dir, &manifest)?;
     // The manifest is installed and fsynced; nothing references these any more. A failure here is
     // a stray file, which is disk and not data, so it is logged rather than returned: the seal
@@ -358,8 +380,9 @@ fn read_segment_rows(path: &Path) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// Build an Arrow batch from a table's JSON rows. `block_number`/`log_index` are UInt64; every other
-/// column is Utf8 (values already carry their canonical text form - hex, decimal, or string).
+/// Build an Arrow batch from a table's JSON rows. `block_number`, `log_index`, `_seq` and
+/// `block_timestamp` are UInt64; every other column is Utf8 (canonical text: hex, decimal, or
+/// string). The query companions `*_dec` / `*_overflow` are not written here.
 fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
     let mut columns: BTreeSet<String> = BTreeSet::new();
     for r in rows {
@@ -990,6 +1013,47 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     Ok(quarantined)
 }
 
+/// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is
+/// [`verify_and_quarantine`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CatalogueCheck {
+    pub manifest_version: u32,
+    pub segments: usize,
+    pub missing: Vec<String>,
+    pub hash_mismatch: Vec<String>,
+}
+
+impl CatalogueCheck {
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty() && self.hash_mismatch.is_empty()
+    }
+}
+
+/// Every catalogue entry's file exists and hashes. A missing file or a hash mismatch is reported,
+/// not quarantined, so `nuthatch doctor --catalogue` cannot yank data.
+pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
+    let manifest = load_manifest(dir)?;
+    let mut out = CatalogueCheck {
+        manifest_version: manifest.manifest_version,
+        ..Default::default()
+    };
+    for segs in manifest.tables.values() {
+        for s in segs {
+            out.segments += 1;
+            let path = segment_path(dir, &s.file, &s.hash);
+            match std::fs::read(&path) {
+                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {}
+                Ok(_) => out.hash_mismatch.push(s.file.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    out.missing.push(s.file.clone())
+                }
+                Err(_) => out.hash_mismatch.push(s.file.clone()),
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary
@@ -1178,6 +1242,8 @@ mod sealed_rows {
 mod tests {
     use super::*;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Compression;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::fs::File;
 
     fn transfer(block: u64, li: u64, value: &str) -> String {
@@ -1195,6 +1261,161 @@ mod tests {
     /// query over `usdc__transfer` is allowed to make the sweep read.
     fn usdc() -> BTreeSet<String> {
         ["usdc__transfer".to_string()].into_iter().collect()
+    }
+
+    /// RFC-0047 C1 / #1221. The external-reader contract: four counter columns are UInt64,
+    /// everything else (including a uint256) is Utf8 decimal or other canonical text, and the
+    /// DuckDB `*_dec` / `*_overflow` companions are not in the file. A type change here makes
+    /// `docs/reading-segments.md` a lie.
+    #[test]
+    fn sealed_parquet_writes_uint64_counters_and_utf8_uint256_without_dec_companions() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = r#"{"table":"usdc__transfer","from":"0xaaaa","to":"0xbbbb","value":"9","block_number":1,"tx_hash":"0xcc","log_index":0,"_seq":1,"block_timestamp":1700000000}"#;
+        seal_range(dir.path(), &[row.to_string()], 1, 1)
+            .unwrap()
+            .expect("sealed");
+        let manifest = load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+        let schema = builder.schema();
+
+        let ty = |name: &str| -> DataType {
+            schema
+                .field_with_name(name)
+                .unwrap_or_else(|_| panic!("{name} missing from the parquet schema"))
+                .data_type()
+                .clone()
+        };
+        assert_eq!(ty("block_number"), DataType::UInt64);
+        assert_eq!(ty("log_index"), DataType::UInt64);
+        assert_eq!(ty("_seq"), DataType::UInt64);
+        assert_eq!(ty("block_timestamp"), DataType::UInt64);
+        assert_eq!(
+            ty("value"),
+            DataType::Utf8,
+            "uint256 is canonical decimal text, not FLBA32"
+        );
+
+        for field in schema.fields() {
+            let n = field.name();
+            assert!(
+                !n.ends_with("_dec") && !n.ends_with("_overflow"),
+                "{n} is a DuckDB view column and must not be written to parquet"
+            );
+        }
+
+        let batch = builder.build().unwrap().next().unwrap().unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.value(0),
+            "9",
+            "unpadded decimal text; as UTF-8, \"9\" > \"10\""
+        );
+    }
+
+    /// RFC-0047 C2 / #1223. A catalogue written before this field existed is version 0, and every
+    /// segment in it was the original writer profile, not an unknown one.
+    #[test]
+    fn an_old_manifest_is_version_zero_and_names_the_original_writer_profile() {
+        let raw = r#"{"tables":{"t":[{"hash":"aa","from_block":1,"to_block":1,"rows":1,"file":"t.parquet"}]}}"#;
+        let m: Manifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.manifest_version, 0);
+        assert_eq!(
+            m.tables["t"][0].writer_profile, ORIGINAL_WRITER_PROFILE,
+            "a missing writer_profile is the original profile, not unknown"
+        );
+    }
+
+    #[test]
+    fn a_new_seal_writes_manifest_version_and_the_original_writer_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let m = load_manifest(dir.path()).unwrap();
+        assert_eq!(m.manifest_version, MANIFEST_VERSION);
+        assert_eq!(
+            m.tables["usdc__transfer"][0].writer_profile,
+            ORIGINAL_WRITER_PROFILE
+        );
+        assert!(check_catalogue(dir.path()).unwrap().ok());
+    }
+
+    /// `doctor --catalogue` reports; it does not move the file. Startup quarantine is a different
+    /// function, and a diagnostic that yanks data is the defect this exists to prevent.
+    #[test]
+    fn check_catalogue_reports_a_hash_mismatch_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = &m.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        std::fs::write(&path, b"not the bytes that were hashed").unwrap();
+        let check = check_catalogue(dir.path()).unwrap();
+        assert_eq!(check.hash_mismatch, vec![seg.file.clone()]);
+        assert!(check.missing.is_empty());
+        assert!(path.exists(), "the diagnostic must not quarantine");
+    }
+
+    /// RFC-0047 C3 / #1224. `write_parquet` sets SNAPPY and nothing else; crate defaults freeze
+    /// into every sealed file. The footer is the spec, read the same way `tools/pqmeta` reads it.
+    #[test]
+    fn a_sealed_segment_footer_matches_the_writer_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let manifest = load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let md = reader.metadata();
+
+        assert_eq!(
+            md.num_row_groups(),
+            1,
+            "one seal is one row group; a second group is a writer-config change"
+        );
+        let rg = md.row_group(0);
+        assert!(
+            rg.sorting_columns().is_none(),
+            "no sort metadata is written today; a sort is #1234, not a silent default"
+        );
+
+        let mut dictionary_pages = 0usize;
+        for col in rg.columns() {
+            assert_eq!(
+                col.compression(),
+                Compression::SNAPPY,
+                "{}: write_parquet hardcodes SNAPPY",
+                col.column_path()
+            );
+            assert!(
+                col.statistics().is_some(),
+                "{}: column statistics are the crate default and every column has them",
+                col.column_path()
+            );
+            assert!(
+                col.bloom_filter_offset().is_none(),
+                "{}: blooms are off; enabling them is #1234",
+                col.column_path()
+            );
+            if col.dictionary_page_offset().is_some() {
+                dictionary_pages += 1;
+            }
+        }
+        assert!(
+            dictionary_pages > 0,
+            "dictionary encoding is the crate default (on); a footer with no dictionary pages means it was switched off"
+        );
     }
 
     /// **Issue #433, the cost bound the review sent back.** The sweep may read only the segments of
