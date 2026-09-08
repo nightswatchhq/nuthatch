@@ -310,21 +310,29 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
     })
 }
 
+fn catalogue_object(check: &crate::seal::CatalogueCheck) -> serde_json::Value {
+    json!({
+        "manifest_version": check.manifest_version,
+        "segments": check.segments,
+        "missing": check.missing,
+        "hash_mismatch": check.hash_mismatch,
+        "ok": check.ok(),
+    })
+}
+
+fn catalogue_json(check: &crate::seal::CatalogueCheck) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&catalogue_object(check))?)
+}
+
 /// `nuthatch doctor` - probe each endpoint and print what it can do.
 pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     let dir = std::path::Path::new(&args.dir);
-    if args.catalogue && args.json {
+    // Catalogue JSON alone is only for `--json` with no `--rpc`. An explicit `--rpc` is still
+    // probed; the two results share one object so the live-endpoints gate (JSON array, no
+    // `--catalogue`) is unchanged.
+    if args.catalogue && args.json && args.rpc.is_empty() {
         let check = crate::seal::check_catalogue(dir)?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "manifest_version": check.manifest_version,
-                "segments": check.segments,
-                "missing": check.missing,
-                "hash_mismatch": check.hash_mismatch,
-                "ok": check.ok(),
-            }))?
-        );
+        println!("{}", catalogue_json(&check)?);
         if !check.ok() {
             anyhow::bail!(
                 "catalogue disagrees with the files ({} missing, {} hash mismatch)",
@@ -336,23 +344,27 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     }
 
     let mut catalogue_bad = false;
+    let mut catalogue_check: Option<crate::seal::CatalogueCheck> = None;
     if args.catalogue {
         let check = crate::seal::check_catalogue(dir)?;
-        println!(
-            "catalogue  version {}  {} segment(s)",
-            check.manifest_version, check.segments
-        );
-        for f in &check.missing {
-            println!("  missing {f}");
+        if !args.json {
+            println!(
+                "catalogue  version {}  {} segment(s)",
+                check.manifest_version, check.segments
+            );
+            for f in &check.missing {
+                println!("  missing {f}");
+            }
+            for f in &check.hash_mismatch {
+                println!("  hash mismatch {f}");
+            }
+            if check.ok() {
+                println!("  intact");
+            }
+            println!();
         }
-        for f in &check.hash_mismatch {
-            println!("  hash mismatch {f}");
-        }
-        if check.ok() {
-            println!("  intact");
-        }
-        println!();
         catalogue_bad = !check.ok();
+        catalogue_check = Some(check);
         if args.rpc.is_empty() && !dir.join(crate::config::CONFIG_FILE).exists() {
             if catalogue_bad {
                 anyhow::bail!("catalogue disagrees with the files");
@@ -448,7 +460,26 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
 
     if args.json {
         // Stdout is JSON only so `jq` can be the gate. Human asides stay off this stream.
-        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        // `--json` without `--catalogue` stays an array of endpoints; the live-endpoints
+        // gate keys on that. Combined with `--catalogue`, one object so both results survive.
+        if let Some(check) = catalogue_check {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "endpoints": json_rows,
+                    "catalogue": catalogue_object(&check),
+                }))?
+            );
+            if !check.ok() {
+                anyhow::bail!(
+                    "catalogue disagrees with the files ({} missing, {} hash mismatch)",
+                    check.missing.len(),
+                    check.hash_mismatch.len()
+                );
+            }
+        } else {
+            println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        }
         return Ok(());
     }
 
@@ -876,6 +907,29 @@ abi = "abis/second.json"
             carries("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             "the second declared contract was dropped - doctor probed only the first, which is \
              exactly #670: {filters:?}"
+        );
+    }
+
+    /// `--catalogue --json --rpc` must still probe the endpoint. The catalogue-only JSON
+    /// shortcut is `--json` with no `--rpc`; an explicit URL is not dropped.
+    #[tokio::test]
+    async fn catalogue_json_with_an_explicit_rpc_still_probes() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = filter_capturing_rpc(seen.clone(), None).await;
+        let dir = tempfile::tempdir().unwrap();
+        run(crate::cli::DoctorArgs {
+            rpc: vec![url],
+            dir: dir.path().to_string_lossy().into_owned(),
+            address: None,
+            json: true,
+            catalogue: true,
+        })
+        .await
+        .unwrap();
+        handle.abort();
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "an explicit --rpc must be probed even when --catalogue --json is set"
         );
     }
 }
