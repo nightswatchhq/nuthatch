@@ -72,6 +72,7 @@ Startup moves a per-dataset file that is missing, unreadable, or hash-mismatched
 
 ```json
 {
+  "manifest_version": 1,
   "tables": {
     "usdc__transfer": [
       {
@@ -79,12 +80,16 @@ Startup moves a per-dataset file that is missing, unreadable, or hash-mismatched
         "from_block": 1,
         "to_block": 100,
         "rows": 20000,
-        "file": "usdc__transfer-ab….parquet"
+        "file": "usdc__transfer-ab….parquet",
+        "writer_profile": "zstd-bloom-v1"
       }
     ]
   }
 }
 ```
+
+`manifest_version` sits on the object, not the segment. A catalogue written before it existed has
+no such key and **is version 0**; treat an absent key as 0 rather than as unknown.
 
 Per segment, today:
 
@@ -97,9 +102,23 @@ Per segment, today:
 | `file` | yes | `{table}-{hash}.parquet` |
 | `registry_snapshot` | no | factory-discovered child-set hash at seal time; absent on a static nest and on pre-RFC-0009 manifests |
 | `provisional` | no | `true` when this table had fewer than 1,000 rows at the cut and the next seal will fold it; omitted when `false`, which is every segment sealed before this existed |
+| `writer_profile` | no | the writer settings the file was produced with. Absent means `"snappy"`, **not** unknown: every segment sealed before the field existed was that profile |
 
-There is no `manifest_version`, no `sort_order`, no per-column `logical_type`, and no
-segment-level stats in the catalogue. Those are [#1223](https://github.com/nightswatchhq/nuthatch/issues/1223),
+Two named writer profiles exist:
+
+| profile | compression | blooms | dictionary | sort metadata |
+| --- | --- | --- | --- | --- |
+| `snappy` | SNAPPY | none | crate default (on) | none |
+| `zstd-bloom-v1` | ZSTD level 3 | address, topic and hash columns | off on near-unique 32-byte hashes | rows sorted by `(block_number, log_index)` |
+
+A reader that only decodes Parquet needs neither: the footer describes the file, and both profiles
+are ordinary Parquet. The name is there so a reader can tell the two apart **without** opening the
+footer, and so a change of bytes is a change of name rather than a silent rewrite. Nuthatch writes
+`zstd-bloom-v1` for new seals and never rewrites an existing segment, so one catalogue routinely
+holds both.
+
+There is no `sort_order`, no per-column `logical_type`, and no segment-level stats in the
+catalogue. Those are [#1223](https://github.com/nightswatchhq/nuthatch/issues/1223),
 not this page. Unknown fields should be ignored (the `registry_snapshot` / `provisional`
 defaults already work that way).
 
@@ -255,5 +274,6 @@ schema. Changing them is a writer-config decision and is not implied by this pag
 
 - The hot store, reorgs, or anything unsealed.
 - Authored SQL views and incremental entities; those are query-layer, not segment layout.
-- A versioned catalogue (`manifest_version`, `sort_order`, `logical_type`, stats): #1223.
+- The rest of the versioned catalogue (`sort_order`, `logical_type`, stats): #1223. `manifest_version`
+  and `writer_profile` shipped ahead of it and are documented above.
 - A physical-type change for 256-bit values: #1222.
