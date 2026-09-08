@@ -43,7 +43,7 @@ yaml-rust2 = "0.11"
 toml = "0.8"
 redb = "2"
 arrow = { version = "58", features = ["ipc"] }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to

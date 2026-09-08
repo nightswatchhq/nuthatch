@@ -30,8 +30,10 @@ use arrow::array::{Array, ArrayRef, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -80,10 +82,14 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// Catalogue version this binary writes. Absent in a file on disk is version 0 (RFC-0047 C2).
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// Writer settings this binary seals with: SNAPPY, crate-default dictionary and statistics, no
-/// blooms, no sort metadata. A segment whose field is missing deserialises as this, not as unknown
-/// (#1223 / #1234). Changing the settings is a new name, not a silent rewrite of this one.
+/// Writer settings this binary sealed with before #1234: SNAPPY, crate-default dictionary and
+/// statistics, no blooms, no sort metadata. A segment whose field is missing deserialises as this,
+/// not as unknown (#1223 / #1234).
 pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
+
+/// Writer settings this binary seals with now: zstd level 3, blooms on address/topic/hash columns,
+/// dictionary off on near-unique 32-byte hashes, rows sorted by `(block_number, log_index)`.
+pub const WRITER_PROFILE: &str = "zstd-bloom-v1";
 
 fn default_writer_profile() -> String {
     ORIGINAL_WRITER_PROFILE.to_string()
@@ -232,7 +238,8 @@ pub fn seal_range_with_snapshot(
     // a manifest pointing at a file that is gone, and the folded rows would read as missing.
     let mut folded_away: Vec<PathBuf> = Vec::new();
 
-    for (table, rows) in by_table {
+    for (table, mut rows) in by_table {
+        sort_rows_for_seal(&mut rows);
         let batch = rows_to_batch(&rows)?;
         let bytes = write_parquet(&batch)?;
         let hash = hex::encode(Sha256::digest(&bytes));
@@ -261,6 +268,7 @@ pub fn seal_range_with_snapshot(
                         format!("reading provisional segment {} to fold it", prev.file)
                     })?;
                 all.extend(rows);
+                sort_rows_for_seal(&mut all);
                 let bytes = write_parquet(&rows_to_batch(&all)?)?;
                 let hash = hex::encode(Sha256::digest(&bytes));
                 (all, prev.from_block, bytes, hash, Some(prev))
@@ -305,7 +313,7 @@ pub fn seal_range_with_snapshot(
             // so the latest snapshot covers every row in the file; the earlier ones covered less.
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
-            writer_profile: ORIGINAL_WRITER_PROFILE.to_string(),
+            writer_profile: WRITER_PROFILE.to_string(),
         });
     }
 
@@ -419,11 +427,61 @@ fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
         .context("failed to build record batch")
 }
 
+/// Row order the catalogue promises: `(block_number, log_index)`. `tx_index` is not a column we
+/// write, so it is not in the key. Applied before `rows_to_batch` so the footer sort metadata is
+/// true of the bytes, not just declared.
+fn sort_rows_for_seal(rows: &mut [Value]) {
+    rows.sort_by(|a, b| {
+        let key = |r: &Value| {
+            (
+                r.get("block_number").and_then(Value::as_u64).unwrap_or(0),
+                r.get("log_index").and_then(Value::as_u64).unwrap_or(0),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+}
+
+fn bloom_column(name: &str) -> bool {
+    matches!(
+        name,
+        "address" | "from" | "to" | "owner" | "spender" | "topic0" | "block_hash" | "tx_hash"
+    ) || name.ends_with("_hash")
+        || name.ends_with("_address")
+}
+
+fn dictionary_off(name: &str) -> bool {
+    matches!(name, "block_hash" | "tx_hash") || name.ends_with("_hash")
+}
+
 fn write_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
+    let zstd = ZstdLevel::try_new(3).expect("zstd level 3 is valid");
+    let mut builder = WriterProperties::builder().set_compression(Compression::ZSTD(zstd));
+    let schema = batch.schema();
+    let mut sorting = Vec::new();
+    for name in ["block_number", "log_index"] {
+        if let Some((idx, _)) = schema.column_with_name(name) {
+            sorting.push(SortingColumn {
+                column_idx: idx as i32,
+                descending: false,
+                nulls_first: false,
+            });
+        }
+    }
+    if !sorting.is_empty() {
+        builder = builder.set_sorting_columns(Some(sorting));
+    }
+    for field in schema.fields() {
+        let path = ColumnPath::from(field.name().as_str());
+        if bloom_column(field.name()) {
+            builder = builder.set_column_bloom_filter_enabled(path.clone(), true);
+        }
+        if dictionary_off(field.name()) {
+            builder = builder.set_column_dictionary_enabled(path, false);
+        }
+    }
+    let props = builder.build();
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .context("failed to create parquet writer")?;
     writer.write(batch).context("failed to write batch")?;
@@ -1241,6 +1299,7 @@ mod sealed_rows {
 mod tests {
     use super::*;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Compression;
     use std::fs::File;
 
     fn transfer(block: u64, li: u64, value: &str) -> String {
@@ -1274,18 +1333,90 @@ mod tests {
     }
 
     #[test]
-    fn a_new_seal_writes_manifest_version_and_the_original_writer_profile() {
+    fn a_new_seal_writes_manifest_version_and_the_writer_profile() {
         let dir = tempfile::tempdir().unwrap();
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
             .unwrap()
             .expect("sealed");
         let m = load_manifest(dir.path()).unwrap();
         assert_eq!(m.manifest_version, MANIFEST_VERSION);
-        assert_eq!(
-            m.tables["usdc__transfer"][0].writer_profile,
-            ORIGINAL_WRITER_PROFILE
-        );
+        assert_eq!(m.tables["usdc__transfer"][0].writer_profile, WRITER_PROFILE);
         assert!(check_catalogue(dir.path()).unwrap().ok());
+    }
+
+    fn sealed_path(dir: &Path) -> (Segment, PathBuf) {
+        let m = load_manifest(dir).unwrap();
+        let seg = m.tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir, &seg.file, &seg.hash);
+        (seg, path)
+    }
+
+    fn writer_profile_matches_footer(profile: &str, path: &Path) -> bool {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+        let rg = reader.metadata().row_group(0);
+        let zstd = rg
+            .columns()
+            .iter()
+            .all(|c| matches!(c.compression(), Compression::ZSTD(_)));
+        let snappy = rg
+            .columns()
+            .iter()
+            .all(|c| c.compression() == Compression::SNAPPY);
+        match profile {
+            ORIGINAL_WRITER_PROFILE => {
+                snappy
+                    && rg
+                        .columns()
+                        .iter()
+                        .all(|c| c.bloom_filter_offset().is_none())
+            }
+            WRITER_PROFILE => zstd,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_new_segment_footer_matches_the_named_writer_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let (seg, path) = sealed_path(dir.path());
+        assert!(
+            writer_profile_matches_footer(&seg.writer_profile, &path),
+            "named profile must describe the bytes"
+        );
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let rg = reader.metadata().row_group(0);
+        assert!(
+            rg.sorting_columns().is_some(),
+            "sort metadata is the promise"
+        );
+        let from = rg
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string() == "from")
+            .expect("from");
+        assert!(
+            from.bloom_filter_offset().is_some(),
+            "address columns carry a bloom"
+        );
+    }
+
+    /// #1234: a change of bytes that nothing records is the defect this exists to prevent.
+    #[test]
+    fn a_profile_field_forced_back_to_snappy_does_not_match_the_new_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
+            .unwrap()
+            .expect("sealed");
+        let (_, path) = sealed_path(dir.path());
+        assert!(
+            !writer_profile_matches_footer(ORIGINAL_WRITER_PROFILE, &path),
+            "new bytes labelled snappy must not pass the profile check"
+        );
     }
 
     /// `doctor --catalogue` reports; it does not move the file. Startup quarantine is a different
