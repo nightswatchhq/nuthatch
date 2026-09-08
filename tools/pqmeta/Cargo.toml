@@ -3,7 +3,7 @@ name = "pqmeta"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
-parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
 
 # Deliberately a standalone crate, not a workspace member: it exists to inspect what nuthatch WROTE,
 # and building it against nuthatch's own dependency graph would let a shared version pin hide a
