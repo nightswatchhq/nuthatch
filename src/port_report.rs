@@ -608,6 +608,11 @@ pub(crate) struct Assignment {
     pub field: String,
     pub citation: Citation,
     pub expr: String,
+    /// Whether the receiver is known to be an entity at all. `x.field = ..` where `x` is not a
+    /// resolved binding is only an entity write if something saves `x`; without that, the
+    /// unique-field fallback in [`classify`] would read any plain object assignment as a write to
+    /// whichever entity happens to own that field name.
+    pub receiver_is_entity: bool,
 }
 
 /// An `eventHandlers` entry: which source and event the named handler is wired to.
@@ -615,7 +620,7 @@ pub(crate) struct Assignment {
 pub(crate) struct HandlerBinding {
     pub handler: String,
     pub source: String,
-    pub event: String,
+    pub event: String
 }
 
 #[derive(Debug, Clone)]
@@ -1264,7 +1269,7 @@ fn match_let_create(text: &str, i: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let ent = take_ident_str(text, &mut k)?;
-    if ent.is_empty() || !ent.starts_with(|c: char| c.is_ascii_uppercase()) {
+    if !ent.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
         return None;
     }
     skip_ws_str(text, &mut k);
@@ -1352,12 +1357,14 @@ fn collect_assignments(
     body_start_line: usize,
     bindings: &BTreeMap<String, String>,
 ) -> Vec<Assignment> {
+    let saved = collect_saved_idents(body);
     let mut out = Vec::new();
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if let Some((var, field, eq_at)) = match_assign(body, i) {
             let entity = bindings.get(&var).cloned().unwrap_or_default();
+            let receiver_is_entity = bindings.contains_key(&var) || saved.contains(&var);
             let expr = resolve_local(body, &take_expr(body, eq_at + 1));
             let line = body_start_line + line_of(body, eq_at) - 1;
             out.push(Assignment {
@@ -1368,9 +1375,46 @@ fn collect_assignments(
                     line,
                 },
                 expr: collapse_ws(&expr),
+                receiver_is_entity,
             });
             i = eq_at + 1;
             continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Identifiers this body calls `.save()` on. In graph-ts an entity is only persisted by `save()`,
+/// so a receiver that is saved is an entity even when the binding collector could not see where it
+/// came from (`getOrCreateToken(..)` and friends). A receiver that is never saved is a plain
+/// object, and its fields are not entity writes.
+fn collect_saved_idents(body: &str) -> BTreeSet<String> {
+    let bytes = body.as_bytes();
+    let mut out = BTreeSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'.' {
+            let mut k = i + 1;
+            skip_ws_str(body, &mut k);
+            if body[k..].starts_with("save") {
+                let mut n = k + 4;
+                skip_ws_str(body, &mut n);
+                if n < bytes.len() && bytes[n] == b'(' {
+                    // Walk back over the receiver identifier.
+                    let mut e = i;
+                    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+                        e -= 1;
+                    }
+                    let mut b = e;
+                    while b > 0 && (bytes[b - 1].is_ascii_alphanumeric() || bytes[b - 1] == b'_') {
+                        b -= 1;
+                    }
+                    if b < e && !bytes[b].is_ascii_digit() && body.is_char_boundary(b) {
+                        out.insert(body[b..e].to_string());
+                    }
+                }
+            }
         }
         i += 1;
     }
@@ -1583,6 +1627,8 @@ fn collect_constructor_ids(
                         line,
                     },
                     expr: collapse_ws(&expr),
+                    // `new Entity(..)` names the entity outright.
+                    receiver_is_entity: true,
                 });
             }
             i = next;
@@ -1740,8 +1786,14 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
     let mut writers: BTreeMap<(String, String), Vec<(String, Assignment)>> = BTreeMap::new();
     for func in functions.values() {
         for a in &func.assignments {
+            // The unique-field fallback answers *which* entity, never *whether* the receiver is
+            // one. Without that guard `let metadata = loadMetadata(); metadata.symbol = ..` is
+            // recorded as a write to `Token.symbol` whenever `symbol` is uniquely owned, and the
+            // field is then reported exact on the strength of an unrelated object assignment.
             let entity = if entity_names.contains(a.entity.as_str()) {
                 a.entity.clone()
+            } else if !a.receiver_is_entity {
+                continue;
             } else if let Some(owner) = unique_fields.get(&a.field) {
                 owner.clone()
             } else {
@@ -3055,6 +3107,52 @@ export function handlePoolCreated(event: PoolCreated): void {
         let (schema, mappings) = schema_and_mappings(schema, "src/factory.ts", mapping);
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "decimals"), Class::CallDerived);
+    }
+
+    /// Jules on #1242. `metadata` is a plain object with no binding, so before the guard the
+    /// unique-field fallback took `metadata.symbol = ..` for a write to `Token.symbol` on the sole
+    /// evidence that `symbol` is uniquely owned, and reported the field exact.
+    #[test]
+    fn an_unresolved_receiver_that_is_never_saved_is_not_an_entity_write() {
+        let schema_src = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let plain_object = r#"
+export function handleTransfer(event: Transfer): void {
+  let metadata = loadMetadata(event.address)
+  metadata.symbol = event.params.symbol
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema_src, "src/token.ts", plain_object);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "symbol"),
+            Class::Unreachable,
+            "an assignment to an object nothing saves is not a write to Token.symbol: {}",
+            reason_of(&rows, "Token", "symbol")
+        );
+        assert!(
+            reason_of(&rows, "Token", "symbol").contains("no mapping writes this field"),
+            "{}",
+            reason_of(&rows, "Token", "symbol")
+        );
+
+        // Saved, so it is an entity, and the unique field then says which one. This is the case
+        // the fallback exists for, and it must keep working.
+        let saved = r#"
+export function handleTransfer(event: Transfer): void {
+  let token = getOrMakeToken(event.address)
+  token.symbol = event.params.symbol
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema_src, "src/token.ts", saved);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::Exact);
+        assert!(reason_of(&rows, "Token", "symbol").contains("event.params.symbol"));
     }
 
     #[test]
