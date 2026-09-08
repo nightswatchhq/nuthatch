@@ -2440,6 +2440,69 @@ export function handlePoolCreated(event: PoolCreated): void {
         );
     }
 
+    /// Jules on #1242 read the propagation as caller to callee: a blockHandler making every helper
+    /// it calls unreachable, so a shared helper would poison an event handler's field.
+    ///
+    /// Two things stop it, and reversing the propagation direction leaves this test green, so the
+    /// direction is not the one that matters. `propagate_fn_class` does run callee to caller. But
+    /// the load-bearing rule is in `class_of_assignment`: a helper's class reaches an assignment
+    /// only when that assignment's own right-hand side calls it, and `swap.amount0 =
+    /// event.params.amount0` calls nothing. A helper's class is what `x = helper(..)` inherits, not
+    /// a property of every write inside it.
+    #[test]
+    fn a_helper_shared_with_a_block_handler_does_not_poison_the_event_path() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+}
+type BlockStat @entity {
+  id: ID!
+  n: BigInt!
+}
+"#;
+        let mapping = r#"
+export function record(swap: Swap, event: SwapEvent): void {
+  swap.amount0 = event.params.amount0
+  swap.save()
+}
+
+export function handleBlock(block: ethereum.Block): void {
+  let s = new BlockStat(block.number.toString())
+  s.n = block.number
+  s.save()
+  record(s as Swap, block as SwapEvent)
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap(event.transaction.hash.toHex())
+  record(swap, event)
+}
+"#;
+        let (schema, mut mappings) = schema_and_mappings(schema, "src/x.ts", mapping);
+        // The manifest is what marks a blockHandler and these fixtures have none, so set it here
+        // or the scenario is not exercised at all and the test passes without touching the path.
+        mappings.functions.get_mut("handleBlock").unwrap().kind = HandlerKind::Block;
+        assert!(
+            mappings.functions["handleBlock"].calls.contains("record")
+                && mappings.functions["handleSwap"].calls.contains("record"),
+            "the helper has to be shared for this to be testing anything"
+        );
+
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "BlockStat", "n"),
+            Class::Unreachable,
+            "the blockHandler's own writes are still unreachable"
+        );
+        assert_eq!(
+            class_of(&rows, "Swap", "amount0"),
+            Class::Exact,
+            "the event path through the shared helper stays exact: {}",
+            reason_of(&rows, "Swap", "amount0")
+        );
+    }
+
     #[test]
     fn nested_helper_is_call_derived() {
         let schema = r#"
