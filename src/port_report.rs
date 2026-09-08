@@ -331,31 +331,98 @@ fn directive_arg(after_directive: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Field definitions in an entity body, in order, with the line each starts on.
+///
+/// **Not line-based.** GraphQL puts no significance on newlines, and
+/// `type Token @entity { id: ID! derivedETH: BigDecimal! }` is as valid as the multi-line form.
+/// Splitting on lines and taking the first `name:` from each recorded only `id` and dropped every
+/// later field on the line - silently, which for a report whose whole promise is "every field,
+/// classified" means the author is told about a field that does not exist and not told about one
+/// that does (#1210).
+///
+/// A field starts at an identifier followed by `:` **at depth zero**: not inside `[..]` (list
+/// types), not inside `(..)` (a directive's arguments, which contain their own colons, as
+/// `@derivedFrom(field: "pool")` does), and not inside a string or a `#` comment. Everything from
+/// one field start to the next is that field's type and directives, so a directive on its own line
+/// still attaches to the field above it.
 fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
+    let starts = field_starts(body);
     let mut fields = Vec::new();
-    let mut pending_name: Option<(String, usize)> = None;
-    let mut pending_dirs = String::new();
-    for (offset, raw) in body.lines().enumerate() {
-        let line_no = start_line + offset + 1;
-        let stripped = strip_graphql_line_comment(raw);
-        let line = stripped.trim();
-        if line.is_empty() {
+    for (idx, (name, at)) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).map(|(_, n)| *n).unwrap_or(body.len());
+        let segment = &body[*at..end];
+        let dirs: String = segment
+            .match_indices('@')
+            .map(|(i, _)| segment[i..].trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `start_line` is the 1-based line the `{` is on and `line_of` is 1-based within the
+        // body, so the two overlap on that first line. The old per-line loop had the same overlap
+        // (`start_line + offset + 1`) and reported every schema field one line below itself.
+        let line = start_line + line_of(body, *at) - 1;
+        flush_field(&mut fields, Some((name.clone(), line)), &dirs);
+    }
+    fields
+}
+
+/// `(name, byte offset)` for every field definition in the body.
+fn field_starts(body: &str) -> Vec<(String, usize)> {
+    let bytes = body.as_bytes();
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut brackets = 0i32;
+    let mut parens = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            b'(' => parens += 1,
+            b')' => parens -= 1,
+            _ => {}
+        }
+        let at_word_start =
+            i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if brackets == 0
+            && parens == 0
+            && at_word_start
+            && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+        {
+            let mut k = i + 1;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            let mut n = k;
+            while n < bytes.len() && bytes[n].is_ascii_whitespace() {
+                n += 1;
+            }
+            if n < bytes.len() && bytes[n] == b':' {
+                out.push((body[i..k].to_string(), i));
+                i = n + 1;
+                continue;
+            }
+            i = k;
             continue;
         }
-        if let Some((name, ty_and_dir)) = parse_field_line(line) {
-            flush_field(&mut fields, pending_name.take(), &pending_dirs);
-            pending_dirs.clear();
-            if let Some(dir) = ty_and_dir {
-                pending_dirs.push_str(dir);
-            }
-            pending_name = Some((name, line_no));
-        } else if pending_name.is_some() && line.starts_with('@') {
-            pending_dirs.push(' ');
-            pending_dirs.push_str(line);
-        }
+        i += 1;
     }
-    flush_field(&mut fields, pending_name, &pending_dirs);
-    fields
+    out
 }
 
 fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, dirs: &str) {
@@ -371,45 +438,6 @@ fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, 
         line,
         derived_from,
     });
-}
-
-fn parse_field_line(line: &str) -> Option<(String, Option<&str>)> {
-    let line = line.trim();
-    if line.starts_with('@') || line.starts_with('}') || line.starts_with('#') {
-        return None;
-    }
-    let colon = line.find(':')?;
-    let name = line[..colon].trim();
-    if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return None;
-    }
-    let rest = line[colon + 1..].trim();
-    let dir = rest.find('@').map(|i| rest[i..].trim());
-    Some((name.to_string(), dir))
-}
-
-fn strip_graphql_line_comment(line: &str) -> String {
-    let mut out = String::new();
-    let mut in_str = false;
-    let chars = line.chars().peekable();
-    for c in chars {
-        if c == '"' {
-            in_str = !in_str;
-            out.push(c);
-            continue;
-        }
-        if !in_str && c == '#' {
-            break;
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn skip_ws_and_graphql_trivia(chars: &[(usize, char)], i: &mut usize) {
@@ -2710,6 +2738,50 @@ type Token @entity { id: ID! leftover: String! }
         assert!(text.contains("watch"));
         assert!(text.contains("service_u_r_i_update"));
         assert!(!text.contains("nuthatch init 0x") || text.contains("not"));
+    }
+
+    /// Jules on #1242. GraphQL puts no meaning on newlines. Splitting the body by line and taking
+    /// the first `name:` from each recorded `id` and silently dropped every field beside it, so the
+    /// report told the author about fields that were not there and never mentioned ones that were.
+    #[test]
+    fn a_compact_entity_declaration_keeps_every_field() {
+        let schema = parse_schema(
+            "type Token @entity { id: ID! derivedETH: BigDecimal! symbol: String! }\n",
+        )
+        .unwrap();
+        let token = schema.entities.iter().find(|e| e.name == "Token").unwrap();
+        let names: Vec<&str> = token.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "derivedETH", "symbol"], "{names:?}");
+    }
+
+    /// A colon inside a directive's arguments or a list type is not a field boundary, and a `#`
+    /// comment is not a field at all.
+    #[test]
+    fn a_directive_argument_colon_is_not_a_field() {
+        let schema = parse_schema(
+            "type Pool @entity {\n  id: ID!\n  # ignored: NotAField\n  ticks: [Tick!]! \n               swaps: [Swap!]! @derivedFrom(field: \"pool\")\n  fee: BigInt!\n}\n",
+        )
+        .unwrap();
+        let pool = schema.entities.iter().find(|e| e.name == "Pool").unwrap();
+        let names: Vec<&str> = pool.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "ticks", "swaps", "fee"], "{names:?}");
+        let swaps = pool.fields.iter().find(|f| f.name == "swaps").unwrap();
+        assert_eq!(
+            swaps.derived_from.as_deref(),
+            Some("pool"),
+            "the directive must still attach to its field"
+        );
+    }
+
+    /// The citation is the line the field is on, and a compact declaration puts several on one.
+    #[test]
+    fn a_field_citation_is_its_own_line() {
+        let schema =
+            parse_schema("\n\ntype Token @entity {\n  id: ID!\n  symbol: String!\n}\n").unwrap();
+        let token = schema.entities.iter().find(|e| e.name == "Token").unwrap();
+        let line_of_field = |n: &str| token.fields.iter().find(|f| f.name == n).unwrap().line;
+        assert_eq!(line_of_field("id"), 4, "id is on line 4");
+        assert_eq!(line_of_field("symbol"), 5, "symbol is on line 5");
     }
 
     #[test]

@@ -26,7 +26,7 @@ A pure function of decoded events. Port as a view or entity; byte-identical.
 | `Pool.id` | `src/mappings/core.ts:24` | assigned from `event.params.pool.toHex()` |
 | `Pool.liquidity` | `src/mappings/core.ts:30` | assigned from `ZERO_BI` |
 | `Pool.sqrtPrice` | `src/mappings/core.ts:27` | assigned from `ZERO_BI` |
-| `Pool.swaps` | `schema.graphql:25` | `@derivedFrom(field: "pool")` - reverse lookup, a SQL join |
+| `Pool.swaps` | `schema.graphql:24` | `@derivedFrom(field: "pool")` - reverse lookup, a SQL join |
 | `Pool.token0` | `src/mappings/core.ts:25` | assigned from `token0.id` |
 | `Pool.token0Price` | `src/mappings/core.ts:28` | assigned from `ZERO_BD` |
 | `Pool.token1` | `src/mappings/core.ts:26` | assigned from `token1.id` |
@@ -63,8 +63,8 @@ Will not be ported. This field will not reproduce.
 |---|---|---|
 | `BlockStat.blockNumber` | `src/mappings/core.ts:65` | written from blockHandler `handleBlock`; nuthatch indexes logs |
 | `BlockStat.id` | `src/mappings/core.ts:64` | written from blockHandler `handleBlock`; nuthatch indexes logs |
-| `Token.name` | `schema.graphql:34` | no mapping writes this field |
-| `Token.whitelistPools` | `schema.graphql:33` | no mapping writes this field |
+| `Token.name` | `schema.graphql:33` | no mapping writes this field |
+| `Token.whitelistPools` | `schema.graphql:32` | no mapping writes this field |
 | `_Schema_.tokenSearch` | `schema.graphql:3` | `@fulltext` search index `tokenSearch` |
 
 ## Traps
