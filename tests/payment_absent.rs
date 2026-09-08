@@ -7,8 +7,11 @@
 //!
 //! `PAYMENT_SURFACE` is empty today because there is no payment code. S1 (#1218) adds files here.
 //! Deleting every listed file must leave the default binary serving - which is why a listed file
-//! may not be an unconditional `mod` of `src/lib.rs`.
+//! may only be declared behind a feature a default `cargo build` leaves off. Merely having *a*
+//! cfg is not enough: `#[cfg(target_os = "linux")] mod payment;` is compiled by every default
+//! Linux build, and deleting the file would then break the binary.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::CommandFactory;
@@ -301,7 +304,57 @@ fn mod_stem(line: &str) -> Option<&str> {
         .filter(|s| !s.is_empty() && !s.contains(' ') && !s.contains('['))
 }
 
-fn unconditional_mod_stems(src: &str) -> Vec<String> {
+/// Strip any leading attributes so `#[cfg(...)] mod payment;` is seen as a declaration at all.
+/// `mod_stem` alone returns `None` for that line, which made the whole one-line form invisible.
+fn strip_leading_attrs(line: &str) -> &str {
+    let mut s = line.trim_start();
+    while s.starts_with("#[") {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in s.char_indices().skip(1) {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(i) => s = s[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    s
+}
+
+/// The `#[cfg(..)]` attribute on a line, balanced parens included.
+fn cfg_attr(line: &str) -> Option<String> {
+    let start = line.find("#[cfg")?;
+    let rest = &line[start..];
+    let open = rest.find('(')?;
+    let mut depth = 0usize;
+    for (i, c) in rest.char_indices().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every `mod <stem>;` in production text with the cfg guarding it, `None` when there is none.
+fn mod_declarations(src: &str) -> Vec<(String, Option<String>)> {
     let text = production_src(src);
     let mut prev = String::new();
     let mut out = Vec::new();
@@ -310,15 +363,99 @@ fn unconditional_mod_stems(src: &str) -> Vec<String> {
         if t.is_empty() {
             continue;
         }
-        let cfg_on_line = t.contains("#[cfg");
-        if let Some(stem) = mod_stem(t) {
-            if !cfg_on_line && !prev.starts_with("#[cfg") {
-                out.push(stem.to_string());
-            }
+        if let Some(stem) = mod_stem(strip_leading_attrs(t)) {
+            out.push((stem.to_string(), cfg_attr(t).or_else(|| cfg_attr(&prev))));
         }
         prev = t.to_string();
     }
     out
+}
+
+/// `[features]` as a table. Hand-parsed like the rest of this file; there is no TOML parser in
+/// dev-dependencies, and the values here are one flat array each.
+fn feature_table(toml: &str) -> BTreeMap<String, Vec<String>> {
+    let section = toml
+        .split("\n[features]")
+        .nth(1)
+        .unwrap_or("")
+        .split("\n[")
+        .next()
+        .unwrap_or("");
+    let mut table = BTreeMap::new();
+    let mut name: Option<String> = None;
+    let mut acc = String::new();
+    for line in section.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if name.is_none() {
+            let Some((n, v)) = t.split_once('=') else {
+                continue;
+            };
+            name = Some(n.trim().trim_matches('"').to_string());
+            acc = v.trim().to_string();
+        } else {
+            acc.push(' ');
+            acc.push_str(t);
+        }
+        if acc.contains(']') {
+            let inner = acc.split_once('[').map(|(_, r)| r).unwrap_or("");
+            let deps = inner
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            table.insert(name.take().unwrap_or_default(), deps);
+            acc.clear();
+        }
+    }
+    table
+}
+
+/// The features a plain `cargo build` turns on: `default` and its transitive closure.
+fn default_on_features(toml: &str) -> BTreeSet<String> {
+    let table = feature_table(toml);
+    let mut out = BTreeSet::new();
+    let mut stack = vec!["default".to_string()];
+    while let Some(f) = stack.pop() {
+        if !out.insert(f.clone()) {
+            continue;
+        }
+        for dep in table.get(&f).into_iter().flatten() {
+            // `dep:foo` enables an optional dependency and `crate/feat` a feature of another crate.
+            // Neither names a feature of this package, so neither can gate a module in this tree.
+            if dep.starts_with("dep:") || dep.contains('/') {
+                continue;
+            }
+            stack.push(dep.clone());
+        }
+    }
+    out
+}
+
+/// Whether a default `cargo build` leaves this gate off.
+///
+/// Only the exact `#[cfg(feature = "x")]` shape with an off-by-default feature counts. A
+/// `#[cfg(target_os = "linux")]` gates nothing on a Linux build, `not(..)` is true precisely when
+/// the feature is absent, and `any(..)` is true as soon as any arm is. Anything more inventive than
+/// one off-by-default feature is refused rather than reasoned about.
+fn gate_is_off_by_default(gate: &str, default_on: &BTreeSet<String>) -> bool {
+    let inner = match (gate.find('('), gate.rfind(')')) {
+        (Some(a), Some(b)) if b > a => &gate[a + 1..b],
+        _ => return false,
+    };
+    let Some((k, v)) = inner.split_once('=') else {
+        return false;
+    };
+    if k.trim() != "feature" {
+        return false;
+    }
+    let name = v.trim().trim_matches('"');
+    !name.is_empty() && !default_on.contains(name)
 }
 
 fn lockfile_packages(text: &str) -> Vec<String> {
@@ -462,8 +599,17 @@ mod tests {
 }
 
 #[test]
-fn listed_payment_files_are_not_unconditional_modules() {
+fn listed_payment_files_are_gated_off_the_default_build() {
     let root = root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let default_on = default_on_features(&manifest);
+    // Without this the closure could come back holding only `default`, every gate would read as
+    // off-by-default, and the assertion below would pass on a module the default build compiles.
+    assert!(
+        default_on.contains("object-store"),
+        "the [features] parser did not follow default = [\"object-store\"]; a default-on feature \
+         gate would then read as off-by-default and this test would wave it through: {default_on:?}"
+    );
     let files = production_rust_files(&root);
     for rel in PAYMENT_SURFACE {
         let stem = Path::new(rel)
@@ -472,20 +618,93 @@ fn listed_payment_files_are_not_unconditional_modules() {
             .unwrap_or(rel);
         for f in &files {
             let src = std::fs::read_to_string(f).unwrap();
-            let stems = unconditional_mod_stems(&src);
             let where_ = f
                 .strip_prefix(&root)
                 .unwrap()
                 .to_str()
                 .unwrap()
                 .replace('\\', "/");
-            assert!(
-                !stems.iter().any(|s| s == stem),
-                "{rel} is `mod {stem}` in {where_} without a cfg - deleting it would stop the default \
-                 binary compiling, which is the property S1 has to keep (#1217)"
-            );
+            for (decl, gate) in mod_declarations(&src) {
+                if decl != stem {
+                    continue;
+                }
+                let gate = gate.unwrap_or_default();
+                assert!(
+                    gate_is_off_by_default(&gate, &default_on),
+                    "{rel} is `mod {stem}` in {where_} behind `{gate}`, which a default \
+                     `cargo build` still compiles - deleting the file would break the default \
+                     binary, which is the property S1 has to keep (#1217). It needs \
+                     `#[cfg(feature = \"<off-by-default feature>\")]`"
+                );
+            }
         }
     }
+}
+
+/// The gate above has to fail on the shapes that look conditional and are not. `PAYMENT_SURFACE`
+/// is empty until S1, so without this the test is vacuous and proves nothing about the rule.
+#[test]
+fn a_cfg_the_default_build_still_compiles_is_not_a_gate() {
+    let toml = "\n[features]\ndefault = [\"object-store\"]\nobject-store = [\"dep:object_store\"]\nx402 = []\n\n[dev-dependencies]\nproptest = \"1\"\n";
+    let on = default_on_features(toml);
+    assert!(
+        on.contains("default") && on.contains("object-store"),
+        "{on:?}"
+    );
+    assert!(
+        !on.contains("x402"),
+        "an unreferenced feature is not default-on: {on:?}"
+    );
+    assert!(
+        !on.contains("dep:object_store"),
+        "a dep: entry is not a feature: {on:?}"
+    );
+    assert!(
+        !on.contains("proptest"),
+        "the parser ran past [features]: {on:?}"
+    );
+
+    let gate_of = |src: &str| {
+        let decls = mod_declarations(src);
+        assert_eq!(
+            decls.len(),
+            1,
+            "one declaration expected in {src:?}: {decls:?}"
+        );
+        assert_eq!(decls[0].0, "payment");
+        decls[0].1.clone()
+    };
+
+    // Jules' case on #1240: conditional, and compiled by every default build on Linux.
+    let target_os = gate_of("#[cfg(target_os = \"linux\")]\nmod payment;\n").unwrap();
+    assert!(!gate_is_off_by_default(&target_os, &on), "{target_os}");
+
+    // Same line, which `mod_stem` alone could not see as a declaration at all.
+    let inline = gate_of("#[cfg(feature = \"x402\")] mod payment;").unwrap();
+    assert!(gate_is_off_by_default(&inline, &on), "{inline}");
+
+    let default_feature = gate_of("#[cfg(feature = \"object-store\")] mod payment;").unwrap();
+    assert!(
+        !gate_is_off_by_default(&default_feature, &on),
+        "{default_feature}"
+    );
+
+    let negated = gate_of("#[cfg(not(feature = \"x402\"))] mod payment;").unwrap();
+    assert!(!gate_is_off_by_default(&negated, &on), "{negated}");
+
+    let any_of =
+        gate_of("#[cfg(any(feature = \"x402\", target_os = \"linux\"))] mod payment;").unwrap();
+    assert!(!gate_is_off_by_default(&any_of, &on), "{any_of}");
+
+    assert_eq!(
+        gate_of("pub mod payment;"),
+        None,
+        "an unguarded mod has no gate"
+    );
+    assert!(
+        !gate_is_off_by_default("", &on),
+        "and no gate is not a gate"
+    );
 }
 
 #[test]
