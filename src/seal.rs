@@ -84,7 +84,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// Writer settings this binary sealed with before #1234: SNAPPY, crate-default dictionary and
 /// statistics, no blooms, no sort metadata. A segment whose field is missing deserialises as this,
-/// not as unknown (#1223 / #1234).
+/// not as unknown (#1223 / #1234). Changing the settings is a new name, not a silent rewrite of
+/// this one.
 pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
 
 /// Writer settings this binary seals with now: zstd level 3, blooms on address/topic/hash columns,
@@ -1462,19 +1463,45 @@ mod tests {
         );
         use parquet::file::reader::{FileReader, SerializedFileReader};
         let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
-        let rg = reader.metadata().row_group(0);
+        let md = reader.metadata();
+        // Carried over from `a_sealed_segment_footer_matches_the_writer_spec` (#1236), which this
+        // test replaces: the assertions #1234 does not change still have to hold, or the profile
+        // name would cover a footer that quietly moved in some other respect.
+        assert_eq!(
+            md.num_row_groups(),
+            1,
+            "one seal is one row group; a second group is a writer-config change"
+        );
+        let rg = md.row_group(0);
         assert!(
             rg.sorting_columns().is_some(),
             "sort metadata is the promise"
         );
-        let from = rg
-            .columns()
-            .iter()
-            .find(|c| c.column_path().string() == "from")
-            .expect("from");
+        let mut dictionary_pages = 0usize;
+        for col in rg.columns() {
+            let name = col.column_path().string();
+            assert!(
+                col.statistics().is_some(),
+                "{name}: column statistics are still on, and the profile name does not say otherwise"
+            );
+            assert_eq!(
+                col.bloom_filter_offset().is_some(),
+                bloom_column(&name),
+                "{name}: the footer's blooms must be exactly the columns the profile names"
+            );
+            assert_eq!(
+                col.dictionary_page_offset().is_none(),
+                dictionary_off(&name),
+                "{name}: dictionary encoding must be off on exactly the near-unique hash columns"
+            );
+            if col.dictionary_page_offset().is_some() {
+                dictionary_pages += 1;
+            }
+        }
         assert!(
-            from.bloom_filter_offset().is_some(),
-            "address columns carry a bloom"
+            dictionary_pages > 0,
+            "dictionary encoding stays on outside the hash columns; no dictionary pages at all \
+             means it was switched off wholesale"
         );
     }
 
