@@ -380,8 +380,9 @@ fn read_segment_rows(path: &Path) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// Build an Arrow batch from a table's JSON rows. `block_number`/`log_index` are UInt64; every other
-/// column is Utf8 (values already carry their canonical text form - hex, decimal, or string).
+/// Build an Arrow batch from a table's JSON rows. `block_number`, `log_index`, `_seq` and
+/// `block_timestamp` are UInt64; every other column is Utf8 (canonical text: hex, decimal, or
+/// string). The query companions `*_dec` / `*_overflow` are not written here.
 fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
     let mut columns: BTreeSet<String> = BTreeSet::new();
     for r in rows {
@@ -1258,6 +1259,62 @@ mod tests {
     /// query over `usdc__transfer` is allowed to make the sweep read.
     fn usdc() -> BTreeSet<String> {
         ["usdc__transfer".to_string()].into_iter().collect()
+    }
+
+    /// RFC-0047 C1 / #1221. The external-reader contract: four counter columns are UInt64,
+    /// everything else (including a uint256) is Utf8 decimal or other canonical text, and the
+    /// DuckDB `*_dec` / `*_overflow` companions are not in the file. A type change here makes
+    /// `docs/reading-segments.md` a lie.
+    #[test]
+    fn sealed_parquet_writes_uint64_counters_and_utf8_uint256_without_dec_companions() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = r#"{"table":"usdc__transfer","from":"0xaaaa","to":"0xbbbb","value":"9","block_number":1,"tx_hash":"0xcc","log_index":0,"_seq":1,"block_timestamp":1700000000}"#;
+        seal_range(dir.path(), &[row.to_string()], 1, 1)
+            .unwrap()
+            .expect("sealed");
+        let manifest = load_manifest(dir.path()).unwrap();
+        let seg = &manifest.tables["usdc__transfer"][0];
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+        let schema = builder.schema();
+
+        let ty = |name: &str| -> DataType {
+            schema
+                .field_with_name(name)
+                .unwrap_or_else(|_| panic!("{name} missing from the parquet schema"))
+                .data_type()
+                .clone()
+        };
+        assert_eq!(ty("block_number"), DataType::UInt64);
+        assert_eq!(ty("log_index"), DataType::UInt64);
+        assert_eq!(ty("_seq"), DataType::UInt64);
+        assert_eq!(ty("block_timestamp"), DataType::UInt64);
+        assert_eq!(
+            ty("value"),
+            DataType::Utf8,
+            "uint256 is canonical decimal text, not FLBA32"
+        );
+
+        for field in schema.fields() {
+            let n = field.name();
+            assert!(
+                !n.ends_with("_dec") && !n.ends_with("_overflow"),
+                "{n} is a DuckDB view column and must not be written to parquet"
+            );
+        }
+
+        let batch = builder.build().unwrap().next().unwrap().unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.value(0),
+            "9",
+            "unpadded decimal text; as UTF-8, \"9\" > \"10\""
+        );
     }
 
     /// RFC-0047 C2 / #1223. A catalogue written before this field existed is version 0, and every
