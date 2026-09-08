@@ -447,12 +447,13 @@ fn bloom_column(name: &str) -> bool {
     matches!(
         name,
         "address" | "from" | "to" | "owner" | "spender" | "topic0" | "block_hash" | "tx_hash"
+            | "hash"
     ) || name.ends_with("_hash")
         || name.ends_with("_address")
 }
 
 fn dictionary_off(name: &str) -> bool {
-    matches!(name, "block_hash" | "tx_hash") || name.ends_with("_hash")
+    matches!(name, "block_hash" | "tx_hash" | "hash") || name.ends_with("_hash")
 }
 
 fn write_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
@@ -1435,6 +1436,10 @@ mod tests {
 
     #[test]
     fn a_new_segment_footer_matches_the_named_writer_profile() {
+        assert!(
+            bloom_column("hash") && dictionary_off("hash"),
+            "a column named hash is a hash column, not only *_hash"
+        );
         let dir = tempfile::tempdir().unwrap();
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100)
             .unwrap()
