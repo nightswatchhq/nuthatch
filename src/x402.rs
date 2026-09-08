@@ -224,18 +224,20 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
     let body = json.payload.ok_or(Refusal::NoAuthorization)?;
     let auth = body.authorization.ok_or(Refusal::NoAuthorization)?;
     let sig = body.signature.ok_or(Refusal::NoAuthorization)?;
-    if let Some(scheme) = json.scheme.as_deref() {
-        if scheme != "exact" {
-            return Err(Refusal::UnsupportedScheme(scheme.to_string()));
-        }
+    match json.scheme.as_deref() {
+        Some("exact") => {}
+        Some(scheme) => return Err(Refusal::UnsupportedScheme(scheme.to_string())),
+        None => return Err(Refusal::MissingFields),
     }
-    if let Some(network) = json.network.as_deref() {
-        if network != chain.network {
+    match json.network.as_deref() {
+        Some(network) if network == chain.network => {}
+        Some(network) => {
             return Err(Refusal::WrongNetwork {
                 got: network.to_string(),
                 want: chain.network,
             });
         }
+        None => return Err(Refusal::MissingFields),
     }
 
     let from = auth.from.as_deref().and_then(parse_addr);
@@ -279,7 +281,7 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
     if now < valid_after {
         return Err(Refusal::NotYetValid);
     }
-    if now > valid_before {
+    if now >= valid_before {
         return Err(Refusal::Expired);
     }
 
@@ -556,6 +558,45 @@ mod tests {
                 got: "eip155:1".into(),
                 want: "eip155:84532",
             })
+        );
+    }
+
+    #[test]
+    fn refuses_a_payment_missing_scheme() {
+        let cfg = cfg();
+        let (_, from) = payer();
+        let header = sign_authorization(&cfg, &default_auth(from, &cfg));
+        let mut obj = decode_header(&header);
+        obj.as_object_mut().unwrap().remove("scheme");
+        assert_eq!(
+            verify_payment(&cfg, &encode_header(&obj), NOW),
+            Err(Refusal::MissingFields)
+        );
+    }
+
+    #[test]
+    fn refuses_a_payment_missing_network() {
+        let cfg = cfg();
+        let (_, from) = payer();
+        let header = sign_authorization(&cfg, &default_auth(from, &cfg));
+        let mut obj = decode_header(&header);
+        obj.as_object_mut().unwrap().remove("network");
+        assert_eq!(
+            verify_payment(&cfg, &encode_header(&obj), NOW),
+            Err(Refusal::MissingFields)
+        );
+    }
+
+    #[test]
+    fn refuses_an_authorization_at_valid_before() {
+        let cfg = cfg();
+        let (_, from) = payer();
+        let auth = default_auth(from, &cfg);
+        let header = sign_authorization(&cfg, &auth);
+        let at_expiry: u64 = auth.valid_before.try_into().expect("fits u64");
+        assert_eq!(
+            verify_payment(&cfg, &header, at_expiry),
+            Err(Refusal::Expired)
         );
     }
 
