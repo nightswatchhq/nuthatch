@@ -225,7 +225,7 @@ fn dropping_the_call_from_the_mapping_drops_the_calls_stanza() {
 }
 
 #[test]
-fn parameterized_call_is_refused_rather_than_emitted_with_a_guessed_signature() {
+fn parameterized_call_is_refused_but_the_rest_of_the_overlay_still_lands() {
     let subgraph = tempfile::tempdir().unwrap();
     copy_dir(&one_call_dir(), subgraph.path());
     let mapping = subgraph.path().join("src/mappings/core.ts");
@@ -241,11 +241,41 @@ fn parameterized_call_is_refused_rather_than_emitted_with_a_guessed_signature() 
 
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);
-    let err = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(text.contains("parameterized call"), "{text}");
-    assert!(text.contains("refusing to guess"), "{text}");
-    assert!(text.contains("core.ts"), "{text}");
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path())
+        .expect("one unpinnable read must not cost the author the whole overlay");
+
+    // Still refused, and still not guessed.
+    assert!(
+        result.calls.is_empty(),
+        "a parameterized read has no ABI parameter types, so no signature may be emitted: {:?}",
+        result
+            .calls
+            .iter()
+            .map(|c| &c.decl.name)
+            .collect::<Vec<_>>()
+    );
+    let skipped = result
+        .skipped_calls
+        .iter()
+        .find(|s| s.signature.contains("balanceOf"))
+        .expect("the skipped read must be reported by name, not dropped silently");
+    assert!(skipped.why.contains("refusing to guess"), "{}", skipped.why);
+    assert!(
+        skipped.citation.file.contains("core.ts"),
+        "{:?}",
+        skipped.citation
+    );
+
+    // And the rest of the port is there, which is what aborting used to destroy.
+    assert!(!result.views.is_empty(), "views must still be emitted");
+    assert!(
+        nest.path().join("README.md").exists(),
+        "the README carrying the port report must still be written"
+    );
+    assert!(
+        nest.path().join("checks/port_views.sql").exists(),
+        "the checks must still be written"
+    );
 }
 
 #[test]

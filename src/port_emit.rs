@@ -32,6 +32,16 @@ pub struct EmitResult {
     pub calls: Vec<EmittedCall>,
     pub views: Vec<EmittedView>,
     pub report: String,
+    /// Reads that could not be pinned to an ABI signature, with the reason. Named so an author can
+    /// add the stanza by hand; never guessed, and never a reason to abandon the rest of the port.
+    pub skipped_calls: Vec<SkippedCall>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedCall {
+    pub signature: String,
+    pub citation: Citation,
+    pub why: String,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +72,16 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             c.citation.line
         );
     }
+    // Loudly, and by name. A skipped read the author never hears about is a silent hole in the
+    // port, which is worse than the abort this replaced.
+    for s in &result.skipped_calls {
+        println!(
+            "  ! not emitted: {} at {} - {}",
+            s.signature,
+            s.citation.display(),
+            s.why
+        );
+    }
     Ok(())
 }
 
@@ -81,7 +101,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     let mut config =
         Config::load(nest).with_context(|| format!("load nest at {}", nest.display()))?;
 
-    let emitted_calls = calls_to_decls(&calls_raw, &mappings, &config)?;
+    let (emitted_calls, skipped_calls) = calls_to_decls(&calls_raw, &mappings, &config)?;
     config.calls = emitted_calls.iter().map(|c| c.decl.clone()).collect();
     config.save(nest)?;
     crate::project::regen(crate::cli::SchemaArgs {
@@ -97,23 +117,37 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         calls: emitted_calls,
         views,
         report: report_text,
+        skipped_calls,
     })
 }
 
+/// Emittable calls, and the reads that were skipped with the reason why.
+///
+/// A parameterized read is still **refused, never guessed**: the mapping expression carries no ABI
+/// parameter types, so any signature we wrote would be invented. What changed is the blast radius.
+/// Aborting the whole overlay meant one such read cost the author their views, checks and README
+/// too, and it was the only unpinnable read treated that way - an unresolvable handler, contract or
+/// argument below is skipped and the port carries on. A partial port is the contract; this is now
+/// the same skip as the others, reported by name so the stanza can be written by hand.
 fn calls_to_decls(
     raw: &[MappingCall],
     mappings: &crate::port_report::Mappings,
     config: &Config,
-) -> Result<Vec<EmittedCall>> {
+) -> Result<(Vec<EmittedCall>, Vec<SkippedCall>)> {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let mut used_names: BTreeSet<String> = BTreeSet::new();
     for call in raw {
         if !call.args.is_empty() {
-            bail!(
-                "cannot emit parameterized call `{}` at {}: the mapping expression does not carry ABI parameter types; refusing to guess a Solidity signature. Add this [[calls]] stanza by hand with the ABI signature",
-                call.signature,
-                call.citation.display(),
-            );
+            skipped.push(SkippedCall {
+                signature: call.signature.clone(),
+                citation: call.citation.clone(),
+                why: "parameterized call: the mapping expression does not carry ABI parameter \
+                      types, so refusing to guess a Solidity signature. Add this [[calls]] stanza \
+                      by hand with the ABI signature"
+                    .to_string(),
+            });
+            continue;
         }
         let Some(on) = table_for_handler(&call.handler, mappings, config) else {
             // No event table for this handler: inventing `on` would be a guess.
@@ -165,7 +199,7 @@ fn calls_to_decls(
             field: call.field.clone(),
         });
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 fn unique_call_name(
