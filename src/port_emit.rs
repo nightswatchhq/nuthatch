@@ -471,8 +471,7 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
         s.push_str(";\n");
         s
     };
-    std::fs::write(dir.join("port_views.sql"), sql)
-        .with_context(|| format!("write checks/port_views.sql"))?;
+    std::fs::write(dir.join("port_views.sql"), sql).context("write checks/port_views.sql")?;
     // `nuthatch check` compares against this fixture. A fresh nest has empty views, so the
     // counts are zero; `--update` after a real backfill is the author's next step.
     let expected = if views.is_empty() {
@@ -480,14 +479,7 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     } else {
         let rows: Vec<serde_json::Value> = views
             .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if i == 0 {
-                    serde_json::json!({ "n": 0 })
-                } else {
-                    serde_json::json!({ "n": 0 })
-                }
-            })
+            .map(|_| serde_json::json!({ "n": 0 }))
             .collect();
         serde_json::Value::Array(rows)
     };
