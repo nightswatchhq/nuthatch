@@ -312,6 +312,55 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
 
 /// `nuthatch doctor` - probe each endpoint and print what it can do.
 pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
+    let dir = std::path::Path::new(&args.dir);
+    if args.catalogue && args.json {
+        let check = crate::seal::check_catalogue(dir)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "manifest_version": check.manifest_version,
+                "segments": check.segments,
+                "missing": check.missing,
+                "hash_mismatch": check.hash_mismatch,
+                "ok": check.ok(),
+            }))?
+        );
+        if !check.ok() {
+            anyhow::bail!(
+                "catalogue disagrees with the files ({} missing, {} hash mismatch)",
+                check.missing.len(),
+                check.hash_mismatch.len()
+            );
+        }
+        return Ok(());
+    }
+
+    let mut catalogue_bad = false;
+    if args.catalogue {
+        let check = crate::seal::check_catalogue(dir)?;
+        println!(
+            "catalogue  version {}  {} segment(s)",
+            check.manifest_version, check.segments
+        );
+        for f in &check.missing {
+            println!("  missing {f}");
+        }
+        for f in &check.hash_mismatch {
+            println!("  hash mismatch {f}");
+        }
+        if check.ok() {
+            println!("  intact");
+        }
+        println!();
+        catalogue_bad = !check.ok();
+        if args.rpc.is_empty() && !dir.join(crate::config::CONFIG_FILE).exists() {
+            if catalogue_bad {
+                anyhow::bail!("catalogue disagrees with the files");
+            }
+            return Ok(());
+        }
+    }
+
     // Derived only when `--dir` supplies the endpoints and the operator gave no explicit
     // `--address`: the nest already declares its contracts, so there is no reason to fall back to
     // the range-only probe - which #644 measured as understating the real window by up to 256x -
@@ -414,6 +463,9 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             ),
             None => println!("no endpoint answered - nothing to recommend"),
         }
+    }
+    if catalogue_bad {
+        anyhow::bail!("catalogue disagrees with the files");
     }
     Ok(())
 }
@@ -735,6 +787,7 @@ abi = "abis/busiest.json"
             dir: dir.path().to_string_lossy().into_owned(),
             address: None,
             json: false,
+            catalogue: false,
         })
         .await
         .unwrap();
@@ -799,6 +852,7 @@ abi = "abis/second.json"
             dir: dir.path().to_string_lossy().into_owned(),
             address: None,
             json: false,
+            catalogue: false,
         })
         .await
         .unwrap();
