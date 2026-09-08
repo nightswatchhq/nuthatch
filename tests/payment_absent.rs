@@ -52,6 +52,141 @@ fn production_src(src: &str) -> String {
     strip_cfg_test_items(&strip_line_comments_rs(src))
 }
 
+/// Skip comments, char/string/raw-string literals so `{` inside them is not a brace.
+/// Otherwise `const _: &str = "{";` in a cfg(test) module swallows the rest of the file.
+fn skip_non_code(bytes: &[u8], i: usize) -> Option<usize> {
+    if i >= bytes.len() {
+        return None;
+    }
+    match bytes[i] {
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            Some(j.saturating_add(2).min(bytes.len()))
+        }
+        b'\'' => Some(skip_char_or_lifetime(bytes, i)),
+        b'"' => Some(skip_normal_string(bytes, i)),
+        b'r' => skip_raw_string(bytes, i),
+        _ => None,
+    }
+}
+
+fn skip_char_or_lifetime(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    if j >= bytes.len() {
+        return j;
+    }
+    if bytes[j] == b'\\' {
+        j += 1;
+        if j < bytes.len() && bytes[j] == b'u' {
+            j += 1;
+            while j < bytes.len() && bytes[j] != b'}' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                j += 1;
+            }
+        } else if j < bytes.len() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'\'' {
+            j += 1;
+        }
+        return j;
+    }
+    j += 1;
+    if j < bytes.len() && bytes[j] == b'\'' {
+        j += 1;
+    }
+    j
+}
+
+fn skip_normal_string(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\\' {
+            j += 1;
+            if j < bytes.len() {
+                j += 1;
+            }
+            continue;
+        }
+        if bytes[j] == b'"' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    j
+}
+
+fn skip_raw_string(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let mut hashes = 0;
+    while j < bytes.len() && bytes[j] == b'#' {
+        hashes += 1;
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'"' {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            let mut k = 0;
+            while k < hashes && bytes.get(j + 1 + k) == Some(&b'#') {
+                k += 1;
+            }
+            if k == hashes {
+                return Some(j + 1 + hashes);
+            }
+        }
+        j += 1;
+    }
+    Some(j)
+}
+
+fn skip_brace_group(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1;
+    i += 1;
+    while i < bytes.len() && depth > 0 {
+        if let Some(j) = skip_non_code(bytes, i) {
+            i = j;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn skip_cfg_test_item(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if let Some(j) = skip_non_code(bytes, i) {
+            i = j;
+            continue;
+        }
+        match bytes[i] {
+            b';' => return i + 1,
+            b'{' => return skip_brace_group(bytes, i),
+            _ => i += 1,
+        }
+    }
+    i
+}
+
 fn strip_cfg_test_items(src: &str) -> String {
     let bytes = src.as_bytes();
     let needle = b"#[cfg(test)]";
@@ -59,26 +194,7 @@ fn strip_cfg_test_items(src: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i..].starts_with(needle) {
-            i += needle.len();
-            while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b';' {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b';' {
-                i += 1;
-                continue;
-            }
-            if i < bytes.len() && bytes[i] == b'{' {
-                let mut depth = 1;
-                i += 1;
-                while i < bytes.len() && depth > 0 {
-                    match bytes[i] {
-                        b'{' => depth += 1,
-                        b'}' => depth -= 1,
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
+            i = skip_cfg_test_item(bytes, i + needle.len());
             continue;
         }
         out.push(bytes[i] as char);
@@ -295,6 +411,53 @@ fn production_walk_covers_crate_src_beyond_the_root_and_decode() {
             "production walk missed {dir}; payment code there would not be on PAYMENT_SURFACE"
         );
     }
+}
+
+#[test]
+fn string_braces_in_cfg_test_do_not_hide_later_production_payment() {
+    let src = r#"
+fn ready() {}
+
+#[cfg(test)]
+mod tests {
+    const _: &str = "{";
+}
+
+pub const PAYMENT_REQUIRED: u16 = 402;
+"#;
+    assert!(
+        production_carries_payment(src),
+        "production PAYMENT_REQUIRED after a test module that contains a string brace must still be scanned"
+    );
+
+    let x402 = r##"
+#[cfg(test)]
+mod tests {
+    const _: &str = r#"{"#;
+    const C: char = '{';
+    // {
+    /* { */
+}
+fn x402() {}
+"##;
+    assert!(
+        production_carries_payment(x402),
+        "production x402 after a test module whose braces sit in strings and comments must still be scanned"
+    );
+
+    let only_in_test = r#"
+fn ready() {}
+
+#[cfg(test)]
+mod tests {
+    const _: &str = "{";
+    const PAYMENT_REQUIRED: u16 = 402;
+}
+"#;
+    assert!(
+        !production_carries_payment(only_in_test),
+        "payment tokens only inside the cfg(test) item must still be stripped"
+    );
 }
 
 #[test]
