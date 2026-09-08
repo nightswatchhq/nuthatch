@@ -23,7 +23,19 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: jules-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  # Workflow-level concurrency is evaluated before the job's `if`. An irrelevant issue-comment
+  # event therefore used to enter this group, skip its job, and still cancel a live review for the
+  # same PR. Jules's own posted review comment was enough to kill the run before it published its
+  # approval. Give comments that cannot request a review their own disposable group; genuine
+  # `/re-review` comments, PR synchronises and manual dispatches still supersede one another.
+  group: >-
+    jules-review-${{
+      github.event_name == 'issue_comment' &&
+      !(github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/re-review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) &&
+      github.run_id || github.event.pull_request.number || github.event.issue.number || inputs.pr
+    }}
   cancel-in-progress: true
 
 jobs:
