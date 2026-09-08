@@ -295,6 +295,14 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ),
     ("src/serve.rs", "HTTP request bodies for the query API"),
     (
+        // The decoded `X-PAYMENT` header a caller presents (RFC-0046 S1, #1218). It arrives on a
+        // request and is never read from a nest's TOML - and must not become a config key, because
+        // a price that lives in nest identity is a price a self-hoster cannot turn off, which is
+        // the line #1217's gate exists to hold.
+        "src/x402.rs",
+        "an inbound x402 authorisation header, not nest config",
+    ),
+    (
         "src/authored_entity_spike.rs",
         "RFC-0041 sealed measurement tapes and DBSP fixture data, not nest config",
     ),

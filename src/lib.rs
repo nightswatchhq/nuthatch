@@ -90,3 +90,7 @@ pub mod webhooks;
 /// The writer-worker role for scaled mode (RFC-0022 §2): the reconcile loop, running.
 #[cfg(feature = "postgres-store")]
 pub mod worker;
+/// RFC-0046 S1: x402 authorisation verification. `cfg(test)` so deleting `src/x402.rs` still
+/// leaves the default binary serving (#1217). Nothing in `router()` calls this.
+#[cfg(test)]
+pub mod x402;
