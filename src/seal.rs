@@ -429,8 +429,10 @@ fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
 }
 
 /// Row order the catalogue promises: `(block_number, log_index)`. `tx_index` is not a column we
-/// write, so it is not in the key. Applied before `rows_to_batch` so the footer sort metadata is
-/// true of the bytes, not just declared.
+/// write, so it is not in the key. Rows sharing those coordinates use their canonical JSON as a
+/// deterministic tie-breaker, so folding a provisional segment cannot make identical logical rows
+/// seal to different bytes merely by presenting them in another order. Applied before
+/// `rows_to_batch` so the footer sort metadata is true of the bytes, not just declared.
 fn sort_rows_for_seal(rows: &mut [Value]) {
     rows.sort_by(|a, b| {
         let key = |r: &Value| {
@@ -439,7 +441,9 @@ fn sort_rows_for_seal(rows: &mut [Value]) {
                 r.get("log_index").and_then(Value::as_u64).unwrap_or(0),
             )
         };
-        key(a).cmp(&key(b))
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.to_string().cmp(&b.to_string()))
     });
 }
 
