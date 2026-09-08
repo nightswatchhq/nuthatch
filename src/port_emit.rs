@@ -305,29 +305,35 @@ fn view_for_entity(
         return ViewDraft { sql, exact_fields };
     }
 
-    // One table: the one that supplies the most mapped columns. Remaining columns from other
-    // tables stay as comments rather than a guessed join.
-    let mut table_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for (table, _) in selects.values() {
-        *table_counts.entry(table.clone()).or_default() += 1;
-    }
-    let primary = table_counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(t, _)| t)
-        .unwrap();
-
-    let mut cols = Vec::new();
-    for (field, (table, col)) in &selects {
-        if table == &primary {
-            cols.push(format!("  \"{col}\" AS \"{field}\""));
-        }
-    }
     sql.push_str(&format!(
-        "CREATE VIEW \"{view_name}\" AS\nSELECT\n{}\nFROM \"{primary}\";\n",
-        cols.join(",\n")
+        "CREATE VIEW \"{view_name}\" AS\n{}\n",
+        exact_select_sql(&selects)
     ));
     ViewDraft { sql, exact_fields }
+}
+
+/// Project every mapped field. One table stays a single SELECT; several become UNION ALL
+/// so a guessed JOIN never hides a column. Unmapped Exact fields stay comments, not NULLs.
+fn exact_select_sql(selects: &BTreeMap<String, (String, String)>) -> String {
+    let mut tables = BTreeSet::new();
+    for (table, _) in selects.values() {
+        tables.insert(table.clone());
+    }
+    let fields: Vec<&str> = selects.keys().map(String::as_str).collect();
+    let arms: Vec<String> = tables
+        .iter()
+        .map(|table| {
+            let cols: Vec<String> = fields
+                .iter()
+                .map(|field| match selects.get(*field) {
+                    Some((t, col)) if t == table => format!("  \"{col}\" AS \"{field}\""),
+                    _ => format!("  NULL AS \"{field}\""),
+                })
+                .collect();
+            format!("SELECT\n{}\nFROM \"{table}\"", cols.join(",\n"))
+        })
+        .collect();
+    format!("{};", arms.join("\nUNION ALL\n"))
 }
 
 fn map_exact_field(
@@ -431,5 +437,52 @@ mod tests {
         assert_eq!(n0, "token_symbol_token0");
         assert_eq!(n1, "token_symbol_token1");
         assert_ne!(n0, n1);
+    }
+
+    #[test]
+    fn exact_select_keeps_fields_from_every_table() {
+        let mut selects = BTreeMap::new();
+        selects.insert(
+            "symbol".into(),
+            ("factory__pool_created".into(), "token0".into()),
+        );
+        selects.insert(
+            "name".into(),
+            ("factory__token_updated".into(), "name".into()),
+        );
+        let sql = exact_select_sql(&selects);
+        assert!(sql.contains("UNION ALL"), "{sql}");
+        assert!(sql.contains("\"token0\" AS \"symbol\""), "{sql}");
+        assert!(sql.contains("\"name\" AS \"name\""), "{sql}");
+        assert!(sql.contains("NULL AS \"symbol\""), "{sql}");
+        assert!(sql.contains("NULL AS \"name\""), "{sql}");
+        assert!(sql.contains("FROM \"factory__pool_created\""), "{sql}");
+        assert!(sql.contains("FROM \"factory__token_updated\""), "{sql}");
+        let arms: Vec<&str> = sql.split("UNION ALL").collect();
+        assert_eq!(arms.len(), 2, "{sql}");
+        for arm in &arms {
+            let name_at = arm.find("AS \"name\"").expect(arm);
+            let symbol_at = arm.find("AS \"symbol\"").expect(arm);
+            assert!(name_at < symbol_at, "BTreeMap field order, got {arm}");
+        }
+    }
+
+    #[test]
+    fn exact_select_stays_one_table_when_all_columns_share_it() {
+        let mut selects = BTreeMap::new();
+        selects.insert(
+            "id".into(),
+            ("factory__pool_created".into(), "token0".into()),
+        );
+        selects.insert(
+            "symbol".into(),
+            ("factory__pool_created".into(), "token0".into()),
+        );
+        let sql = exact_select_sql(&selects);
+        assert!(!sql.contains("UNION ALL"), "{sql}");
+        assert!(!sql.contains("NULL AS"), "{sql}");
+        assert!(sql.contains("\"token0\" AS \"id\""), "{sql}");
+        assert!(sql.contains("\"token0\" AS \"symbol\""), "{sql}");
+        assert!(sql.contains("FROM \"factory__pool_created\""), "{sql}");
     }
 }

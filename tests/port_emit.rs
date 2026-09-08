@@ -266,6 +266,151 @@ fn four_classes_exact_sqrt_price_lands_in_a_view() {
 }
 
 #[test]
+fn two_triggering_tables_keep_every_exact_field() {
+    let subgraph = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
+    std::fs::write(
+        subgraph.path().join("schema.graphql"),
+        r#"type Token @entity {
+  id: ID!
+  symbol: String!
+  name: String!
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("subgraph.yaml"),
+        r#"specVersion: 0.0.8
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: arbitrum-one
+    source:
+      address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+      abi: Factory
+      startBlock: 1
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.7
+      language: wasm/assemblyscript
+      file: ./src/mappings/core.ts
+      entities: [Token]
+      abis:
+        - name: Factory
+          file: ./abis/factory.json
+      eventHandlers:
+        - event: PoolCreated(indexed address,indexed address,indexed uint24,int24,address)
+          handler: handlePoolCreated
+        - event: TokenUpdated(indexed address,string)
+          handler: handleTokenUpdated
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("src/mappings/core.ts"),
+        r#"import { PoolCreated, TokenUpdated } from '../../generated/Factory/Factory'
+import { Token } from '../../generated/schema'
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.symbol = event.params.token0.toHex()
+  token.save()
+}
+
+export function handleTokenUpdated(event: TokenUpdated): void {
+  let token = Token.load(event.params.token.toHex())!
+  token.name = event.params.name
+  token.save()
+}
+"#,
+    )
+    .unwrap();
+
+    let nest = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(nest.path().join("abis")).unwrap();
+    let abi = r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[
+    {"name":"token0","type":"address","indexed":true},
+    {"name":"token1","type":"address","indexed":true},
+    {"name":"fee","type":"uint24","indexed":true},
+    {"name":"tickSpacing","type":"int24","indexed":false},
+    {"name":"pool","type":"address","indexed":false}]},
+{"type":"event","name":"TokenUpdated","anonymous":false,"inputs":[
+    {"name":"token","type":"address","indexed":true},
+    {"name":"name","type":"string","indexed":false}]}]"#;
+    std::fs::write(nest.path().join("abis/factory.json"), abi).unwrap();
+    std::fs::write(
+        nest.path().join("nuthatch.toml"),
+        r#"[nest]
+name = "port-emit-two-tables"
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = ["http://127.0.0.1:1"]
+
+[[contracts]]
+alias = "factory"
+address = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+start_block = 1
+abi = "abis/factory.json"
+events = ["PoolCreated", "TokenUpdated"]
+"#,
+    )
+    .unwrap();
+    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
+        dir: nest.path().display().to_string(),
+    })
+    .expect("regen nest artifacts");
+
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap();
+    let token = result
+        .views
+        .iter()
+        .find(|v| v.entity == "Token")
+        .expect("Token view");
+    assert!(
+        token.exact_fields.iter().any(|f| f == "symbol"),
+        "Token.symbol is exact: {:?}",
+        token.exact_fields
+    );
+    assert!(
+        token.exact_fields.iter().any(|f| f == "name"),
+        "Token.name is exact: {:?}",
+        token.exact_fields
+    );
+    let select = select_sql(&token.sql);
+    assert!(
+        select.contains("AS \"symbol\""),
+        "Token.symbol must be a SELECT column:\n{}",
+        token.sql
+    );
+    assert!(
+        select.contains("AS \"name\""),
+        "Token.name must be a SELECT column:\n{}",
+        token.sql
+    );
+    assert!(
+        select.contains("factory__pool_created"),
+        "PoolCreated table must appear:\n{}",
+        token.sql
+    );
+    assert!(
+        select.contains("factory__token_updated"),
+        "TokenUpdated table must appear:\n{}",
+        token.sql
+    );
+    assert!(
+        select.contains("UNION ALL"),
+        "two tables overlay with UNION ALL, not a guessed JOIN:\n{}",
+        token.sql
+    );
+    assert!(
+        !select.to_ascii_lowercase().contains(" join "),
+        "must not invent a JOIN:\n{}",
+        token.sql
+    );
+}
+
+#[test]
 fn emitted_nest_loads_and_views_validate() {
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);

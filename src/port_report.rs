@@ -2063,18 +2063,47 @@ fn derive_mapping_call(
     if let Some(call) = call_from_body(writer, asg, None, &asg.expr) {
         return Some(call);
     }
-    for callee in &writer.calls {
-        if !expr_calls(&asg.expr, callee) {
+    let mut seen = BTreeSet::new();
+    seen.insert(writer.name.clone());
+    call_via_helpers(writer, asg, mappings, writer, &asg.expr, &mut seen)
+}
+
+/// A wrapper that only forwards (`fetchTokenSymbol` → `readTokenSymbol` → `try_symbol`)
+/// still has to emit the [[calls]] stanza; otherwise classify and emit disagree.
+fn call_via_helpers(
+    func: &FunctionInfo,
+    asg: &Assignment,
+    mappings: &Mappings,
+    writer: &FunctionInfo,
+    expr: &str,
+    seen: &mut BTreeSet<String>,
+) -> Option<MappingCall> {
+    let at_writer = func.name == writer.name;
+    for callee in &func.calls {
+        if at_writer && !expr_calls(expr, callee) {
+            continue;
+        }
+        if !seen.insert(callee.clone()) {
             continue;
         }
         let Some(helper) = mappings.functions.get(callee) else {
             continue;
         };
-        if helper.contract_call.is_none() && !helper.body.contains(".try_") {
-            continue;
-        }
-        let caller_args = call_arg_list(&asg.expr, callee);
-        if let Some(call) = call_from_body(helper, asg, Some(writer), &asg.expr) {
+        let invoke = if at_writer {
+            expr.to_string()
+        } else {
+            return_exprs(&func.body)
+                .into_iter()
+                .find(|r| expr_calls(r, callee))
+                .unwrap_or_else(|| func.body.clone())
+        };
+        let caller_args = call_arg_list(&invoke, callee);
+        let found = if helper.contract_call.is_some() || helper.body.contains(".try_") {
+            call_from_body(helper, asg, Some(writer), &asg.expr)
+        } else {
+            call_via_helpers(helper, asg, mappings, writer, &invoke, seen)
+        };
+        if let Some(call) = found {
             let contract_arg = subst_params(&call.contract_arg, &helper.param_names, &caller_args);
             let args = call
                 .args
