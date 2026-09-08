@@ -38,14 +38,12 @@ this table.
 | Row groups | 1 per file | one seal is one group |
 | Dictionary | on | crate default `DEFAULT_DICTIONARY_ENABLED`; at least one dictionary page in the footer |
 | Sort metadata | none | crate default; footer `sorting_columns` absent |
-| Page header statistics | off | crate default `DEFAULT_WRITE_PAGE_HEADER_STATISTICS` |
-| Writer version | Parquet 1.0 | crate default |
-| `created_by` | `parquet-rs version 58.x` (unpinned) | crate stamps it; F-D3, not a contract across nuthatch versions |
 
-The 2026-08-29 Lodestar production sample (below) matched compression, statistics, blooms and row
-groups. Dictionary, sort metadata and page-header statistics were not printed by `pqmeta` then;
-the unit gate now covers them. A production re-read that disagrees with this table is a
-writer-config bug and gets its own issue, not a table edit.
+Every row is asserted from the footer. Page-header statistics and `created_by` are crate defaults
+the footer walk does not see, so they are not in this table (F-D3 for `created_by`). The
+2026-08-29 Lodestar production sample matched compression, statistics, blooms and row groups.
+A production re-read that disagrees with this table is a writer-config bug and gets its own
+issue, not a table edit.
 
 ## The layout, per nest
 
