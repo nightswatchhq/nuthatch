@@ -386,6 +386,29 @@ pub fn compose_runtime(
     let roster = Arc::new(roster);
     let roster_health = health.clone();
     let ready_health = health.clone();
+    // Every nest's handle is built **before** the root routes, so the root `/ready` can hold them and
+    // judge each nest with [`nest_readiness`] - the same function that nest's own `/ready` calls
+    // (#1204). Holding `SharedNest`s rather than `AppState`s keeps the root honest across a hot swap:
+    // it reads whatever version is current, exactly as the nest's own endpoint does.
+    let shared: Vec<(String, SharedNest)> = nests
+        .into_iter()
+        .map(|(name, mut state)| {
+            // A nest served through this composition answers `/ready` and `/metrics` from `health`'s
+            // per-nest counters, never the process-global aggregate - `spawn_runtime` and `mount()`
+            // stamp `runtime_health` before a real nest ever reaches here. Filled in here too, only if
+            // the caller left it unset, so a fixture (or any future caller) that forgets the stamp
+            // cannot silently fall back to the solo path - the fault that let three fixtures in a row
+            // (#292, #356, #388) prove the handler and never the wiring. `get_or_insert_with` rather
+            // than an unconditional assignment: an alias mount's state is deliberately pre-stamped
+            // with its *canonical* nest's name (`fan_out_aliases`), and that must survive composition
+            // unchanged.
+            state
+                .runtime_health
+                .get_or_insert_with(|| (name.clone(), health.clone()));
+            (name, SharedNest::new(state))
+        })
+        .collect();
+    let ready_nests = Arc::new(shared.clone());
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         // `GET /nests` - the roster (name, chain, registry hash, table count) across mounted nests,
@@ -406,24 +429,14 @@ pub fn compose_runtime(
             "/ready",
             get(move || {
                 let h = ready_health.clone();
-                async move { roost_ready(&h) }
+                let n = ready_nests.clone();
+                async move { roost_ready(&h, &n) }
             }),
         );
-    for (name, mut state) in nests {
-        // A nest served through this composition answers `/ready` and `/metrics` from `health`'s
-        // per-nest counters, never the process-global aggregate - `spawn_runtime` and `mount()` stamp
-        // `runtime_health` before a real nest ever reaches here. Filled in here too, only if the caller
-        // left it unset, so a fixture (or any future caller) that forgets the stamp cannot silently fall
-        // back to the solo path - the fault that let three fixtures in a row (#292, #356, #388) prove
-        // the handler and never the wiring. `get_or_insert_with` rather than an unconditional
-        // assignment: an alias mount's state is deliberately pre-stamped with its *canonical* nest's
-        // name (`fan_out_aliases`), and that must survive composition unchanged.
-        state
-            .runtime_health
-            .get_or_insert_with(|| (name.clone(), health.clone()));
+    for (name, nest) in shared {
         // `Router::nest` re-roots the whole per-nest router under `/<name>`, so `/lodestar/tables`,
         // `/lodestar/sql`, `/lodestar/_admin/` … all resolve to that nest's isolated state.
-        app = app.nest(&format!("/{name}"), router(SharedNest::new(state)));
+        app = app.nest(&format!("/{name}"), router(nest));
     }
     app
 }
@@ -510,19 +523,49 @@ fn merge_roster_health(
     out
 }
 
-/// MountTable-wide readiness (RFC-0026 §5): **200** while every mounted nest is indexing, **503** as soon as
-/// any nest or cursor is quarantined, with the offenders named.
+/// MountTable-wide readiness (RFC-0026 §5): **200** while every mounted nest is indexing, **503** as
+/// soon as any nest or cursor is quarantined **or any nest's own `/ready` would answer 503**, with
+/// the offenders named.
 ///
-/// 503-on-any-quarantine is the deliberately conservative choice. A supervisor should treat a
+/// 503-on-any-fault is the deliberately conservative choice. A supervisor should treat a
 /// partly-broken mounts as not-ready and fetch a human, while the healthy nests carry on serving reads
 /// to consumers who ask for them directly - readiness is advice to a supervisor, it does not gate
 /// traffic. The healthy/unhealthy split stays visible per nest on `/nests` and `/<name>/ready`.
-fn roost_ready(health: &crate::health::RuntimeHealth) -> impl IntoResponse {
+///
+/// **The stall half is #1204**, and that same "advice, not a gate" reasoning is why it belongs here
+/// rather than being kept out on blast-radius grounds: a stalled co-tenant costs a healthy nest
+/// nothing, because nothing about this verdict stops it serving. Until 3.6.2 this consulted the
+/// quarantine set alone, so `wedged`, `poll_stalled`, `initial_poll_failed`, `entities_stalled` and
+/// `tip_seal_stalled` were all computed correctly per nest and none of them reached the root. A
+/// runtime answered `{"quarantined":[],"ready":true}` while the `horizon` nest inside it sat 753,000
+/// blocks behind on its seal for two days, on the surface that issues TAP receipts, and
+/// `docs/operators.md` promised the opposite in the words an operator wires a supervisor to.
+fn roost_ready(
+    health: &crate::health::RuntimeHealth,
+    nests: &[(String, SharedNest)],
+) -> impl IntoResponse {
     let unhealthy = health.unhealthy();
-    let ready = unhealthy.is_empty();
+    // A quarantined nest is unready and already named; it is not judged a second time on its stall
+    // terms, which would report one fault twice under two vocabularies.
+    let quarantined: std::collections::HashSet<&str> =
+        unhealthy.iter().map(|(n, _)| n.as_str()).collect();
+    // #1204: every nest's own verdict, reached with the same [`nest_readiness`] its `/<name>/ready`
+    // uses. An alias mount is judged here too - its state carries its canonical nest's counters, so
+    // it reports that dataset's health rather than a private, permanently-cheerful one.
+    let stalled: Vec<serde_json::Value> = nests
+        .iter()
+        .filter(|(name, _)| !quarantined.contains(name.as_str()))
+        .filter_map(|(name, nest)| {
+            let v = nest_readiness(&nest.current());
+            v.stalled
+                .then(|| json!({"nest": name, "reasons": v.reasons()}))
+        })
+        .collect();
+    let ready = unhealthy.is_empty() && stalled.is_empty();
     let body = json!({
         "ready": ready,
         "quarantined": unhealthy.iter().map(|(n, r)| json!({"nest": n, "reason": r})).collect::<Vec<_>>(),
+        "stalled": stalled,
     });
     let code = if ready {
         StatusCode::OK
@@ -1036,35 +1079,74 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
     (Value::Array(entities), stalled)
 }
 
-async fn ready(State(s): State<AppState>) -> impl IntoResponse {
-    use crate::metrics::{now_unix, METRICS};
-    // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
-    // must not be told the runtime is unwell because some unrelated co-tenant is quarantined - nor told
-    // all is well when *this* nest is the one that is frozen.
-    if let Some((name, health)) = &s.runtime_health {
-        if let Some(q) = health.status(name) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "ready": false,
-                    "quarantined": true,
-                    "kind": q.kind,
-                    "class": q.class,
-                    "reason": q.reason,
-                    "since_unixtime": q.since_unixtime,
-                    "next_retry_unixtime": q.next_retry_unixtime,
-                })),
-            )
-                .into_response();
+/// One nest's readiness verdict, and the counters it was reached from.
+///
+/// **Extracted from [`ready`] so the runtime root can reach the same answer (#1204).** Before this
+/// there were two definitions of "unready": the five terms below, and the runtime root's, which was
+/// membership of the quarantine set and nothing else. Two definitions drift, and these two had -
+/// `docs/operators.md` promised the root answered 200 "only when every cursor and nest is indexing"
+/// while a nest 753,000 blocks behind on its seal left the root reporting ready. One function now,
+/// called by both surfaces.
+///
+/// **Nothing here touches the store.** Every term is an in-memory counter (`METRICS.nest`) or an
+/// entity handle on the `AppState`, which is what makes it cheap enough for the root to evaluate per
+/// nest on a surface a supervisor polls every few seconds.
+pub(crate) struct NestReadiness {
+    pub stalled: bool,
+    pub wedged: bool,
+    pub initial_failure: bool,
+    pub seal_stalled: bool,
+    pub tip_seal_stalled: bool,
+    pub entities_stalled: bool,
+    pub cursor_stalled: bool,
+    pub tip: u64,
+    pub last: u64,
+    pub sealed: u64,
+    pub lag: u64,
+    pub now: u64,
+    pub age: Option<u64>,
+    pub last_poll: u64,
+    pub last_seal_progress: u64,
+    pub seal_direct_active: bool,
+    pub seal_direct_origin: u64,
+    pub seal_direct_completed: u64,
+    pub seal_direct_target: u64,
+    pub seal_direct_fetched: u64,
+    pub fetch_window: u64,
+    pub entities: Value,
+}
+
+impl NestReadiness {
+    /// The terms that took this nest unready, named. The runtime root reports these beside a
+    /// quarantine so an operator learns *which* nest and *why* from one request, rather than being
+    /// told the runtime is unwell and left to poll every nest by name to find out which.
+    pub fn reasons(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cursor_stalled {
+            out.push(if self.initial_failure {
+                "initial_poll_failed"
+            } else if self.wedged {
+                "wedged"
+            } else {
+                "poll_stalled"
+            });
         }
+        if self.seal_stalled {
+            out.push("seal_direct_stalled");
+        }
+        if self.tip_seal_stalled {
+            out.push("tip_seal_stalled");
+        }
+        if self.entities_stalled {
+            out.push("entities_stalled");
+        }
+        out
     }
-    // Answer from **this nest's** counters when it is one of several in a runtime. The process-global
-    // gauges are shared by every cursor, so in a multichain runtime whichever cursor polled last wins -
-    // and this endpoint then reports another chain's block heights. Observed live in a two-chain mounts:
-    // the mainnet nest reported `tip: 488677305` (Arbitrum) while mainnet was at 25,632,906, alongside
-    // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
-    //
-    // A solo `dev` has exactly one nest feeding the globals, so both paths agree there.
+}
+
+/// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
+pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
+    use crate::metrics::{now_unix, METRICS};
     let nest = s
         .runtime_health
         .as_ref()
@@ -1144,7 +1226,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
     // An entity that has stopped makes the nest unready whatever the cursor is doing: §5.2 calls
     // serving frozen derived state as healthy "a lie with a pleasant HTTP status", and a cursor
     // polling happily while an entity is dead is exactly that lie.
-    let (entities, entities_stalled) = entity_readiness(&s, last, now);
+    let (entities, entities_stalled) = entity_readiness(s, last, now);
     // #1199: the tip path's own seal clock. `seal_stalled` above judges only a bulk backfill, so a
     // nest whose *ordinary* sealing had stopped answered `ready: true` indefinitely - measured at
     // 739,192 blocks behind on a cursor that was sitting at tip.
@@ -1188,6 +1270,84 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                 || wedged)
     };
     let stalled = seal_stalled || tip_seal_stalled || entities_stalled || cursor_stalled;
+    NestReadiness {
+        stalled,
+        wedged,
+        initial_failure,
+        seal_stalled,
+        tip_seal_stalled,
+        entities_stalled,
+        cursor_stalled,
+        tip,
+        last,
+        sealed,
+        lag,
+        now,
+        age,
+        last_poll,
+        last_seal_progress,
+        seal_direct_active,
+        seal_direct_origin,
+        seal_direct_completed,
+        seal_direct_target,
+        seal_direct_fetched,
+        fetch_window,
+        entities,
+    }
+}
+
+async fn ready(State(s): State<AppState>) -> impl IntoResponse {
+    // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
+    // must not be told the runtime is unwell because some unrelated co-tenant is quarantined - nor told
+    // all is well when *this* nest is the one that is frozen.
+    if let Some((name, health)) = &s.runtime_health {
+        if let Some(q) = health.status(name) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ready": false,
+                    "quarantined": true,
+                    "kind": q.kind,
+                    "class": q.class,
+                    "reason": q.reason,
+                    "since_unixtime": q.since_unixtime,
+                    "next_retry_unixtime": q.next_retry_unixtime,
+                })),
+            )
+                .into_response();
+        }
+    }
+    // Answer from **this nest's** counters when it is one of several in a runtime. The process-global
+    // gauges are shared by every cursor, so in a multichain runtime whichever cursor polled last wins -
+    // and this endpoint then reports another chain's block heights. Observed live in a two-chain mounts:
+    // the mainnet nest reported `tip: 488677305` (Arbitrum) while mainnet was at 25,632,906, alongside
+    // a mainnet `sealed_through`. One body, two chains, no way for an operator to tell.
+    //
+    // A solo `dev` has exactly one nest feeding the globals, so both paths agree there.
+    let NestReadiness {
+        stalled,
+        wedged,
+        initial_failure,
+        seal_stalled,
+        tip_seal_stalled,
+        entities_stalled,
+        cursor_stalled: _,
+        tip,
+        last,
+        sealed,
+        lag,
+        now,
+        age,
+        last_poll,
+        last_seal_progress,
+        seal_direct_active,
+        seal_direct_origin,
+        seal_direct_completed,
+        seal_direct_target,
+        seal_direct_fetched,
+        fetch_window,
+        entities,
+    } = nest_readiness(&s);
     let body = json!({
         "ready": !stalled,
         "stalled": stalled,
@@ -2893,6 +3053,85 @@ mod tests {
         assert_eq!(live_json["ready"], json!(true));
     }
 
+    /// #1204: the runtime **root** `/ready` must see a per-nest stall, not only a quarantine.
+    ///
+    /// Until this landed, `roost_ready` read the quarantine set and nothing else, so a runtime
+    /// answered `{"quarantined":[],"ready":true}` while a nest inside it had stopped. That is what
+    /// happened to the `horizon` nest behind `nuthatch-ds-upstream`: 753,000 blocks behind on its
+    /// seal, ready at the root throughout, on the surface that issues TAP receipts. The two solo
+    /// nests with the identical defect were caught within a day because for a solo nest the root
+    /// `/ready` *is* the per-nest one; the runtime root was the only place it could hide.
+    ///
+    /// **Nothing is quarantined in this test, deliberately.** A quarantine would take the root to 503
+    /// through the pre-existing path and prove nothing about the new one, so the `quarantined` array
+    /// is asserted empty: the 503 can only have come from the stall verdict.
+    ///
+    /// The blast-radius half is asserted too, because it is the thing the conservative design was
+    /// worried about: the healthy co-tenant's own `/ready` still answers 200 and keeps serving.
+    /// Readiness is advice to a supervisor, not a gate on traffic.
+    ///
+    /// Composed through [`compose_runtime`] from un-stamped [`test_state`], for the #388 reason: a
+    /// hand-stamped fixture proves the handler and never the wiring, which is the shape that let this
+    /// defect live.
+    #[tokio::test]
+    async fn the_runtime_root_reports_a_stalled_nest_that_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        // Names unique to this test: `METRICS.nest(..)` is a process-global map shared by every test
+        // in the binary.
+        let (dead, live) = ("root-agg-dead", "root-agg-live");
+        std::fs::create_dir_all(dir.path().join(dead)).unwrap();
+        std::fs::create_dir_all(dir.path().join(live)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": dead}, {"name": live}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests: Vec<(String, AppState)> = [dead, live]
+            .into_iter()
+            .map(|name| (name.to_string(), test_state(&dir.path().join(name), 4)))
+            .collect();
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        crate::metrics::METRICS
+            .nest(dead)
+            .set_last_poll_ok_for_test(now.saturating_sub(600));
+        crate::metrics::METRICS
+            .nest(live)
+            .set_last_poll_ok_for_test(now.saturating_sub(1));
+        // The healthy nest also writes the process-global aggregate, as a real one would. A root that
+        // consulted the globals rather than each nest would read this and answer 200.
+        crate::metrics::METRICS.mark_poll_ok();
+
+        let (root_code, root_body) = get(router.clone(), "/ready").await;
+        let (live_code, live_body) = get(router, &format!("/{live}/ready")).await;
+        let json_of = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+        let (root, live_json) = (json_of(&root_body), json_of(&live_body));
+
+        assert_eq!(
+            root_code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a stalled nest must take the runtime root unready: {root}"
+        );
+        assert_eq!(root["ready"], json!(false));
+        assert_eq!(
+            root["quarantined"].as_array().unwrap().len(),
+            0,
+            "nothing is quarantined here - the 503 must come from the stall verdict: {root}"
+        );
+        let stalled = root["stalled"].as_array().unwrap();
+        assert_eq!(stalled.len(), 1, "only the dead nest is stalled: {root}");
+        assert_eq!(stalled[0]["nest"], json!(dead));
+        assert!(
+            !stalled[0]["reasons"].as_array().unwrap().is_empty(),
+            "the offender is named with a reason, not merely counted: {root}"
+        );
+
+        assert_eq!(
+            live_code,
+            StatusCode::OK,
+            "a co-tenant must not be evicted by its neighbour's stall: {live_json}"
+        );
+        assert_eq!(live_json["ready"], json!(true));
+    }
+
     /// #510: a nest whose RPC pool has been dead since before its very first successful poll must
     /// eventually answer `/ready` with `stalled`, not a permanent healthy-looking
     /// `{"stalled":false,"last_poll_unixtime":0}` - the exact body a fully dead pool served forever
@@ -3631,7 +3870,7 @@ mod tests {
         health.register("alpha", "base");
         health.register("beta", "arbitrum-one");
         assert_eq!(
-            roost_ready(&health).into_response().status(),
+            roost_ready(&health, &[]).into_response().status(),
             StatusCode::OK
         );
 
@@ -3640,7 +3879,7 @@ mod tests {
             "base",
             "every nest on this cursor is terminally quarantined".into(),
         );
-        let resp = roost_ready(&health).into_response();
+        let resp = roost_ready(&health, &[]).into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
