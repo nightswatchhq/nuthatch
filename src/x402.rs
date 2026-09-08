@@ -122,6 +122,8 @@ pub type VerifyResult = Result<Accepted, Refusal>;
 
 #[derive(Debug, Deserialize)]
 struct PaymentPayload {
+    #[serde(rename = "x402Version")]
+    x402_version: Option<u64>,
     scheme: Option<String>,
     network: Option<String>,
     payload: Option<PaymentBody>,
@@ -224,6 +226,10 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
     let body = json.payload.ok_or(Refusal::NoAuthorization)?;
     let auth = body.authorization.ok_or(Refusal::NoAuthorization)?;
     let sig = body.signature.ok_or(Refusal::NoAuthorization)?;
+    match json.x402_version {
+        Some(1) => {}
+        _ => return Err(Refusal::MissingFields),
+    }
     match json.scheme.as_deref() {
         Some("exact") => {}
         Some(scheme) => return Err(Refusal::UnsupportedScheme(scheme.to_string())),
@@ -558,6 +564,26 @@ mod tests {
                 got: "eip155:1".into(),
                 want: "eip155:84532",
             })
+        );
+    }
+
+    #[test]
+    fn refuses_an_unsupported_or_missing_x402_version() {
+        let cfg = cfg();
+        let (_, from) = payer();
+        let header = sign_authorization(&cfg, &default_auth(from, &cfg));
+        assert!(verify_payment(&cfg, &header, NOW).is_ok());
+
+        let mut obj = decode_header(&header);
+        obj["x402Version"] = serde_json::json!(2);
+        assert_eq!(
+            verify_payment(&cfg, &encode_header(&obj), NOW),
+            Err(Refusal::MissingFields)
+        );
+        obj.as_object_mut().unwrap().remove("x402Version");
+        assert_eq!(
+            verify_payment(&cfg, &encode_header(&obj), NOW),
+            Err(Refusal::MissingFields)
         );
     }
 
