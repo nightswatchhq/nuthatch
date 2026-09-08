@@ -620,7 +620,7 @@ pub(crate) struct Assignment {
 pub(crate) struct HandlerBinding {
     pub handler: String,
     pub source: String,
-    pub event: String
+    pub event: String,
 }
 
 #[derive(Debug, Clone)]
