@@ -12,8 +12,8 @@ use crate::calls::CallDecl;
 use crate::cli::PortEmitArgs;
 use crate::config::Config;
 use crate::port_report::{
-    event_column, mapping_calls, render_report, resolved_contract, Citation, Class, MappingCall,
-    Report, ResolvedContract,
+    assignment_event_column, event_column, event_handler_for, mapping_calls, render_report,
+    resolved_contract, Citation, Class, MappingCall, Report, ResolvedContract,
 };
 use crate::registry::snake_case;
 use crate::subgraph_import::to_alias;
@@ -343,10 +343,13 @@ fn map_exact_field(
             if asg.entity != field.entity || asg.field != field.field {
                 continue;
             }
-            let Some(col) = event_column(&asg.expr) else {
+            let Some(col) = assignment_event_column(asg, func) else {
                 continue;
             };
-            let Some(table) = table_for_handler(&func.name, mappings, config) else {
+            let Some(handler) = event_handler_for(func, mappings) else {
+                continue;
+            };
+            let Some(table) = table_for_handler(&handler.name, mappings, config) else {
                 continue;
             };
             return Some((table, col));

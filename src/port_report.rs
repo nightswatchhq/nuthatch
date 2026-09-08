@@ -2026,10 +2026,11 @@ fn call_from_body(
     func: &FunctionInfo,
     asg: &Assignment,
     writer: Option<&FunctionInfo>,
-    _expr: &str,
+    expr: &str,
 ) -> Option<MappingCall> {
     let sites = find_try_sites(&func.body, &func.file, func.body_start_line);
-    let site = sites.into_iter().next()?;
+    let use_returns = writer.is_some() || func.kind == HandlerKind::Helper;
+    let site = pick_try_site(&sites, &func.body, expr, use_returns)?;
     let bind_arg = site
         .bind_arg
         .clone()
@@ -2050,11 +2051,189 @@ fn call_from_body(
         handler: writer.unwrap_or(func).name.clone(),
         signature,
         contract_arg: bind_arg,
-        args: site.args,
-        citation: site.citation,
+        args: site.args.clone(),
+        citation: site.citation.clone(),
     })
 }
 
+/// The `.try_*` that actually feeds `expr` (the assignment) or, in a helper, the returned value.
+/// A helper that calls `try_symbol` and then returns `try_decimals` must not emit `symbol()` for
+/// the decimals field.
+fn pick_try_site<'a>(
+    sites: &'a [TrySite],
+    body: &str,
+    expr: &str,
+    use_returns: bool,
+) -> Option<&'a TrySite> {
+    if sites.is_empty() {
+        return None;
+    }
+    let locals = locals_bound_to_try(body, sites);
+    if let Some(site) = site_for_text(expr, sites, &locals) {
+        return Some(site);
+    }
+    if use_returns {
+        for ret in return_exprs(body) {
+            if let Some(site) = site_for_text(&ret, sites, &locals) {
+                return Some(site);
+            }
+        }
+        if sites.len() == 1 {
+            return sites.first();
+        }
+    }
+    None
+}
+
+fn site_for_text<'a>(
+    text: &str,
+    sites: &'a [TrySite],
+    locals: &BTreeMap<String, &'a TrySite>,
+) -> Option<&'a TrySite> {
+    for site in sites {
+        if ident_in(text, &format!("try_{}", site.method)) {
+            return Some(site);
+        }
+    }
+    for (var, site) in locals {
+        if uses_local(text, var) {
+            return Some(site);
+        }
+    }
+    None
+}
+
+fn locals_bound_to_try<'a>(body: &str, sites: &'a [TrySite]) -> BTreeMap<String, &'a TrySite> {
+    let mut map = BTreeMap::new();
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((var, rhs, next)) = match_let_rhs(body, i) {
+            if let Some(site) = sites
+                .iter()
+                .find(|s| ident_in(&rhs, &format!("try_{}", s.method)))
+            {
+                map.insert(var, site);
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    map
+}
+
+fn match_let_rhs(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if k >= text.len() || text.as_bytes()[k] != b'=' {
+        return None;
+    }
+    if k + 1 < text.len() {
+        let n = text.as_bytes()[k + 1];
+        if n == b'=' || n == b'>' {
+            return None;
+        }
+    }
+    let rhs = take_expr(text, k + 1);
+    Some((var, collapse_ws(&rhs), k + 1))
+}
+
+fn return_exprs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if body[i..].starts_with("return") {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after = i + 6;
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if before_ok && after_ok {
+                let expr = take_expr(body, after);
+                if !expr.is_empty() {
+                    out.push(collapse_ws(&expr));
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn ident_in(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_')
+            };
+            let after_ok = i + needle.len() == bytes.len() || {
+                let n = bytes[i + needle.len()];
+                !(n.is_ascii_alphanumeric() || n == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn uses_local(text: &str, var: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = var.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_' || p == b'.')
+            };
+            let after_ok = i + needle.len() == bytes.len() || {
+                let n = bytes[i + needle.len()];
+                !(n.is_ascii_alphanumeric() || n == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
 struct TrySite {
     method: String,
     receiver: String,
@@ -2356,6 +2535,106 @@ pub(crate) fn strip_converters(expr: &str) -> String {
     s
 }
 
+/// Event-table column this assignment copies. Constructor ids (`new Token(event.params.token0)`)
+/// use the constructor argument; a local that only aliases that argument is chased for `id`.
+pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> Option<String> {
+    if let Some(col) = event_column(&asg.expr) {
+        return Some(col);
+    }
+    if asg.field != "id" {
+        return None;
+    }
+    let ident = local_root(&asg.expr)?;
+    let arg = constructor_arg_for(&func.body, &ident)
+        .or_else(|| load_arg_for(&func.body, &ident))
+        .or_else(|| create_arg_for(&func.body, &ident))?;
+    event_column(&arg)
+}
+
+/// The event/call handler that wrote this, or a handler that calls this helper. Block handlers
+/// are never a table source.
+pub(crate) fn event_handler_for<'a>(
+    func: &'a FunctionInfo,
+    mappings: &'a Mappings,
+) -> Option<&'a FunctionInfo> {
+    if func.kind == HandlerKind::Event || func.kind == HandlerKind::Call {
+        return Some(func);
+    }
+    if func.kind == HandlerKind::Block {
+        return None;
+    }
+    mappings.functions.values().find(|f| {
+        (f.kind == HandlerKind::Event || f.kind == HandlerKind::Call)
+            && f.calls.contains(&func.name)
+    })
+}
+
+fn local_root(expr: &str) -> Option<String> {
+    let e = strip_converters(expr);
+    let e = e.strip_suffix(".id").unwrap_or(&e).trim();
+    if e.is_empty() {
+        return None;
+    }
+    if !e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if e.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    Some(e.to_string())
+}
+
+fn constructor_arg_for(body: &str, var: &str) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        let hit = match_let_new(body, i).or_else(|| match_bare_new(body, i));
+        if let Some((v, _ent, next)) = hit {
+            if v == var {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    return Some(collapse_ws(&take_expr(body, k + 1)));
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn load_arg_for(body: &str, var: &str) -> Option<String> {
+    arg_after_match(body, var, match_let_load)
+}
+
+fn create_arg_for(body: &str, var: &str) -> Option<String> {
+    arg_after_match(body, var, match_let_create)
+}
+
+fn arg_after_match(
+    body: &str,
+    var: &str,
+    matcher: fn(&str, usize) -> Option<(String, String, usize)>,
+) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((v, _ent, next)) = matcher(body, i) {
+            if v == var {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    return Some(collapse_ws(&take_expr(body, k + 1)));
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Map a mapping expression onto a nest column (`token0`, `address`, …). `None` if it is not
 /// a field of the triggering event - emit then refuses to guess.
 pub(crate) fn event_column(expr: &str) -> Option<String> {
@@ -2461,6 +2740,50 @@ mod tests {
             .unwrap()
             .reason
             .clone()
+    }
+
+    #[test]
+    fn constructor_id_maps_to_the_event_column() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+type Pool @entity {
+  id: ID!
+  token0: Token!
+}
+"#;
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = 'x'
+  token0.save()
+  let pool = new Pool(event.params.pool.toHex())
+  pool.token0 = token0.id
+  pool.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/mappings/core.ts", mapping);
+        let func = mappings.functions.get("handlePoolCreated").unwrap();
+        let token_id = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Token" && a.field == "id")
+            .expect("constructor id");
+        assert_eq!(
+            assignment_event_column(token_id, func).as_deref(),
+            Some("token0")
+        );
+        let pool_id = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Pool" && a.field == "id")
+            .expect("pool constructor id");
+        assert_eq!(
+            assignment_event_column(pool_id, func).as_deref(),
+            Some("pool")
+        );
     }
 
     #[test]
@@ -2845,6 +3168,87 @@ export function handlePoolCreated(event: PoolCreated): void {
             "try_symbol is line 4 of the mapping"
         );
         assert_eq!(calls[0].handler, "handlePoolCreated");
+    }
+
+    #[test]
+    fn helper_with_two_reads_emits_the_returned_method() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(tokenAddress: Address): BigInt {
+  let contract = ERC20.bind(tokenAddress)
+  let _sym = contract.try_symbol()
+  return contract.try_decimals().value
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0].signature, "decimals()",
+            "the returned try_decimals must win over the earlier try_symbol: {calls:?}"
+        );
+        assert_eq!(calls[0].contract_arg, "event.params.token0");
+        assert_eq!(
+            calls[0].citation.line, 5,
+            "must cite try_decimals, not try_symbol, got {}",
+            calls[0].citation.line
+        );
+    }
+
+    #[test]
+    fn two_inline_reads_attribute_each_field_to_its_try() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+  decimals: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  let contract = ERC20.bind(event.params.token0)
+  token0.symbol = contract.try_symbol().value
+  token0.decimals = contract.try_decimals().value
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/mappings/core.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        let sig = |field: &str| {
+            calls
+                .iter()
+                .find(|c| c.field == field)
+                .map(|c| c.signature.as_str())
+                .unwrap_or("missing")
+        };
+        assert_eq!(sig("symbol"), "symbol()", "{calls:?}");
+        assert_eq!(sig("decimals"), "decimals()", "{calls:?}");
     }
 
     #[test]

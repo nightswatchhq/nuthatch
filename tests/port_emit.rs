@@ -71,6 +71,13 @@ template = "pool"
     .expect("regen nest artifacts");
 }
 
+fn select_sql(sql: &str) -> String {
+    sql.lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -140,13 +147,27 @@ fn exact_field_appears_in_a_view() {
         "Token.id is exact: {:?}",
         token.exact_fields
     );
+    let select = select_sql(&token.sql);
     assert!(
-        token.sql.contains("id") || token.sql.contains("\"id\""),
-        "Exact field id must appear in the view SQL:\n{}",
+        select.contains("AS \"id\""),
+        "Token.id must be a SELECT column, not a comment:\n{}",
+        token.sql
+    );
+    assert!(
+        select.contains("\"token0\""),
+        "constructor id is event.params.token0:\n{}",
+        token.sql
+    );
+    assert!(
+        !select.contains("port_placeholder"),
+        "Token.id was omitted from the projection:\n{}",
         token.sql
     );
     let on_disk = std::fs::read_to_string(nest.path().join("views").join(&token.file)).unwrap();
-    assert!(on_disk.contains("id"), "{on_disk}");
+    assert!(
+        select_sql(&on_disk).contains("AS \"id\""),
+        "on-disk view must project id:\n{on_disk}"
+    );
     assert!(
         !on_disk.to_ascii_lowercase().contains("symbol")
             || on_disk.contains("Call-derived")
