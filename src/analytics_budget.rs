@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 512;
 /// DuckDB worker threads. Operator key `analytics.threads`.
 pub const DEFAULT_THREADS: i64 = 2;
+/// Hard ceiling on `analytics.threads`. Matches [`crate::serve::SQL_MAX_CONCURRENCY_CEILING`].
+pub const THREADS_CEILING: i64 = crate::serve::SQL_MAX_CONCURRENCY_CEILING as i64;
 
 pub const ENV_MEMORY_LIMIT: &str = "NUTHATCH_ANALYTICS_MEMORY_LIMIT";
 pub const ENV_THREADS: &str = "NUTHATCH_ANALYTICS_THREADS";
@@ -66,8 +68,9 @@ pub fn derived_ingestion_reservation_mb() -> u64 {
         .saturating_sub(crate::serve::SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB)
 }
 
-/// Read the live operator settings. Invalid values fall back to the shipped default and warn,
-/// matching `NUTHATCH_SQL_MAX_CONCURRENCY`. Over-budget valid values are the validator's job.
+/// Read the live operator settings. Invalid values fall back to the shipped default and warn;
+/// a thread count above [`THREADS_CEILING`] clamps, matching `NUTHATCH_SQL_MAX_CONCURRENCY`.
+/// Over-budget valid values are the validator's job.
 pub fn from_env() -> AnalyticsConfig {
     AnalyticsConfig {
         memory_limit_mb: env_u64_memory(ENV_MEMORY_LIMIT, DEFAULT_MEMORY_LIMIT_MB),
@@ -80,6 +83,7 @@ pub fn from_env() -> AnalyticsConfig {
 
 /// Startup refusal: `(sql_permits × analytics.memory_limit) + ingestion_reservation +
 /// runtime_headroom ≤ 2 GiB`. `sql_permits` is cursor-wide. `analytics.max_temp_size` is disk.
+/// `analytics.threads` above [`THREADS_CEILING`] is refused; it is not a term in that equation.
 pub fn validate_cursor_budget() -> Result<()> {
     validate_against(&from_env(), crate::serve::sql_max_concurrency())
 }
@@ -97,6 +101,13 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     if cfg.threads < 1 {
         bail!(
             "analytics.threads must be at least 1 (set {ENV_THREADS}, default {DEFAULT_THREADS})"
+        );
+    }
+    if cfg.threads > THREADS_CEILING {
+        bail!(
+            "analytics.threads is {}, above the ceiling of {THREADS_CEILING} (set {ENV_THREADS}, \
+             default {DEFAULT_THREADS}). DuckDB worker threads are not an unconstrained config key.",
+            cfg.threads
         );
     }
     let duck = permits.saturating_mul(cfg.memory_limit_mb);
@@ -157,7 +168,16 @@ fn env_threads() -> i64 {
     match std::env::var(ENV_THREADS) {
         Err(_) => DEFAULT_THREADS,
         Ok(raw) => match raw.trim().parse::<i64>() {
-            Ok(n) if n >= 1 => n,
+            Ok(n) if (1..=THREADS_CEILING).contains(&n) => n,
+            Ok(n) if n > THREADS_CEILING => {
+                tracing::warn!(
+                    requested = n,
+                    ceiling = THREADS_CEILING,
+                    "{ENV_THREADS} above the ceiling; clamping. DuckDB worker threads are not \
+                     an unconstrained config key"
+                );
+                THREADS_CEILING
+            }
             _ => {
                 tracing::warn!(
                     value = %raw,
@@ -242,6 +262,8 @@ mod tests {
         assert_eq!(SQL_MAX_CONCURRENCY, 2);
         assert_eq!(DEFAULT_MEMORY_LIMIT_MB, 512);
         assert_eq!(DEFAULT_THREADS, 2);
+        assert_eq!(THREADS_CEILING, SQL_MAX_CONCURRENCY_CEILING as i64);
+        assert_eq!(THREADS_CEILING, 16);
         assert_eq!(derived_ingestion_reservation_mb(), 1024);
         assert_eq!(DEFAULT_MAX_RSS_MB, 2048);
         assert_eq!(RUNTIME_HEADROOM_MB, 0);
@@ -369,6 +391,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("analytics.memory_limit"), "{err}");
+    }
+
+    #[test]
+    fn oversize_thread_count_is_refused() {
+        let cfg = AnalyticsConfig {
+            threads: i64::MAX,
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_against(&cfg, SQL_MAX_CONCURRENCY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("analytics.threads"),
+            "must name analytics.threads: {err}"
+        );
+        assert!(
+            err.contains(&THREADS_CEILING.to_string()),
+            "must name the ceiling: {err}"
+        );
+        assert!(
+            err.contains(ENV_THREADS),
+            "must name the env key an operator can actually set: {err}"
+        );
+        validate_against(
+            &AnalyticsConfig {
+                threads: THREADS_CEILING,
+                ..AnalyticsConfig::default()
+            },
+            SQL_MAX_CONCURRENCY,
+        )
+        .expect("the ceiling itself must still start");
     }
 
     #[test]
