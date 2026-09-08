@@ -893,7 +893,16 @@ Get this right in your supervisor and your load balancer:
 
 - **`/health`** is liveness. `200` while the process serves. Restart on failure.
 - **`/ready`** is readiness. Runtime root: `200` only when **every** cursor and nest is indexing; `503`
-  with a body naming what is quarantined. Per-nest `/<name>/ready` answers only for that nest.
+  with a body naming what is quarantined (`quarantined`) **and which nests are stalled, with the terms
+  that took each one unready** (`stalled`). Per-nest `/<name>/ready` answers only for that nest.
+
+  A nest reaches the `stalled` list on exactly the terms its own `/<name>/ready` uses - one function
+  computes both, so the two surfaces cannot disagree. Before 3.6.2 the root consulted the quarantine
+  set alone, and a runtime answered `{"quarantined":[],"ready":true}` while a nest inside it had not
+  sealed in two days (#1204). **A 503 here is advice, not a gate:** every healthy nest carries on
+  serving reads to whoever asks for it directly, so wiring a supervisor to this endpoint tells it to
+  fetch a human rather than to restart the process. If yours restarts on a failed readiness check,
+  point it at `/health` instead.
 
 **A cursor at tip is not the same claim as a seal that is keeping up**, and since 3.6.1 `/ready`
 answers both. `lag_blocks` describes *following*; `seal_lag_blocks` is how far the sealed watermark
