@@ -1161,7 +1161,7 @@ fn match_let_create(text: &str, i: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let ent = take_ident_str(text, &mut k)?;
-    if ent.is_empty() || !ent.starts_with(|c: char| c.is_ascii_uppercase()) {
+    if !ent.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
         return None;
     }
     skip_ws_str(text, &mut k);
