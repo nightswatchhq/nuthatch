@@ -257,14 +257,15 @@ fn parse_schema(text: &str) -> Result<Schema> {
                     .map(|(_, c)| *c)
                     .collect();
                 if name == "_Schema_" {
+                    // Directive-only in this dialect: the next `{` belongs to the
+                    // following type, not to `_Schema_`.
+                    let next = find_next_type_decl(&chars, i).unwrap_or(chars.len());
+                    let header: String = chars[i.min(chars.len())..next]
+                        .iter()
+                        .map(|(_, c)| *c)
+                        .collect();
                     collect_fulltext(&header, header_line, &mut fulltext);
-                    if let Some(open) = find_char(&chars, i, '{') {
-                        if let Some(close) = match_brace(&chars, open) {
-                            i = close + 1;
-                            continue;
-                        }
-                    }
-                    i = header_end;
+                    i = next;
                     continue;
                 }
                 if !header.contains("@entity") {
@@ -487,6 +488,42 @@ fn take_ident(chars: &[(usize, char)], i: &mut usize) -> Option<String> {
         *i += 1;
     }
     Some(chars[start..*i].iter().map(|(_, c)| *c).collect())
+}
+
+fn find_next_type_decl(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    while i < chars.len() {
+        skip_ws_and_graphql_trivia(chars, &mut i);
+        if i >= chars.len() {
+            return None;
+        }
+        match chars[i].1 {
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            _ => {
+                if paren == 0
+                    && bracket == 0
+                    && brace == 0
+                    && ident_at(chars, i, "type")
+                    && (i == 0 || !is_ident_continue(chars[i - 1].1))
+                {
+                    let after = i + 4;
+                    if after >= chars.len() || !is_ident_continue(chars[after].1) {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_char(chars: &[(usize, char)], start: usize, want: char) -> Option<usize> {
@@ -2232,6 +2269,37 @@ type Token @entity {
         assert!(reason_of(&rows, "_Schema_", "tokenSearch").contains("@fulltext"));
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::Unreachable);
         assert!(reason_of(&rows, "Token", "symbol").contains("no mapping writes"));
+    }
+
+    #[test]
+    fn schema_underscore_does_not_swallow_the_next_entity() {
+        let schema = r#"
+type _Schema_
+  @fulltext(
+    name: "tokenSearch"
+    language: en
+    algorithm: rank
+  )
+
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/x.ts", "");
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Bundle", "id"), Class::Unreachable);
+        assert_eq!(class_of(&rows, "Bundle", "ethPriceUSD"), Class::Unreachable);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::Unreachable);
+        assert_eq!(
+            class_of(&rows, "_Schema_", "tokenSearch"),
+            Class::Unreachable
+        );
     }
 
     #[test]
