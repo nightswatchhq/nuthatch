@@ -428,7 +428,11 @@ fn view_for_entity(
         sql.push_str(&format!(
             "CREATE VIEW \"{view_name}\" AS SELECT 1 AS port_placeholder;\n"
         ));
-        return ViewDraft { sql, exact_fields, skipped };
+        return ViewDraft {
+            sql,
+            exact_fields,
+            skipped,
+        };
     }
 
     sql.push_str(&format!(
@@ -611,7 +615,13 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     // engine refusing to bind an absent column is worth more than either list agreeing with itself.
     let mut labels: Vec<(String, String, Vec<String>)> = views
         .iter()
-        .map(|v| (v.entity.clone(), to_alias(&v.entity), v.exact_fields.clone()))
+        .map(|v| {
+            (
+                v.entity.clone(),
+                to_alias(&v.entity),
+                v.exact_fields.clone(),
+            )
+        })
         .collect();
     labels.sort();
     let sql = if labels.is_empty() {

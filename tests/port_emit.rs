@@ -487,7 +487,6 @@ fn emitted_nest_loads_and_views_validate() {
     );
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // #1248: an Exact field must be answered correctly or named, never answered wrongly.
 // ---------------------------------------------------------------------------------------------
@@ -508,7 +507,10 @@ fn subgraph_with(schema: &str, mapping: &str) -> tempfile::TempDir {
     dir
 }
 
-fn emitted_nest(schema: &str, mapping: &str) -> (tempfile::TempDir, nuthatch::port_emit::EmitResult) {
+fn emitted_nest(
+    schema: &str,
+    mapping: &str,
+) -> (tempfile::TempDir, nuthatch::port_emit::EmitResult) {
     let subgraph = subgraph_with(schema, mapping);
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);
@@ -645,10 +647,16 @@ fn the_generated_check_names_the_promised_columns_rather_than_star() {
     }
 }
 
-/// The check must not merely *name* the promised columns; naming them has to be what makes
-/// `nuthatch check` refuse. This runs the generated check against DuckDB, so the guarantee is the
-/// engine's rather than a substring's: if `exact_fields` ever again advertises a field the view does
-/// not project, the check names a column that is not there and binding fails.
+/// Pins the *mechanism* the fix depends on: DuckDB refuses to bind a projection naming a column the
+/// view does not have, so a check written that way can see a missing promised column.
+///
+/// **Read this together with its sibling above, and do not mistake one for the other.** Reverting
+/// the projection to `SELECT *` kills `the_generated_check_names_the_promised_columns_rather_than_star`
+/// and leaves this one green, because breaking the check by hand still names an absent column
+/// whichever way the generator wrote it. So the sibling is the regression test for the change, and
+/// this is the test that says why naming columns is worth doing at all. Neither is sufficient alone:
+/// without the sibling nothing notices the generator regressing, and without this one the sibling is
+/// asserting on a substring whose consequence nobody has demonstrated.
 #[test]
 fn the_generated_check_fails_if_a_promised_column_is_missing() {
     let (nest, _result) = emitted_nest(OPS_SCHEMA, OPS_MAPPING);
@@ -657,16 +665,19 @@ fn the_generated_check_fails_if_a_promised_column_is_missing() {
         dir: nest.path().display().to_string(),
         update: false,
     });
-    assert!(clean.is_ok(), "the emitted nest must pass its own check: {clean:?}");
+    assert!(
+        clean.is_ok(),
+        "the emitted nest must pass its own check: {clean:?}"
+    );
 
     // Now break exactly the invariant #1248 broke: promise a column the view does not project.
     let path = nest.path().join("checks/port_views.sql");
     let sql = std::fs::read_to_string(&path).unwrap();
-    let broken = sql.replace(
-        "FROM (SELECT ",
-        "FROM (SELECT \"negated\", ",
+    let broken = sql.replace("FROM (SELECT ", "FROM (SELECT \"negated\", ");
+    assert_ne!(
+        broken, sql,
+        "the check must have a projection to break:\n{sql}"
     );
-    assert_ne!(broken, sql, "the check must have a projection to break:\n{sql}");
     std::fs::write(&path, &broken).unwrap();
 
     let result = nuthatch::check::check(nuthatch::cli::CheckArgs {
