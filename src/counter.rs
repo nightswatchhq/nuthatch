@@ -153,6 +153,7 @@ pub fn verify_and_record(
         "authorisation": header,
     });
     use std::io::Write;
+    let existed = path.try_exists().map_err(|_| x402::Refusal::RecordFailed)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -160,6 +161,14 @@ pub fn verify_and_record(
         .map_err(|_| x402::Refusal::RecordFailed)?;
     writeln!(file, "{row}").map_err(|_| x402::Refusal::RecordFailed)?;
     file.sync_data().map_err(|_| x402::Refusal::RecordFailed)?;
+    // `sync_data` makes the row durable, but a first write has also created a directory entry.
+    // Without syncing that parent directory, a crash can lose the name after the query has been
+    // served, turning the same signed promise into an apparently unspent nonce after restart.
+    if !existed {
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| x402::Refusal::RecordFailed)?;
+    }
     Ok(())
 }
 
