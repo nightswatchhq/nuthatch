@@ -287,6 +287,14 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
+        // RFC-0053 S0's migration validator. `Operation` is one entry in a **corpus file the
+        // caller supplies on the command line** - the queries they want checked - not nest config
+        // an operator authors and nothing under `nuthatch.toml` nests it. The operator surface for
+        // this is the CLI subcommand, which `cli-reference.md` documents.
+        "src/graph_validate.rs",
+        "a caller-supplied query corpus, not nest config",
+    ),
+    (
         // RFC-0045 stage 1. `Catalogue`/`Snapshot` are the provenance manifest that
         // `nuthatch offchain drop` *writes* - content hash, source path, ingest time, tool version.
         // An operator never authors it, and nothing under `nuthatch.toml` nests it; the operator
