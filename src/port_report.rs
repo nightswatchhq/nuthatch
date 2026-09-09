@@ -332,31 +332,98 @@ fn directive_arg(after_directive: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Field definitions in an entity body, in order, with the line each starts on.
+///
+/// **Not line-based.** GraphQL puts no significance on newlines, and
+/// `type Token @entity { id: ID! derivedETH: BigDecimal! }` is as valid as the multi-line form.
+/// Splitting on lines and taking the first `name:` from each recorded only `id` and dropped every
+/// later field on the line - silently, which for a report whose whole promise is "every field,
+/// classified" means the author is told about a field that does not exist and not told about one
+/// that does (#1210).
+///
+/// A field starts at an identifier followed by `:` **at depth zero**: not inside `[..]` (list
+/// types), not inside `(..)` (a directive's arguments, which contain their own colons, as
+/// `@derivedFrom(field: "pool")` does), and not inside a string or a `#` comment. Everything from
+/// one field start to the next is that field's type and directives, so a directive on its own line
+/// still attaches to the field above it.
 fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
+    let starts = field_starts(body);
     let mut fields = Vec::new();
-    let mut pending_name: Option<(String, usize)> = None;
-    let mut pending_dirs = String::new();
-    for (offset, raw) in body.lines().enumerate() {
-        let line_no = start_line + offset + 1;
-        let stripped = strip_graphql_line_comment(raw);
-        let line = stripped.trim();
-        if line.is_empty() {
+    for (idx, (name, at)) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).map(|(_, n)| *n).unwrap_or(body.len());
+        let segment = &body[*at..end];
+        let dirs: String = segment
+            .match_indices('@')
+            .map(|(i, _)| segment[i..].trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `start_line` is the 1-based line the `{` is on and `line_of` is 1-based within the
+        // body, so the two overlap on that first line. The old per-line loop had the same overlap
+        // (`start_line + offset + 1`) and reported every schema field one line below itself.
+        let line = start_line + line_of(body, *at) - 1;
+        flush_field(&mut fields, Some((name.clone(), line)), &dirs);
+    }
+    fields
+}
+
+/// `(name, byte offset)` for every field definition in the body.
+fn field_starts(body: &str) -> Vec<(String, usize)> {
+    let bytes = body.as_bytes();
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut brackets = 0i32;
+    let mut parens = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            b'(' => parens += 1,
+            b')' => parens -= 1,
+            _ => {}
+        }
+        let at_word_start =
+            i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if brackets == 0
+            && parens == 0
+            && at_word_start
+            && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+        {
+            let mut k = i + 1;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            let mut n = k;
+            while n < bytes.len() && bytes[n].is_ascii_whitespace() {
+                n += 1;
+            }
+            if n < bytes.len() && bytes[n] == b':' {
+                out.push((body[i..k].to_string(), i));
+                i = n + 1;
+                continue;
+            }
+            i = k;
             continue;
         }
-        if let Some((name, ty_and_dir)) = parse_field_line(line) {
-            flush_field(&mut fields, pending_name.take(), &pending_dirs);
-            pending_dirs.clear();
-            if let Some(dir) = ty_and_dir {
-                pending_dirs.push_str(dir);
-            }
-            pending_name = Some((name, line_no));
-        } else if pending_name.is_some() && line.starts_with('@') {
-            pending_dirs.push(' ');
-            pending_dirs.push_str(line);
-        }
+        i += 1;
     }
-    flush_field(&mut fields, pending_name, &pending_dirs);
-    fields
+    out
 }
 
 fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, dirs: &str) {
@@ -372,45 +439,6 @@ fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, 
         line,
         derived_from,
     });
-}
-
-fn parse_field_line(line: &str) -> Option<(String, Option<&str>)> {
-    let line = line.trim();
-    if line.starts_with('@') || line.starts_with('}') || line.starts_with('#') {
-        return None;
-    }
-    let colon = line.find(':')?;
-    let name = line[..colon].trim();
-    if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return None;
-    }
-    let rest = line[colon + 1..].trim();
-    let dir = rest.find('@').map(|i| rest[i..].trim());
-    Some((name.to_string(), dir))
-}
-
-fn strip_graphql_line_comment(line: &str) -> String {
-    let mut out = String::new();
-    let mut in_str = false;
-    let chars = line.chars().peekable();
-    for c in chars {
-        if c == '"' {
-            in_str = !in_str;
-            out.push(c);
-            continue;
-        }
-        if !in_str && c == '#' {
-            break;
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn skip_ws_and_graphql_trivia(chars: &[(usize, char)], i: &mut usize) {
@@ -905,8 +933,12 @@ fn match_function_name(text: &str, i: usize) -> Option<std::ops::Range<usize>> {
 }
 
 fn match_ts_brace(text: &str, open: usize) -> Option<usize> {
+    match_ts_delim(text, open, b'{', b'}')
+}
+
+fn match_ts_delim(text: &str, open: usize, o: u8, c: u8) -> Option<usize> {
     let bytes = text.as_bytes();
-    if open >= bytes.len() || bytes[open] != b'{' {
+    if open >= bytes.len() || bytes[open] != o {
         return None;
     }
     let mut depth = 0;
@@ -930,9 +962,9 @@ fn match_ts_brace(text: &str, open: usize) -> Option<usize> {
             i += 1;
             continue;
         }
-        if b == b'{' {
+        if b == o {
             depth += 1;
-        } else if b == b'}' {
+        } else if b == c {
             depth -= 1;
             if depth == 0 {
                 return Some(i);
@@ -1071,8 +1103,7 @@ fn analyse_function(
     ));
     let calls = collect_calls(body);
     let contract_call = find_contract_call(body, file, body_start_line);
-    let has_loop = has_loop(body);
-    let has_load = body.contains(".load(");
+    let has_loop_load = loop_reads_a_loaded_entity_field(body, &bindings);
     let field_reads = collect_field_reads(body, &bindings);
     FunctionInfo {
         name,
@@ -1080,7 +1111,7 @@ fn analyse_function(
         assignments,
         calls,
         contract_call,
-        has_loop_load: has_loop && has_load,
+        has_loop_load,
         field_reads,
         param_names,
         body: body.to_string(),
@@ -1701,24 +1732,66 @@ fn find_contract_call(body: &str, file: &str, body_start_line: usize) -> Option<
     })
 }
 
-fn has_loop(body: &str) -> bool {
+/// A fixed point is a loop that **reads entity state it has loaded**, not a body that merely
+/// contains a loop somewhere and a `.load(` somewhere.
+///
+/// `has_loop(body) && body.contains(".load(")` was body-wide, so a load outside every loop set the
+/// class, and a loop that only loads and saves - which reproduces exactly - set it too. Both
+/// report a field as non-reproducible when it is not, which is the wrong direction to be wrong in
+/// for a port report: the author does the work of hand-checking a field that was fine.
+///
+/// `findEthPerToken` is the shape this exists for. It loops over whitelisted pools, loads each, and
+/// reads a stored field off the loaded entity, so its answer depends on state derived from earlier
+/// blocks. A loop with no such read has no such dependency. A braceless single-statement loop is
+/// not treated as a fixed point rather than guessed at.
+fn loop_reads_a_loaded_entity_field(body: &str, bindings: &BTreeMap<String, String>) -> bool {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-            && (body[i..].starts_with("for") || body[i..].starts_with("while"))
-        {
-            let kw_len = if body[i..].starts_with("for") { 3 } else { 5 };
-            let after = i + kw_len;
-            if after >= bytes.len()
-                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
-            {
-                return true;
+        let at_word_start =
+            i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let kw = if body.is_char_boundary(i) && body[i..].starts_with("for") {
+            3
+        } else if body.is_char_boundary(i) && body[i..].starts_with("while") {
+            5
+        } else {
+            0
+        };
+        if at_word_start && kw > 0 {
+            let after = i + kw;
+            let boundary = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if boundary {
+                if let Some(inner) = loop_body(body, after) {
+                    if inner.contains(".load(") && !collect_field_reads(inner, bindings).is_empty()
+                    {
+                        return true;
+                    }
+                }
             }
         }
         i += 1;
     }
     false
+}
+
+/// The braced body of the loop whose keyword ends at `after`, or `None` when the header does not
+/// have the `( .. ) { .. }` shape. A nested loop is reached by the outer scan continuing past here.
+fn loop_body(body: &str, after: usize) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut k = after;
+    skip_ws_str(body, &mut k);
+    if k >= bytes.len() || bytes[k] != b'(' {
+        return None;
+    }
+    let close = match_ts_delim(body, k, b'(', b')')?;
+    let mut b = close + 1;
+    skip_ws_str(body, &mut b);
+    if b >= bytes.len() || bytes[b] != b'{' {
+        return None;
+    }
+    let end = match_ts_brace(body, b)?;
+    Some(&body[b + 1..end])
 }
 
 fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -1988,11 +2061,70 @@ fn worst_writer(
         let c = class_of_assignment(fn_name, asg, functions, fn_class, field_class);
         if c > worst {
             worst = c;
-            citation = asg.citation.clone();
+            // Cite the line that *decided* the class. For a call-derived field that is the
+            // `bind`/`try_` in some helper, not the `token.symbol = fetchTokenSymbol(..)` that
+            // called it: a reader following the assignment site finds no contract call there and
+            // cannot check the claim (#1210). The assignment stays in the reason, so the row still
+            // says where the field is written.
+            citation = deciding_call_citation(fn_name, asg, functions, fn_class)
+                .unwrap_or_else(|| asg.citation.clone());
             reason = reason_for(c, fn_name, asg, functions.get(fn_name));
+            if citation != asg.citation {
+                reason.push_str(&format!("; assigned at `{}`", asg.citation.display()));
+            }
         }
     }
     (worst, citation, reason)
+}
+
+/// The contract-call site that makes this assignment call-derived, following the helper chain.
+///
+/// `None` when the assignment's own expression carries the call (its citation is already the right
+/// line) or when nothing in the chain records one.
+fn deciding_call_citation(
+    fn_name: &str,
+    asg: &Assignment,
+    functions: &BTreeMap<String, FunctionInfo>,
+    fn_class: &BTreeMap<String, Class>,
+) -> Option<Citation> {
+    if expr_has_contract_call(&asg.expr) {
+        return None;
+    }
+    let func = functions.get(fn_name)?;
+    for callee in &func.calls {
+        if !expr_calls(&asg.expr, callee) {
+            continue;
+        }
+        if fn_class.get(callee) != Some(&Class::CallDerived) {
+            continue;
+        }
+        if let Some(c) = contract_call_in_chain(callee, functions, &mut BTreeSet::new()) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// First `contract_call` reachable from `name`, breadth of the call graph in name order so the
+/// answer does not depend on iteration luck. `seen` stops a cycle.
+fn contract_call_in_chain(
+    name: &str,
+    functions: &BTreeMap<String, FunctionInfo>,
+    seen: &mut BTreeSet<String>,
+) -> Option<Citation> {
+    if !seen.insert(name.to_string()) {
+        return None;
+    }
+    let func = functions.get(name)?;
+    if let Some(c) = &func.contract_call {
+        return Some(c.clone());
+    }
+    for callee in &func.calls {
+        if let Some(c) = contract_call_in_chain(callee, functions, seen) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 fn class_of_assignment(
@@ -3235,6 +3367,145 @@ export function handlePoolCreated(event: PoolCreated): void {
         assert!(reason_of(&rows, "Token", "symbol").contains("fetchTokenSymbol"));
     }
 
+    /// Jules on #1242. The citation must be the line that decided the class. For a call-derived
+    /// field that is the `bind`/`try_` inside the helper, possibly several calls down, not the
+    /// assignment that called it - a reader following the assignment site finds no contract call
+    /// there and cannot check the claim.
+    #[test]
+    fn a_call_derived_field_cites_the_contract_call_not_the_assignment() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        // Two hops: the assignment calls `fetchTokenSymbol`, which calls `readTokenSymbol`, and
+        // only the innermost one binds the contract.
+        let mapping = r#"
+function readTokenSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  return contract.try_symbol().value
+}
+
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  return readTokenSymbol(tokenAddress)
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.symbol = fetchTokenSymbol(event.params.token0)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        let row = rows
+            .iter()
+            .find(|r| r.entity == "Token" && r.field == "symbol")
+            .unwrap();
+        assert_eq!(
+            row.citation.line,
+            3,
+            "the citation must be the ERC20.bind line, not the assignment: {}",
+            row.citation.display()
+        );
+        assert!(
+            row.reason.contains("assigned at"),
+            "and the assignment site must not be lost from the row: {}",
+            row.reason
+        );
+    }
+
+    /// When the call is on the assignment's own line there is nothing to redirect to.
+    #[test]
+    fn an_inline_contract_call_still_cites_its_own_assignment() {
+        let schema = "type Token @entity {\n  id: ID!\n  symbol: String!\n}\n";
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.symbol = ERC20.bind(event.params.token0).try_symbol().value
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
+        let row = rows
+            .iter()
+            .find(|r| r.entity == "Token" && r.field == "symbol")
+            .unwrap();
+        assert_eq!(row.citation.line, 4, "{}", row.citation.display());
+        assert!(
+            !row.reason.contains("assigned at"),
+            "no redirection, so no second location to name: {}",
+            row.reason
+        );
+    }
+
+    /// Jules on #1242 read the propagation as caller to callee: a blockHandler making every helper
+    /// it calls unreachable, so a shared helper would poison an event handler's field.
+    ///
+    /// Two things stop it, and reversing the propagation direction leaves this test green, so the
+    /// direction is not the one that matters. `propagate_fn_class` does run callee to caller. But
+    /// the load-bearing rule is in `class_of_assignment`: a helper's class reaches an assignment
+    /// only when that assignment's own right-hand side calls it, and `swap.amount0 =
+    /// event.params.amount0` calls nothing. A helper's class is what `x = helper(..)` inherits, not
+    /// a property of every write inside it.
+    #[test]
+    fn a_helper_shared_with_a_block_handler_does_not_poison_the_event_path() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+}
+type BlockStat @entity {
+  id: ID!
+  n: BigInt!
+}
+"#;
+        let mapping = r#"
+export function record(swap: Swap, event: SwapEvent): void {
+  swap.amount0 = event.params.amount0
+  swap.save()
+}
+
+export function handleBlock(block: ethereum.Block): void {
+  let s = new BlockStat(block.number.toString())
+  s.n = block.number
+  s.save()
+  record(s as Swap, block as SwapEvent)
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap(event.transaction.hash.toHex())
+  record(swap, event)
+}
+"#;
+        let (schema, mut mappings) = schema_and_mappings(schema, "src/x.ts", mapping);
+        // The manifest is what marks a blockHandler and these fixtures have none, so set it here
+        // or the scenario is not exercised at all and the test passes without touching the path.
+        mappings.functions.get_mut("handleBlock").unwrap().kind = HandlerKind::Block;
+        assert!(
+            mappings.functions["handleBlock"].calls.contains("record")
+                && mappings.functions["handleSwap"].calls.contains("record"),
+            "the helper has to be shared for this to be testing anything"
+        );
+
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "BlockStat", "n"),
+            Class::Unreachable,
+            "the blockHandler's own writes are still unreachable"
+        );
+        assert_eq!(
+            class_of(&rows, "Swap", "amount0"),
+            Class::Exact,
+            "the event path through the shared helper stays exact: {}",
+            reason_of(&rows, "Swap", "amount0")
+        );
+    }
+
     #[test]
     fn nested_helper_is_call_derived() {
         let schema = r#"
@@ -3261,6 +3532,112 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    const LOOP_SCHEMA: &str = r#"
+type Token @entity {
+  id: ID!
+  derivedETH: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  token1Price: BigDecimal!
+  liquidity: BigInt!
+}
+"#;
+
+    /// Jules on #1242. `has_loop && body.contains(".load(")` was body-wide, so a `.load()` sitting
+    /// outside every loop still made the helper a fixed point and every field written from it
+    /// non-reproducible. The class only reaches a field through a call, so the helper is called.
+    #[test]
+    fn a_load_outside_every_loop_is_not_a_fixed_point() {
+        let mapping = r#"
+export function sumAmounts(event: Mint): BigDecimal {
+  const pool = Pool.load(event.address.toHex())
+  let total = ZERO_BD
+  for (let i = 0; i < event.params.amounts.length; ++i) {
+    total = total.plus(event.params.amounts[i])
+  }
+  return total
+}
+
+export function handleMint(event: Mint): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = sumAmounts(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::Exact,
+            "the load is outside the loop, so nothing depends on earlier-block state: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
+    }
+
+    /// A loop that loads and writes, reading nothing off what it loaded, reproduces exactly.
+    #[test]
+    fn a_loop_that_loads_without_reading_a_field_is_not_a_fixed_point() {
+        let mapping = r#"
+export function countPools(event: Sync): BigDecimal {
+  let n = ZERO_BD
+  for (let i = 0; i < event.params.pools.length; ++i) {
+    const pool = Pool.load(event.params.pools[i])
+    if (pool) {
+      n = n.plus(ONE_BD)
+    }
+  }
+  return n
+}
+
+export function handleSync(event: Sync): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = countPools(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::Exact,
+            "a loop that only loads and counts has no cross-block dependency: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
+    }
+
+    /// And the guard must not have removed the class: the same shape with a read of the loaded
+    /// entity's stored field is still a fixed point.
+    #[test]
+    fn a_loop_reading_a_loaded_entitys_field_is_still_a_fixed_point() {
+        let mapping = r#"
+export function priceFromPools(event: Sync): BigDecimal {
+  let priceSoFar = ZERO_BD
+  for (let i = 0; i < event.params.pools.length; ++i) {
+    const pool = Pool.load(event.params.pools[i])
+    if (pool) {
+      priceSoFar = priceSoFar.plus(pool.token1Price)
+    }
+  }
+  return priceSoFar
+}
+
+export function handleSync(event: Sync): void {
+  let token = new Token(event.params.token.toHex())
+  token.derivedETH = priceFromPools(event)
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(LOOP_SCHEMA, "src/pool.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::FixedPoint,
+            "reading pool.token1Price inside the loop is the dependency: {}",
+            reason_of(&rows, "Token", "derivedETH")
+        );
     }
 
     #[test]
@@ -3562,6 +3939,50 @@ type Token @entity { id: ID! leftover: String! }
         assert!(text.contains("watch"));
         assert!(text.contains("service_u_r_i_update"));
         assert!(!text.contains("nuthatch init 0x") || text.contains("not"));
+    }
+
+    /// Jules on #1242. GraphQL puts no meaning on newlines. Splitting the body by line and taking
+    /// the first `name:` from each recorded `id` and silently dropped every field beside it, so the
+    /// report told the author about fields that were not there and never mentioned ones that were.
+    #[test]
+    fn a_compact_entity_declaration_keeps_every_field() {
+        let schema = parse_schema(
+            "type Token @entity { id: ID! derivedETH: BigDecimal! symbol: String! }\n",
+        )
+        .unwrap();
+        let token = schema.entities.iter().find(|e| e.name == "Token").unwrap();
+        let names: Vec<&str> = token.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "derivedETH", "symbol"], "{names:?}");
+    }
+
+    /// A colon inside a directive's arguments or a list type is not a field boundary, and a `#`
+    /// comment is not a field at all.
+    #[test]
+    fn a_directive_argument_colon_is_not_a_field() {
+        let schema = parse_schema(
+            "type Pool @entity {\n  id: ID!\n  # ignored: NotAField\n  ticks: [Tick!]! \n               swaps: [Swap!]! @derivedFrom(field: \"pool\")\n  fee: BigInt!\n}\n",
+        )
+        .unwrap();
+        let pool = schema.entities.iter().find(|e| e.name == "Pool").unwrap();
+        let names: Vec<&str> = pool.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "ticks", "swaps", "fee"], "{names:?}");
+        let swaps = pool.fields.iter().find(|f| f.name == "swaps").unwrap();
+        assert_eq!(
+            swaps.derived_from.as_deref(),
+            Some("pool"),
+            "the directive must still attach to its field"
+        );
+    }
+
+    /// The citation is the line the field is on, and a compact declaration puts several on one.
+    #[test]
+    fn a_field_citation_is_its_own_line() {
+        let schema =
+            parse_schema("\n\ntype Token @entity {\n  id: ID!\n  symbol: String!\n}\n").unwrap();
+        let token = schema.entities.iter().find(|e| e.name == "Token").unwrap();
+        let line_of_field = |n: &str| token.fields.iter().find(|f| f.name == n).unwrap().line;
+        assert_eq!(line_of_field("id"), 4, "id is on line 4");
+        assert_eq!(line_of_field("symbol"), 5, "symbol is on line 5");
     }
 
     #[test]
