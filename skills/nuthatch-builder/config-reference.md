@@ -314,6 +314,43 @@ willing to answer it, not that it is cheap.
 **This is mount config, not manifest**, so changing it leaves the NID untouched and re-indexes
 nothing - and two tenants sharing one dataset can expose different surfaces over it.
 
+### `[mounts.counter]` - charging at your own endpoint (RFC-0046 S2)
+
+**Absent from an ordinary build.** The counter is behind the off-by-default `counter` Cargo feature,
+so a binary built without it has no `[counter]` key, no price, and no payment code at all. That is
+the point rather than an accident: delete every payment feature from the tree and a self-hoster
+loses nothing (#1217 is the test that fails if it ever stops being true).
+
+With the feature on, an operator may put a price on one of their own mounts:
+
+```toml
+[[mounts]]
+tenant = "default"
+alias = "usdc"
+nid = "..."
+sql = "allowlist"
+
+[mounts.counter]
+price = "1000"                                          # USDC base units, as a string
+recipient = "0x1111111111111111111111111111111111111111"
+network = "testnet"                                     # or "mainnet"
+```
+
+| Key | Meaning |
+|---|---|
+| `price` | Cost per named-query request, in **USDC base units**, quoted as a string so TOML cannot round a 256-bit amount before the verifier reads it. Must be greater than zero; a zero price is refused at load rather than serving free. |
+| `recipient` | The address the authorisation pays. Refused at load if it is not an address. |
+| `network` | `mainnet` or `testnet`, selecting the EIP-3009 domain the signature is checked against. |
+
+A priced mount answers an unpaid request with `402` and a challenge naming the exact terms; a request
+carrying a valid `Payment-Signature` is served. The counter **verifies and records, and settles
+nothing** - draining the recorded authorisations is RFC-0046 S3's job, deliberately outside the
+request path so no facilitator sits between a question and its answer.
+
+Only named queries (`sql = "allowlist"`) can be priced. The authorisation log is
+`authorisations.jsonl` beside the nest, and a nonce is spent per **payer**, so two buyers choosing
+the same nonce do not collide.
+
 ### `queries.toml` - the author's ceiling (RFC-0034 phase 2)
 
 A nest **author** can declare the maximum surface they sanction. A mount may then narrow within it,

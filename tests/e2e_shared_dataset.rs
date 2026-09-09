@@ -55,6 +55,8 @@ fn two_mounts_one_nest(root: &Path) -> String {
         nid: nid.clone(),
         sql: Default::default(),
         queries: Vec::new(),
+        #[cfg(feature = "counter")]
+        counter: None,
     });
     std::fs::write(
         root.join(MOUNTS_FILE),
@@ -356,6 +358,8 @@ async fn two_tenants_mounting_one_nest_share_it() {
             nid: nid.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            #[cfg(feature = "counter")]
+            counter: None,
         },
         nuthatch::runtime::Mount {
             tenant: "globex".into(),
@@ -363,6 +367,8 @@ async fn two_tenants_mounting_one_nest_share_it() {
             nid: nid.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            #[cfg(feature = "counter")]
+            counter: None,
         },
     ];
     mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative once present

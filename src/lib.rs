@@ -28,6 +28,10 @@ pub mod control_api;
 /// The control plane for scaled mode (RFC-0022 §3): desired state and the worker registry.
 #[cfg(feature = "postgres-store")]
 pub mod controlplane;
+/// RFC-0046 S2: an optional, local-only x402 counter. The default binary does not compile this
+/// module, which is the S0 deletion boundary rather than an assurance about it.
+#[cfg(feature = "counter")]
+pub mod counter;
 pub mod distribution;
 pub mod doctor;
 pub mod effectful;
@@ -56,6 +60,7 @@ pub mod mcp;
 pub mod metadata;
 pub mod metrics;
 pub mod migrate;
+pub mod offchain;
 pub mod pack;
 /// The Postgres hot store (RFC-0022 slice 2). Feature-gated so the default build stays a single
 /// binary with no database in its dependency tree.
@@ -93,7 +98,3 @@ pub mod webhooks;
 /// The writer-worker role for scaled mode (RFC-0022 §2): the reconcile loop, running.
 #[cfg(feature = "postgres-store")]
 pub mod worker;
-/// RFC-0046 S1: x402 authorisation verification. `cfg(test)` so deleting `src/x402.rs` still
-/// leaves the default binary serving (#1217). Nothing in `router()` calls this.
-#[cfg(test)]
-pub mod x402;

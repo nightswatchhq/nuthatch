@@ -150,6 +150,8 @@ fn remount(root: &Path, nid: &str) {
         nid: nid.to_string(),
         sql: Default::default(),
         queries: Vec::new(),
+        #[cfg(feature = "counter")]
+        counter: None,
     }];
     std::fs::write(
         root.join(MOUNTS_FILE),

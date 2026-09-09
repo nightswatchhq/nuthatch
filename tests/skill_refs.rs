@@ -275,6 +275,10 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/calls.rs", Some(&["CallDecl"])),
     ("src/ipfs.rs", Some(&["IpfsDecl"])),
     ("src/entities.rs", Some(&["EntityFile", "EntityDecl"])),
+    // RFC-0046 S2's optional counter. Feature-gated off by default, but `[counter]` under a mount is
+    // operator config like any other when the feature is on, and an undocumented price is exactly
+    // the key an operator most needs to find.
+    ("src/counter.rs", Some(&["Config", "Network"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -282,6 +286,14 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 /// config file lands on this list by accident.
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
+    (
+        // RFC-0045 stage 1. `Catalogue`/`Snapshot` are the provenance manifest that
+        // `nuthatch offchain drop` *writes* - content hash, source path, ingest time, tool version.
+        // An operator never authors it, and nothing under `nuthatch.toml` nests it; the operator
+        // surface for this feature is the CLI subcommand, which `cli-reference.md` documents.
+        "src/offchain.rs",
+        "the generated offchain provenance manifest, written by the tool and not authored",
+    ),
     (
         // Not serde's `Deserialize` at all - this is rkyv's, required by `dbsp::DBData` so an entity
         // circuit can archive its own row type (#870). Nothing here is ever read from a nest's TOML.

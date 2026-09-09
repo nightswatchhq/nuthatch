@@ -103,6 +103,8 @@ pub enum Command {
     Metadata(MetadataArgs),
     /// Run a WASM transform component over a project's stored transfers.
     Transform(TransformArgs),
+    /// Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1).
+    Offchain(OffchainArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -193,6 +195,30 @@ pub struct PortEmitArgs {
     /// Nest directory already scaffolded by `nuthatch init --from-subgraph`. Overlay is written here.
     #[arg(long)]
     pub out: String,
+}
+
+#[derive(Args)]
+pub struct OffchainArgs {
+    #[command(subcommand)]
+    pub what: OffchainWhat,
+}
+
+#[derive(Subcommand)]
+pub enum OffchainWhat {
+    /// Import one CSV, JSON array, or Parquet file as an immutable, content-addressed snapshot.
+    Drop(OffchainDropArgs),
+}
+
+#[derive(Args)]
+pub struct OffchainDropArgs {
+    /// Source CSV, JSON, or Parquet file. Read once; indexing never reads this path.
+    pub file: String,
+    /// SQL table name beneath the `offchain__` namespace.
+    #[arg(long)]
+    pub table: String,
+    /// Nest directory containing the offchain namespace.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]

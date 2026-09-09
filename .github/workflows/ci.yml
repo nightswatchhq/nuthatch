@@ -258,6 +258,47 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  check-counter:
+    name: fmt · clippy · test (counter)
+    runs-on: ubuntu-latest
+    # The exact lesson `check-exex` above was created for (#423), applied to the second
+    # feature-gated surface: **a feature nobody lints is a feature that rots silently.** RFC-0046's
+    # counter shipped behind an off-by-default flag that no CI job built, and the state that left it
+    # in was not theoretical - the test suite did not compile under `--features counter` at all
+    # (`Mount` gained a gated field that six test literals never set), clippy had an unnoticed
+    # `-D warnings` failure, and both doc-drift gates were red because the feature's operator config
+    # was undocumented. None of it was visible on a green pull request. This job is the reason it
+    # cannot happen twice.
+    #
+    # Not in `.github/required-checks.txt` yet: making it required is a branch-protection change and
+    # that is the board's call, not this PR's. It runs on every PR regardless, which is the part that
+    # stops the rot.
+    timeout-minutes: 90
+    steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          key: check-counter
+      - name: reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache
+          df -h /
+      - name: clippy (counter)
+        run: cargo clippy --features counter --all-targets -- -D warnings
+      - name: test (counter)
+        run: cargo test --features counter --locked
+      - name: disk after the builds
+        if: always()
+        run: df -h /
+
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
     runs-on: ubuntu-latest

@@ -503,6 +503,13 @@ fn write_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Encode JSON-object rows with the same deterministic Parquet writer used for sealed chain data.
+/// The offchain namespace owns a distinct catalogue and never enters the chain seal/replay path;
+/// sharing the byte writer is deliberately the only shared part.
+pub fn write_snapshot_parquet(rows: &[Value]) -> Result<Vec<u8>> {
+    write_parquet(&rows_to_batch(rows)?)
+}
+
 /// Read a table's sealed rows back as [`DecodedRow`]s, in block order (RFC-0041 §5.3, nuthatch#865).
 ///
 /// **The one conversion, not a second one.** Every cell goes through

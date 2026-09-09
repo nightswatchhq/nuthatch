@@ -210,6 +210,10 @@ pub struct AppState {
     /// arbitrary `/sql`, exactly as before - because a local `nuthatch dev` is an exploration tool and
     /// a security control that turns itself on is a support ticket.
     pub surface: Arc<crate::allowlist::Surface>,
+    /// The optional local x402 counter for this mount. Only a binary explicitly built with the
+    /// `counter` feature carries it; default self-hosting has no payment path at all (#1217).
+    #[cfg(feature = "counter")]
+    pub counter: Option<Arc<crate::counter::Config>>,
     /// The identity of the dataset serving this mount (RFC-0032 §3), stamped into `provenance` so an
     /// answer can be cited against the data that produced it. `None` for a solo `dev` nest, which has
     /// no mount record and therefore no identity to report.
@@ -1751,7 +1755,10 @@ async fn named_query(
     State(s): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(args): Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    #[cfg(not(feature = "counter"))]
+    let _ = &headers;
     use crate::metrics::METRICS;
     let Some(q) = s.surface.get(&name) else {
         METRICS.inc_sql_rejected();
@@ -1775,6 +1782,13 @@ async fn named_query(
                 .into_response();
         }
     };
+    #[cfg(feature = "counter")]
+    if let Some(counter) = &s.counter {
+        let resource = format!("/q/{name}");
+        if let Err(response) = crate::counter::admit(&s.dir, counter, &headers, &resource, &name) {
+            return *response;
+        }
+    }
     run_sql_query(s, sql, None).await
 }
 
@@ -2930,6 +2944,8 @@ mod tests {
             freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             surface: Arc::new(crate::allowlist::Surface::default()),
+            #[cfg(feature = "counter")]
+            counter: None,
             nid: None,
             admin_enabled: true,
             admin_token: None,
@@ -4800,5 +4816,52 @@ mod tests {
         for path in &runtime_paths {
             assert_unpriced(plain.clone(), paying.clone(), path, StatusCode::OK).await;
         }
+    }
+
+    /// S2's positive boundary: only a declared query on an explicitly priced mount asks for a
+    /// payment. `/sql` and every default mount stay outside the counter.
+    #[cfg(feature = "counter")]
+    #[tokio::test]
+    async fn a_priced_named_query_returns_the_local_challenge_before_serving() {
+        use base64::Engine;
+        use tower::ServiceExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let mut state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        state.surface = Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "answer".into(),
+                sql: "SELECT 1 AS answer".into(),
+                params: Default::default(),
+            }],
+        });
+        state.counter = Some(Arc::new(crate::counter::Config {
+            price: "1000".into(),
+            recipient: "0x1111111111111111111111111111111111111111".into(),
+            network: crate::counter::Network::Testnet,
+        }));
+
+        let response = router(SharedNest::new(state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/q/answer")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = response
+            .headers()
+            .get("payment-required")
+            .and_then(|v| v.to_str().ok())
+            .expect("the x402 challenge header");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(challenge)
+            .expect("base64 challenge");
+        let body: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON challenge");
+        assert_eq!(body["accepts"][0]["amount"], "1000");
+        assert_eq!(body["accepts"][0]["network"], "eip155:84532");
     }
 }

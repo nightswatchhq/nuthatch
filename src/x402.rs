@@ -13,6 +13,7 @@ use std::str::FromStr;
 use alloy_primitives::{address, b256, keccak256, Address, Signature, B256, U256};
 use base64::Engine;
 use serde::Deserialize;
+use serde_json::json;
 
 /// EIP-3009 `TransferWithAuthorization` typehash. Recomputed in tests rather than trusted.
 const TRANSFER_WITH_AUTHORIZATION_TYPEHASH: B256 =
@@ -78,6 +79,29 @@ pub struct SellerConfig {
     pub price_base_units: U256,
 }
 
+/// The base64 JSON carried in a `payment-required` response header. This is the format the
+/// Lodestar buyer already consumes, not a second interpretation of the protocol.
+pub fn challenge_header(cfg: &SellerConfig, resource: &str, description: &str) -> String {
+    let chain = cfg.network.params();
+    let challenge = json!({
+        "x402Version": 1,
+        "error": "Payment required",
+        "resource": { "url": resource },
+        "accepts": [{
+            "scheme": "exact",
+            "network": chain.network,
+            "amount": cfg.price_base_units.to_string(),
+            "payTo": cfg.pay_to.to_string(),
+            "asset": chain.asset.to_string(),
+            "maxTimeoutSeconds": 60,
+            "resource": resource,
+            "description": description,
+            "extra": { "name": chain.asset_name, "version": chain.asset_version },
+        }],
+    });
+    base64::engine::general_purpose::STANDARD.encode(challenge.to_string())
+}
+
 /// A payment that authorised what we asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
@@ -109,6 +133,8 @@ pub enum Refusal {
     SignatureDoesNotMatchPayer,
     /// `s` above n/2. See [`SECP256K1_HALF_N`].
     MalleableSignature,
+    AlreadyUsed,
+    RecordFailed,
 }
 
 impl std::fmt::Display for Refusal {
@@ -135,6 +161,8 @@ impl std::fmt::Display for Refusal {
             Self::SignatureDoesNotMatchPayer => {
                 write!(f, "signature does not match the stated payer")
             }
+            Self::AlreadyUsed => write!(f, "authorisation nonce has already been used"),
+            Self::RecordFailed => write!(f, "could not record authorisation"),
         }
     }
 }
@@ -764,6 +792,34 @@ mod tests {
         assert_ne!(
             recovered, from,
             "swapping from/to must not still recover as the payer"
+        );
+    }
+
+    /// Recording happens before a query runs. Without the nonce check, a caller can replay this
+    /// one valid promise until the separate S3 settler notices, turning the RFC's one-query loss
+    /// bound into an open tab.
+    #[test]
+    fn a_recorded_authorisation_cannot_buy_a_second_query() {
+        let verifier = cfg();
+        let (_, from) = payer();
+        let header = sign_authorization(&verifier, &default_auth(from, &verifier));
+        let dir = tempfile::tempdir().unwrap();
+        let counter = super::super::Config {
+            price: verifier.price_base_units.to_string(),
+            recipient: verifier.pay_to.to_string(),
+            network: super::super::Network::Testnet,
+        };
+
+        super::super::verify_and_record(dir.path(), &counter, &header, NOW).unwrap();
+        assert_eq!(
+            super::super::verify_and_record(dir.path(), &counter, &header, NOW),
+            Err(Refusal::AlreadyUsed)
+        );
+        let log = std::fs::read_to_string(dir.path().join("authorisations.jsonl")).unwrap();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "the second request must not be recorded"
         );
     }
 }

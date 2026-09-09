@@ -31,10 +31,13 @@ futures = "0.3"
 alloy-json-abi = "1.6"
 alloy-dyn-abi = "1.6"
 alloy-primitives = "1.6"
+base64 = { version = "0.22", optional = true }
+k256 = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+csv = "1"
 # Subgraph manifests are YAML (`init --from-subgraph`). yaml-rust2 rather than
 # serde_yaml, which is archived (RUSTSEC-2024-0320) and would trip the
 # `unmaintained = "workspace"` gate in deny.toml on a direct dependency.
@@ -97,6 +100,9 @@ object-store = ["dep:object_store", "dep:url"]
 # 1 is that embedded mode runs with zero external services, and a default-on Postgres backend would
 # put a database in the dependency tree of the single-binary story. Scaled mode opts in.
 postgres-store = ["dep:postgres"]
+# RFC-0046 S2: an operator's optional x402 counter. It is deliberately not part of the default
+# binary: an unconfigured self-hoster remains entirely unpriced (#1217).
+counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 
 [dev-dependencies]
 proptest = "1"
@@ -107,8 +113,6 @@ tokio = { version = "1", features = ["test-util"] }
 # these is on the default binary - `src/x402.rs` is `#[cfg(test)]`.
 alloy-primitives = { version = "1.6", features = ["k256"] }
 alloy-sol-types = "1.6"
-k256 = "0.13"
-base64 = "0.22"
 
 [profile.release]
 lto = "thin"
