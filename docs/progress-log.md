@@ -13,6 +13,58 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-08-20 to 2026-09-09 - catch-up entry, reconciled retrospectively (2026-09-09).** The log went
+  quiet for three weeks across nineteen tags and one major - v2.6.1 through v3.6.1 - and 104 merges.
+  **This is the third time**, and the entry above already carries the lesson from the second, so it is
+  worth stating plainly that the lesson did not take: a quiet log reads as no progress to anyone who
+  has not read `git log`, and it went quiet again during the busiest three weeks the project has had.
+  Per-push granularity resumes after this. What happened, in the order it happened:
+  - **[RFC-0041](rfcs/0041-authored-incremental-entities.md) shipped (2026-08-28, v3.0.0-alpha.1).**
+    Authored incremental entities: declared in `entities.toml`, defined in `entities/*.sql`,
+    maintained by DBSP as blocks arrive, served from `/derived` and by name from `/sql`. It closes
+    the gap GraphOps named - a view recomputed on every query gives the caller a name but no
+    query-performance benefit. Measured against a copy of the real Lodestar nest, the panel it
+    replaces went **p50 2.15 s to 87.7 ms**, and one block's update is flat at ~285 µs against
+    309,548 groups. RFC-0033's durable grafting (#357) is deliberately not in v1.
+  - **[RFC-0042](rfcs/0042-rust-native-without-duckdb.md) closed KEEP DuckDB (2026-08-30), §14.** The
+    Rust-native investigation ran slices 0 and 1 under a carve-out, was then unfrozen in full on
+    2026-08-29, and reached its decision the next day at **78% confidence** on six measured
+    regressions. Worth recording that this is one of the two answers §0 admitted in advance - *"there
+    is no preferred answer; if evidence says DuckDB remains best, it stays"* - and that slice 0 had
+    already measured §1's premise false: DuckDB is 10.6% of clean build time where wasmtime and
+    cranelift are 21.3%, though it is 93% of native artefact bytes. Parked to **2027-09-01** or any
+    one of four triggers, of which the fourth binds on us: if RFC-0033 slice 4 (#357) is ever
+    scheduled, reopen RFC-0042 **before** it, not after.
+  - **Two chains, one carve-out each.** [RFC-0051](rfcs/0051-monad-chain.md) Monad (2026-09-03, #1136) and
+    [RFC-0050](rfcs/0050-robinhood-chain.md) Robinhood Chain (2026-09-04, #1133), both as registry
+    entries on the generic EVM path rather than as new machinery. Both differ from their own RFC
+    body on the seal boundary and both addenda say why: Monad seals at a depth of eight blocks rather
+    than the `finalized` tag, and Robinhood uses `FinalizedTag` with a fallback depth sized for its
+    100 ms cadence rather than the `safe` tag the body recommended, because `Finality` has no `safe`
+    arm and adding one is a seal-loop change rather than a data entry.
+  - **[RFC-0040](rfcs/0040-the-freshness-dial.md), the freshness dial (2026-09-06, v3.5.0).** Taken
+    after the Alchemy bill: one Arbitrum cursor following tip measured at **~9,900 compute units a
+    minute**, about 430M a month and roughly $185 on pay-as-you-go, to serve panels that refresh
+    every 2 to 15 minutes. Knobs 1, 2 and 4 - a finality-only mode, a poll interval, and backing the
+    cursor off under rate limits. Timestamp interpolation was explicitly not taken.
+  - **The freeze ended (2026-09-08), and the carve-out mechanism retired with it.** It ran from
+    2026-08-20 and all five carve-outs were taken and spent. It ended because there was a body of
+    design worth building, not because the discipline failed. `docs/frozen-for-2027.md` is unchanged.
+  - **[RFC-0044](rfcs/0044-the-subgraph-port-skill.md) through
+    [RFC-0048](rfcs/0048-pricing-query-access.md) became the programme**, chosen the day the freeze
+    lifted: the subgraph port skill, offchain data, x402 at the counter, the lakehouse commitments,
+    and pricing query access. The first RFCs about what nuthatch guarantees to people who are *not*
+    running it. Each leads with the non-negotiable it appears to break and shows why it does not, and
+    none of those arguments is waived.
+  - **Sprint `halcyon-hoopoe` closed it out (2026-09-08 to 09).** RFC-0047's four lakehouse
+    commitments (#1221, #1223, #1224, #1225, #1234), RFC-0046 S0 and S1 (#1217, #1218), RFC-0044 S1
+    and S2 (#1210, #1211), and #1204. #1217 is the one to remember: it is a build gate that fails if
+    a payment feature ever becomes load-bearing, and it is on main.
+  - **The lesson worth keeping.** Two of this window's largest items ended in *not doing the thing*:
+    RFC-0042 kept DuckDB, and RFC-0040 declined its own knob 3. Neither reads as progress in a
+    changelog and both were the work. A log that only records additions will keep understating a
+    quarter like this one, which is a second reason not to let it go quiet.
+
 - **2026-07-29 to 2026-08-19 - catch-up entry, reconciled retrospectively (2026-08-20).** The log went
   quiet for three weeks across nineteen tags and two majors - v0.7.1 through v2.6.0 - found while
   fixing three RFC index rows that had gone stale the same way (issue #658). Rather than back-fill
