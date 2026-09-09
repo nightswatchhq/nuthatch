@@ -192,6 +192,31 @@ fn walk(sel: &Selection, reference: &Value, nest: &Value, path: &mut Path, out: 
         return;
     }
 
+    // **A container mismatch is reported where it happens, not as a missing child.**
+    //
+    // Both sides answered this field; they answered it with different *kinds* of thing - an object
+    // against a string, or a list against an object. Coercing the odd one out with
+    // `as_object().unwrap_or(&empty)` would turn that into `Missing` for every child selection
+    // underneath, which names the wrong place and the wrong fault: it reads as "the nest omitted
+    // `pool.token.symbol`" when what happened is that the nest's `pool.token` is not an object at
+    // all. That is exactly the schema incompatibility the separate `Type` variant exists to name.
+    // Raised by review of this change.
+    if !matches!((reference, nest), (Value::Object(_), Value::Object(_))) {
+        out.compared.push(render(path));
+        if reference != nest {
+            out.divergences.push(Divergence::Type {
+                path: render(path),
+                reference: type_name(reference).to_string(),
+                nest: type_name(nest).to_string(),
+            });
+        }
+        // Equal and not an object: both sides gave the same answer here and there is nothing
+        // below it to compare. A null parent has no children in GraphQL, and two nulls agree -
+        // descending anyway would coerce both to `{}` and report every selected child as missing
+        // from a nest that answered exactly what the reference did.
+        return;
+    }
+
     // An object with children: drive from the selection, so a requested field that neither side
     // returned is still reported.
     let empty = Map::new();
@@ -390,6 +415,78 @@ mod tests {
             report.divergences,
             vec![Divergence::Extra {
                 path: "pool.surprise".into()
+            }]
+        );
+    }
+
+    /// A container answered as a different kind of thing is a `Type` divergence *at the container*,
+    /// not a `Missing` for every child underneath. Both sides answered `pool.token`; they disagree
+    /// about what it is. Naming the children would point at the wrong place and call a schema
+    /// incompatibility an omission. Raised in review of this change.
+    #[test]
+    fn an_object_answered_as_a_scalar_is_a_type_divergence_at_the_container() {
+        let s = sel(&["pool.token.symbol"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"token": {"symbol": "WETH"}}}),
+            &json!({"pool": {"token": "0x1"}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Type {
+                path: "pool.token".into(),
+                reference: "object".into(),
+                nest: "string".into(),
+            }],
+            "the fault is at pool.token, not a missing pool.token.symbol"
+        );
+    }
+
+    #[test]
+    fn a_list_answered_as_an_object_is_a_type_divergence_at_the_container() {
+        let s = sel(&["pools.id"]);
+        let report = compare(
+            &s,
+            &json!({"pools": [{"id": "a"}]}),
+            &json!({"pools": {"id": "a"}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Type {
+                path: "pools".into(),
+                reference: "list".into(),
+                nest: "object".into(),
+            }]
+        );
+    }
+
+    /// Null is a legitimate answer for a nullable field, and two nulls agree even where the
+    /// operation selected children of them.
+    #[test]
+    fn two_nulls_under_a_nested_selection_agree() {
+        let s = sel(&["pool.token.symbol"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"token": null}}),
+            &json!({"pool": {"token": null}}),
+        );
+        assert!(report.is_clean(), "{:?}", report.divergences);
+    }
+
+    #[test]
+    fn a_null_against_an_object_is_a_type_divergence() {
+        let s = sel(&["pool.token.symbol"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"token": {"symbol": "WETH"}}}),
+            &json!({"pool": {"token": null}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Type {
+                path: "pool.token".into(),
+                reference: "object".into(),
+                nest: "null".into(),
             }]
         );
     }
