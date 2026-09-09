@@ -59,8 +59,232 @@ impl Selection {
         root
     }
 
+    /// Derive the selection from the operation's own text.
+    ///
+    /// **This is the load-bearing half of the "cannot come back clean" property, not a
+    /// convenience.** [`Selection::from_paths`] makes the caller enumerate what to compare, and a
+    /// caller who omits a path gets a clean run for a field nobody checked - the same failure the
+    /// module exists to prevent, moved one layer up into the corpus. Parsing the query means the
+    /// comparison covers what was actually asked, and a corpus cannot silently under-specify.
+    ///
+    /// Deliberately a **selection-set** parser and not a GraphQL parser. It reads field names and
+    /// nesting and skips what cannot change which fields were requested: arguments, directives,
+    /// variable definitions and the operation header. Two constructs genuinely can change it and are
+    /// therefore refused rather than ignored - see [`SelectionError`] - because guessing at them is
+    /// how a field quietly leaves the comparison.
+    pub fn from_query(query: &str) -> Result<Self, SelectionError> {
+        let mut p = Cursor {
+            src: query.as_bytes(),
+            i: 0,
+        };
+        p.skip_trivia();
+        // A named fragment cannot be resolved without spreading it, and a spread cannot be resolved
+        // without the fragment: refusing both together is the only honest position.
+        if query.contains("fragment ") {
+            return Err(SelectionError::Fragment);
+        }
+        // Skip an operation header (`query Foo($x: Int)`) up to the first selection set.
+        while p.i < p.src.len() && p.peek() != Some(b'{') {
+            p.i += 1;
+        }
+        if p.peek() != Some(b'{') {
+            return Err(SelectionError::NoSelectionSet);
+        }
+        p.parse_set()
+    }
+
     fn is_leaf(&self) -> bool {
         self.fields.is_empty()
+    }
+}
+
+/// Why a selection could not be derived from an operation's text.
+///
+/// Every variant is a **refusal**, never a silent best effort. A selection this parser cannot be
+/// sure of is a comparison that might omit a field, and a validator that omits a field can come back
+/// clean while the nest is wrong - the one outcome RFC-0053 S0 must not produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionError {
+    /// Named fragments change which fields an operation requests, and resolving a spread needs the
+    /// fragment definition. Refused rather than skipped: skipping a spread drops every field it
+    /// carries out of the comparison.
+    Fragment,
+    /// An inline fragment (`... on Pool { id }`) is the same problem in miniature.
+    InlineFragment,
+    /// No `{` at all, so there is nothing to compare.
+    NoSelectionSet,
+    /// Braces do not balance; the text is not an operation.
+    Unbalanced,
+    /// A field alias (`vol: volumeUSD`) makes the response key differ from the schema field, so
+    /// comparing by field name would look in the wrong place in both answers.
+    Alias { alias: String },
+}
+
+impl fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SelectionError::Fragment => write!(
+                f,
+                "named fragments are not supported; inline the fields so the comparison covers them"
+            ),
+            SelectionError::InlineFragment => write!(
+                f,
+                "inline fragments are not supported; inline the fields so the comparison covers them"
+            ),
+            SelectionError::NoSelectionSet => write!(f, "the operation has no selection set"),
+            SelectionError::Unbalanced => write!(f, "the operation's braces do not balance"),
+            SelectionError::Alias { alias } => write!(
+                f,
+                "field alias `{alias}` changes the response key; aliases are not supported"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
+/// A byte cursor over one operation's text.
+struct Cursor<'a> {
+    src: &'a [u8],
+    i: usize,
+}
+
+impl Cursor<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.i).copied()
+    }
+
+    /// Whitespace, commas (insignificant in GraphQL) and `#` comments.
+    fn skip_trivia(&mut self) {
+        loop {
+            match self.peek() {
+                Some(c) if c.is_ascii_whitespace() || c == b',' => self.i += 1,
+                Some(b'#') => {
+                    while let Some(c) = self.peek() {
+                        self.i += 1;
+                        if c == b'\n' {
+                            break;
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Skip a balanced `(..)` argument list, respecting string literals so a `)` inside one does not
+    /// end it early.
+    fn skip_parens(&mut self) -> Result<(), SelectionError> {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                None => return Err(SelectionError::Unbalanced),
+                Some(b'"') => self.skip_string(),
+                Some(b'(') => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Some(b')') => {
+                    depth -= 1;
+                    self.i += 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                Some(_) => self.i += 1,
+            }
+        }
+    }
+
+    fn skip_string(&mut self) {
+        self.i += 1; // opening quote
+        while let Some(c) = self.peek() {
+            self.i += 1;
+            if c == b'\\' {
+                self.i += 1; // escaped char
+            } else if c == b'"' {
+                return;
+            }
+        }
+    }
+
+    fn name(&mut self) -> String {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&self.src[start..self.i]).into_owned()
+    }
+
+    /// Parse one `{ .. }` selection set into a [`Selection`].
+    fn parse_set(&mut self) -> Result<Selection, SelectionError> {
+        debug_assert_eq!(self.peek(), Some(b'{'));
+        self.i += 1;
+        let mut out = Selection::default();
+        loop {
+            self.skip_trivia();
+            match self.peek() {
+                None => return Err(SelectionError::Unbalanced),
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(out);
+                }
+                // `...` - a spread or an inline fragment. Both change the requested field set.
+                Some(b'.') => return Err(SelectionError::InlineFragment),
+                Some(b'@') => {
+                    // A directive on the enclosing field; skip its name and any arguments.
+                    self.i += 1;
+                    let _ = self.name();
+                    self.skip_trivia();
+                    if self.peek() == Some(b'(') {
+                        self.skip_parens()?;
+                    }
+                }
+                Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
+                    let name = self.name();
+                    self.skip_trivia();
+                    if self.peek() == Some(b':') {
+                        // `alias: field` - the response key is the alias, not the field, so
+                        // comparing by field name would look in the wrong place on both sides.
+                        return Err(SelectionError::Alias { alias: name });
+                    }
+                    if self.peek() == Some(b'(') {
+                        self.skip_parens()?;
+                        self.skip_trivia();
+                    }
+                    while self.peek() == Some(b'@') {
+                        self.i += 1;
+                        let _ = self.name();
+                        self.skip_trivia();
+                        if self.peek() == Some(b'(') {
+                            self.skip_parens()?;
+                        }
+                        self.skip_trivia();
+                    }
+                    let child = if self.peek() == Some(b'{') {
+                        self.parse_set()?
+                    } else {
+                        Selection::leaf()
+                    };
+                    // Merge rather than overwrite: the same field may be selected twice with
+                    // different children, and dropping either would shrink the comparison.
+                    let slot = out.fields.entry(name).or_default();
+                    merge(slot, child);
+                }
+                Some(_) => self.i += 1,
+            }
+        }
+    }
+}
+
+fn merge(into: &mut Selection, from: Selection) {
+    for (k, v) in from.fields {
+        let slot = into.fields.entry(k).or_default();
+        merge(slot, v);
     }
 }
 
@@ -283,6 +507,126 @@ mod tests {
 
     fn sel(paths: &[&str]) -> Selection {
         Selection::from_paths(paths)
+    }
+
+    // --- Selection::from_query -------------------------------------------------------------
+
+    #[test]
+    fn a_query_yields_the_fields_it_asked_for() {
+        let q = r#"
+            query Pools($first: Int) {
+              pools(first: $first, orderBy: volumeUSD) {
+                id
+                volumeUSD
+                token0 { symbol decimals }
+              }
+            }
+        "#;
+        assert_eq!(
+            Selection::from_query(q).unwrap(),
+            sel(&[
+                "pools.id",
+                "pools.volumeUSD",
+                "pools.token0.symbol",
+                "pools.token0.decimals",
+            ])
+        );
+    }
+
+    /// Arguments can contain braces, parentheses and quoted strings. Losing track inside one would
+    /// silently truncate the selection, which is the failure this whole module guards against.
+    #[test]
+    fn arguments_do_not_disturb_the_selection() {
+        let q = r#"{ pools(where: {id_in: ["0x)", "0x{"]}, first: 5) { id } }"#;
+        assert_eq!(Selection::from_query(q).unwrap(), sel(&["pools.id"]));
+    }
+
+    #[test]
+    fn comments_and_commas_are_trivia() {
+        let q = "{ pool { id, # the address\n  volumeUSD } }";
+        assert_eq!(
+            Selection::from_query(q).unwrap(),
+            sel(&["pool.id", "pool.volumeUSD"])
+        );
+    }
+
+    #[test]
+    fn the_same_field_selected_twice_keeps_both_sets_of_children() {
+        let q = "{ pool { token0 { symbol } token0 { decimals } } }";
+        assert_eq!(
+            Selection::from_query(q).unwrap(),
+            sel(&["pool.token0.symbol", "pool.token0.decimals"]),
+            "merging must not drop either selection"
+        );
+    }
+
+    /// **Refusals, not best efforts.** Each of these changes which fields an operation requests, so
+    /// skipping one would drop fields out of the comparison and let the run come back clean.
+    #[test]
+    fn a_named_fragment_is_refused_rather_than_skipped() {
+        let q = "query { pool { ...PoolBits } } fragment PoolBits on Pool { id volumeUSD }";
+        assert_eq!(
+            Selection::from_query(q).unwrap_err(),
+            SelectionError::Fragment
+        );
+    }
+
+    #[test]
+    fn an_inline_fragment_is_refused_rather_than_skipped() {
+        let q = "{ pool { ... on Pool { id } } }";
+        assert_eq!(
+            Selection::from_query(q).unwrap_err(),
+            SelectionError::InlineFragment
+        );
+    }
+
+    /// An alias makes the response key differ from the field name, so a comparison keyed on the
+    /// field would look in the wrong place in *both* answers and find nothing in either - agreement
+    /// by mutual absence.
+    #[test]
+    fn an_alias_is_refused_because_the_response_key_is_not_the_field_name() {
+        let q = "{ pool { vol: volumeUSD } }";
+        assert_eq!(
+            Selection::from_query(q).unwrap_err(),
+            SelectionError::Alias {
+                alias: "vol".into()
+            }
+        );
+    }
+
+    #[test]
+    fn text_with_no_selection_set_is_refused() {
+        assert_eq!(
+            Selection::from_query("query Pools").unwrap_err(),
+            SelectionError::NoSelectionSet
+        );
+    }
+
+    #[test]
+    fn unbalanced_braces_are_refused() {
+        assert_eq!(
+            Selection::from_query("{ pool { id }").unwrap_err(),
+            SelectionError::Unbalanced
+        );
+    }
+
+    /// The two halves joined up: a parsed operation drives the comparison, and a nest that cannot
+    /// answer one of its fields is still reported.
+    #[test]
+    fn a_parsed_operation_still_catches_a_dropped_selection() {
+        let q = "{ pool { id volumeUSD } }";
+        let s = Selection::from_query(q).unwrap();
+        let report = compare(
+            &s,
+            &json!({"pool": {"id": "0x1", "volumeUSD": "9"}}),
+            &json!({"pool": {"id": "0x1"}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Missing {
+                path: "pool.volumeUSD".into()
+            }]
+        );
     }
 
     /// The property the whole module exists for, and the one the issue names: a clean result must
