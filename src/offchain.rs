@@ -62,6 +62,28 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
         std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     }
     let mut catalogue = load(dir)?;
+    // **A case-insensitive collision is refused, not merged.**
+    //
+    // The manifest is a `BTreeMap` and would happily hold both `Prices` and `prices` as separate
+    // tables. `define_offchain_views` then creates `offchain__Prices` and `offchain__prices`, and
+    // DuckDB resolves identifiers case-insensitively - so the second `CREATE OR REPLACE VIEW`
+    // replaces the first and one table silently answers with the other's rows.
+    //
+    // Refusing is the honest half of the fix. Lower-casing the name instead would make the two the
+    // same table, which is a guess about intent: an operator who dropped `Prices` and `prices` may
+    // well have meant two datasets, and quietly concatenating them is the same silent wrongness in
+    // a different place. The error names the existing table so the choice is theirs.
+    if let Some(existing) = catalogue
+        .tables
+        .keys()
+        .find(|k| k.as_str() != table && k.eq_ignore_ascii_case(table))
+    {
+        bail!(
+            "offchain table `{table}` collides with `{existing}`, which is already in the \
+             manifest: SQL view names are case-insensitive, so both would resolve to the same \
+             view and one would silently answer with the other's rows. Rename one of them."
+        );
+    }
     let snapshots = catalogue.tables.entry(table.to_string()).or_default();
     if !snapshots.iter().any(|s| s.hash == hash) {
         snapshots.push(Snapshot {
@@ -148,11 +170,28 @@ fn read_json(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
     ))
 }
 
+/// **One file description, read twice, rather than one path opened twice.**
+///
+/// This used to build the metadata from `File::open(path)` and then take the bytes from a separate
+/// `std::fs::read(path)`. A source replaced between those two calls - a feed rewriting its export,
+/// an operator re-running a job - would be described by the first file's row count and columns while
+/// the stored snapshot held the second file's bytes, and the manifest would state something the
+/// segment does not contain. Nothing about that is detectable afterwards, because the hash is taken
+/// over the bytes that won.
+///
+/// `try_clone` shares the underlying file description, so both reads see the same inode whatever
+/// happens to the path in between. The offset is shared with it, hence the explicit rewind before
+/// taking the bytes.
 fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(file).context("invalid Parquet source")?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(
+        file.try_clone()
+            .with_context(|| format!("reading {}", path.display()))?,
+    )
+    .context("invalid Parquet source")?;
     let columns = builder
         .schema()
         .fields()
@@ -161,7 +200,13 @@ fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
         .collect::<Vec<_>>();
     validate_columns(&columns)?;
     let rows = builder.metadata().file_metadata().num_rows() as usize;
-    Ok((std::fs::read(path)?, rows, columns))
+    drop(builder);
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok((bytes, rows, columns))
 }
 
 fn validate_table(table: &str) -> Result<()> {
@@ -270,5 +315,122 @@ mod tests {
         let rows = crate::analytics::query(dir.path(), r#"SELECT token FROM "dex__swap""#).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["token"], "WETH");
+    }
+
+    /// Two table names differing only in case would become one DuckDB view, and the later
+    /// `CREATE OR REPLACE VIEW` would make one table answer with the other's rows. Refused rather
+    /// than merged, because merging is a guess about what the operator meant.
+    #[test]
+    fn a_case_only_table_name_collision_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.csv");
+        std::fs::write(&src, "token\nWETH\n").unwrap();
+
+        drop_file(dir.path(), &src, "prices").expect("the first drop defines the table");
+
+        let err = drop_file(dir.path(), &src, "Prices")
+            .expect_err("a case-only variant must be refused, not silently shadow the first")
+            .to_string();
+        assert!(err.contains("collides with"), "{err}");
+        assert!(
+            err.contains("prices"),
+            "the error must name the existing table: {err}"
+        );
+
+        // And the first table is untouched by the refusal.
+        let cat = load(dir.path()).unwrap();
+        assert!(cat.tables.contains_key("prices"));
+        assert!(!cat.tables.contains_key("Prices"));
+    }
+
+    /// The same name is not a collision with itself - re-dropping a table must keep working.
+    #[test]
+    fn re_dropping_the_same_table_is_not_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.csv");
+        std::fs::write(&a, "token\nWETH\n").unwrap();
+        let b = dir.path().join("b.csv");
+        std::fs::write(&b, "token\nUSDC\n").unwrap();
+        drop_file(dir.path(), &a, "prices").unwrap();
+        drop_file(dir.path(), &b, "prices").expect("a second snapshot of the same table is normal");
+        assert_eq!(load(dir.path()).unwrap().tables["prices"].len(), 2);
+    }
+
+    /// The manifest must describe the bytes that were stored. Reading metadata from one open of the
+    /// path and the bytes from another lets the source change in between, so the row count and
+    /// columns end up describing a file the snapshot does not contain.
+    #[test]
+    fn parquet_metadata_and_bytes_come_from_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.parquet");
+        write_parquet_fixture(&src, &["a", "b"], 3);
+
+        let (bytes, rows, columns) = read_parquet(&src).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            bytes,
+            std::fs::read(&src).unwrap(),
+            "the bytes returned must be the file that was described"
+        );
+    }
+
+    /// The property the fix rests on, demonstrated directly: once the handle is open, replacing the
+    /// **path** does not change what that handle reads.
+    ///
+    /// The replacement has to be a `rename`, which is what an atomic publish actually does.
+    /// `File::create` truncates the same inode in place, so the open handle would see the new bytes
+    /// and the test would prove the opposite of what it claims - which is how the first version of
+    /// this test failed.
+    #[test]
+    fn an_open_handle_reads_the_version_it_was_opened_on() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.parquet");
+        write_parquet_fixture(&src, &["a", "b"], 3);
+        let three = std::fs::read(&src).unwrap();
+
+        let mut handle = std::fs::File::open(&src).unwrap();
+
+        let replacement = dir.path().join("p.parquet.new");
+        write_parquet_fixture(&replacement, &["a", "b"], 9);
+        std::fs::rename(&replacement, &src).unwrap();
+        let nine = std::fs::read(&src).unwrap();
+        assert_ne!(
+            three, nine,
+            "the fixture must differ, or this proves nothing"
+        );
+
+        let mut seen = Vec::new();
+        handle.read_to_end(&mut seen).unwrap();
+        assert_eq!(
+            seen, three,
+            "the handle must still read the file it was opened on, not whatever now owns the path"
+        );
+    }
+
+    fn write_parquet_fixture(path: &std::path::Path, cols: &[&str], rows: usize) {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|c| Field::new(*c, DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<arrow::array::ArrayRef> = cols
+            .iter()
+            .map(|c| {
+                Arc::new(StringArray::from(
+                    (0..rows).map(|i| format!("{c}{i}")).collect::<Vec<_>>(),
+                )) as arrow::array::ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
     }
 }
