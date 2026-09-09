@@ -486,3 +486,157 @@ fn emitted_nest_loads_and_views_validate() {
         "emitted nest must pass nuthatch check: {result:?}"
     );
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// #1248: an Exact field must be answered correctly or named, never answered wrongly.
+// ---------------------------------------------------------------------------------------------
+
+/// A throwaway subgraph whose mappings are supplied inline. The fixtures on disk are the curated
+/// ports; these cases are about right-hand sides the emitter must refuse, so they belong with the
+/// test rather than in the fixture set the drift gate watches.
+fn subgraph_with(schema: &str, mapping: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/mappings")).unwrap();
+    std::fs::copy(
+        one_call_dir().join("subgraph.yaml"),
+        dir.path().join("subgraph.yaml"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("schema.graphql"), schema).unwrap();
+    std::fs::write(dir.path().join("src/mappings/core.ts"), mapping).unwrap();
+    dir
+}
+
+fn emitted_nest(schema: &str, mapping: &str) -> (tempfile::TempDir, nuthatch::port_emit::EmitResult) {
+    let subgraph = subgraph_with(schema, mapping);
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+    (nest, result)
+}
+
+const OPS_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+  negated: BigInt!
+  scaled: BigInt!
+  summed: BigInt!
+}
+"#;
+
+const OPS_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.plain = event.params.tickSpacing
+  pool.negated = event.params.fee.neg()
+  pool.scaled = event.params.fee.times(BigInt.fromI32(1000))
+  pool.summed = event.params.fee.plus(event.params.tickSpacing)
+  pool.save()
+}
+"#;
+
+#[test]
+fn an_operation_on_an_event_param_is_never_answered_by_the_bare_column() {
+    let (_nest, result) = emitted_nest(OPS_SCHEMA, OPS_MAPPING);
+    let view = result
+        .views
+        .iter()
+        .find(|v| v.entity == "Pool")
+        .expect("a Pool view");
+    let sql = select_sql(&view.sql);
+
+    // The defect: each of these resolved to `"fee"`, so the view answered with the wrong sign, a
+    // factor of 1000 out, or an addend short - under a report promising byte-identical.
+    for field in ["negated", "scaled", "summed"] {
+        assert!(
+            !sql.contains(&format!("AS \"{field}\"")),
+            "`{field}` applies an operation the emitter cannot render, so it must not be projected \
+             at all; the view answered it anyway:\n{sql}"
+        );
+        assert!(
+            !view.exact_fields.contains(&field.to_string()),
+            "`{field}` is not in the view, so exact_fields must not advertise it: {:?}",
+            view.exact_fields
+        );
+        assert!(
+            result
+                .skipped_fields
+                .iter()
+                .any(|s| s.entity == "Pool" && s.field == field),
+            "`{field}` must be named in skipped_fields, not silently dropped: {:?}",
+            result
+                .skipped_fields
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // And the field that genuinely is a bare parameter still lands, so this is a refusal of
+    // unrenderable expressions and not a refusal of everything.
+    assert!(
+        sql.contains("AS \"plain\""),
+        "a bare event param must still be projected:\n{sql}"
+    );
+    assert!(view.exact_fields.contains(&"plain".to_string()));
+}
+
+#[test]
+fn an_exact_field_that_reaches_no_column_is_named_rather_than_dropped() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  accumulated: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.accumulated = pool.accumulated.plus(event.params.fee)
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    assert!(
+        result
+            .skipped_fields
+            .iter()
+            .any(|s| s.entity == "Pool" && s.field == "accumulated"),
+        "an accumulation reaches no column and must be named: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    assert!(
+        !view.exact_fields.contains(&"accumulated".to_string()),
+        "exact_fields must not advertise a field the SQL does not contain: {:?}",
+        view.exact_fields
+    );
+}
+
+#[test]
+fn the_generated_check_names_the_promised_columns_rather_than_star() {
+    let (nest, result) = emitted_nest(OPS_SCHEMA, OPS_MAPPING);
+    let check = std::fs::read_to_string(nest.path().join("checks/port_views.sql")).unwrap();
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+
+    assert!(
+        !check.contains("SELECT * FROM"),
+        "`SELECT *` binds whatever the view happens to contain and cannot see a missing promised \
+         column, which is how #1248 passed every generated check:\n{check}"
+    );
+    for field in &view.exact_fields {
+        assert!(
+            check.contains(&format!("\"{field}\"")),
+            "the check must name `{field}` so DuckDB refuses to bind if the view ever stops \
+             projecting it:\n{check}"
+        );
+    }
+}
