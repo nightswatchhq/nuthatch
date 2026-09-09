@@ -127,6 +127,11 @@ pub enum Command {
     /// Hidden: authoring tool, not part of the two-command story. Does not scaffold a nest.
     #[command(hide = true)]
     PortReport(PortReportArgs),
+
+    /// Overlay `[[calls]]`, Exact views, checks and a README onto a nest already scaffolded by
+    /// `init --from-subgraph` (RFC-0044 S2). Hidden: authoring tool. Does not reimplement the importer.
+    #[command(hide = true)]
+    PortEmit(PortEmitArgs),
 }
 
 #[cfg(test)]
@@ -178,6 +183,16 @@ pub struct PortReportArgs {
     /// Subgraph directory containing `schema.graphql` and the mappings. Nothing is written.
     #[arg(long, default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Args)]
+pub struct PortEmitArgs {
+    /// Subgraph directory containing `schema.graphql` and the mappings.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Nest directory already scaffolded by `nuthatch init --from-subgraph`. Overlay is written here.
+    #[arg(long)]
+    pub out: String,
 }
 
 #[derive(Args)]

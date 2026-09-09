@@ -56,13 +56,15 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// The six sites slice 0 inventoried, with their roles. See `docs/rfcs/0042-slice0-bom.md`.
+/// The sites slice 0 inventoried, with their roles, plus what has been added since. See
+/// `docs/rfcs/0042-slice0-bom.md`.
 const KNOWN: &[&str] = &[
     "analytics.rs",             // general SQL, views, hot+cold federation
     "entities.rs",              // the admissible function vocabulary, from duckdb_functions()
     "entity_lower.rs",          // AST for lowering authored SQL to a circuit
     "graft.rs",                 // canonical plan, engine version, determinism gate
     "seal.rs",                  // segment-binding oracle (test-only)
+    "port_emit.rs",             // emitted-check oracle (test-only)
     "authored_entity_spike.rs", // RFC-0041 spike, reachable via `nuthatch bench`
 ];
 

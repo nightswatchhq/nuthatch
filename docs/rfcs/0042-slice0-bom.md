@@ -111,6 +111,9 @@ ABI floor on one target and change nothing a user can observe on the other. Wort
 
 The deletion checklist. §9 named four roles; walking the call sites finds six. Two were originally
 classified **product-visible**; slice 3 found that to be **one** - see the correction below the table.
+One test-only site has been added since (`port_emit.rs`, 2026-09-08), so the table now lists seven;
+the six in the heading is what slice 0 found, kept because that is the number the rest of this
+document reasons about.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
@@ -119,6 +122,7 @@ classified **product-visible**; slice 3 found that to be **one** - see the corre
 | `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role |
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
 | `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
+| `port_emit.rs` | emitted-check oracle | test-only | added 2026-09-08 (#1211). Two in-memory connections in `#[cfg(test)]`, proving the generated `checks/port_views.sql` binds and answers the same on an empty and a populated nest. Nothing in the authoring path reaches the engine |
 | `authored_entity_spike.rs` | RFC-0041 slice-zero spike | **production, measurement-only** | `pub mod` in `lib.rs`, reachable via `nuthatch bench`. A naive read files this as test-only; it ships |
 
 The function vocabulary is what makes "remove DuckDB" more than an implementation change: it decides

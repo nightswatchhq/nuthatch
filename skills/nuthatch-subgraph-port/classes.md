@@ -5,7 +5,7 @@ named line of mapping source (or of the schema, for `@derivedFrom` and `@fulltex
 
 | Class | Meaning | Ported as |
 |---|---|---|
-| **exact** | a pure function of decoded events | a view or entity; byte-identical |
+| **exact** | a pure function of decoded events | a `views/*.sql` view (entities.toml is S5); byte-identical |
 | **call-derived** | reads contract state at the row's block | a `[[calls]]` declaration (RFC-0038 §3) |
 | **fixed point** | reads back its own or another entity's prior output | a convergent value: defensible, and **different** |
 | **unreachable** | needs internal calls, `@fulltext`, or time travel | not ported; named, with the reason |

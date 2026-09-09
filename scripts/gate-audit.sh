@@ -55,6 +55,8 @@ CASES=(
 # port_report diffs the committed four-class fixture report (RFC-0044 S1). Mutating a class
 # must turn it red; averaging a field away is the failure the report exists to prevent.
 "port_report_fixture|port_report|skills/nuthatch-subgraph-port/fixtures/four-classes/expected.md|Token.derivedETH|Token.derivedETH_mutated"
+# port_emit traces [[calls]] to a mapping try_*; mutating the call away must go red.
+"port_emit_call|port_emit|skills/nuthatch-subgraph-port/fixtures/one-call/src/mappings/core.ts|try_symbol|try_symbol_gone"
 # tape_clean guards the recorded benchmark tapes against silent edits.
 # tape_clean guards exactly one thing: no recorded error in the CLEAN tape. Mutating anything else
 # in that file is not a mutation of what it claims - the gate is narrow on purpose and says so.

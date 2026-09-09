@@ -1,7 +1,8 @@
 //! RFC-0044 S1: classify a subgraph's `schema.graphql` and mappings, emit the port report.
 //!
 //! Nothing here runs in the data path and nothing executes AssemblyScript. The mappings are
-//! read as text. The report is the deliverable; scaffolding a nest is RFC-0044 S2.
+//! read as text. The report is the deliverable; scaffolding a nest is RFC-0044 S2
+//! (`port_emit`).
 
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,7 +45,7 @@ pub struct Citation {
 }
 
 impl Citation {
-    fn display(&self) -> String {
+    pub fn display(&self) -> String {
         format!("{}:{}", self.file, self.line)
     }
 }
@@ -605,7 +606,7 @@ fn match_brace(chars: &[(usize, char)], open: usize) -> Option<usize> {
 // ── Mappings ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandlerKind {
+pub(crate) enum HandlerKind {
     Event,
     Call,
     Block,
@@ -613,42 +614,81 @@ enum HandlerKind {
 }
 
 #[derive(Debug, Clone)]
-struct FunctionInfo {
-    name: String,
-    kind: HandlerKind,
-    assignments: Vec<Assignment>,
+pub(crate) struct FunctionInfo {
+    pub name: String,
+    pub kind: HandlerKind,
+    pub assignments: Vec<Assignment>,
     calls: BTreeSet<String>,
     contract_call: Option<Citation>,
     has_loop_load: bool,
     field_reads: Vec<(String, String)>, // (entity, field)
+    /// Source order, so `fetchTokenSymbol(event.params.token0)` can map the helper's bind
+    /// argument back onto the triggering row.
+    param_names: Vec<String>,
+    body: String,
+    file: String,
+    body_start_line: usize,
 }
 
 #[derive(Debug, Clone)]
-struct Assignment {
-    entity: String,
-    field: String,
-    citation: Citation,
-    expr: String,
+pub(crate) struct Assignment {
+    pub entity: String,
+    pub field: String,
+    pub citation: Citation,
+    pub expr: String,
     /// Whether the receiver is known to be an entity at all. `x.field = ..` where `x` is not a
     /// resolved binding is only an entity write if something saves `x`; without that, the
     /// unique-field fallback in [`classify`] would read any plain object assignment as a write to
     /// whichever entity happens to own that field name.
-    receiver_is_entity: bool,
+    pub receiver_is_entity: bool,
+}
+
+/// An `eventHandlers` entry: which source and event the named handler is wired to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandlerBinding {
+    pub handler: String,
+    pub source: String,
+    pub event: String,
 }
 
 #[derive(Debug, Clone)]
-struct Mappings {
-    functions: BTreeMap<String, FunctionInfo>,
+pub(crate) struct Mappings {
+    pub functions: BTreeMap<String, FunctionInfo>,
+    pub handlers: Vec<HandlerBinding>,
 }
 
-fn load_mappings(dir: &Path) -> Result<Mappings> {
+/// A contract read the mapping actually makes, tied to the Call-derived field it feeds.
+///
+/// `signature` is the ABI form (`symbol()`, `decimals()`), taken from `.try_*` / `.bind`.
+/// `contract_arg` is the bind argument after substituting the helper's parameters for the
+/// caller's, still in mapping syntax (`event.params.token0`). Emit turns that into a
+/// `contract_column` or a literal address. A call we cannot trace is not returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingCall {
+    pub entity: String,
+    pub field: String,
+    pub handler: String,
+    pub signature: String,
+    pub contract_arg: String,
+    pub args: Vec<String>,
+    pub citation: Citation,
+}
+
+pub(crate) fn load_mappings(dir: &Path) -> Result<Mappings> {
     let mut handler_kinds: BTreeMap<String, HandlerKind> = BTreeMap::new();
+    let mut handler_bindings: Vec<HandlerBinding> = Vec::new();
     let mut yaml_files: Vec<PathBuf> = Vec::new();
     for name in ["subgraph.yaml", "subgraph.yml"] {
         let p = dir.join(name);
         if p.exists() {
             if let Ok(text) = std::fs::read_to_string(&p) {
-                collect_manifest_hints(dir, &text, &mut handler_kinds, &mut yaml_files);
+                collect_manifest_hints(
+                    dir,
+                    &text,
+                    &mut handler_kinds,
+                    &mut handler_bindings,
+                    &mut yaml_files,
+                );
             }
         }
     }
@@ -675,13 +715,17 @@ fn load_mappings(dir: &Path) -> Result<Mappings> {
             functions.insert(func.name.clone(), func);
         }
     }
-    Ok(Mappings { functions })
+    Ok(Mappings {
+        functions,
+        handlers: handler_bindings,
+    })
 }
 
 fn collect_manifest_hints(
     dir: &Path,
     text: &str,
     kinds: &mut BTreeMap<String, HandlerKind>,
+    bindings: &mut Vec<HandlerBinding>,
     files: &mut Vec<PathBuf>,
 ) {
     let Ok(docs) = YamlLoader::load_from_str(text) else {
@@ -704,6 +748,8 @@ fn collect_manifest_hints(
             take_handlers(mapping, "eventHandlers", HandlerKind::Event, kinds);
             take_handlers(mapping, "callHandlers", HandlerKind::Call, kinds);
             take_handlers(mapping, "blockHandlers", HandlerKind::Block, kinds);
+            let source = get_yaml(src, "name").and_then(|v| v.as_str()).unwrap_or("");
+            take_event_bindings(mapping, source, bindings);
         }
     }
 }
@@ -724,6 +770,29 @@ fn mapping_file_path(dir: &Path, mapping: &Yaml) -> Option<PathBuf> {
     };
     let p = dir.join(rel.trim_start_matches("./"));
     p.exists().then_some(p)
+}
+
+fn take_event_bindings(mapping: &Yaml, source: &str, bindings: &mut Vec<HandlerBinding>) {
+    let Some(arr) = get_yaml(mapping, "eventHandlers").and_then(|v| v.as_vec()) else {
+        return;
+    };
+    for entry in arr {
+        let Some(handler) = get_yaml(entry, "handler").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let event = get_yaml(entry, "event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let event_name = event.split('(').next().unwrap_or(event).trim();
+        if event_name.is_empty() || source.is_empty() {
+            continue;
+        }
+        bindings.push(HandlerBinding {
+            handler: handler.to_string(),
+            source: source.to_string(),
+            event: event_name.to_string(),
+        });
+    }
 }
 
 fn take_handlers(
@@ -808,9 +877,17 @@ fn parse_functions(text: &str, file: &str) -> Vec<FunctionInfo> {
                 if let Some(close) = match_ts_brace(&stripped, open) {
                     let sig = &stripped[after_name..open];
                     let params = parse_params(sig);
+                    let param_names = param_names_of(sig);
                     let body = &stripped[open + 1..close];
                     let start_line = line_of(&stripped, open);
-                    out.push(analyse_function(name, file, body, start_line, params));
+                    out.push(analyse_function(
+                        name,
+                        file,
+                        body,
+                        start_line,
+                        params,
+                        param_names,
+                    ));
                     i = close + 1;
                     continue;
                 }
@@ -956,6 +1033,29 @@ fn strip_ts_comments(text: &str) -> String {
     out
 }
 
+fn param_names_of(sig: &str) -> Vec<String> {
+    let start = match sig.find('(') {
+        Some(i) => i + 1,
+        None => return Vec::new(),
+    };
+    let end = match sig[start..].find(')') {
+        Some(i) => start + i,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for part in sig[start..end].split(',') {
+        let part = part.trim();
+        let Some(colon) = part.find(':') else {
+            continue;
+        };
+        let var = part[..colon].trim();
+        if !var.is_empty() {
+            out.push(var.to_string());
+        }
+    }
+    out
+}
+
 fn parse_params(sig: &str) -> BTreeMap<String, String> {
     let start = match sig.find('(') {
         Some(i) => i + 1,
@@ -990,6 +1090,7 @@ fn analyse_function(
     body: &str,
     body_start_line: usize,
     params: BTreeMap<String, String>,
+    param_names: Vec<String>,
 ) -> FunctionInfo {
     let mut bindings = params;
     bindings.extend(collect_bindings(body));
@@ -1012,6 +1113,10 @@ fn analyse_function(
         contract_call,
         has_loop_load,
         field_reads,
+        param_names,
+        body: body.to_string(),
+        file: file.to_string(),
+        body_start_line,
     }
 }
 
@@ -2158,6 +2263,854 @@ fn reason_for(
     }
 }
 
+// ── Mapping calls (RFC-0044 S2) ─────────────────────────────────────────────
+
+/// Contract reads that feed Call-derived fields. Each entry cites the `.try_*` / `.bind` line,
+/// not a guessed getter. Fields the classifier did not call Call-derived are skipped, so dropping
+/// the read from the mapping drops the entry.
+pub fn mapping_calls(dir: &Path) -> Result<Vec<MappingCall>> {
+    let report = classify_dir(dir)?;
+    let mappings = load_mappings(dir)?;
+    Ok(calls_from_mappings(&report, &mappings))
+}
+
+pub(crate) fn calls_from_mappings(report: &Report, mappings: &Mappings) -> Vec<MappingCall> {
+    let call_fields: BTreeSet<(String, String)> = report
+        .fields
+        .iter()
+        .filter(|f| f.class == Class::CallDerived)
+        .map(|f| (f.entity.clone(), f.field.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for func in mappings.functions.values() {
+        if func.kind == HandlerKind::Block {
+            continue;
+        }
+        for asg in &func.assignments {
+            if !call_fields.contains(&(asg.entity.clone(), asg.field.clone())) {
+                continue;
+            }
+            if let Some(call) = derive_mapping_call(func, asg, mappings) {
+                let key = (
+                    call.entity.clone(),
+                    call.field.clone(),
+                    call.signature.clone(),
+                    call.contract_arg.clone(),
+                    call.args.clone(),
+                );
+                if seen.insert(key) {
+                    out.push(call);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.entity
+            .cmp(&b.entity)
+            .then(a.field.cmp(&b.field))
+            .then(a.contract_arg.cmp(&b.contract_arg))
+            .then(a.signature.cmp(&b.signature))
+    });
+    out
+}
+
+fn derive_mapping_call(
+    writer: &FunctionInfo,
+    asg: &Assignment,
+    mappings: &Mappings,
+) -> Option<MappingCall> {
+    if let Some(call) = call_from_body(writer, asg, None, &asg.expr) {
+        return Some(call);
+    }
+    let mut seen = BTreeSet::new();
+    seen.insert(writer.name.clone());
+    call_via_helpers(writer, asg, mappings, writer, &asg.expr, &mut seen)
+}
+
+/// A wrapper that only forwards (`fetchTokenSymbol` → `readTokenSymbol` → `try_symbol`)
+/// still has to emit the [[calls]] stanza; otherwise classify and emit disagree.
+fn call_via_helpers(
+    func: &FunctionInfo,
+    asg: &Assignment,
+    mappings: &Mappings,
+    writer: &FunctionInfo,
+    expr: &str,
+    seen: &mut BTreeSet<String>,
+) -> Option<MappingCall> {
+    let at_writer = func.name == writer.name;
+    for callee in &func.calls {
+        if at_writer && !expr_calls(expr, callee) {
+            continue;
+        }
+        if !seen.insert(callee.clone()) {
+            continue;
+        }
+        let Some(helper) = mappings.functions.get(callee) else {
+            continue;
+        };
+        let invoke = if at_writer {
+            expr.to_string()
+        } else {
+            return_exprs(&func.body)
+                .into_iter()
+                .find(|r| expr_calls(r, callee))
+                .unwrap_or_else(|| func.body.clone())
+        };
+        let caller_args = call_arg_list(&invoke, callee);
+        let found = if helper.contract_call.is_some() || helper.body.contains(".try_") {
+            call_from_body(helper, asg, Some(writer), &asg.expr)
+        } else {
+            call_via_helpers(helper, asg, mappings, writer, &invoke, seen)
+        };
+        if let Some(call) = found {
+            let contract_arg = subst_params(&call.contract_arg, &helper.param_names, &caller_args);
+            let args = call
+                .args
+                .iter()
+                .map(|a| subst_params(a, &helper.param_names, &caller_args))
+                .collect();
+            return Some(MappingCall {
+                handler: writer.name.clone(),
+                contract_arg,
+                args,
+                ..call
+            });
+        }
+    }
+    None
+}
+
+fn call_from_body(
+    func: &FunctionInfo,
+    asg: &Assignment,
+    writer: Option<&FunctionInfo>,
+    expr: &str,
+) -> Option<MappingCall> {
+    let sites = find_try_sites(&func.body, &func.file, func.body_start_line);
+    let use_returns = writer.is_some() || func.kind == HandlerKind::Helper;
+    let site = pick_try_site(&sites, &func.body, expr, use_returns)?;
+    let bind_arg = site
+        .bind_arg
+        .clone()
+        .or_else(|| bind_arg_for(&func.body, &site.receiver))?;
+    let sig_types: Vec<&str> = site
+        .args
+        .iter()
+        .map(|a| sol_type_of_expr(a, func))
+        .collect::<Option<Vec<_>>>()?;
+    let signature = if sig_types.is_empty() {
+        format!("{}()", site.method)
+    } else {
+        format!("{}({})", site.method, sig_types.join(","))
+    };
+    Some(MappingCall {
+        entity: asg.entity.clone(),
+        field: asg.field.clone(),
+        handler: writer.unwrap_or(func).name.clone(),
+        signature,
+        contract_arg: bind_arg,
+        args: site.args.clone(),
+        citation: site.citation.clone(),
+    })
+}
+
+/// The `.try_*` that actually feeds `expr` (the assignment) or, in a helper, the returned value.
+/// A helper that calls `try_symbol` and then returns `try_decimals` must not emit `symbol()` for
+/// the decimals field.
+fn pick_try_site<'a>(
+    sites: &'a [TrySite],
+    body: &str,
+    expr: &str,
+    use_returns: bool,
+) -> Option<&'a TrySite> {
+    if sites.is_empty() {
+        return None;
+    }
+    let locals = locals_bound_to_try(body, sites);
+    if let Some(site) = site_for_text(expr, sites, &locals) {
+        return Some(site);
+    }
+    if use_returns {
+        for ret in return_exprs(body) {
+            if let Some(site) = site_for_text(&ret, sites, &locals) {
+                return Some(site);
+            }
+        }
+        if sites.len() == 1 {
+            return sites.first();
+        }
+    }
+    None
+}
+
+fn site_for_text<'a>(
+    text: &str,
+    sites: &'a [TrySite],
+    locals: &BTreeMap<String, &'a TrySite>,
+) -> Option<&'a TrySite> {
+    for site in sites {
+        if ident_in(text, &format!("try_{}", site.method)) {
+            return Some(site);
+        }
+    }
+    for (var, site) in locals {
+        if uses_local(text, var) {
+            return Some(site);
+        }
+    }
+    None
+}
+
+fn locals_bound_to_try<'a>(body: &str, sites: &'a [TrySite]) -> BTreeMap<String, &'a TrySite> {
+    let mut map = BTreeMap::new();
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((var, rhs, next)) = match_let_rhs(body, i) {
+            if let Some(site) = sites
+                .iter()
+                .find(|s| ident_in(&rhs, &format!("try_{}", s.method)))
+            {
+                map.insert(var, site);
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    map
+}
+
+fn match_let_rhs(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if k >= text.len() || text.as_bytes()[k] != b'=' {
+        return None;
+    }
+    if k + 1 < text.len() {
+        let n = text.as_bytes()[k + 1];
+        if n == b'=' || n == b'>' {
+            return None;
+        }
+    }
+    let rhs = take_expr(text, k + 1);
+    Some((var, collapse_ws(&rhs), k + 1))
+}
+
+fn return_exprs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if body[i..].starts_with("return") {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after = i + 6;
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if before_ok && after_ok {
+                let expr = take_expr(body, after);
+                if !expr.is_empty() {
+                    out.push(collapse_ws(&expr));
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn ident_in(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_')
+            };
+            let after_ok = i + needle.len() == bytes.len() || {
+                let n = bytes[i + needle.len()];
+                !(n.is_ascii_alphanumeric() || n == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn uses_local(text: &str, var: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = var.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_' || p == b'.')
+            };
+            let after_ok = i + needle.len() == bytes.len() || {
+                let n = bytes[i + needle.len()];
+                !(n.is_ascii_alphanumeric() || n == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+struct TrySite {
+    method: String,
+    receiver: String,
+    bind_arg: Option<String>,
+    args: Vec<String>,
+    citation: Citation,
+}
+
+fn find_try_sites(body: &str, file: &str, body_start_line: usize) -> Vec<TrySite> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &body[i..];
+        let Some(at) = rest.find(".try_") else {
+            break;
+        };
+        let dot = i + at;
+        let method_start = dot + 5;
+        let mut k = method_start;
+        while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+            k += 1;
+        }
+        if k == method_start {
+            i = method_start;
+            continue;
+        }
+        let method = body[method_start..k].to_string();
+        let mut j = k;
+        skip_ws_str(body, &mut j);
+        if j >= bytes.len() || bytes[j] != b'(' {
+            i = k;
+            continue;
+        }
+        let args_raw = take_paren_list(body, j);
+        let receiver = ident_before(body, dot).unwrap_or_default();
+        let bind_arg = chained_bind_arg(body, dot);
+        let line = body_start_line + line_of(body, dot) - 1;
+        out.push(TrySite {
+            method,
+            receiver,
+            bind_arg,
+            args: args_raw,
+            citation: Citation {
+                file: file.to_string(),
+                line,
+            },
+        });
+        i = k;
+    }
+    out
+}
+
+fn chained_bind_arg(body: &str, try_dot: usize) -> Option<String> {
+    // `ERC20.bind(addr).try_symbol()` - the bind sits immediately before this `.try_`.
+    let before = &body[..try_dot];
+    let bind_at = before.rfind(".bind(")?;
+    let close = match_paren(body, bind_at + 5)?;
+    if close >= try_dot {
+        return None;
+    }
+    if !body[close + 1..try_dot].trim().is_empty() {
+        return None;
+    }
+    let inner = body[bind_at + 6..close].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(collapse_ws(inner))
+}
+
+fn bind_arg_for(body: &str, receiver: &str) -> Option<String> {
+    if receiver.is_empty() {
+        return first_bind_arg(body);
+    }
+    // `let contract = ERC20.bind(tokenAddress)`
+    let mut i = 0;
+    while i < body.len() {
+        if !body.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if let Some((var, arg, next)) = match_bind_assign(body, i) {
+            if var == receiver {
+                return Some(arg);
+            }
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    first_bind_arg(body)
+}
+
+fn first_bind_arg(body: &str) -> Option<String> {
+    let at = body.find(".bind(")?;
+    let close = match_paren(body, at + 5)?;
+    let inner = body[at + 6..close].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(collapse_ws(inner))
+    }
+}
+
+fn match_bind_assign(text: &str, i: usize) -> Option<(String, String, usize)> {
+    if !text.is_char_boundary(i) {
+        return None;
+    }
+    let rest = &text[i..];
+    let kw = if rest.starts_with("let ") {
+        4
+    } else if rest.starts_with("const ") {
+        6
+    } else if rest.starts_with("var ") {
+        4
+    } else {
+        return None;
+    };
+    if i > 0 {
+        let p = text.as_bytes()[i - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' {
+            return None;
+        }
+    }
+    let mut k = i + kw;
+    let var = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with('=') {
+        return None;
+    }
+    k += 1;
+    skip_ws_str(text, &mut k);
+    let _ty = take_ident_str(text, &mut k)?;
+    skip_ws_str(text, &mut k);
+    if !text[k..].starts_with(".bind(") {
+        return None;
+    }
+    let open = k + 5;
+    let close = match_paren(text, open)?;
+    let arg = collapse_ws(text[open + 1..close].trim());
+    Some((var, arg, close + 1))
+}
+
+fn match_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if open >= bytes.len() || bytes[open] != b'(' {
+        return None;
+    }
+    let mut depth = 0;
+    let mut i = open;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn take_paren_list(text: &str, open: usize) -> Vec<String> {
+    let Some(close) = match_paren(text, open) else {
+        return Vec::new();
+    };
+    let inner = text[open + 1..close].trim();
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    split_args(inner)
+}
+
+fn split_args(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'(' || b == b'[' {
+            depth += 1;
+        } else if b == b')' || b == b']' {
+            depth -= 1;
+        } else if b == b',' && depth == 0 {
+            let part = inner[start..i].trim();
+            if !part.is_empty() {
+                out.push(collapse_ws(part));
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let part = inner[start..].trim();
+    if !part.is_empty() {
+        out.push(collapse_ws(part));
+    }
+    out
+}
+
+fn ident_before(text: &str, dot: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = dot;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let end = i;
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    if i == end {
+        return None;
+    }
+    Some(text[i..end].to_string())
+}
+
+fn call_arg_list(expr: &str, name: &str) -> Vec<String> {
+    let needle = format!("{name}(");
+    let Some(at) = expr.find(&needle) else {
+        return Vec::new();
+    };
+    if at > 0 {
+        let p = expr.as_bytes()[at - 1];
+        if p.is_ascii_alphanumeric() || p == b'_' || p == b'.' {
+            return Vec::new();
+        }
+    }
+    take_paren_list(expr, at + name.len())
+}
+
+fn subst_params(expr: &str, params: &[String], args: &[String]) -> String {
+    let ident = strip_converters(expr);
+    if let Some(idx) = params.iter().position(|p| p == &ident) {
+        if let Some(arg) = args.get(idx) {
+            return strip_converters(arg);
+        }
+    }
+    strip_converters(expr)
+}
+
+/// Drop `.toHex()` / `.toHexString()` / `.toString()` so `event.params.token0.toHex()` is still
+/// the `token0` column.
+pub(crate) fn strip_converters(expr: &str) -> String {
+    let mut s = collapse_ws(expr);
+    loop {
+        let next = s
+            .strip_suffix(".toHex()")
+            .or_else(|| s.strip_suffix(".toHexString()"))
+            .or_else(|| s.strip_suffix(".toString()"))
+            .or_else(|| s.strip_suffix(".toI32()"))
+            .or_else(|| s.strip_suffix(".toU32()"));
+        match next {
+            Some(n) => s = n.trim().to_string(),
+            None => break,
+        }
+    }
+    s
+}
+
+/// Event column that identifies `entity` in this function: an `id` assignment, else
+/// `new Entity(event.params.x)` / `Entity.load(event.params.x)`.
+pub(crate) fn entity_id_event_column(entity: &str, func: &FunctionInfo) -> Option<String> {
+    for asg in &func.assignments {
+        if asg.entity == entity && asg.field == "id" {
+            if let Some(col) = assignment_event_column(asg, func) {
+                return Some(col);
+            }
+        }
+    }
+    id_from_new_or_load(entity, &func.body)
+}
+
+fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((_var, ent, next)) = match_let_new(body, i).or_else(|| match_bare_new(body, i))
+        {
+            if ent == entity {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                        return Some(col);
+                    }
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        if let Some((_var, ent, next)) = match_let_load(body, i) {
+            if ent == entity {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                        return Some(col);
+                    }
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Event-table column this assignment copies. Constructor ids (`new Token(event.params.token0)`)
+/// use the constructor argument; a local that only aliases that argument is chased for `id`.
+pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> Option<String> {
+    if let Some(col) = event_column(&asg.expr) {
+        return Some(col);
+    }
+    if asg.field != "id" {
+        return None;
+    }
+    let ident = local_root(&asg.expr)?;
+    let arg = constructor_arg_for(&func.body, &ident)
+        .or_else(|| load_arg_for(&func.body, &ident))
+        .or_else(|| create_arg_for(&func.body, &ident))?;
+    event_column(&arg)
+}
+
+/// The event/call handler that wrote this, or a handler that calls this helper. Block handlers
+/// are never a table source.
+pub(crate) fn event_handler_for<'a>(
+    func: &'a FunctionInfo,
+    mappings: &'a Mappings,
+) -> Option<&'a FunctionInfo> {
+    if func.kind == HandlerKind::Event || func.kind == HandlerKind::Call {
+        return Some(func);
+    }
+    if func.kind == HandlerKind::Block {
+        return None;
+    }
+    mappings.functions.values().find(|f| {
+        (f.kind == HandlerKind::Event || f.kind == HandlerKind::Call)
+            && f.calls.contains(&func.name)
+    })
+}
+
+fn local_root(expr: &str) -> Option<String> {
+    let e = strip_converters(expr);
+    let e = e.strip_suffix(".id").unwrap_or(&e).trim();
+    if e.is_empty() {
+        return None;
+    }
+    if !e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if e.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    Some(e.to_string())
+}
+
+fn constructor_arg_for(body: &str, var: &str) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        let hit = match_let_new(body, i).or_else(|| match_bare_new(body, i));
+        if let Some((v, _ent, next)) = hit {
+            if v == var {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    return Some(collapse_ws(&take_expr(body, k + 1)));
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn load_arg_for(body: &str, var: &str) -> Option<String> {
+    arg_after_match(body, var, match_let_load)
+}
+
+fn create_arg_for(body: &str, var: &str) -> Option<String> {
+    arg_after_match(body, var, match_let_create)
+}
+
+type ArgumentMatcher = fn(&str, usize) -> Option<(String, String, usize)>;
+
+fn arg_after_match(body: &str, var: &str, matcher: ArgumentMatcher) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((v, _ent, next)) = matcher(body, i) {
+            if v == var {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    return Some(collapse_ws(&take_expr(body, k + 1)));
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Map a mapping expression onto a nest column (`token0`, `address`, …). `None` if it is not
+/// a field of the triggering event - emit then refuses to guess.
+pub(crate) fn event_column(expr: &str) -> Option<String> {
+    let e = strip_converters(expr);
+    if let Some(rest) = e.strip_prefix("event.params.") {
+        let mut k = 0;
+        let name = take_ident_str(rest, &mut k)?;
+        if name.is_empty() {
+            return None;
+        }
+        return Some(nuthatch_decode::registry::snake_case(&name));
+    }
+    match e.as_str() {
+        "event.address" => Some("address".into()),
+        "event.block.timestamp" => Some("block_timestamp".into()),
+        "event.block.number" => Some("block_number".into()),
+        "event.transaction.hash" => Some("tx_hash".into()),
+        "event.logIndex" => Some("log_index".into()),
+        _ => None,
+    }
+}
+
+fn sol_type_of_expr(expr: &str, func: &FunctionInfo) -> Option<&'static str> {
+    let e = strip_converters(expr);
+    if e.starts_with("event.params.") || e == "event.address" {
+        return Some("address");
+    }
+    if func.param_names.iter().any(|p| p == &e) {
+        return Some("address");
+    }
+    if e.starts_with("Address.") || e.starts_with("Address.from") {
+        return Some("address");
+    }
+    None
+}
+
+fn literal_address(expr: &str) -> Option<String> {
+    let e = strip_converters(expr);
+    // Address.fromString('0x…') / Address.fromHexString("0x…")
+    for prefix in ["Address.fromString(", "Address.fromHexString("] {
+        if let Some(rest) = e.strip_prefix(prefix) {
+            let rest = rest.trim_start_matches(['\'', '"']).trim_end_matches(')');
+            let rest = rest.trim_end_matches(['\'', '"', ' ', ')']);
+            if rest.starts_with("0x") && rest.len() == 42 {
+                return Some(rest.to_ascii_lowercase());
+            }
+        }
+    }
+    if e.starts_with("0x") && e.len() == 42 {
+        return Some(e.to_ascii_lowercase());
+    }
+    None
+}
+
+pub(crate) fn resolved_contract(expr: &str) -> ResolvedContract {
+    if let Some(col) = event_column(expr) {
+        return ResolvedContract::Column(col);
+    }
+    if let Some(addr) = literal_address(expr) {
+        return ResolvedContract::Address(addr);
+    }
+    ResolvedContract::Unknown
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedContract {
+    Column(String),
+    Address(String),
+    Unknown,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2170,7 +3123,13 @@ mod tests {
         for func in parse_functions(mapping, file) {
             functions.insert(func.name.clone(), func);
         }
-        (schema, Mappings { functions })
+        (
+            schema,
+            Mappings {
+                functions,
+                handlers: Vec::new(),
+            },
+        )
     }
 
     fn class_of(rows: &[FieldRow], entity: &str, field: &str) -> Class {
@@ -2186,6 +3145,50 @@ mod tests {
             .unwrap()
             .reason
             .clone()
+    }
+
+    #[test]
+    fn constructor_id_maps_to_the_event_column() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+type Pool @entity {
+  id: ID!
+  token0: Token!
+}
+"#;
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = 'x'
+  token0.save()
+  let pool = new Pool(event.params.pool.toHex())
+  pool.token0 = token0.id
+  pool.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/mappings/core.ts", mapping);
+        let func = mappings.functions.get("handlePoolCreated").unwrap();
+        let token_id = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Token" && a.field == "id")
+            .expect("constructor id");
+        assert_eq!(
+            assignment_event_column(token_id, func).as_deref(),
+            Some("token0")
+        );
+        let pool_id = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Pool" && a.field == "id")
+            .expect("pool constructor id");
+        assert_eq!(
+            assignment_event_column(pool_id, func).as_deref(),
+            Some("pool")
+        );
     }
 
     #[test]
@@ -2985,6 +3988,166 @@ type Token @entity { id: ID! leftover: String! }
     #[test]
     fn schema_parse_rejects_empty() {
         assert!(parse_schema("enum Foo { A }").is_err());
+    }
+
+    #[test]
+    fn mapping_call_signature_cites_the_try_line() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  let contract = ERC20.bind(tokenAddress)
+  let result = contract.try_symbol()
+  if (!result.reverted) {
+    return result.value
+  }
+  return 'unknown'
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = fetchTokenSymbol(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].signature, "symbol()");
+        assert_eq!(calls[0].contract_arg, "event.params.token0");
+        assert_eq!(calls[0].citation.file, "src/common/token.ts");
+        assert_eq!(
+            calls[0].citation.line, 4,
+            "try_symbol is line 4 of the mapping"
+        );
+        assert_eq!(calls[0].handler, "handlePoolCreated");
+    }
+
+    #[test]
+    fn helper_with_two_reads_emits_the_returned_method() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(tokenAddress: Address): BigInt {
+  let contract = ERC20.bind(tokenAddress)
+  let _sym = contract.try_symbol()
+  return contract.try_decimals().value
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0].signature, "decimals()",
+            "the returned try_decimals must win over the earlier try_symbol: {calls:?}"
+        );
+        assert_eq!(calls[0].contract_arg, "event.params.token0");
+        assert_eq!(
+            calls[0].citation.line, 5,
+            "must cite try_decimals, not try_symbol, got {}",
+            calls[0].citation.line
+        );
+    }
+
+    #[test]
+    fn two_inline_reads_attribute_each_field_to_its_try() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+  decimals: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  let contract = ERC20.bind(event.params.token0)
+  token0.symbol = contract.try_symbol().value
+  token0.decimals = contract.try_decimals().value
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/mappings/core.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        let sig = |field: &str| {
+            calls
+                .iter()
+                .find(|c| c.field == field)
+                .map(|c| c.signature.as_str())
+                .unwrap_or("missing")
+        };
+        assert_eq!(sig("symbol"), "symbol()", "{calls:?}");
+        assert_eq!(sig("decimals"), "decimals()", "{calls:?}");
+    }
+
+    #[test]
+    fn mapping_call_vanishes_when_the_try_is_dropped() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenSymbol(tokenAddress: Address): string {
+  return 'unknown'
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token0 = new Token(event.params.token0.toHex())
+  token0.symbol = fetchTokenSymbol(event.params.token0)
+  token0.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/common/token.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Token", "symbol"), Class::Exact);
+        let calls = calls_from_mappings(
+            &Report {
+                source: "t".into(),
+                fields: rows,
+            },
+            &mappings,
+        );
+        assert!(
+            calls.is_empty(),
+            "dropping try_symbol must not invent a [[calls]]: {calls:?}"
+        );
     }
 
     #[test]
