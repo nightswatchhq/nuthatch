@@ -3061,7 +3061,14 @@ pub(crate) fn event_column(expr: &str) -> Option<String> {
         if !rest[k..].trim().is_empty() {
             return None;
         }
-        return Some(nuthatch_decode::registry::snake_case(&name));
+        // **The parameter name as written, not snake_cased** (#1250). `snake_case` builds the
+        // *table* name from the event name (`{alias}__{snake_case(event.name)}`); a column is the
+        // ABI parameter name verbatim, because `EventDecoder::new` takes `p.name.clone()`.
+        // Snake-casing it meant every camelCase parameter named a column that does not exist, so a
+        // view over `sqrtPriceX96` or `tickSpacing` asked for `sqrt_price_x96` and did not bind at
+        // all. The only fixture that bound an emitted view used `token0`, which snake_cases to
+        // itself, which is why the whole class was invisible.
+        return Some(name);
     }
     match e.as_str() {
         "event.address" => Some("address".into()),

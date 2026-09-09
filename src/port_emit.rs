@@ -140,7 +140,13 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         dir: nest.display().to_string(),
     })?;
 
-    let (views, skipped_fields) = write_exact_views(nest, &report, &mappings, &config)?;
+    // The real decoded columns, so a mapped column name is *resolved* rather than guessed (#1250).
+    // Built after `regen` so it reflects the `[[calls]]` just written.
+    let schema = crate::registry::from_nest(nest, &config)
+        .with_context(|| format!("build the decode registry for {}", nest.display()))?
+        .schema();
+
+    let (views, skipped_fields) = write_exact_views(nest, &report, &mappings, &config, &schema)?;
     write_checks(nest, &views)?;
     std::fs::write(nest.join("README.md"), &report_text)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
@@ -288,6 +294,7 @@ fn write_exact_views(
     report: &Report,
     mappings: &crate::port_report::Mappings,
     config: &Config,
+    schema: &[nuthatch_decode::registry::TableSchema],
 ) -> Result<(Vec<EmittedView>, Vec<SkippedField>)> {
     let views_dir = nest.join("views");
     std::fs::create_dir_all(&views_dir)
@@ -315,7 +322,7 @@ fn write_exact_views(
     let mut emitted = Vec::new();
     let mut skipped = Vec::new();
     for (entity, fields) in &exact_by_entity {
-        let view = view_for_entity(entity, fields, mappings, config);
+        let view = view_for_entity(entity, fields, mappings, config, schema);
         let file = format!("20-{}.sql", to_alias(entity));
         std::fs::write(views_dir.join(&file), &view.sql)
             .with_context(|| format!("write views/{file}"))?;
@@ -363,6 +370,7 @@ fn view_for_entity(
     fields: &[&crate::port_report::FieldRow],
     mappings: &crate::port_report::Mappings,
     config: &Config,
+    schema: &[nuthatch_decode::registry::TableSchema],
 ) -> ViewDraft {
     let view_name = to_alias(entity);
     let mut comments = Vec::new();
@@ -375,7 +383,7 @@ fn view_for_entity(
         // **Claim the field only once it has a column.** `exact_fields` used to be pushed before
         // the mapping was attempted, so a field that reached no table was still advertised as
         // being in this view while the SQL never mentioned it (#1248).
-        let tables = map_exact_field_tables(f, mappings, config);
+        let tables = map_exact_field_tables(f, mappings, config, schema);
         if tables.is_empty() {
             comments.push(format!(
                 "-- `{}.{}` exact but NOT IN THIS VIEW: {}:{} - {}",
@@ -515,10 +523,37 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
     )
 }
 
+/// The decoded column this name refers to, or `None` if the table has no such column.
+///
+/// **Resolved, never guessed** (#1250). A column is the ABI parameter name verbatim, except that an
+/// indexed dynamic type lands as `{name}_hash` because the log carries `keccak(value)` rather than
+/// the value (RFC-0001). Those are the only two shapes, and both are checked against the real
+/// schema, so a name that matches neither yields nothing and the field is reported as skipped rather
+/// than written into a view that cannot bind. There is deliberately no fuzzy or case-insensitive
+/// fallback: a near-miss resolved to the wrong column is the failure mode this whole change exists
+/// to remove.
+fn resolve_column(
+    table: &str,
+    name: &str,
+    schema: &[nuthatch_decode::registry::TableSchema],
+) -> Option<String> {
+    let cols = &schema.iter().find(|t| t.table == table)?.columns;
+    let has = |c: &str| cols.iter().any(|col| col.name == c);
+    if has(name) {
+        return Some(name.to_string());
+    }
+    let hashed = format!("{name}_hash");
+    if has(&hashed) {
+        return Some(hashed);
+    }
+    None
+}
+
 fn map_exact_field_tables(
     field: &crate::port_report::FieldRow,
     mappings: &crate::port_report::Mappings,
     config: &Config,
+    schema: &[nuthatch_decode::registry::TableSchema],
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for func in mappings.functions.values() {
@@ -536,6 +571,9 @@ fn map_exact_field_tables(
                 continue;
             };
             let Some(table) = table_for_handler(&handler.name, mappings, config) else {
+                continue;
+            };
+            let Some(col) = resolve_column(&table, &col, schema) else {
                 continue;
             };
             out.entry(table).or_insert(col);

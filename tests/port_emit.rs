@@ -690,3 +690,117 @@ fn the_generated_check_fails_if_a_promised_column_is_missing() {
         "a check naming a column the view does not project must fail to bind, and did not:\n{broken}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1250: a column name is resolved against the decoded schema, never snake_cased into existence.
+// ---------------------------------------------------------------------------------------------
+
+/// The regression test the fixture choice hid. `tickSpacing` is a camelCase ABI parameter, so the
+/// decoded column is `tickSpacing`; the emitter used to ask for `tick_spacing` and the view did not
+/// bind at all. **This binds rather than greps**, because the whole class of defect was invisible to
+/// a test that only inspects SQL text: `four_classes_exact_sqrt_price_lands_in_a_view` exercises
+/// `sqrtPriceX96` and passes on the broken code.
+#[test]
+fn a_camel_case_parameter_yields_a_view_that_binds() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  spacing: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.spacing = event.params.tickSpacing
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    // **What each assertion below actually guards, because they are not interchangeable.**
+    //
+    // The bind proves the emitted view is loadable, which is what the old code failed outright with
+    // `Binder Error: Referenced column "tick_spacing" not found in FROM clause!`. It does *not*
+    // catch a return to snake-casing on its own: `resolve_column` refuses a name the table does not
+    // have, so the field would simply be skipped and the smaller view would bind perfectly well.
+    // Measured, not assumed - restoring `snake_case` leaves this assertion green and prints
+    // `✓ port_views: 1 row(s) match`.
+    //
+    // So the two below it are the ones that catch that regression: the field has to *land*, named
+    // as the ABI names it, and nothing may be skipped. Read together, the three say the view loads
+    // and carries the field, which is the whole claim.
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "a camelCase parameter must produce a view that binds: {check:?}\n{sql}"
+    );
+
+    assert!(
+        sql.contains("\"tickSpacing\""),
+        "the decoded column is the ABI parameter verbatim:\n{sql}"
+    );
+    assert!(
+        !sql.contains("tick_spacing"),
+        "`tick_spacing` is not a column of this table and never was:\n{sql}"
+    );
+    assert!(
+        result.skipped_fields.is_empty(),
+        "`spacing` resolves to a real column, so nothing should be skipped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A name matching no column of the table is skipped by name, not written into a view that cannot
+/// bind. `resolve_column` has no fuzzy fallback, so this also pins that a near-miss is refused
+/// rather than resolved to something adjacent.
+#[test]
+fn a_name_that_matches_no_column_is_skipped_rather_than_emitted() {
+    // `PoolCreated` has no `amount0`; the Swap ABI does, and this nest does not import it.
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  missing: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.missing = event.params.amount0
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    assert!(
+        result
+            .skipped_fields
+            .iter()
+            .any(|s| s.entity == "Pool" && s.field == "missing"),
+        "a parameter this event does not have must be named as skipped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "skipping the field must leave a nest that still checks: {check:?}"
+    );
+}
