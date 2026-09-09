@@ -28,7 +28,11 @@ use std::time::{Duration, Instant};
 /// `Config`, not in a later `SET`. `lock_configuration` then freezes both so a query cannot widen
 /// them. Measured against `libduckdb-sys` 1.10504.0, the bundled build.
 fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![dir.join(crate::seal::SEGMENTS_DIR), dir.join("labels")];
+    let mut dirs = vec![
+        dir.join(crate::seal::SEGMENTS_DIR),
+        dir.join("labels"),
+        dir.join(crate::offchain::DIR).join("segments"),
+    ];
     // Runtime layout (RFC-0033): Parquet lives at `<root>/segments/{hash}.parquet`, not under
     // `data/<nid>/segments`. Locking only the per-dataset dir made `/sql` succeed with zero rows
     // on every mounted nest (#289 follow-up, `e2e_early_cutoff`).
@@ -119,6 +123,7 @@ pub fn invalidate_duck_cache(dir: &Path) {
 
 pub(crate) fn duck_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, DuckInputStamp> {
     let mut paths = vec![dir.join(crate::config::CONFIG_FILE)];
+    paths.push(crate::offchain::catalogue_path(dir));
     if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
         paths.extend(
             entries
@@ -827,6 +832,7 @@ fn attempt(
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
         define_nest_views(conn, dir, wanted.as_ref());
+        define_offchain_views(conn, dir, wanted.as_ref());
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
         define_labels_view(conn, dir);
@@ -2349,6 +2355,47 @@ fn define_nest_views(
             if let Err(e) = conn.execute_batch(&with_or_replace_view(&stmt)) {
                 tracing::debug!("nest view {} statement skipped: {e}", v.file);
             }
+        }
+    }
+}
+
+/// Bind immutable offchain snapshots beneath an explicit namespace. They deliberately have no hot
+/// half, no watermark, and no path back into chain replay: they are query inputs only.
+fn define_offchain_views(
+    conn: &Connection,
+    dir: &Path,
+    wanted: Option<&std::collections::BTreeSet<String>>,
+) {
+    let Ok(catalogue) = crate::offchain::load(dir) else {
+        tracing::warn!(
+            "offchain provenance manifest is unreadable; no offchain views were defined"
+        );
+        return;
+    };
+    for (table, snapshots) in catalogue.tables {
+        let view = format!("offchain__{table}");
+        if wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
+            continue;
+        }
+        let files: Vec<String> = snapshots
+            .iter()
+            .map(|s| {
+                dir.join(crate::offchain::DIR)
+                    .join("segments")
+                    .join(&s.file)
+            })
+            .filter(|p| p.exists())
+            .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        let ddl = format!(
+            "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
+            files.join(", ")
+        );
+        if let Err(e) = conn.execute_batch(&ddl) {
+            tracing::warn!("offchain view {view} skipped: {e}");
         }
     }
 }

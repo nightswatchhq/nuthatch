@@ -12,7 +12,7 @@
 
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
-    lists, mcp, pack, project, runtime, screen, store, transform,
+    lists, mcp, offchain, pack, project, runtime, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
@@ -149,6 +149,13 @@ async fn main() -> Result<()> {
         ),
         cli::Command::Sql(args) => run_sql(args).await,
         cli::Command::Transform(args) => run_transform(args),
+        cli::Command::Offchain(args) => match args.what {
+            cli::OffchainWhat::Drop(args) => offchain::drop_file(
+                std::path::Path::new(&args.dir),
+                std::path::Path::new(&args.file),
+                &args.table,
+            ),
+        },
         cli::Command::Mcp(args) => {
             if args.print_config {
                 mcp::print_client_config(&args.url);
