@@ -269,17 +269,41 @@ mod tests {
 
     /// A log that cannot be read is not evidence that a nonce is unspent. Admitting on that basis is
     /// how one signed promise buys an unlimited number of queries.
+    ///
+    /// **There are two failure arms and they need a test each.** Opening can fail, or opening can
+    /// succeed and reading fail. The first version of this test used a directory in the log's place
+    /// and covered only the second: on macOS `File::open` succeeds on a directory and the error
+    /// arrives from `lines()`. Reverting the open arm to fail open left that test green, which is
+    /// how the gap was found - the mutation survived, so the test was not guarding what it claimed.
     #[test]
-    fn an_unreadable_log_refuses_rather_than_admitting() {
+    fn a_log_that_cannot_be_opened_refuses_rather_than_admitting() {
         let dir = tempfile::tempdir().unwrap();
-        // A directory where the log should be: `File::open` succeeds on some platforms and the
-        // read then fails, and fails outright on others. Either way it is not `NotFound`, and both
-        // paths must refuse.
+        // A regular file standing where the log's *parent directory* should be. `File::open` then
+        // fails with `NotADirectory` rather than `NotFound`, which is the arm under test.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join(LOG);
+        let err = std::fs::File::open(&path).unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "this fixture must not produce NotFound, or it tests the empty-log arm instead"
+        );
+        assert!(
+            matches!(is_spent(&path, A, N), Err(x402::Refusal::RecordFailed)),
+            "a log that cannot be opened must refuse, not admit"
+        );
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_read_refuses_rather_than_admitting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in the log's place: opening may succeed, and the read then fails.
         let path = dir.path().join(LOG);
         std::fs::create_dir(&path).unwrap();
         assert!(
             matches!(is_spent(&path, A, N), Err(x402::Refusal::RecordFailed)),
-            "an unreadable log must refuse, not admit"
+            "a log that cannot be read must refuse, not admit"
         );
     }
 
