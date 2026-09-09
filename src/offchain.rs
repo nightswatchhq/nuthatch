@@ -179,19 +179,24 @@ fn read_json(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
 /// segment does not contain. Nothing about that is detectable afterwards, because the hash is taken
 /// over the bytes that won.
 ///
-/// `try_clone` shares the underlying file description, so both reads see the same inode whatever
-/// happens to the path in between. The offset is shared with it, hence the explicit rewind before
-/// taking the bytes.
+/// The path is resolved once, here, and everything else happens on [`read_parquet_handle`], which
+/// has no path to re-open. That is deliberate: a test can assert the property, but a signature that
+/// cannot express the defect is worth more than a test that watches for it.
 fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    read_parquet_handle(file).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Metadata and bytes from one open file description.
+///
+/// `try_clone` shares the description, so both reads see the same inode whatever happens to the name
+/// it was opened under. The offset is shared with it, hence the explicit rewind before taking the
+/// bytes.
+fn read_parquet_handle(mut file: std::fs::File) -> Result<(Vec<u8>, usize, Vec<String>)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::io::{Read, Seek, SeekFrom};
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(
-        file.try_clone()
-            .with_context(|| format!("reading {}", path.display()))?,
-    )
-    .context("invalid Parquet source")?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file.try_clone()?)
+        .context("invalid Parquet source")?;
     let columns = builder
         .schema()
         .fields()
@@ -201,11 +206,9 @@ fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
     validate_columns(&columns)?;
     let rows = builder.metadata().file_metadata().num_rows() as usize;
     drop(builder);
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("reading {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
+    file.read_to_end(&mut bytes)?;
     Ok((bytes, rows, columns))
 }
 
@@ -375,37 +378,45 @@ mod tests {
         );
     }
 
-    /// The property the fix rests on, demonstrated directly: once the handle is open, replacing the
-    /// **path** does not change what that handle reads.
+    /// The property the fix rests on, asserted against `read_parquet_handle` itself rather than
+    /// against the file system in isolation: the handle is opened, the **path** is then replaced by
+    /// a genuinely different file, and the metadata and bytes that come back must both describe the
+    /// version the handle was opened on.
     ///
-    /// The replacement has to be a `rename`, which is what an atomic publish actually does.
-    /// `File::create` truncates the same inode in place, so the open handle would see the new bytes
-    /// and the test would prove the opposite of what it claims - which is how the first version of
-    /// this test failed.
+    /// This is the test the first attempt got wrong twice. `File::create` truncates the same inode
+    /// in place, so a "replacement" written that way is visible through an open handle and proves
+    /// the opposite; the replacement has to be a `rename`, which is what an atomic publish does. And
+    /// asserting only that `read_parquet`'s bytes match the file on disk passes whether or not the
+    /// bytes were re-read by path, because in that test nothing changes in between - the mutation
+    /// survived, which is how the gap was found.
     #[test]
-    fn an_open_handle_reads_the_version_it_was_opened_on() {
-        use std::io::Read;
+    fn metadata_and_bytes_describe_the_version_the_handle_was_opened_on() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("p.parquet");
         write_parquet_fixture(&src, &["a", "b"], 3);
         let three = std::fs::read(&src).unwrap();
 
-        let mut handle = std::fs::File::open(&src).unwrap();
+        let handle = std::fs::File::open(&src).unwrap();
 
+        // An atomic publish of a different file over the same name, after the open.
         let replacement = dir.path().join("p.parquet.new");
         write_parquet_fixture(&replacement, &["a", "b"], 9);
         std::fs::rename(&replacement, &src).unwrap();
-        let nine = std::fs::read(&src).unwrap();
         assert_ne!(
-            three, nine,
-            "the fixture must differ, or this proves nothing"
+            three,
+            std::fs::read(&src).unwrap(),
+            "the fixture must actually differ, or this proves nothing"
         );
 
-        let mut seen = Vec::new();
-        handle.read_to_end(&mut seen).unwrap();
+        let (bytes, rows, columns) = read_parquet_handle(handle).unwrap();
         assert_eq!(
-            seen, three,
-            "the handle must still read the file it was opened on, not whatever now owns the path"
+            rows, 3,
+            "the row count must be the opened version's, not the path's"
+        );
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            bytes, three,
+            "the bytes stored must be the same version the row count describes"
         );
     }
 
