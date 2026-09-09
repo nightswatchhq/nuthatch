@@ -1786,7 +1786,7 @@ async fn named_query(
     if let Some(counter) = &s.counter {
         let resource = format!("/q/{name}");
         if let Err(response) = crate::counter::admit(&s.dir, counter, &headers, &resource, &name) {
-            return response;
+            return *response;
         }
     }
     run_sql_query(s, sql, None).await

@@ -406,6 +406,8 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 nid: usdc_nid.clone(),
                 sql: Default::default(),
                 queries: Vec::new(),
+                #[cfg(feature = "counter")]
+                counter: None,
             }],
             sources: std::collections::HashMap::from([(
                 "arbitrum-one".to_string(),
@@ -570,6 +572,8 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 nid: usdc_nid.clone(),
                 sql: Default::default(),
                 queries: Vec::new(),
+                #[cfg(feature = "counter")]
+                counter: None,
             }],
             sources: std::collections::HashMap::from([(
                 "arbitrum-one".to_string(),

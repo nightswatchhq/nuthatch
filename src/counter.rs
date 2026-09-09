@@ -157,24 +157,27 @@ pub fn now() -> u64 {
 /// Admit one named-query request. The only failures disclosed here are the same challenge: a
 /// malformed signature must not become an oracle for an attacker, and the buyer already has the
 /// precise terms it needs in the challenge header.
+/// The error is boxed because an `axum` `Response` is 128 bytes and clippy's `result_large_err`
+/// is right that a `Result` this wide should not be moved through the happy path of a request
+/// handler. The caller unboxes it once, on the refusal branch only.
 pub fn admit(
     dir: &std::path::Path,
     cfg: &Config,
     headers: &HeaderMap,
     resource: &str,
     description: &str,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), Box<axum::response::Response>> {
     let seller = cfg
         .seller()
-        .map_err(|_| challenge(cfg, resource, description))?;
+        .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
     let Some(header) = headers
         .get("Payment-Signature")
         .and_then(|v| v.to_str().ok())
     else {
-        return Err(challenge(cfg, resource, description));
+        return Err(Box::new(challenge(cfg, resource, description)));
     };
     verify_and_record(dir, cfg, header, now())
-        .map_err(|_| challenge(cfg, resource, description))?;
+        .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
     // `seller` is constructed before receipt verification, so an invalid operator config cannot
     // issue a challenge that promises a payment the verifier will not accept.
     let _ = seller;
