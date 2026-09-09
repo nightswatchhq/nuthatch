@@ -155,6 +155,19 @@ jobs:
             exit 1
           fi
 
+          # **A truncated file list fails closed.** The compare endpoint caps `files` at 300, and
+          # paging it walks commits rather than extending that list. A truncated list is worse than
+          # no list: every omitted file is handed to the prompt as already on the default branch, so
+          # the reviewer is explicitly told not to raise findings against changes this branch really
+          # makes. Refuse instead. The largest pull request in this repository's history changes 44
+          # files, so this is a guard rather than a limit anyone should meet. Raised in review of
+          # this change.
+          own_count="$(wc -l < pr.own_files | tr -d ' ')"
+          if [ "$own_count" -ge 300 ]; then
+            echo "::error::compare $default_branch...$head_sha listed $own_count files, at or past the endpoint's 300-file maximum; the list is truncated and a review against it would silently ignore the rest"
+            exit 1
+          fi
+
           # **What this reviewer already said about this pull request.** Without it every pass
           # starts from nothing, re-raises settled ground, and reverses its own verdict: one PR
           # took thirteen passes and went back to changes-requested four times after shipping.
