@@ -48,6 +48,7 @@ pub mod factory;
 pub mod flags;
 pub mod freshness;
 pub mod graft;
+pub mod graph_validate;
 pub mod health;
 pub mod help;
 pub mod indexer;
