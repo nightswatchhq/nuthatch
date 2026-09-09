@@ -250,6 +250,19 @@ Re-key a contract alias: `nuthatch.toml`, the ABI file, and `semantic.toml`
 - `<NEW>` - New alias, e.g. `gns`. Must match `[a-z][a-z0-9_]*`
 - `--dir <DIR>` - Nest directory (must contain a nuthatch.toml)
 
+## `nuthatch offchain`
+
+Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1)
+
+
+## `nuthatch offchain drop`
+
+Import one CSV, JSON array, or Parquet file as an immutable, content-addressed snapshot
+
+- `<FILE>` - Source CSV, JSON, or Parquet file. Read once; indexing never reads this path
+- `--table <TABLE>` - SQL table name beneath the `offchain__` namespace
+- `--dir <DIR>` - Nest directory containing the offchain namespace
+
 ## `nuthatch pack`
 
 Build, sign, and verify the signed compliance-pack manifest (RFC-0008 C6)
