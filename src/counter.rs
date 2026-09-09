@@ -61,12 +61,17 @@ impl Config {
     }
 }
 
-/// Whether this `(payer, nonce)` pair already appears in the durable log.
+/// Whether this `(network, payer, nonce)` tuple already appears in the durable log.
 ///
 /// Split out of [`verify_and_record`] so the three properties that matter can be tested without
 /// forging a signature: the key is the pair and not the nonce alone, an absent log is empty rather
 /// than an error, and an unreadable one refuses rather than admits.
-fn is_spent(path: &std::path::Path, payer: &str, nonce: &str) -> Result<bool, x402::Refusal> {
+fn is_spent(
+    path: &std::path::Path,
+    network: &str,
+    payer: &str,
+    nonce: &str,
+) -> Result<bool, x402::Refusal> {
     let file = match std::fs::File::open(path) {
         // The ordinary first-request case. Nothing has been sold yet, so nothing is spent.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -82,7 +87,12 @@ fn is_spent(path: &std::path::Path, payer: &str, nonce: &str) -> Result<bool, x4
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if v.get("payer").and_then(|n| n.as_str()) == Some(payer)
+        // Logs written before payment-domain scoping have no `network`. Treat those conservatively
+        // as spent in every domain: an upgrade must not reopen an already-recorded promise.
+        if v.get("network")
+            .and_then(|n| n.as_str())
+            .is_none_or(|recorded| recorded == network)
+            && v.get("payer").and_then(|n| n.as_str()) == Some(payer)
             && v.get("nonce").and_then(|n| n.as_str()) == Some(nonce)
         {
             return Ok(true);
@@ -106,7 +116,7 @@ pub fn verify_and_record(
         .lock()
         .expect("authorisation log lock poisoned");
     let path = dir.join(LOG);
-    // **Keyed by (payer, nonce), and streamed rather than slurped.**
+    // **Keyed by (payment domain, payer, nonce), and streamed rather than slurped.**
     //
     // EIP-3009 authorisation state is keyed by authoriser *and* nonce, so a nonce is only ever spent
     // for the payer who signed it. Matching on the nonce alone refuses payer B's perfectly good
@@ -122,8 +132,13 @@ pub fn verify_and_record(
     // **The scan fails closed.** An absent log is the ordinary first-request case and reads as
     // empty. Any other IO error means we cannot show the nonce is unspent, and admitting on that
     // basis is how one signed promise buys unlimited queries.
+    let network = match cfg.network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+    };
     if is_spent(
         &path,
+        network,
         &accepted.from.to_string(),
         &accepted.nonce.to_string(),
     )? {
@@ -131,6 +146,7 @@ pub fn verify_and_record(
     }
     let row = serde_json::json!({
         "received_at": now,
+        "network": network,
         "payer": accepted.from.to_string(),
         "nonce": accepted.nonce.to_string(),
         "value": accepted.value.to_string(),
@@ -220,13 +236,18 @@ mod tests {
     const A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const N: &str = "0x00000000000000000000000000000000000000000000000000000000000000ff";
+    const MAINNET: &str = "mainnet";
+    const TESTNET: &str = "testnet";
 
-    fn log_with(dir: &std::path::Path, rows: &[(&str, &str)]) -> std::path::PathBuf {
+    fn log_with(dir: &std::path::Path, rows: &[(&str, &str, &str)]) -> std::path::PathBuf {
         let path = dir.join(LOG);
         let body: String = rows
             .iter()
-            .map(|(payer, nonce)| {
-                format!("{}\n", serde_json::json!({"payer": payer, "nonce": nonce}))
+            .map(|(network, payer, nonce)| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"network": network, "payer": payer, "nonce": nonce})
+                )
             })
             .collect();
         std::fs::write(&path, body).unwrap();
@@ -239,13 +260,13 @@ mod tests {
     #[test]
     fn a_nonce_is_only_spent_for_the_payer_who_signed_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = log_with(dir.path(), &[(A, N)]);
+        let path = log_with(dir.path(), &[(TESTNET, A, N)]);
         assert!(
-            is_spent(&path, A, N).unwrap(),
+            is_spent(&path, TESTNET, A, N).unwrap(),
             "payer A signed this nonce, so A may not reuse it"
         );
         assert!(
-            !is_spent(&path, B, N).unwrap(),
+            !is_spent(&path, TESTNET, B, N).unwrap(),
             "payer B's authorisation is unspent; the same nonce from a different payer is a \
              different authorisation and must not be refused"
         );
@@ -255,17 +276,37 @@ mod tests {
     fn a_payer_may_not_reuse_one_of_its_own_nonces() {
         let dir = tempfile::tempdir().unwrap();
         let other = "0x0000000000000000000000000000000000000000000000000000000000000001";
-        let path = log_with(dir.path(), &[(A, other), (B, N), (A, N)]);
-        assert!(is_spent(&path, A, N).unwrap(), "recorded later in the log");
-        assert!(is_spent(&path, A, other).unwrap(), "recorded first");
-        assert!(!is_spent(&path, B, other).unwrap());
+        let path = log_with(
+            dir.path(),
+            &[(TESTNET, A, other), (TESTNET, B, N), (TESTNET, A, N)],
+        );
+        assert!(
+            is_spent(&path, TESTNET, A, N).unwrap(),
+            "recorded later in the log"
+        );
+        assert!(
+            is_spent(&path, TESTNET, A, other).unwrap(),
+            "recorded first"
+        );
+        assert!(!is_spent(&path, TESTNET, B, other).unwrap());
+    }
+
+    #[test]
+    fn a_nonce_is_only_spent_in_its_payment_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_with(dir.path(), &[(TESTNET, A, N)]);
+        assert!(is_spent(&path, TESTNET, A, N).unwrap());
+        assert!(
+            !is_spent(&path, MAINNET, A, N).unwrap(),
+            "a mainnet authorisation is independent of the same testnet nonce"
+        );
     }
 
     #[test]
     fn an_absent_log_is_empty_rather_than_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            !is_spent(&dir.path().join(LOG), A, N).unwrap(),
+            !is_spent(&dir.path().join(LOG), TESTNET, A, N).unwrap(),
             "the first paid request of a mount's life has no log to read"
         );
     }
@@ -293,7 +334,10 @@ mod tests {
             "this fixture must not produce NotFound, or it tests the empty-log arm instead"
         );
         assert!(
-            matches!(is_spent(&path, A, N), Err(x402::Refusal::RecordFailed)),
+            matches!(
+                is_spent(&path, TESTNET, A, N),
+                Err(x402::Refusal::RecordFailed)
+            ),
             "a log that cannot be opened must refuse, not admit"
         );
     }
@@ -305,7 +349,10 @@ mod tests {
         let path = dir.path().join(LOG);
         std::fs::create_dir(&path).unwrap();
         assert!(
-            matches!(is_spent(&path, A, N), Err(x402::Refusal::RecordFailed)),
+            matches!(
+                is_spent(&path, TESTNET, A, N),
+                Err(x402::Refusal::RecordFailed)
+            ),
             "a log that cannot be read must refuse, not admit"
         );
     }
@@ -320,12 +367,12 @@ mod tests {
             &path,
             format!(
                 "not json at all\n{}\n",
-                serde_json::json!({"payer": A, "nonce": N})
+                serde_json::json!({"network": TESTNET, "payer": A, "nonce": N})
             ),
         )
         .unwrap();
         assert!(
-            is_spent(&path, A, N).unwrap(),
+            is_spent(&path, TESTNET, A, N).unwrap(),
             "a line the scan cannot parse must not curtail the scan"
         );
     }
