@@ -1,6 +1,10 @@
 # RFC-0053: Graph-subgraph compatibility mode
 
-**Status:** Draft - engineering assessment; no implementation is authorised by this document
+**Status:** **Accepted 2026-09-09 by Chief**, as the decision RFC-0044 §8 requires for new binary
+capability. It **overrides [RFC-0044](0044-the-subgraph-port-skill.md) §11's** "not a subgraph
+compatibility layer" non-goal, annotated there. Scope of the authorisation: S0 (#1264, the migration
+validator) is in the `resolute-robin` sprint; S1 to S4 (#1265 to #1268) are filed but wait on what S0
+measures, because S0 is the only slice that can falsify the rest.
 
 **Date:** 2026-09-09
 
