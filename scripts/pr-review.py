@@ -61,6 +61,10 @@ CLAUDE_MD = Path("CLAUDE.md")
 # so nobody reads a partial review as a whole one.
 MAX_DIFF_CHARS = 400_000
 
+# Prior reviews are context, not the subject. Bounded so a long-lived pull request cannot crowd the
+# diff out of the window with its own history.
+MAX_PRIOR_CHARS = 40_000
+
 # Marks our comments so a re-review can find its predecessors, and so a human scrolling a long PR
 # can tell the outside reader from the firm's own.
 MARKER = "<!-- pr-review:luna -->"
@@ -101,6 +105,45 @@ was reviewed there. "The implementation is not in this diff" is a description of
 finding about a release: check the two commit lists before you write it, and if the change is named \
 in either, the release contains it. It is a finding only when it appears in neither list, or when no \
 lists were supplied at all - and then say which of those two it is.
+
+**A file already on the default branch is not this pull request's work.** You are told which files \
+this branch changes relative to the default branch. A file that appears in the diff but not on that \
+list is byte-identical to the default branch: it arrived because this branch merged the default \
+branch in, or because it is stacked on another branch that did, and it was reviewed on the pull \
+request that landed it. Do not raise a finding against it. Merging this branch does not change it. \
+This is the third route to the same mistake #1056 and #1201 fixed: a `high` was raised against \
+`src/analytics_budget.rs` on a subgraph-tooling pull request, on the same day and by this reviewer, \
+having shipped that exact file at 88/100 on the pull request it belonged to.
+
+**You have reviewed this pull request before, and those verdicts are evidence.** Your previous \
+reviews are supplied when they exist. Read them first.
+
+- A finding you already raised that has been addressed is **closed**. Say so in `summary` and do \
+  not raise it again in another form.
+- A verdict may not move from `ship` to `changes-requested` unless the diff changed in the place \
+  the new finding is about. Say which commit or hunk changed your mind. A branch that has only had \
+  defects removed since you approved it has not become less safe, and a review that says otherwise \
+  is a review that is not converging. One pull request took thirteen passes, returned `ship` at \
+  91/100 on the seventh, and then went back to `changes-requested` four times running while every \
+  finding it raised was being fixed.
+- A fresh medium on every pass is a smell in **you**, not in the branch. If this pass finds nothing \
+  that the previous pass would have called blocking, the honest verdict is `ship`, and "there is \
+  always one more thing" is not a reason to withhold it.
+
+**You cannot run anything.** You have the diff, not a test runner, not a debugger, and not the rest \
+of the file. So:
+
+- Never state that a named test fails, panics or passes. You did not run it. Say what in the source \
+  leads you to expect that, and quote the lines that do. A review claimed at certainty 99 that a \
+  named test "panics instead of passing"; the test passed, because a value the reviewer could not \
+  see was recovered elsewhere.
+- The direction a value flows, the order two functions run in, and what a loop actually reaches are \
+  claims about behaviour, not about text. Quote the lines you are reading them from. A review \
+  asserted at certainty 94 that a propagation ran caller to callee; it runs callee to caller, and \
+  three lines of the function say so.
+- Certainty above 90 is for something the diff itself proves - a missing bound, a wrong constant, a \
+  swapped argument you can point at. An inference about runtime behaviour from partial source caps \
+  at 80 however sure it feels.
 
 Review the diff you are given. Judge the change that is there, not the change you would have made. \
 Rank correctness above style; a naming quibble is not a finding. Prefer one concrete failure \
@@ -291,6 +334,23 @@ def main():
         help="what the base commit list covers, e.g. 'v3.6.0...main (12 of 12 commits listed)'. "
              "Stated rather than implied, because a truncated range must not pass for a whole one.",
     )
+    ap.add_argument(
+        "--own-files-file",
+        type=Path,
+        help="file holding the paths this branch changes relative to the DEFAULT branch, one per "
+             "line. A stacked branch that merged `main` in has a diff against its own base that "
+             "carries all of main with it, and the reviewer then raises findings against files it "
+             "reviewed and shipped elsewhere. #1056 and #1201 fixed the same blindness from the "
+             "commit-list side; this is the file side of it.",
+    )
+    ap.add_argument(
+        "--prior-reviews-file",
+        type=Path,
+        help="file holding this reviewer's previous reviews of this pull request, newest last. "
+             "Without them every pass re-derives from nothing and finds a fresh medium: one PR took "
+             "thirteen passes and reversed its own `ship` four times while its findings were being "
+             "fixed.",
+    )
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--json", action="store_true", help="print the raw structured review instead")
     ap.add_argument(
@@ -329,6 +389,18 @@ def main():
         if args.base_commits_file
         else ""
     )
+    own_files = (
+        args.own_files_file.read_text(errors="replace").strip() if args.own_files_file else ""
+    )
+    # Newest last, and bounded: a long-lived PR accumulates these, and the point is the trend and
+    # the open findings, not every word of every pass.
+    prior = (
+        args.prior_reviews_file.read_text(errors="replace").strip()
+        if args.prior_reviews_file
+        else ""
+    )
+    if len(prior) > MAX_PRIOR_CHARS:
+        prior = "(earlier reviews elided)\n\n" + prior[-MAX_PRIOR_CHARS:]
     user = (
         f"Pull request title: {args.title}\n\n"
         f"Description:\n{body or '(none)'}\n\n"
@@ -339,6 +411,13 @@ def main():
         f"Already on the base, and therefore in this release "
         f"[{args.base_range or 'range not supplied'}] "
         f"({len(base_commits.splitlines())}):\n{base_commits or '(not supplied)'}\n\n"
+        # Byte-identical to the default branch means merging this branch does not change it, so a
+        # finding against it is a finding about somebody else's merged pull request.
+        f"Files this branch changes relative to the default branch "
+        f"({len(own_files.splitlines())}). Anything in the diff and not on this list came from a "
+        f"merge and is already on the default branch:\n{own_files or '(not supplied)'}\n\n"
+        f"Your previous reviews of this pull request, oldest first:\n"
+        f"{prior or '(none - this is your first pass)'}\n\n"
         f"Diff:\n```diff\n{diff}\n```"
     )
     if args.dry_run:

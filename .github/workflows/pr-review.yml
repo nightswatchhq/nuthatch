@@ -140,6 +140,51 @@ jobs:
             total="$(jq -r '.total_commits' compare.json)"
             printf '%s...%s (%s of %s commits listed)' "$prev_tag" "$base" "$listed" "$total" > pr.base_range
           fi
+          # **What this branch actually changes.** `gh pr diff` is the diff against the PR's own
+          # base, and a branch stacked on another feature branch that has since merged `main` in
+          # carries the whole of main in that diff. Jules then reviews files it has already
+          # reviewed and shipped on the pull requests they belong to - it raised a `high` against
+          # `src/analytics_budget.rs` on a subgraph-tooling PR hours after shipping that file at
+          # 88/100 on the PR that wrote it. Comparing against the DEFAULT branch answers the
+          # question the reviewer actually needs: which files would merging this change?
+          default_branch="$(gh api "repos/$REPO" --jq '.defaultBranch // .default_branch')"
+          head_sha="$(cat head.sha)"
+          if ! gh api --paginate "repos/$REPO/compare/$default_branch...$head_sha" \
+               --jq '.files[].filename' > pr.own_files; then
+            echo "::error::could not compare $default_branch...$head_sha; refusing to review without knowing which files are this branch's own"
+            exit 1
+          fi
+
+          # **A truncated file list fails closed.** The compare endpoint caps `files` at 300, and
+          # paging it walks commits rather than extending that list. A truncated list is worse than
+          # no list: every omitted file is handed to the prompt as already on the default branch, so
+          # the reviewer is explicitly told not to raise findings against changes this branch really
+          # makes. Refuse instead. The largest pull request in this repository's history changes 44
+          # files, so this is a guard rather than a limit anyone should meet. Raised in review of
+          # this change.
+          own_count="$(wc -l < pr.own_files | tr -d ' ')"
+          if [ "$own_count" -ge 300 ]; then
+            echo "::error::compare $default_branch...$head_sha listed $own_count files, at or past the endpoint's 300-file maximum; the list is truncated and a review against it would silently ignore the rest"
+            exit 1
+          fi
+
+          # **What this reviewer already said about this pull request.** Without it every pass
+          # starts from nothing, re-raises settled ground, and reverses its own verdict: one PR
+          # took thirteen passes and went back to changes-requested four times after shipping.
+          # Not fatal when it fails - a first pass legitimately has none, and the prompt says so.
+          #
+          # **Filtered by author, not just by marker.** The marker is a comment body, so anyone who
+          # can comment on the pull request can write one - and this input is handed to the model as
+          # its own previous reviews, under a rule that forbids moving from `ship` to
+          # changes-requested without a changed hunk. A forged `ship` would therefore pin the
+          # verdict, and forged prose would arrive as instructions. `[bot]` logins are reserved by
+          # GitHub and cannot be registered by a person, so author login plus `type == "Bot"` is not
+          # forgeable by a PR author. Raised in review of this change.
+          gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.user.type == "Bot" and .user.login == "nuthatch-jules[bot]")
+                       | select(.body | contains("<!-- pr-review:luna -->")) | .body' \
+            > pr.prior_reviews || : > pr.prior_reviews
+
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
@@ -190,6 +235,7 @@ jobs:
           if python3 scripts/pr-review.py --diff pr.diff --title "$(cat pr.title)" \
               --body-file pr.body --commits-file pr.commits --base-file pr.base \
               --base-commits-file pr.base_commits --base-range "$(cat pr.base_range)" \
+              --own-files-file pr.own_files --prior-reviews-file pr.prior_reviews \
               --json > review.json; then
             {
               echo '<!-- pr-review:luna -->'

@@ -342,3 +342,141 @@ fn a_superseded_review_is_neutral_rather_than_a_red_verdict() {
         "the cancellation handler does not report a failure to neutralise:\n{handler}"
     );
 }
+
+// ── What is this branch's own work, and what did this reviewer already say ────────────────────
+
+fn dry_run_with(dir: &Path, extra: &[(&str, &str)]) -> String {
+    let base = dir.join("base");
+    std::fs::write(&base, "main").expect("write base");
+    let diff = dir.join("diff2");
+    std::fs::write(&diff, "diff --git a/x b/x\n+one line\n").expect("write diff");
+    let mut c = Command::new("python3");
+    c.arg(root().join("scripts/pr-review.py"))
+        .arg("--diff")
+        .arg(&diff)
+        .args(["--title", "t", "--dry-run"])
+        .arg("--base-file")
+        .arg(&base);
+    for (flag, path) in extra {
+        c.arg(flag).arg(path);
+    }
+    let out = c.output().expect("run pr-review.py");
+    assert!(
+        out.status.success(),
+        "pr-review.py --dry-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A stacked branch that merged `main` in has a diff against its own base carrying all of main, and
+/// the reviewer raised a `high` against a file it had shipped at 88/100 hours earlier on the pull
+/// request that wrote it. The comparison against the *default* branch is what separates the two.
+#[test]
+fn the_reviewer_is_told_which_files_are_this_branchs_own() {
+    let dir = fixtures();
+    let own = dir.path().join("own");
+    std::fs::write(&own, "src/port_emit.rs\nsrc/port_report.rs\n").expect("write");
+    let prompt = dry_run_with(dir.path(), &[("--own-files-file", own.to_str().unwrap())]);
+    assert!(prompt.contains("src/port_emit.rs"), "{prompt}");
+    assert!(
+        prompt.contains("(2)"),
+        "the count must be stated so a truncated list cannot pass for a whole one: {prompt}"
+    );
+    assert!(
+        prompt.contains("came from a merge and is already on the default branch"),
+        "the list is useless without the rule that reads it: {prompt}"
+    );
+}
+
+/// Absent is a fact, not an empty list. An unsupplied file must not read as "this branch changes
+/// nothing", which would make every file in the diff look like somebody else's merge.
+#[test]
+fn an_unsupplied_own_file_list_says_so_rather_than_reading_as_empty() {
+    let dir = fixtures();
+    let prompt = dry_run_with(dir.path(), &[]);
+    assert!(prompt.contains("(not supplied)"), "{prompt}");
+}
+
+/// Thirteen passes on one pull request, `ship` at 91/100 on the seventh, then four reversals while
+/// its findings were being fixed. Every pass started from nothing.
+#[test]
+fn the_reviewer_is_given_its_own_previous_verdicts() {
+    let dir = fixtures();
+    let prior = dir.path().join("prior");
+    std::fs::write(
+        &prior,
+        "<!-- pr-review:luna -->\n### Jules 91/100\nverdict: **ship**\nNo findings.\n",
+    )
+    .expect("write");
+    let prompt = dry_run_with(
+        dir.path(),
+        &[("--prior-reviews-file", prior.to_str().unwrap())],
+    );
+    assert!(prompt.contains("verdict: **ship**"), "{prompt}");
+    assert!(
+        prompt.contains("Your previous reviews of this pull request"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn a_first_pass_is_told_it_is_a_first_pass() {
+    let dir = fixtures();
+    let prompt = dry_run_with(dir.path(), &[]);
+    assert!(
+        prompt.contains("this is your first pass"),
+        "an empty history must not read as a reviewer who said nothing: {prompt}"
+    );
+}
+
+/// The rules that read the two new inputs. Without them the inputs are decoration.
+#[test]
+fn the_prompt_carries_the_rules_that_read_the_new_inputs() {
+    let dir = fixtures();
+    let prompt = dry_run_with(dir.path(), &[]);
+    let _ = prompt;
+    let src = std::fs::read_to_string(root().join("scripts/pr-review.py")).expect("read");
+    for needle in [
+        "already on the default branch is not this pull request's work",
+        "may not move from `ship` to `changes-requested`",
+        "You cannot run anything",
+        "Never state that a named test fails",
+        "at 80 however sure it feels",
+    ] {
+        assert!(
+            src.contains(needle),
+            "the reviewer is not told `{needle}`, so the input it reads is decoration"
+        );
+    }
+}
+
+/// The workflow has to fetch and pass both, or the script's new arguments are never supplied and
+/// nothing changes for the reviewer. Comments stripped: this file explains its faults at length
+/// beside the fix, and an assertion matching the prose passes with the code deleted.
+#[test]
+fn the_workflow_fetches_and_passes_the_new_inputs() {
+    let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
+    let code: String = wf
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("--own-files-file pr.own_files"),
+        "the workflow does not pass the branch's own file list"
+    );
+    assert!(
+        code.contains("--prior-reviews-file pr.prior_reviews"),
+        "the workflow does not pass the previous reviews"
+    );
+    assert!(
+        code.contains("default_branch") && code.contains("/compare/$default_branch..."),
+        "the own-file list must come from a comparison against the DEFAULT branch; comparing \
+         against the PR's own base is the thing that goes wrong for a stacked branch"
+    );
+    assert!(
+        code.contains("pr-review:luna") && code.contains("/issues/$PR/comments"),
+        "nothing fetches this reviewer's previous comments, so pr.prior_reviews is always empty"
+    );
+}
