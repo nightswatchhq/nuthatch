@@ -1,0 +1,413 @@
+//! RFC-0053 S0: the migration validator (#1264).
+//!
+//! Runs a corpus of real GraphQL operations against a reference Graph endpoint and against a nest,
+//! and reports every way the two answers differ. It is the instrument #1212 needs as well, which is
+//! why the sprint builds it once: RFC-0044 §10 wants a ported nest diffed against a reference field
+//! by field, and this is that diff with the operations supplied by the caller.
+//!
+//! **The property that shapes the whole module: a clean result must not be obtainable by dropping
+//! unsupported selections.** The obvious way to write a validator like this is to walk the two
+//! responses and compare the keys they have in common, which is exactly wrong - a nest that answers
+//! `{ id }` for a query asking `{ id, volumeUSD }` would then be reported as agreeing, and the
+//! caller would migrate on the strength of it. So the comparison is driven by **what the query
+//! asked for**, never by what either side happened to return, and a field that is requested and
+//! absent is a divergence with its own name rather than a silence.
+
+use serde_json::{Map, Value};
+use std::collections::BTreeSet;
+use std::fmt;
+
+/// One requested field, as a path from the operation root.
+///
+/// Held as an owned path rather than a borrowed slice because divergences outlive the walk and are
+/// sorted and printed; the corpora involved are small enough that this is not worth optimising.
+pub type Path = Vec<String>;
+
+fn render(path: &Path) -> String {
+    path.join(".")
+}
+
+/// A selection set: the tree of fields an operation actually asked for.
+///
+/// The validator is driven by this rather than by either response, so an unsupported selection
+/// cannot quietly leave the comparison.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// Child selections by field name. A leaf has none.
+    pub fields: std::collections::BTreeMap<String, Selection>,
+}
+
+impl Selection {
+    pub fn leaf() -> Self {
+        Selection::default()
+    }
+
+    /// Build a selection tree from `("a.b", "a.c")`-style paths, which is how a corpus file and the
+    /// tests both express one.
+    pub fn from_paths<I, S>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut root = Selection::default();
+        for p in paths {
+            let mut node = &mut root;
+            for part in p.as_ref().split('.').filter(|s| !s.is_empty()) {
+                node = node.fields.entry(part.to_string()).or_default();
+            }
+        }
+        root
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+/// How the two answers differ at one place.
+///
+/// Every variant is a *reported* mismatch. There is deliberately no `Ignored` or `Skipped`: a
+/// selection the nest cannot answer is [`Divergence::Missing`], which counts, rather than a
+/// silence that lets the run come back clean.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Divergence {
+    /// The query asked for this field and the nest did not return it.
+    Missing { path: String },
+    /// The nest returned a field the reference did not, so the shapes differ even though nothing
+    /// the caller asked for is absent.
+    Extra { path: String },
+    /// Both answered, with different values.
+    Value {
+        path: String,
+        reference: String,
+        nest: String,
+    },
+    /// Both answered, with different JSON types - a string where the reference had a number, most
+    /// often a scalar serialisation difference and the thing RFC-0053 §Values is about.
+    Type {
+        path: String,
+        reference: String,
+        nest: String,
+    },
+    /// A list the caller asked for came back a different length. Reported separately from `Value`
+    /// because pagination and ordering bugs look like this and want finding by name.
+    Length {
+        path: String,
+        reference: usize,
+        nest: usize,
+    },
+}
+
+impl fmt::Display for Divergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Divergence::Missing { path } => {
+                write!(f, "{path}: requested, and the nest did not return it")
+            }
+            Divergence::Extra { path } => {
+                write!(f, "{path}: the nest returned it, the reference did not")
+            }
+            Divergence::Value {
+                path,
+                reference,
+                nest,
+            } => write!(f, "{path}: reference {reference}, nest {nest}"),
+            Divergence::Type {
+                path,
+                reference,
+                nest,
+            } => write!(f, "{path}: reference is {reference}, nest is {nest}"),
+            Divergence::Length {
+                path,
+                reference,
+                nest,
+            } => write!(
+                f,
+                "{path}: reference has {reference} items, nest has {nest}"
+            ),
+        }
+    }
+}
+
+/// The result of comparing one operation's two answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub divergences: Vec<Divergence>,
+    /// Every path the operation asked for, so a reader can see the comparison's breadth rather than
+    /// inferring it from the absence of complaints.
+    pub compared: Vec<String>,
+}
+
+impl Report {
+    pub fn is_clean(&self) -> bool {
+        self.divergences.is_empty()
+    }
+}
+
+/// Compare one operation's two answers, driven by what the operation asked for.
+pub fn compare(selection: &Selection, reference: &Value, nest: &Value) -> Report {
+    let mut report = Report::default();
+    walk(selection, reference, nest, &mut Vec::new(), &mut report);
+    report.divergences.sort();
+    report.divergences.dedup();
+    report.compared.sort();
+    report.compared.dedup();
+    report
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "object",
+    }
+}
+
+fn walk(sel: &Selection, reference: &Value, nest: &Value, path: &mut Path, out: &mut Report) {
+    // Lists first: a selection applies to every element, and the two sides are zipped by position
+    // because ordering is part of what RFC-0053 promises. A length difference is reported and the
+    // common prefix is still compared, so one short page does not hide a wrong value in row 0.
+    if let (Value::Array(a), Value::Array(b)) = (reference, nest) {
+        if a.len() != b.len() {
+            out.divergences.push(Divergence::Length {
+                path: render(path),
+                reference: a.len(),
+                nest: b.len(),
+            });
+        }
+        for (i, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
+            path.push(format!("[{i}]"));
+            walk(sel, ra, rb, path, out);
+            path.pop();
+        }
+        return;
+    }
+
+    if sel.is_leaf() {
+        out.compared.push(render(path));
+        compare_scalar(reference, nest, path, out);
+        return;
+    }
+
+    // An object with children: drive from the selection, so a requested field that neither side
+    // returned is still reported.
+    let empty = Map::new();
+    let ra = reference.as_object().unwrap_or(&empty);
+    let rb = nest.as_object().unwrap_or(&empty);
+
+    for (name, child) in &sel.fields {
+        path.push(name.clone());
+        match (ra.get(name), rb.get(name)) {
+            (_, None) => {
+                // **The load-bearing branch.** Requested and absent from the nest is a divergence,
+                // whether or not the reference had it. Treating this as "nothing to compare" is
+                // precisely how a validator reaches agreement by dropping what it cannot answer.
+                out.compared.push(render(path));
+                out.divergences
+                    .push(Divergence::Missing { path: render(path) });
+            }
+            (None, Some(_)) => {
+                out.compared.push(render(path));
+                out.divergences
+                    .push(Divergence::Extra { path: render(path) });
+            }
+            (Some(x), Some(y)) => walk(child, x, y, path, out),
+        }
+        path.pop();
+    }
+
+    // Fields the nest volunteered that the operation never asked for. The shapes differ, and a
+    // caller comparing responses byte for byte would see it, so it is reported rather than ignored.
+    let requested: BTreeSet<&String> = sel.fields.keys().collect();
+    for name in rb.keys() {
+        if !requested.contains(name) && !ra.contains_key(name) {
+            path.push(name.clone());
+            out.divergences
+                .push(Divergence::Extra { path: render(path) });
+            path.pop();
+        }
+    }
+}
+
+fn compare_scalar(reference: &Value, nest: &Value, path: &mut Path, out: &mut Report) {
+    if reference == nest {
+        return;
+    }
+    if type_name(reference) != type_name(nest) {
+        out.divergences.push(Divergence::Type {
+            path: render(path),
+            reference: type_name(reference).to_string(),
+            nest: type_name(nest).to_string(),
+        });
+        return;
+    }
+    out.divergences.push(Divergence::Value {
+        path: render(path),
+        reference: reference.to_string(),
+        nest: nest.to_string(),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sel(paths: &[&str]) -> Selection {
+        Selection::from_paths(paths)
+    }
+
+    /// The property the whole module exists for, and the one the issue names: a clean result must
+    /// not be obtainable by dropping selections the nest cannot answer.
+    #[test]
+    fn a_field_the_nest_cannot_answer_is_a_divergence_not_a_silence() {
+        let s = sel(&["pool.id", "pool.volumeUSD"]);
+        let reference = json!({"pool": {"id": "0x1", "volumeUSD": "123.45"}});
+        let nest = json!({"pool": {"id": "0x1"}});
+
+        let report = compare(&s, &reference, &nest);
+        assert!(
+            !report.is_clean(),
+            "dropping an unsupported selection must not produce a clean run: {:?}",
+            report.divergences
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Missing {
+                path: "pool.volumeUSD".into()
+            }]
+        );
+        assert!(
+            report.compared.contains(&"pool.volumeUSD".to_string()),
+            "the field must be counted as compared, not quietly left out of the denominator: {:?}",
+            report.compared
+        );
+    }
+
+    /// The same, when *neither* side returns it. A validator driven by the intersection of the two
+    /// responses would call this agreement; there is nothing to intersect.
+    #[test]
+    fn a_requested_field_absent_from_both_sides_is_still_reported() {
+        let s = sel(&["pool.id", "pool.feesUSD"]);
+        let reference = json!({"pool": {"id": "0x1"}});
+        let nest = json!({"pool": {"id": "0x1"}});
+        let report = compare(&s, &reference, &nest);
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Missing {
+                path: "pool.feesUSD".into()
+            }],
+            "two silences are not an agreement"
+        );
+    }
+
+    #[test]
+    fn identical_answers_are_clean() {
+        let s = sel(&["pool.id", "pool.volumeUSD"]);
+        let v = json!({"pool": {"id": "0x1", "volumeUSD": "123.45"}});
+        let report = compare(&s, &v, &v);
+        assert!(report.is_clean(), "{:?}", report.divergences);
+        assert_eq!(report.compared, vec!["pool.id", "pool.volumeUSD"]);
+    }
+
+    /// A scalar serialisation difference is the failure RFC-0053 §Values is about: `"1"` and `1`
+    /// are not the same answer to a client, and a validator that coerces would hide it.
+    #[test]
+    fn a_string_where_the_reference_had_a_number_is_a_type_divergence() {
+        let s = sel(&["pool.tick"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"tick": 100}}),
+            &json!({"pool": {"tick": "100"}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Type {
+                path: "pool.tick".into(),
+                reference: "number".into(),
+                nest: "string".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn differing_values_of_the_same_type_are_reported_with_both_sides() {
+        let s = sel(&["pool.volumeUSD"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"volumeUSD": "100"}}),
+            &json!({"pool": {"volumeUSD": "101"}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Value {
+                path: "pool.volumeUSD".into(),
+                reference: "\"100\"".into(),
+                nest: "\"101\"".into(),
+            }]
+        );
+    }
+
+    /// Lists are zipped by position, because ordering is part of the promise. A short page is
+    /// reported *and* the overlapping rows are still compared, so a wrong row 0 is not masked by a
+    /// length complaint.
+    #[test]
+    fn a_short_list_reports_length_and_still_compares_the_rows_it_has() {
+        let s = sel(&["pools.id"]);
+        let report = compare(
+            &s,
+            &json!({"pools": [{"id": "a"}, {"id": "b"}]}),
+            &json!({"pools": [{"id": "z"}]}),
+        );
+        assert!(report.divergences.contains(&Divergence::Length {
+            path: "pools".into(),
+            reference: 2,
+            nest: 1,
+        }));
+        assert!(
+            report.divergences.contains(&Divergence::Value {
+                path: "pools.[0].id".into(),
+                reference: "\"a\"".into(),
+                nest: "\"z\"".into(),
+            }),
+            "the rows that do overlap must still be compared: {:?}",
+            report.divergences
+        );
+    }
+
+    #[test]
+    fn a_field_the_nest_volunteered_is_reported_as_extra() {
+        let s = sel(&["pool.id"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"id": "0x1"}}),
+            &json!({"pool": {"id": "0x1", "surprise": 1}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Extra {
+                path: "pool.surprise".into()
+            }]
+        );
+    }
+
+    /// Nested selections keep their full path, so a report names the place rather than the leaf.
+    #[test]
+    fn nested_paths_are_reported_in_full() {
+        let s = sel(&["pool.token0.symbol"]);
+        let report = compare(
+            &s,
+            &json!({"pool": {"token0": {"symbol": "WETH"}}}),
+            &json!({"pool": {"token0": {}}}),
+        );
+        assert_eq!(
+            report.divergences,
+            vec![Divergence::Missing {
+                path: "pool.token0.symbol".into()
+            }]
+        );
+    }
+}
