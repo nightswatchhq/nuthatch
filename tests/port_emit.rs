@@ -526,14 +526,18 @@ type Pool @entity {
 }
 "#;
 
+/// Every parameter here is one that `snake_case` maps to itself (`fee`, `token1`, `pool`).
+/// That is deliberate: a camelCase parameter emits a column name the decoded table does not have,
+/// so the view fails to bind for a reason that has nothing to do with what these tests assert.
+/// That is #1250, filed separately and fixed separately.
 const OPS_MAPPING: &str = r#"
 export function handlePoolCreated(event: PoolCreated): void {
   let pool = new Pool(event.params.pool.toHex())
   pool.id = event.params.pool.toHex()
-  pool.plain = event.params.tickSpacing
-  pool.negated = event.params.fee.neg()
-  pool.scaled = event.params.fee.times(BigInt.fromI32(1000))
-  pool.summed = event.params.fee.plus(event.params.tickSpacing)
+  pool.plain = event.params.fee
+  pool.negated = event.params.token1.neg()
+  pool.scaled = event.params.token1.times(BigInt.fromI32(1000))
+  pool.summed = event.params.token1.plus(event.params.fee)
   pool.save()
 }
 "#;
@@ -639,4 +643,39 @@ fn the_generated_check_names_the_promised_columns_rather_than_star() {
              projecting it:\n{check}"
         );
     }
+}
+
+/// The check must not merely *name* the promised columns; naming them has to be what makes
+/// `nuthatch check` refuse. This runs the generated check against DuckDB, so the guarantee is the
+/// engine's rather than a substring's: if `exact_fields` ever again advertises a field the view does
+/// not project, the check names a column that is not there and binding fails.
+#[test]
+fn the_generated_check_fails_if_a_promised_column_is_missing() {
+    let (nest, _result) = emitted_nest(OPS_SCHEMA, OPS_MAPPING);
+    let clean = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(clean.is_ok(), "the emitted nest must pass its own check: {clean:?}");
+
+    // Now break exactly the invariant #1248 broke: promise a column the view does not project.
+    let path = nest.path().join("checks/port_views.sql");
+    let sql = std::fs::read_to_string(&path).unwrap();
+    let broken = sql.replace(
+        "FROM (SELECT ",
+        "FROM (SELECT \"negated\", ",
+    );
+    assert_ne!(broken, sql, "the check must have a projection to break:\n{sql}");
+    std::fs::write(&path, &broken).unwrap();
+
+    let result = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        result.is_err(),
+        "a check naming a column the view does not project must fail to bind, and did not:\n{broken}"
+    );
 }
