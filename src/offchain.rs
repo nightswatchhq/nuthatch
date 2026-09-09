@@ -52,14 +52,6 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
     if columns.is_empty() {
         bail!("offchain source {} has no columns", source.display());
     }
-    let mut catalogue = load(dir)?;
-    if catalogue
-        .tables
-        .keys()
-        .any(|existing| existing != table && existing.eq_ignore_ascii_case(table))
-    {
-        bail!("offchain table name {table:?} collides case-insensitively with an existing table");
-    }
     let hash = hex::encode(Sha256::digest(&bytes));
     let out_dir = dir.join(DIR).join(SEGMENTS);
     std::fs::create_dir_all(&out_dir)
@@ -282,14 +274,16 @@ mod tests {
     }
 
     #[test]
-    fn case_only_table_names_are_refused() {
+    fn case_only_table_names_are_refused_in_either_order() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("prices.csv");
         std::fs::write(&input, "token,price\nWETH,3210\n").unwrap();
         drop_file(dir.path(), &input, "Prices").unwrap();
 
+        // The mixed-case name first, the lowercase one second - the mirror of the sibling test
+        // above, because a guard that only compares one direction would pass one and fail the other.
         let err = drop_file(dir.path(), &input, "prices").unwrap_err();
-        assert!(err.to_string().contains("case-insensitively"), "{err:#}");
+        assert!(err.to_string().contains("collides with"), "{err:#}");
     }
 
     #[test]
