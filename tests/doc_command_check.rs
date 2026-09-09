@@ -39,6 +39,19 @@ fn repo_root() -> PathBuf {
 /// no longer needs to exist as a separate check - a stale entry is just the actual-count-0 case).
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
+        "docs/rfcs/0052-the-mirrored-nest.md",
+        "publish",
+        4,
+        "RFC-0052 proposes the not-yet-shipped `nuthatch publish` command family; it is a dated \
+         design contract, not executable operator guidance",
+    ),
+    (
+        "docs/rfcs/0052-the-mirrored-nest.md",
+        "--from-mirror",
+        1,
+        "RFC-0052 §8 names a future cold-start follow-on and explicitly says it needs its own RFC",
+    ),
+    (
         "docs/operators.md",
         "roost",
         1,

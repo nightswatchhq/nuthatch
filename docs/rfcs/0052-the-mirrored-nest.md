@@ -233,9 +233,10 @@ for each entry in want − have, by (from_block, to_block, hash):
                                                  else HEAD size check after put
 if every put succeeded:
     put <dataset>/schema.json                    (only when changed)
-    put <dataset>/publish.json                   (sealed_through = max to_block of want)
     put <dataset>/manifest.json                  conditional on the remote version (ETag /
                                                  object_store PutMode::Update); refuse on mismatch
+    put <dataset>/publish.json                   after the catalogue, with its sha256 and
+                                                 sealed_through = max to_block of want
 ```
 
 Properties this buys:
@@ -246,7 +247,10 @@ Properties this buys:
   reader that sees it early sees fresher data, not wrong data. This is the one place the
   local "do not glob" rule can be relaxed, and only because §3.2 guarantees a per-table prefix
   holds nothing but catalogued, non-provisional segments (plus at most one in-flight batch of
-  the same).
+  the same). The catalogue is committed before its provenance envelope, so a crash can only
+  understate `sealed_through`, never advertise a catalogue that does not yet exist. A consumer
+  accepts `publish.json` only when its `catalogue_sha256` matches the `manifest.json` it read;
+  any mismatch is the ordinary short publication window, and it re-reads both objects.
 - **Idempotent and self-healing.** There is no queue to lose. A crash mid-run leaves files the
   next run finds by hash and skips. A bucket wiped by an operator is rebuilt by the next run.
   `nest load` on a fresh box followed by a backfill converges to the same keys (F-D3 caveat:
@@ -307,6 +311,10 @@ The catalogue says which files. This says whose, and how complete:
 "this mirror is complete through block N", the same fact the `/sql` caveat carries for a
 degraded nest. `published_at` is the only non-deterministic field and is the reason
 `publish.json` is not content-addressed; it is a pointer, like `index/…/latest` in RFC-0019 §2.
+Its `catalogue_sha256` is a commit check, not merely provenance: readers compare it with the
+catalogue bytes they read and retry on a mismatch. A publisher writes the catalogue first and
+this envelope second, so an interruption can leave freshness understated but cannot make it
+overstate an absent catalogue.
 
 ### 3.6 - The consumer contract: one page of deltas
 
@@ -379,7 +387,9 @@ retries.* It follows from four existing facts and one new rule:
    atomic put, conditional on version.
 4. `reading-segments.md`'s ordering and `union_by_name` rules are unchanged.
 5. New: per-table prefixes hold only catalogued, non-provisional segments (§3.2), so globbing
-   and catalogue-driven reads agree.
+   and catalogue-driven reads agree. `publish.json` is accepted only when its
+   `catalogue_sha256` names the `manifest.json` the reader has; the catalogue-first publication
+   order makes a mismatched envelope stale rather than ahead.
 
 The one assumption is the `[VERIFY]` in §1: that a non-provisional entry is never removed from
 the local catalogue. If it can be, rule 5 fails for globbing readers and §3.2's generations
