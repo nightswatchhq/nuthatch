@@ -134,6 +134,27 @@ pub enum Command {
     /// `init --from-subgraph` (RFC-0044 S2). Hidden: authoring tool. Does not reimplement the importer.
     #[command(hide = true)]
     PortEmit(PortEmitArgs),
+
+    /// Compare a corpus of GraphQL operations against a reference Graph endpoint and a nest, and
+    /// report every field-level divergence (RFC-0053 S0). Hidden: a migration and acceptance
+    /// instrument, not part of the two-command story.
+    #[command(hide = true)]
+    GraphValidate(GraphValidateArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct GraphValidateArgs {
+    /// A JSON corpus: `[{"name": "...", "query": "..."}]`. Operations are the caller's real
+    /// queries; the selection compared is parsed from each one rather than declared separately, so
+    /// a corpus cannot under-specify what gets checked.
+    #[arg(long)]
+    pub corpus: String,
+    /// The reference Graph endpoint, taken as correct.
+    #[arg(long)]
+    pub reference: String,
+    /// The nest's GraphQL endpoint, the thing under test.
+    #[arg(long)]
+    pub nest: String,
 }
 
 #[cfg(test)]

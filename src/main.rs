@@ -227,6 +227,7 @@ async fn main() -> Result<()> {
             nuthatch::port_report::print_report(std::path::Path::new(&a.dir))
         }
         cli::Command::PortEmit(a) => nuthatch::port_emit::run(a),
+        cli::Command::GraphValidate(a) => nuthatch::graph_validate::run(a).await,
         cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run, a.allow_breaking),
         cli::Command::Prune(a) => {
             nuthatch::prune::run(std::path::Path::new(&a.dir), a.yes)

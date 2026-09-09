@@ -13,6 +13,7 @@
 //! asked for**, never by what either side happened to return, and a field that is requested and
 //! absent is a divergence with its own name rather than a silence.
 
+use anyhow::Context;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -500,6 +501,127 @@ fn compare_scalar(reference: &Value, nest: &Value, path: &mut Path, out: &mut Re
     });
 }
 
+/// One operation in a corpus file.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Operation {
+    pub name: String,
+    pub query: String,
+    /// Variables, passed through to both endpoints unchanged so the two answers are comparable.
+    #[serde(default)]
+    pub variables: serde_json::Value,
+}
+
+/// What one operation produced when run against both endpoints.
+#[derive(Debug)]
+pub struct Outcome {
+    pub name: String,
+    /// `Err` when the operation could not be compared at all - a selection this parser refuses, or
+    /// an endpoint that failed. **Never treated as agreement**: the run's exit status counts these
+    /// alongside divergences, because "we could not check it" and "it matched" must not look the
+    /// same to the caller.
+    pub result: Result<Report, String>,
+}
+
+/// Post one operation and return `data`, or the transport/GraphQL error as text.
+async fn post(
+    client: &reqwest::Client,
+    url: &str,
+    op: &Operation,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({"query": op.query});
+    if !op.variables.is_null() {
+        body["variables"] = op.variables.clone();
+    }
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {e}"))?;
+    let status = resp.status();
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("{url}: response was not JSON ({e})"))?;
+    if !status.is_success() {
+        return Err(format!("{url}: HTTP {status}"));
+    }
+    // A GraphQL endpoint can return 200 with an `errors` array and a partial `data`. Comparing the
+    // partial answer would be comparing a failure to a success, so it is reported as an error.
+    if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
+        if !errors.is_empty() {
+            return Err(format!(
+                "{url}: {}",
+                serde_json::Value::Array(errors.clone())
+            ));
+        }
+    }
+    Ok(value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// Run a whole corpus against both endpoints.
+pub async fn run(args: crate::cli::GraphValidateArgs) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(&args.corpus)
+        .with_context(|| format!("reading corpus {}", args.corpus))?;
+    let corpus: Vec<Operation> =
+        serde_json::from_str(&raw).with_context(|| format!("parsing corpus {}", args.corpus))?;
+    if corpus.is_empty() {
+        anyhow::bail!(
+            "corpus {} contains no operations; an empty corpus would pass without comparing anything",
+            args.corpus
+        );
+    }
+    let client = reqwest::Client::new();
+    let mut outcomes = Vec::new();
+    for op in &corpus {
+        let result = match Selection::from_query(&op.query) {
+            Err(e) => Err(format!("selection: {e}")),
+            Ok(sel) => match (
+                post(&client, &args.reference, op).await,
+                post(&client, &args.nest, op).await,
+            ) {
+                (Err(e), _) => Err(format!("reference: {e}")),
+                (_, Err(e)) => Err(format!("nest: {e}")),
+                (Ok(a), Ok(b)) => Ok(compare(&sel, &a, &b)),
+            },
+        };
+        outcomes.push(Outcome {
+            name: op.name.clone(),
+            result,
+        });
+    }
+
+    let mut failed = 0usize;
+    for o in &outcomes {
+        match &o.result {
+            Err(e) => {
+                failed += 1;
+                println!("✗ {}: not compared - {e}", o.name);
+            }
+            Ok(r) if r.is_clean() => println!("✓ {} ({} fields)", o.name, r.compared.len()),
+            Ok(r) => {
+                failed += 1;
+                println!("✗ {} ({} fields)", o.name, r.compared.len());
+                for d in &r.divergences {
+                    println!("    {d}");
+                }
+            }
+        }
+    }
+    println!(
+        "{}/{} operations agree",
+        outcomes.len() - failed,
+        outcomes.len()
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} operations did not agree", outcomes.len());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +629,51 @@ mod tests {
 
     fn sel(paths: &[&str]) -> Selection {
         Selection::from_paths(paths)
+    }
+
+    // --- the corpus runner ---------------------------------------------------------------
+
+    /// An empty corpus must not pass. A run that compared nothing and reported success is the
+    /// clean-by-omission failure at its largest possible scale.
+    #[tokio::test]
+    async fn an_empty_corpus_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("c.json");
+        std::fs::write(&corpus, "[]").unwrap();
+        let err = run(crate::cli::GraphValidateArgs {
+            corpus: corpus.display().to_string(),
+            reference: "http://127.0.0.1:1".into(),
+            nest: "http://127.0.0.1:1".into(),
+        })
+        .await
+        .expect_err("an empty corpus must not report success");
+        assert!(err.to_string().contains("no operations"), "{err}");
+    }
+
+    /// An operation that could not be compared - a refused selection, a dead endpoint - counts
+    /// against the run. "We could not check it" and "it matched" must not look the same.
+    #[tokio::test]
+    async fn an_uncomparable_operation_fails_the_run_rather_than_passing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("c.json");
+        std::fs::write(
+            &corpus,
+            serde_json::to_string(&json!([{
+                "name": "aliased",
+                // Refused by the selection parser, so it is never even sent.
+                "query": "{ pool { vol: volumeUSD } }"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = run(crate::cli::GraphValidateArgs {
+            corpus: corpus.display().to_string(),
+            reference: "http://127.0.0.1:1".into(),
+            nest: "http://127.0.0.1:1".into(),
+        })
+        .await
+        .expect_err("an operation that could not be compared must fail the run");
+        assert!(err.to_string().contains("did not agree"), "{err}");
     }
 
     // --- Selection::from_query -------------------------------------------------------------
