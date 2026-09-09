@@ -1824,17 +1824,14 @@ fn returns_a_loaded_entity_field(body: &str, bindings: &BTreeMap<String, String>
         return false;
     }
     // The locals a field is actually read off, e.g. `pool` in `pool.token0Price`.
-    let mut read_from: BTreeSet<String> = BTreeSet::new();
-    for (name, _) in bindings {
-        if collect_field_reads(body, bindings).is_empty() {
-            break;
-        }
-        // A read off this binding: `name` followed by `.` and an identifier.
-        let needle = format!("{name}.");
-        if body.contains(&needle) {
-            read_from.insert(name.clone());
-        }
+    if collect_field_reads(body, bindings).is_empty() {
+        return false;
     }
+    let read_from: BTreeSet<&String> = bindings
+        .keys()
+        // A read off this binding: the name followed by `.`.
+        .filter(|name| body.contains(&format!("{name}.")))
+        .collect();
     if read_from.is_empty() {
         return false;
     }
