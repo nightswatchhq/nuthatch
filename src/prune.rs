@@ -518,6 +518,8 @@ mod tests {
             nid: a.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            #[cfg(feature = "counter")]
+            counter: None,
         });
         std::fs::write(
             d.path().join(MOUNTS_FILE),

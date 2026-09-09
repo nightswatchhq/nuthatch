@@ -135,6 +135,11 @@ pub struct Mount {
     /// The queries this mount answers by name, when `sql = "allowlist"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queries: Vec<crate::allowlist::NamedQuery>,
+    /// Optional x402 price at this operator-owned mount. It exists only in a binary built with the
+    /// off-by-default `counter` feature; an ordinary self-hosting build remains unpriced (#1217).
+    #[cfg(feature = "counter")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter: Option<crate::counter::Config>,
 }
 
 impl Mount {
@@ -504,6 +509,19 @@ impl MountTable {
             safe_segment(&m.tenant, "tenant")?;
             safe_segment(&m.alias, "nest name")?;
             m.surface().validate(&m.alias)?;
+            #[cfg(feature = "counter")]
+            if let Some(counter) = &m.counter {
+                counter.seller().with_context(|| {
+                    format!("mount '{}': invalid counter configuration", m.alias)
+                })?;
+                if m.sql != crate::allowlist::SqlAccess::Allowlist {
+                    bail!(
+                        "mount '{}' configures a counter but is not `sql = \"allowlist\"`; \
+                         only declared queries are priceable",
+                        m.alias
+                    );
+                }
+            }
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
@@ -1671,6 +1689,10 @@ pub async fn dev(
             );
         }
         state.surface = Arc::new(surface);
+        #[cfg(feature = "counter")]
+        {
+            state.counter = m.counter.clone().map(Arc::new);
+        }
         state.nid = ds_nid_for(&datasets, key, multi_tenant);
     }
     let all_states = all_states;
@@ -2279,6 +2301,8 @@ impl RuntimeHandles {
                     nid: nid.clone(),
                     sql: Default::default(),
                     queries: Vec::new(),
+                    #[cfg(feature = "counter")]
+                    counter: None,
                 }),
             }
         }
