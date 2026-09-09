@@ -37,6 +37,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+csv = "1"
 # Subgraph manifests are YAML (`init --from-subgraph`). yaml-rust2 rather than
 # serde_yaml, which is archived (RUSTSEC-2024-0320) and would trip the
 # `unmaintained = "workspace"` gate in deny.toml on a direct dependency.
