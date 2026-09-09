@@ -347,6 +347,8 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 // deliberate act (RFC-0034), not something a layout change does to them.
                 sql: crate::allowlist::SqlAccess::Open,
                 queries: Vec::new(),
+                #[cfg(feature = "counter")]
+                counter: None,
             }),
             Plan::Move {
                 alias,
@@ -362,6 +364,8 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    #[cfg(feature = "counter")]
+                    counter: None,
                 });
             }
             Plan::Merge {
@@ -383,6 +387,8 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    #[cfg(feature = "counter")]
+                    counter: None,
                 });
             }
             Plan::Adopt {
@@ -429,6 +435,8 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    #[cfg(feature = "counter")]
+                    counter: None,
                 });
             }
             Plan::Refuse { alias, .. } => refused.push(alias),

@@ -22,7 +22,7 @@ fn root() -> PathBuf {
 }
 
 /// Source files that implement payment. Every path is repo-relative.
-const PAYMENT_SURFACE: &[&str] = &["src/x402.rs"];
+const PAYMENT_SURFACE: &[&str] = &["src/counter.rs", "src/x402.rs"];
 
 fn is_x402_crate(name: &str) -> bool {
     name.to_ascii_lowercase()
