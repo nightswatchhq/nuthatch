@@ -159,8 +159,17 @@ jobs:
           # starts from nothing, re-raises settled ground, and reverses its own verdict: one PR
           # took thirteen passes and went back to changes-requested four times after shipping.
           # Not fatal when it fails - a first pass legitimately has none, and the prompt says so.
+          #
+          # **Filtered by author, not just by marker.** The marker is a comment body, so anyone who
+          # can comment on the pull request can write one - and this input is handed to the model as
+          # its own previous reviews, under a rule that forbids moving from `ship` to
+          # changes-requested without a changed hunk. A forged `ship` would therefore pin the
+          # verdict, and forged prose would arrive as instructions. `[bot]` logins are reserved by
+          # GitHub and cannot be registered by a person, so author login plus `type == "Bot"` is not
+          # forgeable by a PR author. Raised in review of this change.
           gh api --paginate "repos/$REPO/issues/$PR/comments" \
-            --jq '.[] | select(.body | contains("<!-- pr-review:luna -->")) | .body' \
+            --jq '.[] | select(.user.type == "Bot" and .user.login == "nuthatch-jules[bot]")
+                       | select(.body | contains("<!-- pr-review:luna -->")) | .body' \
             > pr.prior_reviews || : > pr.prior_reviews
 
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
