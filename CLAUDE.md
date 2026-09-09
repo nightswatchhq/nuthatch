@@ -183,6 +183,27 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > and none of them is now waived.** RFC-0046 §1's test in particular is a build gate, not a
 > paragraph: *delete every payment feature from the tree and a self-hoster loses nothing.*
 >
+> **RFC-0053 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0053](docs/rfcs/0053-graph-subgraph-compatibility.md) on 2026-09-09, a Graph-dialect-to-SQL
+> compatibility surface so a caller adopts a nest by changing a GraphQL URL. It is **new binary
+> capability**, which is exactly the case RFC-0044 §8 says must be decided here or not happen, and it
+> **overrides RFC-0044 §11's "not a subgraph compatibility layer" non-goal**, annotated in that RFC.
+> It sits outside the programme's original five and is now the sixth document in it.
+>
+> Three things the acceptance does not do, because they were the grounds for §11 in the first place.
+> It does not run AssemblyScript, in the indexing path or anywhere else; RFC-0038 §8 still holds.
+> It does not promise byte-for-byte parity for the ordered, mapping-derived family - `derivedETH`,
+> `volumeUSD`, `totalValueLockedUSD` and their relatives are a **compiler over stored state, not a
+> second indexer**, and RFC-0038 §6a's finding is unchanged. And it does not reopen arbitrary SQL or
+> RFC-0034's resource limits merely because a request arrived as GraphQL. The compatibility surface
+> is a read surface; nothing about it touches non-negotiable 4, because no LLM and no query shape
+> feeds stored state.
+>
+> **The authorisation is scoped to the evidence.** RFC-0053 S0 (#1264, the migration validator) is in
+> the `resolute-robin` sprint. S1 to S4 (#1265 to #1268) are filed and wait on what S0 measures,
+> because S0 is the only slice that can falsify the others. Accepting the direction is not accepting
+> the build-out sight unseen.
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred

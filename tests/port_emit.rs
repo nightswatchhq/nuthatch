@@ -598,11 +598,14 @@ type Pool @entity {
   accumulated: BigInt!
 }
 "#;
+    // The operand is itself an expression, so this is neither a renderable view column nor an
+    // accumulation #1214 can turn into `sum(col)`: `accumulation` takes one flat argument only,
+    // precisely so an operand it cannot render does not become a sum over the wrong thing.
     let mapping = r#"
 export function handlePoolCreated(event: PoolCreated): void {
   let pool = new Pool(event.params.pool.toHex())
   pool.id = event.params.pool.toHex()
-  pool.accumulated = pool.accumulated.plus(event.params.fee)
+  pool.accumulated = pool.accumulated.plus(event.params.fee.times(BigInt.fromI32(2)))
   pool.save()
 }
 "#;
@@ -803,4 +806,325 @@ export function handlePoolCreated(event: PoolCreated): void {
         check.is_ok(),
         "skipping the field must leave a nest that still checks: {check:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1214 / RFC-0044 S5: a running total is maintained incrementally, not folded in a view.
+// ---------------------------------------------------------------------------------------------
+
+const ACCUM_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  totalFees: BigInt!
+  latest: BigInt!
+}
+"#;
+
+const ACCUM_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.totalFees = pool.totalFees.plus(event.params.fee)
+  pool.latest = event.params.tickSpacing
+  pool.save()
+}
+"#;
+
+/// The gate that decides the slice: the emitted entity has to satisfy RFC-0041's v1 shape rules and
+/// bind. `nuthatch check` runs both, so this is the real validator rather than a substring.
+#[test]
+fn an_accumulated_field_is_emitted_as_an_incremental_entity_that_validates() {
+    let (nest, result) = emitted_nest(ACCUM_SCHEMA, ACCUM_MAPPING);
+
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Pool")
+        .unwrap_or_else(|| {
+            panic!(
+                "a running total must become an entity: {:?}",
+                result.entities
+            )
+        });
+    assert_eq!(entity.fields, vec!["totalFees".to_string()]);
+    assert!(
+        entity
+            .sql
+            .contains("sum(TRY_CAST(\"fee\" AS DECIMAL(38,0)))"),
+        "the total is the sum of the deltas, through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql
+    );
+    // The half that keeps the cast honest. `TRY_CAST` yields NULL past 38 digits and `sum` skips
+    // NULLs, so without this a real uint256 would leave a total silently short.
+    assert!(
+        entity.sql.contains("AS \"totalFees_overflow\""),
+        "a checked cast must report the values it could not represent:\n{}",
+        entity.sql
+    );
+
+    // Declared, and declared consistently: `entities.toml` requires the name to match the file stem
+    // and the path to be exactly `entities/<name>.sql`.
+    let toml = std::fs::read_to_string(nest.path().join("entities.toml")).unwrap();
+    assert!(toml.contains("name = \"pool\""), "{toml}");
+    assert!(toml.contains("sql = \"entities/pool.sql\""), "{toml}");
+    assert!(nest.path().join("entities/pool.sql").is_file());
+
+    // RFC-0041's shape gate and the binder, via the real validator.
+    let issues = nuthatch::entities::validate(nest.path());
+    assert!(
+        issues.is_empty(),
+        "the emitted entity must satisfy RFC-0041 v1: {:?}",
+        issues
+            .iter()
+            .map(|i| format!("{}: {}", i.name, i.error))
+            .collect::<Vec<_>>()
+    );
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(check.is_ok(), "the ported nest must still check: {check:?}");
+}
+
+/// The accumulation must not *also* appear in the view, where `last()` would answer with the most
+/// recent delta instead of the total - a wrong number rather than a missing one. The view keeps the
+/// latest-value field, and the file says where the other one went.
+#[test]
+fn the_running_total_is_absent_from_the_view_and_the_view_says_where_it_went() {
+    let (_nest, result) = emitted_nest(ACCUM_SCHEMA, ACCUM_MAPPING);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+
+    assert!(
+        !view.exact_fields.contains(&"totalFees".to_string()),
+        "a running total is not a view field: {:?}",
+        view.exact_fields
+    );
+    assert!(
+        view.exact_fields.contains(&"latest".to_string()),
+        "the latest-value field still belongs in the view: {:?}",
+        view.exact_fields
+    );
+    assert!(
+        view.sql
+            .contains("maintained incrementally in entities/pool.sql"),
+        "RFC-0044 §6 wants the artefact to say which of the two a field landed in:\n{}",
+        view.sql
+    );
+    assert!(
+        !result.skipped_fields.iter().any(|s| s.field == "totalFees"),
+        "a field that landed as an entity is not skipped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The absence case, and the sprint's theme. A port with no running totals must leave **no**
+/// `entities.toml` behind: one that declares nothing is itself a `check` error, so emitting an empty
+/// file would turn a nest that is merely view-shaped into a nest that fails its own validation.
+#[test]
+fn a_port_with_no_running_totals_leaves_no_entities_file() {
+    let (nest, result) = emitted_nest(OPS_SCHEMA, OPS_MAPPING);
+    assert!(
+        result.entities.is_empty(),
+        "nothing here accumulates: {:?}",
+        result.entities
+    );
+    assert!(
+        !nest.path().join("entities.toml").exists(),
+        "an entities.toml declaring nothing fails `nuthatch check`"
+    );
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "a nest with no entities is still a nest: {check:?}"
+    );
+}
+
+/// `port-emit` is deliberately re-runnable into the same nest. When a mapping that once had an
+/// accumulation loses it, the old generated declaration and SQL must disappear together; otherwise
+/// `has_declarations` still starts the entity runtime from a stale file.
+#[test]
+fn rerunning_without_a_running_total_removes_the_prior_generated_entity() {
+    let subgraph = subgraph_with(ACCUM_SCHEMA, ACCUM_MAPPING);
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("initial emitting port");
+    assert!(nest.path().join("entities.toml").is_file());
+    assert!(nest.path().join("entities/pool.sql").is_file());
+
+    std::fs::write(subgraph.path().join("schema.graphql"), OPS_SCHEMA).unwrap();
+    std::fs::write(subgraph.path().join("src/mappings/core.ts"), OPS_MAPPING).unwrap();
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("re-emitting port");
+
+    assert!(
+        result.entities.is_empty(),
+        "nothing here accumulates: {:?}",
+        result.entities
+    );
+    assert!(
+        !nest.path().join("entities.toml").exists(),
+        "the former declaration must not survive an empty re-emission"
+    );
+    assert!(
+        !nest.path().join("entities").exists(),
+        "the former generated SQL directory must not keep the nest entity-backed"
+    );
+}
+
+/// A field accumulated by two event tables cannot be silently narrowed to the first table the
+/// mapper happens to visit. v1 emits one relation per entity, so the second contribution is named
+/// for the operator instead of claiming a total that omits it.
+#[test]
+fn an_accumulation_from_a_second_table_is_named_rather_than_discarded() {
+    let subgraph = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
+    std::fs::write(
+        subgraph.path().join("schema.graphql"),
+        r#"type Pool @entity {
+  id: ID!
+  totalFees: BigInt!
+}
+
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("subgraph.yaml"),
+        r#"specVersion: 0.0.8
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    mapping:
+      file: ./src/mappings/core.ts
+      eventHandlers:
+        - event: PoolCreated(indexed address,indexed address,indexed uint24,int24,address)
+          handler: handlePoolCreated
+templates:
+  - kind: ethereum/contract
+    name: Pool
+    mapping:
+      file: ./src/mappings/core.ts
+      eventHandlers:
+        - event: Swap(indexed address,indexed address,int256,int256,uint160,uint128,int24)
+          handler: handlePoolSwap
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("src/mappings/core.ts"),
+        r#"export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.totalFees = pool.totalFees.plus(event.params.fee)
+  pool.save()
+}
+
+export function handlePoolSwap(event: Swap): void {
+  let pool = new Pool(event.address.toHex())
+  pool.id = event.address.toHex()
+  pool.totalFees = pool.totalFees.plus(event.params.amount0)
+  pool.save()
+}
+"#,
+    )
+    .unwrap();
+
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), true);
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+
+    assert!(
+        result.entities.iter().any(|entity| entity.entity == "Pool"),
+        "the first relation is emitted: {:?}",
+        result.entities
+    );
+    assert!(
+        result.skipped_fields.iter().any(|field| {
+            field.entity == "Pool" && field.field == "totalFees" && field.why.contains("pool__swap")
+        }),
+        "the second relation must be reported, not silently dropped: {:?}",
+        result.skipped_fields
+    );
+}
+
+#[test]
+fn an_accumulation_from_another_entity_receiver_is_not_emitted_for_this_entity() {
+    let mapping = r#"export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  let other = new Pool(event.params.token0.toHex())
+  pool.id = event.params.pool.toHex()
+  other.id = event.params.token0.toHex()
+  pool.totalFees = other.totalFees.plus(event.params.fee)
+  pool.save()
+  other.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(ACCUM_SCHEMA, mapping);
+    assert!(
+        result.entities.is_empty(),
+        "a different receiver's value is not this entity's running total: {:?}",
+        result.entities
+    );
+}
+
+#[test]
+fn a_nonempty_reemission_removes_entities_no_longer_generated() {
+    let initial_schema = r#"type Pool @entity {
+  id: ID!
+  totalFees: BigInt!
+}
+
+type Token @entity {
+  id: ID!
+  totalSupply: BigInt!
+}
+"#;
+    let initial_mapping = r#"export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  let token = new Token(event.params.token0.toHex())
+  pool.id = event.params.pool.toHex()
+  token.id = event.params.token0.toHex()
+  pool.totalFees = pool.totalFees.plus(event.params.fee)
+  token.totalSupply = token.totalSupply.plus(event.params.fee)
+  pool.save()
+  token.save()
+}
+"#;
+    let subgraph = subgraph_with(initial_schema, initial_mapping);
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("initial emitting port");
+    assert!(nest.path().join("entities/pool.sql").is_file());
+    assert!(nest.path().join("entities/token.sql").is_file());
+    std::fs::write(
+        nest.path().join("entities/manual.sql"),
+        "SELECT id FROM factory__pool_created",
+    )
+    .unwrap();
+    let mut manifest = std::fs::read_to_string(nest.path().join("entities.toml")).unwrap();
+    manifest.push_str(
+        "\n[[entities]]\nname = \"manual\"\nsql = \"entities/manual.sql\"\nkey = [\"id\"]\nmax_rows = 100\n",
+    );
+    std::fs::write(nest.path().join("entities.toml"), manifest).unwrap();
+
+    std::fs::write(subgraph.path().join("schema.graphql"), ACCUM_SCHEMA).unwrap();
+    std::fs::write(subgraph.path().join("src/mappings/core.ts"), ACCUM_MAPPING).unwrap();
+    nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("re-emitting port");
+
+    assert!(nest.path().join("entities/pool.sql").is_file());
+    assert!(
+        !nest.path().join("entities/token.sql").exists(),
+        "a generator-owned entity omitted by a non-empty re-emission must disappear"
+    );
+    let manifest = std::fs::read_to_string(nest.path().join("entities.toml")).unwrap();
+    assert!(manifest.contains("name = \"manual\""));
+    assert!(nest.path().join("entities/manual.sql").is_file());
 }
