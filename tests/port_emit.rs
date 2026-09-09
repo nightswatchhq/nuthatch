@@ -720,10 +720,18 @@ export function handlePoolCreated(event: PoolCreated): void {
     let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
     let sql = select_sql(&view.sql);
 
-    // **The bind is asserted first, deliberately.** It is the claim that matters and the one the
-    // old code failed, with `Binder Error: Referenced column "tick_spacing" not found in FROM
-    // clause!`. Asserting the SQL text first would let this test die on a substring and never
-    // demonstrate that the view is loadable at all.
+    // **What each assertion below actually guards, because they are not interchangeable.**
+    //
+    // The bind proves the emitted view is loadable, which is what the old code failed outright with
+    // `Binder Error: Referenced column "tick_spacing" not found in FROM clause!`. It does *not*
+    // catch a return to snake-casing on its own: `resolve_column` refuses a name the table does not
+    // have, so the field would simply be skipped and the smaller view would bind perfectly well.
+    // Measured, not assumed - restoring `snake_case` leaves this assertion green and prints
+    // `✓ port_views: 1 row(s) match`.
+    //
+    // So the two below it are the ones that catch that regression: the field has to *land*, named
+    // as the ABI names it, and nothing may be skipped. Read together, the three say the view loads
+    // and carries the field, which is the whole claim.
     let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
         name: None,
         dir: nest.path().display().to_string(),
