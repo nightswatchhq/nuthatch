@@ -720,6 +720,20 @@ export function handlePoolCreated(event: PoolCreated): void {
     let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
     let sql = select_sql(&view.sql);
 
+    // **The bind is asserted first, deliberately.** It is the claim that matters and the one the
+    // old code failed, with `Binder Error: Referenced column "tick_spacing" not found in FROM
+    // clause!`. Asserting the SQL text first would let this test die on a substring and never
+    // demonstrate that the view is loadable at all.
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "a camelCase parameter must produce a view that binds: {check:?}\n{sql}"
+    );
+
     assert!(
         sql.contains("\"tickSpacing\""),
         "the decoded column is the ABI parameter verbatim:\n{sql}"
@@ -736,18 +750,6 @@ export function handlePoolCreated(event: PoolCreated): void {
             .iter()
             .map(|s| s.name())
             .collect::<Vec<_>>()
-    );
-
-    // The gate: DuckDB binds it. This is what failed before, with
-    // `Binder Error: Referenced column "tick_spacing" not found in FROM clause!`.
-    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
-        name: None,
-        dir: nest.path().display().to_string(),
-        update: false,
-    });
-    assert!(
-        check.is_ok(),
-        "a camelCase parameter must produce a view that binds: {check:?}"
     );
 }
 
