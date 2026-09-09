@@ -122,6 +122,11 @@ pub enum Command {
     /// Hidden: a dev/authoring tool, not part of the user-facing two-command story.
     #[command(hide = true)]
     SkillRefs,
+
+    /// Classify a subgraph's schema and mappings into a port report (RFC-0044 S1).
+    /// Hidden: authoring tool, not part of the two-command story. Does not scaffold a nest.
+    #[command(hide = true)]
+    PortReport(PortReportArgs),
 }
 
 #[cfg(test)]
@@ -166,6 +171,13 @@ mod tests {
             visible.len()
         );
     }
+}
+
+#[derive(Args)]
+pub struct PortReportArgs {
+    /// Subgraph directory containing `schema.graphql` and the mappings. Nothing is written.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]

@@ -19,6 +19,12 @@ use crate::cli::Cli;
 /// Where the builder skill lives in the repo.
 pub const SKILL_DIR: &str = "skills/nuthatch-builder";
 
+/// Where the subgraph-port skill lives (RFC-0044). Drift-checked alongside the builder skill.
+pub const PORT_SKILL_DIR: &str = "skills/nuthatch-subgraph-port";
+
+/// Authored skill packages whose `--flag` mentions CI greps against clap.
+pub const AUTHORED_SKILL_DIRS: &[&str] = &[SKILL_DIR, PORT_SKILL_DIR];
+
 /// Regenerate the skill's machine-generated references into `root/skills/nuthatch-builder/`. Today
 /// that's `cli-reference.md`; the config reference is authored, with its keys drift-checked in CI
 /// in both directions — no key it names that the structs lack, and none the structs have that it
@@ -148,6 +154,10 @@ mod tests {
         assert!(
             !r.contains("## `nuthatch skill-refs`"),
             "the generator hides itself"
+        );
+        assert!(
+            !r.contains("## `nuthatch port-report`"),
+            "the port-report classifier hides itself"
         );
     }
 }

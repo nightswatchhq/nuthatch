@@ -52,6 +52,9 @@ CASES=(
 # checks the generated cli-reference.md is not stale. Two cases, because they are two mechanisms.
 "skill_refs_authored|skill_refs|skills/nuthatch-builder/workflows.md|--dir|--blancmange"
 "skill_refs_stale|skill_refs|skills/nuthatch-builder/cli-reference.md|--abi|--abbi"
+# port_report diffs the committed four-class fixture report (RFC-0044 S1). Mutating a class
+# must turn it red; averaging a field away is the failure the report exists to prevent.
+"port_report_fixture|port_report|skills/nuthatch-subgraph-port/fixtures/four-classes/expected.md|Token.derivedETH|Token.derivedETH_mutated"
 # tape_clean guards the recorded benchmark tapes against silent edits.
 # tape_clean guards exactly one thing: no recorded error in the CLEAN tape. Mutating anything else
 # in that file is not a mutation of what it claims - the gate is narrow on purpose and says so.

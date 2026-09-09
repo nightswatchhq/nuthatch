@@ -60,6 +60,7 @@ pub mod pack;
 /// binary with no database in its dependency tree.
 #[cfg(feature = "postgres-store")]
 pub mod pgstore;
+pub mod port_report;
 pub mod progress;
 pub mod project;
 pub mod prune;

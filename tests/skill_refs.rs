@@ -4,12 +4,41 @@
 //!   1. the committed `cli-reference.md` is byte-identical to what the binary generates now, and
 //!   2. every `--flag` mentioned in the *authored* skill files is a real flag (present in the
 //!      reference) - no hallucinated flags.
+//!
+//! RFC-0044 S1 extends (2) to `skills/nuthatch-subgraph-port/` as well: a port skill that lies
+//! about `--from-subgraph` is the same failure class.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn skill_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(nuthatch::skill::SKILL_DIR)
+}
+
+fn authored_skill_md() -> Vec<(String, PathBuf)> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for dir in nuthatch::skill::AUTHORED_SKILL_DIRS {
+        collect_skill_md(&root.join(dir), &mut out);
+    }
+    out
+}
+
+fn collect_skill_md(dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_md(&path, out);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") && name != "cli-reference.md" {
+            out.push((name, path));
+        }
+    }
 }
 
 #[test]
@@ -30,14 +59,10 @@ fn authored_files_only_mention_real_flags() {
     let real: BTreeSet<String> = flags_in(&reference);
     assert!(real.contains("--chain") && real.contains("--seal-direct"));
 
-    // Scan every authored skill file (everything except the generated reference).
+    // Scan every authored skill file (everything except the generated reference), including
+    // the subgraph-port skill (RFC-0044).
     let mut offenders = Vec::new();
-    for entry in std::fs::read_dir(skill_dir()).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") || name == "cli-reference.md" {
-            continue;
-        }
+    for (name, path) in authored_skill_md() {
         let text = std::fs::read_to_string(&path).unwrap();
         for flag in flags_in(&text) {
             // `--url` etc. are all real; a flag not in the reference is a hallucination.
@@ -172,12 +197,7 @@ fn authored_files_only_mention_real_metrics() {
     );
 
     let mut offenders = Vec::new();
-    for entry in std::fs::read_dir(skill_dir()).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+    for (name, path) in authored_skill_md() {
         let text = std::fs::read_to_string(&path).unwrap();
         for metric in metric_names_in(&text) {
             if !real.contains(&metric) {
