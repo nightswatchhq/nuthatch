@@ -5,6 +5,7 @@
 //! reproduce a result from the retained snapshot.
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -52,6 +53,14 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
     if columns.is_empty() {
         bail!("offchain source {} has no columns", source.display());
     }
+    let mut catalogue = load(dir)?;
+    if catalogue
+        .tables
+        .keys()
+        .any(|existing| existing != table && existing.eq_ignore_ascii_case(table))
+    {
+        bail!("offchain table name {table:?} collides case-insensitively with an existing table");
+    }
     let hash = hex::encode(Sha256::digest(&bytes));
     let out_dir = dir.join(DIR).join(SEGMENTS);
     std::fs::create_dir_all(&out_dir)
@@ -61,7 +70,6 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
     if !out.exists() {
         std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     }
-    let mut catalogue = load(dir)?;
     let snapshots = catalogue.tables.entry(table.to_string()).or_default();
     if !snapshots.iter().any(|s| s.hash == hash) {
         snapshots.push(Snapshot {
@@ -150,9 +158,9 @@ fn read_json(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
 
 fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(file).context("invalid Parquet source")?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.clone()))
+        .context("invalid Parquet source")?;
     let columns = builder
         .schema()
         .fields()
@@ -161,7 +169,7 @@ fn read_parquet(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
         .collect::<Vec<_>>();
     validate_columns(&columns)?;
     let rows = builder.metadata().file_metadata().num_rows() as usize;
-    Ok((std::fs::read(path)?, rows, columns))
+    Ok((bytes, rows, columns))
 }
 
 fn validate_table(table: &str) -> Result<()> {
@@ -223,6 +231,17 @@ mod tests {
 
         drop_file(dir.path(), &input, "prices").unwrap();
         assert_eq!(load(dir.path()).unwrap().tables["prices"].len(), 1);
+    }
+
+    #[test]
+    fn case_only_table_names_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prices.csv");
+        std::fs::write(&input, "token,price\nWETH,3210\n").unwrap();
+        drop_file(dir.path(), &input, "Prices").unwrap();
+
+        let err = drop_file(dir.path(), &input, "prices").unwrap_err();
+        assert!(err.to_string().contains("case-insensitively"), "{err:#}");
     }
 
     #[test]
