@@ -10,9 +10,9 @@ Path: `--from-subgraph`. The proxy trap does not apply: the manifest pins implem
 
 | Class | Count |
 |---|---:|
-| exact | 16 |
+| exact | 15 |
 | call-derived | 2 |
-| fixed point | 1 |
+| fixed point | 2 |
 | unreachable | 5 |
 
 ## exact
@@ -21,7 +21,6 @@ A pure function of decoded events. Port as a view or entity; byte-identical.
 
 | Field | Citation | Why |
 |---|---|---|
-| `Bundle.ethPriceUSD` | `src/mappings/core.ts:40` | assigned from `getEthPriceInUSD()` |
 | `Bundle.id` | `src/mappings/core.ts:38` | assigned from `'1'` |
 | `Pool.id` | `src/mappings/core.ts:24` | assigned from `event.params.pool.toHex()` |
 | `Pool.liquidity` | `src/mappings/core.ts:30` | assigned from `ZERO_BI` |
@@ -53,6 +52,7 @@ Reads back stored entity output. A nest can converge; the number will be differe
 
 | Field | Citation | Why |
 |---|---|---|
+| `Bundle.ethPriceUSD` | `src/mappings/core.ts:40` | `handleSwap` reads stored entity output (`getEthPriceInUSD()`); a nest can converge, this will not reproduce |
 | `Token.derivedETH` | `src/mappings/core.ts:53` | `handleSwap` reads stored entity output (`findEthPerToken(token0 as Token)`); a nest can converge, this will not reproduce |
 
 ## unreachable
