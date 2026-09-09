@@ -632,6 +632,7 @@ pub(crate) struct FunctionInfo {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Assignment {
+    pub receiver: String,
     pub entity: String,
     pub field: String,
     pub citation: Citation,
@@ -1399,6 +1400,7 @@ fn collect_assignments(
             let expr = resolve_local(body, &take_expr(body, eq_at + 1));
             let line = body_start_line + line_of(body, eq_at) - 1;
             out.push(Assignment {
+                receiver: var,
                 entity,
                 field,
                 citation: Citation {
@@ -1644,13 +1646,13 @@ fn collect_constructor_ids(
     while i < body.len() {
         let hit = match_let_new(body, i).or_else(|| match_bare_new(body, i));
         if let Some((var, ent, next)) = hit {
-            let _ = var;
             let mut k = next;
             skip_ws_str(body, &mut k);
             if body[k..].starts_with('(') {
                 let expr = take_expr(body, k + 1);
                 let line = body_start_line + line_of(body, k) - 1;
                 out.push(Assignment {
+                    receiver: var,
                     entity: ent,
                     field: "id".into(),
                     citation: Citation {
@@ -2944,6 +2946,45 @@ fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
 
 /// Event-table column this assignment copies. Constructor ids (`new Token(event.params.token0)`)
 /// use the constructor argument; a local that only aliases that argument is chased for `id`.
+/// An accumulation: `x.f = x.f.plus(<operand>)` or `.minus(...)`, where the receiver names the same
+/// field being written (RFC-0044 S5, #1214).
+///
+/// This is the shape a subgraph uses for a running total, and it is the one field shape that is
+/// **better** as an RFC-0041 incremental entity than as a view. A view cannot express it at all: the
+/// decoded table holds each event's delta, not the total, so the overlay's `last()` fold would
+/// answer with the most recent delta. As `sum(operand) GROUP BY id` it is exactly right, and `sum`
+/// is one of the six aggregates the v1 lowerer can maintain under insert and retraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Accumulation {
+    /// `.minus(..)`, which renders as `sum(-col)` rather than a second aggregate.
+    pub negated: bool,
+    pub operand: String,
+}
+
+pub(crate) fn accumulation(asg: &Assignment) -> Option<Accumulation> {
+    let e = collapse_ws(&asg.expr);
+    for (op, negated) in [(".plus(", false), (".minus(", true)] {
+        let Some(at) = e.find(op) else { continue };
+        let (receiver, rest) = e.split_at(at);
+        // The receiver must be exactly the field currently being assigned. `a.total = b.total.plus(x)`
+        // is not an accumulation of `a.total`, and treating it as one would sum the wrong column.
+        if receiver != format!("{}.{}", asg.receiver, asg.field) {
+            continue;
+        }
+        let inner = rest[op.len()..].strip_suffix(')')?.trim();
+        // One flat argument only. A nested call is not an event column, and admitting it here would
+        // put us back to guessing at an expression we cannot render - the defect in #1248.
+        if inner.is_empty() || inner.contains('(') || inner.contains(')') || inner.contains(',') {
+            return None;
+        }
+        return Some(Accumulation {
+            negated,
+            operand: inner.to_string(),
+        });
+    }
+    None
+}
+
 pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> Option<String> {
     if let Some(col) = event_column(&asg.expr) {
         return Some(col);

@@ -37,6 +37,8 @@ pub struct EmitResult {
     pub skipped_calls: Vec<SkippedCall>,
     /// Exact fields that reached no column. Same contract as `skipped_calls`: named, never silent.
     pub skipped_fields: Vec<SkippedField>,
+    /// Running totals emitted as RFC-0041 incremental entities rather than as views (#1214).
+    pub entities: Vec<EmittedEntity>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +68,19 @@ impl SkippedField {
     }
 }
 
+/// One authored incremental entity emitted for a subgraph's running totals (RFC-0044 S5, #1214).
+#[derive(Debug, Clone)]
+pub struct EmittedEntity {
+    /// The GraphQL entity name.
+    pub entity: String,
+    /// The declaration name, which is also the file stem `entities.toml` requires them to share.
+    pub name: String,
+    pub file: String,
+    pub sql: String,
+    /// Fields materialised incrementally rather than at query time.
+    pub fields: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EmittedView {
     pub entity: String,
@@ -80,11 +95,19 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
     let nest = Path::new(&args.out);
     let result = emit(subgraph, nest)?;
     println!(
-        "✓ emitted {} [[calls]] and {} view(s) into {}",
+        "✓ emitted {} [[calls]], {} view(s) and {} incremental entit(ies) into {}",
         result.calls.len(),
         result.views.len(),
+        result.entities.len(),
         nest.display()
     );
+    for e in &result.entities {
+        println!(
+            "  entities/{}.sql  maintained incrementally: {}",
+            e.name,
+            e.fields.join(", ")
+        );
+    }
     for c in &result.calls {
         println!(
             "  [[calls]] {}  {}  ← {}:{}",
@@ -146,7 +169,17 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .with_context(|| format!("build the decode registry for {}", nest.display()))?
         .schema();
 
-    let (views, skipped_fields) = write_exact_views(nest, &report, &mappings, &config, &schema)?;
+    let (entities, mut skipped_fields) =
+        write_entities(nest, &report, &mappings, &config, &schema)?;
+    // Where each field landed, so the view path reports "materialised as an entity" rather than
+    // "not in this view" - RFC-0044 §6 requires the artefacts to say which of the two it was.
+    let materialised: BTreeSet<(String, String)> = entities
+        .iter()
+        .flat_map(|e| e.fields.iter().map(|f| (e.entity.clone(), f.clone())))
+        .collect();
+    let (views, view_skipped) =
+        write_exact_views(nest, &report, &mappings, &config, &schema, &materialised)?;
+    skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
     std::fs::write(nest.join("README.md"), &report_text)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
@@ -157,6 +190,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         report: report_text,
         skipped_calls,
         skipped_fields,
+        entities,
     })
 }
 
@@ -289,12 +323,283 @@ fn nest_alias(source: &str, config: &Config) -> String {
     want
 }
 
+/// Emit `entities/*.sql` plus the `entities.toml` that declares them (RFC-0044 S5, #1214).
+///
+/// **Only accumulations become entities.** RFC-0044 §9 calls this slice "one file" on the
+/// assumption that only the emit target changes, and that turns out not to survive contact with
+/// RFC-0041's v1 shape gate: the overlay view folds with `last(.. ORDER BY ..)`, and neither `last`
+/// nor `ORDER BY` is incremental v1 SQL, so the exact-field view cannot become an entity by
+/// retargeting it. A running total can, and it is the one field shape a view answers *wrongly*
+/// today, so this is the swap that was actually worth making.
+///
+/// **An entity is emitted only when there is one to declare.** `entities.toml` declaring nothing is
+/// itself a `nuthatch check` error ("declares no entities; remove entities.toml until an incremental
+/// relation is ready"), so a port with no running totals must leave no file behind at all. That is
+/// also the sprint's absence case: a nest with no entities is still a nest.
+fn write_entities(
+    nest: &Path,
+    report: &Report,
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+    schema: &[nuthatch_decode::registry::TableSchema],
+) -> Result<(Vec<EmittedEntity>, Vec<SkippedField>)> {
+    let mut exact_by_entity: BTreeMap<String, Vec<&crate::port_report::FieldRow>> = BTreeMap::new();
+    for f in &report.fields {
+        if f.class == Class::Exact && f.entity != "_Schema_" {
+            exact_by_entity.entry(f.entity.clone()).or_default().push(f);
+        }
+    }
+
+    let mut emitted: Vec<EmittedEntity> = Vec::new();
+    let mut skipped: Vec<SkippedField> = Vec::new();
+    for (entity, fields) in &exact_by_entity {
+        let accumulated = map_accumulating_fields(entity, fields, mappings, config, schema);
+        if accumulated.is_empty() {
+            continue;
+        }
+        // One relation, one table. Two triggering tables would need a UNION ALL under the GROUP BY,
+        // which is expressible but is a second shape to get right; the fields on the other tables
+        // are named rather than folded in silently.
+        let table = accumulated[0].table.clone();
+        let (here, elsewhere): (Vec<_>, Vec<_>) =
+            accumulated.into_iter().partition(|a| a.table == table);
+        let mut seen_fields = BTreeSet::new();
+        let here = here
+            .into_iter()
+            .filter(|a| {
+                if seen_fields.insert(a.field.clone()) {
+                    true
+                } else {
+                    skipped.push(SkippedField {
+                        entity: entity.clone(),
+                        field: a.field.clone(),
+                        citation: a.citation.clone(),
+                        why: format!(
+                            "has another accumulating assignment on `{table}`; duplicate aliases are unsupported in one incremental entity"
+                        ),
+                    });
+                    false
+                }
+            })
+            .collect::<Vec<_>>();
+        for a in elsewhere {
+            skipped.push(SkippedField {
+                entity: entity.clone(),
+                field: a.field.clone(),
+                citation: a.citation.clone(),
+                why: format!(
+                    "accumulates from `{}` while `{entity}`'s incremental entity is built on \
+                     `{table}`; one entity is one relation in v1, so add this arm by hand",
+                    a.table
+                ),
+            });
+        }
+        let Some(id_column) = id_column_for_table(entity, &table, mappings, config)
+            .and_then(|c| resolve_column(&table, &c, schema))
+        else {
+            for a in here {
+                skipped.push(SkippedField {
+                    entity: entity.clone(),
+                    field: a.field.clone(),
+                    citation: a.citation.clone(),
+                    why: format!(
+                        "accumulates over `{table}` but nothing in the mapping identifies which \
+                         `{entity}` a row belongs to, so there is no key to group by"
+                    ),
+                });
+            }
+            continue;
+        };
+
+        let name = to_alias(entity);
+        let mut sql = String::new();
+        sql.push_str(&format!(
+            "-- Running totals of `{entity}`, maintained incrementally (RFC-0041).\n"
+        ));
+        sql.push_str(
+            "-- A subgraph accumulates these one event at a time; the decoded table holds the\n             -- deltas, so the total is their sum and never the latest value. The exact fields that\n             -- *are* latest-value live in views/, and README.md says which field went where.\n",
+        );
+        for a in &here {
+            sql.push_str(&format!(
+                "-- `{entity}.{}` {} `{}` of `{table}`: {}\n",
+                a.field,
+                if a.negated {
+                    "sums the negation of"
+                } else {
+                    "sums"
+                },
+                a.column,
+                a.citation.display()
+            ));
+        }
+        // **The cast is checked, and its failure is reported rather than swallowed.** Every event
+        // param is sealed as exact decimal *text* (RFC-0047 §1), so `sum("col")` does not even
+        // type-check - `sum(VARCHAR)` has no candidate. `TRY_CAST` to `DECIMAL(38,0)` is the
+        // conversion RFC-0047 §2 C1 names, but on its own it yields NULL past 38 digits and `sum`
+        // skips NULLs, which would drop a real uint256 out of a total in silence. C1's rule is
+        // explicit that no conversion out of the exact text may narrow silently, so each total
+        // carries an `_overflow` companion that is 1 when any contributing row could not be
+        // represented. `max` is one of the six aggregates v1 maintains, so the flag costs nothing
+        // the total does not already cost.
+        let mut cols = vec![format!("  \"{id_column}\" AS \"id\"")];
+        for a in &here {
+            let cast = format!("TRY_CAST(\"{}\" AS DECIMAL(38,0))", a.column);
+            let operand = if a.negated {
+                format!("-{cast}")
+            } else {
+                cast.clone()
+            };
+            cols.push(format!("  sum({operand}) AS \"{}\"", a.field));
+            cols.push(format!(
+                "  max(CASE WHEN \"{}\" IS NOT NULL AND {cast} IS NULL THEN 1 ELSE 0 END) AS \"{}_overflow\"",
+                a.column, a.field
+            ));
+        }
+        sql.push_str(&format!(
+            "SELECT\n{}\nFROM \"{table}\"\nGROUP BY \"{id_column}\"\n",
+            cols.join(",\n")
+        ));
+
+        emitted.push(EmittedEntity {
+            entity: entity.clone(),
+            name: name.clone(),
+            file: format!("entities/{name}.sql"),
+            sql,
+            fields: here.iter().map(|a| a.field.clone()).collect(),
+        });
+    }
+
+    let dir = nest.join("entities");
+    let operator_declarations = load_operator_entity_declarations(nest, &dir)?;
+    remove_generated_entities(&dir)?;
+    if emitted.is_empty() {
+        // Leave nothing behind. An `entities.toml` that declares nothing fails `check`, and an
+        // empty `entities/` directory makes `has_declarations` claim this nest has maintained state.
+        if operator_declarations.is_empty() {
+            let _ = std::fs::remove_file(nest.join(crate::entities::ENTITY_FILE));
+        } else {
+            write_operator_entity_declarations(nest, &operator_declarations)?;
+        }
+        return Ok((emitted, skipped));
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut toml = String::from(
+        "# Authored incremental entities emitted by `port-emit` (RFC-0041, RFC-0044 S5).\n         #\n         # `max_rows` is an admission and runtime bound, not documentation: crossing it faults the\n         # nest loudly. The value below is a starting point, not a measurement. Set it from the\n         # cardinality this relation actually reaches on your chain before running unattended.\n",
+    );
+    for e in &emitted {
+        std::fs::write(nest.join(&e.file), &e.sql).with_context(|| format!("write {}", e.file))?;
+        toml.push_str(&format!(
+            "\n[[entities]]\nname = \"{}\"\nsql = \"{}\"\nkey = [\"id\"]\nmax_rows = 500_000\n",
+            e.name, e.file
+        ));
+    }
+    for declaration in &operator_declarations {
+        let mut root = toml::map::Map::new();
+        root.insert(
+            "entities".into(),
+            toml::Value::Array(vec![toml::Value::Table(declaration.clone())]),
+        );
+        toml.push('\n');
+        toml.push_str(&toml::to_string(&toml::Value::Table(root))?);
+    }
+    std::fs::write(nest.join(crate::entities::ENTITY_FILE), toml).context("write entities.toml")?;
+    Ok((emitted, skipped))
+}
+
+fn load_operator_entity_declarations(
+    nest: &Path,
+    dir: &Path,
+) -> Result<Vec<toml::map::Map<String, toml::Value>>> {
+    let manifest = nest.join(crate::entities::ENTITY_FILE);
+    let raw = match std::fs::read_to_string(&manifest) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", manifest.display())),
+    };
+    let value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("parse {}", manifest.display()))?;
+    let Some(entries) = value.get("entities").and_then(toml::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut operator = Vec::new();
+    for entry in entries {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let generated = table
+            .get("sql")
+            .and_then(toml::Value::as_str)
+            .map(|sql| dir.join(sql.strip_prefix("entities/").unwrap_or(sql)))
+            .filter(|path| path.is_file())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|sql| sql.starts_with("-- Running totals of `"));
+        if !generated {
+            operator.push(table.clone());
+        }
+    }
+    Ok(operator)
+}
+
+fn write_operator_entity_declarations(
+    nest: &Path,
+    declarations: &[toml::map::Map<String, toml::Value>],
+) -> Result<()> {
+    let entities = toml::Value::Array(
+        declarations
+            .iter()
+            .cloned()
+            .map(toml::Value::Table)
+            .collect(),
+    );
+    let mut root = toml::map::Map::new();
+    root.insert("entities".into(), entities);
+    std::fs::write(
+        nest.join(crate::entities::ENTITY_FILE),
+        toml::to_string(&toml::Value::Table(root))?,
+    )
+    .context("write entities.toml")?;
+    Ok(())
+}
+
+/// Remove only SQL files this generator previously owned. A nest may also contain an entity written
+/// by its operator, so `port-emit` must not treat the whole directory as disposable merely because
+/// it no longer emits a running total.
+fn remove_generated_entities(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("read entry in {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("sql") {
+            continue;
+        }
+        let sql =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        if sql.starts_with("-- Running totals of `") {
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    if std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .next()
+        .is_none()
+    {
+        std::fs::remove_dir(dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 fn write_exact_views(
     nest: &Path,
     report: &Report,
     mappings: &crate::port_report::Mappings,
     config: &Config,
     schema: &[nuthatch_decode::registry::TableSchema],
+    materialised: &BTreeSet<(String, String)>,
 ) -> Result<(Vec<EmittedView>, Vec<SkippedField>)> {
     let views_dir = nest.join("views");
     std::fs::create_dir_all(&views_dir)
@@ -322,7 +627,7 @@ fn write_exact_views(
     let mut emitted = Vec::new();
     let mut skipped = Vec::new();
     for (entity, fields) in &exact_by_entity {
-        let view = view_for_entity(entity, fields, mappings, config, schema);
+        let view = view_for_entity(entity, fields, mappings, config, schema, materialised);
         let file = format!("20-{}.sql", to_alias(entity));
         std::fs::write(views_dir.join(&file), &view.sql)
             .with_context(|| format!("write views/{file}"))?;
@@ -371,6 +676,7 @@ fn view_for_entity(
     mappings: &crate::port_report::Mappings,
     config: &Config,
     schema: &[nuthatch_decode::registry::TableSchema],
+    materialised: &BTreeSet<(String, String)>,
 ) -> ViewDraft {
     let view_name = to_alias(entity);
     let mut comments = Vec::new();
@@ -383,6 +689,19 @@ fn view_for_entity(
         // **Claim the field only once it has a column.** `exact_fields` used to be pushed before
         // the mapping was attempted, so a field that reached no table was still advertised as
         // being in this view while the SQL never mentioned it (#1248).
+        // A running total is materialised incrementally and is deliberately absent from the
+        // overlay: the view's `last()` fold would answer with the most recent delta rather than the
+        // total, which is the wrong number rather than a missing one.
+        if materialised.contains(&(f.entity.clone(), f.field.clone())) {
+            comments.push(format!(
+                "-- `{}.{}` exact, maintained incrementally in entities/{}.sql, not here: {}",
+                f.entity,
+                f.field,
+                to_alias(&f.entity),
+                f.reason.replace('\n', " ")
+            ));
+            continue;
+        }
         let tables = map_exact_field_tables(f, mappings, config, schema);
         if tables.is_empty() {
             comments.push(format!(
@@ -521,6 +840,65 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
         outer.join(",\n"),
         inner
     )
+}
+
+/// One accumulating field resolved to a real decoded column.
+struct AccumulatedField {
+    field: String,
+    table: String,
+    column: String,
+    negated: bool,
+    citation: Citation,
+}
+
+/// Fields of `entity` written as running totals, resolved to the table and column that feed them.
+///
+/// Deliberately the same resolution path as [`map_exact_field_tables`]: an operand that reaches no
+/// real column yields nothing here either, so an accumulation the emitter cannot render is reported
+/// as a skipped field rather than turned into a `sum()` over a column that does not exist.
+fn map_accumulating_fields(
+    entity: &str,
+    fields: &[&crate::port_report::FieldRow],
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+    schema: &[nuthatch_decode::registry::TableSchema],
+) -> Vec<AccumulatedField> {
+    let mut out = Vec::new();
+    for f in fields {
+        for func in mappings.functions.values() {
+            if func.kind == crate::port_report::HandlerKind::Block {
+                continue;
+            }
+            for asg in &func.assignments {
+                if asg.entity != entity || asg.field != f.field {
+                    continue;
+                }
+                let Some(acc) = crate::port_report::accumulation(asg) else {
+                    continue;
+                };
+                let Some(raw) = crate::port_report::event_column(&acc.operand) else {
+                    continue;
+                };
+                let Some(handler) = event_handler_for(func, mappings) else {
+                    continue;
+                };
+                let Some(table) = table_for_handler(&handler.name, mappings, config) else {
+                    continue;
+                };
+                let Some(column) = resolve_column(&table, &raw, schema) else {
+                    continue;
+                };
+                out.push(AccumulatedField {
+                    field: f.field.clone(),
+                    table,
+                    column,
+                    negated: acc.negated,
+                    citation: f.citation.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The decoded column this name refers to, or `None` if the table has no such column.

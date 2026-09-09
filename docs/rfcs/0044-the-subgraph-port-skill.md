@@ -151,6 +151,10 @@ design question inside it (§12.2) and it must not hold up the part that does no
 the data right and hands over a query-translation table is worth shipping; a port that waits for a
 GraphQL compatibility answer ships nothing.
 
+That half is now [RFC-0053](0053-graph-subgraph-compatibility.md), accepted 2026-09-09. It overrides
+§11's compatibility-layer non-goal; this section's sequencing argument is unaffected, because the
+whole point of it was that the two halves ship independently.
+
 ## 8. The freeze
 
 The 2026 freeze permits bug fixes, security, performance, maintenance, **marketing** and making the
@@ -199,6 +203,13 @@ being judged.
   declaratively for the order-dependent family. This RFC's job is to say so before the user finds out.
 - **Not a subgraph compatibility layer.** No GraphQL endpoint that impersonates a subgraph, no
   `graph-node` protocol surface. A translation table, not a shim.
+  **Overridden 2026-09-09, on Chief's decision, by
+  [RFC-0053](0053-graph-subgraph-compatibility.md)**, which proposes exactly the surface this bullet
+  rules out. The non-goal was right for *this* RFC and §7 is why: a port skill that waited on a
+  compatibility answer would have shipped nothing. What changed is that the question now has a
+  document of its own, so declining it here no longer declines it everywhere. Nothing else in §11
+  moves, and RFC-0053 independently keeps AssemblyScript out of the indexing path and refuses to
+  claim byte-for-byte parity for mapping-derived values.
 - **Not automatic.** The skill produces a nest and a report for a human to accept. It does not deploy.
 
 ## 12. Open questions
