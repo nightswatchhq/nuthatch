@@ -3050,6 +3050,17 @@ pub(crate) fn event_column(expr: &str) -> Option<String> {
         if name.is_empty() {
             return None;
         }
+        // **Nothing may follow the parameter name.** This used to take the leading identifier and
+        // discard the rest, so `event.params.fee.neg()`, `.times(x)` and `.plus(y)` all resolved to
+        // the `fee` column - a value with the wrong sign, the wrong scale, or a missing addend,
+        // emitted into a view whose report promises the field is byte-identical (#1248). An
+        // operation this function cannot represent must yield no column at all, so the caller can
+        // report the field as skipped rather than answer it wrongly. `strip_converters` has already
+        // removed the representation-only suffixes, which are the ones that genuinely do not change
+        // the value; a residue here is arithmetic, an array index, or something else unmodelled.
+        if !rest[k..].trim().is_empty() {
+            return None;
+        }
         return Some(nuthatch_decode::registry::snake_case(&name));
     }
     match e.as_str() {

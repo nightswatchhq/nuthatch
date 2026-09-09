@@ -35,6 +35,8 @@ pub struct EmitResult {
     /// Reads that could not be pinned to an ABI signature, with the reason. Named so an author can
     /// add the stanza by hand; never guessed, and never a reason to abandon the rest of the port.
     pub skipped_calls: Vec<SkippedCall>,
+    /// Exact fields that reached no column. Same contract as `skipped_calls`: named, never silent.
+    pub skipped_fields: Vec<SkippedField>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,26 @@ pub struct SkippedCall {
     pub signature: String,
     pub citation: Citation,
     pub why: String,
+}
+
+/// An Exact field the emitter could not render into its view, named rather than dropped (#1248).
+///
+/// The report promises that a field it calls Exact matches byte-for-byte, so a field that reaches
+/// no column must be visible to the porter. Silence here used to take two forms and both were
+/// worse than this: the field vanished from the SQL while `exact_fields` still listed it, or the
+/// mapping's operation was discarded and the bare event column answered in its place.
+#[derive(Debug, Clone)]
+pub struct SkippedField {
+    pub entity: String,
+    pub field: String,
+    pub citation: Citation,
+    pub why: String,
+}
+
+impl SkippedField {
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.entity, self.field)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +104,16 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             s.why
         );
     }
+    // Same contract for fields. A field the report calls Exact that reached no column is the one
+    // thing a porter must not learn from a gateway diff three days later (#1248).
+    for s in &result.skipped_fields {
+        println!(
+            "  ! exact but not in a view: {} at {} - {}",
+            s.name(),
+            s.citation.display(),
+            s.why
+        );
+    }
     Ok(())
 }
 
@@ -108,7 +140,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         dir: nest.display().to_string(),
     })?;
 
-    let views = write_exact_views(nest, &report, &mappings, &config)?;
+    let (views, skipped_fields) = write_exact_views(nest, &report, &mappings, &config)?;
     write_checks(nest, &views)?;
     std::fs::write(nest.join("README.md"), &report_text)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
@@ -118,6 +150,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         views,
         report: report_text,
         skipped_calls,
+        skipped_fields,
     })
 }
 
@@ -255,7 +288,7 @@ fn write_exact_views(
     report: &Report,
     mappings: &crate::port_report::Mappings,
     config: &Config,
-) -> Result<Vec<EmittedView>> {
+) -> Result<(Vec<EmittedView>, Vec<SkippedField>)> {
     let views_dir = nest.join("views");
     std::fs::create_dir_all(&views_dir)
         .with_context(|| format!("create {}", views_dir.display()))?;
@@ -280,6 +313,7 @@ fn write_exact_views(
     };
 
     let mut emitted = Vec::new();
+    let mut skipped = Vec::new();
     for (entity, fields) in &exact_by_entity {
         let view = view_for_entity(entity, fields, mappings, config);
         let file = format!("20-{}.sql", to_alias(entity));
@@ -291,13 +325,37 @@ fn write_exact_views(
             sql: view.sql,
             exact_fields: view.exact_fields,
         });
+        skipped.extend(view.skipped);
     }
-    Ok(emitted)
+    Ok((emitted, skipped))
 }
 
 struct ViewDraft {
     sql: String,
     exact_fields: Vec<String>,
+    skipped: Vec<SkippedField>,
+}
+
+/// Why an Exact field reached no decoded column, phrased for the porter rather than the compiler.
+///
+/// The report's `reason` already quotes the right-hand side, which is the only evidence that
+/// matters here, so this classifies that text rather than re-parsing the mapping. Three shapes
+/// account for every case seen so far and the fallback is honest about not knowing.
+fn skip_reason(report_reason: &str) -> String {
+    let r = report_reason.replace('\n', " ");
+    if r.contains("event.params.") {
+        format!(
+            "the mapping applies an operation this emitter cannot render, so no column answers it ({r}). \
+             Add the field to a view by hand, or see #1248"
+        )
+    } else if r.contains(".plus(") || r.contains(".minus(") {
+        format!(
+            "accumulates its own prior value ({r}); a running total's proper home is an incremental \
+             entity rather than a view, see #1214"
+        )
+    } else {
+        format!("no decoded column corresponds to it ({r})")
+    }
 }
 
 fn view_for_entity(
@@ -311,18 +369,40 @@ fn view_for_entity(
     // field → table → column. One field may be written from several triggering tables.
     let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut exact_fields = Vec::new();
+    let mut skipped = Vec::new();
 
     for f in fields {
+        // **Claim the field only once it has a column.** `exact_fields` used to be pushed before
+        // the mapping was attempted, so a field that reached no table was still advertised as
+        // being in this view while the SQL never mentioned it (#1248).
+        let tables = map_exact_field_tables(f, mappings, config);
+        if tables.is_empty() {
+            comments.push(format!(
+                "-- `{}.{}` exact but NOT IN THIS VIEW: {}:{} - {}",
+                f.entity,
+                f.field,
+                f.citation.file,
+                f.citation.line,
+                skip_reason(&f.reason)
+            ));
+            skipped.push(SkippedField {
+                entity: f.entity.clone(),
+                field: f.field.clone(),
+                citation: f.citation.clone(),
+                why: skip_reason(&f.reason),
+            });
+            continue;
+        }
         exact_fields.push(f.field.clone());
         comments.push(format!(
-            "-- `{}.{}` exact: {}:{} — {}",
+            "-- `{}.{}` exact: {}:{} - {}",
             f.entity,
             f.field,
             f.citation.file,
             f.citation.line,
             f.reason.replace('\n', " ")
         ));
-        for (table, col) in map_exact_field_tables(f, mappings, config) {
+        for (table, col) in tables {
             selects
                 .entry(f.field.clone())
                 .or_default()
@@ -348,14 +428,22 @@ fn view_for_entity(
         sql.push_str(&format!(
             "CREATE VIEW \"{view_name}\" AS SELECT 1 AS port_placeholder;\n"
         ));
-        return ViewDraft { sql, exact_fields };
+        return ViewDraft {
+            sql,
+            exact_fields,
+            skipped,
+        };
     }
 
     sql.push_str(&format!(
         "CREATE VIEW \"{view_name}\" AS\n{}\n",
         exact_select_sql(&selects)
     ));
-    ViewDraft { sql, exact_fields }
+    ViewDraft {
+        sql,
+        exact_fields,
+        skipped,
+    }
 }
 
 /// Latest mapped value per entity id. Several tables overlay with UNION ALL (not a JOIN);
@@ -519,9 +607,21 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     // projected under `LIMIT 0`: the query fails if a view is missing or its columns do not
     // type-check, and its answer does not move as the nest fills. The aggregate is what guarantees
     // one row per view - `SELECT true FROM (.. LIMIT 0)` would return none.
-    let mut labels: Vec<(String, String)> = views
+    //
+    // **The projection names the promised columns.** `SELECT *` binds a view whatever it contains,
+    // so it could not see a field that `exact_fields` advertised and the SQL never emitted - the
+    // defect in #1248, which passed every generated check. Naming each column makes DuckDB the
+    // independent party: the two lists were computed in the same loop and still diverged, so the
+    // engine refusing to bind an absent column is worth more than either list agreeing with itself.
+    let mut labels: Vec<(String, String, Vec<String>)> = views
         .iter()
-        .map(|v| (v.entity.clone(), to_alias(&v.entity)))
+        .map(|v| {
+            (
+                v.entity.clone(),
+                to_alias(&v.entity),
+                v.exact_fields.clone(),
+            )
+        })
         .collect();
     labels.sort();
     let sql = if labels.is_empty() {
@@ -531,14 +631,25 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
             "-- Structural: every exact view binds and projects. Not a row count - this stays true \
              once the nest holds data.\n",
         );
-        for (i, (entity, alias)) in labels.iter().enumerate() {
+        for (i, (entity, alias, fields)) in labels.iter().enumerate() {
             let head = if i == 0 {
                 format!("SELECT '{entity}' AS view, count(*) >= 0 AS binds")
             } else {
                 format!("UNION ALL SELECT '{entity}', count(*) >= 0")
             };
+            // An entity whose fields were all skipped emits the placeholder view, which has no
+            // promised column to name; `*` is then the only honest projection.
+            let projection = if fields.is_empty() {
+                "*".to_string()
+            } else {
+                fields
+                    .iter()
+                    .map(|f| format!("\"{f}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             s.push_str(&format!(
-                "{head} FROM (SELECT * FROM \"{alias}\" LIMIT 0)\n"
+                "{head} FROM (SELECT {projection} FROM \"{alias}\" LIMIT 0)\n"
             ));
         }
         s.push_str("ORDER BY 1;\n");
@@ -552,7 +663,7 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     } else {
         let rows: Vec<serde_json::Value> = labels
             .iter()
-            .map(|(entity, _)| serde_json::json!({ "view": entity, "binds": true }))
+            .map(|(entity, _, _)| serde_json::json!({ "view": entity, "binds": true }))
             .collect();
         serde_json::Value::Array(rows)
     };
