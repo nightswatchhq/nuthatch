@@ -1114,7 +1114,7 @@ fn analyse_function(
     let contract_call = find_contract_call(body, file, body_start_line);
     let has_loop_load = loop_reads_a_loaded_entity_field(body, &bindings);
     let field_reads = collect_field_reads(body, &bindings);
-    let reads_loaded_entity_field = body.contains(".load(") && !field_reads.is_empty();
+    let reads_loaded_entity_field = returns_a_loaded_entity_field(body, &bindings);
     FunctionInfo {
         name,
         kind: HandlerKind::Helper,
@@ -1804,6 +1804,58 @@ fn loop_body(body: &str, after: usize) -> Option<&str> {
     }
     let end = match_ts_brace(body, b)?;
     Some(&body[b + 1..end])
+}
+
+/// Whether a `return` in this body hands back a field read off a loaded entity.
+///
+/// **Two independent facts are not one fact.** The first version of this asked only whether the body
+/// contained `.load(` *and* whether it read any entity field anywhere - which are unrelated
+/// questions. A helper that loads a pool, ignores it, and returns `ZERO_BD` satisfied both and was
+/// marked fixed point, so a caller's genuinely exact field was reported as unreproducible. Raised in
+/// review of #1274.
+///
+/// Still a syntactic approximation rather than dataflow: it asks whether a returned expression
+/// mentions a binding that some field read is taken off. That is enough to separate "loads and
+/// returns the stored value" from "loads and returns a constant", which is the distinction the class
+/// turns on, and it errs toward fixed point only when a returned expression really does name the
+/// loaded entity.
+fn returns_a_loaded_entity_field(body: &str, bindings: &BTreeMap<String, String>) -> bool {
+    if !body.contains(".load(") {
+        return false;
+    }
+    // The locals a field is actually read off, e.g. `pool` in `pool.token0Price`.
+    let mut read_from: BTreeSet<String> = BTreeSet::new();
+    for (name, _) in bindings {
+        if collect_field_reads(body, bindings).is_empty() {
+            break;
+        }
+        // A read off this binding: `name` followed by `.` and an identifier.
+        let needle = format!("{name}.");
+        if body.contains(&needle) {
+            read_from.insert(name.clone());
+        }
+    }
+    if read_from.is_empty() {
+        return false;
+    }
+    let mut rest = body;
+    while let Some(at) = rest.find("return") {
+        let after = &rest[at + "return".len()..];
+        // Word boundary, so `returnValue` is not a return statement.
+        let boundary = after
+            .as_bytes()
+            .first()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
+        if boundary {
+            let end = after.find(['\n', ';']).unwrap_or(after.len());
+            let expr = &after[..end];
+            if read_from.iter().any(|b| expr.contains(&format!("{b}."))) {
+                return true;
+            }
+        }
+        rest = &rest[at + "return".len()..];
+    }
+    false
 }
 
 fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -3807,6 +3859,45 @@ export function handleSwap(event: SwapEvent): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "derivedETH"), Class::FixedPoint);
         assert_eq!(class_of(&rows, "Pool", "usd"), Class::FixedPoint);
+    }
+
+    /// Jules' counterexample on #1274: loading an entity and reading a field off it is not enough
+    /// on its own. If the helper hands back a constant, the caller's field really is exact, and
+    /// calling it fixed point costs a porter a hand check on a field that was never in doubt.
+    #[test]
+    fn a_helper_that_loads_but_returns_a_constant_stays_exact() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  token0Price: BigDecimal!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function getNativePriceInUSD(): BigDecimal {
+  let pool = Pool.load(STABLE_POOL)
+  if (pool) {
+    log.info('price seen {}', [pool.token0Price.toString()])
+  }
+  return ZERO_BD
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = getNativePriceInUSD()
+  bundle.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Bundle", "ethPriceUSD"),
+            Class::Exact,
+            "the loaded field never reaches the return; the helper hands back a constant"
+        );
     }
 
     /// The #1274 case in the shape it was found in: two sibling helpers in one pricing module,
