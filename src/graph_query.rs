@@ -1058,6 +1058,15 @@ type Swap @entity { id: ID! pool: Pool! }
             matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
             "{e:?}"
         );
+        // And arguments on a leaf *inside* a traversal, which is a different guard: the case above
+        // is caught before the relation is resolved, so removing this one changed nothing and no
+        // test noticed - found by mutation, not by reading.
+        let e = compile(&schema(), &one(r#"{ pools { token0 { symbol(x: 1) } } }"#))
+            .expect_err("arguments on a traversed leaf");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "symbol"),
+            "{e:?}"
+        );
 
         // An unknown field on the *target* entity is named against the target, not the parent.
         let e = compile(&schema(), &one("{ pools { token0 { nope } } }")).expect_err("unknown");
