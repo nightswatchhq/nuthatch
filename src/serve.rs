@@ -1583,8 +1583,16 @@ async fn graph_graphql(
         }
     };
 
-    // `__schema` is the introspection surface a generated client fetches first.
-    if query.contains("__schema") {
+    // The operation is parsed **before** anything is routed. Deciding by searching the raw text for
+    // `__schema` meant a filter value of `"__schema"` - a perfectly ordinary thing to store in a
+    // `hooks` column - was answered with the schema document instead of rows (Jules on #1282). A root
+    // field name is a structural fact and a string literal is not, so read the structure.
+    let roots = match crate::graph_query::parse_with(&query, &vars) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+    };
+    // The introspection surface a generated client fetches before it will send anything useful.
+    if roots.iter().any(|r| r.name == "__schema") {
         return (
             StatusCode::OK,
             // `render` already produces `{"__schema": …}`, which is precisely the `data` payload.
@@ -1592,19 +1600,24 @@ async fn graph_graphql(
                 crate::graph_schema::introspection::render(&schema)})),
         );
     }
-    // `__type(name: "Pool")` is the other standard introspection operation, and it has to answer
-    // under `__type`. This used to fall into the `__schema` branch above and return the whole schema
-    // document under the wrong key, which is an invalid response to the query that was asked
-    // (Jules on #1282).
-    if query.contains("__type") {
+    // `__type(name: "Pool")` is the other standard introspection operation, and it answers under
+    // `__type`. The name comes from the parsed argument rather than a hand-rolled scan of the text.
+    if let Some(root) = roots.iter().find(|r| r.name == "__type") {
         let doc = crate::graph_schema::introspection::render(&schema);
-        let found = type_argument(&query).and_then(|want| {
-            doc["__schema"]["types"]
-                .as_array()?
-                .iter()
-                .find(|t| t["name"].as_str() == Some(want.as_str()))
-                .cloned()
-        });
+        let found = root
+            .args
+            .get("name")
+            .and_then(|v| match v {
+                crate::graph_query::Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .and_then(|want| {
+                doc["__schema"]["types"]
+                    .as_array()?
+                    .iter()
+                    .find(|t| t["name"].as_str() == Some(want.as_str()))
+                    .cloned()
+            });
         return (
             StatusCode::OK,
             // A name the schema does not declare is `null`, not an error: that is what introspection
@@ -1612,11 +1625,6 @@ async fn graph_graphql(
             Json(serde_json::json!({"data": {"__type": found}})),
         );
     }
-    // RFC-0053 S2 (#1266): compile the operation and run it over the nest's views.
-    let roots = match crate::graph_query::parse_with(&query, &vars) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
-    };
     let mut data = serde_json::Map::new();
     for root in &roots {
         // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
@@ -1702,27 +1710,6 @@ fn graph_shape(
         }
     }
     serde_json::Value::Object(out)
-}
-
-/// The `name:` argument of a `__type(name: "…")` selection.
-///
-/// A deliberately small scan rather than the S2 parser: that one resolves root fields against the
-/// schema and would refuse `__type` as an unknown root, which is correct for it and useless here.
-fn type_argument(query: &str) -> Option<String> {
-    let at = query.find("__type")? + "__type".len();
-    let rest = &query[at..];
-    let open = rest.find('(')?;
-    // Nothing but whitespace may sit between the field name and its arguments, or this is some other
-    // token that merely starts with `__type`.
-    if !rest[..open].trim().is_empty() {
-        return None;
-    }
-    let close = rest.find(')')?;
-    let args = &rest[open + 1..close];
-    let name_at = args.find("name")?;
-    let q = args[name_at..].find('"')? + name_at + 1;
-    let end = args[q..].find('"')? + q;
-    Some(args[q..end].to_string())
 }
 
 /// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
@@ -5284,6 +5271,25 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}]),
             "variables from the request body must bind: {body}"
+        );
+
+        // Introspection is chosen from the parsed root field name, not by searching the text. A
+        // filter value that happens to read `__schema` is an ordinary string, and answering it with
+        // the schema document loses the caller's query entirely (Jules on #1282).
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { hooks: "__schema" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["data"]["__schema"].is_null(),
+            "a string literal must not route to introspection: {body}"
+        );
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([]),
+            "it must run as the filter it is, and no pool has that hook: {body}"
         );
 
         // `__type` is the other standard introspection operation, and it has to answer under

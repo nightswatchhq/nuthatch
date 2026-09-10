@@ -38,6 +38,10 @@ pub struct RootField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub name: String,
+    /// Arguments written on this field. Recorded rather than refused for the same reason as the
+    /// sub-selection below: a real introspection query writes `fields(includeDeprecated: true)`, and
+    /// the handler answers introspection itself.
+    pub args: BTreeMap<String, Value>,
     /// Empty for a scalar.
     pub sub: Vec<Selection>,
 }
@@ -74,12 +78,6 @@ impl Value {
             ),
             serde_json::Value::Null => return None,
         })
-    }
-    fn as_i64(&self) -> Option<i64> {
-        match self {
-            Value::Int(n) => Some(*n),
-            _ => None,
-        }
     }
     /// The SQL literal for this value. Strings are single-quoted with internal quotes doubled; there
     /// is no other escaping because there is no other type that reaches a literal position.
@@ -162,12 +160,32 @@ impl fmt::Display for Unsupported {
 }
 
 /// Parse the root fields of an operation, with their arguments.
-/// Levels of sub-selection a selection set may contain.
+/// Levels of relation traversal `compile` will lower.
 ///
 /// One, matching `E_orderBy`'s traversal depth in the recorded reference: graph-node emits
 /// `token0__symbol` and no `token0__whitelistPools__id`, so one level is the depth the schema itself
-/// advertises. Deeper is refused by name rather than answered with an N+1 walk.
+/// advertises. Deeper parses - the handler needs deep selections for introspection - and is refused
+/// by name at lowering rather than answered with an N+1 walk.
 const MAX_TRAVERSAL: usize = 1;
+
+/// The field at which `sel` exceeds `budget` levels of traversal, if any.
+///
+/// Recursive rather than a one-level `!sub.is_empty()` test, so [`MAX_TRAVERSAL`] is the thing being
+/// enforced instead of a comment next to a hand-unrolled check of it.
+fn too_deep(sel: &[Selection], budget: usize) -> Option<&Selection> {
+    for s in sel {
+        if s.sub.is_empty() {
+            continue;
+        }
+        if budget == 0 {
+            return Some(s);
+        }
+        if let Some(deeper) = too_deep(&s.sub, budget - 1) {
+            return Some(deeper);
+        }
+    }
+    None
+}
 
 /// The base table's alias. Every column is qualified with it; see `compile`.
 const BASE: &str = "b";
@@ -222,7 +240,7 @@ pub fn parse_with(
         };
         c.trivia();
         let sel = if c.peek() == Some(b'{') {
-            c.selection_set(MAX_TRAVERSAL)?
+            c.selection_set()?
         } else {
             Vec::new()
         };
@@ -273,11 +291,15 @@ impl<'a> Cursor<'a> {
         }
         Ok(String::from_utf8_lossy(&self.b[start..self.i]).into_owned())
     }
-    /// A selection set, where `depth` is how many further levels of sub-selection may be entered.
+    /// A selection set, to any depth, with the arguments each field carries.
     ///
-    /// One level is what a relation traversal costs (`pools { token0 { symbol } }`), and it is also
-    /// what `_meta { block { number } }` costs, so the same budget serves both.
-    fn selection_set(&mut self, depth: usize) -> Result<Vec<Selection>, Unsupported> {
+    /// **No depth limit and no argument refusal here.** Both belong to lowering: an introspection
+    /// query is about twenty levels deep and writes `fields(includeDeprecated: true)`, and the
+    /// handler answers introspection without the compiler ever seeing it. Refusing depth while
+    /// parsing made introspection unaskable through the parser, which is what forced the handler to
+    /// detect it by searching the raw text - and a filter value of `"__schema"` then routed a
+    /// perfectly ordinary query to the schema document (Jules on #1282).
+    fn selection_set(&mut self) -> Result<Vec<Selection>, Unsupported> {
         self.i += 1; // '{'
         let mut out = Vec::new();
         loop {
@@ -292,20 +314,18 @@ impl<'a> Cursor<'a> {
             }
             let name = self.ident()?;
             self.trivia();
-            // Arguments on a nested field - `swaps(first: 5)` - need the join that field has not
-            // got, and a dropped `first` on a relation returns every related row. Refuse by name.
-            if self.peek() == Some(b'(') {
-                return Err(Unsupported::NestedSelection(name));
-            }
+            let args = if self.peek() == Some(b'(') {
+                self.args()?
+            } else {
+                BTreeMap::new()
+            };
+            self.trivia();
             let sub = if self.peek() == Some(b'{') {
-                if depth == 0 {
-                    return Err(Unsupported::NestedSelection(name));
-                }
-                self.selection_set(depth - 1)?
+                self.selection_set()?
             } else {
                 Vec::new()
             };
-            out.push(Selection { name, sub });
+            out.push(Selection { name, args, sub });
         }
     }
     /// Consume an optional operation header, leaving the cursor on the selection set's `{`.
@@ -580,6 +600,9 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         .find(|e| e.name == entity)
         .expect("resolve_root returned an entity the schema has");
 
+    if let Some(s) = too_deep(&root.sel, MAX_TRAVERSAL) {
+        return Err(Unsupported::NestedSelection(s.name.clone()));
+    }
     // Every column is qualified with the base alias whether or not this query joins. One shape
     // rather than two, and a relation whose target happens to share a column name - `id` always
     // does - cannot then turn a working query into an ambiguous one on some other schema.
@@ -635,9 +658,14 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             " LEFT JOIN \"{tview}\" {alias} ON {alias}.\"id\" = {BASE}.\"{}\"",
             sel.name
         ));
+        // Arguments on a traversed field need that field's own join plus its own `LIMIT`; a dropped
+        // `first` on a relation returns every related row.
+        if !sel.args.is_empty() {
+            return Err(Unsupported::NestedSelection(sel.name.clone()));
+        }
         let mut sub = Vec::new();
         for s in &sel.sub {
-            if !s.sub.is_empty() {
+            if !s.args.is_empty() {
                 return Err(Unsupported::NestedSelection(s.name.clone()));
             }
             if !tent.fields.iter().any(|x| x.name == s.name) {
@@ -734,17 +762,28 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 
         // graph-node's defaults, taken from the recorded reference: first = 100, skip = 0, and
         // §Query semantics caps first at 1000.
-        let first = root
-            .args
-            .get("first")
-            .and_then(Value::as_i64)
-            .unwrap_or(100);
+        // A supplied argument is never silently replaced by the default. `first: "1"` used to fall
+        // through `as_i64` to `LIMIT 100`, which is this module's one prohibition - approximating a
+        // value and calling the endpoint drop-in (Jules on #1282).
+        let first = match root.args.get("first") {
+            None => 100,
+            Some(Value::Int(n)) => *n,
+            Some(_) => {
+                return Err(Unsupported::Argument(
+                    "first must be an integer".to_string(),
+                ))
+            }
+        };
         if !(0..=1000).contains(&first) {
             return Err(Unsupported::Argument(format!(
                 "first must be between 0 and 1000, got {first}"
             )));
         }
-        let skip = root.args.get("skip").and_then(Value::as_i64).unwrap_or(0);
+        let skip = match root.args.get("skip") {
+            None => 0,
+            Some(Value::Int(n)) => *n,
+            Some(_) => return Err(Unsupported::Argument("skip must be an integer".to_string())),
+        };
         if skip < 0 {
             return Err(Unsupported::Argument(format!(
                 "skip must not be negative, got {skip}"
@@ -998,16 +1037,23 @@ type Swap @entity { id: ID! pool: Pool! }
             "{e:?}"
         );
 
-        // One level only, matching the depth `E_orderBy` advertises in the reference.
-        let e = parse("{ pools { token0 { pool { id } } } }").expect_err("two levels");
+        // One level only, matching the depth `E_orderBy` advertises in the reference. Refused at
+        // lowering rather than while parsing, because an introspection query is far deeper and the
+        // handler has to be able to see its root field name.
+        let e = compile(&schema(), &one("{ pools { token0 { pool { id } } } }"))
+            .expect_err("two levels");
         assert!(
             matches!(&e, Unsupported::NestedSelection(n) if n == "pool"),
             "{e:?}"
         );
+        // But it does parse, so `__schema { types { fields { … } } }` can reach the handler.
+        assert!(parse("{ pools { token0 { pool { id } } } }").is_ok());
 
         // Arguments on a traversed field need the same join plus its own LIMIT; dropping `first`
-        // there would return every related row.
-        let e = parse("{ pools { swaps(first: 5) { id } } }").expect_err("nested arguments");
+        // there would return every related row. Also refused at lowering - a real introspection
+        // query writes `fields(includeDeprecated: true)`.
+        let e = compile(&schema(), &one("{ pools { swaps(first: 5) { id } } }"))
+            .expect_err("nested arguments");
         assert!(
             matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
             "{e:?}"
@@ -1019,6 +1065,29 @@ type Swap @entity { id: ID! pool: Pool! }
             matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "nope"),
             "{e:?}"
         );
+
+        // `first` and `skip` must be integers. Falling through to the default meant `first: "1"`
+        // silently became `LIMIT 100` - a supplied argument replaced by a guess, which is the one
+        // thing this module says it never does (Jules on #1282).
+        for (q, which) in [
+            (r#"{ pools(first: "1") { id } }"#, "first"),
+            (r#"{ pools(skip: "10") { id } }"#, "skip"),
+            ("{ pools(first: true) { id } }", "first"),
+        ] {
+            let e = compile(&schema(), &one(q)).expect_err(q);
+            assert!(
+                matches!(&e, Unsupported::Argument(a) if a.contains(which)),
+                "{q}: {e:?}"
+            );
+        }
+        // And a variable carrying the wrong type is refused the same way, since that is how a client
+        // actually sends one.
+        let roots = parse_with(
+            "query P($n: Int!) { pools(first: $n) { id } }",
+            &BTreeMap::from([("n".to_string(), Value::Str("1".into()))]),
+        )
+        .unwrap();
+        assert!(compile(&schema(), &roots[0]).is_err());
 
         // A composite root with no selection set is not a legal query, and answering `*` for one
         // would invent a field list the caller never asked for.
@@ -1036,6 +1105,14 @@ type Swap @entity { id: ID! pool: Pool! }
         );
         // A derived list is the same: composite, so it needs one too.
         assert!(compile(&schema(), &one("{ pools { swaps } }")).is_err());
+    }
+
+    fn leaf(name: &str) -> Selection {
+        Selection {
+            name: name.into(),
+            args: BTreeMap::new(),
+            sub: vec![],
+        }
     }
 
     #[test]
@@ -1099,21 +1176,13 @@ type Swap @entity { id: ID! pool: Pool! }
         assert_eq!(
             roots[0].sel,
             vec![
-                Selection {
-                    name: "id".into(),
-                    sub: vec![],
-                },
+                leaf("id"),
                 Selection {
                     name: "swaps".into(),
-                    sub: vec![Selection {
-                        name: "id".into(),
-                        sub: vec![],
-                    }],
+                    args: BTreeMap::new(),
+                    sub: vec![leaf("id")],
                 },
-                Selection {
-                    name: "createdAtTimestamp".into(),
-                    sub: vec![],
-                },
+                leaf("createdAtTimestamp"),
             ],
             "the sub-selection is recorded and the field after it is not dropped"
         );
