@@ -2918,7 +2918,15 @@ fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
                 let mut k = next;
                 skip_ws_str(body, &mut k);
                 if body[k..].starts_with('(') {
-                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                    let arg = take_expr(body, k + 1);
+                    if let Some(col) = event_column(&arg) {
+                        return Some(col);
+                    }
+                    // `new Pool(poolId)`, with `poolId` a local aliasing the parameter (#1277).
+                    if let Some(col) = local_root(&arg)
+                        .and_then(|v| plain_local_expr(body, &v))
+                        .and_then(|e| event_column(&e))
+                    {
                         return Some(col);
                     }
                 }
@@ -2931,7 +2939,15 @@ fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
                 let mut k = next;
                 skip_ws_str(body, &mut k);
                 if body[k..].starts_with('(') {
-                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                    let arg = take_expr(body, k + 1);
+                    if let Some(col) = event_column(&arg) {
+                        return Some(col);
+                    }
+                    // `new Pool(poolId)`, with `poolId` a local aliasing the parameter (#1277).
+                    if let Some(col) = local_root(&arg)
+                        .and_then(|v| plain_local_expr(body, &v))
+                        .and_then(|e| event_column(&e))
+                    {
                         return Some(col);
                     }
                 }
@@ -2995,7 +3011,9 @@ pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> 
     let ident = local_root(&asg.expr)?;
     let arg = constructor_arg_for(&func.body, &ident)
         .or_else(|| load_arg_for(&func.body, &ident))
-        .or_else(|| create_arg_for(&func.body, &ident))?;
+        .or_else(|| create_arg_for(&func.body, &ident))
+        // A local that aliases an event parameter rather than holding an entity (#1277).
+        .or_else(|| plain_local_expr(&func.body, &ident))?;
     event_column(&arg)
 }
 
@@ -3015,6 +3033,76 @@ pub(crate) fn event_handler_for<'a>(
         (f.kind == HandlerKind::Event || f.kind == HandlerKind::Call)
             && f.calls.contains(&func.name)
     })
+}
+
+/// `const <var> = <expr>` where `<expr>` is a plain expression rather than an entity constructor.
+///
+/// The entity-aware lookups below only find a local that holds an *entity* - `new Pool(..)`,
+/// `Pool.load(..)`, `Pool.create(..)`. A local that merely aliases an event parameter was invisible,
+/// and `Pool.id` is exactly that shape:
+///
+/// ```text
+/// const poolId = event.params.id.toHexString()   // poolManager.ts:37
+/// const pool = new Pool(poolId)                  // poolManager.ts:68
+/// ```
+///
+/// Without this the emitter reported the primary key of all 132,765 pools as having no corresponding
+/// decoded column, while `pool_manager__initialize.id` held it already hex-encoded, and every field
+/// the `pool` view did answer became unalignable against a reference (#1277).
+///
+/// The returned expression is handed to [`event_column`], which is strict: `strip_converters` drops
+/// only the representation-only suffixes, and any arithmetic residue after the parameter name yields
+/// no column at all (#1248). So a local holding a *transformed* parameter still resolves to nothing
+/// rather than to the wrong column.
+fn plain_local_expr(body: &str, var: &str) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() {
+        if !body.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &body[i..];
+        let kw = if rest.starts_with("let ") || rest.starts_with("var ") {
+            4
+        } else if rest.starts_with("const ") {
+            6
+        } else {
+            i += 1;
+            continue;
+        };
+        // Not a keyword if it is the tail of a longer identifier.
+        if i > 0 {
+            let p = body.as_bytes()[i - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut k = i + kw;
+        let Some(v) = take_ident_str(body, &mut k) else {
+            i += 1;
+            continue;
+        };
+        skip_ws_str(body, &mut k);
+        if !body[k..].starts_with('=') {
+            i += 1;
+            continue;
+        }
+        k += 1;
+        skip_ws_str(body, &mut k);
+        if v == var {
+            let end = body[k..]
+                .find([';', '\n'])
+                .map(|o| k + o)
+                .unwrap_or(body.len());
+            let e = collapse_ws(&body[k..end]);
+            if !e.is_empty() {
+                return Some(e);
+            }
+        }
+        i = k.max(i + 1);
+    }
+    None
 }
 
 fn local_root(expr: &str) -> Option<String> {

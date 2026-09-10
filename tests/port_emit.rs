@@ -1128,3 +1128,69 @@ type Token @entity {
     assert!(manifest.contains("name = \"manual\""));
     assert!(nest.path().join("entities/manual.sql").is_file());
 }
+
+/// #1277. A local that only aliases an event parameter is the shape every `Pool.id` takes in the
+/// real Uniswap V4 subgraph:
+///
+/// ```text
+/// const poolId = event.params.id.toHexString()
+/// const pool = new Pool(poolId)
+/// ```
+///
+/// The emitter resolved the constructor argument with `event_column` alone, which sees a bare
+/// identifier and refuses, so the primary key of all 132,765 pools was reported as *"no decoded
+/// column corresponds to it"* while the column sat in `pool_manager__initialize` already
+/// hex-encoded. Without an id in the view, every other field the view answered was unalignable
+/// against a reference, which is why this one field decided the acceptance port.
+#[test]
+fn an_id_from_a_local_aliasing_an_event_param_reaches_its_column() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  const poolId = event.params.pool.toHexString()
+  const pool = new Pool(poolId)
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains("AS \"id\""),
+        "`Pool.id` must bind to the column its local aliases (#1277):\n{sql}"
+    );
+    assert!(
+        sql.contains("\"pool\""),
+        "and the column is `pool`, as the ABI names it:\n{sql}"
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|s| s.name().contains("id")),
+        "`Pool.id` must not be skipped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+
+    // The view has to load, not merely mention the column.
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}
