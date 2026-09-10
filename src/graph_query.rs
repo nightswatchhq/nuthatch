@@ -741,6 +741,8 @@ pub enum Shape {
     Object {
         /// The key to answer under - `token0`, or its alias.
         key: String,
+        /// A column holding the target's id, non-null exactly when the joined row exists.
+        marker: String,
         /// Each selected sub-field's key, and the column alias it arrives under.
         fields: Vec<(String, String)>,
     },
@@ -864,11 +866,17 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 if !sub.sub.is_empty() || !sub.args.is_empty() {
                     return Err(Unsupported::NestedSelection(sub.name.clone()));
                 }
-                if !child.fields.iter().any(|f| f.name == sub.name) {
+                let Some(cf) = child.fields.iter().find(|f| f.name == sub.name) else {
                     return Err(Unsupported::UnknownField {
                         entity: target.to_string(),
                         field: sub.name.clone(),
                     });
+                };
+                if let Some(inner_target) = cf.ty.entity_name() {
+                    return Err(Unsupported::Syntax(format!(
+                        "`{target}.{}` returns `{inner_target}`, which needs a selection set",
+                        sub.name
+                    )));
                 }
                 packed.push(format!("\"{}\" := {alias}.\"{}\"", sub.name, sub.name));
             }
@@ -915,16 +923,31 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             " LEFT JOIN \"{tview}\" {alias} ON {alias}.\"id\" = {BASE}.\"{}\"",
             sel.name
         ));
+        // The target's own id, always selected, so shaping can tell "no such row" from "the row
+        // exists and every selected field happens to be null". Using the selected values themselves
+        // answered `null` for a relation that was really there (Jules on #1282).
+        let marker = format!("{alias}__present");
+        cols.push(format!("{alias}.\"id\" AS \"{marker}\""));
         let mut sub = Vec::new();
         for s in &sel.sub {
             if !s.args.is_empty() {
                 return Err(Unsupported::NestedSelection(s.name.clone()));
             }
-            if !tent.fields.iter().any(|x| x.name == s.name) {
+            let Some(cf) = tent.fields.iter().find(|x| x.name == s.name) else {
                 return Err(Unsupported::UnknownField {
                     entity: target.clone(),
                     field: s.name.clone(),
                 });
+            };
+            // The same rule as the outer selection: a composite field needs a selection set. Without
+            // this a traversed child's own relation was emitted as a scalar column, so
+            // `{ pools { token0 { whitelistPools } } }` returned a stored id list under a field the
+            // schema declares as an object list (Jules on #1282).
+            if let Some(inner_target) = cf.ty.entity_name() {
+                return Err(Unsupported::Syntax(format!(
+                    "`{target}.{}` returns `{inner_target}`, which needs a selection set",
+                    s.name
+                )));
             }
             let col = format!("{alias}__{}", s.name);
             cols.push(format!("{alias}.\"{}\" AS \"{col}\"", s.name));
@@ -932,6 +955,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         }
         shape.push(Shape::Object {
             key: sel.key.clone(),
+            marker,
             fields: sub,
         });
     }
@@ -1457,7 +1481,9 @@ type Swap @entity { id: ID! pool: Pool! }
         assert_eq!(
             c.sql,
             concat!(
-                r#"SELECT b."id", j1."symbol" AS "j1__symbol" FROM "pool" b"#,
+                // `j1__present` is the target's id, carried so shaping can tell a missing row from
+                // one whose selected fields are all null.
+                r#"SELECT b."id", j1."id" AS "j1__present", j1."symbol" AS "j1__symbol" FROM "pool" b"#,
                 r#" LEFT JOIN "token" j1 ON j1."id" = b."token0""#,
                 r#" ORDER BY b."id" ASC LIMIT 2 OFFSET 0"#
             ),
@@ -1475,10 +1501,28 @@ type Swap @entity { id: ID! pool: Pool! }
                 },
                 Shape::Object {
                     key: "token0".into(),
+                    marker: "j1__present".into(),
                     fields: vec![("symbol".into(), "j1__symbol".into())],
                 },
             ],
             "only the shape knows `j1__symbol` belongs under `token0`"
+        );
+
+        // A composite field inside a traversal needs a selection set too. Without this the child's own
+        // relation was emitted as a scalar column, returning a stored id under a field the schema
+        // declares as an object.
+        let e = compile(&schema(), &one("{ pools { token0 { pools } } }"))
+            .expect_err("a composite child needs a selection set");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("Token.pools")),
+            "{e:?}"
+        );
+        // And the same inside a derived list.
+        let e = compile(&schema(), &one("{ pools { swaps { pool } } }"))
+            .expect_err("a composite child of a derived list too");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("Swap.pool")),
+            "{e:?}"
         );
 
         // A derived list is not joined at all - joining it would multiply the parent row per child
@@ -1774,6 +1818,7 @@ type Swap @entity { id: ID! pool: Pool! }
             c.shape,
             vec![Shape::Object {
                 key: "t".into(),
+                marker: "j0__present".into(),
                 fields: vec![("s".into(), "j0__symbol".into())],
             }],
             "the join is still on token0, the answer is still under t"

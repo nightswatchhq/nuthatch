@@ -407,6 +407,66 @@ fn every_object_type_matches_the_reference_field_for_field() {
     );
 }
 
+/// The `__Schema` fields either side of `types`, which a standard client selects and which the diff
+/// below cannot see because it indexes `types` only.
+///
+/// The recording query originally asked for `queryType` and `types` and nothing else, so the reference
+/// was silent about the rest and no assertion here could have noticed them missing. That is the same
+/// fault as comparing type *names* and not kinds, one level up: a golden test is bounded by what the
+/// recording asked for, not by what the surface has.
+#[test]
+fn the_schema_level_fields_match_the_reference() {
+    let ours = nuthatch::graph_schema::introspection::render(&parsed());
+    let r = reference();
+    for field in ["queryType", "mutationType", "subscriptionType"] {
+        assert_eq!(
+            ours["__schema"][field], r["__schema"][field],
+            "__schema.{field}"
+        );
+    }
+    // Directives, compared whole: name, locations, and each argument's name and rendered type.
+    let render_dirs = |v: &serde_json::Value| -> Vec<String> {
+        v["__schema"]["directives"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no directives in {}", v["__schema"]["directives"]))
+            .iter()
+            .map(|d| {
+                let args: Vec<String> = d["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| {
+                        fn ty(t: &serde_json::Value) -> String {
+                            match t["kind"].as_str().unwrap_or("") {
+                                "NON_NULL" => format!("{}!", ty(&t["ofType"])),
+                                "LIST" => format!("[{}]", ty(&t["ofType"])),
+                                k => format!("{k}:{}", t["name"].as_str().unwrap_or("?")),
+                            }
+                        }
+                        format!("{}: {}", a["name"].as_str().unwrap_or("?"), ty(&a["type"]))
+                    })
+                    .collect();
+                let locs: Vec<&str> = d["locations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|l| l.as_str())
+                    .collect();
+                format!(
+                    "{} {locs:?} ({})",
+                    d["name"].as_str().unwrap_or("?"),
+                    args.join(", ")
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        render_dirs(&ours),
+        render_dirs(&r),
+        "the five directives, their locations and their argument types"
+    );
+}
+
 /// RFC-0053 §Acceptance: the generated introspection against the recorded one, for every type the
 /// reference has, comparing kind, field names, argument names and rendered types.
 ///

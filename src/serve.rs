@@ -1722,17 +1722,23 @@ fn graph_shape(
                 };
                 out.insert(key.clone(), list);
             }
-            Shape::Object { key, fields } => {
+            Shape::Object {
+                key,
+                marker,
+                fields,
+            } => {
                 let mut inner = serde_json::Map::new();
-                let mut any = false;
                 for (sub_key, col) in fields {
                     let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
-                    any |= !v.is_null();
                     inner.insert(sub_key.clone(), v);
                 }
+                // The marker is the target's id, so it is non-null exactly when the `LEFT JOIN` found a
+                // row. Deciding from the *selected* values instead answered `null` for a relation that
+                // existed but whose selected fields were all null - a real object reported as absent.
+                let present = row.get(marker).is_some_and(|v| !v.is_null());
                 out.insert(
                     key.clone(),
-                    if any {
+                    if present {
                         serde_json::Value::Object(inner)
                     } else {
                         serde_json::Value::Null
@@ -5141,7 +5147,8 @@ mod tests {
         std::fs::write(
             d.path().join("views/pool.sql"),
             "CREATE VIEW pool AS SELECT '0xaaa' AS id, 42 AS liquidity, '0xhook' AS hooks, '0xt1' AS token0 \
-             UNION ALL SELECT '0xbbb', 7, '0xhook2', '0xmissing';\n",
+             UNION ALL SELECT '0xbbb', 7, '0xhook2', '0xmissing' \
+             UNION ALL SELECT '0xccc', 99, '0xhook3', '0xt2';\n",
         )
         .unwrap();
         std::fs::write(
@@ -5152,7 +5159,10 @@ mod tests {
         .unwrap();
         std::fs::write(
             d.path().join("views/token.sql"),
-            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals;\n",
+            // `0xt2` exists but has nothing in its selected fields: that is the row that tells a
+            // missing join apart from an all-null one.
+            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals \
+             UNION ALL SELECT '0xt2', NULL, NULL;\n",
         )
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
@@ -5260,6 +5270,7 @@ mod tests {
             serde_json::json!([
                 {"id": "0xaaa", "liquidity": 42},
                 {"id": "0xbbb", "liquidity": 7},
+                {"id": "0xccc", "liquidity": 99},
             ]),
             "a plain collection must answer rows from the nest's view: {body}"
         );
@@ -5323,9 +5334,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        // Both bound variables show: `liquidity_gt: 10` excludes `0xbbb` at 7 and keeps the two above
+        // it, and `first: 5` is wide enough not to be what trimmed the list.
         assert_eq!(
             body["data"]["pools"],
-            serde_json::json!([{"id": "0xaaa"}]),
+            serde_json::json!([{"id": "0xaaa"}, {"id": "0xccc"}]),
             "variables from the request body must bind: {body}"
         );
     }
@@ -5488,6 +5501,7 @@ mod tests {
             serde_json::json!([
                 {"id": "0xaaa", "swaps": [{"id": "s1", "amount": 5}, {"id": "s2", "amount": 7}]},
                 {"id": "0xbbb", "swaps": []},
+                {"id": "0xccc", "swaps": []},
             ]),
             "a derived list must nest, in child id order, and be [] when empty: {body}"
         );
@@ -5507,6 +5521,10 @@ mod tests {
             serde_json::json!([
                 {"id": "0xaaa", "token0": {"symbol": "WETH", "decimals": 18}},
                 {"id": "0xbbb", "token0": null},
+                // `0xccc`'s token exists but its selected fields are all null. An object of nulls,
+                // not `null`: deciding presence from the selected values reported a real row as
+                // absent, which is why the join now carries the target's id as a marker.
+                {"id": "0xccc", "token0": {"symbol": null, "decimals": null}},
             ]),
             "a to-one traversal must nest, and a missing target must not drop the parent: {body}"
         );

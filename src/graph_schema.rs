@@ -1000,7 +1000,43 @@ pub mod introspection {
                 ))
             })
             .collect();
-        let mut doc = json!({"__schema":{"queryType":{"name":"Query"},"types":types}});
+        // The `__Schema` fields a standard client asks for, all of them. Omitting them meant a
+        // normal generated introspection request got a response missing fields it had selected, and
+        // the recorded reference could not catch it because the *recording query* never asked for them
+        // either - a golden diff cannot compare what was never captured (Jules on #1282).
+        //
+        // Measured against the live deployment: both operation types are `null`, which agrees with
+        // this compiler refusing `mutation` and `subscription` outright, and there are exactly five
+        // directives - GraphQL's own `skip` and `include` plus graph-node's `entity`, `subgraphId` and
+        // `derivedFrom`.
+        let bool_arg = |name: &str| {
+            json!({"name":name,"description":Value::Null,
+                   "type":type_ref("Boolean!"),"defaultValue":Value::Null})
+        };
+        let string_arg = |name: &str| {
+            json!({"name":name,"description":Value::Null,
+                   "type":type_ref("String!"),"defaultValue":Value::Null})
+        };
+        const ON_SELECTION: [&str; 3] = ["FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"];
+        let directives = json!([
+            {"name":"skip","description":Value::Null,"locations":ON_SELECTION,
+             "args":[bool_arg("if")]},
+            {"name":"include","description":Value::Null,"locations":ON_SELECTION,
+             "args":[bool_arg("if")]},
+            {"name":"entity","description":Value::Null,"locations":["OBJECT"],"args":[]},
+            {"name":"subgraphId","description":Value::Null,"locations":["OBJECT"],
+             "args":[string_arg("id")]},
+            {"name":"derivedFrom","description":Value::Null,"locations":["FIELD_DEFINITION"],
+             "args":[string_arg("field")]},
+        ]);
+        let mut doc = json!({"__schema":{
+            "queryType":{"name":"Query"},
+            // A nest serves queries only, which is why `parse` refuses the other two outright.
+            "mutationType": Value::Null,
+            "subscriptionType": Value::Null,
+            "types": types,
+            "directives": directives,
+        }});
         let dangling = resolve_kinds(&mut doc, &kinds);
         assert!(
             dangling.is_empty(),
