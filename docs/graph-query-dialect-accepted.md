@@ -41,6 +41,32 @@ missing row is exactly the case a failed subgraph leaves behind.
 
 Because the target's id is unique the join cannot multiply rows, so `first` still means what it says.
 
+A **`@derivedFrom` list** is aggregated rather than joined, because a join would multiply the parent row
+once per child and `first` would stop meaning anything. One correlated subquery per parent keeps the
+parent's row count and the child's page size separate:
+
+```graphql
+{ pools { id swaps { id amount } } }
+```
+
+```sql
+SELECT b."id",
+  coalesce((SELECT to_json(list(t.s)) FROM (
+     SELECT struct_pack("id" := c1."id", "amount" := c1."amount") AS s
+     FROM "swap" c1 WHERE c1."pool" = b."id" ORDER BY c1."id" ASC LIMIT 100) t), '[]') AS "c1__swaps"
+FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0
+```
+
+The join key is the schema author's: `@derivedFrom(field: "pool")` says `Swap.pool` holds the parent id.
+
+`to_json(list(struct_pack(…)))` in preference to returning a `LIST` of `STRUCT`, so the column arrives
+as a plain JSON string and nothing depends on how the row serialiser handles a nested DuckDB type. The
+inner subquery exists because `ORDER BY` and `LIMIT` cannot sit inside the aggregate.
+
+**`coalesce` is not decoration.** `list()` over zero rows is `NULL` in DuckDB - measured with the CLI
+before any of this was written - so a parent with no children would answer `null` for a field the
+generated schema types `[Swap!]!`.
+
 One level, matching the depth `E_orderBy` advertises in the reference: graph-node emits
 `token0__symbol` and no `token0__whitelistPools__id`.
 
@@ -142,8 +168,8 @@ after which the whole operation reads as garbage.
 | refused | why it is not approximated |
 |---|---|
 | `block:` / `block_gte:` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right |
-| a **to-many** or `@derivedFrom` traversal (`pools { swaps { id } }`) | there is no id column on the parent row to join against, and joining it would multiply rows so `first` would stop meaning what it says. Needs an aggregation and its own slice |
-| arguments on a traversed field (`swaps(first: 5)`) | needs that same join plus its own `LIMIT`; a dropped `first` there returns every related row |
+| arguments on a traversed field (`swaps(first: 5)`) | the relation would need its own `LIMIT`, and a dropped `first` there returns every related row. Refused **before** any traversal is lowered: the guard once sat after the aggregation branch, so this compiled with the argument silently gone |
+| a **stored** list of entity ids (`Token.whitelistPools`, no `@derivedFrom`) | a different shape needing `unnest`, not the aggregation below, and using the wrong one would answer with the wrong join |
 | a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
 | an entity root with no selection set | not a legal GraphQL query, and answering `*` would invent a field list the caller never asked for |
 | an operator the schema does not declare for that field's type | `sender_starts_with` on a `Bytes` field: our own generated schema says it does not exist |

@@ -1605,7 +1605,7 @@ async fn graph_graphql(
             "__schema" => {
                 let d =
                     doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
-                data.insert("__schema".into(), d["__schema"].clone());
+                data.insert(root.key.clone(), d["__schema"].clone());
                 continue;
             }
             // The other standard introspection operation. The name comes from the parsed argument,
@@ -1628,7 +1628,7 @@ async fn graph_graphql(
                             .find(|t| t["name"].as_str() == Some(want.as_str()))
                             .cloned()
                     });
-                data.insert("__type".into(), found.unwrap_or(serde_json::Value::Null));
+                data.insert(root.key.clone(), found.unwrap_or(serde_json::Value::Null));
                 continue;
             }
             // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
@@ -1642,7 +1642,7 @@ async fn graph_graphql(
                     .flatten()
                     .and_then(|v| v.parse::<u64>().ok());
                 data.insert(
-                    "_meta".into(),
+                    root.key.clone(),
                     serde_json::json!({
                         "block": {"number": last},
                         "deployment": s.nid.clone(),
@@ -1670,7 +1670,7 @@ async fn graph_graphql(
                 } else {
                     serde_json::Value::Array(shaped)
                 };
-                data.insert(root.name.clone(), value);
+                data.insert(root.key.clone(), value);
             }
             Err(msg) => return (StatusCode::OK, Json(gql_error(&msg))),
         }
@@ -1695,14 +1695,16 @@ fn graph_shape(
     let mut out = serde_json::Map::new();
     for sh in &compiled.shape {
         match sh {
-            Shape::Scalar(name) => {
+            // `key` is what the caller asked to see it under, `col` is where it arrives. They differ
+            // when an alias was written - `{ p: pools { n: id } }`.
+            Shape::Scalar { key, col } => {
                 out.insert(
-                    name.clone(),
-                    row.get(name).cloned().unwrap_or(serde_json::Value::Null),
+                    key.clone(),
+                    row.get(col).cloned().unwrap_or(serde_json::Value::Null),
                 );
             }
             // A `@derivedFrom` list arrives as one JSON array in one column.
-            Shape::List { name, col } => {
+            Shape::List { key, col } => {
                 let v = row.get(col);
                 let list = match v {
                     // Already parsed: the row serialiser may hand back a DuckDB `json` column as a
@@ -1713,25 +1715,23 @@ fn graph_shape(
                         // Not an array and not parseable is a bug in the SQL this module wrote, not
                         // something to paper over with `[]` - a caller told an empty list is
                         // indistinguishable from one told the truth.
-                        _ => {
-                            return Err(format!("`{name}` did not come back as a JSON array: {t}"))
-                        }
+                        _ => return Err(format!("`{key}` did not come back as a JSON array: {t}")),
                     },
                     // `coalesce(…, '[]')` means this cannot be null, so null is also a bug.
-                    other => return Err(format!("`{name}` is missing from the row: {other:?}")),
+                    other => return Err(format!("`{key}` is missing from the row: {other:?}")),
                 };
-                out.insert(name.clone(), list);
+                out.insert(key.clone(), list);
             }
-            Shape::Object { name, fields } => {
+            Shape::Object { key, fields } => {
                 let mut inner = serde_json::Map::new();
                 let mut any = false;
-                for (field, col) in fields {
+                for (sub_key, col) in fields {
                     let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
                     any |= !v.is_null();
-                    inner.insert(field.clone(), v);
+                    inner.insert(sub_key.clone(), v);
                 }
                 out.insert(
-                    name.clone(),
+                    key.clone(),
                     if any {
                         serde_json::Value::Object(inner)
                     } else {
@@ -5418,6 +5418,27 @@ mod tests {
         let (d, state) = graph_fixture();
         let _ = &d;
         let ask = graph_ask;
+
+        // Aliases, over HTTP: the handler routes on the schema field name and answers under the
+        // caller's key. That split matters for the introspection roots too, which are routed by name.
+        let body = ask(
+            "/graphql",
+            r#"{ s: __schema { queryType { name } } m: _meta { hasIndexingErrors }
+                 p: pools(first: 1) { n: id t: token0 { sym: symbol } } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(body["data"]["s"]["queryType"]["name"], "Query", "{body}");
+        assert_eq!(body["data"]["m"]["hasIndexingErrors"], false, "{body}");
+        assert_eq!(
+            body["data"]["p"],
+            serde_json::json!([{"n": "0xaaa", "t": {"sym": "WETH"}}]),
+            "an aliased entity root, scalar and traversal all answer under their keys: {body}"
+        );
+        assert!(
+            body["data"]["__schema"].is_null() && body["data"]["pools"].is_null(),
+            "nothing answers under the unaliased name: {body}"
+        );
 
         // `__type` is the other standard introspection operation, and it has to answer under
         // `__type`. It used to fall into the `__schema` branch and return the whole schema document

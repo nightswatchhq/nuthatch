@@ -22,7 +22,12 @@ use crate::graph_schema::{self, Schema};
 /// One root field of an operation, with its arguments and the fields it selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootField {
-    /// As written: `pools`, `pool`, `_meta`.
+    /// The key this root answers under: the alias if one was written, otherwise `name`.
+    ///
+    /// Separate from `name` because `{ p: pools { id } }` looks up `pools` in the schema and answers
+    /// under `p`. Using one string for both either rejects the query or looks up the wrong root.
+    pub key: String,
+    /// The schema's field name: `pools`, `pool`, `_meta`.
     pub name: String,
     pub args: BTreeMap<String, Value>,
     /// What the caller selected, in the order they wrote it, sub-selections included.
@@ -37,6 +42,9 @@ pub struct RootField {
 /// that knows whether a join exists for a given relation, so it is the only place that can decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
+    /// The key this field answers under - the alias if written, otherwise `name`.
+    pub key: String,
+    /// The schema's field name, which is what the column is called.
     pub name: String,
     /// Arguments written on this field. Recorded rather than refused for the same reason as the
     /// sub-selection below: a real introspection query writes `fields(includeDeprecated: true)`, and
@@ -281,6 +289,7 @@ pub fn parse_with(
     Ok(roots
         .into_iter()
         .map(|s| RootField {
+            key: s.key,
             name: s.name,
             args: s.args,
             sel: s.sub,
@@ -312,6 +321,7 @@ fn resolve_spreads(
     for s in sel {
         match s {
             Sel::Field(f, sub) => out.push(Selection {
+                key: f.key.clone(),
                 name: f.name.clone(),
                 args: f.args.clone(),
                 sub: resolve_spreads(sub, fragments, visiting)?,
@@ -421,7 +431,18 @@ impl<'a> Cursor<'a> {
                 }
                 continue;
             }
-            let name = self.ident()?;
+            // `alias: field`. The first identifier is the alias only if a colon follows it, which is
+            // why the colon has to be looked for before anything else is decided.
+            let first = self.ident()?;
+            self.trivia();
+            let (key, name) = if self.peek() == Some(b':') {
+                self.i += 1;
+                self.trivia();
+                let real = self.ident()?;
+                (first, real)
+            } else {
+                (first.clone(), first)
+            };
             self.trivia();
             let args = if self.peek() == Some(b'(') {
                 self.args()?
@@ -436,6 +457,7 @@ impl<'a> Cursor<'a> {
             };
             out.push(Sel::Field(
                 Selection {
+                    key,
                     name,
                     args,
                     sub: Vec::new(),
@@ -712,19 +734,20 @@ fn comparison(suffix: &str) -> Option<&'static str> {
 /// One field of a response object, and where in the SQL row its value comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
-    /// A scalar: the GraphQL field name, which is also its column name.
-    Scalar(String),
+    /// A scalar: the key to answer under, and the column it arrives in. The two differ when the
+    /// caller wrote an alias.
+    Scalar { key: String, col: String },
     /// A to-one relation flattened into the row by a join.
     Object {
-        /// The GraphQL field name - `token0`.
-        name: String,
-        /// Each selected sub-field, and the column alias it arrives under.
+        /// The key to answer under - `token0`, or its alias.
+        key: String,
+        /// Each selected sub-field's key, and the column alias it arrives under.
         fields: Vec<(String, String)>,
     },
     /// A `@derivedFrom` list, aggregated into one JSON array by a correlated subquery.
     List {
-        /// The GraphQL field name - `swaps`.
-        name: String,
+        /// The key to answer under - `swaps`, or its alias.
+        key: String,
         /// The column alias the JSON array arrives under.
         col: String,
     },
@@ -786,8 +809,21 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     entity, sel.name
                 )));
             }
-            cols.push(format!("{BASE}.\"{}\"", sel.name));
-            shape.push(Shape::Scalar(sel.name.clone()));
+            // An aliased scalar needs its own column alias, or two aliases on one field would
+            // collide in the row. `a{i}` rather than the caller's key, because a key is arbitrary
+            // text and could collide with a join's `j{i}__…`.
+            let col = if sel.key == sel.name {
+                cols.push(format!("{BASE}.\"{}\"", sel.name));
+                sel.name.clone()
+            } else {
+                let c = format!("a{i}");
+                cols.push(format!("{BASE}.\"{}\" AS \"{c}\"", sel.name));
+                c
+            };
+            shape.push(Shape::Scalar {
+                key: sel.key.clone(),
+                col,
+            });
             continue;
         }
         // Arguments on a traversed field are refused **before** any traversal is lowered. This guard
@@ -850,7 +886,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 packed.join(", ")
             ));
             shape.push(Shape::List {
-                name: sel.name.clone(),
+                key: sel.key.clone(),
                 col,
             });
             continue;
@@ -892,10 +928,10 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             }
             let col = format!("{alias}__{}", s.name);
             cols.push(format!("{alias}.\"{}\" AS \"{col}\"", s.name));
-            sub.push((s.name.clone(), col));
+            sub.push((s.key.clone(), col));
         }
         shape.push(Shape::Object {
-            name: sel.name.clone(),
+            key: sel.key.clone(),
             fields: sub,
         });
     }
@@ -1323,9 +1359,12 @@ type Swap @entity { id: ID! pool: Pool! }
         assert_eq!(
             c.shape,
             vec![
-                Shape::Scalar("id".into()),
+                Shape::Scalar {
+                    key: "id".into(),
+                    col: "id".into(),
+                },
                 Shape::List {
-                    name: "swaps".into(),
+                    key: "swaps".into(),
                     col: "c1__swaps".into(),
                 },
             ]
@@ -1372,9 +1411,12 @@ type Swap @entity { id: ID! pool: Pool! }
         assert_eq!(
             c.shape,
             vec![
-                Shape::Scalar("id".into()),
+                Shape::Scalar {
+                    key: "id".into(),
+                    col: "id".into(),
+                },
                 Shape::Object {
-                    name: "token0".into(),
+                    key: "token0".into(),
                     fields: vec![("symbol".into(), "j1__symbol".into())],
                 },
             ],
@@ -1478,6 +1520,7 @@ type Swap @entity { id: ID! pool: Pool! }
 
     fn leaf(name: &str) -> Selection {
         Selection {
+            key: name.into(),
             name: name.into(),
             args: BTreeMap::new(),
             sub: vec![],
@@ -1620,6 +1663,82 @@ type Swap @entity { id: ID! pool: Pool! }
         assert_eq!(types.sel_names(), ["kind"]);
     }
 
+    /// Aliases: the response key and the schema field name are different strings.
+    ///
+    /// `{ p: pools { id } }` is ordinary client-generated GraphQL. Reading one identifier for both
+    /// rejected it outright, and using the alias as the field name would have looked up the wrong root
+    /// and the wrong column (Jules on #1282).
+    #[test]
+    fn an_alias_answers_under_its_own_key_while_looking_up_the_real_field() {
+        let roots = parse(r#"{ p: pools { n: id liquidity } }"#).expect("an alias parses");
+        assert_eq!(roots[0].key, "p");
+        assert_eq!(
+            roots[0].name, "pools",
+            "the schema lookup uses the real name"
+        );
+
+        let c = compile(&schema(), &roots[0]).expect("and lowers");
+        // The column is the real field; the alias only names the column so two aliases on one field
+        // cannot collide in the row.
+        assert_eq!(
+            c.sql,
+            r#"SELECT b."id" AS "a0", b."liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#,
+            "{}",
+            c.sql
+        );
+        assert_eq!(
+            c.shape,
+            vec![
+                Shape::Scalar {
+                    key: "n".into(),
+                    col: "a0".into(),
+                },
+                Shape::Scalar {
+                    key: "liquidity".into(),
+                    col: "liquidity".into(),
+                },
+            ]
+        );
+
+        // The same field twice under two aliases must produce two columns, or one would overwrite the
+        // other in the row and the caller would see the same value under both keys.
+        let c = compile(&schema(), &one(r#"{ pools { a: id b: id } }"#)).unwrap();
+        assert_eq!(
+            c.sql,
+            r#"SELECT b."id" AS "a0", b."id" AS "a1" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#,
+            "{}",
+            c.sql
+        );
+
+        // An alias on a traversal, and on a field inside one.
+        let c = compile(&schema(), &one(r#"{ pools { t: token0 { s: symbol } } }"#)).unwrap();
+        assert_eq!(
+            c.shape,
+            vec![Shape::Object {
+                key: "t".into(),
+                fields: vec![("s".into(), "j0__symbol".into())],
+            }],
+            "the join is still on token0, the answer is still under t"
+        );
+        assert!(c.sql.contains(r#"= b."token0""#), "{}", c.sql);
+
+        // And on a derived list.
+        let c = compile(&schema(), &one(r#"{ pools { s: swaps { id } } }"#)).unwrap();
+        assert!(
+            matches!(&c.shape[0], Shape::List { key, .. } if key == "s"),
+            "{:?}",
+            c.shape
+        );
+        assert!(c.sql.contains(r#"c0."pool" = b."id""#), "{}", c.sql);
+
+        // An alias naming a field the entity has not got is still refused against the real name.
+        let e = compile(&schema(), &one(r#"{ pools { x: nope } }"#)).expect_err("unknown");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { field, .. } if field == "nope"),
+            "{e:?}"
+        );
+    }
+
     #[test]
     fn a_generated_clients_operation_binds_its_variables() {
         // The shape an Apollo- or graph-client-generated query actually has: a named operation, a
@@ -1683,6 +1802,7 @@ type Swap @entity { id: ID! pool: Pool! }
             vec![
                 leaf("id"),
                 Selection {
+                    key: "swaps".into(),
                     name: "swaps".into(),
                     args: BTreeMap::new(),
                     sub: vec![leaf("id")],
