@@ -411,14 +411,18 @@ fn every_object_type_matches_the_reference_field_for_field() {
 /// reference has, comparing kind, field names, argument names and rendered types.
 ///
 /// The declared divergences, which is what "a reviewed, machine-readable divergence list" means: they
-/// are listed and asserted about, not silently skipped.
+/// are listed and asserted about, not silently skipped - and the check is two-sided, so a name left
+/// here after we start generating it fails rather than quietly excusing a real difference.
 ///
-/// `_Block_`, `_Log_`, `_LogMeta_` and `_LogArgument_` are fixed graph-node internals this slice does
-/// not model. `_Log_` exists to serve graph-node's own log-query surface rather than any subgraph
-/// data, and `Query._logs` - `[_Log_!]!` taking `level, from, to, search, first, skip,
-/// orderDirection` - is that surface's root field, so it is declared with them.
-const DECLARED_DIVERGENCES: &[&str] = &["_Block_", "_Log_", "_LogMeta_", "_LogArgument_"];
-const DECLARED_FIELD_DIVERGENCES: &[&str] = &["_logs"];
+/// **Both lists are now empty, and that is the point.** `_Block_`, `_Log_`, `_LogMeta_`,
+/// `_LogArgument_` and `Query._logs` were declared here as graph-node internals this slice did not
+/// model. That was wrong for `_Block_`, because `_Meta_.block` is typed `_Block_!` and `_meta` is a
+/// root the endpoint answers - so the served document referenced a type it did not declare, which
+/// makes the whole schema invalid to a client that resolves it (Jules on #1282). The rest followed:
+/// declaring `LogLevel` while omitting `_Log_` is not a schema graph-node would serve, whether or not
+/// a nest has any logs to put in it.
+const DECLARED_DIVERGENCES: &[&str] = &[];
+const DECLARED_FIELD_DIVERGENCES: &[&str] = &[];
 
 #[test]
 fn generated_introspection_matches_the_reference_shape() {
@@ -426,11 +430,17 @@ fn generated_introspection_matches_the_reference_shape() {
     let ours = nuthatch::graph_schema::introspection::render(&s);
     let r = reference();
 
+    /// A type reference as a comparable string, **kind included**.
+    ///
+    /// The kind used to be dropped here, so `SCALAR:Token` and `OBJECT:Token` rendered identically
+    /// and every relation, `orderBy` and `where` argument was advertised with the wrong kind while
+    /// this diff read clean (Jules on #1282). A client validates against the kind, so the diff has to
+    /// compare it. Third time a name-only comparison has hidden a real difference here.
     fn render(t: &serde_json::Value) -> String {
         match t["kind"].as_str().unwrap_or("") {
             "NON_NULL" => format!("{}!", render(&t["ofType"])),
             "LIST" => format!("[{}]", render(&t["ofType"])),
-            _ => t["name"].as_str().unwrap_or("?").to_string(),
+            kind => format!("{kind}:{}", t["name"].as_str().unwrap_or("?")),
         }
     }
     fn index(v: &serde_json::Value) -> std::collections::BTreeMap<String, &serde_json::Value> {

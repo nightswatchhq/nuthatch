@@ -596,6 +596,17 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 field: sel.name.clone(),
             })?;
         if sel.sub.is_empty() {
+            // A composite field needs a selection set, and GraphQL validation rejects one without.
+            // Lowering `{ pools { token0 } }` to `SELECT b."token0"` returned the relation's id under
+            // a field the schema declares as `Token!`, so the endpoint accepted a query a client's
+            // own validator would have refused and answered it in a shape the schema does not
+            // describe (Jules on #1282).
+            if let Some(target) = field.ty.entity_name() {
+                return Err(Unsupported::Syntax(format!(
+                    "`{}.{}` returns `{target}`, which needs a selection set",
+                    entity, sel.name
+                )));
+            }
             cols.push(format!("{BASE}.\"{}\"", sel.name));
             shape.push(Shape::Scalar(sel.name.clone()));
             continue;

@@ -115,6 +115,26 @@ pub const BUILTIN_SCALARS: &[&str] = &["String", "Int", "Float", "Boolean", "ID"
 /// than refused, because a schema may carry `@fulltext`, `@aggregation` and others that do not
 /// change the generated shape for S1.
 pub fn parse(text: &str) -> Result<Schema> {
+    // Descriptions are neutralised before anything else looks at the text. A GraphQL block string is
+    // a legal place to write `type Fake @entity {`, and both `starts_decl` (line-start only) and
+    // `match_brace` (skips `"…"`, not `"""…"""`) would have read that as syntax - inventing an
+    // entity, or matching the wrong closing brace (Jules on #1282). One pre-pass rather than three
+    // functions each learning about block strings, and byte offsets are preserved so every slice
+    // below still lines up.
+    //
+    // Ordinary strings are left alone on purpose: `@derivedFrom(field: "pool")` is one, and its
+    // contents are load-bearing.
+    // Descriptions are neutralised before anything else looks at the text. A GraphQL block string is
+    // a legal place to write `type Fake @entity {`, and both `starts_decl` (line-start only) and
+    // `match_brace` (which skips `"…"` but not a block string) would have read that as syntax -
+    // inventing an entity, or matching the wrong closing brace (Jules on #1282). One pre-pass rather
+    // than three functions each learning about block strings, and byte offsets are preserved so every
+    // slice below still lines up.
+    //
+    // Ordinary strings are left alone on purpose: `@derivedFrom(field: "pool")` is one, and its
+    // contents are load-bearing.
+    let blanked = blank_block_strings(text);
+    let text: &str = &blanked;
     let mut out = Schema::default();
     let b = text.as_bytes();
     let mut i = 0usize;
@@ -375,6 +395,34 @@ fn strip_comment(line: &str) -> &str {
         Some(h) => &line[..h],
         None => line,
     }
+}
+
+/// Replace the contents of every `"""…"""` block string with spaces, keeping newlines and the
+/// overall byte length so every offset into the text stays valid.
+fn blank_block_strings(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i..].starts_with(b"\"\"\"") {
+            out.extend_from_slice(b"\"\"\"");
+            i += 3;
+            while i < b.len() && !b[i..].starts_with(b"\"\"\"") {
+                // Newlines survive, so a line-start test still sees the same lines.
+                out.push(if b[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            if i < b.len() {
+                out.extend_from_slice(b"\"\"\"");
+                i += 3;
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    // Only ASCII bytes were substituted, so this cannot split a multi-byte character.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 fn match_brace(text: &str, open: usize) -> Option<usize> {
@@ -720,8 +768,64 @@ pub mod introspection {
             let inner = &rendered[1..rendered.len() - 1];
             return json!({"kind":"LIST","name":Value::Null,"ofType":type_ref(inner)});
         }
-        // A leaf. The kind a client cares about here is the name; `ofType` is null.
-        json!({"kind":"SCALAR","name":rendered,"ofType":Value::Null})
+        // A leaf. The kind is filled in by `resolve_kinds` from the document's own type list, because
+        // nothing here can know whether `Token` is an object, an enum or an input object - and
+        // guessing `SCALAR` advertised every relation, every `orderBy` and every `where` as a scalar,
+        // which a validating client rejects before it executes anything (Jules on #1282).
+        json!({"kind":UNRESOLVED,"name":rendered,"ofType":Value::Null})
+    }
+
+    /// The placeholder `type_ref` leaves for [`resolve_kinds`] to replace.
+    const UNRESOLVED: &str = "__UNRESOLVED__";
+
+    /// Rewrite every leaf type reference's `kind` to the kind its own declaration carries, returning
+    /// the names no declaration covers.
+    ///
+    /// **Derived from the rendered type list, not classified by name.** A hand-written "`_filter`
+    /// means input object, `_orderBy` means enum" table is one more list to keep in step with the
+    /// renderer; taking the kind from the declaration cannot drift from it by construction.
+    ///
+    /// A reference to an undeclared type makes the whole document invalid - `_Meta_.block` pointed at
+    /// `_Block_` while `_Block_` was never emitted - so the caller treats a non-empty result as a bug.
+    fn resolve_kinds(
+        doc: &mut Value,
+        kinds: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut dangling = Vec::new();
+        walk(doc, kinds, &mut dangling);
+        dangling.sort();
+        dangling.dedup();
+        dangling
+    }
+
+    fn walk(
+        v: &mut Value,
+        kinds: &std::collections::BTreeMap<String, String>,
+        dangling: &mut Vec<String>,
+    ) {
+        match v {
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, kinds, dangling)),
+            Value::Object(o) => {
+                if o.get("kind").and_then(Value::as_str) == Some(UNRESOLVED) {
+                    let name = o
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    match kinds.get(&name) {
+                        Some(k) => {
+                            o.insert("kind".into(), Value::String(k.clone()));
+                        }
+                        None => {
+                            dangling.push(name);
+                            o.insert("kind".into(), Value::String("SCALAR".into()));
+                        }
+                    }
+                }
+                o.iter_mut().for_each(|(_, x)| walk(x, kinds, dangling));
+            }
+            _ => {}
+        }
     }
 
     fn arg(name: &str, ty: &str, default: Option<&str>) -> Value {
@@ -770,6 +874,31 @@ pub mod introspection {
             json!({"kind":"INPUT_OBJECT","name":"BlockChangedFilter","inputFields":[
             arg("number_gte","Int!",None)]}),
         );
+        // `_Block_` is referenced by `_Meta_.block`, and `_meta` is a root this endpoint answers, so
+        // omitting it left the served document pointing at a type it did not define.
+        types.push(json!({"kind":"OBJECT","name":"_Block_","fields":[
+            {"name":"hash","args":[],"type":type_ref("Bytes")},
+            {"name":"number","args":[],"type":type_ref("Int!")},
+            {"name":"timestamp","args":[],"type":type_ref("Int")},
+            {"name":"parentHash","args":[],"type":type_ref("Bytes")}]}));
+        // The `_logs` family. Emitted because the generated schema has to be *complete* for a client
+        // that validates it, even though a nest has no mapping logs to return: a schema declaring
+        // `LogLevel` and no `_Log_` is not a schema graph-node would serve.
+        types.push(json!({"kind":"OBJECT","name":"_LogArgument_","fields":[
+            {"name":"key","args":[],"type":type_ref("String!")},
+            {"name":"value","args":[],"type":type_ref("String!")}]}));
+        types.push(json!({"kind":"OBJECT","name":"_LogMeta_","fields":[
+            {"name":"module","args":[],"type":type_ref("String!")},
+            {"name":"line","args":[],"type":type_ref("Int!")},
+            {"name":"column","args":[],"type":type_ref("Int!")}]}));
+        types.push(json!({"kind":"OBJECT","name":"_Log_","fields":[
+            {"name":"id","args":[],"type":type_ref("String!")},
+            {"name":"subgraphId","args":[],"type":type_ref("String!")},
+            {"name":"timestamp","args":[],"type":type_ref("String!")},
+            {"name":"level","args":[],"type":type_ref("LogLevel!")},
+            {"name":"text","args":[],"type":type_ref("String!")},
+            {"name":"arguments","args":[],"type":type_ref("[_LogArgument_!]!")},
+            {"name":"meta","args":[],"type":type_ref("_LogMeta_!")}]}));
         types.push(json!({"kind":"OBJECT","name":"_Meta_","fields":[
             {"name":"block","args":[],"type":type_ref("_Block_!")},
             {"name":"deployment","args":[],"type":type_ref("String!")},
@@ -845,9 +974,39 @@ pub mod introspection {
         }
         roots.push(json!({"name":"_meta","type":type_ref("_Meta_"),
             "args":[arg("block","Block_height",None)]}));
+        // `_logs` completes the root inventory `Schema::root_field_names` already claims. The
+        // arguments and their defaults are the reference's, `orderDirection` included - it defaults to
+        // `desc` here and nowhere else in the schema.
+        roots.push(json!({"name":"_logs","type":type_ref("[_Log_!]!"),"args":[
+            arg("level","LogLevel",None),
+            arg("from","String",None),
+            arg("to","String",None),
+            arg("search","String",None),
+            arg("first","Int",Some("100")),
+            arg("skip","Int",Some("0")),
+            arg("orderDirection","OrderDirection",Some("desc"))]}));
         types.push(json!({"kind":"OBJECT","name":"Query","fields":roots}));
 
-        json!({"__schema":{"queryType":{"name":"Query"},"types":types}})
+        // Every leaf reference's `kind` comes from the declaration it names. A name no declaration
+        // covers leaves the document invalid and there is no sensible way to serve it, so it panics
+        // here rather than reaching a client: only the renderer can create the condition, and the
+        // golden test covers it.
+        let kinds: std::collections::BTreeMap<String, String> = types
+            .iter()
+            .filter_map(|t| {
+                Some((
+                    t.get("name")?.as_str()?.to_string(),
+                    t.get("kind")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let mut doc = json!({"__schema":{"queryType":{"name":"Query"},"types":types}});
+        let dangling = resolve_kinds(&mut doc, &kinds);
+        assert!(
+            dangling.is_empty(),
+            "the generated schema references types it does not declare: {dangling:?}"
+        );
+        doc
     }
 }
 

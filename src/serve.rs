@@ -1583,13 +1583,33 @@ async fn graph_graphql(
         }
     };
 
-    // `__schema` or `__type` is the introspection surface. Anything else needs the S2 compiler.
-    if query.contains("__schema") || query.contains("__type") {
+    // `__schema` is the introspection surface a generated client fetches first.
+    if query.contains("__schema") {
         return (
             StatusCode::OK,
             // `render` already produces `{"__schema": …}`, which is precisely the `data` payload.
             Json(serde_json::json!({"data":
                 crate::graph_schema::introspection::render(&schema)})),
+        );
+    }
+    // `__type(name: "Pool")` is the other standard introspection operation, and it has to answer
+    // under `__type`. This used to fall into the `__schema` branch above and return the whole schema
+    // document under the wrong key, which is an invalid response to the query that was asked
+    // (Jules on #1282).
+    if query.contains("__type") {
+        let doc = crate::graph_schema::introspection::render(&schema);
+        let found = type_argument(&query).and_then(|want| {
+            doc["__schema"]["types"]
+                .as_array()?
+                .iter()
+                .find(|t| t["name"].as_str() == Some(want.as_str()))
+                .cloned()
+        });
+        return (
+            StatusCode::OK,
+            // A name the schema does not declare is `null`, not an error: that is what introspection
+            // says, and a client uses it to test whether a type exists.
+            Json(serde_json::json!({"data": {"__type": found}})),
         );
     }
     // RFC-0053 S2 (#1266): compile the operation and run it over the nest's views.
@@ -1682,6 +1702,27 @@ fn graph_shape(
         }
     }
     serde_json::Value::Object(out)
+}
+
+/// The `name:` argument of a `__type(name: "…")` selection.
+///
+/// A deliberately small scan rather than the S2 parser: that one resolves root fields against the
+/// schema and would refuse `__type` as an unknown root, which is correct for it and useless here.
+fn type_argument(query: &str) -> Option<String> {
+    let at = query.find("__type")? + "__type".len();
+    let rest = &query[at..];
+    let open = rest.find('(')?;
+    // Nothing but whitespace may sit between the field name and its arguments, or this is some other
+    // token that merely starts with `__type`.
+    if !rest[..open].trim().is_empty() {
+        return None;
+    }
+    let close = rest.find(')')?;
+    let args = &rest[open + 1..close];
+    let name_at = args.find("name")?;
+    let q = args[name_at..].find('"')? + name_at + 1;
+    let end = args[q..].find('"')? + q;
+    Some(args[q..end].to_string())
 }
 
 /// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
