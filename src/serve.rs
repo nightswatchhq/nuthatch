@@ -1578,11 +1578,86 @@ async fn graph_graphql(
                 crate::graph_schema::introspection::render(&schema)})),
         );
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"errors":[{"message":
-            "this endpoint serves schema introspection only; the query compiler is RFC-0053 S2              (nuthatch#1266). Entity queries are available meanwhile at /sql and /q/<name>."}]})),
-    )
+    // RFC-0053 S2 (#1266): compile the operation and run it over the nest's views.
+    let roots = match crate::graph_query::parse(&query) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+    };
+    let mut data = serde_json::Map::new();
+    for root in &roots {
+        // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
+        // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no handler
+        // that could have aborted.
+        if root.name == "_meta" {
+            let last = s
+                .store
+                .get_meta("last_block")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+            data.insert(
+                "_meta".into(),
+                serde_json::json!({
+                    "block": {"number": last},
+                    "deployment": s.nid.clone(),
+                    "hasIndexingErrors": false
+                }),
+            );
+            continue;
+        }
+        let compiled = match crate::graph_query::compile(&schema, root) {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+        };
+        match graph_rows(&s, &compiled).await {
+            Ok(rows) => {
+                let value = if compiled.singular {
+                    match rows.into_iter().next() {
+                        Some(r) => serde_json::Value::Object(r),
+                        None => serde_json::Value::Null,
+                    }
+                } else {
+                    serde_json::Value::Array(
+                        rows.into_iter().map(serde_json::Value::Object).collect(),
+                    )
+                };
+                data.insert(root.name.clone(), value);
+            }
+            Err(msg) => return (StatusCode::OK, Json(gql_error(&msg))),
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"data": data})))
+}
+
+/// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
+/// every refusal here returns `200` with this body rather than a 4xx.
+fn gql_error(message: &str) -> serde_json::Value {
+    serde_json::json!({"errors":[{"message": message}]})
+}
+
+/// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
+/// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
+async fn graph_rows(
+    s: &AppState,
+    compiled: &crate::graph_query::Compiled,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    let resp = run_sql_query(s.clone(), compiled.sql.clone(), None).await;
+    let body = axum::body::to_bytes(resp.into_response().into_body(), 64 << 20)
+        .await
+        .map_err(|e| format!("reading the query result: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("decoding the query result: {e}"))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(v.get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_object().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default())
 }
 
 async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
@@ -4941,7 +5016,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("graph")).unwrap();
         std::fs::write(
             d.path().join("graph/schema.graphql"),
-            "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n}\n",
+            "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n}\n",
         )
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
@@ -4998,12 +5073,61 @@ mod tests {
             );
         }
 
-        // Not introspection: refused, in the envelope, and naming where to go meanwhile.
+        // `_meta` is answered from the nest's own head and needs no view.
+        let body = ask(
+            "/graphql",
+            "{ _meta { block { number } hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["_meta"]["hasIndexingErrors"],
+            serde_json::json!(false),
+            "a nest runs no mapping, so it has no indexing error to report: {body}"
+        );
+
+        // An entity query compiles now (S2, #1266). This nest has a schema but no views, so the
+        // failure must arrive **in the Graph envelope** rather than as a 500 a client cannot read.
         let body = ask("/graphql", "{ pools { id } }", state.clone()).await;
+        assert!(
+            body["errors"].is_array() || body["data"]["pools"].is_array(),
+            "an entity query must answer or explain itself in the envelope, got {body}"
+        );
+        assert!(
+            !body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("introspection only"),
+            "the S2 refusal should be gone now that the compiler exists: {body}"
+        );
+
+        // An operator the compiler does not lower is refused **by name**, because a dropped filter
+        // returns more rows than were asked for.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { hooks_contains: "ab" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
         let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
         assert!(
-            body["data"].is_null() && msg.contains("S2"),
-            "an entity query must be refused in the Graph error envelope, got {body}"
+            msg.contains("hooks_contains"),
+            "an unlowerable operator must be named: {body}"
+        );
+
+        // And `block:` says why rather than answering as of head while implying otherwise.
+        let body = ask(
+            "/graphql",
+            "{ pools(block: { number: 1 }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1267"),
+            "time travel must name the issue that tracks it: {body}"
         );
 
         // A nest with no Graph schema says so rather than inventing one.

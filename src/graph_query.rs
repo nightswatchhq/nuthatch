@@ -25,9 +25,15 @@ pub struct RootField {
     /// As written: `pools`, `pool`, `_meta`.
     pub name: String,
     pub args: BTreeMap<String, Value>,
-    /// Leaf field names, in the order the caller asked for them. Nested selections are refused for
-    /// now; see [`Unsupported::NestedSelection`].
+    /// Leaf field names, in the order the caller asked for them.
     pub fields: Vec<String>,
+    /// Selected fields that carried a sub-selection.
+    ///
+    /// **Recorded here rather than refused during the parse.** `_meta { block { number } }` is a
+    /// legitimate nested selection that the handler answers itself, and refusing nesting while
+    /// parsing made `_meta` unaskable - found by the HTTP test. Parse what is there; refuse at
+    /// lowering, where the decision belongs.
+    pub nested: Vec<String>,
 }
 
 /// A GraphQL argument value, as far as S2 needs to understand one.
@@ -151,6 +157,7 @@ pub fn parse(query: &str) -> Result<Vec<RootField>, Unsupported> {
         };
         c.trivia();
         let mut fields = Vec::new();
+        let mut nested = Vec::new();
         if c.peek() == Some(b'{') {
             c.i += 1;
             loop {
@@ -171,12 +178,34 @@ pub fn parse(query: &str) -> Result<Vec<RootField>, Unsupported> {
                     c.trivia();
                 }
                 if c.peek() == Some(b'{') {
-                    return Err(Unsupported::NestedSelection(f));
+                    // Consume the sub-selection and note the field carried one.
+                    let mut depth = 0usize;
+                    while let Some(ch) = c.peek() {
+                        match ch {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    c.i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        c.i += 1;
+                    }
+                    nested.push(f);
+                    continue;
                 }
                 fields.push(f);
             }
         }
-        out.push(RootField { name, args, fields });
+        out.push(RootField {
+            name,
+            args,
+            fields,
+            nested,
+        });
     }
 }
 
@@ -364,6 +393,9 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         .find(|e| e.name == entity)
         .expect("resolve_root returned an entity the schema has");
 
+    if let Some(n) = root.nested.first() {
+        return Err(Unsupported::NestedSelection(n.clone()));
+    }
     for f in &root.fields {
         if !ent.fields.iter().any(|x| &x.name == f) {
             return Err(Unsupported::UnknownField {
@@ -674,9 +706,40 @@ type Swap @entity { id: ID! pool: Pool! }
     /// **The refusals, which are the module's contract.** Each of these is a wrong answer if
     /// silently ignored, so each must be an error a caller can read.
     #[test]
+    fn a_sub_selection_is_recorded_and_the_fields_after_it_still_parse() {
+        // `_meta { block { number } hasIndexingErrors }` is a legitimate nested selection the
+        // handler answers itself, so the parser records nesting rather than refusing it. Skipping
+        // the sub-selection must leave the cursor after its closing brace and no further, or every
+        // field written after a nested one is silently dropped.
+        let q = "{ pools { id swaps { id transaction { id } } createdAtTimestamp } }";
+        let roots = parse(q).expect("nesting parses");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].fields,
+            vec!["id".to_string(), "createdAtTimestamp".to_string()],
+            "the field after a nested selection is not dropped"
+        );
+        assert_eq!(
+            roots[0].nested,
+            vec!["swaps".to_string()],
+            "the nested field is recorded, not refused"
+        );
+
+        // And it is still refused, one layer later, when it reaches an entity root.
+        let e = compile(&schema(), &roots[0]).expect_err("an entity root refuses nesting");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn everything_unlowerable_is_refused_by_name() {
         let s = schema();
-        let cases: Vec<(&str, fn(&Unsupported) -> bool)> = vec![
+        /// A query and the predicate its refusal must satisfy. Named because clippy is right that
+        /// the tuple is unreadable inline.
+        type Case = (&'static str, fn(&Unsupported) -> bool);
+        let cases: Vec<Case> = vec![
             // A dropped filter returns more rows than were asked for.
             (
                 r#"{ pools(where: { hooks_contains: "ab" }) { id } }"#,
