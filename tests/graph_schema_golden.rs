@@ -233,3 +233,104 @@ fn a_relation_filters_as_a_string_not_an_id() {
     );
     assert_eq!(token0.ty.filter_scalar(), Some("String"));
 }
+
+/// The operator rules, checked against **every** filter graph-node generated, not a sample.
+///
+/// This is the assertion S1 actually rests on: 19 entities, and for each one the exact set of input
+/// field names on its `*_filter`. A single wrong operator, a missing nested relation filter, or a
+/// derived field treated as filterable shows up here as a named difference.
+#[test]
+fn every_filter_input_matches_the_reference_field_for_field() {
+    let s = parsed();
+    let r = reference();
+    let types = r["__schema"]["types"].as_array().unwrap();
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for e in &s.entities {
+        let want = format!("{}_filter", e.name);
+        let Some(t) = types.iter().find(|t| t["name"] == want.as_str()) else {
+            problems.push(format!("{want}: not in the reference"));
+            continue;
+        };
+        let theirs: BTreeSet<String> = t["inputFields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        let ours: BTreeSet<String> = s
+            .filter_fields(&e.name)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        checked += theirs.len();
+        for m in theirs.difference(&ours) {
+            problems.push(format!("{want}: missing {m}"));
+        }
+        for x in ours.difference(&theirs) {
+            problems.push(format!("{want}: extra {x}"));
+        }
+    }
+    assert!(
+        checked > 600,
+        "the sweep must cover the real filters; only {checked} input fields seen"
+    );
+    assert!(
+        problems.is_empty(),
+        "{} filter input differences across {} entities, first 12:\n  {}",
+        problems.len(),
+        s.entities.len(),
+        problems
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+/// And the same for every `*_orderBy`, which is where the one-level traversal rule is really tested.
+#[test]
+fn every_order_by_enum_matches_the_reference_value_for_value() {
+    let s = parsed();
+    let r = reference();
+    let types = r["__schema"]["types"].as_array().unwrap();
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for e in &s.entities {
+        let want = format!("{}_orderBy", e.name);
+        let Some(t) = types.iter().find(|t| t["name"] == want.as_str()) else {
+            problems.push(format!("{want}: not in the reference"));
+            continue;
+        };
+        let theirs: BTreeSet<String> = t["enumValues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect();
+        let ours: BTreeSet<String> = s.order_by_values(&e.name).into_iter().collect();
+        checked += theirs.len();
+        for m in theirs.difference(&ours) {
+            problems.push(format!("{want}: missing {m}"));
+        }
+        for x in ours.difference(&theirs) {
+            problems.push(format!("{want}: extra {x}"));
+        }
+    }
+    assert!(
+        checked > 400,
+        "the sweep must cover the real enums; only {checked} values seen"
+    );
+    assert!(
+        problems.is_empty(),
+        "{} orderBy differences, first 12:\n  {}",
+        problems.len(),
+        problems
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}

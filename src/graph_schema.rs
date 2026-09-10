@@ -51,8 +51,13 @@ impl FieldType {
         }
     }
 
-    fn is_list(&self) -> bool {
-        matches!(self, FieldType::List(_))
+    /// The entity this type refers to, through a list if need be.
+    pub fn entity_name(&self) -> Option<&str> {
+        match self {
+            FieldType::Entity(n) => Some(n.as_str()),
+            FieldType::List(inner) => inner.entity_name(),
+            _ => None,
+        }
     }
 }
 
@@ -80,6 +85,17 @@ pub struct Schema {
     /// Enum types declared in the schema, in declaration order.
     pub enums: BTreeMap<String, Vec<String>>,
 }
+
+/// The operator set a **list** field gets, every one list-typed. Read off `Token.whitelistPools`
+/// (`[Pool!]!`), which generates exactly these six and no comparison operators at all.
+pub const LIST_SUFFIXES: &[&str] = &[
+    "",
+    "_not",
+    "_contains",
+    "_contains_nocase",
+    "_not_contains",
+    "_not_contains_nocase",
+];
 
 /// Scalars graph-node defines on top of GraphQL's built-ins.
 pub const GRAPH_SCALARS: &[&str] = &["BigInt", "BigDecimal", "Bytes", "Int8", "Timestamp"];
@@ -452,6 +468,71 @@ impl Schema {
         v
     }
 
+    /// The input fields of `<Entity>_filter`, as `(name, rendered type)`.
+    ///
+    /// Four shapes, all read off the recorded reference rather than generalised from one of them:
+    ///
+    /// | field shape | what graph-node generates |
+    /// |---|---|
+    /// | scalar or enum | that scalar's operator set, `_in`/`_not_in` in list form |
+    /// | relation (`Token`) | the `String` set on the bare name, **plus** `<name>_: Token_filter` |
+    /// | list (`[Pool!]!`) | six list-typed operators - bare, `_not`, `_contains`, `_contains_nocase`, `_not_contains`, `_not_contains_nocase` - plus `<name>_: Pool_filter` |
+    /// | `@derivedFrom` | **only** `<name>_: Target_filter`, no scalar comparison at all |
+    ///
+    /// The last two are the ones a first pass gets wrong. Skipping derived and list fields entirely -
+    /// which is what "a reverse lookup has no column to compare" suggests - loses `whitelistPools`,
+    /// its five list operators and both nested filters, and the sweep across all 19 entities is what
+    /// caught it.
+    pub fn filter_fields(&self, entity: &str) -> Vec<(String, String)> {
+        let Some(e) = self.entities.iter().find(|e| e.name == entity) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for f in &e.fields {
+            match (&f.ty, f.derived_from.is_some()) {
+                // A derived field is filterable only through the far side.
+                (_, true) => {
+                    if let Some(target) = f.ty.entity_name() {
+                        out.push((format!("{}_", f.name), format!("{target}_filter")));
+                    }
+                }
+                (FieldType::List(inner), false) => {
+                    // A list compares as a list of the inner type's filter scalar - `[String]` for a
+                    // list of relations, because it compares the ids.
+                    let Some(scalar) = inner.filter_scalar() else {
+                        continue;
+                    };
+                    for suffix in LIST_SUFFIXES {
+                        out.push((format!("{}{}", f.name, suffix), format!("[{scalar}]")));
+                    }
+                    if let Some(target) = inner.entity_name() {
+                        out.push((format!("{}_", f.name), format!("{target}_filter")));
+                    }
+                }
+                (ty, false) => {
+                    let Some(scalar) = ty.filter_scalar() else {
+                        continue;
+                    };
+                    for suffix in filter_suffixes(scalar) {
+                        let rendered = if suffix_is_list(suffix) {
+                            format!("[{scalar}]")
+                        } else {
+                            scalar.to_string()
+                        };
+                        out.push((format!("{}{}", f.name, suffix), rendered));
+                    }
+                    if let Some(target) = ty.entity_name() {
+                        out.push((format!("{}_", f.name), format!("{target}_filter")));
+                    }
+                }
+            }
+        }
+        out.push(("_change_block".into(), "BlockChangedFilter".into()));
+        out.push(("and".into(), format!("[{entity}_filter]")));
+        out.push(("or".into(), format!("[{entity}_filter]")));
+        out
+    }
+
     /// `<Entity>_orderBy` values: the entity's own non-derived, non-list fields, plus one level of
     /// relation traversal joined by `__`. One level only - the reference has `token0__symbol` and no
     /// `token0__whitelistPools__id`.
@@ -463,14 +544,22 @@ impl Schema {
         };
         let mut v = Vec::new();
         for f in &e.fields {
-            if f.derived_from.is_some() {
-                continue;
-            }
+            // **Every field by bare name, derived and list included.** `Pool_orderBy` carries
+            // `swaps`, `ticks`, `poolDayData` and `modifyLiquiditys`; skipping them because they are
+            // not orderable columns loses values the reference has.
             v.push(f.name.clone());
+            // One level of traversal, and **only the target's scalar fields**. `Tick_orderBy` has 28
+            // of `Pool`'s 35 under `pool__`: the seven absent are its five lists and its two
+            // relations, `token0` and `token1`. So the nested level does not recurse into relations
+            // either, which is a different rule from "one level deep".
             if let FieldType::Entity(target) = &f.ty {
+                if f.derived_from.is_some() {
+                    continue;
+                }
                 if let Some(t) = by_name.get(target.as_str()) {
                     for tf in &t.fields {
-                        if tf.derived_from.is_some() || tf.ty.is_list() {
+                        let scalar_ish = matches!(tf.ty, FieldType::Scalar(_) | FieldType::Enum(_));
+                        if !scalar_ish {
                             continue;
                         }
                         v.push(format!("{}__{}", f.name, tf.name));
