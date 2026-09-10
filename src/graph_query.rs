@@ -204,11 +204,6 @@ pub fn parse_with(
     query: &str,
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<RootField>, Unsupported> {
-    if query.contains("fragment ") || query.contains("...") {
-        return Err(Unsupported::Syntax(
-            "fragments are not implemented yet".into(),
-        ));
-    }
     let b = query.as_bytes();
     let mut c = Cursor {
         b,
@@ -216,36 +211,130 @@ pub fn parse_with(
         vars,
         defaults: BTreeMap::new(),
     };
-    c.operation_header()?;
-    if c.peek() != Some(b'{') {
-        return Err(Unsupported::Syntax("no selection set".into()));
-    }
-    c.i += 1;
-    let mut out = Vec::new();
+    // A document is a list of definitions in any order, so fragments are collected as they are met
+    // and spreads are resolved once the whole document has been read - a fragment may legally be
+    // defined after the operation that uses it.
+    let mut fragments: BTreeMap<String, Vec<Sel>> = BTreeMap::new();
+    let mut operation: Option<Vec<Sel>> = None;
     loop {
         c.trivia();
-        match c.peek() {
-            None => return Err(Unsupported::Syntax("unclosed selection set".into())),
-            // The closing brace of the operation's selection set: nothing follows it, so the
-            // cursor is not advanced.
-            Some(b'}') => return Ok(out),
-            _ => {}
+        if c.peek().is_none() {
+            break;
         }
-        let name = c.ident()?;
-        c.trivia();
-        let args = if c.peek() == Some(b'(') {
-            c.args()?
-        } else {
-            BTreeMap::new()
-        };
-        c.trivia();
-        let sel = if c.peek() == Some(b'{') {
-            c.selection_set()?
-        } else {
-            Vec::new()
-        };
-        out.push(RootField { name, args, sel });
+        if c.peek() == Some(b'{') {
+            // The anonymous shorthand operation.
+            if operation.is_some() {
+                return Err(Unsupported::Syntax("more than one operation".into()));
+            }
+            operation = Some(c.selection_set()?);
+            continue;
+        }
+        let kw = c.ident()?;
+        match kw.as_str() {
+            "fragment" => {
+                c.trivia();
+                let name = c.ident()?;
+                c.trivia();
+                // `on TypeCondition`. The condition is consumed and not checked: this compiler
+                // validates every field against the entity anyway, so a spread naming fields the
+                // entity has not got is already refused by name.
+                if c.ident()? != "on" {
+                    return Err(Unsupported::Syntax(format!(
+                        "fragment `{name}` has no type condition"
+                    )));
+                }
+                c.trivia();
+                c.type_ref()?;
+                c.trivia();
+                if c.peek() != Some(b'{') {
+                    return Err(Unsupported::Syntax(format!(
+                        "fragment `{name}` has no body"
+                    )));
+                }
+                let body = c.selection_set()?;
+                fragments.insert(name, body);
+            }
+            "query" => {
+                if operation.is_some() {
+                    return Err(Unsupported::Syntax("more than one operation".into()));
+                }
+                c.operation_tail()?;
+                if c.peek() != Some(b'{') {
+                    return Err(Unsupported::Syntax("no selection set".into()));
+                }
+                operation = Some(c.selection_set()?);
+            }
+            other @ ("mutation" | "subscription") => {
+                return Err(Unsupported::NotAQuery(other.to_string()))
+            }
+            other => {
+                return Err(Unsupported::Syntax(format!(
+                    "expected an operation or a fragment, found `{other}`"
+                )))
+            }
+        }
     }
+    let Some(operation) = operation else {
+        return Err(Unsupported::Syntax("no selection set".into()));
+    };
+    let roots = resolve_spreads(&operation, &fragments, &mut Vec::new())?;
+    Ok(roots
+        .into_iter()
+        .map(|s| RootField {
+            name: s.name,
+            args: s.args,
+            sel: s.sub,
+        })
+        .collect())
+}
+
+/// One entry of a selection set before fragment spreads have been resolved.
+#[derive(Debug, Clone)]
+enum Sel {
+    Field(Selection, Vec<Sel>),
+    /// `...Name`
+    Spread(String),
+    /// `... on Type { … }`, whose selections are spliced in place.
+    Inline(Vec<Sel>),
+}
+
+/// Splice every fragment spread into the selection set that used it.
+///
+/// `visiting` is the spread stack, so a fragment that refers to itself is an error rather than a
+/// stack overflow - a client cannot send one by accident, but a malformed document should not take the
+/// node down.
+fn resolve_spreads(
+    sel: &[Sel],
+    fragments: &BTreeMap<String, Vec<Sel>>,
+    visiting: &mut Vec<String>,
+) -> Result<Vec<Selection>, Unsupported> {
+    let mut out: Vec<Selection> = Vec::new();
+    for s in sel {
+        match s {
+            Sel::Field(f, sub) => out.push(Selection {
+                name: f.name.clone(),
+                args: f.args.clone(),
+                sub: resolve_spreads(sub, fragments, visiting)?,
+            }),
+            Sel::Inline(inner) => out.extend(resolve_spreads(inner, fragments, visiting)?),
+            Sel::Spread(name) => {
+                let Some(body) = fragments.get(name) else {
+                    return Err(Unsupported::Syntax(format!(
+                        "fragment `{name}` is spread but never defined"
+                    )));
+                };
+                if visiting.iter().any(|v| v == name) {
+                    return Err(Unsupported::Syntax(format!(
+                        "fragment `{name}` spreads itself"
+                    )));
+                }
+                visiting.push(name.clone());
+                out.extend(resolve_spreads(body, fragments, visiting)?);
+                visiting.pop();
+            }
+        }
+    }
+    Ok(out)
 }
 
 struct Cursor<'a> {
@@ -299,7 +388,7 @@ impl<'a> Cursor<'a> {
     /// parsing made introspection unaskable through the parser, which is what forced the handler to
     /// detect it by searching the raw text - and a filter value of `"__schema"` then routed a
     /// perfectly ordinary query to the schema document (Jules on #1282).
-    fn selection_set(&mut self) -> Result<Vec<Selection>, Unsupported> {
+    fn selection_set(&mut self) -> Result<Vec<Sel>, Unsupported> {
         self.i += 1; // '{'
         let mut out = Vec::new();
         loop {
@@ -311,6 +400,26 @@ impl<'a> Cursor<'a> {
                     return Ok(out);
                 }
                 _ => {}
+            }
+            // `...Name` or `... on Type { … }`. The standard introspection document a generated
+            // client sends is built out of these, so refusing them refused the one request that has
+            // to work before any other can (Jules on #1282).
+            if self.b[self.i..].starts_with(b"...") {
+                self.i += 3;
+                self.trivia();
+                let word = self.ident()?;
+                if word == "on" {
+                    self.trivia();
+                    self.type_ref()?;
+                    self.trivia();
+                    if self.peek() != Some(b'{') {
+                        return Err(Unsupported::Syntax("an inline fragment has no body".into()));
+                    }
+                    out.push(Sel::Inline(self.selection_set()?));
+                } else {
+                    out.push(Sel::Spread(word));
+                }
+                continue;
             }
             let name = self.ident()?;
             self.trivia();
@@ -325,7 +434,14 @@ impl<'a> Cursor<'a> {
             } else {
                 Vec::new()
             };
-            out.push(Selection { name, args, sub });
+            out.push(Sel::Field(
+                Selection {
+                    name,
+                    args,
+                    sub: Vec::new(),
+                },
+                sub,
+            ));
         }
     }
     /// Consume an optional operation header, leaving the cursor on the selection set's `{`.
@@ -333,23 +449,7 @@ impl<'a> Cursor<'a> {
     /// **Parsed rather than skipped to the first brace.** A variable definition may carry a default
     /// that is itself an object - `$w: Pool_filter = { id: "a" }` - and skipping to the first `{`
     /// lands inside it, so the whole operation then reads as garbage.
-    fn operation_header(&mut self) -> Result<(), Unsupported> {
-        self.trivia();
-        if self.peek() == Some(b'{') {
-            return Ok(()); // anonymous shorthand
-        }
-        let kw = self.ident()?;
-        match kw.as_str() {
-            "query" => {}
-            other @ ("mutation" | "subscription") => {
-                return Err(Unsupported::NotAQuery(other.to_string()))
-            }
-            other => {
-                return Err(Unsupported::Syntax(format!(
-                    "expected an operation, found `{other}`"
-                )))
-            }
-        }
+    fn operation_tail(&mut self) -> Result<(), Unsupported> {
         self.trivia();
         // An optional operation name.
         if self
@@ -541,6 +641,55 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+}
+
+/// Where the caller's text has to appear in the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextShape {
+    Anywhere,
+    Prefix,
+    Suffix,
+}
+
+impl TextShape {
+    /// A quoted `LIKE` pattern for `text`, with the caller's own wildcards escaped.
+    ///
+    /// **This is the whole point of the function.** `%` and `_` are data in a caller's filter and
+    /// wildcards in `LIKE`, so `symbol_contains: "50%"` must match a literal `50%` rather than
+    /// anything beginning `50`. Backslash is escaped first, or escaping the wildcards would introduce
+    /// backslashes this then re-escapes.
+    fn pattern(self, text: &str) -> String {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            // The SQL literal's own quoting, applied last so it cannot be undone by the above.
+            .replace('\'', "''");
+        match self {
+            TextShape::Anywhere => format!("'%{escaped}%'"),
+            TextShape::Prefix => format!("'{escaped}%'"),
+            TextShape::Suffix => format!("'%{escaped}'"),
+        }
+    }
+}
+
+/// `(negated, case-insensitive, where the text sits)` for a text-matching suffix.
+fn text_match(suffix: &str) -> Option<(bool, bool, TextShape)> {
+    let (negated, rest) = match suffix.strip_prefix("_not") {
+        Some(r) => (true, r),
+        None => (false, suffix),
+    };
+    let (nocase, rest) = match rest.strip_suffix("_nocase") {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let shape = match rest {
+        "_contains" => TextShape::Anywhere,
+        "_starts_with" => TextShape::Prefix,
+        "_ends_with" => TextShape::Suffix,
+        _ => return None,
+    };
+    Some((negated, nocase, shape))
 }
 
 /// The `where` suffixes this slice lowers, and the SQL they become.
@@ -808,7 +957,44 @@ fn lower_predicate(
     v: &Value,
 ) -> Result<String, Unsupported> {
     if key == "and" || key == "or" {
-        return Err(Unsupported::Operator(key.to_string()));
+        let Value::List(items) = v else {
+            return Err(Unsupported::Argument(format!(
+                "`{key}` needs a list of filters"
+            )));
+        };
+        // An empty `and`/`or`, and an empty filter object inside one, are refused rather than given a
+        // meaning. `_in []` could be reasoned about from SQL - there is no empty `IN` list and the
+        // empty set matches nothing - but "no conditions" has no such forced reading, graph-node's
+        // behaviour here is not something this slice has measured, and guessing it would be
+        // approximating a predicate.
+        if items.is_empty() {
+            return Err(Unsupported::Argument(format!(
+                "`{key}` is empty, and an empty condition list has no meaning this slice has verified"
+            )));
+        }
+        let mut parts = Vec::new();
+        for item in items {
+            let Value::Object(m) = item else {
+                return Err(Unsupported::Argument(format!(
+                    "`{key}` takes filter objects"
+                )));
+            };
+            if m.is_empty() {
+                return Err(Unsupported::Argument(format!(
+                    "`{key}` contains an empty filter"
+                )));
+            }
+            let inner: Result<Vec<String>, Unsupported> = m
+                .iter()
+                .map(|(k, vv)| lower_predicate(ent, k, vv))
+                .collect();
+            // Conditions within one filter object are ANDed, which is what `where` itself does.
+            parts.push(format!("({})", inner?.join(" AND ")));
+        }
+        let joiner = if key == "and" { " AND " } else { " OR " };
+        // Parenthesised as a whole: `a OR b` spliced unbracketed into the `WHERE`'s AND list would
+        // bind as `x AND a OR b`, which is a different query.
+        return Ok(format!("({})", parts.join(joiner)));
     }
     if key == "_change_block" {
         return Err(Unsupported::Operator("_change_block".into()));
@@ -844,8 +1030,19 @@ fn lower_predicate(
         if field.ends_with('_') || field.is_empty() {
             continue;
         }
-        if !ent.fields.iter().any(|x| x.name == field) {
+        let Some(f) = ent.fields.iter().find(|x| x.name == field) else {
             continue;
+        };
+        // The operator has to be one the generated schema declares for *this* field's type, which
+        // `filter_suffixes` derives from the recorded reference. `Bytes` carries ten operators and
+        // `String` eighteen - no `_starts_with`, no `_nocase` on `Bytes` - so accepting one here would
+        // answer a query a client's own validator, built from our schema, would have refused.
+        let allowed =
+            f.ty.filter_scalar()
+                .map(graph_schema::filter_suffixes)
+                .unwrap_or_default();
+        if !allowed.contains(suffix) {
+            return Err(Unsupported::Operator(key.to_string()));
         }
         let col = format!("{BASE}.\"{field}\"");
         return match *suffix {
@@ -867,6 +1064,21 @@ fn lower_predicate(
                 }
                 let neg = if *suffix == "_in" { "IN" } else { "NOT IN" };
                 Ok(format!("{col} {neg} ({})", lits.join(", ")))
+            }
+            s if text_match(s).is_some() => {
+                let (negated, nocase, shape) = text_match(s).expect("just matched");
+                let Value::Str(text) = v else {
+                    return Err(Unsupported::Argument(format!("`{key}` needs a string")));
+                };
+                let pattern = shape.pattern(text);
+                let op = match (negated, nocase) {
+                    (false, false) => "LIKE",
+                    (true, false) => "NOT LIKE",
+                    (false, true) => "ILIKE",
+                    (true, true) => "NOT ILIKE",
+                };
+                // The escape character is declared, because the caller's own `%` and `_` are data.
+                Ok(format!("{col} {op} {pattern} ESCAPE '\\'"))
             }
             s => match comparison(s) {
                 Some(op) => {
@@ -909,6 +1121,7 @@ type Pool @entity {
   id: ID!
   liquidity: BigInt!
   hooks: String!
+  sender: Bytes!
   token0: Token!
   swaps: [Swap!]! @derivedFrom(field: "pool")
 }
@@ -938,7 +1151,14 @@ type Swap @entity { id: ID! pool: Pool! }
     }
 
     #[test]
-    fn arguments_lower_in_the_order_a_caller_wrote_them() {
+    /// Every argument reaches the SQL.
+    ///
+    /// **Not an order test, despite what this used to be called.** Arguments and `where` conditions
+    /// live in a `BTreeMap`, so they lower in name order; `hooks` before `liquidity_gt` happens to be
+    /// both, which is why the old name went unchallenged. The order is immaterial - `AND` is
+    /// commutative and the other arguments lower to distinct clauses - but a test should not claim
+    /// something it cannot see.
+    fn every_argument_reaches_the_sql() {
         let c = compile(
             &schema(),
             &one(
@@ -1116,12 +1336,154 @@ type Swap @entity { id: ID! pool: Pool! }
         assert!(compile(&schema(), &one("{ pools { swaps } }")).is_err());
     }
 
+    impl Selection {
+        fn sel_names(&self) -> Vec<&str> {
+            self.sub.iter().map(|s| s.name.as_str()).collect()
+        }
+    }
+
     fn leaf(name: &str) -> Selection {
         Selection {
             name: name.into(),
             args: BTreeMap::new(),
             sub: vec![],
         }
+    }
+
+    /// Text operators lower to `LIKE`, and the caller's own wildcards stay data.
+    #[test]
+    fn text_operators_lower_to_like_with_the_callers_wildcards_escaped() {
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { hooks_contains: "ab" }) { id } }"#),
+        )
+        .unwrap();
+        assert!(
+            c.sql.contains(r#"b."hooks" LIKE '%ab%' ESCAPE '\'"#),
+            "{}",
+            c.sql
+        );
+
+        // The whole reason this needs its own slice: `%` and `_` are wildcards in `LIKE` and data in
+        // a filter, so `50%` must match a literal `50%` and not everything starting `50`.
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { hooks_starts_with: "50%_x" }) { id } }"#),
+        )
+        .unwrap();
+        assert!(
+            c.sql.contains(r#"b."hooks" LIKE '50\%\_x%' ESCAPE '\'"#),
+            "the caller's own wildcards are escaped, the trailing one is ours: {}",
+            c.sql
+        );
+
+        // A quote still closes the literal correctly after escaping.
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { hooks_ends_with: "o'clock" }) { id } }"#),
+        )
+        .unwrap();
+        assert!(c.sql.contains(r#"'%o''clock'"#), "{}", c.sql);
+
+        // Negation and case-insensitivity are the four combinations of two flags.
+        for (op, sql) in [
+            ("hooks_not_contains", "NOT LIKE '%a%'"),
+            ("hooks_contains_nocase", "ILIKE '%a%'"),
+            ("hooks_not_contains_nocase", "NOT ILIKE '%a%'"),
+        ] {
+            let q = format!(r#"{{ pools(where: {{ {op}: "a" }}) {{ id }} }}"#);
+            let c = compile(&schema(), &one(&q)).unwrap();
+            assert!(c.sql.contains(sql), "{op}: {}", c.sql);
+        }
+    }
+
+    /// `and` / `or`, and the bracketing that keeps `or` from rebinding the rest of the `WHERE`.
+    #[test]
+    fn and_or_lower_to_a_bracketed_boolean_tree() {
+        let c = compile(
+            &schema(),
+            &one(
+                r#"{ pools(where: { liquidity_gt: "1", or: [{ id: "a" }, { hooks: "b" }] }) { id } }"#,
+            ),
+        )
+        .unwrap();
+        // `liquidity > '1' AND a OR b` would bind as `(liquidity > '1' AND a) OR b`, which answers a
+        // different question, so the whole tree is parenthesised.
+        assert!(
+            c.sql.contains(r#"((b."id" = 'a') OR (b."hooks" = 'b'))"#),
+            "{}",
+            c.sql
+        );
+        assert!(c.sql.contains(r#"b."liquidity" > '1'"#), "{}", c.sql);
+
+        // Conditions inside one filter object are ANDed, as `where` itself is.
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { and: [{ id: "a", hooks: "b" }] }) { id } }"#),
+        )
+        .unwrap();
+        // Name order, not written order: a filter object is a `BTreeMap`. Immaterial here because
+        // `AND` is commutative, but asserted as it actually is.
+        assert!(
+            c.sql.contains(r#"((b."hooks" = 'b' AND b."id" = 'a'))"#),
+            "{}",
+            c.sql
+        );
+
+        // And they nest.
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { or: [{ and: [{ id: "a" }] }] }) { id } }"#),
+        )
+        .unwrap();
+        assert!(c.sql.contains(r#"(((b."id" = 'a')))"#), "{}", c.sql);
+    }
+
+    /// The introspection document a generated client actually sends is built from fragments.
+    #[test]
+    fn a_clients_fragment_based_introspection_query_parses() {
+        // Shortened, but the shape is the standard one: a named fragment on `__Type`, spread from a
+        // field selection, and a fragment defined *after* the operation that uses it.
+        let q = r#"
+            query IntrospectionQuery {
+              __schema {
+                queryType { name }
+                types { ...FullType }
+              }
+            }
+            fragment FullType on __Type {
+              kind
+              name
+              fields(includeDeprecated: true) { name ...TypeRef }
+            }
+            fragment TypeRef on __Type { kind name }
+        "#;
+        let roots = parse(q).expect("a client introspection document parses");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, "__schema", "the handler routes on this name");
+        // The spread was spliced, not dropped: `types` carries the fragment's fields.
+        let types = roots[0]
+            .sel
+            .iter()
+            .find(|s| s.name == "types")
+            .expect("types survived");
+        let names: Vec<&str> = types.sel_names();
+        assert_eq!(
+            names,
+            ["kind", "name", "fields"],
+            "the fragment's fields are spliced in place"
+        );
+        // And the nested spread inside the fragment resolved too.
+        let fields = types.sub.iter().find(|s| s.name == "fields").unwrap();
+        assert_eq!(
+            fields.sel_names(),
+            ["name", "kind", "name"],
+            "a fragment spread inside a fragment resolves"
+        );
+        // An inline fragment splices the same way.
+        let roots = parse("{ __schema { types { ... on __Type { kind } } } }").unwrap();
+        let types = &roots[0].sel[0];
+        assert_eq!(types.sel_names(), ["kind"]);
     }
 
     #[test]
@@ -1212,14 +1574,29 @@ type Swap @entity { id: ID! pool: Pool! }
         /// the tuple is unreadable inline.
         type Case = (&'static str, fn(&Unsupported) -> bool);
         let cases: Vec<Case> = vec![
-            // A dropped filter returns more rows than were asked for.
+            // A dropped filter returns more rows than were asked for. `_contains` and `or` are
+            // lowered now, so the refusals that remain are the operators the *schema* does not
+            // declare for that field's type: `liquidity` is a `BigInt` and has no text operators.
             (
-                r#"{ pools(where: { hooks_contains: "ab" }) { id } }"#,
-                |e| matches!(e, Unsupported::Operator(o) if o == "hooks_contains"),
+                r#"{ pools(where: { liquidity_contains: "ab" }) { id } }"#,
+                |e| matches!(e, Unsupported::Operator(o) if o == "liquidity_contains"),
+            ),
+            // `Bytes` carries ten operators in the reference and `String` eighteen: no prefix forms
+            // and no `_nocase` anywhere. Accepting one on `sender` would answer a query a client's
+            // own validator, built from the schema we advertise, would have refused.
+            (
+                r#"{ pools(where: { sender_starts_with: "0xab" }) { id } }"#,
+                |e| matches!(e, Unsupported::Operator(o) if o == "sender_starts_with"),
             ),
             (
-                r#"{ pools(where: { or: [{ id: "a" }] }) { id } }"#,
-                |e| matches!(e, Unsupported::Operator(o) if o == "or"),
+                r#"{ pools(where: { sender_contains_nocase: "0xab" }) { id } }"#,
+                |e| matches!(e, Unsupported::Operator(o) if o == "sender_contains_nocase"),
+            ),
+            // And an empty condition list is refused rather than given a meaning this slice has not
+            // measured against graph-node.
+            (
+                r#"{ pools(where: { or: [] }) { id } }"#,
+                |e| matches!(e, Unsupported::Argument(a) if a.contains("or")),
             ),
             // A silently-ignored `block:` answers as of head while claiming a past block.
             ("{ pools(block: { number: 1 }) { id } }", |e| {
@@ -1270,7 +1647,15 @@ type Swap @entity { id: ID! pool: Pool! }
             "{e:?}"
         );
         // And so is a fragment, because resolving a spread needs the definition.
-        assert!(parse("{ pools { ...F } }").is_err());
+        // A spread with no definition is refused by name - it is not silently nothing, which would
+        // drop every field the fragment was carrying.
+        let e = parse("{ pools { ...F } }").expect_err("undefined fragment");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("`F`") && m.contains("never defined")),
+            "{e:?}"
+        );
+        // And one that spreads itself is an error rather than a stack overflow.
+        assert!(parse("fragment F on Pool { ...F } { pools { ...F } }").is_err());
     }
 
     /// `_not_in` must not be read as `_not`, which would compare against a list and produce a

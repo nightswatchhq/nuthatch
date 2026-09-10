@@ -61,7 +61,59 @@ no mapping, so `allow` and `deny` cannot differ.
 
 ### `where` operators
 
-Bare, `_not`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`.
+Bare, `_not`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, and the text set: `_contains`,
+`_starts_with`, `_ends_with`, each with a `_not` form and each with a `_nocase` form, eight more.
+
+**Which operators a field accepts is derived from the schema, not from a table here.** The operator has
+to be one `graph_schema::filter_suffixes` declares for that field's type, and that function was derived
+from the recorded reference. `Bytes` carries ten operators and `String` eighteen - no prefix forms and
+no `_nocase` anywhere on `Bytes` - so `sender_starts_with` on a `Bytes` field is refused. Accepting it
+would answer a query that a client's own validator, built from the schema we advertise, would reject.
+
+Text operators lower to `LIKE`, `NOT LIKE`, `ILIKE` or `NOT ILIKE` with a declared escape character:
+
+```
+hooks_contains: "50%_x"   ->   b."hooks" LIKE '%50\%\_x%' ESCAPE '\'
+```
+
+**The escaping is the whole point.** `%` and `_` are wildcards in `LIKE` and *data* in a filter, so
+`hooks_contains: "50%"` has to match a literal `50%` rather than everything beginning `50`. Backslash
+is escaped first, or escaping the wildcards would introduce backslashes that then get re-escaped, and
+the SQL literal's own quote-doubling is applied last so nothing above can undo it.
+
+### `and` and `or`
+
+Both lower to a bracketed boolean tree, and conditions inside one filter object are `AND`ed, as `where`
+itself is:
+
+```
+where: { liquidity_gt: "1", or: [{ id: "a" }, { hooks: "b" }] }
+  ->   b."liquidity" > '1' AND ((b."id" = 'a') OR (b."hooks" = 'b'))
+```
+
+The outer brackets are load-bearing: spliced in unbracketed, `x AND a OR b` binds as `(x AND a) OR b`,
+which answers a different question. They nest.
+
+An **empty** `and`/`or`, and an empty filter object inside one, are refused. `_in []` could be reasoned
+about from SQL - there is no empty `IN` list and the empty set matches nothing - but "no conditions" has
+no such forced reading, and graph-node's behaviour here is not something this slice has measured.
+
+### Fragments
+
+Named fragments and fragment spreads, inline fragments, fragments defined after the operation that uses
+them, and a spread inside a fragment. Spliced structurally, never by text substitution - this endpoint
+already had one bug from deciding things by searching the raw query.
+
+This is not a nicety: **the introspection document a generated client sends is built from fragments**
+(`fragment FullType on __Type`, `...FullType`), so refusing them refused the one request that has to
+work before any other can.
+
+A spread with no definition is refused by name rather than treated as nothing, which would silently
+drop every field it was carrying. A fragment that spreads itself is an error rather than a stack
+overflow.
+
+The type condition on `... on Type` is consumed and not checked, because every field is validated
+against the entity anyway: a spread naming fields the entity has not got is already refused by name.
 
 `_in []` lowers to `FALSE` and `_not_in []` to `TRUE`, because SQL has no empty `IN` list and the
 empty set is a legitimate thing for a client to send. Suffixes are matched longest-first, so
@@ -94,11 +146,12 @@ after which the whole operation reads as garbage.
 | arguments on a traversed field (`swaps(first: 5)`) | needs that same join plus its own `LIMIT`; a dropped `first` there returns every related row |
 | a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
 | an entity root with no selection set | not a legal GraphQL query, and answering `*` would invent a field list the caller never asked for |
-| `_contains`, `_starts_with`, `_ends_with`, the `_nocase` family | `LIKE` with correct escaping wants its own slice and its own tests. A caller's `%` must not become a wildcard by accident |
-| `and:` / `or:` | a nested boolean tree, and precedence got wrong silently changes which rows come back |
-| fragments and `...` | not implemented |
+| an operator the schema does not declare for that field's type | `sender_starts_with` on a `Bytes` field: our own generated schema says it does not exist |
+| an empty `and`/`or`, or an empty filter object inside one | "no conditions" has no forced reading, and guessing one would be approximating a predicate |
+| a fragment spread with no definition | treating it as nothing would silently drop every field it carried |
 | `orderBy` that traverses a relation (`token0__symbol`) | needs the same join as a nested selection |
 | `mutation`, `subscription` | a nest has no mappings, so it has nothing to mutate and nothing to stream |
+| more than one operation in a document | without an `operationName` there is no way to know which was meant |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
 | an unbound `$name` | neither the request nor the header supplies a value. Dropping the argument would widen the filter |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |

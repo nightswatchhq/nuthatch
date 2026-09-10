@@ -5279,6 +5279,39 @@ mod tests {
             "variables from the request body must bind: {body}"
         );
 
+        // The introspection document a generated client actually sends, fragments and all. Refusing
+        // fragments refused the one request that has to work before any other can: a client will not
+        // send a useful query until it has validated against the schema it fetched this way.
+        let body = ask(
+            "/graphql",
+            r#"query IntrospectionQuery {
+                 __schema {
+                   queryType { name }
+                   types { ...FullType }
+                 }
+               }
+               fragment FullType on __Type {
+                 kind
+                 name
+                 fields(includeDeprecated: true) { name }
+               }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["errors"].is_null(),
+            "a fragment-based introspection document must not be refused: {body}"
+        );
+        let names: Vec<&str> = body["data"]["__schema"]["types"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no types: {body}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for want in ["Pool", "Pool_filter", "Token", "_Meta_", "_Log_"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+
         // Introspection is not an exclusive mode, it is two more root fields. Returning early on the
         // first one meant a mixed operation came back without its data fields at all - present in the
         // request, silently missing from the response.
@@ -5389,17 +5422,43 @@ mod tests {
             "the S2 refusal should be gone now that the compiler exists: {body}"
         );
 
-        // An operator the compiler does not lower is refused **by name**, because a dropped filter
-        // returns more rows than were asked for.
+        // A text operator filters for real over HTTP, through DuckDB's own `LIKE`.
         let body = ask(
             "/graphql",
-            r#"{ pools(where: { hooks_contains: "ab" }) { id } }"#,
+            r#"{ pools(where: { hooks_contains: "hook2" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xbbb"}]),
+            "_contains must match the one pool whose hooks contain it: {body}"
+        );
+        // And the caller's own `%` is data: no pool's hooks contain a literal percent sign, so a
+        // pattern that was not escaped would match everything instead of nothing.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { hooks_contains: "%" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([]),
+            "an unescaped wildcard would have matched every row: {body}"
+        );
+
+        // An operator the *schema* does not declare for that field's type is still refused by name,
+        // because a dropped filter returns more rows than were asked for.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { liquidity_contains: "ab" }) { id } }"#,
             state.clone(),
         )
         .await;
         let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("hooks_contains"),
+            msg.contains("liquidity_contains"),
             "an unlowerable operator must be named: {body}"
         );
 
