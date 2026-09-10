@@ -1132,10 +1132,12 @@ fn lower_predicate(
         // about which rows come back. Refused by name, with the reason.
         let target = match (&field.ty, &field.derived_from) {
             (graph_schema::FieldType::Entity(t), None) => t.clone(),
-            _ => return Err(Unsupported::Operator(format!(
+            _ => {
+                return Err(Unsupported::Operator(format!(
                 "{key} (a nested filter across a list relation needs a child-existence subquery \
                      whose semantics the reference endpoint times out rather than demonstrates)"
-            ))),
+            )))
+            }
         };
         let child = schema
             .entities

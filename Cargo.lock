@@ -4241,6 +4241,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "k256",
+ "num-bigint",
  "nuthatch-decode",
  "object_store",
  "parquet",
