@@ -17,6 +17,7 @@ or below the reference's own head.
 import argparse
 import json
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -26,17 +27,31 @@ UA = "nuthatch-port-1212"
 PRUNE_FLOOR = 25942028
 
 
-def gql(query):
+def gql(query, attempts=5):
     """Query the reference. A non-empty `errors` array is a failure whatever the status
     says: the gateway answers an auth failure and a pruned-block refusal with HTTP 200,
-    and treating either as an empty result is how a diff agrees with itself."""
+    and treating either as an empty result is how a diff agrees with itself.
+
+    A transport timeout is retried with backoff, and only a transport timeout: paging
+    `pools` is 133 requests and the public endpoint does time one out from time to time.
+    A partial walk that raised would otherwise look identical to a short reference.
+    A GraphQL `errors` array is never retried - it is an answer, and the wrong one."""
     req = urllib.request.Request(
         REF,
         data=json.dumps({"query": query}).encode(),
         headers={"content-type": "application/json", "User-Agent": UA},
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        body = json.load(r)
+    last = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                body = json.load(r)
+            break
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            last = e
+            if attempt == attempts - 1:
+                raise SystemExit(f"reference unreachable after {attempts} attempts: {e}")
+            time.sleep(2 ** attempt)
     if body.get("errors"):
         raise SystemExit(f"reference refused: {body['errors']}")
     if "data" not in body or body["data"] is None:
@@ -140,9 +155,26 @@ def main():
         raise SystemExit("reference reports indexing errors; its answers are not a baseline")
 
     rows, prov = sql("SELECT 1 AS ok")
-    print(f"reference head {head['block']['number']}   nest as_of {prov.get('as_of')}   pinned {a.block}")
-    if prov.get("as_of", 0) < a.block:
-        raise SystemExit(f"nest is at {prov.get('as_of')}, behind the pin; nothing to compare")
+    as_of = prov.get("as_of", 0)
+    print(f"reference head {head['block']['number']}   nest as_of {as_of}   pinned {a.block}")
+    # **The nest must be exactly at the pin, not merely past it.**
+    #
+    # Only some of the nest-side queries below carry a block predicate. The emitted `token` view
+    # cannot: it is `SELECT id FROM (...) GROUP BY id` with no block column, so it always answers as
+    # of whatever the nest has reached. Accepting `as_of > block` therefore compares post-pin rows
+    # against a reference pinned earlier, and reports the difference as extras - a divergence caused
+    # by the clock rather than by the port. My own first run did exactly that: nest frozen at
+    # 25,945,634, pinned at 25,943,500, and the 27 "extra" tokens include any created in those 2,134
+    # blocks. Raised by review of #1278.
+    #
+    # Equality is cheap to satisfy because the procedure already freezes the nest: stop `dev`, start
+    # `serve` (which owns no cursor), read `as_of`, and pin to that.
+    if as_of != a.block:
+        raise SystemExit(
+            f"nest is at {as_of} and the pin is {a.block}. Pass --block {as_of}, or freeze the nest "
+            f"at {a.block}. Comparing a view with no block predicate against a reference pinned "
+            f"elsewhere reports clock skew as divergence."
+        )
 
     lo, hi = a.block - a.window, a.block
     ts = sql(f'SELECT min(block_timestamp) AS lo, max(block_timestamp) AS hi '
