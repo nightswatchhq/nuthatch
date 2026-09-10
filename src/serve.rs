@@ -1528,14 +1528,14 @@ struct TableQuery {
 /// authored **meaning** from `semantic.toml`, the derived **footguns**, and live **coverage** (the
 /// hot/cold seam as numbers). Assembled per call from this running nest - the MCP `schema` tool
 /// relays it, so an agent reads *this* nest's data model, not a static string. Plain text.
-/// The Graph-compatible GraphQL surface (RFC-0053 S1, #1265).
+/// The Graph-compatible GraphQL surface (RFC-0053 S1 #1265, S2 #1266).
 ///
-/// **Introspection only, deliberately.** A generated client fetches the schema and validates against
-/// it before it will send a useful query, so introspection is the first thing that has to be right
-/// and it is worth serving on its own: until it answers, nothing else about compatibility can even be
-/// tested against a real client. The query compiler is S2 (#1266), and until it lands anything that
-/// is not introspection is refused **in the Graph error envelope** rather than with a bare HTTP
-/// status, because that is what a client knows how to read.
+/// Three things behind one path. **Introspection** first, because a generated client fetches the
+/// schema and validates against it before it will send anything useful. **`_meta`**, answered from
+/// the nest's own head rather than compiled, since a nest runs no mapping and so has no indexing
+/// error to report. Everything else goes through [`crate::graph_query`], which lowers what it can
+/// lower exactly and **refuses the rest by name in the Graph error envelope** - a client can read an
+/// envelope, and a dropped `where` clause returns more rows than were asked for.
 ///
 /// The generated schema comes from `graph/schema.graphql` in the nest, written there by `port-emit`.
 /// A nest that was not produced from a subgraph has no such file and this endpoint says so rather
@@ -1549,13 +1549,27 @@ async fn graph_graphql(
         .and_then(|q| q.as_str())
         .unwrap_or_default()
         .to_string();
+    // `variables` is how every generated client passes its arguments. A value this dialect cannot
+    // represent is left unbound rather than coerced, so the operation is refused by variable name.
+    let vars: std::collections::BTreeMap<String, crate::graph_query::Value> = body
+        .get("variables")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| {
+                    crate::graph_query::Value::from_json(v).map(|v| (k.clone(), v))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let path = s.dir.join("graph").join("schema.graphql");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return (
             StatusCode::OK,
             Json(serde_json::json!({"errors":[{"message":
-                "this nest carries no Graph schema; run `nuthatch port-emit` against the subgraph                  source to write graph/schema.graphql"}]})),
+                "this nest carries no Graph schema; run `nuthatch port-emit` against the \
+                 subgraph source to write graph/schema.graphql"}]})),
         );
     };
     let schema = match crate::graph_schema::parse(&text) {
@@ -1579,7 +1593,7 @@ async fn graph_graphql(
         );
     }
     // RFC-0053 S2 (#1266): compile the operation and run it over the nest's views.
-    let roots = match crate::graph_query::parse(&query) {
+    let roots = match crate::graph_query::parse_with(&query, &vars) {
         Ok(r) => r,
         Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
     };
@@ -5146,6 +5160,39 @@ mod tests {
             body["data"]["pool"],
             serde_json::json!({"hooks": "0xhook2"}),
             "a singular root must answer one object, not a list: {body}"
+        );
+
+        // A client-shaped request: a named operation with variables, passed in the request body's
+        // `variables` object rather than inlined in the query. Asserted over HTTP because the
+        // parser test cannot see whether the handler actually reads that field.
+        let res = router(SharedNest::new(state.clone()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "query": "query Pools($n: Int!, $min: BigInt!) \
+                                      { pools(first: $n, where: { liquidity_gt: $min }) { id } }",
+                            "variables": { "n": 5, "min": "10" },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 4 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "variables from the request body must bind: {body}"
         );
 
         // An unlowerable operation is refused **in the Graph envelope** rather than as a bare

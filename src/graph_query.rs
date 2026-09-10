@@ -48,6 +48,27 @@ pub enum Value {
 }
 
 impl Value {
+    /// A JSON value from a request's `variables`, as this dialect's value.
+    ///
+    /// A JSON number that is not an integer has no place in this dialect - `BigDecimal` and `BigInt`
+    /// both travel as strings over GraphQL, precisely because a float would lose them - so a
+    /// fractional number is `None` and refused by name rather than rounded into a filter.
+    pub fn from_json(v: &serde_json::Value) -> Option<Value> {
+        Some(match v {
+            serde_json::Value::String(s) => Value::Str(s.clone()),
+            serde_json::Value::Bool(b) => Value::Bool(*b),
+            serde_json::Value::Number(n) => Value::Int(n.as_i64()?),
+            serde_json::Value::Array(a) => {
+                Value::List(a.iter().map(Value::from_json).collect::<Option<_>>()?)
+            }
+            serde_json::Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, v)| Value::from_json(v).map(|v| (k.clone(), v)))
+                    .collect::<Option<_>>()?,
+            ),
+            serde_json::Value::Null => return None,
+        })
+    }
     fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(n) => Some(*n),
@@ -87,6 +108,10 @@ pub enum Unsupported {
     Operator(String),
     /// `block:` needs a block-ranged entity store, which the nest has not got (#1267).
     TimeTravel,
+    /// A `$name` the operation used but neither the request nor a header default supplies.
+    UnboundVariable(String),
+    /// A `mutation` or `subscription`. A nest has neither.
+    NotAQuery(String),
 }
 
 impl fmt::Display for Unsupported {
@@ -105,6 +130,16 @@ impl fmt::Display for Unsupported {
                  join rather than an N+1 walk); select scalar fields meanwhile"
             ),
             Unsupported::Argument(a) => write!(f, "argument `{a}` is not implemented yet"),
+            Unsupported::UnboundVariable(v) => write!(
+                f,
+                "no value was supplied for variable `${v}`, and its definition declares no default"
+            ),
+            Unsupported::NotAQuery(k) => {
+                write!(
+                    f,
+                    "a nest serves queries; `{k}` operations do not exist here"
+                )
+            }
             Unsupported::Operator(o) => write!(
                 f,
                 "filter operator `{o}` is not implemented yet; it is refused rather than ignored, \
@@ -122,18 +157,32 @@ impl fmt::Display for Unsupported {
 
 /// Parse the root fields of an operation, with their arguments.
 pub fn parse(query: &str) -> Result<Vec<RootField>, Unsupported> {
+    parse_with(query, &BTreeMap::new())
+}
+
+/// Parse an operation, binding `$name` arguments from `vars`.
+///
+/// Every generated client sends its arguments this way - `query Pools($first: Int!) { pools(first:
+/// $first) … }` - so a compiler that refuses variables refuses in practice every query a client
+/// produces, whatever it can do with a hand-written one. A `$name` with no supplied value and no
+/// header default is [`Unsupported::UnboundVariable`], never a silently-dropped argument.
+pub fn parse_with(
+    query: &str,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<RootField>, Unsupported> {
     if query.contains("fragment ") || query.contains("...") {
         return Err(Unsupported::Syntax(
             "fragments are not implemented yet".into(),
         ));
     }
     let b = query.as_bytes();
-    let mut c = Cursor { b, i: 0 };
-    c.trivia();
-    // Skip an operation header - `query Foo($x: Int)` - to the first selection set.
-    while c.i < b.len() && c.peek() != Some(b'{') {
-        c.i += 1;
-    }
+    let mut c = Cursor {
+        b,
+        i: 0,
+        vars,
+        defaults: BTreeMap::new(),
+    };
+    c.operation_header()?;
     if c.peek() != Some(b'{') {
         return Err(Unsupported::Syntax("no selection set".into()));
     }
@@ -212,6 +261,11 @@ pub fn parse(query: &str) -> Result<Vec<RootField>, Unsupported> {
 struct Cursor<'a> {
     b: &'a [u8],
     i: usize,
+    /// Values supplied with the request, then the operation header's declared defaults. Resolved at
+    /// the value site rather than carried as a `Value::Var`, so nothing downstream of the parser can
+    /// forget that a variable existed.
+    vars: &'a BTreeMap<String, Value>,
+    defaults: BTreeMap<String, Value>,
 }
 
 impl<'a> Cursor<'a> {
@@ -246,6 +300,108 @@ impl<'a> Cursor<'a> {
             )));
         }
         Ok(String::from_utf8_lossy(&self.b[start..self.i]).into_owned())
+    }
+    /// Consume an optional operation header, leaving the cursor on the selection set's `{`.
+    ///
+    /// **Parsed rather than skipped to the first brace.** A variable definition may carry a default
+    /// that is itself an object - `$w: Pool_filter = { id: "a" }` - and skipping to the first `{`
+    /// lands inside it, so the whole operation then reads as garbage.
+    fn operation_header(&mut self) -> Result<(), Unsupported> {
+        self.trivia();
+        if self.peek() == Some(b'{') {
+            return Ok(()); // anonymous shorthand
+        }
+        let kw = self.ident()?;
+        match kw.as_str() {
+            "query" => {}
+            other @ ("mutation" | "subscription") => {
+                return Err(Unsupported::NotAQuery(other.to_string()))
+            }
+            other => {
+                return Err(Unsupported::Syntax(format!(
+                    "expected an operation, found `{other}`"
+                )))
+            }
+        }
+        self.trivia();
+        // An optional operation name.
+        if self
+            .peek()
+            .is_some_and(|c| c == b'_' || c.is_ascii_alphabetic())
+        {
+            self.ident()?;
+            self.trivia();
+        }
+        if self.peek() == Some(b'(') {
+            self.variable_definitions()?;
+            self.trivia();
+        }
+        // Directives on the operation change nothing this compiler lowers, and skipping one
+        // silently would be the same class of mistake as a dropped filter, so refuse.
+        if self.peek() == Some(b'@') {
+            return Err(Unsupported::Syntax(
+                "directives on an operation are not implemented yet".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// `($first: Int! = 10, $w: Pool_filter)`. Only the defaults are kept: the declared types are
+    /// the client's assertion about its own values, and this compiler reads the values themselves.
+    fn variable_definitions(&mut self) -> Result<(), Unsupported> {
+        self.i += 1; // '('
+        loop {
+            self.trivia();
+            match self.peek() {
+                None => return Err(Unsupported::Syntax("unclosed variable definitions".into())),
+                Some(b')') => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                Some(b'$') => self.i += 1,
+                Some(c) => {
+                    return Err(Unsupported::Syntax(format!(
+                        "expected `$` in variable definitions, found `{}`",
+                        c as char
+                    )))
+                }
+            }
+            let name = self.ident()?;
+            self.trivia();
+            if self.peek() != Some(b':') {
+                return Err(Unsupported::Syntax(format!("`${name}` has no type")));
+            }
+            self.i += 1;
+            self.type_ref()?;
+            self.trivia();
+            if self.peek() == Some(b'=') {
+                self.i += 1;
+                let v = self.value()?;
+                self.defaults.insert(name, v);
+                self.trivia();
+            }
+            if self.peek() == Some(b',') {
+                self.i += 1;
+            }
+        }
+    }
+    /// A type reference - `Int`, `[Bytes!]!` - consumed and discarded.
+    fn type_ref(&mut self) -> Result<(), Unsupported> {
+        self.trivia();
+        if self.peek() == Some(b'[') {
+            self.i += 1;
+            self.type_ref()?;
+            self.trivia();
+            if self.peek() != Some(b']') {
+                return Err(Unsupported::Syntax("unclosed list type".into()));
+            }
+            self.i += 1;
+        } else {
+            self.ident()?;
+        }
+        while self.peek() == Some(b'!') {
+            self.i += 1;
+        }
+        Ok(())
     }
     fn args(&mut self) -> Result<BTreeMap<String, Value>, Unsupported> {
         self.i += 1; // '('
@@ -326,9 +482,15 @@ impl<'a> Cursor<'a> {
                     m.insert(k, v);
                 }
             }
-            Some(b'$') => Err(Unsupported::Argument(
-                "variables are not implemented yet".into(),
-            )),
+            Some(b'$') => {
+                self.i += 1;
+                let name = self.ident()?;
+                self.vars
+                    .get(&name)
+                    .or_else(|| self.defaults.get(&name))
+                    .cloned()
+                    .ok_or(Unsupported::UnboundVariable(name))
+            }
             Some(c) if c == b'-' || c.is_ascii_digit() => {
                 let start = self.i;
                 if c == b'-' {
@@ -705,6 +867,55 @@ type Swap @entity { id: ID! pool: Pool! }
 
     /// **The refusals, which are the module's contract.** Each of these is a wrong answer if
     /// silently ignored, so each must be an error a caller can read.
+    #[test]
+    fn a_generated_clients_operation_binds_its_variables() {
+        // The shape an Apollo- or graph-client-generated query actually has: a named operation, a
+        // variable definition list, one variable with a default, and `$name` in argument position.
+        // Nothing in the earlier tests looks like this, and a compiler that only handles the
+        // hand-written form handles no real client at all.
+        let q = r#"
+            query Pools($first: Int!, $min: BigInt = "5") {
+              pools(first: $first, where: { liquidity_gt: $min }) { id }
+            }
+        "#;
+        let vars = BTreeMap::from([("first".to_string(), Value::Int(3))]);
+        let roots = parse_with(q, &vars).expect("a client operation parses");
+        let c = compile(&schema(), &roots[0]).expect("and lowers");
+        assert_eq!(
+            c.sql,
+            r#"SELECT "id" FROM "pool" WHERE "liquidity" > '5' ORDER BY "id" ASC LIMIT 3 OFFSET 0"#,
+            "the supplied variable and the header default both reach the SQL"
+        );
+
+        // An unbound variable is refused by name. Silently dropping it would widen the filter, and
+        // widening a filter is the one failure this compiler exists to prevent.
+        let e = parse_with(q, &BTreeMap::new()).expect_err("no value for $first");
+        assert!(
+            matches!(&e, Unsupported::UnboundVariable(v) if v == "first"),
+            "{e:?}"
+        );
+
+        // A default that is itself an object: the old header skip ran to the first `{` and landed
+        // inside this one, so the whole operation read as garbage.
+        let q = r#"query P($w: Pool_filter = { id: "0xaaa" }) { pools(where: $w) { id } }"#;
+        let roots = parse_with(q, &BTreeMap::new()).expect("an object default parses");
+        let c = compile(&schema(), &roots[0]).expect("and lowers");
+        assert!(
+            c.sql.contains(r#""id" = '0xaaa'"#),
+            "the object default reached the predicate: {}",
+            c.sql
+        );
+
+        // A nest has no mappings, so it has nothing to mutate and nothing to stream.
+        for kw in ["mutation", "subscription"] {
+            let e = parse(&format!("{kw} M {{ pools {{ id }} }}")).expect_err("{kw} is refused");
+            assert!(
+                matches!(&e, Unsupported::NotAQuery(k) if k == kw),
+                "{kw}: {e:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_sub_selection_is_recorded_and_the_fields_after_it_still_parse() {
         // `_meta { block { number } hasIndexingErrors }` is a legitimate nested selection the
