@@ -1345,3 +1345,60 @@ export function handlePoolCreated(event: PoolCreated): void {
         "`event.block.timestamp` two hops from the handler must still bind (#1277):\n{sql}"
     );
 }
+
+/// Raised by review of #1279. `plain_local_expr` scanned from the top and returned the first
+/// declaration of the name, which is not the one in scope at the use site:
+///
+/// ```text
+/// const poolId = event.params.token1.toHexString()   // outer
+/// if (..) {
+///   const poolId = event.params.pool.toHexString()   // shadows it
+///   const pool = new Pool(poolId)                    // uses this one
+/// }
+/// ```
+///
+/// Emitting `Pool.id` from `token1` there would answer the wrong column under a report promising
+/// byte-identical - #1248's fault in a new place. Scanning cannot resolve scope, so an ambiguous
+/// name resolves to nothing and the field is reported as reaching no column, exactly as it was
+/// before the alias fallback existed.
+#[test]
+fn a_shadowed_local_is_refused_rather_than_resolved_to_the_wrong_one() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  const poolId = event.params.token1.toHexString()
+  if (event.params.fee.gt(BigInt.zero())) {
+    const poolId = event.params.pool.toHexString()
+    const pool = new Pool(poolId)
+    pool.plain = event.params.fee
+    pool.save()
+  }
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool");
+    if let Some(view) = view {
+        let sql = select_sql(&view.sql);
+        assert!(
+            !sql.contains("\"token1\" AS \"id\""),
+            "the outer `poolId` must not answer `Pool.id`; the inner one shadows it:\n{sql}"
+        );
+    }
+    assert!(
+        result
+            .skipped_fields
+            .iter()
+            .any(|s| s.entity == "Pool" && s.field == "id"),
+        "an ambiguous local must leave `Pool.id` reported as reaching no column: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+}

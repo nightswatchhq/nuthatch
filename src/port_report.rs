@@ -3084,7 +3084,24 @@ pub(crate) fn event_handler_for<'a>(
 /// only the representation-only suffixes, and any arithmetic residue after the parameter name yields
 /// no column at all (#1248). So a local holding a *transformed* parameter still resolves to nothing
 /// rather than to the wrong column.
+///
+/// **A name declared more than once resolves to nothing.** Scanning cannot tell which declaration is
+/// in scope at the use site, and the first textual one is not it:
+///
+/// ```text
+/// const poolId = event.params.a.toHexString()
+/// if (..) {
+///   const poolId = event.params.b.toHexString()
+///   const pool = new Pool(poolId)            // uses b, not a
+/// }
+/// ```
+///
+/// Returning the outer declaration would emit `Pool.id` from column `a` - a view answering the wrong
+/// column under a report promising byte-identical, which is #1248's fault in a new place. Refusing
+/// leaves the field reported as reaching no column, which is what it did before this fallback
+/// existed. Raised by review of this change.
 fn plain_local_expr(body: &str, var: &str) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
     let mut i = 0;
     while i < body.len() {
         if !body.is_char_boundary(i) {
@@ -3127,12 +3144,16 @@ fn plain_local_expr(body: &str, var: &str) -> Option<String> {
                 .unwrap_or(body.len());
             let e = collapse_ws(&body[k..end]);
             if !e.is_empty() {
-                return Some(e);
+                found.push(e);
             }
         }
         i = k.max(i + 1);
     }
-    None
+    // Exactly one declaration, or nothing. See the shadowing note above.
+    match found.len() {
+        1 => found.pop(),
+        _ => None,
+    }
 }
 
 fn local_root(expr: &str) -> Option<String> {
