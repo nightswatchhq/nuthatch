@@ -5554,6 +5554,43 @@ mod tests {
             "an unescaped wildcard would have matched every row: {body}"
         );
 
+        // A nested relation filter, through DuckDB's own EXISTS. `0xaaa`'s token0 is WETH and
+        // `0xbbb` points at a token that is not there, so exactly one pool can match.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "a nested relation filter must filter on the child: {body}"
+        );
+        // And a child condition nothing satisfies returns nothing, rather than ignoring the clause -
+        // which is the failure that makes a dropped filter worse than an error.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { token0_: { symbol: "NOPE" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(body["data"]["pools"], serde_json::json!([]), "{body}");
+
+        // A nested filter across a list relation is refused by name, with the reason, rather than as
+        // an unknown field.
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { swaps_: { id: "s1" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("swaps_") && msg.contains("child-existence"),
+            "the refusal must name the field and the reason: {body}"
+        );
+
         // An operator the *schema* does not declare for that field's type is still refused by name,
         // because a dropped filter returns more rows than were asked for.
         let body = ask(

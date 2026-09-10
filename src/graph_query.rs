@@ -966,7 +966,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, v) in m {
-                    wheres.push(lower_predicate(ent, key, v)?);
+                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0)?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" if !singular => {}
@@ -1055,9 +1055,12 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 }
 
 fn lower_predicate(
+    schema: &Schema,
     ent: &graph_schema::Entity,
     key: &str,
     v: &Value,
+    base: &str,
+    depth: usize,
 ) -> Result<String, Unsupported> {
     if key == "and" || key == "or" {
         let Value::List(items) = v else {
@@ -1089,7 +1092,7 @@ fn lower_predicate(
             }
             let inner: Result<Vec<String>, Unsupported> = m
                 .iter()
-                .map(|(k, vv)| lower_predicate(ent, k, vv))
+                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth))
                 .collect();
             // Conditions within one filter object are ANDed, which is what `where` itself does.
             parts.push(format!("({})", inner?.join(" AND ")));
@@ -1101,6 +1104,59 @@ fn lower_predicate(
     }
     if key == "_change_block" {
         return Err(Unsupported::Operator("_change_block".into()));
+    }
+    // `token0_: Token_filter` - a nested filter on the related entity, which the generated schema
+    // advertises for every relation. It used to fall through the suffix loop below (the key ends in
+    // `_`) and come back as `UnknownField`, so our own schema validated a query the endpoint then
+    // refused for the wrong reason (Jules on #1282).
+    if let Some(field_name) = key.strip_suffix('_') {
+        let Some(field) = ent.fields.iter().find(|f| f.name == field_name) else {
+            return Err(Unsupported::UnknownField {
+                entity: ent.name.clone(),
+                field: key.to_string(),
+            });
+        };
+        let Value::Object(inner) = v else {
+            return Err(Unsupported::Argument(format!(
+                "`{key}` takes a filter object"
+            )));
+        };
+        if inner.is_empty() {
+            return Err(Unsupported::Argument(format!(
+                "`{key}` is an empty filter, which has no meaning this slice has verified"
+            )));
+        }
+        // A **to-one** reference only. The reference advertises `swaps_` for `@derivedFrom` lists too,
+        // but a derived-list nested filter **504s on graph-node itself** for this deployment, so its
+        // semantics cannot be measured here - and "probably matches if any child matches" is a guess
+        // about which rows come back. Refused by name, with the reason.
+        let target = match (&field.ty, &field.derived_from) {
+            (graph_schema::FieldType::Entity(t), None) => t.clone(),
+            _ => return Err(Unsupported::Operator(format!(
+                "{key} (a nested filter across a list relation needs a child-existence subquery \
+                     whose semantics the reference endpoint times out rather than demonstrates)"
+            ))),
+        };
+        let child = schema
+            .entities
+            .iter()
+            .find(|e| e.name == target)
+            .ok_or_else(|| Unsupported::UnknownField {
+                entity: ent.name.clone(),
+                field: key.to_string(),
+            })?;
+        let alias = format!("n{depth}");
+        let view = crate::subgraph_import::to_alias(&target);
+        let parts: Result<Vec<String>, Unsupported> = inner
+            .iter()
+            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1))
+            .collect();
+        // `EXISTS` rather than a join: the parent's row count must not change, and `first` still means
+        // what it says.
+        return Ok(format!(
+            "EXISTS (SELECT 1 FROM \"{view}\" {alias} WHERE {alias}.\"id\" = {base}.\"{field_name}\" AND {})",
+            parts?.join(" AND ")
+        ));
     }
     // Longest suffix first, so `_not_in` is not read as `_not`.
     const SUFFIXES: &[&str] = &[
@@ -1147,7 +1203,7 @@ fn lower_predicate(
         if !allowed.contains(suffix) {
             return Err(Unsupported::Operator(key.to_string()));
         }
-        let col = format!("{BASE}.\"{field}\"");
+        let col = format!("{base}.\"{field}\"");
         return match *suffix {
             "_in" | "_not_in" => {
                 let Value::List(items) = v else {
@@ -1735,6 +1791,83 @@ type Swap @entity { id: ID! pool: Pool! }
         let e = compile(&schema(), &one(r#"{ pools { x: nope } }"#)).expect_err("unknown");
         assert!(
             matches!(&e, Unsupported::UnknownField { field, .. } if field == "nope"),
+            "{e:?}"
+        );
+    }
+
+    /// `token0_: Token_filter` - a nested filter on a related entity, which the generated schema
+    /// advertises for every relation.
+    #[test]
+    fn a_nested_relation_filter_lowers_to_an_exists_subquery() {
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#),
+        )
+        .expect("a nested relation filter lowers");
+        // EXISTS rather than a join: the parent's row count must not change, or `first` stops meaning
+        // what it says.
+        assert!(
+            c.sql.contains(
+                r#"EXISTS (SELECT 1 FROM "token" n0 WHERE n0."id" = b."token0" AND n0."symbol" = 'WETH')"#
+            ),
+            "{}",
+            c.sql
+        );
+
+        // It composes with the parent's own conditions, and the inner operators are the child's.
+        let c = compile(
+            &schema(),
+            &one(
+                r#"{ pools(where: { liquidity_gt: "1", token0_: { symbol_contains: "ET" } }) { id } }"#,
+            ),
+        )
+        .unwrap();
+        assert!(c.sql.contains(r#"b."liquidity" > '1'"#), "{}", c.sql);
+        assert!(
+            c.sql.contains(r#"n0."symbol" LIKE '%ET%' ESCAPE '\'"#),
+            "the child's text operator is lowered against the child: {}",
+            c.sql
+        );
+
+        // An unknown field inside the nested filter is named against the *child* entity.
+        let e = compile(
+            &schema(),
+            &one(r#"{ pools(where: { token0_: { nope: "x" } }) { id } }"#),
+        )
+        .expect_err("unknown child field");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "nope"),
+            "{e:?}"
+        );
+
+        // A nested filter across a **list** relation is refused by name and says why: the reference
+        // endpoint 504s on one, so its semantics are not something this slice has measured, and a
+        // guess about which rows come back is a guess about the answer.
+        let e = compile(
+            &schema(),
+            &one(r#"{ pools(where: { swaps_: { id: "s1" } }) { id } }"#),
+        )
+        .expect_err("a list relation is refused");
+        assert!(
+            matches!(&e, Unsupported::Operator(o) if o.starts_with("swaps_") && o.contains("child-existence")),
+            "{e:?}"
+        );
+
+        // An empty nested filter is refused rather than treated as no condition.
+        assert!(compile(
+            &schema(),
+            &one(r#"{ pools(where: { token0_: {} }) { id } }"#)
+        )
+        .is_err());
+
+        // And a `_`-suffixed key naming no relation at all is still an unknown field.
+        let e = compile(
+            &schema(),
+            &one(r#"{ pools(where: { nope_: { id: "x" } }) { id } }"#),
+        )
+        .expect_err("no such relation");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { field, .. } if field == "nope_"),
             "{e:?}"
         );
     }

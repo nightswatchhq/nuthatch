@@ -107,6 +107,33 @@ hooks_contains: "50%_x"   ->   b."hooks" LIKE '%50\%\_x%' ESCAPE '\'
 is escaped first, or escaping the wildcards would introduce backslashes that then get re-escaped, and
 the SQL literal's own quote-doubling is applied last so nothing above can undo it.
 
+### Nested relation filters
+
+`token0_: Token_filter` - a filter on the related entity. The generated schema advertises one for every
+relation, so refusing it made our own schema validate a query the endpoint then rejected.
+
+```graphql
+{ pools(where: { liquidity_gt: "1", token0_: { symbol_contains: "ET" } }) { id } }
+```
+
+```sql
+WHERE b."liquidity" > '1'
+  AND EXISTS (SELECT 1 FROM "token" n0
+              WHERE n0."id" = b."token0" AND n0."symbol" LIKE '%ET%' ESCAPE '\')
+```
+
+`EXISTS` rather than a join, so the parent's row count is unchanged and `first` keeps meaning what it
+says. Conditions inside are lowered against the **child** entity, with the child's own operator set, and
+an unknown field there is named against the child.
+
+**A nested filter across a `@derivedFrom` list - `swaps_` - is refused by name.** The reference
+advertises those too, but asking the live reference endpoint for one returns **HTTP 504** on this
+deployment: graph-node advertises an input it cannot itself answer here. So the semantics are not
+something this slice has measured, "probably matches if any child matches" is a guess about which rows
+come back, and the refusal says exactly that rather than pretending it is an unknown field.
+
+An empty nested filter is refused for the same reason an empty `and`/`or` is.
+
 ### `and` and `or`
 
 Both lower to a bracketed boolean tree, and conditions inside one filter object are `AND`ed, as `where`
