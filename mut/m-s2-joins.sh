@@ -19,8 +19,11 @@ for m in mut/s2/*.py; do
     echo "[$name] NOT APPLIED (no diff) - the anchor matched nothing that matters"; git checkout -- src; continue
   fi
   echo "[$name] applied: $(git diff --shortstat -- src)"
+  # The whole `serve::tests::` module, not one named test: the HTTP test was split into three and a
+  # filter naming only the first left two thirds of the assertions outside this gate, which showed up
+  # as a GREEN mutation whose own test simply never ran.
   out=$(cargo test --offline --lib graph_ 2>&1
-        cargo test --offline --lib serve::tests::a_client_can_introspect 2>&1
+        cargo test --offline --lib serve::tests:: 2>&1
         cargo test --offline --test graph_schema_golden 2>&1)
   # A mutation that does not COMPILE is red too, and `error: argument never used` carries no
   # bracketed code - a `^error\[` pattern read exactly that case as GREEN.
