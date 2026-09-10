@@ -1194,3 +1194,113 @@ export function handlePoolCreated(event: PoolCreated): void {
         "the emitted view must bind: {check:?}\n{sql}"
     );
 }
+
+/// #1277. An entity whose every exact field reaches no column used to get
+/// `CREATE VIEW "<entity>" AS SELECT 1 AS port_placeholder`, so that `nuthatch check` had a table to
+/// bind. On the RFC-0044 S3 acceptance port that was nine of nineteen entities, `Bundle` and
+/// `PoolManager` among them, and `SELECT count(*) FROM "bundle"` answered `1` with a full provenance
+/// block. The reference has exactly one `Bundle`, so a comparison on row counts agreed with it.
+///
+/// `Bundle` here is the real shape: a literal id and a constant, neither of which is a column.
+const NO_COLUMN_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+
+const NO_COLUMN_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.plain = event.params.fee
+  pool.save()
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = ZERO_BD
+  bundle.save()
+}
+"#;
+
+#[test]
+fn an_entity_whose_fields_reach_no_column_gets_no_view_at_all() {
+    let (nest, result) = emitted_nest(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Bundle"),
+        "no view may be emitted for Bundle: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .entities_without_views
+            .contains(&"Bundle".to_string()),
+        "and it must be named rather than silently absent: {:?}",
+        result.entities_without_views
+    );
+    assert!(
+        !nest.path().join("views/20-bundle.sql").exists(),
+        "no file either - a view returning 1 is worse than no table"
+    );
+
+    // Pool still lands. The change must not cost an entity that does resolve.
+    assert!(
+        result.views.iter().any(|v| v.entity == "Pool"),
+        "Pool resolves `plain` and must still be emitted"
+    );
+
+    // The check must not name Bundle. Its projection for such a view was `*`, which binds whatever
+    // the view holds and so asserted nothing while reading `binds: true`.
+    let check = std::fs::read_to_string(nest.path().join("checks/port_views.sql")).unwrap();
+    assert!(
+        !check.contains("'Bundle'"),
+        "the check may not claim an entity that has no view:\n{check}"
+    );
+    assert!(
+        !check.contains("SELECT * FROM"),
+        "and no row of it may project `*`:\n{check}"
+    );
+    let expected =
+        std::fs::read_to_string(nest.path().join("checks/expected/port_views.json")).unwrap();
+    assert!(
+        !expected.contains("Bundle"),
+        "nor may the committed expectation:\n{expected}"
+    );
+}
+
+/// A nest emitted before that change carries nine placeholder views. Re-emitting has to remove the
+/// one for an entity that now emits none, or the stale table survives and nothing re-examines it.
+#[test]
+fn reemission_removes_a_stale_generated_view() {
+    let subgraph = subgraph_with(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let views = nest.path().join("views");
+    std::fs::create_dir_all(&views).unwrap();
+
+    // Exactly what the previous emitter wrote, header and all.
+    let stale = views.join("20-bundle.sql");
+    std::fs::write(
+        &stale,
+        "-- Exact fields of `Bundle`. Call-derived, fixed-point and unreachable fields are not \
+         here; see README.md.\n\nCREATE VIEW \"bundle\" AS SELECT 1 AS port_placeholder;\n",
+    )
+    .unwrap();
+    // And an operator's own view, which must survive.
+    let mine = views.join("30-mine.sql");
+    std::fs::write(&mine, "CREATE VIEW \"mine\" AS SELECT 1 AS ok;\n").unwrap();
+
+    nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+
+    assert!(
+        !stale.exists(),
+        "the stale generated view for Bundle must be removed"
+    );
+    assert!(
+        mine.exists(),
+        "a view the operator wrote must not be removed"
+    );
+}
