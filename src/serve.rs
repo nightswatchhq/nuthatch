@@ -1591,61 +1591,67 @@ async fn graph_graphql(
         Ok(r) => r,
         Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
     };
-    // The introspection surface a generated client fetches before it will send anything useful.
-    if roots.iter().any(|r| r.name == "__schema") {
-        return (
-            StatusCode::OK,
-            // `render` already produces `{"__schema": …}`, which is precisely the `data` payload.
-            Json(serde_json::json!({"data":
-                crate::graph_schema::introspection::render(&schema)})),
-        );
-    }
-    // `__type(name: "Pool")` is the other standard introspection operation, and it answers under
-    // `__type`. The name comes from the parsed argument rather than a hand-rolled scan of the text.
-    if let Some(root) = roots.iter().find(|r| r.name == "__type") {
-        let doc = crate::graph_schema::introspection::render(&schema);
-        let found = root
-            .args
-            .get("name")
-            .and_then(|v| match v {
-                crate::graph_query::Value::Str(s) => Some(s.clone()),
-                _ => None,
-            })
-            .and_then(|want| {
-                doc["__schema"]["types"]
-                    .as_array()?
-                    .iter()
-                    .find(|t| t["name"].as_str() == Some(want.as_str()))
-                    .cloned()
-            });
-        return (
-            StatusCode::OK,
-            // A name the schema does not declare is `null`, not an error: that is what introspection
-            // says, and a client uses it to test whether a type exists.
-            Json(serde_json::json!({"data": {"__type": found}})),
-        );
-    }
     let mut data = serde_json::Map::new();
+    // Rendered at most once, and only if a root asks for it.
+    let mut doc: Option<serde_json::Value> = None;
+    // **Every root field is answered.** Routing on `any(… == "__schema")` and returning early meant
+    // `{ __schema { queryType { name } } pools { id } }` came back without `pools` at all - a field
+    // the operation asked for, silently missing from the response (Jules on #1282). Introspection is
+    // not an exclusive mode, it is two more root fields.
     for root in &roots {
-        // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
-        // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no handler
-        // that could have aborted.
-        if root.name == "_meta" {
-            let last = s
-                .store
-                .get_meta("last_block")
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<u64>().ok());
-            data.insert(
-                "_meta".into(),
-                serde_json::json!({
-                    "block": {"number": last},
-                    "deployment": s.nid.clone(),
-                    "hasIndexingErrors": false
-                }),
-            );
-            continue;
+        match root.name.as_str() {
+            // The introspection surface a generated client fetches before it sends anything useful.
+            // `render` produces `{"__schema": …}`, so the inner value is what belongs under the key.
+            "__schema" => {
+                let d =
+                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
+                data.insert("__schema".into(), d["__schema"].clone());
+                continue;
+            }
+            // The other standard introspection operation. The name comes from the parsed argument,
+            // and one the schema does not declare is `null` rather than an error - that is what
+            // introspection says, and a client uses it to test whether a type exists.
+            "__type" => {
+                let d =
+                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
+                let found = root
+                    .args
+                    .get("name")
+                    .and_then(|v| match v {
+                        crate::graph_query::Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .and_then(|want| {
+                        d["__schema"]["types"]
+                            .as_array()?
+                            .iter()
+                            .find(|t| t["name"].as_str() == Some(want.as_str()))
+                            .cloned()
+                    });
+                data.insert("__type".into(), found.unwrap_or(serde_json::Value::Null));
+                continue;
+            }
+            // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
+            // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no
+            // handler that could have aborted.
+            "_meta" => {
+                let last = s
+                    .store
+                    .get_meta("last_block")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok());
+                data.insert(
+                    "_meta".into(),
+                    serde_json::json!({
+                        "block": {"number": last},
+                        "deployment": s.nid.clone(),
+                        "hasIndexingErrors": false
+                    }),
+                );
+                continue;
+            }
+            _ => {}
         }
         let compiled = match crate::graph_query::compile(&schema, root) {
             Ok(c) => c,
@@ -5271,6 +5277,27 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}]),
             "variables from the request body must bind: {body}"
+        );
+
+        // Introspection is not an exclusive mode, it is two more root fields. Returning early on the
+        // first one meant a mixed operation came back without its data fields at all - present in the
+        // request, silently missing from the response.
+        let body = ask(
+            "/graphql",
+            r#"{ __schema { queryType { name } } __type(name: "Pool") { name } _meta { hasIndexingErrors } pools(first: 1) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__schema"]["queryType"]["name"], "Query",
+            "the schema root still answers in a mixed operation: {body}"
+        );
+        assert_eq!(body["data"]["__type"]["name"], "Pool", "{body}");
+        assert_eq!(body["data"]["_meta"]["hasIndexingErrors"], false, "{body}");
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "and so does the data root, which used to be dropped entirely: {body}"
         );
 
         // Introspection is chosen from the parsed root field name, not by searching the text. A
