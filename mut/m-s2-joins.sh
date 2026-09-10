@@ -6,7 +6,9 @@
 # a patch that does not apply tests unmutated code.
 set -u
 cd /Users/pepe/Projects/nuthatch-1265 || exit 1
-[ -z "$(git status --porcelain -- src tests)" ] || { echo "REFUSING: uncommitted work in src/tests"; exit 1; }
+# `git diff --quiet` rather than `git status --porcelain`: the apply/restore cycle touches mtimes, so
+# status can report a file modified whose content matches HEAD, and the run then refuses for nothing.
+git diff --quiet -- src tests || { echo "REFUSING: uncommitted work in src/tests"; exit 1; }
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_HOME=/Users/pepe/Projects/nuthatch-1212/cargo-home
 export CARGO_TARGET_DIR=/Users/pepe/Projects/nuthatch-1265/target-1265
 
