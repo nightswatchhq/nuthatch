@@ -48,10 +48,10 @@ pub mod factory;
 pub mod flags;
 pub mod freshness;
 pub mod graft;
-pub mod graph_validate;
-pub mod health;
 /// RFC-0053 S1: graph-node's generated schema, from an imported `schema.graphql` (#1265).
 pub mod graph_schema;
+pub mod graph_validate;
+pub mod health;
 pub mod help;
 pub mod indexer;
 pub mod ipfs;

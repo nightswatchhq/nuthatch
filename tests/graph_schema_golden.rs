@@ -16,8 +16,8 @@ fn fixtures() -> PathBuf {
 }
 
 fn reference() -> serde_json::Value {
-    let raw =
-        std::fs::read_to_string(fixtures().join("graph-node-introspection-uniswap-v4.json")).unwrap();
+    let raw = std::fs::read_to_string(fixtures().join("graph-node-introspection-uniswap-v4.json"))
+        .unwrap();
     serde_json::from_str(&raw).unwrap()
 }
 
@@ -141,9 +141,14 @@ fn bytes_and_string_operator_sets_are_the_reference_ones() {
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    assert_eq!(ours, bytes_ops, "Bytes operator set must match the reference");
+    assert_eq!(
+        ours, bytes_ops,
+        "Bytes operator set must match the reference"
+    );
     assert!(
-        !ours.iter().any(|o| o.contains("starts_with") || o.contains("nocase")),
+        !ours
+            .iter()
+            .any(|o| o.contains("starts_with") || o.contains("nocase")),
         "Bytes has no prefix or case-insensitive operators in the reference: {ours:?}"
     );
     assert_eq!(
@@ -179,14 +184,39 @@ fn order_by_traverses_one_relation_level_only() {
     );
     let ours: BTreeSet<String> = s.order_by_values("Pool").into_iter().collect();
     assert!(
-        !ours.iter().any(|v| v.matches("__").count() > 1),
-        "nor may ours: {:?}",
-        ours.iter().filter(|v| v.matches("__").count() > 1).collect::<Vec<_>>()
-    );
-    assert!(
         ours.contains("token0__symbol"),
         "ours must traverse one level too; got {} values",
         ours.len()
+    );
+
+    // **Across every entity, not just `Pool`.** Checking `Pool` alone cannot see a second level: its
+    // relations go to `Token`, whose own relations are all lists and therefore skipped, so a mutation
+    // that recursed a second level produced nothing extra for `Pool` and a Pool-only assertion stayed
+    // green. `Swap.pool -> Pool.token0 -> Token` is a real two-level path. Measured: that mutation
+    // leaves the Pool-only form passing and fails this sweep.
+    let mut two_level: Vec<String> = Vec::new();
+    for e in &s.entities {
+        for v in s.order_by_values(&e.name) {
+            if v.matches("__").count() > 1 {
+                two_level.push(format!("{}.{}", e.name, v));
+            }
+        }
+    }
+    assert!(
+        two_level.is_empty(),
+        "no *_orderBy value may traverse two relation levels; the reference has none: {:?}",
+        &two_level[..two_level.len().min(5)]
+    );
+    // And the sweep must be capable of seeing one level, or it proves nothing about depth.
+    let one_level = s
+        .entities
+        .iter()
+        .flat_map(|e| s.order_by_values(&e.name))
+        .filter(|v| v.contains("__"))
+        .count();
+    assert!(
+        one_level > 50,
+        "the sweep must actually traverse relations; found only {one_level} nested values"
     );
 }
 
