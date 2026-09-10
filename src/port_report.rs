@@ -3017,8 +3017,21 @@ pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> 
     event_column(&arg)
 }
 
-/// The event/call handler that wrote this, or a handler that calls this helper. Block handlers
+/// The event/call handler that wrote this, or a handler that reaches this helper. Block handlers
 /// are never a table source.
+///
+/// **The search is transitive, because one hop is not how real subgraphs are written.** This used to
+/// look for an event handler calling the helper *directly*. Uniswap V4 routes every handler through
+/// an indirection for testability - `handleSwap` calls `handleSwapHelper(event, config)`, and that
+/// calls `loadTransaction`, `updatePoolDayData` and the rest - so the handler is two hops away and
+/// nothing those helpers wrote reached a column. It was not one field either: an entity whose every
+/// assignment lives two hops down got no view at all, `Transaction` among them, while
+/// `event.block.number` and `event.block.timestamp` were already mapped to implicit columns and
+/// would have bound perfectly well (#1277).
+///
+/// Breadth-first from each event handler, with a visited set: a mapping may call a helper from two
+/// handlers, and `arrakis.ts` and `euler.ts` both call shared utilities, so the call graph is a DAG
+/// at best and cyclic at worst.
 pub(crate) fn event_handler_for<'a>(
     func: &'a FunctionInfo,
     mappings: &'a Mappings,
@@ -3029,10 +3042,27 @@ pub(crate) fn event_handler_for<'a>(
     if func.kind == HandlerKind::Block {
         return None;
     }
-    mappings.functions.values().find(|f| {
-        (f.kind == HandlerKind::Event || f.kind == HandlerKind::Call)
-            && f.calls.contains(&func.name)
-    })
+    // Deterministic: `functions` is a BTreeMap, so two handlers reaching the same helper always
+    // resolve to the same one rather than to whichever the iterator happened to yield.
+    for handler in mappings.functions.values() {
+        if handler.kind != HandlerKind::Event && handler.kind != HandlerKind::Call {
+            continue;
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut queue: Vec<&str> = handler.calls.iter().map(String::as_str).collect();
+        while let Some(name) = queue.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            if name == func.name {
+                return Some(handler);
+            }
+            if let Some(next) = mappings.functions.get(name) {
+                queue.extend(next.calls.iter().map(String::as_str));
+            }
+        }
+    }
+    None
 }
 
 /// `const <var> = <expr>` where `<expr>` is a plain expression rather than an entity constructor.

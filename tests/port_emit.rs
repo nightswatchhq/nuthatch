@@ -1304,3 +1304,44 @@ fn reemission_removes_a_stale_generated_view() {
         "a view the operator wrote must not be removed"
     );
 }
+
+/// #1277. A field assigned inside a helper that is itself called by a helper reaches no column,
+/// because `event_handler_for` looks only one hop: it finds an event handler that calls the function
+/// directly. The Uniswap V4 subgraph routes every handler through that indirection -
+/// `handleSwap` -> `handleSwapHelper` -> `loadTransaction` - so everything `loadTransaction` writes
+/// is lost, `Transaction.blockNumber` and `Transaction.timestamp` among them, even though
+/// `event.block.number` and `event.block.timestamp` are both mapped to implicit columns already.
+#[test]
+fn a_field_written_two_helper_hops_from_the_handler_still_reaches_its_column() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  createdAt: BigInt!
+}
+"#;
+    let mapping = r#"
+export function stamp(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.createdAt = event.block.timestamp
+  pool.save()
+}
+export function handlePoolCreatedHelper(event: PoolCreated): void {
+  stamp(event)
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  handlePoolCreatedHelper(event)
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    let view = result
+        .views
+        .iter()
+        .find(|v| v.entity == "Pool")
+        .expect("a Pool view");
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("\"block_timestamp\" AS \"createdAt\""),
+        "`event.block.timestamp` two hops from the handler must still bind (#1277):\n{sql}"
+    );
+}
