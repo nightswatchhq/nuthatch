@@ -406,3 +406,145 @@ fn every_object_type_matches_the_reference_field_for_field() {
             .join("\n  ")
     );
 }
+
+/// RFC-0053 §Acceptance: the generated introspection against the recorded one, for every type the
+/// reference has, comparing kind, field names, argument names and rendered types.
+///
+/// The declared divergences, which is what "a reviewed, machine-readable divergence list" means: they
+/// are listed and asserted about, not silently skipped.
+///
+/// `_Block_`, `_Log_`, `_LogMeta_` and `_LogArgument_` are fixed graph-node internals this slice does
+/// not model. `_Log_` exists to serve graph-node's own log-query surface rather than any subgraph
+/// data, and `Query._logs` - `[_Log_!]!` taking `level, from, to, search, first, skip,
+/// orderDirection` - is that surface's root field, so it is declared with them.
+const DECLARED_DIVERGENCES: &[&str] = &["_Block_", "_Log_", "_LogMeta_", "_LogArgument_"];
+const DECLARED_FIELD_DIVERGENCES: &[&str] = &["_logs"];
+
+#[test]
+fn generated_introspection_matches_the_reference_shape() {
+    let s = parsed();
+    let ours = nuthatch::graph_schema::introspection::render(&s);
+    let r = reference();
+
+    fn render(t: &serde_json::Value) -> String {
+        match t["kind"].as_str().unwrap_or("") {
+            "NON_NULL" => format!("{}!", render(&t["ofType"])),
+            "LIST" => format!("[{}]", render(&t["ofType"])),
+            _ => t["name"].as_str().unwrap_or("?").to_string(),
+        }
+    }
+    fn index(v: &serde_json::Value) -> std::collections::BTreeMap<String, &serde_json::Value> {
+        v["__schema"]["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| !t["name"].as_str().unwrap_or("").starts_with("__"))
+            .map(|t| (t["name"].as_str().unwrap().to_string(), t))
+            .collect()
+    }
+    let theirs = index(&r);
+    let mine = index(&ours);
+    let mut problems: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+
+    for (name, t) in &theirs {
+        if DECLARED_DIVERGENCES.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(m) = mine.get(name) else {
+            problems.push(format!("{name}: absent from ours"));
+            continue;
+        };
+        if t["kind"] != m["kind"] {
+            problems.push(format!("{name}: kind {} vs {}", t["kind"], m["kind"]));
+            continue;
+        }
+        for key in ["fields", "inputFields", "enumValues"] {
+            let a = t[key].as_array();
+            let b = m[key].as_array();
+            if a.is_none() && b.is_none() {
+                continue;
+            }
+            let sig = |arr: Option<&Vec<serde_json::Value>>| -> BTreeSet<String> {
+                arr.map(|v| {
+                    v.iter()
+                        .map(|f| {
+                            let args: Vec<String> = f["args"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|x| x["name"].as_str().unwrap_or("?").to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let ty = if f["type"].is_null() {
+                                String::new()
+                            } else {
+                                render(&f["type"])
+                            };
+                            format!(
+                                "{}:{}[{}]",
+                                f["name"].as_str().unwrap_or("?"),
+                                ty,
+                                args.join(",")
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            };
+            let drop_declared = |set: BTreeSet<String>| -> BTreeSet<String> {
+                set.into_iter()
+                    .filter(|m| {
+                        !DECLARED_FIELD_DIVERGENCES
+                            .iter()
+                            .any(|d| m.starts_with(&format!("{d}:")))
+                    })
+                    .collect()
+            };
+            let (ta, mb) = (drop_declared(sig(a)), drop_declared(sig(b)));
+            compared += ta.len();
+            for x in ta.difference(&mb) {
+                problems.push(format!("{name}.{key}: missing {x}"));
+            }
+            for x in mb.difference(&ta) {
+                problems.push(format!("{name}.{key}: extra   {x}"));
+            }
+        }
+    }
+    // A divergence list that names something the reference does not have is a list nobody has
+    // reviewed. Assert each entry is real, so the list cannot rot into an excuse.
+    for d in DECLARED_DIVERGENCES {
+        assert!(
+            theirs.contains_key(*d),
+            "declared divergence {d} is not in the reference; the list has rotted"
+        );
+    }
+    let root_fields: BTreeSet<String> = theirs["Query"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_string())
+        .collect();
+    for d in DECLARED_FIELD_DIVERGENCES {
+        assert!(
+            root_fields.contains(*d),
+            "declared field divergence {d} is not a root field of the reference"
+        );
+    }
+    assert!(
+        compared > 1200,
+        "the diff must cover the reference; only {compared} members compared"
+    );
+    assert!(
+        problems.is_empty(),
+        "{} introspection differences, first 15:\n  {}",
+        problems.len(),
+        problems
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}

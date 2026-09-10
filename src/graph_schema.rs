@@ -551,7 +551,7 @@ impl Schema {
                         continue;
                     };
                     for suffix in LIST_SUFFIXES {
-                        out.push((format!("{}{}", f.name, suffix), format!("[{scalar}]")));
+                        out.push((format!("{}{}", f.name, suffix), format!("[{scalar}!]")));
                     }
                     if let Some(target) = inner.entity_name() {
                         out.push((format!("{}_", f.name), format!("{target}_filter")));
@@ -562,8 +562,12 @@ impl Schema {
                         continue;
                     };
                     for suffix in filter_suffixes(scalar) {
+                        // `[BigInt!]`: the inner type is non-null, the list itself is not. Read off
+                        // the reference - a first pass wrote `[BigInt]` and only the full
+                        // introspection diff could see it, because the name-level sweeps compare
+                        // field names and not their types.
                         let rendered = if suffix_is_list(suffix) {
-                            format!("[{scalar}]")
+                            format!("[{scalar}!]")
                         } else {
                             scalar.to_string()
                         };
@@ -616,5 +620,157 @@ impl Schema {
             }
         }
         v
+    }
+}
+
+/// Render the generated schema as an introspection response.
+///
+/// RFC-0053 §Acceptance asks that "generated introspection matches a recorded graph-node reference
+/// except for a reviewed, machine-readable divergence list". This is the document that comparison is
+/// made against, and it is also what a generated client actually fetches before it will send a query.
+///
+/// Only the parts a client validates are emitted: `kind`, `name`, `fields` with their arguments and
+/// types, `inputFields`, `enumValues`. Descriptions are deliberately absent - graph-node carries the
+/// schema author's doc comments there, they are not part of the contract, and the golden diff ignores
+/// them.
+pub mod introspection {
+    use serde_json::{json, Value};
+
+    use super::{lower_first, plural, Schema, BUILTIN_SCALARS, GRAPH_SCALARS};
+
+    /// Turn a rendered type string - `BigInt!`, `[Swap!]!`, `Token` - into introspection's nested
+    /// `NON_NULL`/`LIST` wrappers. Written as the inverse of the renderer so the two cannot drift.
+    pub fn type_ref(rendered: &str) -> Value {
+        if let Some(inner) = rendered.strip_suffix('!') {
+            return json!({"kind":"NON_NULL","name":Value::Null,"ofType":type_ref(inner)});
+        }
+        if rendered.starts_with('[') && rendered.ends_with(']') {
+            let inner = &rendered[1..rendered.len() - 1];
+            return json!({"kind":"LIST","name":Value::Null,"ofType":type_ref(inner)});
+        }
+        // A leaf. The kind a client cares about here is the name; `ofType` is null.
+        json!({"kind":"SCALAR","name":rendered,"ofType":Value::Null})
+    }
+
+    fn arg(name: &str, ty: &str, default: Option<&str>) -> Value {
+        json!({"name":name,"type":type_ref(ty),"defaultValue":default})
+    }
+
+    /// The five arguments every list field takes - stored or derived, and never `block`.
+    fn collection_args(entity: &str) -> Vec<Value> {
+        vec![
+            arg("skip", "Int", None),
+            arg("first", "Int", None),
+            arg("orderBy", &format!("{entity}_orderBy"), None),
+            arg("orderDirection", "OrderDirection", None),
+            arg("where", &format!("{entity}_filter"), None),
+        ]
+    }
+
+    pub fn render(s: &Schema) -> Value {
+        let mut types: Vec<Value> = Vec::new();
+
+        for name in BUILTIN_SCALARS.iter().chain(GRAPH_SCALARS.iter()) {
+            types.push(json!({"kind":"SCALAR","name":name}));
+        }
+
+        // Fixed supporting types. `Aggregation_*` and `LogLevel` are emitted whether or not the
+        // schema uses the feature - measured, not assumed.
+        types.push(json!({"kind":"ENUM","name":"OrderDirection",
+            "enumValues":[{"name":"asc"},{"name":"desc"}]}));
+        types.push(json!({"kind":"ENUM","name":"_SubgraphErrorPolicy_",
+            "enumValues":[{"name":"allow"},{"name":"deny"}]}));
+        types.push(json!({"kind":"ENUM","name":"Aggregation_interval",
+            "enumValues":[{"name":"hour"},{"name":"day"}]}));
+        types.push(json!({"kind":"ENUM","name":"Aggregation_current",
+            "enumValues":[{"name":"exclude"},{"name":"include"}]}));
+        types.push(json!({"kind":"ENUM","name":"LogLevel","enumValues":[
+            {"name":"CRITICAL"},{"name":"ERROR"},{"name":"WARNING"},{"name":"INFO"},{"name":"DEBUG"}]}));
+        types.push(
+            json!({"kind":"INPUT_OBJECT","name":"Block_height","inputFields":[
+            arg("hash","Bytes",None), arg("number","Int",None), arg("number_gte","Int",None)]}),
+        );
+        types.push(
+            json!({"kind":"INPUT_OBJECT","name":"BlockChangedFilter","inputFields":[
+            arg("number_gte","Int!",None)]}),
+        );
+        types.push(json!({"kind":"OBJECT","name":"_Meta_","fields":[
+            {"name":"block","args":[],"type":type_ref("_Block_!")},
+            {"name":"deployment","args":[],"type":type_ref("String!")},
+            {"name":"hasIndexingErrors","args":[],"type":type_ref("Boolean!")}]}));
+
+        for (name, values) in &s.enums {
+            let vs: Vec<Value> = values.iter().map(|v| json!({"name":v})).collect();
+            types.push(json!({"kind":"ENUM","name":name,"enumValues":vs}));
+        }
+
+        for e in &s.entities {
+            let fields: Vec<Value> = s
+                .object_fields(&e.name)
+                .into_iter()
+                .map(|(n, ty, args)| {
+                    // A list field's arguments are typed against the *target* entity, which is the
+                    // inner type rather than this one.
+                    let target = e
+                        .fields
+                        .iter()
+                        .find(|f| f.name == n)
+                        .and_then(|f| f.ty.entity_name())
+                        .unwrap_or(e.name.as_str())
+                        .to_string();
+                    let a: Vec<Value> = if args.is_empty() {
+                        Vec::new()
+                    } else {
+                        collection_args(&target)
+                    };
+                    json!({"name":n,"args":a,"type":type_ref(&ty)})
+                })
+                .collect();
+            types.push(json!({"kind":"OBJECT","name":e.name,"fields":fields}));
+
+            let inputs: Vec<Value> = s
+                .filter_fields(&e.name)
+                .into_iter()
+                .map(|(n, ty)| arg(&n, &ty, None))
+                .collect();
+            types.push(
+                json!({"kind":"INPUT_OBJECT","name":format!("{}_filter",e.name),
+                "inputFields":inputs}),
+            );
+
+            let vals: Vec<Value> = s
+                .order_by_values(&e.name)
+                .into_iter()
+                .map(|v| json!({"name":v}))
+                .collect();
+            types.push(json!({"kind":"ENUM","name":format!("{}_orderBy",e.name),
+                "enumValues":vals}));
+        }
+
+        let mut roots: Vec<Value> = Vec::new();
+        for e in &s.entities {
+            roots.push(
+                json!({"name":lower_first(&e.name),"type":type_ref(&e.name),"args":[
+                arg("id","ID!",None),
+                arg("block","Block_height",None),
+                arg("subgraphError","_SubgraphErrorPolicy_!",Some("deny"))]}),
+            );
+            let mut a = vec![
+                arg("skip", "Int", Some("0")),
+                arg("first", "Int", Some("100")),
+                arg("orderBy", &format!("{}_orderBy", e.name), None),
+                arg("orderDirection", "OrderDirection", None),
+                arg("where", &format!("{}_filter", e.name), None),
+            ];
+            a.push(arg("block", "Block_height", None));
+            a.push(arg("subgraphError", "_SubgraphErrorPolicy_!", Some("deny")));
+            roots.push(json!({"name":plural(&e.name),
+                "type":type_ref(&format!("[{}!]!",e.name)),"args":a}));
+        }
+        roots.push(json!({"name":"_meta","type":type_ref("_Meta_"),
+            "args":[arg("block","Block_height",None)]}));
+        types.push(json!({"kind":"OBJECT","name":"Query","fields":roots}));
+
+        json!({"__schema":{"queryType":{"name":"Query"},"types":types}})
     }
 }
