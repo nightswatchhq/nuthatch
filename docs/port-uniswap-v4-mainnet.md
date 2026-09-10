@@ -45,20 +45,28 @@ opening range is worthless and none is quoted here.
 ## What was verified
 
 Nest frozen by stopping `dev` and starting `serve`, which owns no cursor. Reference pruning floor is
-25,942,028 and does not slide. **Pinned at block 25,943,500.**
+25,942,028 and does not slide. **Pinned at block 25,945,634, which is the nest's frozen `as_of`.**
 
 | entity | reference | nest | aligned | missing | extra | field divergences |
 |---|---:|---:|---:|---:|---:|---:|
-| Swap (500-block window) | 5,511 | 5,511 | 5,511 | 0 | 0 | **0** |
-| Pool | 132,577 | 132,624 | 132,577 | 0 | 47 | **0** |
-| Token (emitted view) | 45,312 | 12,822 | 12,795 | 32,517 | 27 | n/a |
+| Swap (500-block window) | 6,243 | 6,243 | 6,243 | 0 | 0 | **0** |
+| Pool | 132,769 | 132,816 | 132,769 | 0 | 47 | **0** |
+| Token (emitted view) | 45,322 | 12,822 | 12,799 | 32,523 | 23 | n/a |
 
-**Seven fields reproduce byte for byte** across 150,883 aligned rows: `sender`, `sqrtPriceX96`,
+**Seven fields reproduce byte for byte** across 151,811 aligned rows: `sender`, `sqrtPriceX96`,
 `tick`, `logIndex`, `createdAtBlockNumber`, `createdAtTimestamp`, `hooks`. Every field the report
 called `exact` that could be asked, was exact.
 
-Reproduce with `diff-port.py --block 25943500 --window 500` against a nest under `serve`. **No
-credential is needed**: `https://api.thegraph.com/subgraphs/id/<CID>` answers keyless. It reports an
+**The pin must equal the nest's `as_of`, and an earlier run of this table did not.** The emitted
+`token` view is `SELECT id FROM (...) GROUP BY id` with no block column, so it answers as of whatever
+the nest has reached regardless of the pin. A first run had the nest at 25,945,634 and the pin at
+25,943,500, which reported **27** extra tokens where there are **23**: four of them were simply created
+in those 2,134 blocks. `Pool` and `Swap` carry block predicates and were unaffected. The harness now
+refuses an unequal pin rather than leaving the invariant to the procedure.
+
+Reproduce with `scripts/port-diff-uniswap-v4.py --block 25945634 --window 500` against a nest under
+`serve` frozen at that block. **No credential is needed**:
+`https://api.thegraph.com/subgraphs/id/<CID>` answers keyless. It reports an
 auth failure, and a pruned-block refusal, as HTTP **200** with the error in the body, so a client
 gating on status reads either as an empty result.
 
@@ -77,15 +85,16 @@ The part that matters. Ordered by how much a migrating team would care.
 4. **Token metadata.** `symbol`, `name`, `decimals`, `totalSupply` need `eth_call` and no `[[calls]]`
    was emitted. Consequently `Swap.amount0`/`amount1` are unobtainable too: the raw `int128` is in the
    table, but `convertTokenToDecimal` needs `decimals`.
-5. **71% of `Token` rows.** The view projects `currency0` only. The nest *holds* 45,347 distinct
-   currencies against the reference's 45,312 Tokens, so this is the overlay losing rows, not the
-   indexer missing them (#1277).
+5. **72% of `Token` rows.** The view projects `currency0` only, and answers 12,822 against the
+   reference's 45,322 at the same pin. The nest *holds* 45,347 distinct `currency0 ∪ currency1` values,
+   so this is the overlay losing rows rather than the indexer missing them (#1277).
 6. **`Pool` is unusable as an entity.** The view is a `UNION ALL` of the Initialize and Swap tables
    with no key: 35,142,058 rows for 132,765 pools, and `Pool.id` is not in it at all (#1277).
 
 ### And one thing that did not reproduce in the user's favour
 
-**The port gains 47 pools the subgraph silently drops.** `handleInitialize` does a bare `return`
+**The port gains 47 pools the subgraph silently drops**, and 23 tokens with them - the `currency0`
+values of pools the reference never created. `handleInitialize` does a bare `return`
 before `pool.save()` when `fetchTokenDecimals` is null (`poolManager.ts:81`, `:107`). I called
 `decimals()` on every currency of all 47: **42 have one that will not answer**, and the addresses say
 why - `0x833589fc…2913` is USDC on Base, `0x42000000…0006` is WETH on the OP Stack, and
