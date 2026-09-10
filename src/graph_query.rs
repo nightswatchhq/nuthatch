@@ -721,6 +721,13 @@ pub enum Shape {
         /// Each selected sub-field, and the column alias it arrives under.
         fields: Vec<(String, String)>,
     },
+    /// A `@derivedFrom` list, aggregated into one JSON array by a correlated subquery.
+    List {
+        /// The GraphQL field name - `swaps`.
+        name: String,
+        /// The column alias the JSON array arrives under.
+        col: String,
+    },
 }
 
 /// A compiled query: the SQL, and the shape of the object each row becomes.
@@ -783,10 +790,75 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             shape.push(Shape::Scalar(sel.name.clone()));
             continue;
         }
+        // Arguments on a traversed field are refused **before** any traversal is lowered. This guard
+        // used to sit after the derived-list branch below, so `swaps(first: 5)` compiled with the
+        // `first` silently dropped and every related row returned - caught by an existing test, and
+        // the same class of fault as everything else this module refuses.
+        if !sel.args.is_empty() {
+            return Err(Unsupported::NestedSelection(sel.name.clone()));
+        }
+        // A `@derivedFrom` list is aggregated rather than joined. A plain join would multiply the
+        // parent row once per child, so `first` would stop meaning what it says; one correlated
+        // subquery per parent keeps the parent's row count and the child's own page size separate.
+        if let (graph_schema::FieldType::List(inner), Some(back)) = (&field.ty, &field.derived_from)
+        {
+            let Some(target) = inner.entity_name() else {
+                return Err(Unsupported::NestedSelection(sel.name.clone()));
+            };
+            let child = schema
+                .entities
+                .iter()
+                .find(|e| e.name == target)
+                .ok_or_else(|| Unsupported::UnknownField {
+                    entity: entity.clone(),
+                    field: sel.name.clone(),
+                })?;
+            // The back-reference is the schema author's, named in `@derivedFrom(field: …)`. One that
+            // the child has not got is a broken schema rather than a query this can answer.
+            if !child.fields.iter().any(|f| &f.name == back) {
+                return Err(Unsupported::UnknownField {
+                    entity: target.to_string(),
+                    field: back.clone(),
+                });
+            }
+            let alias = format!("c{i}");
+            let cview = crate::subgraph_import::to_alias(target);
+            let mut packed = Vec::new();
+            for sub in &sel.sub {
+                if !sub.sub.is_empty() || !sub.args.is_empty() {
+                    return Err(Unsupported::NestedSelection(sub.name.clone()));
+                }
+                if !child.fields.iter().any(|f| f.name == sub.name) {
+                    return Err(Unsupported::UnknownField {
+                        entity: target.to_string(),
+                        field: sub.name.clone(),
+                    });
+                }
+                packed.push(format!("\"{}\" := {alias}.\"{}\"", sub.name, sub.name));
+            }
+            let col = format!("{alias}__{}", sel.name);
+            // `to_json(list(…))` rather than a bare `LIST` of `STRUCT`, so the column arrives as a
+            // plain JSON string and nothing depends on how the row serialiser handles a nested DuckDB
+            // type. `ORDER BY`/`LIMIT` cannot sit inside the aggregate, hence the inner subquery.
+            //
+            // **`coalesce` is not decoration**: `list()` over zero rows is `NULL`, so a parent with no
+            // children would answer `null` for a field the generated schema types `[{target}!]!`.
+            cols.push(format!(
+                "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s \
+                 FROM \"{cview}\" {alias} WHERE {alias}.\"{back}\" = {BASE}.\"id\" \
+                 ORDER BY {alias}.\"id\" ASC LIMIT 100) t), '[]') AS \"{col}\"",
+                packed.join(", ")
+            ));
+            shape.push(Shape::List {
+                name: sel.name.clone(),
+                col,
+            });
+            continue;
+        }
         // A **to-one** reference is a join on the id this row already holds, and because the target's
-        // id is unique the join cannot multiply rows - so `first` still means what it says. A list or
-        // a `@derivedFrom` field has no such column and would multiply, which needs an aggregation
-        // and its own slice; refuse by name rather than return a row count nobody asked for.
+        // id is unique the join cannot multiply rows - so `first` still means what it says. Anything
+        // else - a stored array of ids, which the reference has as `Token.whitelistPools` - needs
+        // `unnest` and its own slice, so it is refused by name.
         let target = match (&field.ty, &field.derived_from) {
             (graph_schema::FieldType::Entity(t), None) => t.clone(),
             _ => return Err(Unsupported::NestedSelection(sel.name.clone())),
@@ -807,11 +879,6 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             " LEFT JOIN \"{tview}\" {alias} ON {alias}.\"id\" = {BASE}.\"{}\"",
             sel.name
         ));
-        // Arguments on a traversed field need that field's own join plus its own `LIMIT`; a dropped
-        // `first` on a relation returns every related row.
-        if !sel.args.is_empty() {
-            return Err(Unsupported::NestedSelection(sel.name.clone()));
-        }
         let mut sub = Vec::new();
         for s in &sel.sub {
             if !s.args.is_empty() {
@@ -1125,7 +1192,7 @@ type Pool @entity {
   token0: Token!
   swaps: [Swap!]! @derivedFrom(field: "pool")
 }
-type Token @entity { id: ID! symbol: String! }
+type Token @entity { id: ID! symbol: String! pools: [Pool!]! }
 type Swap @entity { id: ID! pool: Pool! }
 "#,
         )
@@ -1215,6 +1282,64 @@ type Swap @entity { id: ID! pool: Pool! }
 
     /// **The refusals, which are the module's contract.** Each of these is a wrong answer if
     /// silently ignored, so each must be an error a caller can read.
+    /// A `@derivedFrom` list, aggregated rather than joined.
+    ///
+    /// A plain join would multiply the parent row once per child, so `first` would stop meaning what
+    /// it says. One correlated subquery per parent keeps the parent's row count and the child's own
+    /// page size separate.
+    #[test]
+    fn a_derived_list_aggregates_into_one_json_column() {
+        let c = compile(&schema(), &one("{ pools { id swaps { id } } }"))
+            .expect("a derived list lowers");
+        // The join key is the schema author's: `@derivedFrom(field: "pool")` says `Swap.pool` holds
+        // the parent id.
+        assert!(
+            c.sql.contains(r#"c1."pool" = b."id""#),
+            "the back-reference comes from @derivedFrom: {}",
+            c.sql
+        );
+        assert!(
+            c.sql.contains(r#"struct_pack("id" := c1."id")"#),
+            "{}",
+            c.sql
+        );
+        // `list()` over zero rows is NULL in DuckDB, so a parent with no children would answer null
+        // for a field the generated schema types `[Swap!]!`. Measured with the CLI, not assumed.
+        assert!(
+            c.sql.contains("coalesce(") && c.sql.contains("'[]'"),
+            "a childless parent must answer [] rather than null: {}",
+            c.sql
+        );
+        // The parent's own paging is untouched by the aggregation.
+        assert!(c.sql.ends_with("LIMIT 100 OFFSET 0"), "{}", c.sql);
+        assert_eq!(
+            c.shape,
+            vec![
+                Shape::Scalar("id".into()),
+                Shape::List {
+                    name: "swaps".into(),
+                    col: "c1__swaps".into(),
+                },
+            ]
+        );
+
+        // A field the *child* has not got is named against the child.
+        let e = compile(&schema(), &one("{ pools { swaps { nope } } }")).expect_err("unknown");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Swap" && field == "nope"),
+            "{e:?}"
+        );
+
+        // A stored array of ids - `Token.whitelistPools` in the reference - is a different shape
+        // needing `unnest`, so it is refused by name rather than aggregated as though it were derived.
+        let e = compile(&schema(), &one("{ tokens { pools { id } } }"))
+            .expect_err("a stored id array is not a derived list");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "pools"),
+            "{e:?}"
+        );
+    }
+
     /// A to-one relation traversal, which is what the canonical Uniswap query is made of:
     /// `pools { token0 { symbol } }`. Lowered to one `LEFT JOIN`, never an N+1 walk.
     #[test]
@@ -1248,13 +1373,14 @@ type Swap @entity { id: ID! pool: Pool! }
             "only the shape knows `j1__symbol` belongs under `token0`"
         );
 
-        // A derived list has no id column on this row to join against, and joining it would
-        // multiply rows so `first` would stop meaning what it says. Refused by name.
-        let e = compile(&schema(), &one("{ pools { swaps { id } } }"))
-            .expect_err("a derived list is refused");
+        // A derived list is not joined at all - joining it would multiply the parent row per child
+        // and `first` would stop meaning what it says - it is aggregated, and the `LEFT JOIN` above
+        // must not appear for one.
+        let c = compile(&schema(), &one("{ pools { swaps { id } } }")).expect("aggregated");
         assert!(
-            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
-            "{e:?}"
+            !c.sql.contains("LEFT JOIN"),
+            "a derived list is aggregated, not joined: {}",
+            c.sql
         );
 
         // One level only, matching the depth `E_orderBy` advertises in the reference. Refused at
@@ -1541,7 +1667,7 @@ type Swap @entity { id: ID! pool: Pool! }
         // handler answers itself, so nesting is recorded rather than refused while parsing. Reading
         // a sub-selection must leave the cursor after its closing brace and no further, or every
         // field written after a nested one is silently dropped - which is what this pins.
-        let q = "{ pools { id swaps { id } createdAtTimestamp } }";
+        let q = "{ pools { id swaps { id } hooks } }";
         let roots = parse(q).expect("nesting parses");
         assert_eq!(roots.len(), 1);
         assert_eq!(
@@ -1553,18 +1679,15 @@ type Swap @entity { id: ID! pool: Pool! }
                     args: BTreeMap::new(),
                     sub: vec![leaf("id")],
                 },
-                leaf("createdAtTimestamp"),
+                leaf("hooks"),
             ],
             "the sub-selection is recorded and the field after it is not dropped"
         );
 
-        // And the derived list is refused one layer later, at lowering, where the compiler is the
-        // only thing that knows no join exists for it.
-        let e = compile(&schema(), &roots[0]).expect_err("a derived list has no join");
-        assert!(
-            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
-            "{e:?}"
-        );
+        // And it lowers: a derived list is aggregated rather than joined, so the sub-selection this
+        // test recorded is the child's field list. See
+        // `a_derived_list_aggregates_into_one_json_column`.
+        assert!(compile(&schema(), &roots[0]).is_ok());
     }
 
     #[test]
@@ -1602,10 +1725,6 @@ type Swap @entity { id: ID! pool: Pool! }
             ("{ pools(block: { number: 1 }) { id } }", |e| {
                 matches!(e, Unsupported::TimeTravel)
             }),
-            (
-                "{ pools { swaps { id } } }",
-                |e| matches!(e, Unsupported::NestedSelection(n) if n == "swaps"),
-            ),
             (
                 "{ pools { nope } }",
                 |e| matches!(e, Unsupported::UnknownField { field, .. } if field == "nope"),

@@ -1659,11 +1659,16 @@ async fn graph_graphql(
         };
         match graph_rows(&s, &compiled).await {
             Ok(rows) => {
-                let mut shaped = rows.iter().map(|r| graph_shape(&compiled, r));
+                let shaped: Result<Vec<serde_json::Value>, String> =
+                    rows.iter().map(|r| graph_shape(&compiled, r)).collect();
+                let shaped = match shaped {
+                    Ok(v) => v,
+                    Err(e) => return (StatusCode::OK, Json(gql_error(&e))),
+                };
                 let value = if compiled.singular {
-                    shaped.next().unwrap_or(serde_json::Value::Null)
+                    shaped.into_iter().next().unwrap_or(serde_json::Value::Null)
                 } else {
-                    serde_json::Value::Array(shaped.collect())
+                    serde_json::Value::Array(shaped)
                 };
                 data.insert(root.name.clone(), value);
             }
@@ -1685,7 +1690,7 @@ async fn graph_graphql(
 fn graph_shape(
     compiled: &crate::graph_query::Compiled,
     row: &serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     use crate::graph_query::Shape;
     let mut out = serde_json::Map::new();
     for sh in &compiled.shape {
@@ -1695,6 +1700,27 @@ fn graph_shape(
                     name.clone(),
                     row.get(name).cloned().unwrap_or(serde_json::Value::Null),
                 );
+            }
+            // A `@derivedFrom` list arrives as one JSON array in one column.
+            Shape::List { name, col } => {
+                let v = row.get(col);
+                let list = match v {
+                    // Already parsed: the row serialiser may hand back a DuckDB `json` column as a
+                    // value rather than a string. Both are accepted rather than one assumed.
+                    Some(serde_json::Value::Array(a)) => serde_json::Value::Array(a.clone()),
+                    Some(serde_json::Value::String(t)) => match serde_json::from_str(t) {
+                        Ok(serde_json::Value::Array(a)) => serde_json::Value::Array(a),
+                        // Not an array and not parseable is a bug in the SQL this module wrote, not
+                        // something to paper over with `[]` - a caller told an empty list is
+                        // indistinguishable from one told the truth.
+                        _ => {
+                            return Err(format!("`{name}` did not come back as a JSON array: {t}"))
+                        }
+                    },
+                    // `coalesce(…, '[]')` means this cannot be null, so null is also a bug.
+                    other => return Err(format!("`{name}` is missing from the row: {other:?}")),
+                };
+                out.insert(name.clone(), list);
             }
             Shape::Object { name, fields } => {
                 let mut inner = serde_json::Map::new();
@@ -1715,7 +1741,7 @@ fn graph_shape(
             }
         }
     }
-    serde_json::Value::Object(out)
+    Ok(serde_json::Value::Object(out))
 }
 
 /// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
@@ -5090,24 +5116,21 @@ mod tests {
         assert_eq!(body["accepts"][0]["amount"], "1000");
         assert_eq!(body["accepts"][0]["network"], "eip155:84532");
     }
-    /// RFC-0053 S1 (#1265): a client can introspect a nest over HTTP.
+    /// The nest every Graph-endpoint test below talks to: a schema, three views, and a head.
     ///
-    /// This is the assertion that moves the compatibility surface from "generated" to "reachable".
-    /// The renderer is diffed against a real graph-node in `tests/graph_schema_golden.rs`; this one
-    /// proves a client can actually fetch it, at the subgraph URL shape as well as the plain one, and
-    /// that anything which is not introspection is refused inside the Graph error envelope rather
-    /// than as a bare status a client cannot read.
-    #[tokio::test]
-    async fn a_client_can_introspect_the_nest_over_http() {
-        use tower::ServiceExt;
-
+    /// Shared because these tests were one 421-line function with thirty assertions, and a Rust test
+    /// stops at its **first** failure - so a mutation breaking an early assertion hid every later one,
+    /// and three different mutations all reported the same line. Split so each lands on its own test.
+    fn graph_fixture() -> (tempfile::TempDir, AppState) {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("graph")).unwrap();
         std::fs::write(
             d.path().join("graph/schema.graphql"),
             concat!(
                 "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n",
-                "  token0: Token!\n}\n",
+                "  token0: Token!\n",
+                "  swaps: [Swap!]! @derivedFrom(field: \"pool\")\n}\n",
+                "type Swap @entity { id: ID! pool: Pool! amount: BigInt! }\n",
                 "type Token @entity { id: ID! symbol: String! decimals: Int! }\n",
             ),
         )
@@ -5122,6 +5145,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            d.path().join("views/swap.sql"),
+            "CREATE VIEW swap AS SELECT 's2' AS id, '0xaaa' AS pool, 7 AS amount \
+             UNION ALL SELECT 's1', '0xaaa', 5;\n",
+        )
+        .unwrap();
+        std::fs::write(
             d.path().join("views/token.sql"),
             "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals;\n",
         )
@@ -5130,26 +5159,47 @@ mod tests {
         // `_meta` reports the nest's own head, so give it one to report.
         state.store.set_meta("last_block", "23456789").unwrap();
 
-        let ask = |uri: &'static str, q: &'static str, st: AppState| async move {
-            let res = router(SharedNest::new(st))
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(
-                            serde_json::json!({ "query": q }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
-                .await
-                .unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
+        (d, state)
+    }
 
+    /// POST one GraphQL operation and decode the envelope.
+    async fn graph_ask(uri: &str, q: &str, st: AppState) -> serde_json::Value {
+        use tower::ServiceExt;
+        let res = router(SharedNest::new(st))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "query": q }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// RFC-0053 S1 (#1265): a client can introspect a nest over HTTP.
+    ///
+    /// This is the assertion that moves the compatibility surface from "generated" to "reachable".
+    /// The renderer is diffed against a real graph-node in `tests/graph_schema_golden.rs`; this one
+    /// proves a client can actually fetch it, at the subgraph URL shape as well as the plain one, and
+    /// that anything which is not introspection is refused inside the Graph error envelope rather
+    /// than as a bare status a client cannot read.
+    #[tokio::test]
+    async fn a_client_can_introspect_the_nest_over_http() {
+        // Two requests below are built inline rather than through `graph_ask`, because they carry a
+        // `variables` object the helper does not take.
+        use tower::ServiceExt;
+
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
         for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
             let body = ask(uri, "{ __schema { types { name } } }", state.clone()).await;
             let types = body["data"]["__schema"]["types"]
@@ -5278,6 +5328,15 @@ mod tests {
             serde_json::json!([{"id": "0xaaa"}]),
             "variables from the request body must bind: {body}"
         );
+    }
+
+    /// The introspection document a generated client actually sends is built from fragments, and the
+    /// endpoint answers every root field of a mixed operation rather than the first it recognises.
+    #[tokio::test]
+    async fn a_fragment_document_and_a_mixed_operation_answer_over_http() {
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
 
         // The introspection document a generated client actually sends, fragments and all. Refusing
         // fragments refused the one request that has to work before any other can: a client will not
@@ -5351,6 +5410,14 @@ mod tests {
             serde_json::json!([]),
             "it must run as the filter it is, and no pool has that hook: {body}"
         );
+    }
+
+    /// `__type`, the traversals, the text operators and every refusal, each in the Graph envelope.
+    #[tokio::test]
+    async fn the_graph_endpoint_answers_types_traversals_and_refusals() {
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
 
         // `__type` is the other standard introspection operation, and it has to answer under
         // `__type`. It used to fall into the `__schema` branch and return the whole schema document
@@ -5384,6 +5451,24 @@ mod tests {
         assert!(
             body["data"]["__type"].is_null() && body["errors"].is_null(),
             "an undeclared type is null, not an error: {body}"
+        );
+
+        // A `@derivedFrom` list, aggregated into one JSON column and read back as an array. `0xbbb`
+        // has no swaps, so it must answer `[]` - DuckDB's `list()` over zero rows is NULL, which
+        // would have served null for a field the schema types `[Swap!]!`.
+        let body = ask(
+            "/graphql",
+            "{ pools { id swaps { id amount } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                {"id": "0xaaa", "swaps": [{"id": "s1", "amount": 5}, {"id": "s2", "amount": 7}]},
+                {"id": "0xbbb", "swaps": []},
+            ]),
+            "a derived list must nest, in child id order, and be [] when empty: {body}"
         );
 
         // The canonical shape: a relation traversal, lowered to a LEFT JOIN and put back under the
