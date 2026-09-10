@@ -21,6 +21,33 @@ Every refusal below names the thing refused, so a caller can act on it.
 | `pool(id: "0x…") { … }` | the same with `WHERE "id" = '0x…' LIMIT 1`, answered as an object |
 | `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
 
+### Relation traversal
+
+A **to-one** reference is one `LEFT JOIN` on the id the parent row already holds:
+
+```graphql
+{ pools { id token0 { symbol decimals } } }
+```
+
+```sql
+SELECT b."id", j1."symbol" AS "j1__symbol", j1."decimals" AS "j1__decimals"
+FROM "pool" b LEFT JOIN "token" j1 ON j1."id" = b."token0"
+ORDER BY b."id" ASC LIMIT 100 OFFSET 0
+```
+
+`LEFT` and not `INNER`: a reference whose target row is absent leaves the parent in the answer with a
+null relation, which is what graph-node does. An inner join would drop the parent silently, and a
+missing row is exactly the case a failed subgraph leaves behind.
+
+Because the target's id is unique the join cannot multiply rows, so `first` still means what it says.
+
+One level, matching the depth `E_orderBy` advertises in the reference: graph-node emits
+`token0__symbol` and no `token0__whitelistPools__id`.
+
+Every column is qualified with a base alias whether or not the query joins, so a relation whose target
+shares a column name - `id` always does - cannot turn a working query into an ambiguous one on some
+other schema.
+
 The two names come from two different derivations, both taken from the live graph-node reference:
 `lower_first` for the singular, `plural` for the collection. `modifyLiquidity` pluralises to
 `modifyLiquidities`, and getting that wrong means the client's query names do not exist here.
@@ -63,7 +90,10 @@ after which the whole operation reads as garbage.
 | refused | why it is not approximated |
 |---|---|
 | `block:` / `block_gte:` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right |
-| nested selections (`pools { token0 { symbol } }`) | lowers to a join, which is the next slice. An N+1 walk would answer, slowly and with a different transaction view per row |
+| a **to-many** or `@derivedFrom` traversal (`pools { swaps { id } }`) | there is no id column on the parent row to join against, and joining it would multiply rows so `first` would stop meaning what it says. Needs an aggregation and its own slice |
+| arguments on a traversed field (`swaps(first: 5)`) | needs that same join plus its own `LIMIT`; a dropped `first` there returns every related row |
+| a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
+| an entity root with no selection set | not a legal GraphQL query, and answering `*` would invent a field list the caller never asked for |
 | `_contains`, `_starts_with`, `_ends_with`, the `_nocase` family | `LIKE` with correct escaping wants its own slice and its own tests. A caller's `%` must not become a wildcard by accident |
 | `and:` / `or:` | a nested boolean tree, and precedence got wrong silently changes which rows come back |
 | fragments and `...` | not implemented |

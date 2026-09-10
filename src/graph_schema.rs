@@ -224,34 +224,106 @@ fn parse_enum(text: &str, start: usize) -> Result<(String, Vec<String>, usize)> 
         Some(c) => c,
         None => bail!("unclosed enum in schema.graphql"),
     };
+    // Whitespace-separated, not line-separated: `enum OrderDirection { asc desc }` is legal, and
+    // reading it a line at a time yields the single value `asc desc`.
     let values = text[open + 1..close]
         .lines()
-        .map(|l| strip_comment(l).trim().to_string())
-        .filter(|l| !l.is_empty())
+        .flat_map(|l| strip_comment(l).split_whitespace())
+        .filter(|v| !v.is_empty() && *v != ",")
+        .map(|v| v.trim_end_matches(',').to_string())
+        .filter(|v| !v.is_empty())
         .collect();
     Ok((name, values, close + 1))
 }
 
+/// The fields of one type body.
+///
+/// **Declaration-oriented, not line-oriented.** GraphQL puts no significance on newlines, and
+/// `type Token @entity { id: ID! symbol: String! }` is a perfectly ordinary way to write a schema.
+/// Reading one field per line took `id` and silently dropped everything after it, which would have
+/// made the generated introspection *omit* fields a client then asks for. The recorded reference
+/// schema happens to be one field per line, so no golden test could see it.
 fn parse_fields(body: &str) -> Vec<Field> {
+    // Comments are the one thing that is line-bounded, so they go first.
+    let cleaned: String = body
+        .lines()
+        .map(strip_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let b = cleaned.as_bytes();
     let mut out = Vec::new();
-    for raw in body.lines() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
+    let mut i = 0usize;
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < b.len() {
+        // Whitespace and commas separate declarations and mean nothing else.
+        if b[i].is_ascii_whitespace() || b[i] == b',' {
+            i += 1;
             continue;
         }
-        let Some((name, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !is_name(b[i]) {
+            i += 1;
             continue;
         }
-        // The type runs to the first space or `@`; directives follow.
-        let rest = rest.trim();
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '@')
-            .unwrap_or(rest.len());
-        let (decl, tail) = (&rest[..end], &rest[end..]);
+        let ns = i;
+        while i < b.len() && is_name(b[i]) {
+            i += 1;
+        }
+        let name = &cleaned[ns..i];
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Not a field declaration - a stray word, or an interface's `implements` list. Skip it
+        // rather than consume the next identifier as its type.
+        if i >= b.len() || b[i] != b':' {
+            continue;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let ts = i;
+        while i < b.len() && (is_name(b[i]) || matches!(b[i], b'[' | b']' | b'!')) {
+            i += 1;
+        }
+        let decl = &cleaned[ts..i];
+        // Directives belong to this field and carry `@derivedFrom`, so read them before moving on -
+        // and read the parenthesised argument as a unit, or a `)` would end the scan early.
+        let ds = i;
+        loop {
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= b.len() || b[j] != b'@' {
+                break;
+            }
+            i = j + 1;
+            while i < b.len() && is_name(b[i]) {
+                i += 1;
+            }
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'(' {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    match b[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            i += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let tail = &cleaned[ds..i];
         let Some(ty) = parse_type(decl) else { continue };
         // `[Swap!]!` -> inner non-null; `[Swap]!` -> not. Read before the outer `!` is stripped.
         let inner_non_null = decl
@@ -776,5 +848,63 @@ pub mod introspection {
         types.push(json!({"kind":"OBJECT","name":"Query","fields":roots}));
 
         json!({"__schema":{"queryType":{"name":"Query"},"types":types}})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GraphQL puts no significance on newlines, so a schema may put a whole type on one line.
+    ///
+    /// Found by an S2 join test failing as though `Token.symbol` did not exist. The parse was
+    /// line-oriented: it took `id` and silently dropped every field after it, which would have made
+    /// the generated introspection **omit** fields a client goes on to ask for. No golden test could
+    /// have caught it, because the recorded reference schema is one field per line throughout.
+    #[test]
+    fn a_type_written_on_one_line_keeps_all_of_its_fields() {
+        let s = parse(concat!(
+            "type Token @entity { id: ID! symbol: String! decimals: Int! }\n",
+            "enum Dir { asc desc }\n",
+            "type Pool @entity { id: ID! token0: Token! ",
+            "swaps: [Swap!]! @derivedFrom(field: \"pool\") dir: Dir }\n",
+            "type Swap @entity { id: ID! pool: Pool! }\n",
+        ))
+        .expect("a one-line schema parses");
+
+        let names = |e: &Entity| {
+            e.fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<String>>()
+        };
+        let token = s.entities.iter().find(|e| e.name == "Token").unwrap();
+        assert_eq!(names(token), ["id", "symbol", "decimals"]);
+
+        let pool = s.entities.iter().find(|e| e.name == "Pool").unwrap();
+        assert_eq!(
+            names(pool),
+            ["id", "token0", "swaps", "dir"],
+            "a directive with a parenthesised argument must not end the scan"
+        );
+        let swaps = pool.fields.iter().find(|f| f.name == "swaps").unwrap();
+        assert_eq!(swaps.derived_from.as_deref(), Some("pool"));
+        assert!(swaps.inner_non_null, "[Swap!]! keeps its inner bang");
+        let token0 = pool.fields.iter().find(|f| f.name == "token0").unwrap();
+        assert!(
+            matches!(&token0.ty, FieldType::Entity(t) if t == "Token"),
+            "{:?}",
+            token0.ty
+        );
+        let dir = pool.fields.iter().find(|f| f.name == "dir").unwrap();
+        assert!(
+            matches!(&dir.ty, FieldType::Enum(e) if e == "Dir"),
+            "{:?}",
+            dir.ty
+        );
+
+        // The same fault, and the same fix, in an enum body: one line yielded the single value
+        // "asc desc", which is not a value any client will ever send.
+        assert_eq!(s.enums.get("Dir").unwrap(), &["asc", "desc"]);
     }
 }

@@ -25,15 +25,21 @@ pub struct RootField {
     /// As written: `pools`, `pool`, `_meta`.
     pub name: String,
     pub args: BTreeMap<String, Value>,
-    /// Leaf field names, in the order the caller asked for them.
-    pub fields: Vec<String>,
-    /// Selected fields that carried a sub-selection.
-    ///
-    /// **Recorded here rather than refused during the parse.** `_meta { block { number } }` is a
-    /// legitimate nested selection that the handler answers itself, and refusing nesting while
-    /// parsing made `_meta` unaskable - found by the HTTP test. Parse what is there; refuse at
-    /// lowering, where the decision belongs.
-    pub nested: Vec<String>,
+    /// What the caller selected, in the order they wrote it, sub-selections included.
+    pub sel: Vec<Selection>,
+}
+
+/// One selected field and its sub-selection.
+///
+/// **Nesting is recorded here and refused at lowering, not during the parse.** `_meta { block {
+/// number } }` is a legitimate nested selection the handler answers itself, and refusing nesting
+/// while parsing made `_meta` unaskable - found by the HTTP test. The compiler is the only place
+/// that knows whether a join exists for a given relation, so it is the only place that can decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub name: String,
+    /// Empty for a scalar.
+    pub sub: Vec<Selection>,
 }
 
 /// A GraphQL argument value, as far as S2 needs to understand one.
@@ -156,6 +162,16 @@ impl fmt::Display for Unsupported {
 }
 
 /// Parse the root fields of an operation, with their arguments.
+/// Levels of sub-selection a selection set may contain.
+///
+/// One, matching `E_orderBy`'s traversal depth in the recorded reference: graph-node emits
+/// `token0__symbol` and no `token0__whitelistPools__id`, so one level is the depth the schema itself
+/// advertises. Deeper is refused by name rather than answered with an N+1 walk.
+const MAX_TRAVERSAL: usize = 1;
+
+/// The base table's alias. Every column is qualified with it; see `compile`.
+const BASE: &str = "b";
+
 pub fn parse(query: &str) -> Result<Vec<RootField>, Unsupported> {
     parse_with(query, &BTreeMap::new())
 }
@@ -205,56 +221,12 @@ pub fn parse_with(
             BTreeMap::new()
         };
         c.trivia();
-        let mut fields = Vec::new();
-        let mut nested = Vec::new();
-        if c.peek() == Some(b'{') {
-            c.i += 1;
-            loop {
-                c.trivia();
-                match c.peek() {
-                    None => return Err(Unsupported::Syntax("unclosed inner set".into())),
-                    Some(b'}') => {
-                        c.i += 1;
-                        break;
-                    }
-                    _ => {}
-                }
-                let f = c.ident()?;
-                c.trivia();
-                // A nested set under a selected field is a relation traversal.
-                if c.peek() == Some(b'(') {
-                    let _ = c.args()?;
-                    c.trivia();
-                }
-                if c.peek() == Some(b'{') {
-                    // Consume the sub-selection and note the field carried one.
-                    let mut depth = 0usize;
-                    while let Some(ch) = c.peek() {
-                        match ch {
-                            b'{' => depth += 1,
-                            b'}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    c.i += 1;
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        c.i += 1;
-                    }
-                    nested.push(f);
-                    continue;
-                }
-                fields.push(f);
-            }
-        }
-        out.push(RootField {
-            name,
-            args,
-            fields,
-            nested,
-        });
+        let sel = if c.peek() == Some(b'{') {
+            c.selection_set(MAX_TRAVERSAL)?
+        } else {
+            Vec::new()
+        };
+        out.push(RootField { name, args, sel });
     }
 }
 
@@ -300,6 +272,41 @@ impl<'a> Cursor<'a> {
             )));
         }
         Ok(String::from_utf8_lossy(&self.b[start..self.i]).into_owned())
+    }
+    /// A selection set, where `depth` is how many further levels of sub-selection may be entered.
+    ///
+    /// One level is what a relation traversal costs (`pools { token0 { symbol } }`), and it is also
+    /// what `_meta { block { number } }` costs, so the same budget serves both.
+    fn selection_set(&mut self, depth: usize) -> Result<Vec<Selection>, Unsupported> {
+        self.i += 1; // '{'
+        let mut out = Vec::new();
+        loop {
+            self.trivia();
+            match self.peek() {
+                None => return Err(Unsupported::Syntax("unclosed selection set".into())),
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(out);
+                }
+                _ => {}
+            }
+            let name = self.ident()?;
+            self.trivia();
+            // Arguments on a nested field - `swaps(first: 5)` - need the join that field has not
+            // got, and a dropped `first` on a relation returns every related row. Refuse by name.
+            if self.peek() == Some(b'(') {
+                return Err(Unsupported::NestedSelection(name));
+            }
+            let sub = if self.peek() == Some(b'{') {
+                if depth == 0 {
+                    return Err(Unsupported::NestedSelection(name));
+                }
+                self.selection_set(depth - 1)?
+            } else {
+                Vec::new()
+            };
+            out.push(Selection { name, sub });
+        }
     }
     /// Consume an optional operation header, leaving the cursor on the selection set's `{`.
     ///
@@ -533,11 +540,29 @@ fn comparison(suffix: &str) -> Option<&'static str> {
     })
 }
 
-/// A compiled query: the SQL, and the fields the caller asked for in their order.
+/// One field of a response object, and where in the SQL row its value comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shape {
+    /// A scalar: the GraphQL field name, which is also its column name.
+    Scalar(String),
+    /// A to-one relation flattened into the row by a join.
+    Object {
+        /// The GraphQL field name - `token0`.
+        name: String,
+        /// Each selected sub-field, and the column alias it arrives under.
+        fields: Vec<(String, String)>,
+    },
+}
+
+/// A compiled query: the SQL, and the shape of the object each row becomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compiled {
     pub sql: String,
-    pub fields: Vec<String>,
+    /// How to build one response object from one SQL row, in the caller's field order.
+    ///
+    /// Needed because a relation traversal flattens into the same row: `token0 { symbol }` arrives as
+    /// a column named `j0__symbol`, and only this says it belongs under `token0`.
+    pub shape: Vec<Shape>,
     /// The entity this root field returns, for shaping the response.
     pub entity: String,
     /// `true` for a singular root (`pool`), which returns one object rather than a list.
@@ -555,29 +580,82 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         .find(|e| e.name == entity)
         .expect("resolve_root returned an entity the schema has");
 
-    if let Some(n) = root.nested.first() {
-        return Err(Unsupported::NestedSelection(n.clone()));
-    }
-    for f in &root.fields {
-        if !ent.fields.iter().any(|x| &x.name == f) {
-            return Err(Unsupported::UnknownField {
-                entity: entity.clone(),
-                field: f.clone(),
-            });
-        }
-    }
-    let select = if root.fields.is_empty() {
-        "*".to_string()
-    } else {
-        root.fields
+    // Every column is qualified with the base alias whether or not this query joins. One shape
+    // rather than two, and a relation whose target happens to share a column name - `id` always
+    // does - cannot then turn a working query into an ambiguous one on some other schema.
+    let mut cols: Vec<String> = Vec::new();
+    let mut shape: Vec<Shape> = Vec::new();
+    let mut joins = String::new();
+    for (i, sel) in root.sel.iter().enumerate() {
+        let field = ent
+            .fields
             .iter()
-            .map(|f| format!("\"{f}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+            .find(|x| x.name == sel.name)
+            .ok_or_else(|| Unsupported::UnknownField {
+                entity: entity.clone(),
+                field: sel.name.clone(),
+            })?;
+        if sel.sub.is_empty() {
+            cols.push(format!("{BASE}.\"{}\"", sel.name));
+            shape.push(Shape::Scalar(sel.name.clone()));
+            continue;
+        }
+        // A **to-one** reference is a join on the id this row already holds, and because the target's
+        // id is unique the join cannot multiply rows - so `first` still means what it says. A list or
+        // a `@derivedFrom` field has no such column and would multiply, which needs an aggregation
+        // and its own slice; refuse by name rather than return a row count nobody asked for.
+        let target = match (&field.ty, &field.derived_from) {
+            (graph_schema::FieldType::Entity(t), None) => t.clone(),
+            _ => return Err(Unsupported::NestedSelection(sel.name.clone())),
+        };
+        let tent = schema
+            .entities
+            .iter()
+            .find(|e| e.name == target)
+            .ok_or_else(|| Unsupported::UnknownField {
+                entity: entity.clone(),
+                field: sel.name.clone(),
+            })?;
+        let alias = format!("j{i}");
+        let tview = crate::subgraph_import::to_alias(&target);
+        // LEFT, not INNER: a reference whose target row is absent must leave the parent in the
+        // answer with a null relation, exactly as graph-node does, rather than drop the parent.
+        joins.push_str(&format!(
+            " LEFT JOIN \"{tview}\" {alias} ON {alias}.\"id\" = {BASE}.\"{}\"",
+            sel.name
+        ));
+        let mut sub = Vec::new();
+        for s in &sel.sub {
+            if !s.sub.is_empty() {
+                return Err(Unsupported::NestedSelection(s.name.clone()));
+            }
+            if !tent.fields.iter().any(|x| x.name == s.name) {
+                return Err(Unsupported::UnknownField {
+                    entity: target.clone(),
+                    field: s.name.clone(),
+                });
+            }
+            let col = format!("{alias}__{}", s.name);
+            cols.push(format!("{alias}.\"{}\" AS \"{col}\"", s.name));
+            sub.push((s.name.clone(), col));
+        }
+        shape.push(Shape::Object {
+            name: sel.name.clone(),
+            fields: sub,
+        });
+    }
+    // An entity root with no selection set is not a legal GraphQL query - a composite type must be
+    // selected from - and answering `*` for one would invent a field list the caller never asked for.
+    if cols.is_empty() {
+        return Err(Unsupported::Syntax(format!(
+            "`{}` returns `{entity}`, which needs a selection set",
+            root.name
+        )));
+    }
+    let select = cols.join(", ");
 
     let view = crate::subgraph_import::to_alias(&entity);
-    let mut sql = format!("SELECT {select} FROM \"{view}\"");
+    let mut sql = format!("SELECT {select} FROM \"{view}\" {BASE}{joins}");
     let mut wheres: Vec<String> = Vec::new();
 
     for (name, value) in &root.args {
@@ -590,7 +668,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 let lit = value
                     .sql_literal()
                     .ok_or_else(|| Unsupported::Argument("id must be a string".into()))?;
-                wheres.push(format!("\"id\" = {lit}"));
+                wheres.push(format!("{BASE}.\"id\" = {lit}"));
             }
             "where" => {
                 let Value::Object(m) = value else {
@@ -641,7 +719,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 ))
             }
         };
-        sql.push_str(&format!(" ORDER BY \"{order_field}\" {dir}"));
+        sql.push_str(&format!(" ORDER BY {BASE}.\"{order_field}\" {dir}"));
 
         // graph-node's defaults, taken from the recorded reference: first = 100, skip = 0, and
         // §Query semantics caps first at 1000.
@@ -668,7 +746,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 
     Ok(Compiled {
         sql,
-        fields: root.fields.clone(),
+        shape,
         entity,
         singular,
     })
@@ -719,7 +797,7 @@ fn lower_predicate(
         if !ent.fields.iter().any(|x| x.name == field) {
             continue;
         }
-        let col = format!("\"{field}\"");
+        let col = format!("{BASE}.\"{field}\"");
         return match *suffix {
             "_in" | "_not_in" => {
                 let Value::List(items) = v else {
@@ -803,7 +881,7 @@ type Swap @entity { id: ID! pool: Pool! }
         // `skip` would be a different page each call.
         assert_eq!(
             c.sql,
-            r#"SELECT "id", "liquidity" FROM "pool" ORDER BY "id" ASC LIMIT 100 OFFSET 0"#
+            r#"SELECT b."id", b."liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#
         );
         assert!(!c.singular);
         assert_eq!(c.entity, "Pool");
@@ -821,7 +899,7 @@ type Swap @entity { id: ID! pool: Pool! }
         .unwrap();
         assert_eq!(
             c.sql,
-            r#"SELECT "id" FROM "pool" WHERE "hooks" = '0xabc' AND "liquidity" > 100 ORDER BY "liquidity" DESC LIMIT 5 OFFSET 10"#
+            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND b."liquidity" > 100 ORDER BY b."liquidity" DESC LIMIT 5 OFFSET 10"#
         );
     }
 
@@ -831,7 +909,7 @@ type Swap @entity { id: ID! pool: Pool! }
         assert!(c.singular);
         assert_eq!(
             c.sql,
-            r#"SELECT "id", "hooks" FROM "pool" WHERE "id" = '0x1' LIMIT 1"#
+            r#"SELECT b."id", b."hooks" FROM "pool" b WHERE b."id" = '0x1' LIMIT 1"#
         );
     }
 
@@ -867,6 +945,75 @@ type Swap @entity { id: ID! pool: Pool! }
 
     /// **The refusals, which are the module's contract.** Each of these is a wrong answer if
     /// silently ignored, so each must be an error a caller can read.
+    /// A to-one relation traversal, which is what the canonical Uniswap query is made of:
+    /// `pools { token0 { symbol } }`. Lowered to one `LEFT JOIN`, never an N+1 walk.
+    #[test]
+    fn a_to_one_relation_lowers_to_a_left_join_and_a_nested_shape() {
+        let c = compile(
+            &schema(),
+            &one("{ pools(first: 2) { id token0 { symbol } } }"),
+        )
+        .expect("a to-one traversal lowers");
+        assert_eq!(
+            c.sql,
+            concat!(
+                r#"SELECT b."id", j1."symbol" AS "j1__symbol" FROM "pool" b"#,
+                r#" LEFT JOIN "token" j1 ON j1."id" = b."token0""#,
+                r#" ORDER BY b."id" ASC LIMIT 2 OFFSET 0"#
+            ),
+            "the join is on the id the parent row already holds"
+        );
+        // LEFT rather than INNER: a reference whose target is missing must leave the parent in the
+        // answer, as graph-node does, rather than silently drop it.
+        assert!(c.sql.contains("LEFT JOIN"), "{}", c.sql);
+        assert_eq!(
+            c.shape,
+            vec![
+                Shape::Scalar("id".into()),
+                Shape::Object {
+                    name: "token0".into(),
+                    fields: vec![("symbol".into(), "j1__symbol".into())],
+                },
+            ],
+            "only the shape knows `j1__symbol` belongs under `token0`"
+        );
+
+        // A derived list has no id column on this row to join against, and joining it would
+        // multiply rows so `first` would stop meaning what it says. Refused by name.
+        let e = compile(&schema(), &one("{ pools { swaps { id } } }"))
+            .expect_err("a derived list is refused");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
+            "{e:?}"
+        );
+
+        // One level only, matching the depth `E_orderBy` advertises in the reference.
+        let e = parse("{ pools { token0 { pool { id } } } }").expect_err("two levels");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "pool"),
+            "{e:?}"
+        );
+
+        // Arguments on a traversed field need the same join plus its own LIMIT; dropping `first`
+        // there would return every related row.
+        let e = parse("{ pools { swaps(first: 5) { id } } }").expect_err("nested arguments");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
+            "{e:?}"
+        );
+
+        // An unknown field on the *target* entity is named against the target, not the parent.
+        let e = compile(&schema(), &one("{ pools { token0 { nope } } }")).expect_err("unknown");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "nope"),
+            "{e:?}"
+        );
+
+        // A composite root with no selection set is not a legal query, and answering `*` for one
+        // would invent a field list the caller never asked for.
+        assert!(compile(&schema(), &one("{ pools }")).is_err());
+    }
+
     #[test]
     fn a_generated_clients_operation_binds_its_variables() {
         // The shape an Apollo- or graph-client-generated query actually has: a named operation, a
@@ -883,7 +1030,7 @@ type Swap @entity { id: ID! pool: Pool! }
         let c = compile(&schema(), &roots[0]).expect("and lowers");
         assert_eq!(
             c.sql,
-            r#"SELECT "id" FROM "pool" WHERE "liquidity" > '5' ORDER BY "id" ASC LIMIT 3 OFFSET 0"#,
+            r#"SELECT b."id" FROM "pool" b WHERE b."liquidity" > '5' ORDER BY b."id" ASC LIMIT 3 OFFSET 0"#,
             "the supplied variable and the header default both reach the SQL"
         );
 
@@ -919,25 +1066,37 @@ type Swap @entity { id: ID! pool: Pool! }
     #[test]
     fn a_sub_selection_is_recorded_and_the_fields_after_it_still_parse() {
         // `_meta { block { number } hasIndexingErrors }` is a legitimate nested selection the
-        // handler answers itself, so the parser records nesting rather than refusing it. Skipping
-        // the sub-selection must leave the cursor after its closing brace and no further, or every
-        // field written after a nested one is silently dropped.
-        let q = "{ pools { id swaps { id transaction { id } } createdAtTimestamp } }";
+        // handler answers itself, so nesting is recorded rather than refused while parsing. Reading
+        // a sub-selection must leave the cursor after its closing brace and no further, or every
+        // field written after a nested one is silently dropped - which is what this pins.
+        let q = "{ pools { id swaps { id } createdAtTimestamp } }";
         let roots = parse(q).expect("nesting parses");
         assert_eq!(roots.len(), 1);
         assert_eq!(
-            roots[0].fields,
-            vec!["id".to_string(), "createdAtTimestamp".to_string()],
-            "the field after a nested selection is not dropped"
-        );
-        assert_eq!(
-            roots[0].nested,
-            vec!["swaps".to_string()],
-            "the nested field is recorded, not refused"
+            roots[0].sel,
+            vec![
+                Selection {
+                    name: "id".into(),
+                    sub: vec![],
+                },
+                Selection {
+                    name: "swaps".into(),
+                    sub: vec![Selection {
+                        name: "id".into(),
+                        sub: vec![],
+                    }],
+                },
+                Selection {
+                    name: "createdAtTimestamp".into(),
+                    sub: vec![],
+                },
+            ],
+            "the sub-selection is recorded and the field after it is not dropped"
         );
 
-        // And it is still refused, one layer later, when it reaches an entity root.
-        let e = compile(&schema(), &roots[0]).expect_err("an entity root refuses nesting");
+        // And the derived list is refused one layer later, at lowering, where the compiler is the
+        // only thing that knows no join exists for it.
+        let e = compile(&schema(), &roots[0]).expect_err("a derived list has no join");
         assert!(
             matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
             "{e:?}"
@@ -988,8 +1147,9 @@ type Swap @entity { id: ID! pool: Pool! }
             ),
         ];
         for (q, want) in cases {
-            // A refusal may come from either stage: a nested selection is caught while parsing,
-            // an unknown field while compiling. What matters is that it is refused and named.
+            // A refusal may come from either stage: a selection too deep to traverse is caught
+            // while parsing, an unknown field while compiling. What matters is that it is refused
+            // and named.
             let got = match parse(q) {
                 Err(e) => e,
                 Ok(roots) => compile(&s, &roots[0]).expect_err(q),
@@ -999,8 +1159,14 @@ type Swap @entity { id: ID! pool: Pool! }
                 "{q}: refused as {got:?}, which is not the reason"
             );
         }
-        // A variable is a refusal at parse time rather than compile time.
-        assert!(parse("query ($n: Int) { pools(first: $n) { id } }").is_err());
+        // An unsupplied variable is a refusal at parse time rather than compile time, and it is
+        // refused *as* an unbound variable: this assertion used to mean "variables are not
+        // implemented" and would otherwise have gone on passing for a different reason entirely.
+        let e = parse("query ($n: Int) { pools(first: $n) { id } }").expect_err("no $n");
+        assert!(
+            matches!(&e, Unsupported::UnboundVariable(v) if v == "n"),
+            "{e:?}"
+        );
         // And so is a fragment, because resolving a spread needs the definition.
         assert!(parse("{ pools { ...F } }").is_err());
     }

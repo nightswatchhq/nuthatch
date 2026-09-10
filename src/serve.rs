@@ -1625,15 +1625,11 @@ async fn graph_graphql(
         };
         match graph_rows(&s, &compiled).await {
             Ok(rows) => {
+                let mut shaped = rows.iter().map(|r| graph_shape(&compiled, r));
                 let value = if compiled.singular {
-                    match rows.into_iter().next() {
-                        Some(r) => serde_json::Value::Object(r),
-                        None => serde_json::Value::Null,
-                    }
+                    shaped.next().unwrap_or(serde_json::Value::Null)
                 } else {
-                    serde_json::Value::Array(
-                        rows.into_iter().map(serde_json::Value::Object).collect(),
-                    )
+                    serde_json::Value::Array(shaped.collect())
                 };
                 data.insert(root.name.clone(), value);
             }
@@ -1641,6 +1637,51 @@ async fn graph_graphql(
         }
     }
     (StatusCode::OK, Json(serde_json::json!({"data": data})))
+}
+
+/// Build one response object from one SQL row.
+///
+/// A relation traversal is flattened into the row by the join that lowered it, so `token0 { symbol }`
+/// arrives as a column called `j0__symbol` and has to be put back under `token0`. Only
+/// [`crate::graph_query::Compiled::shape`] knows that mapping.
+///
+/// A to-one reference whose target row is missing comes back as all-null from the `LEFT JOIN`, and the
+/// relation is then `null` rather than an object of nulls - which is what graph-node answers, and the
+/// difference a client can actually see.
+fn graph_shape(
+    compiled: &crate::graph_query::Compiled,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    use crate::graph_query::Shape;
+    let mut out = serde_json::Map::new();
+    for sh in &compiled.shape {
+        match sh {
+            Shape::Scalar(name) => {
+                out.insert(
+                    name.clone(),
+                    row.get(name).cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Shape::Object { name, fields } => {
+                let mut inner = serde_json::Map::new();
+                let mut any = false;
+                for (field, col) in fields {
+                    let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
+                    any |= !v.is_null();
+                    inner.insert(field.clone(), v);
+                }
+                out.insert(
+                    name.clone(),
+                    if any {
+                        serde_json::Value::Object(inner)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+            }
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
@@ -5030,7 +5071,11 @@ mod tests {
         std::fs::create_dir_all(d.path().join("graph")).unwrap();
         std::fs::write(
             d.path().join("graph/schema.graphql"),
-            "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n}\n",
+            concat!(
+                "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n",
+                "  token0: Token!\n}\n",
+                "type Token @entity { id: ID! symbol: String! decimals: Int! }\n",
+            ),
         )
         .unwrap();
         // A view named for the entity, so the compiled SQL has something to read: this test is the
@@ -5038,8 +5083,13 @@ mod tests {
         std::fs::create_dir_all(d.path().join("views")).unwrap();
         std::fs::write(
             d.path().join("views/pool.sql"),
-            "CREATE VIEW pool AS SELECT '0xaaa' AS id, 42 AS liquidity, '0xhook' AS hooks \
-             UNION ALL SELECT '0xbbb', 7, '0xhook2';\n",
+            "CREATE VIEW pool AS SELECT '0xaaa' AS id, 42 AS liquidity, '0xhook' AS hooks, '0xt1' AS token0 \
+             UNION ALL SELECT '0xbbb', 7, '0xhook2', '0xmissing';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("views/token.sql"),
+            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals;\n",
         )
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
@@ -5193,6 +5243,25 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}]),
             "variables from the request body must bind: {body}"
+        );
+
+        // The canonical shape: a relation traversal, lowered to a LEFT JOIN and put back under the
+        // field name it was asked for. `0xbbb` points at a token that is not there, so its relation
+        // must be `null` rather than an object of nulls, and the pool itself must still be in the
+        // answer - an INNER JOIN would have dropped it silently.
+        let body = ask(
+            "/graphql",
+            "{ pools { id token0 { symbol decimals } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                {"id": "0xaaa", "token0": {"symbol": "WETH", "decimals": 18}},
+                {"id": "0xbbb", "token0": null},
+            ]),
+            "a to-one traversal must nest, and a missing target must not drop the parent: {body}"
         );
 
         // An unlowerable operation is refused **in the Graph envelope** rather than as a bare
