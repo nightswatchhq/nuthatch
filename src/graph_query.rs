@@ -1023,6 +1023,19 @@ type Swap @entity { id: ID! pool: Pool! }
         // A composite root with no selection set is not a legal query, and answering `*` for one
         // would invent a field list the caller never asked for.
         assert!(compile(&schema(), &one("{ pools }")).is_err());
+
+        // Nor is a composite *field* without one. Lowering `{ pools { token0 } }` to
+        // `SELECT b."token0"` returned the relation's id under a field the schema declares as
+        // `Token!`, so the endpoint answered a query a client's own validator would have refused, in
+        // a shape the advertised schema does not describe.
+        let e =
+            compile(&schema(), &one("{ pools { token0 } }")).expect_err("needs a selection set");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("Pool.token0") && m.contains("Token")),
+            "{e:?}"
+        );
+        // A derived list is the same: composite, so it needs one too.
+        assert!(compile(&schema(), &one("{ pools { swaps } }")).is_err());
     }
 
     #[test]

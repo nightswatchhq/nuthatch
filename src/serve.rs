@@ -5286,6 +5286,40 @@ mod tests {
             "variables from the request body must bind: {body}"
         );
 
+        // `__type` is the other standard introspection operation, and it has to answer under
+        // `__type`. It used to fall into the `__schema` branch and return the whole schema document
+        // under the wrong key, which is an invalid response to the query that was asked.
+        let body = ask(
+            "/graphql",
+            r#"{ __type(name: "Pool") { kind name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__type"]["name"], "Pool",
+            "__type must answer under __type: {body}"
+        );
+        assert_eq!(
+            body["data"]["__type"]["kind"], "OBJECT",
+            "an entity is an OBJECT, not a SCALAR: {body}"
+        );
+        assert!(
+            body["data"]["__schema"].is_null(),
+            "asking for __type must not return the whole schema: {body}"
+        );
+        // A name the schema does not declare is `null` rather than an error - that is what
+        // introspection says, and a client uses it to test whether a type exists.
+        let body = ask(
+            "/graphql",
+            r#"{ __type(name: "Nope") { name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["data"]["__type"].is_null() && body["errors"].is_null(),
+            "an undeclared type is null, not an error: {body}"
+        );
+
         // The canonical shape: a relation traversal, lowered to a LEFT JOIN and put back under the
         // field name it was asked for. `0xbbb` points at a token that is not there, so its relation
         // must be `null` rather than an object of nulls, and the pool itself must still be in the

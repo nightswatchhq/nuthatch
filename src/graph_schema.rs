@@ -1066,4 +1066,124 @@ mod tests {
         // "asc desc", which is not a value any client will ever send.
         assert_eq!(s.enums.get("Dir").unwrap(), &["asc", "desc"]);
     }
+
+    /// A GraphQL block string is a legal place to write something that looks like a declaration.
+    ///
+    /// `starts_decl` only tested for a line start and `match_brace` skipped `"…"` but not `"""…"""`,
+    /// so a description could invent an entity or send the brace matcher to the wrong closing brace.
+    #[test]
+    fn a_declaration_inside_a_description_is_not_a_declaration() {
+        let s = parse(concat!(
+            "\"\"\"\n",
+            "A description. It may legally contain:\n",
+            "    type Fake @entity {\n",
+            "      id: ID!\n",
+            "    }\n",
+            "and an unbalanced brace } as prose.\n",
+            "\"\"\"\n",
+            "type Real @entity { id: ID! n: BigInt! }\n",
+        ))
+        .expect("a described schema parses");
+        assert_eq!(
+            s.entities
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Real"],
+            "a description must not become an entity"
+        );
+        let real = &s.entities[0];
+        assert_eq!(
+            real.fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "n"],
+            "and the brace matcher must still find the real type's body"
+        );
+    }
+
+    /// Every leaf `kind` in the rendered document is a real GraphQL kind.
+    ///
+    /// `type_ref` leaves a placeholder for `resolve_kinds` to fill from the type list. One left
+    /// behind is a type reference nothing declares, which makes the whole document invalid to a
+    /// client that resolves it.
+    #[test]
+    fn no_rendered_type_reference_is_left_unresolved() {
+        let s = parse(concat!(
+            "type Pool @entity { id: ID! token0: Token! dir: Dir }\n",
+            "type Token @entity { id: ID! symbol: String! }\n",
+            "enum Dir { asc desc }\n",
+        ))
+        .unwrap();
+        let doc = introspection::render(&s);
+        let mut kinds = std::collections::BTreeSet::new();
+        fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(o) => {
+                    if let Some(k) = o.get("kind").and_then(|k| k.as_str()) {
+                        out.insert(k.to_string());
+                    }
+                    o.values().for_each(|x| walk(x, out));
+                }
+                _ => {}
+            }
+        }
+        walk(&doc, &mut kinds);
+        let legal: std::collections::BTreeSet<String> = [
+            "SCALAR",
+            "OBJECT",
+            "ENUM",
+            "INPUT_OBJECT",
+            "NON_NULL",
+            "LIST",
+            "INTERFACE",
+            "UNION",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let strays: Vec<&String> = kinds.difference(&legal).collect();
+        assert!(strays.is_empty(), "unresolved or invalid kinds: {strays:?}");
+
+        // And the kinds a client actually validates against are the right ones.
+        let types = doc["__schema"]["types"].as_array().unwrap();
+        let pool = types.iter().find(|t| t["name"] == "Pool").unwrap();
+        let f = |n: &str| {
+            pool["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            f("token0")["type"]["ofType"]["kind"],
+            "OBJECT",
+            "a relation is an object"
+        );
+        assert_eq!(f("dir")["type"]["kind"], "ENUM", "an enum field is an enum");
+        assert_eq!(f("id")["type"]["ofType"]["kind"], "SCALAR");
+        let q = types.iter().find(|t| t["name"] == "Query").unwrap();
+        let pools = q["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "pools")
+            .unwrap();
+        let arg = |n: &str| {
+            pools["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(arg("where")["type"]["kind"], "INPUT_OBJECT");
+        assert_eq!(arg("orderBy")["type"]["kind"], "ENUM");
+        assert_eq!(arg("first")["type"]["kind"], "SCALAR");
+    }
 }
