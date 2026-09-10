@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::stream;
@@ -291,6 +291,11 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/metrics", get(metrics_handler))
             .route("/tables", get(tables))
             .route("/schema", get(schema_doc))
+            // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
+            // the subgraph URL form so a client's existing URL needs only its host changed.
+            .route("/graphql", post(graph_graphql))
+            .route("/subgraphs/id/{id}", post(graph_graphql))
+            .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
             .route("/entities", get(entities))
             .route("/entity/{id}", get(entity))
@@ -1523,6 +1528,63 @@ struct TableQuery {
 /// authored **meaning** from `semantic.toml`, the derived **footguns**, and live **coverage** (the
 /// hot/cold seam as numbers). Assembled per call from this running nest - the MCP `schema` tool
 /// relays it, so an agent reads *this* nest's data model, not a static string. Plain text.
+/// The Graph-compatible GraphQL surface (RFC-0053 S1, #1265).
+///
+/// **Introspection only, deliberately.** A generated client fetches the schema and validates against
+/// it before it will send a useful query, so introspection is the first thing that has to be right
+/// and it is worth serving on its own: until it answers, nothing else about compatibility can even be
+/// tested against a real client. The query compiler is S2 (#1266), and until it lands anything that
+/// is not introspection is refused **in the Graph error envelope** rather than with a bare HTTP
+/// status, because that is what a client knows how to read.
+///
+/// The generated schema comes from `graph/schema.graphql` in the nest, written there by `port-emit`.
+/// A nest that was not produced from a subgraph has no such file and this endpoint says so rather
+/// than inventing a schema.
+async fn graph_graphql(
+    State(s): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let query = body
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let path = s.dir.join("graph").join("schema.graphql");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"errors":[{"message":
+                "this nest carries no Graph schema; run `nuthatch port-emit` against the subgraph                  source to write graph/schema.graphql"}]})),
+        );
+    };
+    let schema = match crate::graph_schema::parse(&text) {
+        Ok(sc) => sc,
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"errors":[{"message":
+                    format!("graph/schema.graphql does not parse: {e}")}]})),
+            )
+        }
+    };
+
+    // `__schema` or `__type` is the introspection surface. Anything else needs the S2 compiler.
+    if query.contains("__schema") || query.contains("__type") {
+        return (
+            StatusCode::OK,
+            // `render` already produces `{"__schema": …}`, which is precisely the `data` payload.
+            Json(serde_json::json!({"data":
+                crate::graph_schema::introspection::render(&schema)})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"errors":[{"message":
+            "this endpoint serves schema introspection only; the query compiler is RFC-0053 S2              (nuthatch#1266). Entity queries are available meanwhile at /sql and /q/<name>."}]})),
+    )
+}
+
 async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
     let sem = crate::semantic::load(&s.dir).ok().flatten();
     if let Some(sem) = &sem {
@@ -4863,5 +4925,101 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON challenge");
         assert_eq!(body["accepts"][0]["amount"], "1000");
         assert_eq!(body["accepts"][0]["network"], "eip155:84532");
+    }
+    /// RFC-0053 S1 (#1265): a client can introspect a nest over HTTP.
+    ///
+    /// This is the assertion that moves the compatibility surface from "generated" to "reachable".
+    /// The renderer is diffed against a real graph-node in `tests/graph_schema_golden.rs`; this one
+    /// proves a client can actually fetch it, at the subgraph URL shape as well as the plain one, and
+    /// that anything which is not introspection is refused inside the Graph error envelope rather
+    /// than as a bare status a client cannot read.
+    #[tokio::test]
+    async fn a_client_can_introspect_the_nest_over_http() {
+        use tower::ServiceExt;
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("graph")).unwrap();
+        std::fs::write(
+            d.path().join("graph/schema.graphql"),
+            "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n}\n",
+        )
+        .unwrap();
+        let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+
+        let ask = |uri: &'static str, q: &'static str, st: AppState| async move {
+            let res = router(SharedNest::new(st))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({ "query": q }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
+            let body = ask(uri, "{ __schema { types { name } } }", state.clone()).await;
+            let types = body["data"]["__schema"]["types"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{uri} returned no types: {body}"));
+            let names: Vec<&str> = types.iter().filter_map(|t| t["name"].as_str()).collect();
+            for want in [
+                "Pool",
+                "Pool_filter",
+                "Pool_orderBy",
+                "Query",
+                "BigInt",
+                "_Meta_",
+            ] {
+                assert!(
+                    names.contains(&want),
+                    "{uri}: {want} missing from {names:?}"
+                );
+            }
+            let query = types.iter().find(|t| t["name"] == "Query").unwrap();
+            let roots: Vec<&str> = query["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|f| f["name"].as_str())
+                .collect();
+            assert!(
+                roots.contains(&"pool") && roots.contains(&"pools") && roots.contains(&"_meta"),
+                "{uri}: root fields were {roots:?}"
+            );
+        }
+
+        // Not introspection: refused, in the envelope, and naming where to go meanwhile.
+        let body = ask("/graphql", "{ pools { id } }", state.clone()).await;
+        let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            body["data"].is_null() && msg.contains("S2"),
+            "an entity query must be refused in the Graph error envelope, got {body}"
+        );
+
+        // A nest with no Graph schema says so rather than inventing one.
+        let bare = tempfile::tempdir().unwrap();
+        let body = ask(
+            "/graphql",
+            "{ __schema { types { name } } }",
+            test_state(bare.path(), SQL_MAX_CONCURRENCY),
+        )
+        .await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no Graph schema"),
+            "a nest without graph/schema.graphql must say so, got {body}"
+        );
     }
 }
