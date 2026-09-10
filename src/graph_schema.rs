@@ -67,6 +67,12 @@ pub struct Field {
     pub ty: FieldType,
     /// `true` when the declaration carried `!`. Output nullability only; filters ignore it.
     pub non_null: bool,
+    /// For a list, whether the *inner* type carried `!`. graph-node renders the author's declaration
+    /// verbatim and this schema uses both shapes: `Pool.swaps: [Swap!]!` against
+    /// `Transaction.swaps: [Swap]!`. Assuming `[Inner!]!` put five fields of `Transaction` wrong, and
+    /// the object-type sweep caught it on its first run. Kept on the field rather than inside
+    /// `FieldType` because only rendering needs it and a subgraph schema never nests lists.
+    pub inner_non_null: bool,
     /// `@derivedFrom(field: "x")`. A derived field is a reverse lookup, rendered with collection
     /// arguments but **no `block`** - it inherits the parent query's.
     pub derived_from: Option<String>,
@@ -247,9 +253,16 @@ fn parse_fields(body: &str) -> Vec<Field> {
             .unwrap_or(rest.len());
         let (decl, tail) = (&rest[..end], &rest[end..]);
         let Some(ty) = parse_type(decl) else { continue };
+        // `[Swap!]!` -> inner non-null; `[Swap]!` -> not. Read before the outer `!` is stripped.
+        let inner_non_null = decl
+            .trim()
+            .trim_end_matches('!')
+            .trim_end_matches(']')
+            .ends_with('!');
         out.push(Field {
             name: name.to_string(),
             non_null: decl.ends_with('!'),
+            inner_non_null,
             ty,
             derived_from: derived_target(tail),
         });
@@ -466,6 +479,41 @@ impl Schema {
         }
         v.sort();
         v
+    }
+
+    /// The output fields of an entity's object type, as `(name, rendered type, arg names)`.
+    ///
+    /// **Every list field carries the five collection arguments, stored or derived.** The reference
+    /// gives `Token.whitelistPools` - a stored `[Pool!]!`, not a `@derivedFrom` - the same
+    /// `skip, first, orderBy, orderDirection, where` as `Token.tokenDayData`, so the rule is "is a
+    /// list", not "is derived". None of them takes `block`: a nested selection inherits the parent
+    /// query's block.
+    pub fn object_fields(&self, entity: &str) -> Vec<(String, String, Vec<&'static str>)> {
+        const COLLECTION_ARGS: &[&str] = &["skip", "first", "orderBy", "orderDirection", "where"];
+        let Some(e) = self.entities.iter().find(|e| e.name == entity) else {
+            return Vec::new();
+        };
+        e.fields
+            .iter()
+            .map(|f| {
+                let (rendered, args) = match &f.ty {
+                    FieldType::List(inner) => (
+                        format!(
+                            "[{}{}]{}",
+                            inner.render(),
+                            if f.inner_non_null { "!" } else { "" },
+                            if f.non_null { "!" } else { "" }
+                        ),
+                        COLLECTION_ARGS.to_vec(),
+                    ),
+                    ty => (
+                        format!("{}{}", ty.render(), if f.non_null { "!" } else { "" }),
+                        Vec::new(),
+                    ),
+                };
+                (f.name.clone(), rendered, args)
+            })
+            .collect()
     }
 
     /// The input fields of `<Entity>_filter`, as `(name, rendered type)`.

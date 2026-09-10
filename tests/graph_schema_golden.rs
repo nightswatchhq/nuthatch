@@ -334,3 +334,75 @@ fn every_order_by_enum_matches_the_reference_value_for_value() {
             .join("\n  ")
     );
 }
+
+/// The object types, field for field and type for type, across every entity.
+///
+/// With the two sweeps above this completes S1's structural claim: the generated schema's object
+/// fields, filter inputs and order enums all equal a real graph-node's for this schema.
+#[test]
+fn every_object_type_matches_the_reference_field_for_field() {
+    let s = parsed();
+    let r = reference();
+    let types = r["__schema"]["types"].as_array().unwrap();
+    fn render(t: &serde_json::Value) -> String {
+        match t["kind"].as_str().unwrap() {
+            "NON_NULL" => format!("{}!", render(&t["ofType"])),
+            "LIST" => format!("[{}]", render(&t["ofType"])),
+            _ => t["name"].as_str().unwrap().to_string(),
+        }
+    }
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for e in &s.entities {
+        let Some(t) = types.iter().find(|t| t["name"] == e.name.as_str()) else {
+            problems.push(format!("{}: not in the reference", e.name));
+            continue;
+        };
+        let theirs: BTreeSet<String> = t["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let args: Vec<&str> = f["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a["name"].as_str().unwrap())
+                    .collect();
+                format!(
+                    "{}: {} [{}]",
+                    f["name"].as_str().unwrap(),
+                    render(&f["type"]),
+                    args.join(",")
+                )
+            })
+            .collect();
+        let ours: BTreeSet<String> = s
+            .object_fields(&e.name)
+            .into_iter()
+            .map(|(n, ty, args)| format!("{n}: {ty} [{}]", args.join(",")))
+            .collect();
+        checked += theirs.len();
+        for m in theirs.difference(&ours) {
+            problems.push(format!("{}: missing {m}", e.name));
+        }
+        for x in ours.difference(&theirs) {
+            problems.push(format!("{}: extra   {x}", e.name));
+        }
+    }
+    assert!(
+        checked > 200,
+        "the sweep must cover the real object types; only {checked} fields seen"
+    );
+    assert!(
+        problems.is_empty(),
+        "{} object field differences, first 12:\n  {}",
+        problems.len(),
+        problems
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
