@@ -5019,7 +5019,18 @@ mod tests {
             "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n}\n",
         )
         .unwrap();
+        // A view named for the entity, so the compiled SQL has something to read: this test is the
+        // whole user story end to end, GraphQL in over HTTP and an entity row out.
+        std::fs::create_dir_all(d.path().join("views")).unwrap();
+        std::fs::write(
+            d.path().join("views/pool.sql"),
+            "CREATE VIEW pool AS SELECT '0xaaa' AS id, 42 AS liquidity, '0xhook' AS hooks \
+             UNION ALL SELECT '0xbbb', 7, '0xhook2';\n",
+        )
+        .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        // `_meta` reports the nest's own head, so give it one to report.
+        state.store.set_meta("last_block", "23456789").unwrap();
 
         let ask = |uri: &'static str, q: &'static str, st: AppState| async move {
             let res = router(SharedNest::new(st))
@@ -5085,13 +5096,66 @@ mod tests {
             serde_json::json!(false),
             "a nest runs no mapping, so it has no indexing error to report: {body}"
         );
+        // The head is the nest's real one. Asserted because a client uses `_meta.block.number` to
+        // decide whether the endpoint is caught up, and a hardcoded null reads as "never indexed".
+        assert_eq!(
+            body["data"]["_meta"]["block"]["number"],
+            serde_json::json!(23_456_789u64),
+            "_meta must report the nest's own head: {body}"
+        );
 
-        // An entity query compiles now (S2, #1266). This nest has a schema but no views, so the
-        // failure must arrive **in the Graph envelope** rather than as a 500 a client cannot read.
-        let body = ask("/graphql", "{ pools { id } }", state.clone()).await;
+        // An entity query compiles and answers (S2, #1266). Two rows, in id order, so this sees a
+        // dropped ORDER BY as well as a dropped row.
+        let body = ask("/graphql", "{ pools { id liquidity } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                {"id": "0xaaa", "liquidity": 42},
+                {"id": "0xbbb", "liquidity": 7},
+            ]),
+            "a plain collection must answer rows from the nest's view: {body}"
+        );
+
+        // And the arguments are not decoration: `first` bounds, `where` filters, and a singular
+        // root takes one. Each of these silently returning the unfiltered set is the failure mode
+        // that makes a drop-in endpoint worse than no endpoint.
+        let body = ask("/graphql", "{ pools(first: 1) { id } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "first: 1 must return one row: {body}"
+        );
+        let body = ask(
+            "/graphql",
+            r#"{ pools(where: { liquidity_lt: "10" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xbbb"}]),
+            "a where filter must actually filter: {body}"
+        );
+        let body = ask(
+            "/graphql",
+            r#"{ pool(id: "0xbbb") { hooks } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "a singular root must answer one object, not a list: {body}"
+        );
+
+        // An unlowerable operation is refused **in the Graph envelope** rather than as a bare
+        // status a client cannot read.
+        let body = ask("/graphql", "{ nope { id } }", state.clone()).await;
         assert!(
-            body["errors"].is_array() || body["data"]["pools"].is_array(),
-            "an entity query must answer or explain itself in the envelope, got {body}"
+            body["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("nope")),
+            "an unknown root must be refused by name in the envelope: {body}"
         );
         assert!(
             !body["errors"][0]["message"]
