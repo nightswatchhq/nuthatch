@@ -1310,6 +1310,14 @@ type Swap @entity { id: ID! pool: Pool! }
             "a childless parent must answer [] rather than null: {}",
             c.sql
         );
+        // The child's own ordering and page size, which the reference gives a derived field. Asserted
+        // here and not only over HTTP: a mutation dropping this passed because the only test that
+        // could see it was in a different test function than the mutation runner's filter named.
+        assert!(
+            c.sql.contains(r#"ORDER BY c1."id" ASC LIMIT 100) t)"#),
+            "the child is ordered and paged inside the aggregate: {}",
+            c.sql
+        );
         // The parent's own paging is untouched by the aggregation.
         assert!(c.sql.ends_with("LIMIT 100 OFFSET 0"), "{}", c.sql);
         assert_eq!(
