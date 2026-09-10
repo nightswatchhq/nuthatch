@@ -12,7 +12,7 @@ run () {
   if git diff --quiet -- "$file"; then echo "[$name] NOT APPLIED (no diff)"; git checkout -- "$file"; return; fi
   echo "[$name] applied: $(git diff --shortstat -- "$file")"
   out=$(cargo test --offline --lib graph_query 2>&1; cargo test --offline --lib serve::tests::a_client_can_introspect 2>&1)
-  if echo "$out" | grep -qE "^test result: FAILED|panicked at|^error\["; then
+  if echo "$out" | grep -qE "^test result: FAILED|panicked at|^error(\[|:)|^warning: unused"; then
     echo "[$name] RED (good)"
     echo "$out" | grep -E "panicked at|^---- |assertion" | head -3
   else
