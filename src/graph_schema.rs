@@ -657,10 +657,14 @@ pub mod introspection {
     }
 
     /// The five arguments every list field takes - stored or derived, and never `block`.
+    ///
+    /// **With the same defaults as the root plural**: `skip = 0` and `first = 100`. A name-only
+    /// comparison could not see this and the argument-level diff found it immediately. It matters
+    /// because a client relies on the server's default page size rather than sending one.
     fn collection_args(entity: &str) -> Vec<Value> {
         vec![
-            arg("skip", "Int", None),
-            arg("first", "Int", None),
+            arg("skip", "Int", Some("0")),
+            arg("first", "Int", Some("100")),
             arg("orderBy", &format!("{entity}_orderBy"), None),
             arg("orderDirection", "OrderDirection", None),
             arg("where", &format!("{entity}_filter"), None),

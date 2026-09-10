@@ -469,11 +469,26 @@ fn generated_introspection_matches_the_reference_shape() {
                 arr.map(|v| {
                     v.iter()
                         .map(|f| {
+                            // **Argument types and defaults, not just names.** Dropping the
+                            // `subgraphError: deny` default passed a name-only comparison, and a
+                            // client relies on `first: 100` and `skip: 0` being the server's
+                            // defaults rather than sending them explicitly. Measured.
                             let args: Vec<String> = f["args"]
                                 .as_array()
                                 .map(|a| {
                                     a.iter()
-                                        .map(|x| x["name"].as_str().unwrap_or("?").to_string())
+                                        .map(|x| {
+                                            format!(
+                                                "{}:{}={}",
+                                                x["name"].as_str().unwrap_or("?"),
+                                                if x["type"].is_null() {
+                                                    String::new()
+                                                } else {
+                                                    render(&x["type"])
+                                                },
+                                                x["defaultValue"].as_str().unwrap_or("-")
+                                            )
+                                        })
                                         .collect()
                                 })
                                 .unwrap_or_default();
@@ -512,12 +527,21 @@ fn generated_introspection_matches_the_reference_shape() {
             }
         }
     }
-    // A divergence list that names something the reference does not have is a list nobody has
-    // reviewed. Assert each entry is real, so the list cannot rot into an excuse.
+    // **A divergence must be present in the reference and absent from ours.**
+    //
+    // The first version only asserted the declared name exists in the reference, which let anything
+    // be excused: adding `Pool_filter` to the list silenced a real difference and the suite stayed
+    // green. Measured, which is why the rule is two-sided - that is the shape of "graph-node has
+    // this and we do not model it yet", and nothing else qualifies.
     for d in DECLARED_DIVERGENCES {
         assert!(
             theirs.contains_key(*d),
             "declared divergence {d} is not in the reference; the list has rotted"
+        );
+        assert!(
+            !mine.contains_key(*d),
+            "{d} is declared a divergence but we generate it - the list is excusing a real \
+             difference rather than recording an unmodelled type"
         );
     }
     let root_fields: BTreeSet<String> = theirs["Query"]["fields"]
