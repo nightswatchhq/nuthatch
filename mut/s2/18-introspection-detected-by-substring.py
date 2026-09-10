@@ -1,5 +1,5 @@
-# Route on the raw text again, so a filter value of "__schema" is answered with the schema document.
+# Route on the raw text again, so a filter value of "__schema" takes the introspection arm.
 p = "src/serve.rs"; s = open(p).read()
-old = '    if roots.iter().any(|r| r.name == "__schema") {'
-assert s.count(old) == 1
-open(p, "w").write(s.replace(old, '    if query.contains("__schema") {'))
+old = '            "__schema" => {'
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, '            n if n == "__schema" || query.contains("__schema") => {'))
