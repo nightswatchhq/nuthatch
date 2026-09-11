@@ -415,9 +415,11 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     // After the flip, the SAME endpoint is now backed by the NEW version.
     assert_eq!(shared.current().dir.as_path(), new_dir.path());
 
-    // **The guarantee the flip actually makes** (issue #162): at the moment it swaps, the new version
-    // is at least as far along as the old - so no consumer sees the endpoint go backwards. It does
-    // *not* promise the new version has reached the tip.
+    // **The guarantee the flip actually makes** (issue #162): at the moment it *compares*, the new version
+    // is at least as far along as the old. It does **not** promise the new version has reached the tip,
+    // and it does not promise the comparison instant is the swap instant - the old indexer is a separate
+    // task and can advance between the two. RFC-0020 §111's stronger claim, that the consumer notices
+    // nothing, needs the old writer quiesced before the comparison and is tracked separately.
     //
     // **Asserted on what the flip compared, not on a later read of the stores.** Both indexers keep
     // running, so re-reading afterwards measures a different instant and can show the old version ahead
@@ -429,7 +431,7 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     // flip now returns it.
     assert!(
         heads.new >= heads.old,
-        "the flip must never move the endpoint backwards: {heads:?}"
+        "the flip must not swap to a version behind the one it compared against: {heads:?}"
     );
     // Non-vacuous: the old version really was at the tip when the flip compared them, so `new >= old`
     // above is a claim about two real heads rather than about two `None`s.

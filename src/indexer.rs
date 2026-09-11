@@ -303,15 +303,22 @@ pub struct NestRuntime {
 /// served backing to the new version (RFC-0020 slice 2b, the compatible hot-swap). Old and new indexers
 /// run concurrently until this returns; the caller aborts the old ingest afterwards. `poll` bounds how
 /// often the two heads are compared.
-/// The two heads the flip compared, **at the moment it compared them**.
+/// The two heads the flip compared, at the moment it **compared** them.
 ///
-/// Returned rather than only logged, because the guarantee is about that instant and nothing can
-/// recover it afterwards. Both indexers keep running, so a caller that re-reads the stores measures a
-/// later state and can see the old version ahead again - which is not the flip going backwards, it is
-/// the observation being taken at the wrong time. `compatible_hot_upgrade_flips_backing_after_catchup`
-/// failed that way twice, and the second attempt at fixing it aborted the old indexer first, which only
-/// narrows the window: `JoinHandle::abort` requests cancellation and does not wait, and stopping the old
-/// version cannot un-advance a head it already advanced.
+/// Returned rather than only logged, because nothing can recover the comparison afterwards. Both indexers
+/// keep running, so a caller that re-reads the stores measures a later state and can see the old version
+/// ahead again - which is not the flip going backwards, it is the observation being taken at the wrong
+/// time. `compatible_hot_upgrade_flips_backing_after_catchup` failed that way three times (#162, #1303,
+/// and on a documentation-only PR), and the second attempt at fixing it aborted the old indexer first,
+/// which only narrows the window: `JoinHandle::abort` requests cancellation and does not wait, and
+/// stopping the old version cannot un-advance a head it already advanced.
+///
+/// **Comparison, not swap, and the difference is not cosmetic.** These are read and then `shared.swap` is
+/// called. There is no await between the two, but the old indexer is a separate task that can advance its
+/// store in the gap, so the pair describes the instant the decision was taken and not the instant the
+/// backing changed. RFC-0020 §111 promises an atomic flip that "the consumer notices nothing", and
+/// closing that gap means quiescing the old writer before comparing - a change to the production path,
+/// filed separately (Jules on #1302). This type is deliberately named for what it can honestly report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlipHeads {
     pub old: Option<u64>,
