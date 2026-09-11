@@ -43,6 +43,56 @@ pub struct EmitResult {
     /// rather than served by a placeholder that returns `1` (#1277); the per-field reasons are in
     /// `skipped_fields` and in the report.
     pub entities_without_views: Vec<String>,
+    /// How much of what the report promised the overlay actually answers (#1277).
+    pub coverage: Coverage,
+}
+
+/// Fields answered over fields promised, which is the one number that says whether a port is done.
+///
+/// The report classifies a field `exact` when the mapping computes it purely from decoded events.
+/// That is a claim about *reproducibility in principle*. Whether this overlay reproduces it is a
+/// different question, and on the RFC-0044 S3 acceptance port the two answers were **205 and 27**.
+/// Nothing printed the second one, so a reader saw a report promising 205 byte-identical fields and
+/// an overlay of nineteen view files, and had no way to tell that 178 of those fields could not be
+/// asked for at all (#1277).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Fields the report classified `exact` - what was promised.
+    pub classified_exact: usize,
+    /// Of those, fields a `views/*.sql` projection names.
+    pub in_views: usize,
+    /// Of those, fields maintained incrementally as an RFC-0041 entity. Answered, just not by a view.
+    pub incremental: usize,
+}
+
+impl Coverage {
+    /// Answered either way. A field cannot be both: `view_for_entity` skips a materialised field.
+    pub fn answered(&self) -> usize {
+        self.in_views + self.incremental
+    }
+
+    /// `exact` fields no artefact answers.
+    pub fn unanswered(&self) -> usize {
+        self.classified_exact.saturating_sub(self.answered())
+    }
+
+    /// One line, for the CLI and for `README.md`. Percent of promised, floored, so a port that
+    /// answers 27 of 205 cannot round itself up to anything reassuring.
+    pub fn summary(&self) -> String {
+        let pct = (self.answered() * 100)
+            .checked_div(self.classified_exact)
+            .unwrap_or(0);
+        format!(
+            "{} of {} fields the report calls exact are answered ({}%): {} in views, {} maintained \
+             incrementally, {} not answered at all",
+            self.answered(),
+            self.classified_exact,
+            pct,
+            self.in_views,
+            self.incremental,
+            self.unanswered(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +202,9 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             s.why
         );
     }
+    // Last, because it is the line that says whether any of the above adds up to a port. The entity
+    // count above is the shape of the problem; this is its size (#1277).
+    println!("  coverage: {}", result.coverage.summary());
     Ok(())
 }
 
@@ -196,7 +249,36 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         write_exact_views(nest, &report, &mappings, &config, &schema, &materialised)?;
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
-    std::fs::write(nest.join("README.md"), &report_text)
+
+    // Counted from the artefacts rather than from the bookkeeping, because the bookkeeping is what
+    // was wrong before: `exact_fields` and the emitted SQL were built in the same loop and still
+    // disagreed (#1248). `in_views` counts distinct (entity, field) pairs a view projection names.
+    let coverage = Coverage {
+        classified_exact: report
+            .fields
+            .iter()
+            .filter(|f| f.class == crate::port_report::Class::Exact)
+            .count(),
+        in_views: views
+            .iter()
+            .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone())))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        incremental: materialised.len(),
+    };
+
+    // **`README.md` carries the figure.** It was the report verbatim, and the report's summary table
+    // says `exact 205` - a promise about the mapping, not about this overlay. A porter reading it had
+    // every reason to believe the nest answered 205 fields (#1277).
+    let readme = format!(
+        "{report_text}\n## Overlay coverage\n\n{}\n\nThe class counts above describe the *mapping*: \
+         a field is `exact` when it is a pure function of decoded events, which is a claim about what \
+         is reproducible in principle. This line describes *this overlay*: what it actually answers. \
+         A field counted unanswered is named with its reason in the `-- NOT IN THIS VIEW` comments of \
+         the relevant `views/*.sql`, and on stdout when `port-emit` ran.\n",
+        coverage.summary()
+    );
+    std::fs::write(nest.join("README.md"), &readme)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
 
     Ok(EmitResult {
@@ -207,6 +289,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         skipped_fields,
         entities,
         entities_without_views,
+        coverage,
     })
 }
 

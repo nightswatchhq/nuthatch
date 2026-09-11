@@ -176,16 +176,109 @@ fn exact_field_appears_in_a_view() {
     );
 }
 
+/// `README.md` is the report **plus what this overlay actually answers**.
+///
+/// It used to be the report verbatim, which is what this test asserted. The report's summary table
+/// describes the mapping - a field is `exact` when it is a pure function of decoded events, a claim
+/// about reproducibility in principle. On the RFC-0044 S3 acceptance port it said `exact 205` while
+/// the overlay answered **27**, and nothing on disk or on stdout said so, so the artefacts read as a
+/// finished port (#1277).
 #[test]
-fn readme_is_the_port_report_verbatim() {
+fn readme_carries_the_report_and_the_overlay_coverage() {
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);
     let result = nuthatch::port_emit::emit(&one_call_dir(), nest.path()).unwrap();
     let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
-    assert_eq!(readme, result.report);
+
+    assert!(
+        readme.starts_with(&result.report),
+        "the report must still be there, whole and first:\n{readme}"
+    );
     assert!(readme.contains("# Port report"));
     assert!(readme.contains("call-derived"));
     assert!(readme.contains("`Token.symbol`"));
+
+    // This fixture has one exact field (`Token.id`) and the view answers it, so the honest figure is
+    // 1 of 1. Asserted as the rendered sentence rather than as `contains("coverage")`, because the
+    // sentence is what a porter reads and a count that drifts from the artefacts is the whole defect.
+    assert_eq!(
+        result.coverage,
+        nuthatch::port_emit::Coverage {
+            classified_exact: 1,
+            in_views: 1,
+            incremental: 0,
+        },
+        "coverage must be counted from the artefacts"
+    );
+    assert!(
+        readme.contains(
+            "1 of 1 fields the report calls exact are answered (100%): 1 in views, 0 maintained \
+             incrementally, 0 not answered at all"
+        ),
+        "README must carry the figure as a sentence:\n{readme}"
+    );
+    assert!(
+        readme.contains("## Overlay coverage"),
+        "and under a heading a reader can find:\n{readme}"
+    );
+}
+
+/// The figure has to move when the overlay gets worse, or it is decoration.
+///
+/// `Token.tally` is written by the mapping from an arithmetic expression over an event parameter, so
+/// the classifier calls it exact - a pure function of decoded events - and the emitter cannot render
+/// it into a column. That is the exact shape of the 178 fields the S3 acceptance port promised and
+/// could not answer (#1277), and the coverage line must stop reading 100%.
+#[test]
+fn an_unanswered_exact_field_moves_the_coverage_figure() {
+    let subgraph = tempfile::tempdir().unwrap();
+    copy_dir(&one_call_dir(), subgraph.path());
+
+    let schema = subgraph.path().join("schema.graphql");
+    let text = std::fs::read_to_string(&schema).unwrap();
+    let text = text.replace("  symbol: String!", "  symbol: String!\n  tally: BigInt!");
+    assert!(text.contains("tally"), "schema edit did not apply");
+    std::fs::write(&schema, &text).unwrap();
+
+    let mapping = subgraph.path().join("src/mappings/core.ts");
+    let m = std::fs::read_to_string(&mapping).unwrap();
+    // Asserted rather than assumed: the fixture binds `token0`, not `token`, and an edit that matches
+    // nothing leaves a field the classifier calls *unreachable* instead of exact - which moves no
+    // coverage and makes this test vacuous. It happened while writing it.
+    let m2 = m.replace(
+        "  token0.save()",
+        "  token0.tally = event.params.fee.plus(event.params.fee)\n  token0.save()",
+    );
+    assert_ne!(m2, m, "mapping edit did not apply:\n{m}");
+    std::fs::write(&mapping, &m2).unwrap();
+
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap();
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+
+    assert_eq!(
+        result.coverage.classified_exact,
+        2,
+        "the fixture must promise two exact fields, got {}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.unanswered(),
+        1,
+        "and exactly one must be unanswered, got {}",
+        result.coverage.summary()
+    );
+    assert!(
+        readme.contains("1 of 2 fields the report calls exact are answered (50%)"),
+        "README must carry the moved figure:\n{}",
+        result.coverage.summary()
+    );
+    assert!(
+        !readme.contains("(100%)"),
+        "an overlay with an unanswered exact field must not read 100%:\n{}",
+        result.coverage.summary()
+    );
 }
 
 #[test]
