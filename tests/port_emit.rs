@@ -1128,3 +1128,277 @@ type Token @entity {
     assert!(manifest.contains("name = \"manual\""));
     assert!(nest.path().join("entities/manual.sql").is_file());
 }
+
+/// #1277. A local that only aliases an event parameter is the shape every `Pool.id` takes in the
+/// real Uniswap V4 subgraph:
+///
+/// ```text
+/// const poolId = event.params.id.toHexString()
+/// const pool = new Pool(poolId)
+/// ```
+///
+/// The emitter resolved the constructor argument with `event_column` alone, which sees a bare
+/// identifier and refuses, so the primary key of all 132,765 pools was reported as *"no decoded
+/// column corresponds to it"* while the column sat in `pool_manager__initialize` already
+/// hex-encoded. Without an id in the view, every other field the view answered was unalignable
+/// against a reference, which is why this one field decided the acceptance port.
+#[test]
+fn an_id_from_a_local_aliasing_an_event_param_reaches_its_column() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  const poolId = event.params.pool.toHexString()
+  const pool = new Pool(poolId)
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains("AS \"id\""),
+        "`Pool.id` must bind to the column its local aliases (#1277):\n{sql}"
+    );
+    assert!(
+        sql.contains("\"pool\""),
+        "and the column is `pool`, as the ABI names it:\n{sql}"
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|s| s.name().contains("id")),
+        "`Pool.id` must not be skipped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+
+    // The view has to load, not merely mention the column.
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}
+
+/// #1277. An entity whose every exact field reaches no column used to get
+/// `CREATE VIEW "<entity>" AS SELECT 1 AS port_placeholder`, so that `nuthatch check` had a table to
+/// bind. On the RFC-0044 S3 acceptance port that was nine of nineteen entities, `Bundle` and
+/// `PoolManager` among them, and `SELECT count(*) FROM "bundle"` answered `1` with a full provenance
+/// block. The reference has exactly one `Bundle`, so a comparison on row counts agreed with it.
+///
+/// `Bundle` here is the real shape: a literal id and a constant, neither of which is a column.
+const NO_COLUMN_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+
+const NO_COLUMN_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.plain = event.params.fee
+  pool.save()
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = ZERO_BD
+  bundle.save()
+}
+"#;
+
+#[test]
+fn an_entity_whose_fields_reach_no_column_gets_no_view_at_all() {
+    let (nest, result) = emitted_nest(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Bundle"),
+        "no view may be emitted for Bundle: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .entities_without_views
+            .contains(&"Bundle".to_string()),
+        "and it must be named rather than silently absent: {:?}",
+        result.entities_without_views
+    );
+    assert!(
+        !nest.path().join("views/20-bundle.sql").exists(),
+        "no file either - a view returning 1 is worse than no table"
+    );
+
+    // Pool still lands. The change must not cost an entity that does resolve.
+    assert!(
+        result.views.iter().any(|v| v.entity == "Pool"),
+        "Pool resolves `plain` and must still be emitted"
+    );
+
+    // The check must not name Bundle. Its projection for such a view was `*`, which binds whatever
+    // the view holds and so asserted nothing while reading `binds: true`.
+    let check = std::fs::read_to_string(nest.path().join("checks/port_views.sql")).unwrap();
+    assert!(
+        !check.contains("'Bundle'"),
+        "the check may not claim an entity that has no view:\n{check}"
+    );
+    assert!(
+        !check.contains("SELECT * FROM"),
+        "and no row of it may project `*`:\n{check}"
+    );
+    let expected =
+        std::fs::read_to_string(nest.path().join("checks/expected/port_views.json")).unwrap();
+    assert!(
+        !expected.contains("Bundle"),
+        "nor may the committed expectation:\n{expected}"
+    );
+}
+
+/// A nest emitted before that change carries nine placeholder views. Re-emitting has to remove the
+/// one for an entity that now emits none, or the stale table survives and nothing re-examines it.
+#[test]
+fn reemission_removes_a_stale_generated_view() {
+    let subgraph = subgraph_with(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let views = nest.path().join("views");
+    std::fs::create_dir_all(&views).unwrap();
+
+    // Exactly what the previous emitter wrote, header and all.
+    let stale = views.join("20-bundle.sql");
+    std::fs::write(
+        &stale,
+        "-- Exact fields of `Bundle`. Call-derived, fixed-point and unreachable fields are not \
+         here; see README.md.\n\nCREATE VIEW \"bundle\" AS SELECT 1 AS port_placeholder;\n",
+    )
+    .unwrap();
+    // And an operator's own view, which must survive.
+    let mine = views.join("30-mine.sql");
+    std::fs::write(&mine, "CREATE VIEW \"mine\" AS SELECT 1 AS ok;\n").unwrap();
+
+    nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+
+    assert!(
+        !stale.exists(),
+        "the stale generated view for Bundle must be removed"
+    );
+    assert!(
+        mine.exists(),
+        "a view the operator wrote must not be removed"
+    );
+}
+
+/// #1277. A field assigned inside a helper that is itself called by a helper reaches no column,
+/// because `event_handler_for` looks only one hop: it finds an event handler that calls the function
+/// directly. The Uniswap V4 subgraph routes every handler through that indirection -
+/// `handleSwap` -> `handleSwapHelper` -> `loadTransaction` - so everything `loadTransaction` writes
+/// is lost, `Transaction.blockNumber` and `Transaction.timestamp` among them, even though
+/// `event.block.number` and `event.block.timestamp` are both mapped to implicit columns already.
+#[test]
+fn a_field_written_two_helper_hops_from_the_handler_still_reaches_its_column() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  createdAt: BigInt!
+}
+"#;
+    let mapping = r#"
+export function stamp(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.createdAt = event.block.timestamp
+  pool.save()
+}
+export function handlePoolCreatedHelper(event: PoolCreated): void {
+  stamp(event)
+}
+export function handlePoolCreated(event: PoolCreated): void {
+  handlePoolCreatedHelper(event)
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    let view = result
+        .views
+        .iter()
+        .find(|v| v.entity == "Pool")
+        .expect("a Pool view");
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("\"block_timestamp\" AS \"createdAt\""),
+        "`event.block.timestamp` two hops from the handler must still bind (#1277):\n{sql}"
+    );
+}
+
+/// Raised by review of #1279. `plain_local_expr` scanned from the top and returned the first
+/// declaration of the name, which is not the one in scope at the use site:
+///
+/// ```text
+/// const poolId = event.params.token1.toHexString()   // outer
+/// if (..) {
+///   const poolId = event.params.pool.toHexString()   // shadows it
+///   const pool = new Pool(poolId)                    // uses this one
+/// }
+/// ```
+///
+/// Emitting `Pool.id` from `token1` there would answer the wrong column under a report promising
+/// byte-identical - #1248's fault in a new place. Scanning cannot resolve scope, so an ambiguous
+/// name resolves to nothing and the field is reported as reaching no column, exactly as it was
+/// before the alias fallback existed.
+#[test]
+fn a_shadowed_local_is_refused_rather_than_resolved_to_the_wrong_one() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  const poolId = event.params.token1.toHexString()
+  if (event.params.fee.gt(BigInt.zero())) {
+    const poolId = event.params.pool.toHexString()
+    const pool = new Pool(poolId)
+    pool.plain = event.params.fee
+    pool.save()
+  }
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool");
+    if let Some(view) = view {
+        let sql = select_sql(&view.sql);
+        assert!(
+            !sql.contains("\"token1\" AS \"id\""),
+            "the outer `poolId` must not answer `Pool.id`; the inner one shadows it:\n{sql}"
+        );
+    }
+    assert!(
+        result
+            .skipped_fields
+            .iter()
+            .any(|s| s.entity == "Pool" && s.field == "id"),
+        "an ambiguous local must leave `Pool.id` reported as reaching no column: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+}

@@ -39,6 +39,10 @@ pub struct EmitResult {
     pub skipped_fields: Vec<SkippedField>,
     /// Running totals emitted as RFC-0041 incremental entities rather than as views (#1214).
     pub entities: Vec<EmittedEntity>,
+    /// Entities no view answers, because not one of their exact fields reached a column. Named
+    /// rather than served by a placeholder that returns `1` (#1277); the per-field reasons are in
+    /// `skipped_fields` and in the report.
+    pub entities_without_views: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +131,17 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             s.why
         );
     }
+    // And the entities no view answers at all. Stated as a count first, because nine of nineteen
+    // is the shape of the problem and a reader scanning a long skipped-field list will not add it up
+    // (#1277). A caller querying one of these gets an error from DuckDB, which is the point.
+    if !result.entities_without_views.is_empty() {
+        println!(
+            "  ! {} of {} entit(ies) have no view - not one of their exact fields reached a column: {}",
+            result.entities_without_views.len(),
+            result.entities_without_views.len() + result.views.len(),
+            result.entities_without_views.join(", ")
+        );
+    }
     // Same contract for fields. A field the report calls Exact that reached no column is the one
     // thing a porter must not learn from a gateway diff three days later (#1248).
     for s in &result.skipped_fields {
@@ -177,7 +192,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .iter()
         .flat_map(|e| e.fields.iter().map(|f| (e.entity.clone(), f.clone())))
         .collect();
-    let (views, view_skipped) =
+    let (views, view_skipped, entities_without_views) =
         write_exact_views(nest, &report, &mappings, &config, &schema, &materialised)?;
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
@@ -191,6 +206,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         skipped_calls,
         skipped_fields,
         entities,
+        entities_without_views,
     })
 }
 
@@ -593,6 +609,32 @@ fn remove_generated_entities(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove view files this emitter generated on a previous run. Keyed on the header
+/// `-- Exact fields of ` + "`"` that `view_for_entity` writes, so an operator's own
+/// `views/*.sql` in the same directory is never removed - the same contract
+/// `remove_generated_entities` keeps for `entities/`.
+fn remove_generated_views(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("read entry in {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let sql =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        if sql.starts_with("-- Exact fields of `") {
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn write_exact_views(
     nest: &Path,
     report: &Report,
@@ -600,7 +642,7 @@ fn write_exact_views(
     config: &Config,
     schema: &[nuthatch_decode::registry::TableSchema],
     materialised: &BTreeSet<(String, String)>,
-) -> Result<(Vec<EmittedView>, Vec<SkippedField>)> {
+) -> Result<(Vec<EmittedView>, Vec<SkippedField>, Vec<String>)> {
     let views_dir = nest.join("views");
     std::fs::create_dir_all(&views_dir)
         .with_context(|| format!("create {}", views_dir.display()))?;
@@ -624,11 +666,23 @@ fn write_exact_views(
         m
     };
 
+    // Views are regenerated, not merged: a previous run's file for an entity that now emits none
+    // would otherwise survive as a stale table nothing re-examines. Only files carrying the
+    // generated header are touched, so a hand-written view in the same directory is left alone.
+    remove_generated_views(&views_dir)?;
+
     let mut emitted = Vec::new();
     let mut skipped = Vec::new();
+    let mut without_views = Vec::new();
     for (entity, fields) in &exact_by_entity {
         let view = view_for_entity(entity, fields, mappings, config, schema, materialised);
         let file = format!("20-{}.sql", to_alias(entity));
+        skipped.extend(view.skipped);
+        // Nothing resolved to a column, so there is no view - only the account of why.
+        if view.exact_fields.is_empty() {
+            without_views.push(entity.clone());
+            continue;
+        }
         std::fs::write(views_dir.join(&file), &view.sql)
             .with_context(|| format!("write views/{file}"))?;
         emitted.push(EmittedView {
@@ -637,9 +691,8 @@ fn write_exact_views(
             sql: view.sql,
             exact_fields: view.exact_fields,
         });
-        skipped.extend(view.skipped);
     }
-    Ok((emitted, skipped))
+    Ok((emitted, skipped, without_views))
 }
 
 struct ViewDraft {
@@ -750,11 +803,23 @@ fn view_for_entity(
     sql.push('\n');
 
     if selects.is_empty() {
-        // Still a valid view so `nuthatch check` has something that binds, and the field
-        // names appear in the file (the comments above).
-        sql.push_str(&format!(
-            "CREATE VIEW \"{view_name}\" AS SELECT 1 AS port_placeholder;\n"
-        ));
+        // **No view, rather than a view that answers `1`.**
+        //
+        // This used to emit `CREATE VIEW "<entity>" AS SELECT 1 AS port_placeholder`, so that
+        // `nuthatch check` had something to bind. On the RFC-0044 S3 acceptance port that put nine
+        // of nineteen entities - `Bundle`, `PoolManager`, `Transaction`, `Tick` and all four
+        // interval entities - behind a view returning one row holding the integer 1, with a full
+        // provenance block and no degraded flag. `SELECT count(*) FROM "bundle"` answered `1`, and
+        // the reference has exactly one `Bundle`, so a comparison on row counts agreed (#1277).
+        //
+        // A caller asking for an entity we cannot answer must get an error, not a row. The field
+        // list is not lost: the comments above are returned in `sql` for the report, and the entity
+        // is named in `EmitResult::entities_without_views`.
+        //
+        // It also repaired the check. The projection was `*` for exactly these views, because there
+        // was no promised column to name, so those rows asserted nothing at all while reading as
+        // `binds: true`. With no such view emitted, every row of `port_views.sql` names real
+        // columns and the binder is a gate for all of them.
         return ViewDraft {
             sql,
             exact_fields,
@@ -1053,17 +1118,16 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
             } else {
                 format!("UNION ALL SELECT '{entity}', count(*) >= 0")
             };
-            // An entity whose fields were all skipped emits the placeholder view, which has no
-            // promised column to name; `*` is then the only honest projection.
-            let projection = if fields.is_empty() {
-                "*".to_string()
-            } else {
-                fields
-                    .iter()
-                    .map(|f| format!("\"{f}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
+            // Every emitted view names at least one column: an entity whose fields all reached no
+            // column emits no view at all (#1277). So there is no `*` case left, and that matters -
+            // `*` was the projection for exactly those views, which made their rows read
+            // `binds: true` while asserting nothing the binder could refuse.
+            debug_assert!(!fields.is_empty(), "{entity}: emitted view with no columns");
+            let projection = fields
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             s.push_str(&format!(
                 "{head} FROM (SELECT {projection} FROM \"{alias}\" LIMIT 0)\n"
             ));

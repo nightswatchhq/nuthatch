@@ -2983,7 +2983,15 @@ fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
                 let mut k = next;
                 skip_ws_str(body, &mut k);
                 if body[k..].starts_with('(') {
-                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                    let arg = take_expr(body, k + 1);
+                    if let Some(col) = event_column(&arg) {
+                        return Some(col);
+                    }
+                    // `new Pool(poolId)`, with `poolId` a local aliasing the parameter (#1277).
+                    if let Some(col) = local_root(&arg)
+                        .and_then(|v| plain_local_expr(body, &v))
+                        .and_then(|e| event_column(&e))
+                    {
                         return Some(col);
                     }
                 }
@@ -2996,7 +3004,15 @@ fn id_from_new_or_load(entity: &str, body: &str) -> Option<String> {
                 let mut k = next;
                 skip_ws_str(body, &mut k);
                 if body[k..].starts_with('(') {
-                    if let Some(col) = event_column(&take_expr(body, k + 1)) {
+                    let arg = take_expr(body, k + 1);
+                    if let Some(col) = event_column(&arg) {
+                        return Some(col);
+                    }
+                    // `new Pool(poolId)`, with `poolId` a local aliasing the parameter (#1277).
+                    if let Some(col) = local_root(&arg)
+                        .and_then(|v| plain_local_expr(body, &v))
+                        .and_then(|e| event_column(&e))
+                    {
                         return Some(col);
                     }
                 }
@@ -3060,12 +3076,27 @@ pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> 
     let ident = local_root(&asg.expr)?;
     let arg = constructor_arg_for(&func.body, &ident)
         .or_else(|| load_arg_for(&func.body, &ident))
-        .or_else(|| create_arg_for(&func.body, &ident))?;
+        .or_else(|| create_arg_for(&func.body, &ident))
+        // A local that aliases an event parameter rather than holding an entity (#1277).
+        .or_else(|| plain_local_expr(&func.body, &ident))?;
     event_column(&arg)
 }
 
-/// The event/call handler that wrote this, or a handler that calls this helper. Block handlers
+/// The event/call handler that wrote this, or a handler that reaches this helper. Block handlers
 /// are never a table source.
+///
+/// **The search is transitive, because one hop is not how real subgraphs are written.** This used to
+/// look for an event handler calling the helper *directly*. Uniswap V4 routes every handler through
+/// an indirection for testability - `handleSwap` calls `handleSwapHelper(event, config)`, and that
+/// calls `loadTransaction`, `updatePoolDayData` and the rest - so the handler is two hops away and
+/// nothing those helpers wrote reached a column. It was not one field either: an entity whose every
+/// assignment lives two hops down got no view at all, `Transaction` among them, while
+/// `event.block.number` and `event.block.timestamp` were already mapped to implicit columns and
+/// would have bound perfectly well (#1277).
+///
+/// Breadth-first from each event handler, with a visited set: a mapping may call a helper from two
+/// handlers, and `arrakis.ts` and `euler.ts` both call shared utilities, so the call graph is a DAG
+/// at best and cyclic at worst.
 pub(crate) fn event_handler_for<'a>(
     func: &'a FunctionInfo,
     mappings: &'a Mappings,
@@ -3076,10 +3107,118 @@ pub(crate) fn event_handler_for<'a>(
     if func.kind == HandlerKind::Block {
         return None;
     }
-    mappings.functions.values().find(|f| {
-        (f.kind == HandlerKind::Event || f.kind == HandlerKind::Call)
-            && f.calls.contains(&func.name)
-    })
+    // Deterministic: `functions` is a BTreeMap, so two handlers reaching the same helper always
+    // resolve to the same one rather than to whichever the iterator happened to yield.
+    for handler in mappings.functions.values() {
+        if handler.kind != HandlerKind::Event && handler.kind != HandlerKind::Call {
+            continue;
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut queue: Vec<&str> = handler.calls.iter().map(String::as_str).collect();
+        while let Some(name) = queue.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            if name == func.name {
+                return Some(handler);
+            }
+            if let Some(next) = mappings.functions.get(name) {
+                queue.extend(next.calls.iter().map(String::as_str));
+            }
+        }
+    }
+    None
+}
+
+/// `const <var> = <expr>` where `<expr>` is a plain expression rather than an entity constructor.
+///
+/// The entity-aware lookups below only find a local that holds an *entity* - `new Pool(..)`,
+/// `Pool.load(..)`, `Pool.create(..)`. A local that merely aliases an event parameter was invisible,
+/// and `Pool.id` is exactly that shape:
+///
+/// ```text
+/// const poolId = event.params.id.toHexString()   // poolManager.ts:37
+/// const pool = new Pool(poolId)                  // poolManager.ts:68
+/// ```
+///
+/// Without this the emitter reported the primary key of all 132,765 pools as having no corresponding
+/// decoded column, while `pool_manager__initialize.id` held it already hex-encoded, and every field
+/// the `pool` view did answer became unalignable against a reference (#1277).
+///
+/// The returned expression is handed to [`event_column`], which is strict: `strip_converters` drops
+/// only the representation-only suffixes, and any arithmetic residue after the parameter name yields
+/// no column at all (#1248). So a local holding a *transformed* parameter still resolves to nothing
+/// rather than to the wrong column.
+///
+/// **A name declared more than once resolves to nothing.** Scanning cannot tell which declaration is
+/// in scope at the use site, and the first textual one is not it:
+///
+/// ```text
+/// const poolId = event.params.a.toHexString()
+/// if (..) {
+///   const poolId = event.params.b.toHexString()
+///   const pool = new Pool(poolId)            // uses b, not a
+/// }
+/// ```
+///
+/// Returning the outer declaration would emit `Pool.id` from column `a` - a view answering the wrong
+/// column under a report promising byte-identical, which is #1248's fault in a new place. Refusing
+/// leaves the field reported as reaching no column, which is what it did before this fallback
+/// existed. Raised by review of this change.
+fn plain_local_expr(body: &str, var: &str) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        if !body.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &body[i..];
+        let kw = if rest.starts_with("let ") || rest.starts_with("var ") {
+            4
+        } else if rest.starts_with("const ") {
+            6
+        } else {
+            i += 1;
+            continue;
+        };
+        // Not a keyword if it is the tail of a longer identifier.
+        if i > 0 {
+            let p = body.as_bytes()[i - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut k = i + kw;
+        let Some(v) = take_ident_str(body, &mut k) else {
+            i += 1;
+            continue;
+        };
+        skip_ws_str(body, &mut k);
+        if !body[k..].starts_with('=') {
+            i += 1;
+            continue;
+        }
+        k += 1;
+        skip_ws_str(body, &mut k);
+        if v == var {
+            let end = body[k..]
+                .find([';', '\n'])
+                .map(|o| k + o)
+                .unwrap_or(body.len());
+            let e = collapse_ws(&body[k..end]);
+            if !e.is_empty() {
+                found.push(e);
+            }
+        }
+        i = k.max(i + 1);
+    }
+    // Exactly one declaration, or nothing. See the shadowing note above.
+    match found.len() {
+        1 => found.pop(),
+        _ => None,
+    }
 }
 
 fn local_root(expr: &str) -> Option<String> {
