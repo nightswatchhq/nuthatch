@@ -1126,6 +1126,109 @@ fn the_coverage_figure_counts_an_incremental_field_as_answered() {
     );
 }
 
+/// A unit increment is `count(*)`, not a sum of a column.
+///
+/// `pool.txCount = pool.txCount.plus(ONE_BI)` adds one per event. The matcher required the accumulated
+/// operand to be a decoded column, so every counter was rejected and the field fell back to its
+/// *initialising* assignment (`= ZERO_BI`) - which is why 45 fields on Uniswap V4 read as "zero
+/// initialiser" rather than "running total" (#1310).
+///
+/// No `_overflow` companion, deliberately: that flag exists because an event param is sealed as exact
+/// decimal text and `TRY_CAST` to `DECIMAL(38,0)` yields NULL past 38 digits, which `sum` would skip in
+/// silence. A row count casts nothing, so a flag here would always be 0 and its presence would imply
+/// something could overflow.
+#[test]
+fn a_unit_increment_is_emitted_as_a_row_count() {
+    const SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  txCount: BigInt!
+  liquidity: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.txCount = pool.txCount.plus(ONE_BI)
+  pool.liquidity = pool.liquidity.plus(event.params.fee)
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(SCHEMA, MAPPING);
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Pool")
+        .unwrap_or_else(|| panic!("no Pool entity: {:?}", result.entities));
+    assert!(
+        entity.fields.contains(&"txCount".to_string()),
+        "the counter must be maintained incrementally: {:?}",
+        entity.fields
+    );
+
+    let sql = std::fs::read_to_string(nest.path().join("entities/pool.sql")).unwrap();
+    assert!(
+        sql.contains(r#"count(*) AS "txCount""#),
+        "a unit increment counts rows:\n{sql}"
+    );
+    assert!(
+        !sql.contains(r#""txCount_overflow""#),
+        "a row count cannot overflow, so the flag must not be emitted:\n{sql}"
+    );
+    // The column-sourced total beside it keeps both the cast and the flag.
+    assert!(
+        sql.contains(r#"sum(TRY_CAST("fee" AS DECIMAL(38,0))) AS "liquidity""#),
+        "a column total is still summed with a checked cast:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#""liquidity_overflow""#),
+        "and keeps its overflow flag:\n{sql}"
+    );
+    // The comment says which it is, since the two read very differently to a porter.
+    assert!(
+        sql.contains("counts rows of"),
+        "the provenance comment must say it counts rather than sums:\n{sql}"
+    );
+}
+
+/// A constant that is not one is named rather than folded.
+///
+/// `plus(TWO_BI)` is `2 * count(*)`, which is expressible and is a second shape to get right. Guessing at
+/// it would be the #1248 defect again - an operation discarded and a plausible number answered in its place.
+#[test]
+fn a_non_unit_constant_increment_is_skipped_by_name() {
+    const SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  pairCount: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.pairCount = pool.pairCount.plus(TWO_BI)
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    assert!(
+        result
+            .entities
+            .iter()
+            .all(|e| !e.fields.contains(&"pairCount".to_string())),
+        "a non-unit constant must not be folded as if it were one: {:?}",
+        result.entities
+    );
+    assert!(
+        result.skipped_fields.iter().any(|s| s.field == "pairCount")
+            || result.coverage.unanswered() > 0,
+        "and it must be named rather than vanishing: {:?}",
+        result.skipped_fields
+    );
+}
+
 /// The gate that decides the slice: the emitted entity has to satisfy RFC-0041's v1 shape rules and
 /// bind. `nuthatch check` runs both, so this is the real validator rather than a substring.
 #[test]
