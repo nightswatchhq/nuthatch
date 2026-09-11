@@ -473,59 +473,77 @@ fn write_entities(
         if accumulated.is_empty() {
             continue;
         }
-        // One relation, one table. Two triggering tables would need a UNION ALL under the GROUP BY,
-        // which is expressible but is a second shape to get right; the fields on the other tables
-        // are named rather than folded in silently.
-        let table = accumulated[0].table.clone();
-        let (here, elsewhere): (Vec<_>, Vec<_>) =
-            accumulated.into_iter().partition(|a| a.table == table);
-        let mut seen_fields = BTreeSet::new();
-        let here = here
-            .into_iter()
-            .filter(|a| {
-                if seen_fields.insert(a.field.clone()) {
-                    true
-                } else {
-                    skipped.push(SkippedField {
-                        entity: entity.clone(),
-                        field: a.field.clone(),
-                        citation: a.citation.clone(),
-                        why: format!(
-                            "has another accumulating assignment on `{table}`; duplicate aliases are unsupported in one incremental entity"
-                        ),
-                    });
-                    false
-                }
-            })
-            .collect::<Vec<_>>();
-        for a in elsewhere {
-            skipped.push(SkippedField {
-                entity: entity.clone(),
-                field: a.field.clone(),
-                citation: a.citation.clone(),
-                why: format!(
-                    "accumulates from `{}` while `{entity}`'s incremental entity is built on \
-                     `{table}`; one entity is one relation in v1, so add this arm by hand",
-                    a.table
-                ),
-            });
-        }
-        let Some(id_column) = id_column_for_table(entity, &table, mappings, config)
-            .and_then(|c| resolve_column(&table, &c, schema))
-        else {
-            for a in here {
+        // **One entity, several arms.** A counter counts events from more than one table -
+        // `pool.txCount` increments in both `handleModifyLiquidity` and `handleSwap` - and a field can
+        // be written twice from one table under different keys, as `token0.txCount` and
+        // `token1.txCount` are from one swap. Both used to be named as skipped with "one entity is one
+        // relation in v1", which gated 45 fields on Uniswap V4 (#1313).
+        //
+        // An arm is a (table, key column) pair. Each arm projects its own fields and **zero** for every
+        // other field, the arms are `UNION ALL`ed, and one outer aggregate folds the lot by key. That
+        // also unifies the two sources: a column contributes its checked cast, a row count contributes
+        // `1`, and the outer `sum` does the same job for both.
+        //
+        // The wrapping matters. RFC-0041 v1's validator requires exactly one `SELECT_NODE`, and a bare
+        // `UNION ALL` parses as a `SET_OPERATION_NODE` - measured against DuckDB's own
+        // `json_serialize_sql`. Wrapped in an outer `SELECT .. FROM ( .. )` it is a `SELECT_NODE` and a
+        // derived table in `FROM` is not an expression subquery, so `nuthatch check` still validates it.
+        let mut arms: BTreeMap<(String, String), Vec<AccumulatedField>> = BTreeMap::new();
+        for a in accumulated {
+            // A decoded column, or - for a singleton the mapping keys with a constant - that constant.
+            // `new PoolManager('1')` has no key *in the data* because the key is in the mapping, and
+            // reporting "nothing identifies which `PoolManager` a row belongs to" was true and the wrong
+            // conclusion (#1313). Quoted at the point of resolution, so both drop into the `SELECT` list.
+            let key = id_column_for_table(entity, &a.table, mappings, config)
+                .and_then(|c| resolve_column(&a.table, &c, schema))
+                .map(|c| format!("\"{c}\""))
+                .or_else(|| literal_key_for_table(entity, &a.table, mappings, config));
+            let Some(key) = key else {
                 skipped.push(SkippedField {
                     entity: entity.clone(),
                     field: a.field.clone(),
                     citation: a.citation.clone(),
                     why: format!(
-                        "accumulates over `{table}` but nothing in the mapping identifies which \
-                         `{entity}` a row belongs to, so there is no key to group by"
+                        "accumulates over `{}` but nothing in the mapping identifies which `{entity}` a \
+                         row belongs to, so there is no key to group by",
+                        a.table
                     ),
                 });
-            }
+                continue;
+            };
+            arms.entry((a.table.clone(), key)).or_default().push(a);
+        }
+        if arms.is_empty() {
             continue;
-        };
+        }
+        // Every field any arm contributes, so each arm can zero-fill the rest.
+        let mut fields: Vec<String> = arms.values().flatten().map(|a| a.field.clone()).collect();
+        fields.sort();
+        fields.dedup();
+        // A field written twice *within one arm* is still ambiguous: two contributions to the same key
+        // from the same row, which is a different thing from two arms and is not this change.
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        for ((table, _), list) in &arms {
+            let mut seen = BTreeSet::new();
+            for a in list {
+                if !seen.insert(a.field.clone()) {
+                    dropped.insert(a.field.clone());
+                    skipped.push(SkippedField {
+                        entity: entity.clone(),
+                        field: a.field.clone(),
+                        citation: a.citation.clone(),
+                        why: format!(
+                            "has two accumulating assignments on `{table}` under the same key; that is \
+                             two contributions from one row rather than two arms, so add it by hand"
+                        ),
+                    });
+                }
+            }
+        }
+        fields.retain(|f| !dropped.contains(f));
+        if fields.is_empty() {
+            continue;
+        }
 
         let name = to_alias(entity);
         let mut sql = String::new();
@@ -535,23 +553,22 @@ fn write_entities(
         sql.push_str(
             "-- A subgraph accumulates these one event at a time; the decoded table holds the\n             -- deltas, so the total is their sum and never the latest value. The exact fields that\n             -- *are* latest-value live in views/, and README.md says which field went where.\n",
         );
-        for a in &here {
-            let how = match (&a.source, a.negated) {
-                (AccumulationSource::Column(c), false) => format!("sums `{c}` of `{table}`"),
-                (AccumulationSource::Column(c), true) => {
-                    format!("sums the negation of `{c}` of `{table}`")
-                }
-                (AccumulationSource::Rows, false) => format!("counts rows of `{table}`"),
-                (AccumulationSource::Rows, true) => {
-                    format!("counts rows of `{table}`, negated")
-                }
-            };
-            sql.push_str(&format!(
-                "-- `{entity}.{}` {how}: {}\n",
-                a.field,
-                a.citation.display()
-            ));
+        for ((table, key), list) in &arms {
+            for a in list.iter().filter(|a| fields.contains(&a.field)) {
+                let how = match (&a.source, a.negated) {
+                    (AccumulationSource::Column(c), false) => format!("sums `{c}`"),
+                    (AccumulationSource::Column(c), true) => format!("sums the negation of `{c}`"),
+                    (AccumulationSource::Rows, false) => "counts rows".to_string(),
+                    (AccumulationSource::Rows, true) => "counts rows, negated".to_string(),
+                };
+                sql.push_str(&format!(
+                    "-- `{entity}.{}` {how} of `{table}` keyed by {key}: {}\n",
+                    a.field,
+                    a.citation.display()
+                ));
+            }
         }
+
         // **The cast is checked, and its failure is reported rather than swallowed.** Every event
         // param is sealed as exact decimal *text* (RFC-0047 §1), so `sum("col")` does not even
         // type-check - `sum(VARCHAR)` has no candidate. `TRY_CAST` to `DECIMAL(38,0)` is the
@@ -561,41 +578,72 @@ fn write_entities(
         // carries an `_overflow` companion that is 1 when any contributing row could not be
         // represented. `max` is one of the six aggregates v1 maintains, so the flag costs nothing
         // the total does not already cost.
-        let mut cols = vec![format!("  \"{id_column}\" AS \"id\"")];
-        for a in &here {
-            match &a.source {
-                AccumulationSource::Column(column) => {
-                    let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
-                    let operand = if a.negated {
-                        format!("-{cast}")
-                    } else {
-                        cast.clone()
-                    };
-                    cols.push(format!("  sum({operand}) AS \"{}\"", a.field));
-                    cols.push(format!(
-                        "  max(CASE WHEN \"{column}\" IS NOT NULL AND {cast} IS NULL THEN 1 ELSE 0 END) AS \"{}_overflow\"",
-                        a.field
-                    ));
+        //
+        // A row count casts nothing and cannot narrow, so a field sourced only from row counts carries
+        // no flag - a column that is always 0 would read as evidence that something could overflow.
+        let needs_overflow: BTreeSet<String> = arms
+            .values()
+            .flatten()
+            .filter(|a| matches!(a.source, AccumulationSource::Column(_)))
+            .map(|a| a.field.clone())
+            .collect();
+
+        let mut inner: Vec<String> = Vec::new();
+        for ((table, key), list) in &arms {
+            let mut cols = vec![format!("    {key} AS \"id\"")];
+            for f in &fields {
+                match list.iter().find(|a| &a.field == f) {
+                    Some(a) => match &a.source {
+                        AccumulationSource::Column(column) => {
+                            let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
+                            let term = if a.negated {
+                                format!("-{cast}")
+                            } else {
+                                cast.clone()
+                            };
+                            cols.push(format!("    {term} AS \"{f}\""));
+                            if needs_overflow.contains(f) {
+                                cols.push(format!(
+                                    "    CASE WHEN \"{column}\" IS NOT NULL AND {cast} IS NULL THEN 1 ELSE 0 END AS \"{f}_overflow\""
+                                ));
+                            }
+                        }
+                        AccumulationSource::Rows => {
+                            cols.push(format!(
+                                "    {} AS \"{f}\"",
+                                if a.negated { "-1" } else { "1" }
+                            ));
+                            if needs_overflow.contains(f) {
+                                cols.push(format!("    0 AS \"{f}_overflow\""));
+                            }
+                        }
+                    },
+                    // This arm does not touch the field, so it contributes nothing to its total.
+                    None => {
+                        cols.push(format!("    CAST(0 AS DECIMAL(38,0)) AS \"{f}\""));
+                        if needs_overflow.contains(f) {
+                            cols.push(format!("    0 AS \"{f}_overflow\""));
+                        }
+                    }
                 }
-                // **No `_overflow` companion, and that is not an omission.** The overflow flag exists
-                // because an event param is sealed as exact decimal text and `TRY_CAST` to
-                // `DECIMAL(38,0)` yields NULL past 38 digits, which `sum` would skip in silence
-                // (RFC-0047 §2 C1). A row count casts nothing and cannot narrow, so a flag here would be
-                // a column that is always 0 - and a reader would reasonably take its presence as
-                // evidence that something could overflow.
-                AccumulationSource::Rows => {
-                    let expr = if a.negated {
-                        "-count(*)".to_string()
-                    } else {
-                        "count(*)".to_string()
-                    };
-                    cols.push(format!("  {expr} AS \"{}\"", a.field));
-                }
+            }
+            inner.push(format!(
+                "  SELECT\n{}\n  FROM \"{table}\"",
+                cols.join(",\n")
+            ));
+        }
+
+        let mut outer = vec!["  \"id\"".to_string()];
+        for f in &fields {
+            outer.push(format!("  sum(\"{f}\") AS \"{f}\""));
+            if needs_overflow.contains(f) {
+                outer.push(format!("  max(\"{f}_overflow\") AS \"{f}_overflow\""));
             }
         }
         sql.push_str(&format!(
-            "SELECT\n{}\nFROM \"{table}\"\nGROUP BY \"{id_column}\"\n",
-            cols.join(",\n")
+            "SELECT\n{}\nFROM (\n{}\n)\nGROUP BY \"id\"\n",
+            outer.join(",\n"),
+            inner.join("\n  UNION ALL\n")
         ));
 
         emitted.push(EmittedEntity {
@@ -603,7 +651,7 @@ fn write_entities(
             name: name.clone(),
             file: format!("entities/{name}.sql"),
             sql,
-            fields: here.iter().map(|a| a.field.clone()).collect(),
+            fields: fields.clone(),
         });
     }
 
@@ -1220,6 +1268,38 @@ fn fill_id_columns(
             selects.entry("id".into()).or_default().insert(table, col);
         }
     }
+}
+
+/// The literal key a singleton entity is constructed with, in a handler that writes `table`.
+///
+/// Mirrors [`id_column_for_table`] - same traversal, same handler-to-table resolution - but looks for the
+/// constant rather than a column. Kept separate rather than folded in, because a column key and a literal
+/// key render differently at the call site and one `Option<String>` hiding which it got is the shape that
+/// invites a mistake.
+fn literal_key_for_table(
+    entity: &str,
+    table: &str,
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+) -> Option<String> {
+    for func in mappings.functions.values() {
+        if func.kind == crate::port_report::HandlerKind::Block {
+            continue;
+        }
+        let Some(handler) = event_handler_for(func, mappings) else {
+            continue;
+        };
+        let Some(t) = table_for_handler(&handler.name, mappings, config) else {
+            continue;
+        };
+        if t != table {
+            continue;
+        }
+        if let Some(lit) = crate::port_report::entity_id_literal(entity, func) {
+            return Some(lit);
+        }
+    }
+    None
 }
 
 fn id_column_for_table(
