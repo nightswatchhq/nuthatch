@@ -630,10 +630,17 @@ fn a_recorded_fixture_is_stubbed_rather_than_shortened() {
     let base = dir.path().join("base");
     std::fs::write(&base, "main").expect("write base");
 
-    // Over the threshold and under a `fixtures/` path: a recording.
-    let recording = "{\"x\":1}".repeat(6_000);
-    // Over the threshold but *not* a fixture: code, which must still be budgeted rather than stubbed.
-    let big_code = "// a long authored file\n".repeat(2_000);
+    // **Sized against the real 400,000-character budget, not merely over the stub threshold.**
+    //
+    // The first version of this test built an 88,000-character diff, comfortably inside the budget, so
+    // nothing was ever shortened and `fn the_assertion_that_proves_it` arrived whether or not stubbing
+    // happened. It asserted the conclusion without creating the condition (Jules on #1295).
+    //
+    // 500,000 of recording plus 300,000 of code is 800,000: without stubbing the water-filling cap lands
+    // near 200,000 each and the **code** file is shortened, so its closing marker is missing. With the
+    // recording stubbed, 300,000 fits whole and the marker arrives.
+    let recording = "{\"x\":1}".repeat(72_000);
+    let big_code = "// a long authored file\n".repeat(12_500) + "// END OF THE AUTHORED FILE\n";
     // Under the threshold and a fixture: hand-authored, and sent whole.
     let small_fixture = "{\"authored\": true}";
     let diff = format!(
@@ -687,6 +694,12 @@ fn a_recorded_fixture_is_stubbed_rather_than_shortened() {
     assert!(
         prompt.contains("a long authored file"),
         "a large *code* file must not be stubbed:\n{prompt}"
+    );
+    // And it arrives **whole**, which is only true because the recording stopped consuming the budget.
+    // This is the assertion the first version of the test was missing.
+    assert!(
+        prompt.contains("// END OF THE AUTHORED FILE"),
+        "the code file was shortened, so stubbing freed no budget"
     );
     assert!(
         !prompt.contains("src/big_code.rs is a recorded fixture"),
