@@ -103,3 +103,62 @@ fn every_gate_audit_case_still_has_a_target() {
          so that gate is no longer audited at all - fix the case, do not delete it:\n{text}"
     );
 }
+
+/// `--check` runs on every push, inside `cargo test`, alongside thirty other integration binaries
+/// that read this same working tree. It used to mutate each case's file and restore it; the restore
+/// is honest but the window is not, and a binary that reads the file inside it fails for a reason
+/// nobody can reproduce. Measured 2026-09-11: with `expected.md` held mutated,
+/// `tests/port_report.rs` reds outright, and that is the shape of the full-suite failure that
+/// passed in isolation.
+///
+/// mtime rather than content, because the old code restored the content and so was invisible to a
+/// before/after comparison of it. A `cp` over the file moves mtime whatever the bytes say, and the
+/// check runs long enough that the write cannot land in the same tick as the stat before it. Also
+/// root-proof, which a read-only tree would not be.
+#[test]
+fn the_drift_check_does_not_write_to_the_working_tree() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/gate-audit.sh");
+    let run = || {
+        let out = Command::new("bash")
+            .arg(&script)
+            .arg("--check")
+            .current_dir(root)
+            .output()
+            .expect("run gate-audit.sh --check");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // The case files name themselves in the output, so the list cannot go stale against the script.
+    let files: Vec<String> = run()
+        .lines()
+        .filter_map(|l| l.split("target present in ").nth(1))
+        .map(|f| f.trim().to_string())
+        .collect();
+    assert!(
+        files.len() >= EXPECTED_CASES.len(),
+        "expected one target file per case, got {}: {files:?}",
+        files.len()
+    );
+
+    let stamp = |f: &str| {
+        let m = std::fs::metadata(root.join(f)).unwrap_or_else(|e| panic!("stat {f}: {e}"));
+        (m.len(), m.modified().expect("mtime"))
+    };
+    let before: Vec<_> = files.iter().map(|f| stamp(f)).collect();
+    run();
+    let after: Vec<_> = files.iter().map(|f| stamp(f)).collect();
+
+    let touched: Vec<&String> = files
+        .iter()
+        .zip(before.iter().zip(after.iter()))
+        .filter(|(_, (b, a))| b != a)
+        .map(|(f, _)| f)
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "--check wrote to {touched:?}. Every push runs this inside `cargo test`, so a write here is \
+         a window in which a concurrent test binary reads a mutated repo file and fails \
+         irreproducibly. Count the needle, do not mutate it; only the full serial run may write."
+    );
+}

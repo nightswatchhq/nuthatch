@@ -135,6 +135,18 @@ for c in "${CASES[@]}"; do
     printf "  %-28s SKIP   (needle %q absent from %s - the audit case has drifted)\n" "$name" "$needle" "$file"
     SKIPPED=$((SKIPPED+1)); continue
   fi
+  # --check runs on every push, inside `cargo test`, along 31 other integration binaries that read
+  # this same working tree. Writing a mutation into the tree - even for the microseconds it takes to
+  # restore it - is a window in which one of them reads the mutated file and fails. Measured
+  # 2026-09-11: holding `expected.md` mutated reds `tests/port_report.rs` outright. So the check
+  # counts without writing; only the full mutating run, which is serial and outside cargo, mutates.
+  if [ "$CHECK_ONLY" = 1 ]; then
+    hits=$(grep -oF -- "$needle" "$file" | wc -l | tr -d ' ')
+    if [ "${hits:-0}" -gt 1 ]; then
+      printf "  %-28s note   (needle occurs %s times)\n" "$name" "$hits"
+    fi
+    printf "  %-28s target present in %s\n" "$name" "$file"; PASS=$((PASS+1)); continue
+  fi
   cp "$file" "/tmp/gate-audit.bak.$$"
   # #974: replace EVERY occurrence, not the first.
   #
@@ -159,10 +171,6 @@ PYMUT
   fi
   if [ "${hits:-0}" -gt 1 ]; then
     printf "  %-28s note   (needle occurs %s times; all replaced)\n" "$name" "$hits"
-  fi
-  if [ "$CHECK_ONLY" = 1 ]; then
-    cp "/tmp/gate-audit.bak.$$" "$file"; rm -f "/tmp/gate-audit.bak.$$"
-    printf "  %-28s target present in %s\n" "$name" "$file"; PASS=$((PASS+1)); continue
   fi
   out=$(cargo test --quiet --test "$target" 2>&1)
   rc=$?
