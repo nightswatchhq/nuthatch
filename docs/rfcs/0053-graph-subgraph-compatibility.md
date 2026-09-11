@@ -87,6 +87,35 @@ Tier-1 and tier-2 coverage for one schema is estimated at 5,000 to 9,000 Rust LO
 
 ## Acceptance criteria
 
+**The definition of done, and every criterion below is subordinate to it.** Chief settled this on
+2026-09-11, after the three research passes that closed off the alternative routes:
+
+> Point a client that was talking to the pinned broken deployment at a nest, change nothing but the URL,
+> and its recorded query set answers: exact where the field is exact, converged where it is converged, a
+> named refusal where it is neither, and **never a wrong number presented as a right one**.
+
+Four things that sentence decides, each of which had been answered the other way at some point in this
+programme.
+
+**The client is unmodified and the only change is the URL.** Not a ported client, not a reduced query
+set, not a documented list of selections to avoid. If adoption needs an edit to the consumer, the
+compatibility surface has not been built.
+
+**The target is a *pinned broken* deployment, named in advance.** Measuring against a subgraph that was
+redeployed within days proves nothing, which is why the programme's evidence kept being about a
+deployment nobody needs us for.
+
+**Three legitimate answers, and a field must declare which one it is giving.** Exact, converged, or a
+named refusal. Converged is not a consolation: for the ordered mapping-derived family it is *more*
+correct than the reference, which carries stale write-order artefacts (§6a of RFC-0038, and the
+`derivedETH` measurements on the tracking issue).
+
+**A fourth answer is a defect, not a shortfall.** A plausible substitute - a fallback value, an
+unfiltered set where a filter was asked for, an empty list where the schema promises a non-null one,
+`null` against a non-null field - is worse than no endpoint, because the caller cannot see it. Every
+defect found in S1 and S2 review so far has been this shape and not one has been a crash. A criterion
+that cannot fail on a silent substitution is not a criterion.
+
 - Generated introspection matches a recorded graph-node reference except for a reviewed, machine-readable divergence list.
 - A corpus of real consumer queries proves shape, ordering, pagination and scalar parity.
 - RFC-0034 admission bounds every request before it reaches DuckDB or Postgres.
