@@ -615,3 +615,91 @@ print("all budgets held")
         "the probe did not reach its own conclusion"
     );
 }
+
+/// A recorded fixture is stubbed out of the review diff, not shortened into a fragment of itself.
+///
+/// Thirteen review rounds on #1282 and two of them raised the same finding about the contents of an
+/// 847 KB recorded introspection fixture - while the prompt was already telling the reviewer that what
+/// it had not been sent was unknown rather than absent. A fragment of a recording is worse than none:
+/// unreadable, but with enough text to reason from. Measured on that PR's real diff, stubbing the one
+/// recording takes it from 1,160,295 characters to 313,169, which fits the budget whole: 65 of 65 files
+/// and 100 of 100 added functions reach the reviewer, with nothing shortened at all.
+#[test]
+fn a_recorded_fixture_is_stubbed_rather_than_shortened() {
+    let dir = fixtures();
+    let base = dir.path().join("base");
+    std::fs::write(&base, "main").expect("write base");
+
+    // Over the threshold and under a `fixtures/` path: a recording.
+    let recording = "{\"x\":1}".repeat(6_000);
+    // Over the threshold but *not* a fixture: code, which must still be budgeted rather than stubbed.
+    let big_code = "// a long authored file\n".repeat(2_000);
+    // Under the threshold and a fixture: hand-authored, and sent whole.
+    let small_fixture = "{\"authored\": true}";
+    let diff = format!(
+        "diff --git a/tests/fixtures/recorded/big.json b/tests/fixtures/recorded/big.json\n+{recording}\n\
+         diff --git a/src/big_code.rs b/src/big_code.rs\n+{big_code}\n\
+         diff --git a/tests/fixtures/authored/small.json b/tests/fixtures/authored/small.json\n+{small_fixture}\n\
+         diff --git a/src/tiny.rs b/src/tiny.rs\n+fn the_assertion_that_proves_it() {{}}\n"
+    );
+    let path = dir.path().join("diff-rec");
+    std::fs::write(&path, &diff).expect("write diff");
+
+    let out = Command::new("python3")
+        .arg(root().join("scripts/pr-review.py"))
+        .arg("--diff")
+        .arg(&path)
+        .args([
+            "--title",
+            "a pull request with a recording in it",
+            "--dry-run",
+        ])
+        .arg("--base-file")
+        .arg(&base)
+        .output()
+        .expect("run pr-review.py");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let prompt = String::from_utf8_lossy(&out.stdout);
+
+    // The recording's contents are gone, and the stub says so by name.
+    assert!(
+        !prompt.contains(&recording[..200]),
+        "the recording's contents must not reach the reviewer"
+    );
+    assert!(
+        prompt.contains("tests/fixtures/recorded/big.json is a recorded fixture"),
+        "the stub must name the file:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Raise no finding about what it does or does not contain"),
+        "and tell the reviewer not to opine on it:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("characters of diff, not sent"),
+        "and the prompt must carry the list separately from the inline stub:\n{prompt}"
+    );
+
+    // Code is not a recording, whatever its size: it stays, and the small authored fixture stays whole.
+    assert!(
+        prompt.contains("a long authored file"),
+        "a large *code* file must not be stubbed:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("src/big_code.rs is a recorded fixture"),
+        "src/big_code.rs was stubbed, and it is not a fixture:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("\"authored\": true"),
+        "a small authored fixture is sent whole:\n{prompt}"
+    );
+
+    // And the budget the stub frees reaches the file git's path order puts last.
+    assert!(
+        prompt.contains("fn the_assertion_that_proves_it"),
+        "the last file must still arrive:\n{prompt}"
+    );
+}
