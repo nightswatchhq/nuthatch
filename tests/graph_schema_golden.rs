@@ -407,6 +407,68 @@ fn every_object_type_matches_the_reference_field_for_field() {
     );
 }
 
+/// Every key a standard client's `FullType` fragment selects, present on every type, field, argument
+/// and enum value - with `null` where the kind does not apply.
+///
+/// **This is the assertion that was missing twice.** The renderer emitted only the keys the comparisons
+/// below happened to read, so a client selecting `description`, `interfaces`, `possibleTypes`,
+/// `isDeprecated` or `deprecationReason` received objects missing keys it had asked for, and every other
+/// assertion here passed. Comparing the key *sets* is what makes that falsifiable, so this test exists
+/// to fail when the document is narrower than the reference rather than merely different.
+#[test]
+fn every_introspection_object_carries_the_keys_the_reference_carries() {
+    let ours = nuthatch::graph_schema::introspection::render(&parsed());
+    let r = reference();
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        let mut k: Vec<String> = v
+            .as_object()
+            .unwrap_or_else(|| panic!("not an object: {v}"))
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    };
+    let index = |v: &serde_json::Value| -> std::collections::BTreeMap<String, serde_json::Value> {
+        v["__schema"]["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| !t["name"].as_str().unwrap_or("").starts_with("__"))
+            .map(|t| (t["name"].as_str().unwrap().to_string(), t.clone()))
+            .collect()
+    };
+    let (theirs, mine) = (index(&r), index(&ours));
+    let mut checked = 0;
+    for (name, t) in &theirs {
+        let Some(m) = mine.get(name) else { continue };
+        assert_eq!(keys(m), keys(t), "type `{name}`");
+        for list in ["fields", "inputFields", "enumValues"] {
+            let (Some(a), Some(b)) = (t[list].as_array(), m[list].as_array()) else {
+                // Both null for a kind that has no such list; the key comparison above covers it.
+                assert_eq!(
+                    t[list].is_null(),
+                    m[list].is_null(),
+                    "`{name}.{list}` is null on one side only"
+                );
+                continue;
+            };
+            if let (Some(x), Some(y)) = (a.first(), b.first()) {
+                assert_eq!(keys(y), keys(x), "`{name}.{list}` entry");
+                checked += 1;
+                if let (Some(xa), Some(ya)) = (x["args"].as_array(), y["args"].as_array()) {
+                    if let (Some(p), Some(q)) = (xa.first(), ya.first()) {
+                        assert_eq!(keys(q), keys(p), "`{name}.{list}` argument");
+                    }
+                }
+            }
+        }
+    }
+    // A floor, so this cannot pass by comparing nothing: every entity contributes an object, a filter
+    // and an orderBy enum, and the reference has 19 entities.
+    assert!(checked >= 50, "only {checked} lists compared");
+}
+
 /// The `__Schema` fields either side of `types`, which a standard client selects and which the diff
 /// below cannot see because it indexes `types` only.
 ///

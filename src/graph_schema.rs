@@ -1029,6 +1029,63 @@ pub mod introspection {
             {"name":"derivedFrom","description":Value::Null,"locations":["FIELD_DEFINITION"],
              "args":[string_arg("field")]},
         ]);
+        // Every `__Type` carries the same eight keys, with `null` where the kind does not apply -
+        // measured from the reference, where `interfaces` is `[]` on an object and `null` elsewhere.
+        //
+        // **Filled in one pass rather than at each of the fifteen sites that build a type.** The
+        // renderer previously emitted only the keys the golden comparison happened to read, so a
+        // standard client's `FullType` fragment received type objects missing keys it had selected and
+        // no assertion could see it (Jules on #1282). A normalisation pass cannot drift from the
+        // builders the way fifteen literals can.
+        for t in &mut types {
+            let object = t.get("kind").and_then(Value::as_str) == Some("OBJECT");
+            let obj = t.as_object_mut().expect("a rendered type is an object");
+            obj.entry("description").or_insert(Value::Null);
+            obj.entry("fields").or_insert(Value::Null);
+            obj.entry("inputFields").or_insert(Value::Null);
+            obj.entry("enumValues").or_insert(Value::Null);
+            obj.entry("interfaces").or_insert(if object {
+                Value::Array(Vec::new())
+            } else {
+                Value::Null
+            });
+            // No unions and no interfaces in a generated subgraph schema, so this is always null -
+            // emitted because a client selects it, not because it can ever be populated.
+            obj.entry("possibleTypes").or_insert(Value::Null);
+            for (key, each) in [
+                ("fields", true),
+                ("inputFields", false),
+                ("enumValues", false),
+            ] {
+                let Some(list) = obj.get_mut(key).and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                for item in list {
+                    let Some(m) = item.as_object_mut() else {
+                        continue;
+                    };
+                    m.entry("description").or_insert(Value::Null);
+                    if each {
+                        // A field: arguments, and the deprecation pair a client always selects.
+                        m.entry("args").or_insert(Value::Array(Vec::new()));
+                    } else if key == "inputFields" {
+                        m.entry("defaultValue").or_insert(Value::Null);
+                    }
+                    if key != "inputFields" {
+                        m.entry("isDeprecated").or_insert(Value::Bool(false));
+                        m.entry("deprecationReason").or_insert(Value::Null);
+                    }
+                    if let Some(args) = m.get_mut("args").and_then(Value::as_array_mut) {
+                        for a in args {
+                            if let Some(am) = a.as_object_mut() {
+                                am.entry("description").or_insert(Value::Null);
+                                am.entry("defaultValue").or_insert(Value::Null);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut doc = json!({"__schema":{
             "queryType":{"name":"Query"},
             // A nest serves queries only, which is why `parse` refuses the other two outright.
