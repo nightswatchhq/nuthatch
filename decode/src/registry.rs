@@ -161,6 +161,25 @@ pub struct Column {
     pub sol_type: String,
     pub kind: StorageKind,
     pub indexed: bool,
+    /// A tuple's components, in ABI order, when the ABI names them.
+    ///
+    /// A tuple is stored as a positional JSON array (`dynsol_to_json`), so without these the names the
+    /// ABI declares are lost and a consumer has to know the field order to read the column at all
+    /// (#1304). Recorded here so the view layer can expose one named column per component without
+    /// touching stored data - sealed segments keep their arrays, and an ABI whose components change
+    /// produces a differently-named view rather than a silently reinterpreted index.
+    ///
+    /// Empty for everything that is not a tuple, and for a tuple whose components the ABI leaves
+    /// unnamed: no name is invented.
+    pub components: Vec<Component>,
+}
+
+/// One component of a tuple column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Component {
+    pub name: String,
+    pub sol_type: String,
+    pub storage: String,
 }
 
 /// What kind of chain data a table holds. Events are the only kind that existed before RFC-0014, so
@@ -319,6 +338,13 @@ pub struct ColumnSchema {
     pub sol_type: String,
     pub storage: String,
     pub indexed: bool,
+    /// A tuple's named components, in ABI order. See `Column::components`.
+    ///
+    /// `skip_serializing_if` so a nest with no tuple column writes a byte-identical `schema.json`, and
+    /// `default` so one written before this field existed still parses - the same contract `TableKind`
+    /// established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
 }
 
 /// The implicit columns every table carries (before the event's own params). `_seq` is a single
@@ -343,6 +369,7 @@ pub fn implicit_columns(timestamps: bool) -> Vec<ColumnSchema> {
     .map(|n| ColumnSchema {
         name: (*n).to_string(),
         sol_type: "implicit".to_string(),
+        components: Vec::new(),
         storage: match *n {
             "block_number" | "log_index" | "_seq" | "block_timestamp" => "u64",
             "address" => "address",
@@ -364,6 +391,28 @@ pub struct EventDecoder {
     pub topic0: B256,
     pub signature: String,
     event: Event,
+}
+
+/// A tuple's named components, in ABI order, or empty when the ABI names none of them.
+///
+/// All-or-nothing on purpose: a partially-named tuple would give some components a name and others an
+/// index, and a view mixing the two is harder to read than one that is honestly positional. No name is
+/// ever invented.
+///
+/// One level only. A component that is itself a tuple keeps its positional JSON, and says so by carrying
+/// `sol_type: "tuple"` with no components of its own.
+pub fn tuple_components(components: &[alloy_json_abi::Param]) -> Vec<Component> {
+    if components.is_empty() || components.iter().any(|c| c.name.is_empty()) {
+        return Vec::new();
+    }
+    components
+        .iter()
+        .map(|c| Component {
+            name: c.name.clone(),
+            sol_type: c.ty.clone(),
+            storage: StorageKind::from_sol(&c.ty, false).as_str().to_string(),
+        })
+        .collect()
 }
 
 impl EventDecoder {
@@ -391,6 +440,7 @@ impl EventDecoder {
                     sol_type: p.ty.clone(),
                     kind,
                     indexed: p.indexed,
+                    components: tuple_components(&p.components),
                 }
             })
             .collect();
@@ -996,6 +1046,7 @@ impl DecodeRegistry {
                     sol_type: c.sol_type.clone(),
                     storage: c.kind.as_str().to_string(),
                     indexed: c.indexed,
+                    components: c.components.clone(),
                 }));
                 TableSchema {
                     table: d.table.clone(),
@@ -1016,6 +1067,7 @@ impl DecodeRegistry {
                 sol_type: (*sol).to_string(),
                 storage: kind.as_str().to_string(),
                 indexed: false,
+                components: Vec::new(),
             }));
             out.push(TableSchema {
                 table: BLOCKS_TABLE.to_string(),
@@ -1286,6 +1338,7 @@ mod stored_roundtrip {
             sol_type: sol.into(),
             storage: kind.as_str().to_string(),
             indexed: false,
+            components: Vec::new(),
         }
     }
 
@@ -1419,6 +1472,7 @@ mod stored_roundtrip {
             sol_type: (*sol).to_string(),
             storage: kind.as_str().to_string(),
             indexed: false,
+            components: Vec::new(),
         }));
         TableSchema {
             table: "usdc__transfer".into(),
@@ -1812,6 +1866,7 @@ mod tests {
                         sol_type: s.to_string(),
                         storage: "x".to_string(),
                         indexed: false,
+                        components: Vec::new(),
                     })
                     .collect(),
             }
@@ -1849,6 +1904,7 @@ mod tests {
                 sol_type: "implicit".to_string(),
                 storage: "u64".to_string(),
                 indexed: false,
+                components: Vec::new(),
             },
         );
         assert!(
@@ -1895,6 +1951,116 @@ mod tests {
             abi: abi(abi_json),
             events: Vec::new(),
         }
+    }
+
+    /// A tuple column records the component names the ABI declares.
+    ///
+    /// The tuple is stored as a positional JSON array, so without these the names are lost and a
+    /// consumer has to know the ABI's field order to read the column at all. On the pinned drop-in target
+    /// that was 12 of 60 unanswered fields, every one of them a pure function of a decoded event
+    /// (#1304).
+    ///
+    /// Two refusals are asserted alongside, because inventing a name is worse than having none:
+    /// an unnamed component yields nothing, and a component that is itself a tuple keeps its positional
+    /// JSON rather than being flattened.
+    #[test]
+    fn a_tuple_column_records_its_abi_component_names() {
+        const TUPLES: &str = r#"[
+          {"type":"event","name":"Named","anonymous":false,"inputs":[
+            {"name":"id","type":"uint256","indexed":false},
+            {"name":"order","type":"tuple","indexed":false,"components":[
+              {"name":"y","type":"uint128"},
+              {"name":"z","type":"uint128"},
+              {"name":"A","type":"uint64"}
+            ]}
+          ]},
+          {"type":"event","name":"Unnamed","anonymous":false,"inputs":[
+            {"name":"pair","type":"tuple","indexed":false,"components":[
+              {"name":"a","type":"address"},
+              {"name":"","type":"uint256"}
+            ]}
+          ]},
+          {"type":"event","name":"Nested","anonymous":false,"inputs":[
+            {"name":"outer","type":"tuple","indexed":false,"components":[
+              {"name":"inner","type":"tuple","components":[{"name":"leaf","type":"uint256"}]},
+              {"name":"tail","type":"uint256"}
+            ]}
+          ]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("t", USDC, TUPLES)]).unwrap();
+        let col = |table: &str, name: &str| -> Column {
+            reg.tables()
+                .iter()
+                .find(|d| d.table.ends_with(table))
+                .unwrap_or_else(|| panic!("no table {table}"))
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no column {name} in {table}"))
+                .clone()
+        };
+
+        // Named: every component, in ABI order, with its own solidity type and storage kind.
+        let order = col("named", "order");
+        assert_eq!(order.sol_type, "tuple");
+        assert_eq!(order.kind, StorageKind::Json);
+        assert_eq!(
+            order.components,
+            vec![
+                Component {
+                    name: "y".into(),
+                    sol_type: "uint128".into(),
+                    storage: "word16".into()
+                },
+                Component {
+                    name: "z".into(),
+                    sol_type: "uint128".into(),
+                    storage: "word16".into()
+                },
+                Component {
+                    name: "A".into(),
+                    sol_type: "uint64".into(),
+                    storage: "u64".into()
+                },
+            ],
+            "order matters: the JSON array is positional, so index 2 must be `A`"
+        );
+
+        // A non-tuple carries none.
+        assert!(col("named", "id").components.is_empty());
+
+        // Partially named is all-or-nothing: one component without a name and the whole tuple stays
+        // positional. Naming some and not others would produce a view mixing names and indices.
+        assert!(
+            col("unnamed", "pair").components.is_empty(),
+            "a tuple with an unnamed component must not be half-named"
+        );
+
+        // One level. A component that is itself a tuple is named but keeps its own positional JSON,
+        // which it says by carrying `sol_type: "tuple"` and no components of its own.
+        let outer = col("nested", "outer");
+        assert_eq!(
+            outer
+                .components
+                .iter()
+                .map(|c| (c.name.as_str(), c.sol_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("inner", "tuple"), ("tail", "uint256")]
+        );
+    }
+
+    /// `schema.json` is byte-identical for a nest with no tuple column.
+    ///
+    /// The field is `skip_serializing_if = "Vec::is_empty"` for the same reason `TableKind` is: an
+    /// existing nest's artifact must not change shape because a field was added to the type.
+    #[test]
+    fn the_components_field_is_absent_from_a_tuple_free_schema() {
+        let reg = DecodeRegistry::build(vec![spec("usdc", USDC, ERC20)]).unwrap();
+        let json = serde_json::to_string(&reg.schema()).unwrap();
+        assert!(
+            !json.contains("components"),
+            "ERC20 has no tuple, so `components` must not appear:\n{json}"
+        );
     }
 
     /// Like [`spec`] but with an event allowlist (RFC-0011).

@@ -74,6 +74,8 @@ impl CallDecoder {
                 // Calldata has no topics, so nothing is ever indexed. Stated rather than implied,
                 // because `value_from_dynsol` branches on it.
                 indexed: false,
+                // A function argument can be a tuple exactly as an event parameter can (#1304).
+                components: nuthatch_decode::registry::tuple_components(&p.components),
             })
             .collect();
         CallDecoder {
@@ -274,6 +276,7 @@ impl CallRegistry {
                     sol_type: c.sol_type.clone(),
                     storage: c.kind.as_str().to_string(),
                     indexed: false,
+                    components: c.components.clone(),
                 }));
                 TableSchema {
                     table: d.table.clone(),
@@ -418,12 +421,14 @@ fn raw_calls_schema(timestamps: bool) -> TableSchema {
         sol_type: "bytes4".into(),
         storage: "str".into(),
         indexed: false,
+        components: Vec::new(),
     });
     columns.push(ColumnSchema {
         name: "input".into(),
         sol_type: "bytes".into(),
         storage: "str".into(),
         indexed: false,
+        components: Vec::new(),
     });
     TableSchema {
         table: RAW_CALLS_TABLE.into(),
@@ -445,6 +450,7 @@ fn state_diffs_schema(timestamps: bool) -> TableSchema {
             sol_type: ty.into(),
             storage: "str".into(),
             indexed: false,
+            components: Vec::new(),
         });
     }
     TableSchema {

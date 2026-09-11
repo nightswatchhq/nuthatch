@@ -3794,12 +3794,14 @@ template="pool"
                     sol_type: "uint256".into(),
                     storage: "varchar".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
                 crate::registry::ColumnSchema {
                     name: "memo".into(),
                     sol_type: "string".into(),
                     storage: "varchar".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
             ],
         }];
@@ -4173,12 +4175,14 @@ template="pool"
                     sol_type: "address".into(),
                     storage: "address".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
                 crate::registry::ColumnSchema {
                     name: "enabled".into(),
                     sol_type: "bool".into(),
                     storage: "bool".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
             ],
         }];
@@ -4246,12 +4250,14 @@ template="pool"
                     sol_type: "address".into(),
                     storage: "address".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
                 crate::registry::ColumnSchema {
                     name: "enabled".into(),
                     sol_type: "bool".into(),
                     storage: "bool".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
             ],
         }];
@@ -5924,6 +5930,7 @@ template="pool"
             sol_type: String::new(),
             storage: storage.into(),
             indexed,
+            components: Vec::new(),
         };
         let declared = vec![
             crate::registry::TableSchema {

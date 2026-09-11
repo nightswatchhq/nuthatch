@@ -380,6 +380,7 @@ pub fn schema(decls: &[CallDecl], timestamps: bool) -> Vec<crate::registry::Tabl
                 sol_type: sol.to_string(),
                 storage: storage.to_string(),
                 indexed: false,
+                components: Vec::new(),
             };
             columns.push(own("calldata", "bytes", "bytes"));
             columns.push(own("result", "bytes", "bytes"));
