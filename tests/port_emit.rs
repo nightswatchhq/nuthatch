@@ -1168,9 +1168,11 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
 
     let sql = std::fs::read_to_string(nest.path().join("entities/pool.sql")).unwrap();
+    // One per row in the arm, summed outside - the same answer as `count(*)` and the shape that works
+    // when an entity has several arms.
     assert!(
-        sql.contains(r#"count(*) AS "txCount""#),
-        "a unit increment counts rows:\n{sql}"
+        sql.contains(r#"1 AS "txCount""#) && sql.contains(r#"sum("txCount") AS "txCount""#),
+        "a unit increment contributes one per row and is summed:\n{sql}"
     );
     assert!(
         !sql.contains(r#""txCount_overflow""#),
@@ -1178,8 +1180,9 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
     // The column-sourced total beside it keeps both the cast and the flag.
     assert!(
-        sql.contains(r#"sum(TRY_CAST("fee" AS DECIMAL(38,0))) AS "liquidity""#),
-        "a column total is still summed with a checked cast:\n{sql}"
+        sql.contains(r#"TRY_CAST("fee" AS DECIMAL(38,0)) AS "liquidity""#)
+            && sql.contains(r#"sum("liquidity") AS "liquidity""#),
+        "a column total is still cast then summed:\n{sql}"
     );
     assert!(
         sql.contains(r#""liquidity_overflow""#),
@@ -1246,11 +1249,15 @@ fn an_accumulated_field_is_emitted_as_an_incremental_entity_that_validates() {
             )
         });
     assert_eq!(entity.fields, vec!["totalFees".to_string()]);
+    // The cast is in the arm and the fold is outside it, since an entity may now have several arms.
     assert!(
-        entity
-            .sql
-            .contains("sum(TRY_CAST(\"fee\" AS DECIMAL(38,0)))"),
-        "the total is the sum of the deltas, through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
+        "the delta goes through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "and the total is the sum of those deltas:\n{}",
         entity.sql
     );
     // The half that keeps the cast honest. `TRY_CAST` yields NULL past 38 digits and `sum` skips
@@ -1378,11 +1385,14 @@ fn rerunning_without_a_running_total_removes_the_prior_generated_entity() {
     );
 }
 
-/// A field accumulated by two event tables cannot be silently narrowed to the first table the
-/// mapper happens to visit. v1 emits one relation per entity, so the second contribution is named
-/// for the operator instead of claiming a total that omits it.
+/// A field accumulated by two event tables sums **both**, as two arms of one entity.
+///
+/// It used to name the second contribution as skipped - "one entity is one relation in v1" - which was
+/// honest but left the total wrong unless an operator hand-wrote the arm. 45 fields on Uniswap V4 were
+/// gated on it (#1313). Each arm projects its own fields and zero for the others, the arms are
+/// `UNION ALL`ed, and one outer aggregate folds them by key.
 #[test]
-fn an_accumulation_from_a_second_table_is_named_rather_than_discarded() {
+fn a_field_accumulated_by_two_tables_sums_both_arms() {
     let subgraph = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
     std::fs::write(
@@ -1440,16 +1450,45 @@ export function handlePoolSwap(event: Swap): void {
     write_imported_nest(nest.path(), true);
     let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
 
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Pool")
+        .unwrap_or_else(|| panic!("Pool must be emitted: {:?}", result.entities));
+
+    // Both tables appear, as two arms under one UNION ALL.
+    for table in ["factory__pool_created", "pool__swap"] {
+        assert!(
+            entity.sql.contains(&format!("FROM \"{table}\"")),
+            "`{table}` must be an arm, not a skipped field:\n{}",
+            entity.sql
+        );
+    }
     assert!(
-        result.entities.iter().any(|entity| entity.entity == "Pool"),
-        "the first relation is emitted: {:?}",
-        result.entities
+        entity.sql.matches("UNION ALL").count() == 1,
+        "two arms, one union:\n{}",
+        entity.sql
+    );
+    // Each arm contributes the field it writes; neither is zero-filled, because both write it.
+    assert!(
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))")
+            && entity
+                .sql
+                .contains("TRY_CAST(\"amount0\" AS DECIMAL(38,0))"),
+        "each arm casts its own column:\n{}",
+        entity.sql
+    );
+    // And the total is folded once, outside.
+    assert!(
+        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "the outer aggregate sums across arms:\n{}",
+        entity.sql
     );
     assert!(
-        result.skipped_fields.iter().any(|field| {
-            field.entity == "Pool" && field.field == "totalFees" && field.why.contains("pool__swap")
+        !result.skipped_fields.iter().any(|f| {
+            f.entity == "Pool" && f.field == "totalFees" && f.why.contains("one relation")
         }),
-        "the second relation must be reported, not silently dropped: {:?}",
+        "nothing should still be skipped for being a second relation: {:?}",
         result.skipped_fields
     );
 }
