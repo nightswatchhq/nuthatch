@@ -21,6 +21,27 @@ Every refusal below names the thing refused, so a caller can act on it.
 | `pool(id: "0x…") { … }` | the same with `WHERE "id" = '0x…' LIMIT 1`, answered as an object |
 | `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
 
+### Scalar wire types
+
+graph-node maps every stored value to a GraphQL value in `graph/src/data/store/mod.rs:554`, and only one
+of the numeric scalars stays a number. A nest's decoded columns are typed differently again - a `uint256`
+is canonical text, a block number is `UBIGINT` - so the lane casts at the projection rather than
+letting storage decide the wire shape.
+
+| schema scalar | sent as | why |
+| --- | --- | --- |
+| `Int` | JSON number | `q::Value::Int`. The only numeric scalar that is not a string |
+| `BigInt`, `BigDecimal`, `Int8` | JSON **string** | `q::Value::String`. A number here is unholdable above 2^53 and parses differently below it |
+| `Bytes`, `String`, `ID` | JSON string | already text on both sides |
+| `Boolean` | JSON boolean | a boolean on both sides |
+
+The cast is in the `SELECT`, never in the view: `where` and `orderBy` compare the stored column, and a
+view that cast `value` to text made `orderBy: value` lexicographic.
+
+`Timestamp` is not in that table. graph-node sends microseconds since the epoch, which is a unit
+conversion rather than a cast, and a nest's column is in whatever unit its view put there - so the lane
+leaves it alone rather than converting a known unit into a wrong number.
+
 ### Relation traversal
 
 A **to-one** reference is one `LEFT JOIN` on the id the parent row already holds:

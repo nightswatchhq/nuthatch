@@ -5342,13 +5342,18 @@ mod tests {
 
         // An entity query compiles and answers (S2, #1266). Two rows, in id order, so this sees a
         // dropped ORDER BY as well as a dropped row.
+        //
+        // `liquidity` is a **string**. This assertion read `42` until the end-to-end test over indexed
+        // data caught it: graph-node sends `BigInt` as `q::Value::String`
+        // (`graph/src/data/store/mod.rs:568`), so a JSON number here is a value a client cannot hold
+        // above 2^53 and parses differently below it.
         let body = ask("/graphql", "{ pools { id liquidity } }", state.clone()).await;
         assert_eq!(
             body["data"]["pools"],
             serde_json::json!([
-                {"id": "0xaaa", "liquidity": 42},
-                {"id": "0xbbb", "liquidity": 7},
-                {"id": "0xccc", "liquidity": 99},
+                {"id": "0xaaa", "liquidity": "42"},
+                {"id": "0xbbb", "liquidity": "7"},
+                {"id": "0xccc", "liquidity": "99"},
             ]),
             "a plain collection must answer rows from the nest's view: {body}"
         );

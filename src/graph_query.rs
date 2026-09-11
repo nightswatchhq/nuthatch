@@ -340,6 +340,25 @@ pub fn parse_named(
         .collect())
 }
 
+/// Whether graph-node sends this scalar as a GraphQL string rather than in its storage type.
+///
+/// From `graph/src/data/store/mod.rs:554`, where every stored value is mapped to `q::Value`:
+/// `Int` is the one numeric scalar that stays a number (`q::Value::Int`), while `Int8`, `Timestamp`,
+/// `BigInt` and `BigDecimal` all become `q::Value::String`. `Bytes` is already text in a nest's
+/// decoded tables and `Boolean` is a boolean on both sides, so neither needs a cast.
+///
+/// `Timestamp` is **not** here. graph-node sends microseconds since the epoch, which is a unit
+/// conversion rather than a cast, and a nest's column is in whatever unit its view put there; guessing
+/// would turn a known unit into a wrong number. It is named in the dialect doc instead.
+fn wire_string_cast(ty: &graph_schema::FieldType) -> bool {
+    match ty {
+        graph_schema::FieldType::Scalar(n) => {
+            matches!(n.as_str(), "BigInt" | "BigDecimal" | "Int8")
+        }
+        _ => false,
+    }
+}
+
 /// One entry of a selection set before fragment spreads have been resolved.
 #[derive(Debug, Clone)]
 enum Sel {
@@ -962,12 +981,33 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             // An aliased scalar needs its own column alias, or two aliases on one field would
             // collide in the row. `a{i}` rather than the caller's key, because a key is arbitrary
             // text and could collide with a join's `j{i}__…`.
+            // **The wire type, not the storage type.** graph-node sends `BigInt`, `BigDecimal` and
+            // `Int8` as GraphQL *strings* and only `Int` as a number - `graph/src/data/store/mod.rs:554`
+            // maps every stored value to `q::Value`, and three of the numeric scalars become
+            // `q::Value::String`. A nest storing `value` as `DECIMAL(38,0)` answered a JSON number, so a
+            // client doing `BigInt.from(r.value)` got a number it cannot hold above 2^53 - a wrong value
+            // presented as a right one, which is the one thing this surface may not do.
+            //
+            // Cast here rather than in the view, so `where` and `orderBy` still compare the numeric
+            // column. Casting in the view made `orderBy: value` lexicographic and ranked 9000351 above
+            // 60000353.
+            let cast = wire_string_cast(&field.ty);
+            let expr = if cast {
+                format!("CAST({BASE}.\"{}\" AS VARCHAR)", sel.name)
+            } else {
+                format!("{BASE}.\"{}\"", sel.name)
+            };
             let col = if sel.key == sel.name {
-                cols.push(format!("{BASE}.\"{}\"", sel.name));
+                // A cast needs an alias to land under the field's name; a bare column already has one.
+                if cast {
+                    cols.push(format!("{expr} AS \"{}\"", sel.name));
+                } else {
+                    cols.push(expr);
+                }
                 sel.name.clone()
             } else {
                 let c = format!("a{i}");
-                cols.push(format!("{BASE}.\"{}\" AS \"{c}\"", sel.name));
+                cols.push(format!("{expr} AS \"{c}\""));
                 c
             };
             shape.push(Shape::Scalar {
@@ -1706,7 +1746,7 @@ type Swap @entity { id: ID! pool: Pool! }
         // `skip` would be a different page each call.
         assert_eq!(
             c.sql,
-            r#"SELECT b."id", b."liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#
+            r#"SELECT b."id", CAST(b."liquidity" AS VARCHAR) AS "liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#
         );
         assert!(!c.singular);
         assert_eq!(c.entity, "Pool");
@@ -2161,7 +2201,7 @@ type Swap @entity { id: ID! pool: Pool! }
         // cannot collide in the row.
         assert_eq!(
             c.sql,
-            r#"SELECT b."id" AS "a0", b."liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#,
+            r#"SELECT b."id" AS "a0", CAST(b."liquidity" AS VARCHAR) AS "liquidity" FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0"#,
             "{}",
             c.sql
         );
