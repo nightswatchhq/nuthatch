@@ -1177,7 +1177,7 @@ fn map_exact_field_tables(
             if asg.entity != field.entity || asg.field != field.field {
                 continue;
             }
-            let Some(col) = assignment_event_column(asg, func) else {
+            let Some(col) = assignment_event_column(asg, func, &mappings.functions) else {
                 continue;
             };
             let Some(handler) = event_handler_for(func, mappings) else {
@@ -1241,7 +1241,9 @@ fn id_column_for_table(
         if t != table {
             continue;
         }
-        if let Some(col) = crate::port_report::entity_id_event_column(entity, func) {
+        if let Some(col) =
+            crate::port_report::entity_id_event_column(entity, func, &mappings.functions)
+        {
             return Some(col);
         }
     }
