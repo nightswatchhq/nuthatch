@@ -45,6 +45,7 @@ Reads `OPENAI_API_KEY` from the environment. Prints Markdown on stdout, diagnost
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -57,13 +58,25 @@ CLAUDE_MD = Path("CLAUDE.md")
 
 # A cap on what we send, not on what we can afford. Luna's context window is 1.05M tokens, so this
 # is nowhere near the model's limit - it is a guard against one 40,000-line generated-code PR
-# quietly costing a hundred times what a normal review costs. Truncation is reported in the comment
+# quietly costing a hundred times what a normal review costs. Elision is reported in the comment
 # so nobody reads a partial review as a whole one.
+#
+# **Spent per file, not off the end.** Cutting the diff at this many characters spends the whole
+# budget in `git diff` path order, so one large file evicts every file sorted after it. Measured on
+# #1282: an 847,499-character recorded introspection fixture was 73% of a 1,161,244-character diff,
+# the cut landed inside it, and `tests/graph_schema_golden.rs` was invisible - so the reviewer read a
+# renderer with none of the thirteen assertions that prove it correct, and raised the same finding
+# four times while every reply cited tests it could not see. `budget_diff` caps the largest files
+# instead, which on that diff leaves 63 of 65 files whole.
 MAX_DIFF_CHARS = 400_000
 
 # Prior reviews are context, not the subject. Bounded so a long-lived pull request cannot crowd the
 # diff out of the window with its own history.
 MAX_PRIOR_CHARS = 40_000
+
+# Appended when a diff carries no per-file sections to allocate between, so even that path cannot hand
+# the model an unlabelled fragment.
+WHOLE_NOTE = "\n[pr-review: this diff was shortened to fit the review budget]\n"
 
 # Marks our comments so a re-review can find its predecessors, and so a human scrolling a long PR
 # can tell the outside reader from the firm's own.
@@ -129,6 +142,15 @@ reviews are supplied when they exist. Read them first.
 - A fresh medium on every pass is a smell in **you**, not in the branch. If this pass finds nothing \
   that the previous pass would have called blocking, the honest verdict is `ship`, and "there is \
   always one more thing" is not a reason to withhold it.
+
+**A shortened file is a file you have partly seen, not a file without the rest.** An oversized file is \
+cut to fit the budget and carries a marker saying so where it was cut. Treat what follows the marker as \
+unknown, not as absent: do not report a thing missing from a shortened file, and do not raise a finding \
+whose evidence would be in the part you were not shown. Say in `summary` that the file was shortened. \
+This is #1282's lesson about *you*: a recorded 847,499-character fixture was 73% of that diff, the old \
+flat cut landed inside it, and the whole test file proving the change correct was invisible - so the same \
+finding was raised four passes running, each time against code whose tests were in the part not sent. \
+The budget is now spent per file so that cannot recur, but a shortened file can still mislead you.
 
 **You cannot run anything.** You have the diff, not a test runner, not a debugger, and not the rest \
 of the file. So:
@@ -268,7 +290,7 @@ def call_model(api_key, model, system, user, attempts=3):
 SEVERITY_MARK = {"high": "**high**", "medium": "medium", "low": "low"}
 
 
-def render(review, model, truncated):
+def render(review, model, elided):
     """Markdown comment. The score goes first because it is the bit anyone actually reads."""
     score = review["confidence"]
     bar = "█" * (score // 10) + "░" * (10 - score // 10)
@@ -294,16 +316,89 @@ def render(review, model, truncated):
     else:
         lines.append("No findings.")
         lines.append("")
-    if truncated:
+    if elided:
+        shown = ", ".join(f"`{name}` ({kept:,} of {size:,} chars)" for name, kept, size in elided)
         lines.append(
-            f"> The diff was truncated at {MAX_DIFF_CHARS:,} characters, so this review did not see "
-            "all of it."
+            f"> The diff exceeded {MAX_DIFF_CHARS:,} characters, so the largest files were shortened "
+            f"and this review saw them only in part: {shown}. Every other file was whole."
         )
         lines.append("")
     lines.append(
         f"<sub>Jules · {model} · required approval · push a fix or comment `/re-review` to run again</sub>"
     )
     return "\n".join(lines)
+
+
+def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]]:
+    """Fit a diff into `budget` characters by shortening its largest files.
+
+    A flat `diff[:budget]` spends the whole allowance in path order, so a single large file evicts
+    every file after it - and a recorded fixture or a lock file is exactly the sort of large file a
+    review least needs and most often sits early in the order. Here every file keeps at least as much
+    as every smaller file keeps, which is the most even split available: find the largest per-file cap
+    whose total fits, and apply it.
+
+    Returns the diff and, for each shortened file, `(path, kept, original)`.
+    """
+    sections = re.split(r"(?m)^(?=diff --git )", diff)
+    head, files = ("", sections) if sections[0].startswith("diff --git ") else (sections[0], sections[1:])
+    if not files:
+        # No `diff --git` at a line start: a preamble-only or malformed diff, with nothing to allocate
+        # between. It still must not arrive as an unlabelled fragment, so the same marker discipline
+        # applies - found by the harness test for the small-cap cases.
+        if len(diff) <= budget:
+            return (diff, [])
+        note = next((m for m in (WHOLE_NOTE, "\n[cut]\n") if len(m) <= budget), "")
+        kept = "" if not note else (diff[: max(budget - len(note), 0)] + note)[:budget]
+        return (kept, [("(whole diff)", len(kept), len(diff))])
+    # The header is whatever precedes the first `diff --git`, normally empty. Capped anyway, so a
+    # budget smaller than the header cannot make every later arithmetic step negative.
+    head = head[:budget]
+    room = max(budget - len(head), 0)
+    sizes = [len(f) for f in files]
+    if sum(sizes) <= room:
+        return (diff, [])
+    # The largest cap C with sum(min(size, C)) <= room. Bisected rather than solved, because the
+    # closed form has to special-case ties and this runs once per review.
+    lo, hi = 0, max(sizes)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if sum(min(n, mid) for n in sizes) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    cap = lo
+    out, elided = [head], []
+    for section in files:
+        if len(section) <= cap:
+            out.append(section)
+            continue
+        path = section.split("\n", 1)[0].removeprefix("diff --git ").split(" b/")[-1]
+        # **The marker is inside the cap, not on top of it.** `cap - len(note)` floors at zero, so a cap
+        # smaller than the marker used to contribute the marker's length instead of `cap` - and enough
+        # shortened files, or a cap of zero, then overran the very budget this function exists to
+        # enforce. A shortened section is therefore exactly `min(cap, size)` characters.
+        #
+        # **And the marker wins the space, not the content.** Trimming the joined string could cut the
+        # marker away entirely at a small cap, leaving an unlabelled fragment the model would read as a
+        # whole file. The widest marker that fits is used, shortest last, so any positive cap still says
+        # the file was cut.
+        full = f"\n[pr-review: this file was shortened to fit the review budget; {len(section) - cap:,} characters are not shown]\n"
+        note = next(
+            (m for m in (full, "\n[pr-review: shortened]\n", "\n[cut]\n") if len(m) <= cap),
+            "",
+        )
+        # A cap too small for even the shortest marker leaves nothing worth sending: two characters of a
+        # diff header is not evidence, and unlabelled it reads as a whole file. Contribute nothing and let
+        # the prompt-level list carry it.
+        kept = "" if not note else (section[: max(cap - len(note), 0)] + note)[:cap]
+        out.append(kept)
+        elided.append((path, len(kept), len(section)))
+    joined = "".join(out)
+    # The allocation is exact, so this holds by construction; asserted because a silent overrun is the
+    # failure the per-file split was written to remove.
+    assert len(joined) <= budget, f"budget {budget} exceeded by {len(joined) - budget}"
+    return (joined, elided)
 
 
 def main():
@@ -375,9 +470,19 @@ def main():
     diff = args.diff.read_text(errors="replace")
     if not diff.strip():
         raise SystemExit("pr-review: the diff is empty - nothing to review")
-    truncated = len(diff) > MAX_DIFF_CHARS
-    if truncated:
-        diff = diff[:MAX_DIFF_CHARS]
+    diff, elided = budget_diff(diff, MAX_DIFF_CHARS)
+    # Told to the **model**, not only to the human in the rendered comment. The inline markers can be
+    # squeezed out at a small cap, and a reviewer that cannot tell a fragment from a whole file reports
+    # a thing missing from the part it was not sent - which is #1282's failure in miniature.
+    shortened_note = (
+        ""
+        if not elided
+        else "These files were shortened to fit the budget and you saw them only in part. What is not\n"
+        "shown is unknown, not absent: do not report a thing missing from one of them, and do not\n"
+        "raise a finding whose evidence would be in the part you were not sent.\n"
+        + "".join(f"  {name}: {kept:,} of {size:,} characters\n" for name, kept, size in elided)
+        + "\n"
+    )
 
     body = args.body_file.read_text(errors="replace") if args.body_file else ""
     claude_md = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else "(not available)"
@@ -418,6 +523,7 @@ def main():
         f"merge and is already on the default branch:\n{own_files or '(not supplied)'}\n\n"
         f"Your previous reviews of this pull request, oldest first:\n"
         f"{prior or '(none - this is your first pass)'}\n\n"
+        f"{shortened_note}"
         f"Diff:\n```diff\n{diff}\n```"
     )
     if args.dry_run:
@@ -431,7 +537,7 @@ def main():
     if args.json:
         print(json.dumps(review, indent=2))
     else:
-        print(render(review, args.model, truncated))
+        print(render(review, args.model, elided))
 
 
 if __name__ == "__main__":
