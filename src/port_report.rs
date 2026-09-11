@@ -3353,11 +3353,13 @@ fn entity_field_event_column(
         if !fresh {
             return None;
         }
-        // **Every** assignment to the field here, not the first one that happens to be an event column.
-        // One later assignment from anything else and the value at the read is not this event's.
+        // **Every** assignment to this receiver's field, not every assignment to that entity's field.
+        // A second local of the same entity is a different row, and its assignment says nothing about
+        // this one (Jules, #1316). And every one of them, not the first that happens to be an event
+        // column: one later assignment from anything else and the value at the read is not this event's.
         let mut col = None;
         for asg in &func.assignments {
-            if asg.field != field || asg.entity != entity {
+            if asg.field != field || asg.entity != entity || asg.receiver != recv {
                 continue;
             }
             col = Some(event_column(&asg.expr)?);
@@ -3400,7 +3402,10 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
     let mut col = None;
     let mut unconditional = false;
     for asg in &helper.assignments {
-        if asg.field != field || asg.entity != entity {
+        // The returned local, by name. A helper may load and return `transaction` while also creating an
+        // unrelated `other` of the same entity and writing `other.timestamp` from the event; matching on
+        // the entity alone reported that as the returned row's value (Jules, #1316).
+        if asg.field != field || asg.entity != entity || asg.receiver != var {
             continue;
         }
         let c = event_column(&asg.expr)?;
@@ -4357,6 +4362,96 @@ export function handleSwap(event: SwapEvent): void {
             assignment_event_column(asg, func, &mappings.functions),
             None,
             "the read happens before the write, and nothing here can tell that from the other order"
+        );
+    }
+
+    /// Another local of the same entity is a different row (Jules, #1316).
+    ///
+    /// ```ts
+    /// let transaction = Transaction.load(id)        // returned, and still stored state
+    /// let other = new Transaction(otherId)
+    /// other.timestamp = event.block.timestamp       // says nothing about `transaction`
+    /// return transaction
+    /// ```
+    ///
+    /// The scan matched on entity and field, so `other`'s assignment answered for the row the helper
+    /// actually returns.
+    #[test]
+    fn another_local_of_the_same_entity_does_not_answer_for_the_returned_row() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  let other = new Transaction(event.block.hash.toHex())
+  other.timestamp = event.block.timestamp
+  other.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the returned row is the loaded one, and nothing wrote its timestamp in this invocation"
+        );
+    }
+
+    /// A second local of the same entity in the handler is a different row too.
+    #[test]
+    fn another_local_of_the_same_entity_does_not_answer_in_the_handler() {
+        let schema = r#"
+type Tick @entity {
+  id: ID!
+  liquidityNet: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  liquidityNet: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let upper = new Tick(event.params.upper.toString())
+  let lower = new Tick(event.params.lower.toString())
+  lower.liquidityNet = event.params.liquidity
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.liquidityNet = upper.liquidityNet
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/pool.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "liquidityNet")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "`lower` was written and `upper` was read, and they are not the same row"
         );
     }
 
