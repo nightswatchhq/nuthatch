@@ -3304,10 +3304,10 @@ fn entity_field_event_column(
     // loadTransaction(event)`. That is the common shape and it is followable, because the entity comes
     // from the helper's own binding rather than from a name that matched.
     let rhs = local_assignment(&func.body, recv)?;
+    // No "does this body call it" check: `rhs` is the local's own right-hand side, taken from this body,
+    // so a bare identifier before `(` is one `collect_calls` has already seen. A method call keeps its
+    // dot and matches no function name.
     let callee = rhs.split('(').next()?.trim();
-    if !func.calls.contains(callee) {
-        return None;
-    }
     returned_field_event_column(functions.get(callee)?, field)
 }
 
@@ -3324,7 +3324,9 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
     if field == "id" {
         let args = binding_arguments(&helper.body, &var);
         let first = args.first()?;
-        if args.len() < 2 || args.iter().any(|a| a != first) {
+        // Every binding, agreeing. One `new` on its own is as sound as a `load` and a `new` that carry the
+        // same argument; two that disagree mean the id depends on which path ran.
+        if args.iter().any(|a| a != first) {
             return None;
         }
         return event_column(first);
@@ -4250,6 +4252,136 @@ export function handleSwap(event: SwapEvent): void {
             assignment_event_column(asg, func, &mappings.functions).as_deref(),
             Some("block_timestamp"),
             "overwritten on every path out, so the caller's read is this event's value"
+        );
+    }
+
+    /// A loaded receiver in the handler itself is stored state, whatever the handler later writes.
+    ///
+    /// The assignment list carries no order relative to the read, so `pool.x` read before
+    /// `pool.x = event.params.v` and read after it look the same from here. Refusing a loaded receiver
+    /// outright is what makes that unanswerable rather than a coin toss.
+    #[test]
+    fn a_loaded_receiver_in_the_handler_is_not_this_events_value() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  tick: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  tick: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let pool = Pool.load(event.address.toHex())
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.tick = pool.tick
+  pool.tick = event.params.tick
+  pool.save()
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/pool.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "tick")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the read happens before the write, and nothing here can tell that from the other order"
+        );
+    }
+
+    /// A helper whose returned row is bound with two different ids has no one id.
+    #[test]
+    fn a_returned_row_bound_with_two_different_ids_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+}
+type Swap @entity {
+  id: ID!
+  transaction: Transaction!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  if (transaction === null) {
+    transaction = new Transaction(event.block.hash.toHex())
+  }
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.transaction = transaction.id
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "transaction")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the transaction hash on one path and the block hash on the other is not one column"
+        );
+    }
+
+    /// A helper that writes the field from two different columns has no one answer for it.
+    ///
+    /// The last write wins at runtime. Nothing here knows which line ran last, so the honest answer is
+    /// none rather than whichever the scan reached first.
+    #[test]
+    fn a_field_written_from_two_different_columns_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  transaction.timestamp = event.block.timestamp
+  transaction.timestamp = event.block.number
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "two columns for one field is not one column"
         );
     }
 
