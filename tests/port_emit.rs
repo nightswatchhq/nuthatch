@@ -2342,3 +2342,125 @@ export function handlePoolCreated(event: PoolCreated): void {
         view.exact_fields
     );
 }
+
+/// A braceless conditional is conditional (Jules on #1316).
+///
+/// `if (cond) pool.collectedFeesUSD = ZERO_BD` sits at brace depth zero, so a depth test alone reads it
+/// as unconditional and projects zero for the rows that took the other branch.
+#[test]
+fn a_braceless_conditional_constant_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  if (event.params.tickSpacing > 0)
+    pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "no brace does not make a conditional unconditional:\n{sql}"
+    );
+
+    // The same thing on one line, which is the shape where the header and the assignment share a line and
+    // the check has to look at the assignment's own text rather than the line above it.
+    let one_line = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  if (event.params.tickSpacing > 0) pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, one_line);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "nor on one line:\n{sql}"
+    );
+}
+
+/// A row already saved before the assignment can be stored without it (Jules on #1316).
+///
+/// The early-`return` case, stated the way that makes it decidable: a `return` before the *save* stores
+/// nothing and leaves no row missing the field, but a `save()` before the assignment persists a row that
+/// the assignment had not reached yet.
+#[test]
+fn a_constant_assigned_after_a_save_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.save()
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a row stored before the assignment never got it:\n{sql}"
+    );
+}
+
+/// A `return` *before* the save leaves no row at all, so it does not make the assignment conditional.
+///
+/// Uniswap V4's `handleInitialize` returns three times - a skip list and two null-decimal bails - before
+/// `pool.save()`. Refusing on any earlier `return` would cost all six of `Pool`'s initialiser constants
+/// for paths that store nothing.
+#[test]
+fn a_return_before_the_save_does_not_make_a_constant_conditional() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "a path that stores no row cannot leave one missing the field:\n{sql}"
+    );
+}
+
+/// A function that never saves hands the row to its caller, and the value then depends on a path this
+/// cannot see (Jules on #1316: `if (event.skip) return transaction; transaction.timestamp = ..`).
+#[test]
+fn a_constant_in_a_function_that_never_saves_is_not_answered() {
+    let mapping = r#"
+export function initPool(event: PoolCreated, pool: Pool): void {
+  pool.collectedFeesUSD = ZERO_BD
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  initPool(event, pool)
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "whether the caller saved this row after the write is not visible here:\n{sql}"
+    );
+}

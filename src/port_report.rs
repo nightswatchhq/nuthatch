@@ -3656,7 +3656,7 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
         if col.as_ref().is_some_and(|prev| prev != &c) {
             return None;
         }
-        unconditional |= assigned_unconditionally(helper, asg);
+        unconditional |= assignment_reaches_every_stored_row(helper, asg);
         col = Some(c);
     }
     if unconditional {
@@ -3705,20 +3705,31 @@ fn binding_arguments(body: &str, var: &str) -> Vec<String> {
     args
 }
 
-/// Whether an assignment sits at the top level of the function body, so every path runs it.
+/// Whether every **stored** row of the receiver carries what this assignment wrote.
 ///
-/// Brace depth, counted to the assignment's line. An assignment inside an `if` sets the field on one
-/// path and leaves whatever was stored on the other, and a field set on only one path is not the
-/// event's value on the other.
-pub(crate) fn assigned_unconditionally(func: &FunctionInfo, asg: &Assignment) -> bool {
+/// Brace depth alone is not path coverage, and Jules was right about both ways it fails on #1316: an
+/// earlier `return` skips a depth-zero assignment, and `if (cond) pool.f = ZERO` sits at depth zero
+/// while being conditional. What closes it is not control-flow analysis but **persistence**:
+///
+/// - a row only exists once something saves it, so an early `return` before the save stores nothing and
+///   leaves no row missing the field. Uniswap V4's `handleInitialize` returns three times before
+///   `pool.save()`, and none of those paths leaves a `Pool` behind;
+/// - a row *can* be stored without the field if a `save()` runs before the assignment. So every
+///   `<recv>.save()` in this body has to come after it, and there has to be at least one - a function
+///   that never saves hands the row to its caller, and the value then depends on a path this cannot see.
+///
+/// Still requires depth zero and refuses a braceless control header, because those say the assignment
+/// did not run at all on some path that did reach the save.
+pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Assignment) -> bool {
     let Some(idx) = asg.citation.line.checked_sub(func.body_start_line) else {
         return false;
     };
+    let lines: Vec<&str> = func.body.lines().collect();
+    if idx >= lines.len() {
+        return false;
+    }
     let mut depth = 0i32;
-    for (n, line) in func.body.lines().enumerate() {
-        if n == idx {
-            return depth == 0;
-        }
+    for line in &lines[..idx] {
         for c in line.chars() {
             match c {
                 '{' => depth += 1,
@@ -3726,6 +3737,51 @@ pub(crate) fn assigned_unconditionally(func: &FunctionInfo, asg: &Assignment) ->
                 _ => {}
             }
         }
+    }
+    if depth != 0 {
+        return false;
+    }
+    // `if (cond) pool.f = ZERO` on one line, or the header on the line above with no brace opened.
+    if governed_by_a_braceless_header(&lines, idx) {
+        return false;
+    }
+    // Every save of this receiver, after the assignment, and at least one.
+    let needle = format!("{}.save()", asg.receiver);
+    let mut saves = 0usize;
+    for (n, line) in lines.iter().enumerate() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        if n <= idx {
+            return false;
+        }
+        saves += 1;
+    }
+    saves > 0
+}
+
+/// Whether the statement on `idx` is the body of a conditional or loop that opened no block.
+fn governed_by_a_braceless_header(lines: &[&str], idx: usize) -> bool {
+    const HEADS: [&str; 4] = ["if", "for", "while", "else"];
+    let is_head = |t: &str| {
+        HEADS.iter().any(|h| {
+            t == *h
+                || t.strip_prefix(h).is_some_and(|r| r.starts_with([' ', '(']))
+                || t.strip_prefix("} ")
+                    .is_some_and(|r| r == *h || r.starts_with(&format!("{h} ")))
+        })
+    };
+    let own = lines[idx].trim();
+    if is_head(own) {
+        return true;
+    }
+    // The nearest statement above, skipping blanks and line comments.
+    for prev in lines[..idx].iter().rev() {
+        let t = prev.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        return is_head(t) && !t.ends_with('{');
     }
     false
 }
