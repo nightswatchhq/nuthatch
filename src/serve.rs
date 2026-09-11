@@ -5527,6 +5527,150 @@ mod tests {
         );
     }
 
+    /// The **canonical introspection document**, sent verbatim from the recording fixture, answered with
+    /// the same shape graph-node answers it with.
+    ///
+    /// This is the end of the argument about whether a generated client can consume our introspection
+    /// response. The query is the one graphql-js emits - `FullType`, `InputValue`, `TypeRef`, fragment
+    /// spreads and all - and the assertion is that for every type the reference carries, our response
+    /// carries the same keys, with the same keys on every field, argument and enum value. Not "the keys we
+    /// thought to emit", and not "the keys the other tests happen to read": the reference's own.
+    ///
+    /// **This test deliberately does not cover projection**, and a mutation that stops projecting leaves
+    /// it green. The canonical document selects every key, so narrowing the response to that selection
+    /// yields the same document either way. Projection is covered where it can be seen - narrow
+    /// selections, in `a_fragment_document_and_a_mixed_operation_answer_over_http`. Two tests, two
+    /// properties: this one says the document is *complete*, that one says it is *no wider than asked*.
+    #[tokio::test]
+    async fn the_canonical_introspection_document_answers_with_the_references_shape() {
+        // The **recorded Uniswap V4 schema**, not the small fixture nest: the reference document was
+        // recorded from that deployment, so anything else is comparing two different schemas. No views
+        // are needed - this test only introspects.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("graph")).unwrap();
+        std::fs::write(
+            d.path().join("graph/schema.graphql"),
+            include_str!("../tests/fixtures/graph-node/uniswap-v4-schema.graphql"),
+        )
+        .unwrap();
+        let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        let query: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph-node/introspection-query.gql.json"
+        ))
+        .expect("the recording query parses");
+        let query = query["query"].as_str().expect("a query string");
+        let body = graph_ask("/graphql", query, state).await;
+        assert!(
+            body["errors"].is_null(),
+            "the canonical document must not be refused: {}",
+            serde_json::to_string(&body["errors"]).unwrap_or_default()
+        );
+
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph-node/graph-node-introspection-uniswap-v4.json"
+        ))
+        .expect("the recorded reference parses");
+        // **Values, not key sets.** Projection inserts `null` for any selected key, so the response's
+        // keys always equal the selection and comparing them through this path is vacuous by
+        // construction - my first attempt at this test passed with the normalisation pass removed *and*
+        // with projection removed. Compare what the keys contain.
+        let ours: std::collections::BTreeMap<String, serde_json::Value> = body["data"]["__schema"]
+            ["types"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no types: {body}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|n| (n.to_string(), t.clone())))
+            .collect();
+        let mut compared = 0;
+        for t in reference["__schema"]["types"].as_array().unwrap() {
+            let name = t["name"].as_str().unwrap_or_default();
+            if name.starts_with("__") {
+                continue; // the meta-schema, which a nest does not model
+            }
+            let Some(m) = ours.get(name) else { continue };
+            // `description` is a **declared divergence**: graph-node carries the schema author's doc
+            // comments there, they are not part of the contract a client validates against, and this
+            // renderer emits the key with `null`. The key's *presence* is what a client needs and is
+            // asserted at the render level by the golden test; its text is not reproduced.
+            for key in ["kind", "interfaces", "possibleTypes"] {
+                assert_eq!(m[key], t[key], "{name}.{key}");
+            }
+            for list in ["fields", "inputFields", "enumValues"] {
+                assert_eq!(
+                    m[list].is_null(),
+                    t[list].is_null(),
+                    "{name}.{list}: null on one side only"
+                );
+                let (Some(a), Some(b)) = (t[list].as_array(), m[list].as_array()) else {
+                    continue;
+                };
+                // **By name, not by position.** Declaration order is not something a client depends on,
+                // and zipping the two lists positionally compared unrelated entries - it reported a
+                // field with 35 arguments against one with 5.
+                let by_name = |l: &[serde_json::Value]| -> std::collections::BTreeMap<String, serde_json::Value> {
+                    l.iter()
+                        .filter_map(|e| e["name"].as_str().map(|n| (n.to_string(), e.clone())))
+                        .collect()
+                };
+                let (ra, ma) = (by_name(a), by_name(b));
+                assert_eq!(
+                    ra.keys().collect::<Vec<_>>(),
+                    ma.keys().collect::<Vec<_>>(),
+                    "{name}.{list} names"
+                );
+                for (entry, x) in &ra {
+                    let y = &ma[entry];
+                    for key in ["name", "isDeprecated", "deprecationReason", "type"] {
+                        if x.get(key).is_none() {
+                            continue; // not a key this list's entries carry
+                        }
+                        assert_eq!(y[key], x[key], "{name}.{list}.{entry}.{key}");
+                    }
+                    if let Some(xa) = x["args"].as_array() {
+                        let ya = y["args"]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("{name}.{list}.{entry} has no args"));
+                        let (rg, mg) = (by_name(xa), by_name(ya));
+                        assert_eq!(
+                            rg.keys().collect::<Vec<_>>(),
+                            mg.keys().collect::<Vec<_>>(),
+                            "{name}.{list}.{entry} argument names"
+                        );
+                        for (arg, p) in &rg {
+                            for key in ["name", "type", "defaultValue"] {
+                                assert_eq!(
+                                    mg[arg][key], p[key],
+                                    "{name}.{list}.{entry}({arg}).{key}"
+                                );
+                            }
+                        }
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        // A floor, so this cannot pass by comparing nothing: 19 entities contribute an object, a filter
+        // and an orderBy enum each.
+        assert!(compared >= 500, "only {compared} entries compared");
+
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v["__schema"]["directives"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mine = serde_json::json!({"__schema": body["data"]["__schema"].clone()});
+        assert_eq!(
+            names(&mine),
+            names(&reference),
+            "the directives a client reads"
+        );
+    }
+
     /// `__type`, the traversals, the text operators and every refusal, each in the Graph envelope.
     #[tokio::test]
     async fn the_graph_endpoint_answers_types_traversals_and_refusals() {
