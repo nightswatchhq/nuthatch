@@ -1464,31 +1464,84 @@ type Swap @entity { id: ID! pool: Pool! }
     /// A malformed string must be a syntax error, not a panic and not a silent success. The escape
     /// loop advanced twice for a trailing backslash, so `self.i` could pass the end of the input and
     /// the slice that followed it indexed out of bounds - a panic in a request handler.
+    ///
+    /// The expected wording is asserted, not just `is_err()`. Four of twelve mutations survived the
+    /// first version of this test: each broke the scanner, the scanner then ran off the end of the
+    /// string, and the *object* parser raised "unclosed object" a moment later. A test that only asks
+    /// whether something failed cannot tell a guard working from a guard gone.
     #[test]
     fn a_malformed_string_is_refused_rather_than_crashing() {
-        for q in [
+        let cases: &[(&str, &str)] = &[
             // The exact shape that indexed out of bounds: the backslash is the last byte, so the
             // escape skip walked `self.i` to `len + 1`. Measured before the fix: "range end index 29
             // out of range for slice of length 28", from a 28-byte request.
-            r#"{ pools(where: { hooks: "ab\"#,
-            r#"{ pools(where: { hooks: "ab\ "#,
-            r#"{ pools(where: { hooks: "a
-b" }) { id } }"#,
-            r#"{ pools(where: { hooks: """a""" }) { id } }"#,
-            r#"{ pools(where: { hooks: "\udc00 lone low" }) { id } }"#,
-            r#"{ pools(where: { hooks: "\ud83d\u0041 not a low" }) { id } }"#,
-            r#"{ pools(where: { hooks: "unterminated "#,
-            r#"{ pools(where: { hooks: "bad \q escape" }) { id } }"#,
-            r#"{ pools(where: { hooks: "\u00zz" }) { id } }"#,
-            // `\u` reads four bytes, and four bytes can land inside a code point. The first is
-            // valid UTF-8 that is not hex; the second splits `\u{20ac}` and is not UTF-8 at all.
-            "{ pools(where: { hooks: \"\\u00\u{e9}\" }) { id } }",
-            "{ pools(where: { hooks: \"\\u00\u{20ac}\" }) { id } }",
-            r#"{ pools(where: { hooks: "\u00" }) { id } }"#,
-            r#"{ pools(where: { hooks: "\ud83d only half" }) { id } }"#,
-        ] {
-            let r = parse(q);
-            assert!(r.is_err(), "{q:?} parsed as {r:?} instead of being refused");
+            (r#"{ pools(where: { hooks: "ab\"#, "unterminated string"),
+            // A backslash and a space is an invalid escape, which is a better message than
+            // "unterminated" and is why this case is spelled out separately from the one above.
+            (
+                r#"{ pools(where: { hooks: "ab\ "#,
+                "is not a GraphQL string escape",
+            ),
+            (
+                r#"{ pools(where: { hooks: "unterminated "#,
+                "unterminated string",
+            ),
+            (
+                "{ pools(where: { hooks: \"a\nb\" }) { id } }",
+                "line break inside a string",
+            ),
+            (
+                r#"{ pools(where: { hooks: "bad \q escape" }) { id } }"#,
+                "is not a GraphQL string escape",
+            ),
+            (
+                r#"{ pools(where: { hooks: """a""" }) { id } }"#,
+                "block string",
+            ),
+            (
+                r#"{ pools(where: { hooks: "\u00zz" }) { id } }"#,
+                "not four hex digits",
+            ),
+            (
+                r#"{ pools(where: { hooks: "\u00" }) { id } }"#,
+                "not four hex digits",
+            ),
+            // Genuinely truncated: fewer than four bytes remain after the `\u`, so the window cannot
+            // be read at all. The `}`-terminated case above has four bytes and merely is not hex.
+            (r#"{ pools(where: { hooks: "\u00"#, "truncated"),
+            // `\u` reads four bytes, and four bytes can land inside a code point. The first is valid
+            // UTF-8 that is not hex; the second splits `\u{20ac}` and is not UTF-8 at all.
+            (
+                "{ pools(where: { hooks: \"\\u00\u{e9}\" }) { id } }",
+                "not four hex digits",
+            ),
+            (
+                "{ pools(where: { hooks: \"\\u00\u{20ac}\" }) { id } }",
+                "malformed `\\u` escape",
+            ),
+            (
+                r#"{ pools(where: { hooks: "\ud83d only half" }) { id } }"#,
+                "no low surrogate",
+            ),
+            (
+                r#"{ pools(where: { hooks: "\ud83d\u0041 not a low" }) { id } }"#,
+                "not a low surrogate",
+            ),
+            (
+                r#"{ pools(where: { hooks: "\udc00 lone low" }) { id } }"#,
+                "lone low surrogate",
+            ),
+        ];
+        for (q, want) in cases {
+            match parse(q) {
+                Ok(got) => panic!("{q:?} parsed as {got:?} instead of being refused"),
+                Err(Unsupported::Syntax(msg)) => assert!(
+                    msg.contains(want),
+                    "{q:?} was refused as {msg:?}, which does not mention {want:?} - so this case \
+                     is no longer testing the guard it was written for"
+                ),
+                Err(other) => panic!("{q:?} was refused as {other:?}, not a syntax error"),
+            }
         }
     }
 
