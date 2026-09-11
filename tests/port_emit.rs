@@ -176,6 +176,94 @@ fn exact_field_appears_in_a_view() {
     );
 }
 
+/// The invariant the coverage figure rests on: a view projects exactly the fields it lists.
+///
+/// `EmittedView::exact_fields` feeds two things - the generated check's projection and the coverage
+/// figure - so a field listed but not projected reads as verified *and* as answered while DuckDB
+/// cannot answer it. That divergence is #1248. It is now impossible by construction, because the list
+/// is the key set of the same map the SQL is rendered from, and this test is what holds that true if
+/// anyone reintroduces a parallel list.
+#[test]
+fn every_emitted_view_projects_exactly_the_fields_it_lists() {
+    /// Names the outer projection exposes, for both shapes `exact_select_sql` emits: the grouped fold
+    /// (`last(...) AS "x"` over a union, with a bare `"id"`) and the single-arm form (`"col" AS "x"`).
+    /// `__present__` markers are internal and not fields.
+    fn projected(sql: &str) -> std::collections::BTreeSet<String> {
+        let body = sql
+            .split_once(" AS\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or(sql)
+            .trim_start();
+        let head = body
+            .split_once("\nFROM")
+            .map(|(h, _)| h)
+            .unwrap_or(body)
+            .trim_start()
+            .trim_start_matches("SELECT");
+        let mut out = std::collections::BTreeSet::new();
+        for part in head.split(",\n") {
+            let part = part.trim().trim_end_matches(';');
+            let name = match part.rsplit_once(" AS ") {
+                Some((_, alias)) => alias.trim(),
+                // a bare projected column, which is how `id` is emitted in the fold
+                None => part,
+            };
+            let name = name.trim().trim_matches('"');
+            if name.is_empty()
+                || name.starts_with("__present__")
+                || !name.contains(char::is_alphabetic)
+            {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
+        out
+    }
+
+    // Three shapes: one field and one table, a fold over several fields, and an overlay with a
+    // running total split out to an incremental entity.
+    for (label, schema, mapping) in [
+        ("one field", None, None),
+        ("accumulator split", Some(ACCUM_SCHEMA), Some(ACCUM_MAPPING)),
+        ("operations", Some(OPS_SCHEMA), Some(OPS_MAPPING)),
+    ] {
+        let (_nest, result) = match (schema, mapping) {
+            (Some(s), Some(m)) => emitted_nest(s, m),
+            _ => {
+                let nest = tempfile::tempdir().unwrap();
+                write_imported_nest(nest.path(), false);
+                let r = nuthatch::port_emit::emit(&one_call_dir(), nest.path()).unwrap();
+                (nest, r)
+            }
+        };
+        assert!(
+            !result.views.is_empty(),
+            "{label}: nothing was emitted, so this case proves nothing"
+        );
+        for v in &result.views {
+            let listed: std::collections::BTreeSet<String> =
+                v.exact_fields.iter().cloned().collect();
+            let select = v
+                .sql
+                .split_once("CREATE VIEW")
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{label}/{}: no CREATE VIEW:\n{}", v.entity, v.sql));
+            assert_eq!(
+                projected(select),
+                listed,
+                "{label}/{}: the projection and `exact_fields` disagree\n{}",
+                v.entity,
+                v.sql
+            );
+            assert!(
+                !listed.is_empty(),
+                "{label}/{}: an emitted view with no listed field",
+                v.entity
+            );
+        }
+    }
+}
+
 /// `README.md` is the report **plus what this overlay actually answers**.
 ///
 /// It used to be the report verbatim, which is what this test asserted. The report's summary table

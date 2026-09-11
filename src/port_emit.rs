@@ -250,9 +250,10 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
 
-    // Counted from the artefacts rather than from the bookkeeping, because the bookkeeping is what
-    // was wrong before: `exact_fields` and the emitted SQL were built in the same loop and still
-    // disagreed (#1248). `in_views` counts distinct (entity, field) pairs a view projection names.
+    // `in_views` counts distinct (entity, field) pairs a view projection names. `exact_fields` is the
+    // key set of the map `exact_select_sql` renders, so this counts the projection rather than a
+    // parallel list that could disagree with it - which is what #1248 was and what a metric derived
+    // from bookkeeping would have inherited.
     let coverage = Coverage {
         classified_exact: report
             .fields
@@ -818,7 +819,6 @@ fn view_for_entity(
     let mut comments = Vec::new();
     // field → table → column. One field may be written from several triggering tables.
     let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let mut exact_fields = Vec::new();
     let mut skipped = Vec::new();
 
     for f in fields {
@@ -856,7 +856,6 @@ fn view_for_entity(
             });
             continue;
         }
-        exact_fields.push(f.field.clone());
         comments.push(format!(
             "-- `{}.{}` exact: {}:{} - {}",
             f.entity,
@@ -874,6 +873,18 @@ fn view_for_entity(
         }
     }
     fill_id_columns(entity, &mut selects, mappings, config);
+
+    // **One source for the list and for the SQL.**
+    //
+    // This used to be a parallel `Vec` pushed inside the loop above. The two were built from the same
+    // information and still diverged (#1248), and a divergence here is invisible: `exact_fields` feeds
+    // the generated check's projection and the coverage figure, so a field listed but not projected
+    // reads as verified and as answered while DuckDB cannot answer it. Taking the list from `selects`
+    // - the same map `exact_select_sql` renders - makes that impossible rather than unlikely, and
+    // `every_emitted_view_projects_exactly_the_fields_it_lists` holds the invariant.
+    //
+    // Sorted, because `selects` is a `BTreeMap`. Nothing downstream depends on schema order.
+    let exact_fields: Vec<String> = selects.keys().cloned().collect();
 
     let mut sql = String::new();
     sql.push_str(&format!(
