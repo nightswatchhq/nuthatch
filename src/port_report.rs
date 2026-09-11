@@ -3105,6 +3105,70 @@ pub(crate) fn strip_converters(expr: &str) -> String {
 
 /// Event column that identifies `entity` in this function: an `id` assignment, else
 /// `new Entity(event.params.x)` / `Entity.load(event.params.x)`.
+/// The **literal** id of a singleton entity, as a SQL string literal, if the mapping constructs or loads
+/// it with a constant.
+///
+/// `new PoolManager('1')` and `Bundle.load('1')` are how a subgraph writes a protocol-wide singleton -
+/// one row, one known id. `entity_id_event_column` looks for a decoded column and finds none, so every
+/// accumulator on such an entity was reported as *"nothing in the mapping identifies which `PoolManager` a
+/// row belongs to, so there is no key to group by"* - which is true and the wrong conclusion: the key is
+/// not in the data because it is in the mapping (#1313).
+///
+/// Returned already quoted and escaped, because it goes straight into a `SELECT` list.
+pub(crate) fn entity_id_literal(entity: &str, func: &FunctionInfo) -> Option<String> {
+    // An explicit `x.id = '1'` wins over the constructor argument, the same precedence
+    // `entity_id_event_column` uses.
+    for asg in &func.assignments {
+        if asg.entity == entity && asg.field == "id" {
+            if let Some(lit) = string_literal(&asg.expr) {
+                return Some(lit);
+            }
+        }
+    }
+    let body = &func.body;
+    let mut i = 0usize;
+    while i < body.len() {
+        let hit = match_let_new(body, i)
+            .or_else(|| match_bare_new(body, i))
+            .or_else(|| match_let_load(body, i));
+        if let Some((_var, ent, next)) = hit {
+            if ent == entity {
+                let mut k = next;
+                skip_ws_str(body, &mut k);
+                if body[k..].starts_with('(') {
+                    if let Some(lit) = string_literal(&take_expr(body, k + 1)) {
+                        return Some(lit);
+                    }
+                }
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A single-quoted or double-quoted string literal, re-emitted as a SQL literal.
+///
+/// Nothing else: a numeric literal would be an id of a different type, and a template string or a
+/// concatenation is a composed key, which is a separate piece of work. Quotes inside are doubled, so an id
+/// containing one cannot terminate the literal early.
+fn string_literal(expr: &str) -> Option<String> {
+    let e = collapse_ws(expr).trim().to_string();
+    for quote in ['\'', '"'] {
+        if e.len() >= 2 && e.starts_with(quote) && e.ends_with(quote) {
+            let inner = &e[1..e.len() - 1];
+            if inner.contains(quote) {
+                // An escaped quote inside - not a shape to guess at.
+                return None;
+            }
+            return Some(format!("'{}'", inner.replace('\'', "''")));
+        }
+    }
+    None
+}
+
 pub(crate) fn entity_id_event_column(
     entity: &str,
     func: &FunctionInfo,

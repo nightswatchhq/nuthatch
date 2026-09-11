@@ -1168,9 +1168,11 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
 
     let sql = std::fs::read_to_string(nest.path().join("entities/pool.sql")).unwrap();
+    // One per row in the arm, summed outside - the same answer as `count(*)` and the shape that works
+    // when an entity has several arms.
     assert!(
-        sql.contains(r#"count(*) AS "txCount""#),
-        "a unit increment counts rows:\n{sql}"
+        sql.contains(r#"1 AS "txCount""#) && sql.contains(r#"sum("txCount") AS "txCount""#),
+        "a unit increment contributes one per row and is summed:\n{sql}"
     );
     assert!(
         !sql.contains(r#""txCount_overflow""#),
@@ -1178,8 +1180,9 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
     // The column-sourced total beside it keeps both the cast and the flag.
     assert!(
-        sql.contains(r#"sum(TRY_CAST("fee" AS DECIMAL(38,0))) AS "liquidity""#),
-        "a column total is still summed with a checked cast:\n{sql}"
+        sql.contains(r#"TRY_CAST("fee" AS DECIMAL(38,0)) AS "liquidity""#)
+            && sql.contains(r#"sum("liquidity") AS "liquidity""#),
+        "a column total is still cast then summed:\n{sql}"
     );
     assert!(
         sql.contains(r#""liquidity_overflow""#),
@@ -1246,11 +1249,15 @@ fn an_accumulated_field_is_emitted_as_an_incremental_entity_that_validates() {
             )
         });
     assert_eq!(entity.fields, vec!["totalFees".to_string()]);
+    // The cast is in the arm and the fold is outside it, since an entity may now have several arms.
     assert!(
-        entity
-            .sql
-            .contains("sum(TRY_CAST(\"fee\" AS DECIMAL(38,0)))"),
-        "the total is the sum of the deltas, through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
+        "the delta goes through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "and the total is the sum of those deltas:\n{}",
         entity.sql
     );
     // The half that keeps the cast honest. `TRY_CAST` yields NULL past 38 digits and `sum` skips
@@ -1378,11 +1385,14 @@ fn rerunning_without_a_running_total_removes_the_prior_generated_entity() {
     );
 }
 
-/// A field accumulated by two event tables cannot be silently narrowed to the first table the
-/// mapper happens to visit. v1 emits one relation per entity, so the second contribution is named
-/// for the operator instead of claiming a total that omits it.
+/// A field accumulated by two event tables sums **both**, as two arms of one entity.
+///
+/// It used to name the second contribution as skipped - "one entity is one relation in v1" - which was
+/// honest but left the total wrong unless an operator hand-wrote the arm. 45 fields on Uniswap V4 were
+/// gated on it (#1313). Each arm projects its own fields and zero for the others, the arms are
+/// `UNION ALL`ed, and one outer aggregate folds them by key.
 #[test]
-fn an_accumulation_from_a_second_table_is_named_rather_than_discarded() {
+fn a_field_accumulated_by_two_tables_sums_both_arms() {
     let subgraph = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
     std::fs::write(
@@ -1390,6 +1400,7 @@ fn an_accumulation_from_a_second_table_is_named_rather_than_discarded() {
         r#"type Pool @entity {
   id: ID!
   totalFees: BigInt!
+  swapVolume: BigInt!
 }
 
 "#,
@@ -1430,6 +1441,7 @@ export function handlePoolSwap(event: Swap): void {
   let pool = new Pool(event.address.toHex())
   pool.id = event.address.toHex()
   pool.totalFees = pool.totalFees.plus(event.params.amount0)
+  pool.swapVolume = pool.swapVolume.plus(event.params.amount1)
   pool.save()
 }
 "#,
@@ -1440,17 +1452,222 @@ export function handlePoolSwap(event: Swap): void {
     write_imported_nest(nest.path(), true);
     let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
 
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Pool")
+        .unwrap_or_else(|| panic!("Pool must be emitted: {:?}", result.entities));
+
+    // Both tables appear, as two arms under one UNION ALL.
+    for table in ["factory__pool_created", "pool__swap"] {
+        assert!(
+            entity.sql.contains(&format!("FROM \"{table}\"")),
+            "`{table}` must be an arm, not a skipped field:\n{}",
+            entity.sql
+        );
+    }
     assert!(
-        result.entities.iter().any(|entity| entity.entity == "Pool"),
-        "the first relation is emitted: {:?}",
+        entity.sql.matches("UNION ALL").count() == 1,
+        "two arms, one union:\n{}",
+        entity.sql
+    );
+    // Each arm contributes the field it writes; neither is zero-filled, because both write it.
+    assert!(
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))")
+            && entity
+                .sql
+                .contains("TRY_CAST(\"amount0\" AS DECIMAL(38,0))"),
+        "each arm casts its own column:\n{}",
+        entity.sql
+    );
+    // And the total is folded once, outside.
+    assert!(
+        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "the outer aggregate sums across arms:\n{}",
+        entity.sql
+    );
+    // **`swapVolume` is written by the swap arm only**, so the `pool_created` arm has to fill it - and it
+    // must fill it with **zero**. `sum` skips NULLs, so a NULL fill makes the total NULL for any key that
+    // appears only in arms which do not write the field, where graph-node has 0. A mutation changing the
+    // fill to NULL survived until this fixture had a field that is actually zero-filled.
+    assert!(
+        entity
+            .sql
+            .contains("CAST(0 AS DECIMAL(38,0)) AS \"swapVolume\""),
+        "the arm that does not write `swapVolume` contributes zero:\n{}",
+        entity.sql
+    );
+    assert!(
+        !entity.sql.contains("CAST(NULL AS"),
+        "and never NULL - `sum` would skip it:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"swapVolume\") AS \"swapVolume\""),
+        "both fields are folded outside:\n{}",
+        entity.sql
+    );
+    assert!(
+        !result.skipped_fields.iter().any(|f| {
+            f.entity == "Pool" && f.field == "totalFees" && f.why.contains("one relation")
+        }),
+        "nothing should still be skipped for being a second relation: {:?}",
+        result.skipped_fields
+    );
+    // **The overflow flag folds with `max`, not `min`.** With one arm the two are identical, which is why
+    // a mutation swapping them survived until this test had two. `min` would report "no overflow" as soon
+    // as any single arm was clean, which is the wrong way round for a flag that means "some contributing
+    // row could not be represented".
+    assert!(
+        entity.sql.contains("max(\"totalFees_overflow\")"),
+        "the overflow flag is an OR across arms, so `max`:\n{}",
+        entity.sql
+    );
+}
+
+/// A singleton the mapping keys with a constant gets that constant as its key.
+///
+/// `new Protocol('1')` has no key *in the data*, because the key is in the mapping. The emitter reported
+/// "nothing in the mapping identifies which `Protocol` a row belongs to, so there is no key to group by" -
+/// true as written and the wrong conclusion (#1313).
+///
+/// Neither pinned target exercises this: Uniswap's `PoolManager` is keyed by a local holding an address,
+/// and Carbon's `Protocol` likewise. So this test is the only thing that holds the shape, which is worth
+/// saying out loud rather than leaving a reader to assume a fixture covers it.
+#[test]
+fn a_singleton_keyed_by_a_constant_groups_by_that_constant() {
+    const SCHEMA: &str = r#"
+type Protocol @entity {
+  id: ID!
+  txCount: BigInt!
+  totalFees: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let protocol = new Protocol('1')
+  protocol.txCount = protocol.txCount.plus(ONE_BI)
+  protocol.totalFees = protocol.totalFees.plus(event.params.fee)
+  protocol.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Protocol")
+        .unwrap_or_else(|| {
+            panic!(
+                "a singleton's totals must be emitted: {:?}",
+                result.entities
+            )
+        });
+
+    assert!(
+        entity.sql.contains("'1' AS \"id\""),
+        "the constant is the key:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("GROUP BY \"id\""),
+        "and it still groups, so one row comes out:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"txCount\") AS \"txCount\"")
+            && entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "both totals fold:\n{}",
+        entity.sql
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|f| f.entity == "Protocol" && f.why.contains("no key to group by")),
+        "nothing should still be skipped for want of a key: {:?}",
+        result.skipped_fields
+    );
+}
+
+/// A key that is neither a column nor a constant is still named rather than guessed at.
+///
+/// Uniswap keys `PoolManager` by `poolManagerAddress`, a local holding an address that the function body
+/// does not declare - it comes from a constants module. Resolving that would mean reading imports, and
+/// guessing would mean grouping a protocol-wide total by something arbitrary.
+#[test]
+fn a_key_that_is_neither_a_column_nor_a_constant_is_named() {
+    const SCHEMA: &str = r#"
+type Protocol @entity {
+  id: ID!
+  txCount: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let protocol = new Protocol(PROTOCOL_ADDRESS)
+  protocol.txCount = protocol.txCount.plus(ONE_BI)
+  protocol.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    assert!(
+        result.entities.iter().all(|e| e.entity != "Protocol"),
+        "an unresolvable key must not be guessed at: {:?}",
         result.entities
     );
     assert!(
-        result.skipped_fields.iter().any(|field| {
-            field.entity == "Pool" && field.field == "totalFees" && field.why.contains("pool__swap")
-        }),
-        "the second relation must be reported, not silently dropped: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .any(|f| f.entity == "Protocol" && f.why.contains("no key to group by")),
+        "and it must be named: {:?}",
         result.skipped_fields
+    );
+}
+
+/// An arm that does not write a field contributes **zero**, not NULL.
+///
+/// `sum` skips NULLs, so for a key that appears only in arms which do not write the field, a NULL fill
+/// makes the total come back NULL where graph-node has 0. A mutation changing the fill to NULL survived
+/// until this existed: with every key present in every arm the two are indistinguishable, because
+/// `sum(NULL, 5)` and `sum(0, 5)` are both 5.
+#[test]
+fn an_arm_that_does_not_write_a_field_contributes_zero() {
+    const SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  created: BigInt!
+  swapped: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.created = pool.created.plus(event.params.fee)
+  pool.save()
+}
+"#;
+    // One table, two fields, only one of which this arm writes - so `swapped` is zero-filled here.
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    let Some(entity) = result.entities.iter().find(|e| e.entity == "Pool") else {
+        // `swapped` is written by no mapping at all, so it is not an accumulator and there is nothing
+        // to zero-fill. Assert the shape on the field that is, rather than passing vacuously.
+        panic!("Pool must be emitted: {:?}", result.entities);
+    };
+    assert!(
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
+        "the arm that writes the field casts its column:\n{}",
+        entity.sql
+    );
+    // The zero-fill only appears when an entity has more than one arm, so the two-arm test above is where
+    // it is observable. Pinned there as a literal, because the difference between 0 and NULL is the whole
+    // point and a reader cannot see it from `sum`.
+    assert!(
+        !entity.sql.contains("CAST(NULL AS DECIMAL(38,0))"),
+        "a missing contribution must never be NULL - `sum` would skip it and the total would be NULL \
+         where graph-node has 0:\n{}",
+        entity.sql
     );
 }
 
