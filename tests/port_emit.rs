@@ -1484,12 +1484,74 @@ export function handlePoolSwap(event: Swap): void {
         "the outer aggregate sums across arms:\n{}",
         entity.sql
     );
+    // Both arms write the only field here, so nothing is zero-filled - but nothing may be NULL-filled
+    // either, and that is the property a NULL fill would break for a key present in one arm only.
+    assert!(
+        !entity.sql.contains("CAST(NULL AS"),
+        "a missing contribution is zero, never NULL:\n{}",
+        entity.sql
+    );
     assert!(
         !result.skipped_fields.iter().any(|f| {
             f.entity == "Pool" && f.field == "totalFees" && f.why.contains("one relation")
         }),
         "nothing should still be skipped for being a second relation: {:?}",
         result.skipped_fields
+    );
+    // **The overflow flag folds with `max`, not `min`.** With one arm the two are identical, which is why
+    // a mutation swapping them survived until this test had two. `min` would report "no overflow" as soon
+    // as any single arm was clean, which is the wrong way round for a flag that means "some contributing
+    // row could not be represented".
+    assert!(
+        entity.sql.contains("max(\"totalFees_overflow\")"),
+        "the overflow flag is an OR across arms, so `max`:\n{}",
+        entity.sql
+    );
+}
+
+/// An arm that does not write a field contributes **zero**, not NULL.
+///
+/// `sum` skips NULLs, so for a key that appears only in arms which do not write the field, a NULL fill
+/// makes the total come back NULL where graph-node has 0. A mutation changing the fill to NULL survived
+/// until this existed: with every key present in every arm the two are indistinguishable, because
+/// `sum(NULL, 5)` and `sum(0, 5)` are both 5.
+#[test]
+fn an_arm_that_does_not_write_a_field_contributes_zero() {
+    const SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  created: BigInt!
+  swapped: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHex())
+  pool.id = event.params.pool.toHex()
+  pool.created = pool.created.plus(event.params.fee)
+  pool.save()
+}
+"#;
+    // One table, two fields, only one of which this arm writes - so `swapped` is zero-filled here.
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    let Some(entity) = result.entities.iter().find(|e| e.entity == "Pool") else {
+        // `swapped` is written by no mapping at all, so it is not an accumulator and there is nothing
+        // to zero-fill. Assert the shape on the field that is, rather than passing vacuously.
+        panic!("Pool must be emitted: {:?}", result.entities);
+    };
+    assert!(
+        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
+        "the arm that writes the field casts its column:\n{}",
+        entity.sql
+    );
+    // The zero-fill only appears when an entity has more than one arm, so the two-arm test above is where
+    // it is observable. Pinned there as a literal, because the difference between 0 and NULL is the whole
+    // point and a reader cannot see it from `sum`.
+    assert!(
+        !entity.sql.contains("CAST(NULL AS DECIMAL(38,0))"),
+        "a missing contribution must never be NULL - `sum` would skip it and the total would be NULL \
+         where graph-node has 0:\n{}",
+        entity.sql
     );
 }
 
