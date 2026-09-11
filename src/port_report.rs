@@ -2220,13 +2220,27 @@ fn class_of_assignment(
     }
     // Only this assignment's RHS. A mixed event handler's fn_class is not applied
     // to every write; an own-field fold next to a fixed-point copy stays exact.
+    //
+    // **Every class, not only `FixedPoint`.** This tested `== Class::FixedPoint`, so a read of a
+    // *call-derived* field propagated nothing at all:
+    //
+    // ```ts
+    // token0.decimals = fetchTokenDecimals(..)                                  // call-derived
+    // swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)  // was: exact
+    // ```
+    //
+    // `exact` promises a pure function of decoded events, and that field needs a contract read. Four
+    // such fields on Uniswap V4 name a call-derived field in their own expression, and a porter reading
+    // `exact` has no reason to pass `--state-rpc` - after which every token amount is off by
+    // `10^decimals`, which is a wrong number rather than a missing one (#1310).
+    //
+    // `max` keeps the ordering: a field reading both a call-derived and a fixed-point value takes the
+    // stronger class, and a read of an *exact* field changes nothing.
     for (ent, field) in &func.field_reads {
-        if expr_reads_field(&asg.expr, field)
-            && field_class
-                .get(&(ent.clone(), field.clone()))
-                .is_some_and(|(cl, _, _)| *cl == Class::FixedPoint)
-        {
-            c = c.max(Class::FixedPoint);
+        if expr_reads_field(&asg.expr, field) {
+            if let Some((cl, _, _)) = field_class.get(&(ent.clone(), field.clone())) {
+                c = c.max(*cl);
+            }
         }
     }
     c
@@ -3718,6 +3732,129 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    /// A read of a **call-derived** field makes the reading field call-derived too.
+    ///
+    /// The propagation rule tested `== Class::FixedPoint`, so a call-derived field read propagated
+    /// nothing. `Swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)` was
+    /// classified `exact` - a pure function of decoded events - while needing a contract read for
+    /// `decimals`. Four such fields on Uniswap V4, and a porter reading `exact` has no reason to pass
+    /// `--state-rpc`, after which every token amount is off by `10^decimals`: a wrong number rather
+    /// than a missing one (#1310).
+    #[test]
+    fn a_read_of_a_call_derived_field_propagates() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+  logIndex: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function convertTokenToDecimal(raw: BigInt, decimals: BigInt): BigDecimal {
+  return raw.toBigDecimal().div(exponentToBigDecimal(decimals))
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.save()
+
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)
+  swap.logIndex = event.logIndex
+  swap.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Token", "decimals"),
+            Class::CallDerived,
+            "the premise: decimals is read from the contract"
+        );
+        assert_eq!(
+            class_of(&rows, "Swap", "amount0"),
+            Class::CallDerived,
+            "a field that needs `decimals` is not a pure function of decoded events: {}",
+            reason_of(&rows, "Swap", "amount0")
+        );
+
+        // The field beside it, reading only the event, is untouched - so the rule has not swallowed
+        // every write in a handler that happens to make a call somewhere.
+        assert_eq!(
+            class_of(&rows, "Swap", "logIndex"),
+            Class::Exact,
+            "an event-only field in the same handler stays exact"
+        );
+    }
+
+    /// The stronger class wins when a field reads both.
+    ///
+    /// `max` over the classes, not first-one-found: a field reading a call-derived *and* a fixed-point
+    /// value is fixed point, because that is the promise that cannot be kept.
+    #[test]
+    fn a_field_reading_both_takes_the_stronger_class() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+  derivedETH: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  tvlUSD: BigDecimal!
+  scaled: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function findEthPerToken(token: Token): BigDecimal {
+  let other = Token.load(token.id)
+  return other.derivedETH
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.derivedETH = findEthPerToken(token0)
+  token0.save()
+
+  let pool = new Pool(event.params.pool.toHex())
+  pool.scaled = event.params.amount0.toBigDecimal().div(token0.decimals.toBigDecimal())
+  pool.tvlUSD = token0.decimals.toBigDecimal().times(token0.derivedETH)
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Pool", "scaled"),
+            Class::CallDerived,
+            "reads only the call-derived field: {}",
+            reason_of(&rows, "Pool", "scaled")
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "tvlUSD"),
+            Class::FixedPoint,
+            "reads both, so the stronger class wins: {}",
+            reason_of(&rows, "Pool", "tvlUSD")
+        );
     }
 
     #[test]
