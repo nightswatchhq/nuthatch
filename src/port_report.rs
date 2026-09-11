@@ -3999,6 +3999,72 @@ export function handleSwap(event: SwapEvent): void {
         );
     }
 
+    /// A field name that collides with a local name is not expanded as one.
+    ///
+    /// `bare_idents` returns `a` in `a.b` and not `b`, because `b` is a field access that
+    /// `expr_reads_field` already sees. Without that guard, a field called `rate` would be looked up as a
+    /// local, find an unrelated `let rate = ..` in the same body, and take that local's class - so a field
+    /// reading only exact state would be reported call-derived on the strength of a name collision.
+    ///
+    /// A mutation dropping the guard survived until this existed.
+    #[test]
+    fn a_field_name_colliding_with_a_local_is_not_expanded() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  rate: BigDecimal!
+  derived: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  doubled: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function findEthPerToken(t: Token): BigDecimal {
+  let other = Token.load(t.id)
+  return other.derived
+}
+
+export function handleInit(event: InitEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.rate = event.params.declaredRate.toBigDecimal()
+  token0.derived = findEthPerToken(token0)
+  token0.save()
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = Token.load(event.params.currency0.toHex())
+  // A local whose *name* is also a field name, bound to a fixed-point value. Expanding the field
+  // access `token0.rate` as if it were this local would make `pool.doubled` fixed point.
+  let rate = token0.derived
+  let pool = new Pool(event.params.pool.toHex())
+  pool.doubled = token0.rate.times(BigDecimal.fromString('2'))
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Token", "rate"),
+            Class::Exact,
+            "the premise: the *field* is written from the event"
+        );
+        assert_eq!(
+            class_of(&rows, "Token", "derived"),
+            Class::FixedPoint,
+            "and the local `rate` is bound to this, which is not exact"
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "doubled"),
+            Class::Exact,
+            "reads the exact field `token0.rate`; the fixed-point local `rate` in the same body must not \
+             lend it a class: {}",
+            reason_of(&rows, "Pool", "doubled")
+        );
+    }
+
     /// The stronger class wins when a field reads both.
     ///
     /// `max` over the classes, not first-one-found: a field reading a call-derived *and* a fixed-point
