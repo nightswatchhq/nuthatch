@@ -490,9 +490,15 @@ fn write_entities(
         // derived table in `FROM` is not an expression subquery, so `nuthatch check` still validates it.
         let mut arms: BTreeMap<(String, String), Vec<AccumulatedField>> = BTreeMap::new();
         for a in accumulated {
-            let Some(key) = id_column_for_table(entity, &a.table, mappings, config)
+            // A decoded column, or - for a singleton the mapping keys with a constant - that constant.
+            // `new PoolManager('1')` has no key *in the data* because the key is in the mapping, and
+            // reporting "nothing identifies which `PoolManager` a row belongs to" was true and the wrong
+            // conclusion (#1313). Quoted at the point of resolution, so both drop into the `SELECT` list.
+            let key = id_column_for_table(entity, &a.table, mappings, config)
                 .and_then(|c| resolve_column(&a.table, &c, schema))
-            else {
+                .map(|c| format!("\"{c}\""))
+                .or_else(|| literal_key_for_table(entity, &a.table, mappings, config));
+            let Some(key) = key else {
                 skipped.push(SkippedField {
                     entity: entity.clone(),
                     field: a.field.clone(),
@@ -556,7 +562,7 @@ fn write_entities(
                     (AccumulationSource::Rows, true) => "counts rows, negated".to_string(),
                 };
                 sql.push_str(&format!(
-                    "-- `{entity}.{}` {how} of `{table}` keyed by `{key}`: {}\n",
+                    "-- `{entity}.{}` {how} of `{table}` keyed by {key}: {}\n",
                     a.field,
                     a.citation.display()
                 ));
@@ -584,7 +590,7 @@ fn write_entities(
 
         let mut inner: Vec<String> = Vec::new();
         for ((table, key), list) in &arms {
-            let mut cols = vec![format!("    \"{key}\" AS \"id\"")];
+            let mut cols = vec![format!("    {key} AS \"id\"")];
             for f in &fields {
                 match list.iter().find(|a| &a.field == f) {
                     Some(a) => match &a.source {
@@ -1262,6 +1268,38 @@ fn fill_id_columns(
             selects.entry("id".into()).or_default().insert(table, col);
         }
     }
+}
+
+/// The literal key a singleton entity is constructed with, in a handler that writes `table`.
+///
+/// Mirrors [`id_column_for_table`] - same traversal, same handler-to-table resolution - but looks for the
+/// constant rather than a column. Kept separate rather than folded in, because a column key and a literal
+/// key render differently at the call site and one `Option<String>` hiding which it got is the shape that
+/// invites a mistake.
+fn literal_key_for_table(
+    entity: &str,
+    table: &str,
+    mappings: &crate::port_report::Mappings,
+    config: &Config,
+) -> Option<String> {
+    for func in mappings.functions.values() {
+        if func.kind == crate::port_report::HandlerKind::Block {
+            continue;
+        }
+        let Some(handler) = event_handler_for(func, mappings) else {
+            continue;
+        };
+        let Some(t) = table_for_handler(&handler.name, mappings, config) else {
+            continue;
+        };
+        if t != table {
+            continue;
+        }
+        if let Some(lit) = crate::port_report::entity_id_literal(entity, func) {
+            return Some(lit);
+        }
+    }
+    None
 }
 
 fn id_column_for_table(

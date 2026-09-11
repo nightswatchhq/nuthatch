@@ -1525,6 +1525,106 @@ export function handlePoolSwap(event: Swap): void {
     );
 }
 
+/// A singleton the mapping keys with a constant gets that constant as its key.
+///
+/// `new Protocol('1')` has no key *in the data*, because the key is in the mapping. The emitter reported
+/// "nothing in the mapping identifies which `Protocol` a row belongs to, so there is no key to group by" -
+/// true as written and the wrong conclusion (#1313).
+///
+/// Neither pinned target exercises this: Uniswap's `PoolManager` is keyed by a local holding an address,
+/// and Carbon's `Protocol` likewise. So this test is the only thing that holds the shape, which is worth
+/// saying out loud rather than leaving a reader to assume a fixture covers it.
+#[test]
+fn a_singleton_keyed_by_a_constant_groups_by_that_constant() {
+    const SCHEMA: &str = r#"
+type Protocol @entity {
+  id: ID!
+  txCount: BigInt!
+  totalFees: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let protocol = new Protocol('1')
+  protocol.txCount = protocol.txCount.plus(ONE_BI)
+  protocol.totalFees = protocol.totalFees.plus(event.params.fee)
+  protocol.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    let entity = result
+        .entities
+        .iter()
+        .find(|e| e.entity == "Protocol")
+        .unwrap_or_else(|| {
+            panic!(
+                "a singleton's totals must be emitted: {:?}",
+                result.entities
+            )
+        });
+
+    assert!(
+        entity.sql.contains("'1' AS \"id\""),
+        "the constant is the key:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("GROUP BY \"id\""),
+        "and it still groups, so one row comes out:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"txCount\") AS \"txCount\"")
+            && entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "both totals fold:\n{}",
+        entity.sql
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|f| f.entity == "Protocol" && f.why.contains("no key to group by")),
+        "nothing should still be skipped for want of a key: {:?}",
+        result.skipped_fields
+    );
+}
+
+/// A key that is neither a column nor a constant is still named rather than guessed at.
+///
+/// Uniswap keys `PoolManager` by `poolManagerAddress`, a local holding an address that the function body
+/// does not declare - it comes from a constants module. Resolving that would mean reading imports, and
+/// guessing would mean grouping a protocol-wide total by something arbitrary.
+#[test]
+fn a_key_that_is_neither_a_column_nor_a_constant_is_named() {
+    const SCHEMA: &str = r#"
+type Protocol @entity {
+  id: ID!
+  txCount: BigInt!
+}
+"#;
+    const MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let protocol = new Protocol(PROTOCOL_ADDRESS)
+  protocol.txCount = protocol.txCount.plus(ONE_BI)
+  protocol.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(SCHEMA, MAPPING);
+    assert!(
+        result.entities.iter().all(|e| e.entity != "Protocol"),
+        "an unresolvable key must not be guessed at: {:?}",
+        result.entities
+    );
+    assert!(
+        result
+            .skipped_fields
+            .iter()
+            .any(|f| f.entity == "Protocol" && f.why.contains("no key to group by")),
+        "and it must be named: {:?}",
+        result.skipped_fields
+    );
+}
+
 /// An arm that does not write a field contributes **zero**, not NULL.
 ///
 /// `sum` skips NULLs, so for a key that appears only in arms which do not write the field, a NULL fill
