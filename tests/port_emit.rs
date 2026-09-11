@@ -1801,3 +1801,165 @@ export function handlePoolCreated(event: PoolCreated): void {
             .collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1313: a field the mappings only ever set to a constant.
+// ---------------------------------------------------------------------------------------------
+
+/// Ten of Uniswap V4's forty-four initialiser-reported fields are this shape: `pool.collectedFeesUSD
+/// = ZERO_BD` at creation and nothing in any mapping ever touches it again. Searching for a decoded
+/// column finds none, and the field was reported unanswered - a missing number where the exact one
+/// is known and is zero.
+const CONSTANT_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+  collectedFeesUSD: BigDecimal!
+}
+"#;
+
+const CONSTANT_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+
+#[test]
+fn a_field_the_mappings_only_ever_set_to_a_constant_is_projected_as_that_constant() {
+    let (nest, result) = emitted_nest(CONSTANT_SCHEMA, CONSTANT_MAPPING);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "the constant must be projected as its literal:\n{sql}"
+    );
+    assert!(
+        view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "and listed, so the generated check projects it and coverage counts it: {:?}",
+        view.exact_fields
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|s| s.name().contains("collectedFeesUSD")),
+        "a field answered exactly must not also be named unanswered: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+    // Projected once, in the outer select. A per-arm literal needs a presence marker that is `TRUE`
+    // unconditionally, and a guard that cannot fail is worse than no guard: it reads as one.
+    assert_eq!(
+        sql.matches("AS \"collectedFeesUSD\"").count(),
+        1,
+        "the literal belongs in one place:\n{sql}"
+    );
+    assert!(
+        !sql.contains("__present__collectedFeesUSD"),
+        "and needs no presence marker, having no arm that could omit it:\n{sql}"
+    );
+
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}
+
+#[test]
+fn a_field_assigned_two_different_constants_is_not_constant() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+export function handleOther(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.collectedFeesUSD = ONE_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a field that is 0 on one path and 1 on another is not constant, and guessing either is a \
+         wrong number rather than a missing one:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}
+
+#[test]
+fn a_field_also_assigned_a_real_value_is_not_constant() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.collectedFeesUSD = event.params.tickSpacing
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("0 AS \"collectedFeesUSD\""),
+        "initialised to zero and later assigned a decoded value is not a constant - freezing it at \
+         zero is the worst outcome available here:\n{sql}"
+    );
+    assert!(
+        sql.contains("last(\"collectedFeesUSD\""),
+        "it resolves through its column like any other field:\n{sql}"
+    );
+}
+
+#[test]
+fn a_constant_on_an_entity_with_no_column_is_named_rather_than_claimed() {
+    let (_nest, result) = emitted_nest(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Bundle"),
+        "a constant is not a row source, so `Bundle` still gets no view: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    let named = result
+        .skipped_fields
+        .iter()
+        .find(|s| s.name() == "Bundle.ethPriceUSD")
+        .unwrap_or_else(|| {
+            panic!(
+                "the constant must be named unanswered, not silently dropped: {:?}",
+                result
+                    .skipped_fields
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        named.why.contains("no row"),
+        "and the reason must say why a known value is still unanswered: {}",
+        named.why
+    );
+}
