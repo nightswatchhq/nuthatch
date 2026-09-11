@@ -480,3 +480,66 @@ fn the_workflow_fetches_and_passes_the_new_inputs() {
         "nothing fetches this reviewer's previous comments, so pr.prior_reviews is always empty"
     );
 }
+
+/// A large file must not evict the files after it (#1282).
+///
+/// The budget used to be spent as `diff[:MAX_DIFF_CHARS]`, which is path order, so one oversized file
+/// took the whole allowance and every file sorted after it was simply absent from the review. Measured
+/// on #1282: an 847,499-character recorded introspection fixture was 73% of a 1,161,244-character diff,
+/// the cut landed inside it, and the entire test file that proved the change correct was invisible. The
+/// reviewer then raised the same finding four passes running while every reply cited tests it had never
+/// been shown - reasoning correctly from a mutilated input.
+///
+/// Now the largest files are shortened instead, so every smaller file arrives whole.
+#[test]
+fn one_huge_file_does_not_evict_the_files_after_it() {
+    let dir = fixtures();
+    let base = dir.path().join("base");
+    std::fs::write(&base, "main").expect("write base");
+
+    // Named so git's path order puts the big one first, which is the case that used to lose the rest.
+    let big = "x".repeat(900_000);
+    let diff = format!(
+        "diff --git a/a_huge.json b/a_huge.json\n+{big}\n\
+         diff --git a/b_small.rs b/b_small.rs\n+fn the_assertion_that_proves_it() {{}}\n\
+         diff --git a/c_small.rs b/c_small.rs\n+fn another_one() {{}}\n"
+    );
+    let path = dir.path().join("diff-big");
+    std::fs::write(&path, &diff).expect("write diff");
+
+    let out = Command::new("python3")
+        .arg(root().join("scripts/pr-review.py"))
+        .arg("--diff")
+        .arg(&path)
+        .args(["--title", "a pull request with a recorded fixture in it", "--dry-run"])
+        .arg("--base-file")
+        .arg(&base)
+        .output()
+        .expect("run pr-review.py");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let prompt = String::from_utf8_lossy(&out.stdout);
+
+    for want in [
+        "b_small.rs",
+        "the_assertion_that_proves_it",
+        "c_small.rs",
+        "another_one",
+    ] {
+        assert!(
+            prompt.contains(want),
+            "{want} was evicted by the large file; the reviewer would not see it"
+        );
+    }
+    // The big file is present but shortened, and says so where it was cut, so the reviewer does not
+    // read a part for the whole.
+    assert!(prompt.contains("a_huge.json"), "the large file is still named");
+    assert!(
+        prompt.contains("this file was shortened to fit the review budget"),
+        "a shortened file must say so inline"
+    );
+    assert!(
+        prompt.len() < 420_000,
+        "the budget is still enforced: {} chars",
+        prompt.len()
+    );
+}
