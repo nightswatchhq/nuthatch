@@ -3271,43 +3271,168 @@ fn entity_field_event_column(
     {
         return None;
     }
-    // This function first, then the helpers it calls. Nothing else.
-    let mut bodies: Vec<&FunctionInfo> = vec![func];
-    for callee in &func.calls {
-        if let Some(f) = functions.get(callee) {
-            bodies.push(f);
+    // **This body only, and only a receiver bound fresh in it.**
+    //
+    // The first version of this took the handler plus every function it calls, matched a local by name
+    // and entity type, and accepted an event assignment from any of those bodies. Jules found the
+    // counter-example on #1316: a handler that does `let transaction = Transaction.load(id)`, calls a
+    // helper that happens to bind its own local of the same name and entity and writes
+    // `transaction.timestamp = event.block.timestamp`, and the read resolves to `block_timestamp`
+    // while the handler's receiver still holds whatever an earlier block stored. A name and a type are
+    // not a value flow.
+    //
+    // So: the binding must be `new Entity(..)` in this body, which is the one case where nothing was
+    // read back from the store, and the assignment must be in this body too. A `load()`ed receiver
+    // carries an earlier block's value and is refused; the helper-return shape needs the returned
+    // value tracked through the call and is not this change.
+    if let Some((entity, fresh)) = local_entity_binding(&func.body, recv) {
+        if !fresh {
+            return None;
         }
-    }
-    // **Which entity the receiver holds, not just the field name.** Matching on the field name alone would
-    // let any entity's `timestamp` answer for any other's - two unrelated fields that happen to share a
-    // name, and the column would be right only by luck.
-    let entity = bodies
-        .iter()
-        .find_map(|f| local_entity_name(&f.body, recv))?;
-    for f in &bodies {
-        for asg in &f.assignments {
+        // **Every** assignment to the field here, not the first one that happens to be an event column.
+        // One later assignment from anything else and the value at the read is not this event's.
+        let mut col = None;
+        for asg in &func.assignments {
             if asg.field != field || asg.entity != entity {
                 continue;
             }
-            if let Some(col) = event_column(&asg.expr) {
-                return Some(col);
-            }
+            col = Some(event_column(&asg.expr)?);
+        }
+        return col;
+    }
+    // The receiver is the return value of a helper this body calls: `const transaction =
+    // loadTransaction(event)`. That is the common shape and it is followable, because the entity comes
+    // from the helper's own binding rather than from a name that matched.
+    let rhs = local_assignment(&func.body, recv)?;
+    let callee = rhs.split('(').next()?.trim();
+    if !func.calls.contains(callee) {
+        return None;
+    }
+    returned_field_event_column(functions.get(callee)?, field)
+}
+
+/// The event column a field of the entity a helper returns is known to hold, on every path out of it.
+///
+/// `loadTransaction` is the shape: load by the transaction hash, `new` it if absent, then set
+/// `timestamp` from `event.block.timestamp` before returning. The value is this event's whether or not
+/// the row already existed, and that is what makes the caller's `transaction.timestamp` exact.
+fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<String> {
+    let var = returned_local(&helper.body)?;
+    let (entity, _) = local_entity_binding(&helper.body, &var)?;
+    // `id` is never assigned: it is the argument the row was bound with. Every binding of that local has
+    // to carry the same argument, because a `load` on one path and a `new` on another each set it.
+    if field == "id" {
+        let args = binding_arguments(&helper.body, &var);
+        let first = args.first()?;
+        if args.len() < 2 || args.iter().any(|a| a != first) {
+            return None;
+        }
+        return event_column(first);
+    }
+    // Assigned from an event, every time, and at least once at the body's top level so that it happens
+    // on every path rather than only the one an `if` took.
+    let mut col = None;
+    let mut unconditional = false;
+    for asg in &helper.assignments {
+        if asg.field != field || asg.entity != entity {
+            continue;
+        }
+        let c = event_column(&asg.expr)?;
+        if col.as_ref().is_some_and(|prev| prev != &c) {
+            return None;
+        }
+        unconditional |= assigned_unconditionally(helper, asg);
+        col = Some(c);
+    }
+    if unconditional {
+        col
+    } else {
+        None
+    }
+}
+
+/// The local a function returns, from `return x` or `return x as Entity`.
+fn returned_local(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("return ") else {
+            continue;
+        };
+        let v = rest.trim().trim_end_matches(';').trim();
+        let v = v.split(" as ").next().unwrap_or(v).trim();
+        if !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(v.to_string());
         }
     }
     None
 }
 
-/// The entity type a local holds, from `let x = new Entity(..)`, `Entity.load(..)` or `Entity.create(..)`.
-fn local_entity_name(body: &str, var: &str) -> Option<String> {
+/// Every argument a local was bound with, across `new Entity(..)` and `Entity.load(..)` alike.
+fn binding_arguments(body: &str, var: &str) -> Vec<String> {
+    let mut args = Vec::new();
     let mut i = 0usize;
     while i < body.len() {
         let hit = match_let_new(body, i)
             .or_else(|| match_bare_new(body, i))
-            .or_else(|| match_let_load(body, i))
-            .or_else(|| match_let_create(body, i));
-        if let Some((v, ent, next)) = hit {
+            .or_else(|| match_let_create(body, i))
+            .or_else(|| match_let_load(body, i));
+        if let Some((v, _ent, open)) = hit {
             if v == var {
-                return Some(ent);
+                if let Some(a) = take_paren_list(body, open).into_iter().next() {
+                    args.push(collapse_ws(&strip_converters(&a)).trim().to_string());
+                }
+            }
+            i = open.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    args
+}
+
+/// Whether an assignment sits at the top level of the function body, so every path runs it.
+///
+/// Brace depth, counted to the assignment's line. An assignment inside an `if` sets the field on one
+/// path and leaves whatever was stored on the other, and a field set on only one path is not the
+/// event's value on the other.
+fn assigned_unconditionally(func: &FunctionInfo, asg: &Assignment) -> bool {
+    let Some(idx) = asg.citation.line.checked_sub(func.body_start_line) else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for (n, line) in func.body.lines().enumerate() {
+        if n == idx {
+            return depth == 0;
+        }
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// The entity a local holds, and whether it was bound fresh rather than read back from the store.
+///
+/// `new Entity(..)` and `Entity.create(..)` are fresh: every field of that row is whatever this
+/// invocation puts there. `Entity.load(..)` is not - the row already existed, written by some earlier
+/// block, so its fields are stored state.
+fn local_entity_binding(body: &str, var: &str) -> Option<(String, bool)> {
+    let mut i = 0usize;
+    while i < body.len() {
+        let fresh = match_let_new(body, i)
+            .or_else(|| match_bare_new(body, i))
+            .or_else(|| match_let_create(body, i));
+        let hit = match fresh {
+            Some((v, ent, next)) => Some((v, ent, next, true)),
+            None => match_let_load(body, i).map(|(v, ent, next)| (v, ent, next, false)),
+        };
+        if let Some((v, ent, next, fresh)) = hit {
+            if v == var {
+                return Some((ent, fresh));
             }
             i = next.max(i + 1);
             continue;
@@ -4006,6 +4131,126 @@ export function handleSwap(event: SwapEvent): void {
         );
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Swap", "timestamp"), Class::Exact);
+    }
+
+    /// A helper's same-named local is a different binding (Jules, #1316).
+    ///
+    /// ```ts
+    /// const transaction = Transaction.load(id)   // an earlier block wrote this row
+    /// touch(event)                               // binds its own `transaction`, sets it from the event
+    /// swap.timestamp = transaction.timestamp     // still the earlier block's value
+    /// ```
+    ///
+    /// The first version of the one-hop read matched the receiver by variable name and entity type across
+    /// the handler and every function it called, so the helper's assignment answered for the handler's
+    /// receiver. A name and a type are not a value flow.
+    #[test]
+    fn a_helpers_same_named_local_does_not_answer_for_a_loaded_receiver() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function touch(event: ethereum.Event): void {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  transaction.timestamp = event.block.timestamp
+  transaction.save()
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  touch(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "a loaded receiver holds whatever an earlier block stored, whatever a helper called its own \
+             local"
+        );
+    }
+
+    /// A field the helper sets on only one path out is not the event's value on the other.
+    ///
+    /// `loadTransaction` is exact because it overwrites `timestamp` *after* the `if`. Move that line
+    /// inside the branch and the already-existing row keeps the timestamp of the block that created it.
+    #[test]
+    fn a_field_the_helper_sets_on_one_path_only_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let conditional = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  if (transaction === null) {
+    transaction = new Transaction(event.transaction.hash.toHex())
+    transaction.timestamp = event.block.timestamp
+  }
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", conditional);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "set inside the `if`, so a row that already existed keeps the older block's timestamp"
+        );
+
+        // The same helper with that line after the branch is the real `loadTransaction`, and it is exact.
+        let unconditional = conditional.replace(
+            "    transaction = new Transaction(event.transaction.hash.toHex())\n    transaction.timestamp = event.block.timestamp\n  }",
+            "    transaction = new Transaction(event.transaction.hash.toHex())\n  }\n  transaction.timestamp = event.block.timestamp",
+        );
+        assert_ne!(unconditional, conditional, "the fixture edit must apply");
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", &unconditional);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions).as_deref(),
+            Some("block_timestamp"),
+            "overwritten on every path out, so the caller's read is this event's value"
+        );
     }
 
     /// A field written only in a **different** handler is not this row's value.
