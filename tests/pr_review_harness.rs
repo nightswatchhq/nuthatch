@@ -554,3 +554,57 @@ fn one_huge_file_does_not_evict_the_files_after_it() {
         prompt.len()
     );
 }
+
+/// The budget holds even when the per-file cap is smaller than the marker that says a file was cut.
+///
+/// `cap - len(marker)` floors at zero, so a shortened section used to contribute the *marker's* length
+/// rather than `cap` - and enough shortened files, or a header larger than the budget, then overran the
+/// very budget the per-file split exists to enforce. Found by review on #1285. The marker now lives
+/// inside the cap, so a shortened section is exactly `cap` characters.
+#[test]
+fn the_budget_holds_when_the_cap_is_smaller_than_the_marker() {
+    let dir = fixtures();
+    let script = root().join("scripts/pr-review.py");
+
+    // Exercised through Python directly: these are budgets the CLI never passes, and the point is the
+    // arithmetic rather than the plumbing.
+    let probe = dir.path().join("probe.py");
+    std::fs::write(
+        &probe,
+        format!(
+            r#"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("prr", {script:?})
+m = importlib.util.module_from_spec(spec)
+sys.modules["prr"] = m
+spec.loader.exec_module(m)
+cases = [
+    ("".join("diff --git a/f%d b/f%d\n+%s\n" % (i, i, "x" * 5000) for i in range(200)), 1000),
+    ("".join("diff --git a/f%d b/f%d\n+%s\n" % (i, i, "x" * 5000) for i in range(50)), 100),
+    ("preamble " * 500 + "diff --git a/f b/f\n+x\n", 200),
+    ("diff --git a/f b/f\n+xxxx\n", 0),
+]
+for diff, budget in cases:
+    out, _ = m.budget_diff(diff, budget)
+    assert len(out) <= budget, "budget %d exceeded by %d" % (budget, len(out) - budget)
+print("all budgets held")
+"#
+        ),
+    )
+    .expect("write probe");
+
+    let out = Command::new("python3")
+        .arg(&probe)
+        .output()
+        .expect("run the probe");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("all budgets held"),
+        "the probe did not reach its own conclusion"
+    );
+}

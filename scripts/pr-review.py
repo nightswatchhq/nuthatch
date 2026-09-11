@@ -340,6 +340,9 @@ def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]
     head, files = ("", sections) if sections[0].startswith("diff --git ") else (sections[0], sections[1:])
     if not files:
         return (diff[:budget], [(("(whole diff)"), budget, len(diff))] if len(diff) > budget else [])
+    # The header is whatever precedes the first `diff --git`, normally empty. Capped anyway, so a
+    # budget smaller than the header cannot make every later arithmetic step negative.
+    head = head[:budget]
     room = max(budget - len(head), 0)
     sizes = [len(f) for f in files]
     if sum(sizes) <= room:
@@ -361,10 +364,19 @@ def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]
             continue
         path = section.split("\n", 1)[0].removeprefix("diff --git ").split(" b/")[-1]
         note = f"\n[pr-review: this file was shortened to fit the review budget; {len(section) - cap:,} characters are not shown]\n"
-        keep = max(cap - len(note), 0)
-        out.append(section[:keep] + note)
-        elided.append((path, keep, len(section)))
-    return ("".join(out), elided)
+        # **The marker is inside the cap, not on top of it.** `cap - len(note)` floors at zero, so a cap
+        # smaller than the marker used to contribute the marker's length instead of `cap` - and enough
+        # shortened files, or a cap of zero, then overran the very budget this function exists to
+        # enforce. Trimming the joined string makes a shortened section exactly `cap` characters, which
+        # is what the allocation above already assumed.
+        kept = (section[: max(cap - len(note), 0)] + note)[:cap]
+        out.append(kept)
+        elided.append((path, len(kept), len(section)))
+    joined = "".join(out)
+    # The allocation is exact, so this holds by construction; asserted because a silent overrun is the
+    # failure the per-file split was written to remove.
+    assert len(joined) <= budget, f"budget {budget} exceeded by {len(joined) - budget}"
+    return (joined, elided)
 
 
 def main():
