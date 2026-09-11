@@ -137,7 +137,7 @@ fn bytes_and_string_operator_sets_are_the_reference_ones() {
         .filter(|n| *n == "sender" || n.starts_with("sender_"))
         .map(|n| n.trim_start_matches("sender").to_string())
         .collect();
-    let ours: BTreeSet<String> = graph_schema::filter_suffixes("Bytes")
+    let ours: BTreeSet<String> = graph_schema::filter_suffixes("Bytes", false)
         .into_iter()
         .map(|s| s.to_string())
         .collect();
@@ -152,9 +152,34 @@ fn bytes_and_string_operator_sets_are_the_reference_ones() {
         "Bytes has no prefix or case-insensitive operators in the reference: {ours:?}"
     );
     assert_eq!(
-        graph_schema::filter_suffixes("String").len(),
+        graph_schema::filter_suffixes("String", false).len(),
         20,
         "String carries the numeric set plus twelve text operators"
+    );
+
+    // **An enum carries four, and the reference cannot tell us so.**
+    //
+    // The recorded Uniswap V4 schema declares no author enum at all - every enum in the recording is a
+    // graph-node builtin (`OrderDirection`, `_SubgraphErrorPolicy_`, `Aggregation_*`, `LogLevel`) or a
+    // generated `_orderBy`. So this row was generalised from the numeric set and carried four operators
+    // graph-node does not have (#1306).
+    //
+    // Asserted against graph-node's own `field_enum_filter_input_values`
+    // (`graph/src/schema/api.rs`, MIT/Apache), which returns exactly `["", "not", "in", "not_in"]`, and
+    // confirmed on three unrelated live deployments: `Pair.type: PairType`,
+    // `ChainlinkPrice.period: PricePeriod` and `GovernanceFramework.type: GovernanceFrameworkType` each
+    // answered four. A constant rather than a diff, because the thing this file diffs against is silent
+    // on the question.
+    assert_eq!(
+        graph_schema::filter_suffixes("OrderType", true),
+        vec!["", "_not", "_in", "_not_in"],
+        "an enum has no ordering, so no comparison operators"
+    );
+    assert!(
+        !graph_schema::filter_suffixes("OrderType", true)
+            .iter()
+            .any(|o| matches!(*o, "_gt" | "_lt" | "_gte" | "_lte")),
+        "a comparison on an enum is an ordering graph-node does not define"
     );
 }
 

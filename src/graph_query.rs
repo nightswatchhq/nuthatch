@@ -1345,13 +1345,17 @@ fn lower_predicate(
         let Some(f) = ent.fields.iter().find(|x| x.name == field) else {
             continue;
         };
-        // The operator has to be one the generated schema declares for *this* field's type, which
-        // `filter_suffixes` derives from the recorded reference. `Bytes` carries ten operators and
-        // `String` eighteen - no `_starts_with`, no `_nocase` on `Bytes` - so accepting one here would
-        // answer a query a client's own validator, built from our schema, would have refused.
+        // The operator has to be one the generated schema declares for *this* field's type. `Bytes`
+        // carries ten operators and `String` twenty - no `_starts_with`, no `_nocase` on `Bytes` - so
+        // accepting one here would answer a query a client's own validator, built from our schema, would
+        // have refused.
+        //
+        // **An enum carries four and none of them is a comparison.** It has no ordering, so `type_gt`
+        // lowered to `b."type" > 'order0'` answered a plausible row set for an ordering graph-node does
+        // not define - a wrong answer with no error, from a query the real endpoint rejects (#1306).
         let allowed =
             f.ty.filter_scalar()
-                .map(graph_schema::filter_suffixes)
+                .map(|sc| graph_schema::filter_suffixes(sc, schema.enums.contains_key(sc)))
                 .unwrap_or_default();
         if !allowed.contains(suffix) {
             return Err(Unsupported::Operator(key.to_string()));
@@ -1566,6 +1570,54 @@ type Swap @entity { id: ID! pool: Pool! }
                 Err(other) => panic!("{q:?} was refused as {other:?}, not a syntax error"),
             }
         }
+    }
+
+    /// An enum field takes four operators, and a comparison is not one of them.
+    ///
+    /// An enum has no ordering. `type_gt: order0` lowered to `b."type" > 'order0'` and answered a
+    /// plausible row set off the *string* ordering of the value names - a wrong answer with no error,
+    /// from a query the real endpoint rejects outright.
+    ///
+    /// The recorded reference could not catch this: Uniswap V4's schema declares no author enum, so the
+    /// row was generalised from the numeric set. graph-node's `field_enum_filter_input_values` returns
+    /// exactly `["", "not", "in", "not_in"]`, and three unrelated live deployments answered four
+    /// (#1306).
+    #[test]
+    fn a_comparison_on_an_enum_field_is_refused() {
+        let sch = graph_schema::parse(
+            "enum OrderType { order0 order1 }\n\
+             type Order @entity { id: ID! type: OrderType! size: BigInt! }\n",
+        )
+        .expect("parse");
+
+        // The four it does have.
+        for q in [
+            r#"{ orders(where: { type: order0 }) { id } }"#,
+            r#"{ orders(where: { type_not: order0 }) { id } }"#,
+            r#"{ orders(where: { type_in: [order0, order1] }) { id } }"#,
+            r#"{ orders(where: { type_not_in: [order0] }) { id } }"#,
+        ] {
+            compile(&sch, &one(q)).unwrap_or_else(|e| panic!("{q} must compile: {e}"));
+        }
+
+        // The four it does not.
+        for q in [
+            r#"{ orders(where: { type_gt: order0 }) { id } }"#,
+            r#"{ orders(where: { type_lt: order0 }) { id } }"#,
+            r#"{ orders(where: { type_gte: order0 }) { id } }"#,
+            r#"{ orders(where: { type_lte: order0 }) { id } }"#,
+        ] {
+            let e = compile(&sch, &one(q)).expect_err(&format!("{q} must be refused"));
+            assert!(
+                matches!(e, Unsupported::Operator(_)),
+                "{q} was refused as {e:?}, which is not an operator refusal"
+            );
+        }
+
+        // And the numeric field beside it keeps its comparisons, so the refusal is about the enum and
+        // not about comparisons generally.
+        compile(&sch, &one(r#"{ orders(where: { size_gt: "5" }) { id } }"#))
+            .expect("a numeric comparison still compiles");
     }
 
     /// A singular root without `id` is refused, in graph-node's words.

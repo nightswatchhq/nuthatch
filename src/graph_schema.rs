@@ -506,13 +506,24 @@ pub fn lower_first(name: &str) -> String {
 
 /// Comparison suffixes for a filter field, by the scalar it compares.
 ///
-/// **These sets are not uniform and `Bytes` is not `String`.** Measured on the reference:
-/// `Bytes` has no `_starts_with`, no `_ends_with` and no `_nocase` variant anywhere - ten operators
-/// against `String`'s eighteen. Generalising the string set over `Bytes` would advertise eight
-/// operators graph-node does not have, and a client validating against us would then send queries the
-/// real endpoint refuses.
-pub fn filter_suffixes(scalar: &str) -> Vec<&'static str> {
+/// **These sets are not uniform, `Bytes` is not `String`, and an enum is not a scalar.** `Bytes` has no
+/// `_starts_with`, no `_ends_with` and no `_nocase` variant anywhere - ten operators against `String`'s
+/// twenty. Generalising the string set over `Bytes` would advertise ten operators graph-node does not
+/// have, and a client validating against us would then send queries the real endpoint refuses.
+///
+/// Checked against graph-node's own `field_filter_ops` and `field_enum_filter_input_values`
+/// (`graph/src/schema/api.rs`, MIT/Apache, so readable), which is a better reference than a recording:
+/// it gives the complete table for every type at once rather than whichever shapes one subgraph
+/// happens to use. The recorded Uniswap V4 schema declares **no author enum at all** - every enum in it
+/// is a graph-node builtin or a generated `_orderBy` - so the enum row below was generalised from the
+/// numeric set and was wrong by four operators (#1306). Confirmed on three unrelated live deployments.
+pub fn filter_suffixes(scalar: &str, is_enum: bool) -> Vec<&'static str> {
     let ordered = ["", "_not", "_gt", "_lt", "_gte", "_lte", "_in", "_not_in"];
+    if is_enum {
+        // `field_enum_filter_input_values` returns exactly these. An enum has no ordering, so there is
+        // no `_gt`/`_lt`/`_gte`/`_lte` to offer.
+        return vec!["", "_not", "_in", "_not_in"];
+    }
     let mut v: Vec<&'static str> = match scalar {
         "Boolean" => vec!["", "_not", "_in", "_not_in"],
         "Bytes" => vec![
@@ -547,7 +558,7 @@ pub fn filter_suffixes(scalar: &str) -> Vec<&'static str> {
             }
             s
         }
-        // BigInt, BigDecimal, Int, Int8, Timestamp, and any schema enum.
+        // BigInt, BigDecimal, Int, Int8, Timestamp.
         _ => ordered.to_vec(),
     };
     v.dedup();
@@ -659,7 +670,8 @@ impl Schema {
     ///
     /// | field shape | what graph-node generates |
     /// |---|---|
-    /// | scalar or enum | that scalar's operator set, `_in`/`_not_in` in list form |
+    /// | scalar | that scalar's operator set, `_in`/`_not_in` in list form |
+    /// | enum | **four** - bare, `_not`, `_in`, `_not_in`. An enum has no ordering (#1306) |
     /// | relation (`Token`) | the `String` set on the bare name, **plus** `<name>_: Token_filter` |
     /// | list (`[Pool!]!`) | six list-typed operators - bare, `_not`, `_contains`, `_contains_nocase`, `_not_contains`, `_not_contains_nocase` - plus `<name>_: Pool_filter` |
     /// | `@derivedFrom` | **only** `<name>_: Target_filter`, no scalar comparison at all |
@@ -698,7 +710,7 @@ impl Schema {
                     let Some(scalar) = ty.filter_scalar() else {
                         continue;
                     };
-                    for suffix in filter_suffixes(scalar) {
+                    for suffix in filter_suffixes(scalar, self.enums.contains_key(scalar)) {
                         // `[BigInt!]`: the inner type is non-null, the list itself is not. Read off
                         // the reference - a first pass wrote `[BigInt]` and only the full
                         // introspection diff could see it, because the name-level sweeps compare
