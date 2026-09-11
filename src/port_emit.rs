@@ -861,28 +861,22 @@ fn always_constant(
     field: &str,
     mappings: &crate::port_report::Mappings,
 ) -> Option<String> {
+    // No "was anything assigned at all" flag: a non-literal assignment returns below, so `seen` is
+    // `Some` exactly when every assignment was the same literal and there was at least one.
     let mut seen: Option<String> = None;
-    let mut any = false;
     for func in mappings.functions.values() {
         for asg in &func.assignments {
             if asg.entity != entity || asg.field != field {
                 continue;
             }
-            any = true;
-            let Some(lit) = constant_literal(&asg.expr) else {
-                return None;
-            };
+            let lit = constant_literal(&asg.expr)?;
             match &seen {
                 Some(prev) if prev != &lit => return None,
                 _ => seen = Some(lit),
             }
         }
     }
-    if any {
-        seen
-    } else {
-        None
-    }
+    seen
 }
 
 /// A subgraph's zero and one conventions, as SQL. Nothing else: an unrecognised constant yields no
@@ -1529,7 +1523,7 @@ mod tests {
         put(&mut selects, "id", "factory__token_updated", "token");
         put(&mut selects, "symbol", "factory__pool_created", "sym");
         put(&mut selects, "name", "factory__token_updated", "name");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1622,7 +1616,7 @@ mod tests {
         put(&mut selects, "id", "factory__token_updated", "token");
         put(&mut selects, "symbol", "factory__pool_created", "token0");
         put(&mut selects, "name", "factory__token_updated", "name");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
         assert!(sql.contains("UNION ALL"), "{sql}");
         assert!(sql.contains("GROUP BY \"id\""), "{sql}");
         assert!(
@@ -1649,7 +1643,7 @@ mod tests {
         let mut selects = BTreeMap::new();
         put(&mut selects, "id", "factory__pool_created", "token0");
         put(&mut selects, "symbol", "factory__pool_created", "token0");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
         assert!(!sql.contains("UNION ALL"), "{sql}");
         assert!(!sql.contains("NULL AS"), "{sql}");
         assert!(sql.contains("GROUP BY \"id\""), "{sql}");
