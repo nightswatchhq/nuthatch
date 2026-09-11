@@ -543,9 +543,10 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         // comment above says it should not - silently, unless we say so.
         if events.is_empty() && ds.has_non_event_handlers {
             notes.push(format!(
-                "`{}` declares only block/call handlers, which nuthatch has no equivalent for - \
-                 it indexes logs. This contract will index **every** event its ABI defines; \
-                 narrow it with `events = [...]` in nuthatch.toml if that is not what you want",
+                "`{}` declares only block/call handlers. A block handler has no equivalent; a \
+                 call handler is `[extract] top_level_calls = true`. This contract will index \
+                 **every** event its ABI defines; narrow it with `events = [...]` in \
+                 nuthatch.toml if that is not what you want",
                 ds.name
             ));
         }

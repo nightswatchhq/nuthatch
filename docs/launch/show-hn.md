@@ -86,5 +86,6 @@ single file is the non-negotiable).
 - **"Is this a GraphOps product?"** → No. An operator is preparing a hosted offering and shares revenue
   to fund core dev; the permissive licence means anyone can host, fork or embed the identical software. Link
   GOVERNANCE.md - don't argue it, link it.
-- **"Events only is a dealbreaker for me because X"** → thank them, that's exactly the validation
-  signal; log it (docs/validation).
+- **"No traces / no time travel is a dealbreaker for me because X"** → thank them, that's exactly the
+  validation signal; log it (docs/validation). If they say "events only", correct it: `[[calls]]`
+  (pinned or one per event row), `[extract] top_level_calls` and `[[ipfs]]` all ship.

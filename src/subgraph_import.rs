@@ -71,10 +71,10 @@ pub struct ManifestSource {
     /// exists to be *reported* - diverging from the manifest silently is the thing this module
     /// is not allowed to do.
     pub end_block: Option<u64>,
-    /// True when the source declares `blockHandlers` or `callHandlers`. nuthatch indexes logs,
-    /// so those handlers have no equivalent - and a source carrying only them parses to an empty
-    /// event list, which in `[[contracts]]` means "index every event in the ABI", the opposite of
-    /// what the subgraph did.
+    /// True when the source declares `blockHandlers` or `callHandlers`. A block handler has no
+    /// equivalent and a call handler is `[extract] top_level_calls`, neither of which the import
+    /// writes - and a source carrying only them parses to an empty event list, which in
+    /// `[[contracts]]` means "index every event in the ABI", the opposite of what the subgraph did.
     pub has_non_event_handlers: bool,
     /// Event signatures with whitespace removed, e.g.
     /// `Transfer(indexedaddress,indexedaddress,uint256)` - folded scalars are collapsed so the
@@ -1146,7 +1146,7 @@ dataSources:
 
     /// Three ways the import can quietly diverge from the manifest, each of which has to reach
     /// the operator as a note rather than being absorbed: an `endBlock` a nest cannot express,
-    /// handlers nuthatch has no equivalent for, and a `source.abi` naming an entry that is not
+    /// handlers the import does not write config for, and a `source.abi` naming an entry that is not
     /// there. Asserted on the parse, which is what the reporting reads.
     #[test]
     fn divergences_from_the_manifest_are_visible() {
