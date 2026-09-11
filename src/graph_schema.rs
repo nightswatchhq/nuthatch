@@ -1230,6 +1230,46 @@ mod tests {
 
     /// A GraphQL block string is a legal place to write something that looks like a declaration.
     ///
+    /// The generated `<Entity>_filter` gives an enum field four inputs, and the `_in` form is a list of
+    /// the enum.
+    ///
+    /// Separate from the `filter_suffixes` assertion in `tests/graph_schema_golden.rs`, because that one
+    /// checks the table and this one checks that `filter_fields` consults it. A mutation making the
+    /// generation site pass `is_enum: false` survived until this existed: the helper was right and the
+    /// document still advertised eight (#1306).
+    #[test]
+    fn the_generated_filter_gives_an_enum_field_four_inputs() {
+        let s = parse(
+            "enum OrderType { order0 order1 }\n\
+             type Order @entity { id: ID! type: OrderType! size: BigInt! }\n",
+        )
+        .unwrap();
+        let fields = s.filter_fields("Order");
+        let ops: Vec<(String, String)> = fields
+            .iter()
+            .filter(|(n, _)| n == "type" || n.starts_with("type_"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("type".to_string(), "OrderType".to_string()),
+                ("type_not".to_string(), "OrderType".to_string()),
+                ("type_in".to_string(), "[OrderType!]".to_string()),
+                ("type_not_in".to_string(), "[OrderType!]".to_string()),
+            ],
+            "four inputs, and `_in`/`_not_in` take `[OrderType!]`"
+        );
+
+        // The numeric field beside it keeps its eight, so this is about the enum and not about the
+        // whole filter shrinking.
+        let numeric = fields
+            .iter()
+            .filter(|(n, _)| n == "size" || n.starts_with("size_"))
+            .count();
+        assert_eq!(numeric, 8, "BigInt keeps the ordered set: {fields:?}");
+    }
+
     /// A declaration boundary is lexical, not a line start.
     ///
     /// `type A @entity { id: ID! } type B @entity { id: ID! }` is legal GraphQL and the scan used to
