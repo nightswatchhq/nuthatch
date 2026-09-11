@@ -2180,3 +2180,62 @@ fn a_constant_on_an_entity_with_no_column_is_named_rather_than_claimed() {
         named.why
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1313 limit 3: a composed id reaches a SQL expression rather than a column.
+// ---------------------------------------------------------------------------------------------
+
+/// Five of Uniswap V4's event entities key on the transaction hash and the log index. Without the `id`
+/// the emitted view cannot fold on the entity at all, so the cost of a missing composed key is every
+/// other field on that view, not only the key.
+#[test]
+fn a_composed_id_is_emitted_as_a_concatenation() {
+    let schema = r#"
+type Swap @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let swap = new Swap(eventId(event.transaction.hash, event.logIndex))
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.plain = event.params.fee
+  swap.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Swap").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains(
+            "CAST(\"tx_hash\" AS VARCHAR) || '-' || CAST(\"log_index\" AS VARCHAR) AS \"id\""
+        ),
+        "the composed id must be emitted as the concatenation of its parts:\n{sql}"
+    );
+    assert!(
+        view.exact_fields.contains(&"id".to_string()),
+        "and be listed: {:?}",
+        view.exact_fields
+    );
+    // With an `id` the view folds, which is what the key is worth beyond itself.
+    assert!(
+        sql.contains("GROUP BY \"id\""),
+        "an answerable id must re-enable the fold:\n{sql}"
+    );
+
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}

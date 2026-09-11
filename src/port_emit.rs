@@ -947,7 +947,9 @@ fn view_for_entity(
 ) -> ViewDraft {
     let view_name = to_alias(entity);
     let mut comments = Vec::new();
-    // field → table → column. One field may be written from several triggering tables.
+    // field → table → **SQL expression**. One field may be written from several triggering tables, and
+    // what answers it is not always a bare column: a composed id is a concatenation of two of them. A
+    // plain column is stored already quoted, so what the arms render is unchanged for it.
     let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     // Fields with no column because they have no variation; projected as literals beside the rest.
     let mut constants: BTreeMap<String, String> = BTreeMap::new();
@@ -1130,8 +1132,8 @@ fn exact_select_sql(
                 .iter()
                 .flat_map(
                     |field| match selects.get(*field).and_then(|m| m.get(table)) {
-                        Some(col) => [
-                            format!("  \"{col}\" AS \"{field}\""),
+                        Some(expr) => [
+                            format!("  {expr} AS \"{field}\""),
                             format!("  TRUE AS \"{PRESENT}{field}\""),
                         ],
                         None => [
@@ -1322,22 +1324,70 @@ fn map_exact_field_tables(
             if asg.entity != field.entity || asg.field != field.field {
                 continue;
             }
-            let Some(col) = assignment_event_column(asg, func, &mappings.functions) else {
-                continue;
+            // A bare column first, then a composition of them. Order matters only for clarity: a single
+            // value is not a concatenation, and `expr_concat_parts` refuses one.
+            let simple = assignment_event_column(asg, func, &mappings.functions);
+            let composed = if simple.is_none() {
+                crate::port_report::expr_concat_parts(&asg.expr, func, &mappings.functions)
+            } else {
+                None
             };
+            if simple.is_none() && composed.is_none() {
+                continue;
+            }
             let Some(handler) = event_handler_for(func, mappings) else {
                 continue;
             };
             let Some(table) = table_for_handler(&handler.name, mappings, config) else {
                 continue;
             };
-            let Some(col) = resolve_column(&table, &col, schema) else {
-                continue;
+            let expr = match (simple, composed) {
+                (Some(col), _) => match resolve_column(&table, &col, schema) {
+                    Some(c) => format!("\"{c}\""),
+                    None => continue,
+                },
+                (None, Some(parts)) => match concat_sql(&parts, &table, schema) {
+                    Some(sql) => sql,
+                    None => continue,
+                },
+                (None, None) => continue,
             };
-            out.entry(table).or_insert(col);
+            out.entry(table).or_insert(expr);
         }
     }
     out
+}
+
+/// A composed value as SQL: `"tx_hash" || '-' || CAST("log_index" AS VARCHAR)`.
+///
+/// Every column is cast to text, because the pieces are being concatenated into a string id and DuckDB's
+/// `||` on a non-text operand is not the same expression. A literal is escaped by doubling its quotes, so
+/// a separator containing one cannot end the literal early.
+///
+/// `None` if any column does not resolve against this table, so a key with a missing piece is never
+/// emitted - that would be a different key, which is a wrong row rather than a missing one.
+fn concat_sql(
+    parts: &[crate::port_report::ConcatPart],
+    table: &str,
+    schema: &[nuthatch_decode::registry::TableSchema],
+) -> Option<String> {
+    use crate::port_report::ConcatPart;
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        out.push(match part {
+            ConcatPart::Literal(text) => format!("'{}'", text.replace('\'', "''")),
+            ConcatPart::Column(col) => {
+                let c = resolve_column(table, col, schema)?;
+                format!("CAST(\"{c}\" AS VARCHAR)")
+            }
+        });
+    }
+    // A concatenation of literals only is not a column-backed value; it would be the same string on every
+    // row, which is `always_constant`'s job and not reached through here.
+    if !parts.iter().any(|p| matches!(p, ConcatPart::Column(_))) {
+        return None;
+    }
+    Some(out.join(" || "))
 }
 
 /// A table that writes other Exact fields still needs an id column so UNION ALL can fold
@@ -1362,7 +1412,10 @@ fn fill_id_columns(
             continue;
         }
         if let Some(col) = id_column_for_table(entity, &table, mappings, config) {
-            selects.entry("id".into()).or_default().insert(table, col);
+            selects
+                .entry("id".into())
+                .or_default()
+                .insert(table, format!("\"{col}\""));
         }
     }
 }
@@ -1683,10 +1736,12 @@ mod tests {
         table: &str,
         col: &str,
     ) {
+        // Takes a column name and stores the expression for it, so these cases read as they did before
+        // the map started carrying expressions.
         selects
             .entry(field.into())
             .or_default()
-            .insert(table.into(), col.into());
+            .insert(table.into(), format!("\"{col}\""));
     }
 
     #[test]

@@ -3281,6 +3281,30 @@ pub(crate) fn assignment_event_column(
     func: &FunctionInfo,
     functions: &BTreeMap<String, FunctionInfo>,
 ) -> Option<String> {
+    expr_event_column(&asg.expr, func, functions)
+}
+
+/// The same ladder, on an expression rather than a whole assignment.
+///
+/// Split out so a *part* of a composed expression can be resolved the same way the whole of a simple one
+/// is: `transaction.id + '-' + event.logIndex.toString()` is two of these and a literal, and resolving
+/// the parts by a second, simpler rule would be a second set of answers to maintain.
+pub(crate) fn expr_event_column(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<String> {
+    let asg = &Assignment {
+        receiver: String::new(),
+        entity: String::new(),
+        field: String::new(),
+        citation: Citation {
+            file: String::new(),
+            line: 0,
+        },
+        expr: expr.to_string(),
+        receiver_is_entity: false,
+    };
     if let Some(col) = event_column(&asg.expr) {
         return Some(col);
     }
@@ -3314,6 +3338,193 @@ pub(crate) fn assignment_event_column(
     // read of stored state and needs a join to that entity as of this block, not a column. Those stay
     // unresolved here rather than being answered with the wrong row's value.
     entity_field_event_column(&asg.expr, func, functions)
+}
+
+/// One piece of a composed expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConcatPart {
+    /// A string literal, as written. Quoting for SQL is the emitter's job.
+    Literal(String),
+    /// An event column name, to be resolved against the triggering table.
+    Column(String),
+}
+
+/// A composed value: `transaction.id + '-' + event.logIndex.toString()`, or the template literal
+/// `` `${transactionHash.toHexString()}-${logIndex.toString()}` `` that `eventId` returns.
+///
+/// This is the commonest id shape a subgraph writes - an event entity's primary key is almost always the
+/// transaction hash and the log index with a separator - and seven entities on Uniswap V4 had **no `id`
+/// at all** because of it. An id is not one field among many: without it the emitted view cannot fold on
+/// the entity, so a missing `id` costs every other field on that view its `last()`.
+///
+/// **All or nothing.** One part that resolves to neither a literal nor a column and the whole expression
+/// is unresolved, because a composed key with a piece missing is a different key, and a different key is
+/// a wrong row rather than a missing one.
+pub(crate) fn expr_concat_parts(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<Vec<ConcatPart>> {
+    let e = collapse_ws(expr).trim().to_string();
+    // A call to a one-line helper is the expression it returns. `eventId(event.transaction.hash,
+    // event.logIndex)` is how three of Uniswap V4's event entities spell their primary key, and without
+    // this it reads as an opaque call.
+    let e = inline_single_return(&e, functions).unwrap_or(e);
+    let pieces = split_concat(&e)?;
+    if pieces.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for piece in pieces {
+        let t = piece.trim();
+        if let Some(lit) = plain_string_literal(t) {
+            out.push(ConcatPart::Literal(lit));
+            continue;
+        }
+        out.push(ConcatPart::Column(expr_event_column(t, func, functions)?));
+    }
+    Some(out)
+}
+
+/// A call to a helper whose whole body is one `return`, as that expression with the arguments in place.
+///
+/// **One statement only.** A helper that does anything else - a branch, a load, a `save` - is not a pure
+/// function of its arguments, and substituting its return expression would drop whatever else it did. One
+/// `return` and nothing else is the case where the substitution is the whole meaning of the call.
+///
+/// Arity must match exactly. A defaulted parameter would leave an unsubstituted name behind, which would
+/// then resolve against the *caller's* locals if one happened to share the name.
+fn inline_single_return(expr: &str, functions: &BTreeMap<String, FunctionInfo>) -> Option<String> {
+    let open = expr.find('(')?;
+    let name = expr[..open].trim();
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+        return None;
+    }
+    // The call has to be the whole expression, not the head of a larger one.
+    if match_paren(expr, open)? != expr.len() - 1 {
+        return None;
+    }
+    let f = functions.get(name)?;
+    let args = take_paren_list(expr, open);
+    if args.len() != f.param_names.len() {
+        return None;
+    }
+    let mut body = String::new();
+    for line in f.body.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        if !body.is_empty() {
+            return None;
+        }
+        body = t.to_string();
+    }
+    let mut ret = body.strip_prefix("return ")?.trim().to_string();
+    ret = ret.trim_end_matches(';').trim().to_string();
+    for (param, arg) in f.param_names.iter().zip(&args) {
+        ret = substitute_ident(&ret, param, arg.trim());
+    }
+    Some(ret)
+}
+
+/// The pieces of a `+` chain, or of a template literal's text and `${…}` holes.
+///
+/// Returns `None` for anything that is not a concatenation, so a caller cannot mistake a single value for
+/// a one-piece chain. Quotes, parentheses and brackets are tracked, so a `+` inside a literal or inside a
+/// call's arguments does not split - `a + f(x + 1)` is two pieces, not three.
+fn split_concat(e: &str) -> Option<Vec<String>> {
+    if let Some(inner) = e
+        .strip_prefix('`')
+        .and_then(|r| r.strip_suffix('`'))
+        .filter(|_| e.len() >= 2)
+    {
+        return Some(template_pieces(inner));
+    }
+    let b = e.as_bytes();
+    let (mut depth, mut quote, mut start) = (0i32, None::<u8>, 0usize);
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'+' if depth == 0 => {
+                    out.push(e[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.push(e[start..].to_string());
+    Some(out)
+}
+
+/// A template literal's literal runs and its `${…}` expressions, in order.
+fn template_pieces(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = inner;
+    while let Some(at) = rest.find("${") {
+        if at > 0 {
+            out.push(format!("'{}'", &rest[..at]));
+        }
+        let after = &rest[at + 2..];
+        let mut depth = 1i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(after[..end].to_string());
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    if !rest.is_empty() {
+        out.push(format!("'{rest}'"));
+    }
+    out
+}
+
+/// The text of a single- or double-quoted literal, with no escapes in it.
+///
+/// An escape is refused rather than interpreted: the emitter puts this text into SQL, and guessing what
+/// `\n` meant in AssemblyScript would put a different separator in the key.
+fn plain_string_literal(t: &str) -> Option<String> {
+    for q in ['\'', '"'] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            let inner = &t[1..t.len() - 1];
+            if inner.contains(q) || inner.contains('\\') {
+                return None;
+            }
+            return Some(inner.to_string());
+        }
+    }
+    None
 }
 
 /// `local.field` resolved to an event column, when a reachable function writes that field from the event.
@@ -4362,6 +4573,140 @@ export function handleSwap(event: SwapEvent): void {
             assignment_event_column(asg, func, &mappings.functions),
             None,
             "the read happens before the write, and nothing here can tell that from the other order"
+        );
+    }
+
+    /// A composed id: the transaction hash and the log index with a separator.
+    ///
+    /// The commonest primary key a subgraph writes, and seven entities on Uniswap V4 had **no `id` at
+    /// all** because of it - which costs every other field on those views its `last()` fold, not just the
+    /// id.
+    #[test]
+    fn a_composed_id_resolves_to_its_parts() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+}
+type Swap @entity {
+  id: ID!
+}
+"#;
+        // Three spellings of one key: a `+` chain through a loaded entity's id, a template literal, and a
+        // call to a helper that returns one.
+        let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHexString())
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(transaction.id + '-' + event.logIndex.toString())
+  swap.id = transaction.id + '-' + event.logIndex.toString()
+  swap.save()
+}
+
+export function handleOther(event: SwapEvent): void {
+  let swap = new Swap(eventId(event.transaction.hash, event.logIndex))
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.save()
+}
+
+export function handleThird(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = `${event.transaction.hash.toHexString()}-${event.logIndex.toString()}`
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let want = vec![
+            ConcatPart::Column("tx_hash".into()),
+            ConcatPart::Literal("-".into()),
+            ConcatPart::Column("log_index".into()),
+        ];
+        for handler in ["handleSwap", "handleOther", "handleThird"] {
+            let func = mappings.functions.get(handler).expect(handler);
+            let asg = func
+                .assignments
+                .iter()
+                .find(|a| a.entity == "Swap" && a.field == "id")
+                .unwrap_or_else(|| panic!("{handler} must assign Swap.id"));
+            assert_eq!(
+                expr_concat_parts(&asg.expr, func, &mappings.functions).as_deref(),
+                Some(want.as_slice()),
+                "{handler}: `{}` must resolve to the hash, the separator and the log index",
+                asg.expr
+            );
+        }
+    }
+
+    /// A helper that does more than return is not a pure function of its arguments.
+    #[test]
+    fn a_helper_that_does_more_than_return_is_not_inlined() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  log.info('making an id', [])
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "substituting the return would drop whatever else the helper did"
+        );
+    }
+
+    /// One unresolved piece refuses the whole key.
+    #[test]
+    fn a_composed_id_with_an_unresolved_piece_resolves_to_nothing() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        // `whatever` is bound to a contract call, so it is no part of a key a column can answer.
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let whatever = contract.someValue()
+  let swap = new Swap('x')
+  swap.id = event.transaction.hash.toHexString() + '-' + whatever
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "a key missing a piece is a different key, which is a wrong row rather than a missing one"
         );
     }
 
