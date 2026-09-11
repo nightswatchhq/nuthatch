@@ -41,7 +41,11 @@ fn four_classes_fixture_hits_each_class_on_the_known_fields() {
     };
     use nuthatch::port_report::Class;
     assert_eq!(class("Pool", "sqrtPrice"), Class::Exact);
-    assert_eq!(class("Bundle", "ethPriceUSD"), Class::Exact);
+    // Flipped by #1274. `getEthPriceInUSD()` returns a price read back off a stored `Pool`, and
+    // `classes.md` defines fixed point as "reads back own or another entity's prior output". The
+    // fixture asserted `Exact` because the classifier only ever seeded fixed point from a load
+    // inside a *loop*, so this point-load sibling escaped - the identical shape one field over.
+    assert_eq!(class("Bundle", "ethPriceUSD"), Class::FixedPoint);
     assert_eq!(class("Pool", "swaps"), Class::Exact);
     assert_eq!(class("Token", "symbol"), Class::CallDerived);
     assert_eq!(class("Token", "decimals"), Class::CallDerived);

@@ -621,6 +621,14 @@ pub(crate) struct FunctionInfo {
     calls: BTreeSet<String>,
     contract_call: Option<Citation>,
     has_loop_load: bool,
+    /// Loads an entity and reads a field off it **anywhere**, not only inside a loop (#1274).
+    ///
+    /// `classes.md` says a field that reads back stored entity output is fixed point, and it does
+    /// not say "in a loop". The loop was only ever the shape the first three hand-ports happened to
+    /// contain. A single `Pool.load(..)` followed by a field read is the same thing said in fewer
+    /// lines, and reading it as exact promises byte-identical output for a number that is derived
+    /// from state the nest computed for itself.
+    reads_loaded_entity_field: bool,
     field_reads: Vec<(String, String)>, // (entity, field)
     /// Source order, so `fetchTokenSymbol(event.params.token0)` can map the helper's bind
     /// argument back onto the triggering row.
@@ -1106,6 +1114,7 @@ fn analyse_function(
     let contract_call = find_contract_call(body, file, body_start_line);
     let has_loop_load = loop_reads_a_loaded_entity_field(body, &bindings);
     let field_reads = collect_field_reads(body, &bindings);
+    let reads_loaded_entity_field = returns_a_loaded_entity_field(body, &bindings);
     FunctionInfo {
         name,
         kind: HandlerKind::Helper,
@@ -1113,6 +1122,7 @@ fn analyse_function(
         calls,
         contract_call,
         has_loop_load,
+        reads_loaded_entity_field,
         field_reads,
         param_names,
         body: body.to_string(),
@@ -1796,6 +1806,55 @@ fn loop_body(body: &str, after: usize) -> Option<&str> {
     Some(&body[b + 1..end])
 }
 
+/// Whether a `return` in this body hands back a field read off a loaded entity.
+///
+/// **Two independent facts are not one fact.** The first version of this asked only whether the body
+/// contained `.load(` *and* whether it read any entity field anywhere - which are unrelated
+/// questions. A helper that loads a pool, ignores it, and returns `ZERO_BD` satisfied both and was
+/// marked fixed point, so a caller's genuinely exact field was reported as unreproducible. Raised in
+/// review of #1274.
+///
+/// Still a syntactic approximation rather than dataflow: it asks whether a returned expression
+/// mentions a binding that some field read is taken off. That is enough to separate "loads and
+/// returns the stored value" from "loads and returns a constant", which is the distinction the class
+/// turns on, and it errs toward fixed point only when a returned expression really does name the
+/// loaded entity.
+fn returns_a_loaded_entity_field(body: &str, bindings: &BTreeMap<String, String>) -> bool {
+    if !body.contains(".load(") {
+        return false;
+    }
+    // The locals a field is actually read off, e.g. `pool` in `pool.token0Price`.
+    if collect_field_reads(body, bindings).is_empty() {
+        return false;
+    }
+    let read_from: BTreeSet<&String> = bindings
+        .keys()
+        // A read off this binding: the name followed by `.`.
+        .filter(|name| body.contains(&format!("{name}.")))
+        .collect();
+    if read_from.is_empty() {
+        return false;
+    }
+    let mut rest = body;
+    while let Some(at) = rest.find("return") {
+        let after = &rest[at + "return".len()..];
+        // Word boundary, so `returnValue` is not a return statement.
+        let boundary = after
+            .as_bytes()
+            .first()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
+        if boundary {
+            let end = after.find(['\n', ';']).unwrap_or(after.len());
+            let expr = &after[..end];
+            if read_from.iter().any(|b| expr.contains(&format!("{b}."))) {
+                return true;
+            }
+        }
+        rest = &rest[at + "return".len()..];
+    }
+    false
+}
+
 fn collect_field_reads(body: &str, bindings: &BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let bytes = body.as_bytes();
@@ -1895,7 +1954,13 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
         if func.contract_call.is_some() {
             c = Class::CallDerived;
         }
-        if func.has_loop_load {
+        // **The seed, and why it is not only the loop.** `field_class` cannot resolve this: a
+        // field is fixed point *because* something reads it back, so promoting the writer from the
+        // read field's class is circular and has no seed. `has_loop_load` was that seed, and it is
+        // too narrow - `getNativePriceInUSD` does one `Pool.load(..)` and reads a field off it, so
+        // it stayed exact while its sibling `findNativePerToken`, which loads inside a loop, was
+        // caught. Identical shape, one field over (#1274).
+        if func.has_loop_load || func.reads_loaded_entity_field {
             c = c.max(Class::FixedPoint);
         }
         if func.kind == HandlerKind::Block {
@@ -3793,8 +3858,122 @@ export function handleSwap(event: SwapEvent): void {
         assert_eq!(class_of(&rows, "Pool", "usd"), Class::FixedPoint);
     }
 
+    /// Jules' counterexample on #1274: loading an entity and reading a field off it is not enough
+    /// on its own. If the helper hands back a constant, the caller's field really is exact, and
+    /// calling it fixed point costs a porter a hand check on a field that was never in doubt.
     #[test]
-    fn get_eth_price_is_exact() {
+    fn a_helper_that_loads_but_returns_a_constant_stays_exact() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  token0Price: BigDecimal!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function getNativePriceInUSD(): BigDecimal {
+  let pool = Pool.load(STABLE_POOL)
+  if (pool) {
+    log.info('price seen {}', [pool.token0Price.toString()])
+  }
+  return ZERO_BD
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = getNativePriceInUSD()
+  bundle.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Bundle", "ethPriceUSD"),
+            Class::Exact,
+            "the loaded field never reaches the return; the helper hands back a constant"
+        );
+    }
+
+    /// The #1274 case in the shape it was found in: two sibling helpers in one pricing module,
+    /// one loading inside a loop and one not, both reading back stored entity output. Before the
+    /// fix the loop one was fixed point and the point-load one was exact, which is a difference in
+    /// how the mapping happens to be written rather than in what the field means.
+    #[test]
+    fn a_point_load_helper_is_classified_like_its_loop_loading_sibling() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  token0Price: BigDecimal!
+  liquidity: BigInt!
+}
+type Token @entity {
+  id: ID!
+  derivedETH: BigDecimal!
+}
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+"#;
+        // `findNativePerToken` loads inside a loop; `getNativePriceInUSD` does a single load and
+        // reads a field off the result. Both read back stored output.
+        let mapping = r#"
+export function findNativePerToken(token: Token): BigDecimal {
+  for (let i = 0; i < 1; ++i) {
+    const pool = Pool.load(token.id)
+    if (pool) { return pool.token0Price }
+  }
+  return ZERO_BD
+}
+
+export function getNativePriceInUSD(): BigDecimal {
+  let pool = Pool.load(STABLE_POOL)
+  if (pool) { return pool.token0Price }
+  return ZERO_BD
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token = Token.load(event.address.toHex())!
+  token.derivedETH = findNativePerToken(token)
+  token.save()
+  let bundle = new Bundle('1')
+  bundle.ethPriceUSD = getNativePriceInUSD()
+  bundle.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils/pricing.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "derivedETH"),
+            Class::FixedPoint,
+            "the loop-loading sibling was already correct"
+        );
+        assert_eq!(
+            class_of(&rows, "Bundle", "ethPriceUSD"),
+            Class::FixedPoint,
+            "the point-loading sibling reads back the same stored output and must match it"
+        );
+    }
+
+    /// **This assertion was flipped by #1274, and the flip is the point of that issue.**
+    ///
+    /// It used to assert `Exact`. `classes.md` defines fixed point as "reads back own or another
+    /// entity's prior output", and `getEthPriceInUSD` returns `usdcPool.token1Price` - another
+    /// entity's stored output - so the document and the test disagreed, and the test won by being
+    /// executable. Running S1 against the real Uniswap V4 mainnet subgraph is what surfaced it: the
+    /// identical shape one field over, `getNativePriceInUSD`, was reported exact while its sibling
+    /// `findNativePerToken` was correctly fixed point, and the only difference between them is that
+    /// one loads inside a loop and the other does not.
+    ///
+    /// The direction of the error is why this resolves toward fixed point rather than away.
+    /// Over-classifying costs a porter a hand check on a field that was fine. Under-classifying
+    /// tells them a field is byte-identical when it will not reproduce, which is the single
+    /// experience RFC-0044 exists to prevent.
+    #[test]
+    fn a_price_read_back_off_a_loaded_pool_is_fixed_point() {
         let schema = r#"
 type Pool @entity {
   id: ID!
@@ -3826,7 +4005,12 @@ export function handleSwap(event: SwapEvent): void {
 "#;
         let (schema, mappings) = schema_and_mappings(schema, "src/common/pricing.ts", mapping);
         let rows = classify(&schema, &mappings);
-        assert_eq!(class_of(&rows, "Bundle", "ethPriceUSD"), Class::Exact);
+        assert_eq!(
+            class_of(&rows, "Bundle", "ethPriceUSD"),
+            Class::FixedPoint,
+            "the helper returns a price read back off a stored Pool, which classes.md calls \
+             reading back another entity's prior output"
+        );
     }
 
     #[test]
