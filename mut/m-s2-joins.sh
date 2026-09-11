@@ -36,4 +36,9 @@ for m in mut/s2/*.py; do
   fi
   git checkout -- src
 done
+# One sweep doubles the target dir: 46 mutations, each an apply-rebuild-restore-rebuild cycle, and cargo
+# keeps every intermediate. Measured 11 GiB -> 22 GiB in a single run, and 11 -> 181 over a day, which is
+# what filled the disk hard enough that no command would run at all. Prune here, not when it complains.
+echo "pruning the build cache: $(du -sg "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1) GiB"
+cargo clean --offline -q 2>/dev/null || rm -rf "$CARGO_TARGET_DIR"
 echo "MUTATION_SET_COMPLETE"
