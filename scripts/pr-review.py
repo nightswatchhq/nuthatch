@@ -74,6 +74,10 @@ MAX_DIFF_CHARS = 400_000
 # diff out of the window with its own history.
 MAX_PRIOR_CHARS = 40_000
 
+# Appended when a diff carries no per-file sections to allocate between, so even that path cannot hand
+# the model an unlabelled fragment.
+WHOLE_NOTE = "\n[pr-review: this diff was shortened to fit the review budget]\n"
+
 # Marks our comments so a re-review can find its predecessors, and so a human scrolling a long PR
 # can tell the outside reader from the firm's own.
 MARKER = "<!-- pr-review:luna -->"
@@ -339,7 +343,14 @@ def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]
     sections = re.split(r"(?m)^(?=diff --git )", diff)
     head, files = ("", sections) if sections[0].startswith("diff --git ") else (sections[0], sections[1:])
     if not files:
-        return (diff[:budget], [(("(whole diff)"), budget, len(diff))] if len(diff) > budget else [])
+        # No `diff --git` at a line start: a preamble-only or malformed diff, with nothing to allocate
+        # between. It still must not arrive as an unlabelled fragment, so the same marker discipline
+        # applies - found by the harness test for the small-cap cases.
+        if len(diff) <= budget:
+            return (diff, [])
+        note = next((m for m in (WHOLE_NOTE, "\n[cut]\n") if len(m) <= budget), "")
+        kept = "" if not note else (diff[: max(budget - len(note), 0)] + note)[:budget]
+        return (kept, [("(whole diff)", len(kept), len(diff))])
     # The header is whatever precedes the first `diff --git`, normally empty. Capped anyway, so a
     # budget smaller than the header cannot make every later arithmetic step negative.
     head = head[:budget]
@@ -363,13 +374,24 @@ def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]
             out.append(section)
             continue
         path = section.split("\n", 1)[0].removeprefix("diff --git ").split(" b/")[-1]
-        note = f"\n[pr-review: this file was shortened to fit the review budget; {len(section) - cap:,} characters are not shown]\n"
         # **The marker is inside the cap, not on top of it.** `cap - len(note)` floors at zero, so a cap
         # smaller than the marker used to contribute the marker's length instead of `cap` - and enough
         # shortened files, or a cap of zero, then overran the very budget this function exists to
-        # enforce. Trimming the joined string makes a shortened section exactly `cap` characters, which
-        # is what the allocation above already assumed.
-        kept = (section[: max(cap - len(note), 0)] + note)[:cap]
+        # enforce. A shortened section is therefore exactly `min(cap, size)` characters.
+        #
+        # **And the marker wins the space, not the content.** Trimming the joined string could cut the
+        # marker away entirely at a small cap, leaving an unlabelled fragment the model would read as a
+        # whole file. The widest marker that fits is used, shortest last, so any positive cap still says
+        # the file was cut.
+        full = f"\n[pr-review: this file was shortened to fit the review budget; {len(section) - cap:,} characters are not shown]\n"
+        note = next(
+            (m for m in (full, "\n[pr-review: shortened]\n", "\n[cut]\n") if len(m) <= cap),
+            "",
+        )
+        # A cap too small for even the shortest marker leaves nothing worth sending: two characters of a
+        # diff header is not evidence, and unlabelled it reads as a whole file. Contribute nothing and let
+        # the prompt-level list carry it.
+        kept = "" if not note else (section[: max(cap - len(note), 0)] + note)[:cap]
         out.append(kept)
         elided.append((path, len(kept), len(section)))
     joined = "".join(out)
@@ -449,6 +471,18 @@ def main():
     if not diff.strip():
         raise SystemExit("pr-review: the diff is empty - nothing to review")
     diff, elided = budget_diff(diff, MAX_DIFF_CHARS)
+    # Told to the **model**, not only to the human in the rendered comment. The inline markers can be
+    # squeezed out at a small cap, and a reviewer that cannot tell a fragment from a whole file reports
+    # a thing missing from the part it was not sent - which is #1282's failure in miniature.
+    shortened_note = (
+        ""
+        if not elided
+        else "These files were shortened to fit the budget and you saw them only in part. What is not\n"
+        "shown is unknown, not absent: do not report a thing missing from one of them, and do not\n"
+        "raise a finding whose evidence would be in the part you were not sent.\n"
+        + "".join(f"  {name}: {kept:,} of {size:,} characters\n" for name, kept, size in elided)
+        + "\n"
+    )
 
     body = args.body_file.read_text(errors="replace") if args.body_file else ""
     claude_md = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else "(not available)"
@@ -489,6 +523,7 @@ def main():
         f"merge and is already on the default branch:\n{own_files or '(not supplied)'}\n\n"
         f"Your previous reviews of this pull request, oldest first:\n"
         f"{prior or '(none - this is your first pass)'}\n\n"
+        f"{shortened_note}"
         f"Diff:\n```diff\n{diff}\n```"
     )
     if args.dry_run:

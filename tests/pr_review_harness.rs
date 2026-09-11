@@ -585,8 +585,15 @@ cases = [
     ("diff --git a/f b/f\n+xxxx\n", 0),
 ]
 for diff, budget in cases:
-    out, _ = m.budget_diff(diff, budget)
+    out, elided = m.budget_diff(diff, budget)
     assert len(out) <= budget, "budget %d exceeded by %d" % (budget, len(out) - budget)
+    # A shortened file is either marked inline or absent from the diff entirely - never an unlabelled
+    # fragment the model would read as a whole file.
+    for name, kept, size in elided:
+        if kept:
+            assert "[pr-review:" in out or "[cut]" in out, "a kept fragment of %s carries no marker" % name
+    # And every shortened file is named to the model, whatever the inline markers managed to fit.
+    assert elided, "these cases all shorten something"
 print("all budgets held")
 "#
         ),
