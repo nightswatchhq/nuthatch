@@ -828,8 +828,75 @@ pub mod introspection {
         }
     }
 
+    /// A `__Type` with every key a standard client selects, built **complete at the construction site**.
+    ///
+    /// Four constructors rather than fifteen `json!` literals plus a pass that fills in what they left
+    /// out: a type cannot be built half-shaped, so there is nothing for a later reader - human or
+    /// reviewer - to have to find two hundred lines away before believing the document is whole.
+    ///
+    /// The defaults are the reference's, measured: `description` null throughout (graph-node carries the
+    /// schema author's doc comments there, which are not part of the contract), `interfaces` `[]` on an
+    /// object and null elsewhere, `possibleTypes` always null because a generated subgraph schema has
+    /// neither unions nor interfaces.
+    fn ty(kind: &str, name: &str, payload: Option<(&str, Value)>) -> Value {
+        let mut t = json!({
+            "kind": kind,
+            "name": name,
+            "description": Value::Null,
+            "fields": Value::Null,
+            "inputFields": Value::Null,
+            "interfaces": if kind == "OBJECT" { json!([]) } else { Value::Null },
+            "enumValues": Value::Null,
+            "possibleTypes": Value::Null,
+        });
+        if let Some((key, v)) = payload {
+            t[key] = v;
+        }
+        t
+    }
+
+    fn scalar_type(name: &str) -> Value {
+        ty("SCALAR", name, None)
+    }
+
+    fn object_type(name: &str, fields: Vec<Value>) -> Value {
+        ty("OBJECT", name, Some(("fields", Value::Array(fields))))
+    }
+
+    fn input_object_type(name: &str, input_fields: Vec<Value>) -> Value {
+        ty(
+            "INPUT_OBJECT",
+            name,
+            Some(("inputFields", Value::Array(input_fields))),
+        )
+    }
+
+    fn enum_type(name: &str, values: &[&str]) -> Value {
+        ty(
+            "ENUM",
+            name,
+            Some((
+                "enumValues",
+                Value::Array(values.iter().map(|v| enum_value(v)).collect()),
+            )),
+        )
+    }
+
+    /// An enum value, with the deprecation pair a client always selects.
+    fn enum_value(name: &str) -> Value {
+        json!({"name":name,"description":Value::Null,
+               "isDeprecated":false,"deprecationReason":Value::Null})
+    }
+
+    /// A field on an object type, likewise complete.
+    fn field(name: &str, args: Vec<Value>, ty: Value) -> Value {
+        json!({"name":name,"description":Value::Null,"args":args,"type":ty,
+               "isDeprecated":false,"deprecationReason":Value::Null})
+    }
+
     fn arg(name: &str, ty: &str, default: Option<&str>) -> Value {
-        json!({"name":name,"type":type_ref(ty),"defaultValue":default})
+        json!({"name":name,"description":Value::Null,
+               "type":type_ref(ty),"defaultValue":default})
     }
 
     /// The five arguments every list field takes - stored or derived, and never `block`.
@@ -851,62 +918,84 @@ pub mod introspection {
         let mut types: Vec<Value> = Vec::new();
 
         for name in BUILTIN_SCALARS.iter().chain(GRAPH_SCALARS.iter()) {
-            types.push(json!({"kind":"SCALAR","name":name}));
+            types.push(scalar_type(name));
         }
 
         // Fixed supporting types. `Aggregation_*` and `LogLevel` are emitted whether or not the
         // schema uses the feature - measured, not assumed.
-        types.push(json!({"kind":"ENUM","name":"OrderDirection",
-            "enumValues":[{"name":"asc"},{"name":"desc"}]}));
-        types.push(json!({"kind":"ENUM","name":"_SubgraphErrorPolicy_",
-            "enumValues":[{"name":"allow"},{"name":"deny"}]}));
-        types.push(json!({"kind":"ENUM","name":"Aggregation_interval",
-            "enumValues":[{"name":"hour"},{"name":"day"}]}));
-        types.push(json!({"kind":"ENUM","name":"Aggregation_current",
-            "enumValues":[{"name":"exclude"},{"name":"include"}]}));
-        types.push(json!({"kind":"ENUM","name":"LogLevel","enumValues":[
-            {"name":"CRITICAL"},{"name":"ERROR"},{"name":"WARNING"},{"name":"INFO"},{"name":"DEBUG"}]}));
-        types.push(
-            json!({"kind":"INPUT_OBJECT","name":"Block_height","inputFields":[
-            arg("hash","Bytes",None), arg("number","Int",None), arg("number_gte","Int",None)]}),
-        );
-        types.push(
-            json!({"kind":"INPUT_OBJECT","name":"BlockChangedFilter","inputFields":[
-            arg("number_gte","Int!",None)]}),
-        );
+        types.push(enum_type("OrderDirection", &["asc", "desc"]));
+        types.push(enum_type("_SubgraphErrorPolicy_", &["allow", "deny"]));
+        types.push(enum_type("Aggregation_interval", &["hour", "day"]));
+        types.push(enum_type("Aggregation_current", &["exclude", "include"]));
+        types.push(enum_type(
+            "LogLevel",
+            &["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        ));
+        types.push(input_object_type(
+            "Block_height",
+            vec![
+                arg("hash", "Bytes", None),
+                arg("number", "Int", None),
+                arg("number_gte", "Int", None),
+            ],
+        ));
+        types.push(input_object_type(
+            "BlockChangedFilter",
+            vec![arg("number_gte", "Int!", None)],
+        ));
         // `_Block_` is referenced by `_Meta_.block`, and `_meta` is a root this endpoint answers, so
         // omitting it left the served document pointing at a type it did not define.
-        types.push(json!({"kind":"OBJECT","name":"_Block_","fields":[
-            {"name":"hash","args":[],"type":type_ref("Bytes")},
-            {"name":"number","args":[],"type":type_ref("Int!")},
-            {"name":"timestamp","args":[],"type":type_ref("Int")},
-            {"name":"parentHash","args":[],"type":type_ref("Bytes")}]}));
+        types.push(object_type(
+            "_Block_",
+            vec![
+                field("hash", vec![], type_ref("Bytes")),
+                field("number", vec![], type_ref("Int!")),
+                field("timestamp", vec![], type_ref("Int")),
+                field("parentHash", vec![], type_ref("Bytes")),
+            ],
+        ));
         // The `_logs` family. Emitted because the generated schema has to be *complete* for a client
         // that validates it, even though a nest has no mapping logs to return: a schema declaring
         // `LogLevel` and no `_Log_` is not a schema graph-node would serve.
-        types.push(json!({"kind":"OBJECT","name":"_LogArgument_","fields":[
-            {"name":"key","args":[],"type":type_ref("String!")},
-            {"name":"value","args":[],"type":type_ref("String!")}]}));
-        types.push(json!({"kind":"OBJECT","name":"_LogMeta_","fields":[
-            {"name":"module","args":[],"type":type_ref("String!")},
-            {"name":"line","args":[],"type":type_ref("Int!")},
-            {"name":"column","args":[],"type":type_ref("Int!")}]}));
-        types.push(json!({"kind":"OBJECT","name":"_Log_","fields":[
-            {"name":"id","args":[],"type":type_ref("String!")},
-            {"name":"subgraphId","args":[],"type":type_ref("String!")},
-            {"name":"timestamp","args":[],"type":type_ref("String!")},
-            {"name":"level","args":[],"type":type_ref("LogLevel!")},
-            {"name":"text","args":[],"type":type_ref("String!")},
-            {"name":"arguments","args":[],"type":type_ref("[_LogArgument_!]!")},
-            {"name":"meta","args":[],"type":type_ref("_LogMeta_!")}]}));
-        types.push(json!({"kind":"OBJECT","name":"_Meta_","fields":[
-            {"name":"block","args":[],"type":type_ref("_Block_!")},
-            {"name":"deployment","args":[],"type":type_ref("String!")},
-            {"name":"hasIndexingErrors","args":[],"type":type_ref("Boolean!")}]}));
+        types.push(object_type(
+            "_LogArgument_",
+            vec![
+                field("key", vec![], type_ref("String!")),
+                field("value", vec![], type_ref("String!")),
+            ],
+        ));
+        types.push(object_type(
+            "_LogMeta_",
+            vec![
+                field("module", vec![], type_ref("String!")),
+                field("line", vec![], type_ref("Int!")),
+                field("column", vec![], type_ref("Int!")),
+            ],
+        ));
+        types.push(object_type(
+            "_Log_",
+            vec![
+                field("id", vec![], type_ref("String!")),
+                field("subgraphId", vec![], type_ref("String!")),
+                field("timestamp", vec![], type_ref("String!")),
+                field("level", vec![], type_ref("LogLevel!")),
+                field("text", vec![], type_ref("String!")),
+                field("arguments", vec![], type_ref("[_LogArgument_!]!")),
+                field("meta", vec![], type_ref("_LogMeta_!")),
+            ],
+        ));
+        types.push(object_type(
+            "_Meta_",
+            vec![
+                field("block", vec![], type_ref("_Block_!")),
+                field("deployment", vec![], type_ref("String!")),
+                field("hasIndexingErrors", vec![], type_ref("Boolean!")),
+            ],
+        ));
 
         for (name, values) in &s.enums {
-            let vs: Vec<Value> = values.iter().map(|v| json!({"name":v})).collect();
-            types.push(json!({"kind":"ENUM","name":name,"enumValues":vs}));
+            let vs: Vec<&str> = values.iter().map(String::as_str).collect();
+            types.push(enum_type(name, &vs));
         }
 
         for e in &s.entities {
@@ -928,38 +1017,34 @@ pub mod introspection {
                     } else {
                         collection_args(&target)
                     };
-                    json!({"name":n,"args":a,"type":type_ref(&ty)})
+                    field(&n, a, type_ref(&ty))
                 })
                 .collect();
-            types.push(json!({"kind":"OBJECT","name":e.name,"fields":fields}));
+            types.push(object_type(&e.name, fields));
 
             let inputs: Vec<Value> = s
                 .filter_fields(&e.name)
                 .into_iter()
                 .map(|(n, ty)| arg(&n, &ty, None))
                 .collect();
-            types.push(
-                json!({"kind":"INPUT_OBJECT","name":format!("{}_filter",e.name),
-                "inputFields":inputs}),
-            );
+            types.push(input_object_type(&format!("{}_filter", e.name), inputs));
 
-            let vals: Vec<Value> = s
-                .order_by_values(&e.name)
-                .into_iter()
-                .map(|v| json!({"name":v}))
-                .collect();
-            types.push(json!({"kind":"ENUM","name":format!("{}_orderBy",e.name),
-                "enumValues":vals}));
+            let vals = s.order_by_values(&e.name);
+            let vals: Vec<&str> = vals.iter().map(String::as_str).collect();
+            types.push(enum_type(&format!("{}_orderBy", e.name), &vals));
         }
 
         let mut roots: Vec<Value> = Vec::new();
         for e in &s.entities {
-            roots.push(
-                json!({"name":lower_first(&e.name),"type":type_ref(&e.name),"args":[
-                arg("id","ID!",None),
-                arg("block","Block_height",None),
-                arg("subgraphError","_SubgraphErrorPolicy_!",Some("deny"))]}),
-            );
+            roots.push(field(
+                &lower_first(&e.name),
+                vec![
+                    arg("id", "ID!", None),
+                    arg("block", "Block_height", None),
+                    arg("subgraphError", "_SubgraphErrorPolicy_!", Some("deny")),
+                ],
+                type_ref(&e.name),
+            ));
             let mut a = vec![
                 arg("skip", "Int", Some("0")),
                 arg("first", "Int", Some("100")),
@@ -969,23 +1054,34 @@ pub mod introspection {
             ];
             a.push(arg("block", "Block_height", None));
             a.push(arg("subgraphError", "_SubgraphErrorPolicy_!", Some("deny")));
-            roots.push(json!({"name":plural(&e.name),
-                "type":type_ref(&format!("[{}!]!",e.name)),"args":a}));
+            roots.push(field(
+                &plural(&e.name),
+                a,
+                type_ref(&format!("[{}!]!", e.name)),
+            ));
         }
-        roots.push(json!({"name":"_meta","type":type_ref("_Meta_"),
-            "args":[arg("block","Block_height",None)]}));
+        roots.push(field(
+            "_meta",
+            vec![arg("block", "Block_height", None)],
+            type_ref("_Meta_"),
+        ));
         // `_logs` completes the root inventory `Schema::root_field_names` already claims. The
         // arguments and their defaults are the reference's, `orderDirection` included - it defaults to
         // `desc` here and nowhere else in the schema.
-        roots.push(json!({"name":"_logs","type":type_ref("[_Log_!]!"),"args":[
-            arg("level","LogLevel",None),
-            arg("from","String",None),
-            arg("to","String",None),
-            arg("search","String",None),
-            arg("first","Int",Some("100")),
-            arg("skip","Int",Some("0")),
-            arg("orderDirection","OrderDirection",Some("desc"))]}));
-        types.push(json!({"kind":"OBJECT","name":"Query","fields":roots}));
+        roots.push(field(
+            "_logs",
+            vec![
+                arg("level", "LogLevel", None),
+                arg("from", "String", None),
+                arg("to", "String", None),
+                arg("search", "String", None),
+                arg("first", "Int", Some("100")),
+                arg("skip", "Int", Some("0")),
+                arg("orderDirection", "OrderDirection", Some("desc")),
+            ],
+            type_ref("[_Log_!]!"),
+        ));
+        types.push(object_type("Query", roots));
 
         // Every leaf reference's `kind` comes from the declaration it names. A name no declaration
         // covers leaves the document invalid and there is no sensible way to serve it, so it panics
@@ -1029,63 +1125,6 @@ pub mod introspection {
             {"name":"derivedFrom","description":Value::Null,"locations":["FIELD_DEFINITION"],
              "args":[string_arg("field")]},
         ]);
-        // Every `__Type` carries the same eight keys, with `null` where the kind does not apply -
-        // measured from the reference, where `interfaces` is `[]` on an object and `null` elsewhere.
-        //
-        // **Filled in one pass rather than at each of the fifteen sites that build a type.** The
-        // renderer previously emitted only the keys the golden comparison happened to read, so a
-        // standard client's `FullType` fragment received type objects missing keys it had selected and
-        // no assertion could see it (Jules on #1282). A normalisation pass cannot drift from the
-        // builders the way fifteen literals can.
-        for t in &mut types {
-            let object = t.get("kind").and_then(Value::as_str) == Some("OBJECT");
-            let obj = t.as_object_mut().expect("a rendered type is an object");
-            obj.entry("description").or_insert(Value::Null);
-            obj.entry("fields").or_insert(Value::Null);
-            obj.entry("inputFields").or_insert(Value::Null);
-            obj.entry("enumValues").or_insert(Value::Null);
-            obj.entry("interfaces").or_insert(if object {
-                Value::Array(Vec::new())
-            } else {
-                Value::Null
-            });
-            // No unions and no interfaces in a generated subgraph schema, so this is always null -
-            // emitted because a client selects it, not because it can ever be populated.
-            obj.entry("possibleTypes").or_insert(Value::Null);
-            for (key, each) in [
-                ("fields", true),
-                ("inputFields", false),
-                ("enumValues", false),
-            ] {
-                let Some(list) = obj.get_mut(key).and_then(Value::as_array_mut) else {
-                    continue;
-                };
-                for item in list {
-                    let Some(m) = item.as_object_mut() else {
-                        continue;
-                    };
-                    m.entry("description").or_insert(Value::Null);
-                    if each {
-                        // A field: arguments, and the deprecation pair a client always selects.
-                        m.entry("args").or_insert(Value::Array(Vec::new()));
-                    } else if key == "inputFields" {
-                        m.entry("defaultValue").or_insert(Value::Null);
-                    }
-                    if key != "inputFields" {
-                        m.entry("isDeprecated").or_insert(Value::Bool(false));
-                        m.entry("deprecationReason").or_insert(Value::Null);
-                    }
-                    if let Some(args) = m.get_mut("args").and_then(Value::as_array_mut) {
-                        for a in args {
-                            if let Some(am) = a.as_object_mut() {
-                                am.entry("description").or_insert(Value::Null);
-                                am.entry("defaultValue").or_insert(Value::Null);
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut doc = json!({"__schema":{
             "queryType":{"name":"Query"},
             // A nest serves queries only, which is why `parse` refuses the other two outright.
