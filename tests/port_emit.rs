@@ -923,6 +923,51 @@ export function handlePoolCreated(event: PoolCreated): void {
 }
 "#;
 
+/// A field maintained incrementally is **answered**, and the figure has to say so separately.
+///
+/// Counting it as unanswered would under-report a port that did the right thing with its running
+/// totals, and folding it into the view count would hide where the field actually lives. A mutation
+/// setting `incremental: 0` survived this file before this test existed, which is how the gap showed
+/// up: the two fixtures the coverage tests used had no materialised field between them (#1277).
+#[test]
+fn the_coverage_figure_counts_an_incremental_field_as_answered() {
+    let (nest, result) = emitted_nest(ACCUM_SCHEMA, ACCUM_MAPPING);
+
+    // `id` and `latest` are latest-value and land in the view; `totalFees` is a running total and is
+    // maintained in `entities/pool.sql`. All three are classified exact.
+    assert_eq!(
+        result.coverage,
+        nuthatch::port_emit::Coverage {
+            classified_exact: 3,
+            in_views: 2,
+            incremental: 1,
+        },
+        "got {}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.answered(),
+        3,
+        "{}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.unanswered(),
+        0,
+        "nothing here is unanswered: {}",
+        result.coverage.summary()
+    );
+
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+    assert!(
+        readme.contains(
+            "3 of 3 fields the report calls exact are answered (100%): 2 in views, 1 maintained \
+             incrementally, 0 not answered at all"
+        ),
+        "the README must say where the third field went:\n{readme}"
+    );
+}
+
 /// The gate that decides the slice: the emitted entity has to satisfy RFC-0041's v1 shape rules and
 /// bind. `nuthatch check` runs both, so this is the real validator rather than a substring.
 #[test]
