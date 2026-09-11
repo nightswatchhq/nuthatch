@@ -1605,7 +1605,7 @@ async fn graph_graphql(
             "__schema" => {
                 let d =
                     doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
-                data.insert(root.key.clone(), d["__schema"].clone());
+                data.insert(root.key.clone(), project(&d["__schema"], &root.sel));
                 continue;
             }
             // The other standard introspection operation. The name comes from the parsed argument,
@@ -1627,7 +1627,8 @@ async fn graph_graphql(
                             .iter()
                             .find(|t| t["name"].as_str() == Some(want.as_str()))
                             .cloned()
-                    });
+                    })
+                    .map(|t| project(&t, &root.sel));
                 data.insert(root.key.clone(), found.unwrap_or(serde_json::Value::Null));
                 continue;
             }
@@ -1676,6 +1677,41 @@ async fn graph_graphql(
         }
     }
     (StatusCode::OK, Json(serde_json::json!({"data": data})))
+}
+
+/// Narrow a rendered value to exactly the fields a selection asked for.
+///
+/// A GraphQL response carries the selected fields and no others. The introspection branches used to hand
+/// back the whole rendered document whatever was selected, so `{ __schema { types { name } } }` came back
+/// with all eight keys of every type (Jules on #1282). Harmless to the clients that ignore extras, wrong
+/// for any that do not, and trivially avoidable now the parser hands over a resolved selection tree.
+///
+/// A selected field the document does not carry becomes `null` rather than being dropped: a client that
+/// asked for a key should find it there.
+///
+/// Arguments on an introspection field are ignored on purpose. The only one a client sends is
+/// `includeDeprecated`, and a generated subgraph schema deprecates nothing, so both values answer the
+/// same list.
+fn project(value: &serde_json::Value, sel: &[crate::graph_query::Selection]) -> serde_json::Value {
+    if sel.is_empty() {
+        return value.clone();
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(|v| project(v, sel)).collect())
+        }
+        serde_json::Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for s in sel {
+                let v = o.get(&s.name).cloned().unwrap_or(serde_json::Value::Null);
+                out.insert(s.key.clone(), project(&v, &s.sub));
+            }
+            serde_json::Value::Object(out)
+        }
+        // A scalar with a sub-selection is not a legal query; pass it through rather than invent an
+        // object for it.
+        _ => value.clone(),
+    }
 }
 
 /// Build one response object from one SQL row.
@@ -5211,7 +5247,14 @@ mod tests {
         let _ = &d;
         let ask = graph_ask;
         for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
-            let body = ask(uri, "{ __schema { types { name } } }", state.clone()).await;
+            // The query asks for what this test goes on to read: the response is now projected to the
+            // selection, so relying on unselected keys arriving anyway would be relying on a bug.
+            let body = ask(
+                uri,
+                "{ __schema { types { name fields { name } } } }",
+                state.clone(),
+            )
+            .await;
             let types = body["data"]["__schema"]["types"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{uri} returned no types: {body}"));
@@ -5383,6 +5426,65 @@ mod tests {
         for want in ["Pool", "Pool_filter", "Token", "_Meta_", "_Log_"] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
+
+        // A response carries the selected fields and no others. The introspection branches used to hand
+        // back the whole rendered document whatever was asked for, so a client selecting `name` received
+        // all eight keys of every type.
+        let body = ask("/graphql", "{ __schema { types { name } } }", state.clone()).await;
+        let first = body["data"]["__schema"]["types"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("no types: {body}"));
+        assert_eq!(
+            first.keys().cloned().collect::<Vec<_>>(),
+            ["name"],
+            "a projected response carries only what was selected"
+        );
+        let top = body["data"]["__schema"].as_object().unwrap();
+        assert_eq!(
+            top.keys().cloned().collect::<Vec<_>>(),
+            ["types"],
+            "including at the `__schema` level"
+        );
+
+        // A selected field the document does not carry is `null`, not absent: a client that asked for a
+        // key should find it there.
+        let body = ask(
+            "/graphql",
+            "{ __schema { types { name nope } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__schema"]["types"][0],
+            serde_json::json!({"name": "String", "nope": null}),
+            "an unknown selected key is null rather than missing: {body}"
+        );
+
+        // An alias on an introspection field answers under the alias, and projection follows it down.
+        let body = ask(
+            "/graphql",
+            r#"{ s: __schema { t: types { n: name } } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["s"]["t"][0],
+            serde_json::json!({"n": "String"}),
+            "aliases survive projection at every level: {body}"
+        );
+
+        // `__type` is projected too.
+        let body = ask(
+            "/graphql",
+            r#"{ __type(name: "Pool") { name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__type"],
+            serde_json::json!({"name": "Pool"}),
+            "{body}"
+        );
 
         // Introspection is not an exclusive mode, it is two more root fields. Returning early on the
         // first one meant a mixed operation came back without its data fields at all - present in the
