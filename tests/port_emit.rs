@@ -2278,3 +2278,67 @@ export function handlePoolCreated(event: PoolCreated): void {
         "no file either"
     );
 }
+
+/// A **nullable** field assigned only a literal may still hold nothing.
+///
+/// Every assignment agreeing on one literal means no row holds a different number. It does not mean every
+/// row holds one: a row created by a handler that never touches the field keeps whatever the store had,
+/// which for a nullable field is null. graph-node refuses to save a row whose *non-nullable* field is
+/// unset, and that is the whole argument for answering every row with one literal (Jules on #1316).
+#[test]
+fn a_nullable_constant_field_is_not_answered_with_its_literal() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+  collectedFeesUSD: BigDecimal
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, CONSTANT_MAPPING);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a nullable field may be null on a row no handler wrote, and null is not 0:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}
+
+/// A field assigned the literal only inside a branch is not that literal on the rows that took the other
+/// one.
+///
+/// Jules's case on #1316, and the real shape: Uniswap V4 sets `Token.totalValueLockedUSDUntracked` inside
+/// `if (token0 === null)`, so this refusal costs a field whose value genuinely is always zero. Losing it
+/// is a missing number; projecting the literal for a row that never got it is a wrong one.
+#[test]
+fn a_conditionally_assigned_constant_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    pool = new Pool(event.params.pool.toHexString())
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the branch gives the literal to the rows that took it and leaves the rest as they were:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}

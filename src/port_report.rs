@@ -57,6 +57,9 @@ pub struct FieldRow {
     pub class: Class,
     pub citation: Citation,
     pub reason: String,
+    /// Declared `T!` rather than `T`. The emitter needs it to decide whether a single literal can answer
+    /// for every row (#1316).
+    pub non_null: bool,
 }
 
 impl FieldRow {
@@ -214,6 +217,10 @@ struct SchemaField {
     name: String,
     line: usize,
     derived_from: Option<String>,
+    /// `BigDecimal!` rather than `BigDecimal`. Load-bearing for the constant case: graph-node refuses to
+    /// save a row whose non-nullable field is unset, so a non-nullable field has a value on every stored
+    /// row - which is what lets a single literal answer for all of them.
+    non_null: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -361,7 +368,18 @@ fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
         // body, so the two overlap on that first line. The old per-line loop had the same overlap
         // (`start_line + offset + 1`) and reported every schema field one line below itself.
         let line = start_line + line_of(body, *at) - 1;
-        flush_field(&mut fields, Some((name.clone(), line)), &dirs);
+        // The declared type, between the `:` and the end of this field's segment or its first directive.
+        let ty = segment
+            .split_once(':')
+            .map(|(_, rest)| rest.split('@').next().unwrap_or(rest))
+            .map(|t| t.split('#').next().unwrap_or(t).trim().to_string())
+            .unwrap_or_default();
+        flush_field(
+            &mut fields,
+            Some((name.clone(), line)),
+            &dirs,
+            ty.ends_with('!'),
+        );
     }
     fields
 }
@@ -426,7 +444,12 @@ fn field_starts(body: &str) -> Vec<(String, usize)> {
     out
 }
 
-fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, dirs: &str) {
+fn flush_field(
+    fields: &mut Vec<SchemaField>,
+    pending: Option<(String, usize)>,
+    dirs: &str,
+    non_null: bool,
+) {
     let Some((name, line)) = pending else {
         return;
     };
@@ -438,6 +461,7 @@ fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, 
         name,
         line,
         derived_from,
+        non_null,
     });
 }
 
@@ -2076,12 +2100,21 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
 
     let mut rows: Vec<FieldRow> = field_class
         .into_iter()
-        .map(|((entity, field), (class, citation, reason))| FieldRow {
-            entity,
-            field,
-            class,
-            citation,
-            reason,
+        .map(|((entity, field), (class, citation, reason))| {
+            let non_null = schema
+                .entities
+                .iter()
+                .find(|e| e.name == entity)
+                .and_then(|e| e.fields.iter().find(|f| f.name == field))
+                .is_some_and(|f| f.non_null);
+            FieldRow {
+                entity,
+                field,
+                class,
+                citation,
+                reason,
+                non_null,
+            }
         })
         .collect();
     rows.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.field.cmp(&b.field)));
@@ -3677,7 +3710,7 @@ fn binding_arguments(body: &str, var: &str) -> Vec<String> {
 /// Brace depth, counted to the assignment's line. An assignment inside an `if` sets the field on one
 /// path and leaves whatever was stored on the other, and a field set on only one path is not the
 /// event's value on the other.
-fn assigned_unconditionally(func: &FunctionInfo, asg: &Assignment) -> bool {
+pub(crate) fn assigned_unconditionally(func: &FunctionInfo, asg: &Assignment) -> bool {
     let Some(idx) = asg.citation.line.checked_sub(func.body_start_line) else {
         return false;
     };

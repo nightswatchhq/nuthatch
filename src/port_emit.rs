@@ -907,8 +907,18 @@ fn skip_reason(report_reason: &str) -> String {
 fn always_constant(
     entity: &str,
     field: &str,
+    non_null: bool,
     mappings: &crate::port_report::Mappings,
 ) -> Option<String> {
+    // **Non-nullable, or a row may hold nothing rather than the literal.** Every assignment agreeing on
+    // one literal means no row holds a *different* number, but it does not mean every row holds one: a row
+    // created by a handler that never touches the field keeps whatever the store had, which for a nullable
+    // field is null. graph-node refuses to save a row whose non-nullable field is unset, so on a
+    // non-nullable field the subgraph itself guarantees every stored row was given a value - and the only
+    // value anything writes is this literal (Jules, #1316).
+    if !non_null {
+        return None;
+    }
     // No "was anything assigned at all" flag: a non-literal assignment returns below, so `seen` is
     // `Some` exactly when every assignment was the same literal and there was at least one.
     let mut seen: Option<String> = None;
@@ -918,6 +928,13 @@ fn always_constant(
                 continue;
             }
             let lit = constant_literal(&asg.expr)?;
+            // **On every path through the function that writes it.** An assignment inside an `if` gives the
+            // literal to the rows that took that branch and leaves the rest as they were; a view projecting
+            // the literal for all of them answers a number the subgraph never stored (Jules, #1316). Paired
+            // with the non-null check above, which covers rows no handler wrote at all.
+            if !crate::port_report::assigned_unconditionally(func, asg) {
+                return None;
+            }
             match &seen {
                 Some(prev) if prev != &lit => return None,
                 _ => seen = Some(lit),
@@ -975,7 +992,7 @@ fn view_for_entity(
         // **A field the mappings only ever set to a constant is that constant.** Checked before the
         // column search, because there is no column to find: `pool.collectedFeesToken0 = ZERO_BD` and
         // nothing ever touches it again (#1313).
-        if let Some(lit) = always_constant(&f.entity, &f.field, mappings) {
+        if let Some(lit) = always_constant(&f.entity, &f.field, f.non_null, mappings) {
             comments.push(format!(
                 "-- `{}.{}` exact, and constant: every mapping assigns {} - {}:{}",
                 f.entity, f.field, lit, f.citation.file, f.citation.line
