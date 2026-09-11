@@ -511,12 +511,20 @@ fn one_huge_file_does_not_evict_the_files_after_it() {
         .arg(root().join("scripts/pr-review.py"))
         .arg("--diff")
         .arg(&path)
-        .args(["--title", "a pull request with a recorded fixture in it", "--dry-run"])
+        .args([
+            "--title",
+            "a pull request with a recorded fixture in it",
+            "--dry-run",
+        ])
         .arg("--base-file")
         .arg(&base)
         .output()
         .expect("run pr-review.py");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let prompt = String::from_utf8_lossy(&out.stdout);
 
     for want in [
@@ -532,7 +540,10 @@ fn one_huge_file_does_not_evict_the_files_after_it() {
     }
     // The big file is present but shortened, and says so where it was cut, so the reviewer does not
     // read a part for the whole.
-    assert!(prompt.contains("a_huge.json"), "the large file is still named");
+    assert!(
+        prompt.contains("a_huge.json"),
+        "the large file is still named"
+    );
     assert!(
         prompt.contains("this file was shortened to fit the review budget"),
         "a shortened file must say so inline"
