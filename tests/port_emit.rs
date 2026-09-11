@@ -176,16 +176,266 @@ fn exact_field_appears_in_a_view() {
     );
 }
 
+/// A `@derivedFrom` reverse relation is **answered**, and it must never become a column.
+///
+/// It stores nothing: the value is a reverse lookup that RFC-0053 S2 lowers to a JSON aggregation over
+/// the forward reference. Counting it unanswered understated the overlay by 8 of 92 on the pinned target
+/// and would have sent a porter hunting for columns that must not exist (#1284).
 #[test]
-fn readme_is_the_port_report_verbatim() {
+fn a_derived_from_relation_counts_as_answered_and_reaches_no_column() {
+    let schema = r#"
+type Pair @entity {
+  id: ID!
+  token0: String!
+  trades: [Trade!]! @derivedFrom(field: "pair")
+}
+type Trade @entity {
+  id: ID!
+  pair: Pair!
+}
+"#;
+    let mapping = r#"
+export function handlePairCreated(event: PairCreated): void {
+  let pair = new Pair(event.params.pair.toHex())
+  pair.id = event.params.pair.toHex()
+  pair.token0 = event.params.token0.toHex()
+  pair.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+
+    assert_eq!(
+        result.coverage.derived,
+        1,
+        "`Pair.trades` is a reverse lookup: {}",
+        result.coverage.summary()
+    );
+    assert!(
+        result
+            .coverage
+            .summary()
+            .contains("1 derived by reverse lookup"),
+        "the sentence must say so: {}",
+        result.coverage.summary()
+    );
+
+    // And it is counted as answered rather than as a hole.
+    assert_eq!(
+        result.coverage.answered(),
+        result.coverage.in_views + result.coverage.derived,
+        "{}",
+        result.coverage.summary()
+    );
+
+    // It must not appear in any view's projection: a stored column for a reverse relation would be a
+    // second copy of the truth, drifting from the forward reference.
+    for v in &result.views {
+        assert!(
+            !v.exact_fields.iter().any(|f| f == "trades"),
+            "{}: `trades` must not be a column\n{}",
+            v.entity,
+            v.sql
+        );
+    }
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+    assert!(
+        readme.contains("derived by reverse lookup"),
+        "README must carry the clause:\n{readme}"
+    );
+}
+
+/// The invariant the coverage figure rests on: a view projects exactly the fields it lists.
+///
+/// `EmittedView::exact_fields` feeds two things - the generated check's projection and the coverage
+/// figure - so a field listed but not projected reads as verified *and* as answered while DuckDB
+/// cannot answer it. That divergence is #1248. It is now impossible by construction, because the list
+/// is the key set of the same map the SQL is rendered from, and this test is what holds that true if
+/// anyone reintroduces a parallel list.
+#[test]
+fn every_emitted_view_projects_exactly_the_fields_it_lists() {
+    /// Names the outer projection exposes, for both shapes `exact_select_sql` emits: the grouped fold
+    /// (`last(...) AS "x"` over a union, with a bare `"id"`) and the single-arm form (`"col" AS "x"`).
+    /// `__present__` markers are internal and not fields.
+    fn projected(sql: &str) -> std::collections::BTreeSet<String> {
+        let body = sql
+            .split_once(" AS\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or(sql)
+            .trim_start();
+        let head = body
+            .split_once("\nFROM")
+            .map(|(h, _)| h)
+            .unwrap_or(body)
+            .trim_start()
+            .trim_start_matches("SELECT");
+        let mut out = std::collections::BTreeSet::new();
+        for part in head.split(",\n") {
+            let part = part.trim().trim_end_matches(';');
+            let name = match part.rsplit_once(" AS ") {
+                Some((_, alias)) => alias.trim(),
+                // a bare projected column, which is how `id` is emitted in the fold
+                None => part,
+            };
+            let name = name.trim().trim_matches('"');
+            if name.is_empty()
+                || name.starts_with("__present__")
+                || !name.contains(char::is_alphabetic)
+            {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
+        out
+    }
+
+    // Three shapes: one field and one table, a fold over several fields, and an overlay with a
+    // running total split out to an incremental entity.
+    for (label, schema, mapping) in [
+        ("one field", None, None),
+        ("accumulator split", Some(ACCUM_SCHEMA), Some(ACCUM_MAPPING)),
+        ("operations", Some(OPS_SCHEMA), Some(OPS_MAPPING)),
+    ] {
+        let (_nest, result) = match (schema, mapping) {
+            (Some(s), Some(m)) => emitted_nest(s, m),
+            _ => {
+                let nest = tempfile::tempdir().unwrap();
+                write_imported_nest(nest.path(), false);
+                let r = nuthatch::port_emit::emit(&one_call_dir(), nest.path()).unwrap();
+                (nest, r)
+            }
+        };
+        assert!(
+            !result.views.is_empty(),
+            "{label}: nothing was emitted, so this case proves nothing"
+        );
+        for v in &result.views {
+            let listed: std::collections::BTreeSet<String> =
+                v.exact_fields.iter().cloned().collect();
+            let select = v
+                .sql
+                .split_once("CREATE VIEW")
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{label}/{}: no CREATE VIEW:\n{}", v.entity, v.sql));
+            assert_eq!(
+                projected(select),
+                listed,
+                "{label}/{}: the projection and `exact_fields` disagree\n{}",
+                v.entity,
+                v.sql
+            );
+            assert!(
+                !listed.is_empty(),
+                "{label}/{}: an emitted view with no listed field",
+                v.entity
+            );
+        }
+    }
+}
+
+/// `README.md` is the report **plus what this overlay actually answers**.
+///
+/// It used to be the report verbatim, which is what this test asserted. The report's summary table
+/// describes the mapping - a field is `exact` when it is a pure function of decoded events, a claim
+/// about reproducibility in principle. On the RFC-0044 S3 acceptance port it said `exact 205` while
+/// the overlay answered **27**, and nothing on disk or on stdout said so, so the artefacts read as a
+/// finished port (#1277).
+#[test]
+fn readme_carries_the_report_and_the_overlay_coverage() {
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);
     let result = nuthatch::port_emit::emit(&one_call_dir(), nest.path()).unwrap();
     let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
-    assert_eq!(readme, result.report);
+
+    assert!(
+        readme.starts_with(&result.report),
+        "the report must still be there, whole and first:\n{readme}"
+    );
     assert!(readme.contains("# Port report"));
     assert!(readme.contains("call-derived"));
     assert!(readme.contains("`Token.symbol`"));
+
+    // This fixture has one exact field (`Token.id`) and the view answers it, so the honest figure is
+    // 1 of 1. Asserted as the rendered sentence rather than as `contains("coverage")`, because the
+    // sentence is what a porter reads and a count that drifts from the artefacts is the whole defect.
+    assert_eq!(
+        result.coverage,
+        nuthatch::port_emit::Coverage {
+            classified_exact: 1,
+            in_views: 1,
+            incremental: 0,
+            derived: 0,
+        },
+        "coverage must be counted from the artefacts"
+    );
+    assert!(
+        readme.contains(
+            "1 of 1 fields the report calls exact are answered (100%): 1 in views, 0 maintained \
+             incrementally, 0 derived by reverse lookup, 0 not answered at all"
+        ),
+        "README must carry the figure as a sentence:\n{readme}"
+    );
+    assert!(
+        readme.contains("## Overlay coverage"),
+        "and under a heading a reader can find:\n{readme}"
+    );
+}
+
+/// The figure has to move when the overlay gets worse, or it is decoration.
+///
+/// `Token.tally` is written by the mapping from an arithmetic expression over an event parameter, so
+/// the classifier calls it exact - a pure function of decoded events - and the emitter cannot render
+/// it into a column. That is the exact shape of the 178 fields the S3 acceptance port promised and
+/// could not answer (#1277), and the coverage line must stop reading 100%.
+#[test]
+fn an_unanswered_exact_field_moves_the_coverage_figure() {
+    let subgraph = tempfile::tempdir().unwrap();
+    copy_dir(&one_call_dir(), subgraph.path());
+
+    let schema = subgraph.path().join("schema.graphql");
+    let text = std::fs::read_to_string(&schema).unwrap();
+    let text = text.replace("  symbol: String!", "  symbol: String!\n  tally: BigInt!");
+    assert!(text.contains("tally"), "schema edit did not apply");
+    std::fs::write(&schema, &text).unwrap();
+
+    let mapping = subgraph.path().join("src/mappings/core.ts");
+    let m = std::fs::read_to_string(&mapping).unwrap();
+    // Asserted rather than assumed: the fixture binds `token0`, not `token`, and an edit that matches
+    // nothing leaves a field the classifier calls *unreachable* instead of exact - which moves no
+    // coverage and makes this test vacuous. It happened while writing it.
+    let m2 = m.replace(
+        "  token0.save()",
+        "  token0.tally = event.params.fee.plus(event.params.fee)\n  token0.save()",
+    );
+    assert_ne!(m2, m, "mapping edit did not apply:\n{m}");
+    std::fs::write(&mapping, &m2).unwrap();
+
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap();
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+
+    assert_eq!(
+        result.coverage.classified_exact,
+        2,
+        "the fixture must promise two exact fields, got {}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.unanswered(),
+        1,
+        "and exactly one must be unanswered, got {}",
+        result.coverage.summary()
+    );
+    assert!(
+        readme.contains("1 of 2 fields the report calls exact are answered (50%)"),
+        "README must carry the moved figure:\n{}",
+        result.coverage.summary()
+    );
+    assert!(
+        !readme.contains("(100%)"),
+        "an overlay with an unanswered exact field must not read 100%:\n{}",
+        result.coverage.summary()
+    );
 }
 
 #[test]
@@ -829,6 +1079,52 @@ export function handlePoolCreated(event: PoolCreated): void {
   pool.save()
 }
 "#;
+
+/// A field maintained incrementally is **answered**, and the figure has to say so separately.
+///
+/// Counting it as unanswered would under-report a port that did the right thing with its running
+/// totals, and folding it into the view count would hide where the field actually lives. A mutation
+/// setting `incremental: 0` survived this file before this test existed, which is how the gap showed
+/// up: the two fixtures the coverage tests used had no materialised field between them (#1277).
+#[test]
+fn the_coverage_figure_counts_an_incremental_field_as_answered() {
+    let (nest, result) = emitted_nest(ACCUM_SCHEMA, ACCUM_MAPPING);
+
+    // `id` and `latest` are latest-value and land in the view; `totalFees` is a running total and is
+    // maintained in `entities/pool.sql`. All three are classified exact.
+    assert_eq!(
+        result.coverage,
+        nuthatch::port_emit::Coverage {
+            classified_exact: 3,
+            in_views: 2,
+            incremental: 1,
+            derived: 0,
+        },
+        "got {}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.answered(),
+        3,
+        "{}",
+        result.coverage.summary()
+    );
+    assert_eq!(
+        result.coverage.unanswered(),
+        0,
+        "nothing here is unanswered: {}",
+        result.coverage.summary()
+    );
+
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+    assert!(
+        readme.contains(
+            "3 of 3 fields the report calls exact are answered (100%): 2 in views, 1 maintained \
+             incrementally, 0 derived by reverse lookup, 0 not answered at all"
+        ),
+        "the README must say where the third field went:\n{readme}"
+    );
+}
 
 /// The gate that decides the slice: the emitted entity has to satisfy RFC-0041's v1 shape rules and
 /// bind. `nuthatch check` runs both, so this is the real validator rather than a substring.

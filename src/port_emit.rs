@@ -43,6 +43,64 @@ pub struct EmitResult {
     /// rather than served by a placeholder that returns `1` (#1277); the per-field reasons are in
     /// `skipped_fields` and in the report.
     pub entities_without_views: Vec<String>,
+    /// How much of what the report promised the overlay actually answers (#1277).
+    pub coverage: Coverage,
+}
+
+/// Fields answered over fields promised, which is the one number that says whether a port is done.
+///
+/// The report classifies a field `exact` when the mapping computes it purely from decoded events.
+/// That is a claim about *reproducibility in principle*. Whether this overlay reproduces it is a
+/// different question, and on the RFC-0044 S3 acceptance port the two answers were **205 and 27**.
+/// Nothing printed the second one, so a reader saw a report promising 205 byte-identical fields and
+/// an overlay of nineteen view files, and had no way to tell that 178 of those fields could not be
+/// asked for at all (#1277).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Fields the report classified `exact` - what was promised.
+    pub classified_exact: usize,
+    /// Of those, fields a `views/*.sql` projection names.
+    pub in_views: usize,
+    /// Of those, fields maintained incrementally as an RFC-0041 entity. Answered, just not by a view.
+    pub incremental: usize,
+    /// Of those, `@derivedFrom` reverse relations. **Answered, and they never wanted a column.**
+    ///
+    /// A `@derivedFrom` field stores nothing: it is a reverse lookup that RFC-0053 S2 lowers to a JSON
+    /// aggregation over the forward reference. Counting it unanswered understated the overlay by 8 on
+    /// the pinned target (#1284) and would have had a porter hunting for columns that must not exist.
+    pub derived: usize,
+}
+
+impl Coverage {
+    /// Answered by any of the three routes. A field is in exactly one: `view_for_entity` skips a
+    /// materialised field, and a `@derivedFrom` field reaches no column by construction.
+    pub fn answered(&self) -> usize {
+        self.in_views + self.incremental + self.derived
+    }
+
+    /// `exact` fields no artefact answers.
+    pub fn unanswered(&self) -> usize {
+        self.classified_exact.saturating_sub(self.answered())
+    }
+
+    /// One line, for the CLI and for `README.md`. Percent of promised, floored, so a port that
+    /// answers 27 of 205 cannot round itself up to anything reassuring.
+    pub fn summary(&self) -> String {
+        let pct = (self.answered() * 100)
+            .checked_div(self.classified_exact)
+            .unwrap_or(0);
+        format!(
+            "{} of {} fields the report calls exact are answered ({}%): {} in views, {} maintained \
+             incrementally, {} derived by reverse lookup, {} not answered at all",
+            self.answered(),
+            self.classified_exact,
+            pct,
+            self.in_views,
+            self.incremental,
+            self.derived,
+            self.unanswered(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +210,9 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             s.why
         );
     }
+    // Last, because it is the line that says whether any of the above adds up to a port. The entity
+    // count above is the shape of the problem; this is its size (#1277).
+    println!("  coverage: {}", result.coverage.summary());
     Ok(())
 }
 
@@ -196,7 +257,45 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         write_exact_views(nest, &report, &mappings, &config, &schema, &materialised)?;
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
-    std::fs::write(nest.join("README.md"), &report_text)
+
+    // `in_views` counts distinct (entity, field) pairs a view projection names. `exact_fields` is the
+    // key set of the map `exact_select_sql` renders, so this counts the projection rather than a
+    // parallel list that could disagree with it - which is what #1248 was and what a metric derived
+    // from bookkeeping would have inherited.
+    let coverage = Coverage {
+        classified_exact: report
+            .fields
+            .iter()
+            .filter(|f| f.class == crate::port_report::Class::Exact)
+            .count(),
+        in_views: views
+            .iter()
+            .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone())))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        incremental: materialised.len(),
+        // Counted from the report's own reason, which is where the directive is recorded. A reverse
+        // relation is answered by a join at request time and must never become a stored column.
+        derived: report
+            .fields
+            .iter()
+            .filter(|f| f.class == crate::port_report::Class::Exact)
+            .filter(|f| f.reason.contains("@derivedFrom"))
+            .count(),
+    };
+
+    // **`README.md` carries the figure.** It was the report verbatim, and the report's summary table
+    // says `exact 205` - a promise about the mapping, not about this overlay. A porter reading it had
+    // every reason to believe the nest answered 205 fields (#1277).
+    let readme = format!(
+        "{report_text}\n## Overlay coverage\n\n{}\n\nThe class counts above describe the *mapping*: \
+         a field is `exact` when it is a pure function of decoded events, which is a claim about what \
+         is reproducible in principle. This line describes *this overlay*: what it actually answers. \
+         A field counted unanswered is named with its reason in the `-- NOT IN THIS VIEW` comments of \
+         the relevant `views/*.sql`, and on stdout when `port-emit` ran.\n",
+        coverage.summary()
+    );
+    std::fs::write(nest.join("README.md"), &readme)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
 
     Ok(EmitResult {
@@ -207,6 +306,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         skipped_fields,
         entities,
         entities_without_views,
+        coverage,
     })
 }
 
@@ -735,7 +835,6 @@ fn view_for_entity(
     let mut comments = Vec::new();
     // field → table → column. One field may be written from several triggering tables.
     let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let mut exact_fields = Vec::new();
     let mut skipped = Vec::new();
 
     for f in fields {
@@ -773,7 +872,6 @@ fn view_for_entity(
             });
             continue;
         }
-        exact_fields.push(f.field.clone());
         comments.push(format!(
             "-- `{}.{}` exact: {}:{} - {}",
             f.entity,
@@ -791,6 +889,18 @@ fn view_for_entity(
         }
     }
     fill_id_columns(entity, &mut selects, mappings, config);
+
+    // **One source for the list and for the SQL.**
+    //
+    // This used to be a parallel `Vec` pushed inside the loop above. The two were built from the same
+    // information and still diverged (#1248), and a divergence here is invisible: `exact_fields` feeds
+    // the generated check's projection and the coverage figure, so a field listed but not projected
+    // reads as verified and as answered while DuckDB cannot answer it. Taking the list from `selects`
+    // - the same map `exact_select_sql` renders - makes that impossible rather than unlikely, and
+    // `every_emitted_view_projects_exactly_the_fields_it_lists` holds the invariant.
+    //
+    // Sorted, because `selects` is a `BTreeMap`. Nothing downstream depends on schema order.
+    let exact_fields: Vec<String> = selects.keys().cloned().collect();
 
     let mut sql = String::new();
     sql.push_str(&format!(
