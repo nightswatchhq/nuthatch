@@ -536,15 +536,19 @@ fn write_entities(
             "-- A subgraph accumulates these one event at a time; the decoded table holds the\n             -- deltas, so the total is their sum and never the latest value. The exact fields that\n             -- *are* latest-value live in views/, and README.md says which field went where.\n",
         );
         for a in &here {
+            let how = match (&a.source, a.negated) {
+                (AccumulationSource::Column(c), false) => format!("sums `{c}` of `{table}`"),
+                (AccumulationSource::Column(c), true) => {
+                    format!("sums the negation of `{c}` of `{table}`")
+                }
+                (AccumulationSource::Rows, false) => format!("counts rows of `{table}`"),
+                (AccumulationSource::Rows, true) => {
+                    format!("counts rows of `{table}`, negated")
+                }
+            };
             sql.push_str(&format!(
-                "-- `{entity}.{}` {} `{}` of `{table}`: {}\n",
+                "-- `{entity}.{}` {how}: {}\n",
                 a.field,
-                if a.negated {
-                    "sums the negation of"
-                } else {
-                    "sums"
-                },
-                a.column,
                 a.citation.display()
             ));
         }
@@ -559,17 +563,35 @@ fn write_entities(
         // the total does not already cost.
         let mut cols = vec![format!("  \"{id_column}\" AS \"id\"")];
         for a in &here {
-            let cast = format!("TRY_CAST(\"{}\" AS DECIMAL(38,0))", a.column);
-            let operand = if a.negated {
-                format!("-{cast}")
-            } else {
-                cast.clone()
-            };
-            cols.push(format!("  sum({operand}) AS \"{}\"", a.field));
-            cols.push(format!(
-                "  max(CASE WHEN \"{}\" IS NOT NULL AND {cast} IS NULL THEN 1 ELSE 0 END) AS \"{}_overflow\"",
-                a.column, a.field
-            ));
+            match &a.source {
+                AccumulationSource::Column(column) => {
+                    let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
+                    let operand = if a.negated {
+                        format!("-{cast}")
+                    } else {
+                        cast.clone()
+                    };
+                    cols.push(format!("  sum({operand}) AS \"{}\"", a.field));
+                    cols.push(format!(
+                        "  max(CASE WHEN \"{column}\" IS NOT NULL AND {cast} IS NULL THEN 1 ELSE 0 END) AS \"{}_overflow\"",
+                        a.field
+                    ));
+                }
+                // **No `_overflow` companion, and that is not an omission.** The overflow flag exists
+                // because an event param is sealed as exact decimal text and `TRY_CAST` to
+                // `DECIMAL(38,0)` yields NULL past 38 digits, which `sum` would skip in silence
+                // (RFC-0047 §2 C1). A row count casts nothing and cannot narrow, so a flag here would be
+                // a column that is always 0 - and a reader would reasonably take its presence as
+                // evidence that something could overflow.
+                AccumulationSource::Rows => {
+                    let expr = if a.negated {
+                        "-count(*)".to_string()
+                    } else {
+                        "count(*)".to_string()
+                    };
+                    cols.push(format!("  {expr} AS \"{}\"", a.field));
+                }
+            }
         }
         sql.push_str(&format!(
             "SELECT\n{}\nFROM \"{table}\"\nGROUP BY \"{id_column}\"\n",
@@ -1021,9 +1043,39 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
 struct AccumulatedField {
     field: String,
     table: String,
-    column: String,
+    /// What to fold: a decoded column, or the rows themselves.
+    source: AccumulationSource,
     negated: bool,
     citation: Citation,
+}
+
+/// What an accumulating assignment folds.
+///
+/// A subgraph's counters are not sums of a column - `pool.txCount = pool.txCount.plus(ONE_BI)` adds one per
+/// event, which is `count(*)`. The matcher required the operand to be a decoded column, so every counter was
+/// rejected and the field fell back to its *initialising* assignment (`= ZERO_BI`), which is why the family
+/// read as "zero initialiser" rather than "running total". Eight fields on Uniswap V4 (#1310).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccumulationSource {
+    /// `sum(TRY_CAST("col" AS DECIMAL(38,0)))`, with an `_overflow` companion.
+    Column(String),
+    /// `count(*)`. A unit increment, so there is no column to cast and nothing to overflow.
+    Rows,
+}
+
+/// Is this operand a literal one?
+///
+/// The subgraph conventions (`ONE_BI`, `ONE_BD`) plus the explicit forms. Nothing else: a constant this does
+/// not recognise falls through and is reported as skipped, rather than being folded as if it were one.
+fn is_unit_constant(operand: &str) -> bool {
+    matches!(
+        operand.trim(),
+        "ONE_BI"
+            | "ONE_BD"
+            | "BigInt.fromI32(1)"
+            | "BigInt.fromString('1')"
+            | "BigDecimal.fromString('1')"
+    )
 }
 
 /// Fields of `entity` written as running totals, resolved to the table and column that feed them.
@@ -1051,22 +1103,30 @@ fn map_accumulating_fields(
                 let Some(acc) = crate::port_report::accumulation(asg) else {
                     continue;
                 };
-                let Some(raw) = crate::port_report::event_column(&acc.operand) else {
-                    continue;
-                };
                 let Some(handler) = event_handler_for(func, mappings) else {
                     continue;
                 };
                 let Some(table) = table_for_handler(&handler.name, mappings, config) else {
                     continue;
                 };
-                let Some(column) = resolve_column(&table, &raw, schema) else {
-                    continue;
+                // A **unit increment** counts rows. Only a unit: `plus(TWO_BI)` would be
+                // `2 * count(*)`, which is expressible and is a second shape to get right, so it is
+                // left to fall through and be named as skipped rather than guessed at.
+                let source = if is_unit_constant(&acc.operand) {
+                    AccumulationSource::Rows
+                } else {
+                    let Some(raw) = crate::port_report::event_column(&acc.operand) else {
+                        continue;
+                    };
+                    let Some(column) = resolve_column(&table, &raw, schema) else {
+                        continue;
+                    };
+                    AccumulationSource::Column(column)
                 };
                 out.push(AccumulatedField {
                     field: f.field.clone(),
                     table,
-                    column,
+                    source,
                     negated: acc.negated,
                     citation: f.citation.clone(),
                 });
