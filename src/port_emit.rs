@@ -63,12 +63,19 @@ pub struct Coverage {
     pub in_views: usize,
     /// Of those, fields maintained incrementally as an RFC-0041 entity. Answered, just not by a view.
     pub incremental: usize,
+    /// Of those, `@derivedFrom` reverse relations. **Answered, and they never wanted a column.**
+    ///
+    /// A `@derivedFrom` field stores nothing: it is a reverse lookup that RFC-0053 S2 lowers to a JSON
+    /// aggregation over the forward reference. Counting it unanswered understated the overlay by 8 on
+    /// the pinned target (#1284) and would have had a porter hunting for columns that must not exist.
+    pub derived: usize,
 }
 
 impl Coverage {
-    /// Answered either way. A field cannot be both: `view_for_entity` skips a materialised field.
+    /// Answered by any of the three routes. A field is in exactly one: `view_for_entity` skips a
+    /// materialised field, and a `@derivedFrom` field reaches no column by construction.
     pub fn answered(&self) -> usize {
-        self.in_views + self.incremental
+        self.in_views + self.incremental + self.derived
     }
 
     /// `exact` fields no artefact answers.
@@ -84,12 +91,13 @@ impl Coverage {
             .unwrap_or(0);
         format!(
             "{} of {} fields the report calls exact are answered ({}%): {} in views, {} maintained \
-             incrementally, {} not answered at all",
+             incrementally, {} derived by reverse lookup, {} not answered at all",
             self.answered(),
             self.classified_exact,
             pct,
             self.in_views,
             self.incremental,
+            self.derived,
             self.unanswered(),
         )
     }
@@ -266,6 +274,14 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
             .collect::<BTreeSet<_>>()
             .len(),
         incremental: materialised.len(),
+        // Counted from the report's own reason, which is where the directive is recorded. A reverse
+        // relation is answered by a join at request time and must never become a stored column.
+        derived: report
+            .fields
+            .iter()
+            .filter(|f| f.class == crate::port_report::Class::Exact)
+            .filter(|f| f.reason.contains("@derivedFrom"))
+            .count(),
     };
 
     // **`README.md` carries the figure.** It was the report verbatim, and the report's summary table

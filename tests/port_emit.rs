@@ -176,6 +176,74 @@ fn exact_field_appears_in_a_view() {
     );
 }
 
+/// A `@derivedFrom` reverse relation is **answered**, and it must never become a column.
+///
+/// It stores nothing: the value is a reverse lookup that RFC-0053 S2 lowers to a JSON aggregation over
+/// the forward reference. Counting it unanswered understated the overlay by 8 of 92 on the pinned target
+/// and would have sent a porter hunting for columns that must not exist (#1284).
+#[test]
+fn a_derived_from_relation_counts_as_answered_and_reaches_no_column() {
+    let schema = r#"
+type Pair @entity {
+  id: ID!
+  token0: String!
+  trades: [Trade!]! @derivedFrom(field: "pair")
+}
+type Trade @entity {
+  id: ID!
+  pair: Pair!
+}
+"#;
+    let mapping = r#"
+export function handlePairCreated(event: PairCreated): void {
+  let pair = new Pair(event.params.pair.toHex())
+  pair.id = event.params.pair.toHex()
+  pair.token0 = event.params.token0.toHex()
+  pair.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+
+    assert_eq!(
+        result.coverage.derived,
+        1,
+        "`Pair.trades` is a reverse lookup: {}",
+        result.coverage.summary()
+    );
+    assert!(
+        result
+            .coverage
+            .summary()
+            .contains("1 derived by reverse lookup"),
+        "the sentence must say so: {}",
+        result.coverage.summary()
+    );
+
+    // And it is counted as answered rather than as a hole.
+    assert_eq!(
+        result.coverage.answered(),
+        result.coverage.in_views + result.coverage.derived,
+        "{}",
+        result.coverage.summary()
+    );
+
+    // It must not appear in any view's projection: a stored column for a reverse relation would be a
+    // second copy of the truth, drifting from the forward reference.
+    for v in &result.views {
+        assert!(
+            !v.exact_fields.iter().any(|f| f == "trades"),
+            "{}: `trades` must not be a column\n{}",
+            v.entity,
+            v.sql
+        );
+    }
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+    assert!(
+        readme.contains("derived by reverse lookup"),
+        "README must carry the clause:\n{readme}"
+    );
+}
+
 /// The invariant the coverage figure rests on: a view projects exactly the fields it lists.
 ///
 /// `EmittedView::exact_fields` feeds two things - the generated check's projection and the coverage
@@ -295,13 +363,14 @@ fn readme_carries_the_report_and_the_overlay_coverage() {
             classified_exact: 1,
             in_views: 1,
             incremental: 0,
+            derived: 0,
         },
         "coverage must be counted from the artefacts"
     );
     assert!(
         readme.contains(
             "1 of 1 fields the report calls exact are answered (100%): 1 in views, 0 maintained \
-             incrementally, 0 not answered at all"
+             incrementally, 0 derived by reverse lookup, 0 not answered at all"
         ),
         "README must carry the figure as a sentence:\n{readme}"
     );
@@ -1029,6 +1098,7 @@ fn the_coverage_figure_counts_an_incremental_field_as_answered() {
             classified_exact: 3,
             in_views: 2,
             incremental: 1,
+            derived: 0,
         },
         "got {}",
         result.coverage.summary()
@@ -1050,7 +1120,7 @@ fn the_coverage_figure_counts_an_incremental_field_as_answered() {
     assert!(
         readme.contains(
             "3 of 3 fields the report calls exact are answered (100%): 2 in views, 1 maintained \
-             incrementally, 0 not answered at all"
+             incrementally, 0 derived by reverse lookup, 0 not answered at all"
         ),
         "the README must say where the third field went:\n{readme}"
     );
