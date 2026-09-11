@@ -1070,6 +1070,20 @@ pub mod introspection {
                 vec![
                     arg("id", "ID!", None),
                     arg("block", "Block_height", None),
+                    // **`_SubgraphErrorPolicy_!`, non-null, with a `deny` default.** Unusual, and
+                    // correct. The SDL documentation writes `subgraphError: _SubgraphErrorPolicy_ = deny`,
+                    // which is why this reads as a bug and has been reported as one three times. The
+                    // introspection document graph-node actually serves is NON_NULL, and a non-null
+                    // argument carrying a default does not reject a client that omits it - the default
+                    // supplies it.
+                    //
+                    // graph-node `graph/src/schema/api.rs`, `error_policy_argument` (MIT/Apache):
+                    //     value_type: s::Type::NonNullType(Box::new(
+                    //         s::Type::NamedType(ERROR_POLICY_TYPE.to_string()))),
+                    //     default_value: Some(s::Value::Enum("deny".to_string())),
+                    //
+                    // Also in the recorded reference committed here, and re-probed live twice. Changing it
+                    // reds `tests/graph_schema_golden.rs`, which is the outcome to want.
                     arg("subgraphError", "_SubgraphErrorPolicy_!", Some("deny")),
                 ],
                 type_ref(&e.name),
@@ -1082,6 +1096,7 @@ pub mod introspection {
                 arg("where", &format!("{}_filter", e.name), None),
             ];
             a.push(arg("block", "Block_height", None));
+            // Non-null with a `deny` default, as above and for the same measured reason.
             a.push(arg("subgraphError", "_SubgraphErrorPolicy_!", Some("deny")));
             roots.push(field(
                 &plural(&e.name),

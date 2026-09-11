@@ -170,6 +170,30 @@ fn bytes_and_string_operator_sets_are_the_reference_ones() {
     // `ChainlinkPrice.period: PricePeriod` and `GovernanceFramework.type: GovernanceFrameworkType` each
     // answered four. A constant rather than a diff, because the thing this file diffs against is silent
     // on the question.
+    // **`subgraphError` is non-null with a `deny` default**, on every root. Asserted because it reads as a
+    // bug - the SDL documentation writes it nullable - and has been reported as one three times.
+    // graph-node's `error_policy_argument` builds `NonNullType(NamedType(_SubgraphErrorPolicy_))` with
+    // `default_value: Enum("deny")`, the recording agrees, and two live probes agreed.
+    for root in ["pool", "pools"] {
+        let f = types
+            .iter()
+            .find(|t| t["name"] == "Query")
+            .and_then(|q| q["fields"].as_array())
+            .and_then(|fs| fs.iter().find(|f| f["name"] == root))
+            .unwrap_or_else(|| panic!("no `{root}` root in the reference"));
+        let a = f["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "subgraphError")
+            .unwrap_or_else(|| panic!("`{root}` has no subgraphError in the reference"));
+        assert_eq!(
+            a["type"]["kind"], "NON_NULL",
+            "the reference renders `{root}.subgraphError` non-null, whatever the SDL docs say"
+        );
+        assert_eq!(a["defaultValue"], "deny");
+    }
+
     assert_eq!(
         graph_schema::filter_suffixes("OrderType", true),
         vec!["", "_not", "_in", "_not_in"],
