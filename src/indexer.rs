@@ -246,6 +246,7 @@ pub async fn upgrade(
             tokio::spawn(async move {
                 await_catchup_and_flip(&shared, &old_store, &new_store, new_state, UPGRADE_POLL)
                     .await
+                    .map(|_heads| ())
             })
         };
         // Phase 1 - old + new both live. Any task dying fails loudly (C1). The flip completing → phase 2.
@@ -302,13 +303,28 @@ pub struct NestRuntime {
 /// served backing to the new version (RFC-0020 slice 2b, the compatible hot-swap). Old and new indexers
 /// run concurrently until this returns; the caller aborts the old ingest afterwards. `poll` bounds how
 /// often the two heads are compared.
+/// The two heads the flip compared, **at the moment it compared them**.
+///
+/// Returned rather than only logged, because the guarantee is about that instant and nothing can
+/// recover it afterwards. Both indexers keep running, so a caller that re-reads the stores measures a
+/// later state and can see the old version ahead again - which is not the flip going backwards, it is
+/// the observation being taken at the wrong time. `compatible_hot_upgrade_flips_backing_after_catchup`
+/// failed that way twice, and the second attempt at fixing it aborted the old indexer first, which only
+/// narrows the window: `JoinHandle::abort` requests cancellation and does not wait, and stopping the old
+/// version cannot un-advance a head it already advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlipHeads {
+    pub old: Option<u64>,
+    pub new: Option<u64>,
+}
+
 pub async fn await_catchup_and_flip(
     shared: &serve::SharedNest,
     old_store: &dyn crate::store::HotStore,
     new_store: &dyn crate::store::HotStore,
     new_state: serve::AppState,
     poll: std::time::Duration,
-) -> Result<()> {
+) -> Result<FlipHeads> {
     loop {
         let old_head = old_store.indexed_head()?;
         let new_head = new_store.indexed_head()?;
@@ -319,7 +335,10 @@ pub async fn await_catchup_and_flip(
                 "new version caught up - hot-swapping the served backing (RFC-0020)"
             );
             shared.swap(new_state);
-            return Ok(());
+            return Ok(FlipHeads {
+                old: old_head,
+                new: new_head,
+            });
         }
         tokio::time::sleep(poll).await;
     }

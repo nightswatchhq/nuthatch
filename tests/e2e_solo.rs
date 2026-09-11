@@ -380,8 +380,9 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     // Before the flip, the endpoint is backed by the OLD version.
     assert_eq!(shared.current().dir.as_path(), old_dir.path());
 
-    // Concurrent re-index + atomic flip: returns once the new version has caught up to the old.
-    tokio::time::timeout(
+    // Concurrent re-index + atomic flip: returns once the new version has caught up to the old, and
+    // reports the two heads it compared.
+    let heads = tokio::time::timeout(
         POLL_TIMEOUT,
         indexer::await_catchup_and_flip(
             &shared,
@@ -402,23 +403,20 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     // is at least as far along as the old - so no consumer sees the endpoint go backwards. It does
     // *not* promise the new version has reached the tip.
     //
-    // **Measure it at that moment, not afterwards.** `await_catchup_and_flip` returns when the two are
-    // level, but *both indexers keep running* - so reading the heads after it returns lets the old
-    // version race ahead again, and the comparison then fails for a reason the flip never claimed. It
-    // did exactly that on main (`new=Some(2) old=Some(5)`): a bug in the observation, not in the flip.
-    //
-    // Stopping the old indexer first makes the measurement match the guarantee. An earlier fix here
-    // relaxed `== Some(5)` to `>=`, which was right about the head value and still measured at the
-    // wrong time.
-    old_rt.ingest.abort();
-    let (new_head, old_head) = (
-        new_store.indexed_head().unwrap(),
-        old_store.indexed_head().unwrap(),
-    );
+    // **Asserted on what the flip compared, not on a later read of the stores.** Both indexers keep
+    // running, so re-reading afterwards measures a different instant and can show the old version ahead
+    // again - which is the observation being wrong, not the flip. This test failed that way twice with
+    // `new=Some(2) old=Some(5)`. The first fix relaxed `== Some(5)` to `>=`, right about the value and
+    // still measured at the wrong time; the second aborted the old indexer before reading, which only
+    // narrows the window - `JoinHandle::abort` requests cancellation without waiting, and stopping the
+    // old version cannot un-advance a head it already advanced. Only the flip knows the instant, so the
+    // flip now returns it.
     assert!(
-        new_head >= old_head,
-        "the flip must never move the endpoint backwards: new={new_head:?} old={old_head:?}"
+        heads.new >= heads.old,
+        "the flip must never move the endpoint backwards: {heads:?}"
     );
+
+    old_rt.ingest.abort();
 
     // Separately: left alone, the new version does reach the tip. Polled rather than asserted
     // instantaneously, because *when* it arrives is a matter of scheduling, not of correctness.
