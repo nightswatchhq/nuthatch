@@ -2220,16 +2220,158 @@ fn class_of_assignment(
     }
     // Only this assignment's RHS. A mixed event handler's fn_class is not applied
     // to every write; an own-field fold next to a fixed-point copy stays exact.
+    //
+    // **Every class, not only `FixedPoint`.** This tested `== Class::FixedPoint`, so a read of a
+    // *call-derived* field propagated nothing at all:
+    //
+    // ```ts
+    // token0.decimals = fetchTokenDecimals(..)                                  // call-derived
+    // swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)  // was: exact
+    // ```
+    //
+    // `exact` promises a pure function of decoded events, and that field needs a contract read. Four
+    // such fields on Uniswap V4 name a call-derived field in their own expression, and a porter reading
+    // `exact` has no reason to pass `--state-rpc` - after which every token amount is off by
+    // `10^decimals`, which is a wrong number rather than a missing one (#1310).
+    //
+    // `max` keeps the ordering: a field reading both a call-derived and a fixed-point value takes the
+    // stronger class, and a read of an *exact* field changes nothing.
+    //
+    // **Expanded through locals.** The dependency usually arrives by way of one:
+    //
+    // ```ts
+    // let amount0    = convertTokenToDecimal(event.params.amount0, token0.decimals)
+    // let amount0Abs = amount0.lt(ZERO_BD) ? amount0.times(MINUS_ONE) : amount0
+    // pool.volumeToken0 = pool.volumeToken0.plus(amount0Abs)
+    // ```
+    //
+    // The assignment names no classified field, so the direct test above sees nothing while the total
+    // still cannot be computed without `decimals`. Ten more fields on Uniswap V4 (#1310).
+    let expanded = expand_locals(&func.body, &asg.expr, LOCAL_DEPTH);
     for (ent, field) in &func.field_reads {
-        if expr_reads_field(&asg.expr, field)
-            && field_class
-                .get(&(ent.clone(), field.clone()))
-                .is_some_and(|(cl, _, _)| *cl == Class::FixedPoint)
-        {
-            c = c.max(Class::FixedPoint);
+        if expr_reads_field(&expanded, field) {
+            if let Some((cl, _, _)) = field_class.get(&(ent.clone(), field.clone())) {
+                c = c.max(*cl);
+            }
         }
     }
     c
+}
+
+/// How many hops of local substitution to follow. Uniswap's deepest price chain is three
+/// (`volumeUSD` <- `amountTotalUSDTracked` <- `getTrackedAmountUSD(..)` <- `derivedETH`); the bound is
+/// generous and terminates rather than guessing.
+const LOCAL_DEPTH: usize = 6;
+
+/// `expr` with bare locals replaced by what the body assigned them, to `depth` hops.
+///
+/// Substitution rather than analysis: the only question asked of the result is whether it *reads* a
+/// fixed-point field, and textual expansion answers that without a type system. Each local is expanded
+/// once - `seen` is both the cycle guard and the bound on growth - so a local reused five times does not
+/// multiply the string five times over.
+///
+/// Over-expanding is the safe direction here. If a local's contribution turns out not to matter, the
+/// field is called fixed point when it is exact: an under-promise, which costs a porter a hand-check. The
+/// reverse costs a promise of byte-for-byte output that cannot be kept.
+fn expand_locals(body: &str, expr: &str, depth: usize) -> String {
+    let mut out = expr.to_string();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..depth {
+        let mut grew = false;
+        for ident in bare_idents(&out) {
+            if seen.contains(&ident) {
+                continue;
+            }
+            let Some(rhs) = local_assignment(body, &ident) else {
+                continue;
+            };
+            seen.insert(ident.clone());
+            out = substitute_ident(&out, &ident, &format!("({rhs})"));
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
+/// Every identifier in an expression, as candidates for local substitution.
+///
+/// Deliberately **not** filtered to non-field-access positions. That filter was here and it was
+/// redundant: `substitute_ident` refuses to rewrite an identifier preceded by `.`, so a field name that
+/// collides with a local is never substituted whatever this returns. A mutation removing the filter
+/// survived, which is how the redundancy showed up - two guards for one property, only one of them
+/// reachable. `a_field_name_colliding_with_a_local_is_not_expanded` holds the property and
+/// `substitute_ident`'s boundary check is what enforces it.
+fn bare_idents(expr: &str) -> Vec<String> {
+    let b = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        out.push(expr[start..i].to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What `let <name> = ..` assigned, as written, or `None` if the body declares no such local.
+fn local_assignment(body: &str, name: &str) -> Option<String> {
+    for line in body.lines() {
+        let t = line.trim_start();
+        // `continue`, not `?`. An earlier version returned from the whole function here, so it only
+        // ever resolved a local declared on the body's first line - which made the expansion a no-op
+        // and cost a wrong diagnosis on #1309 before it was noticed.
+        let Some(rest) = t.strip_prefix("let ").or_else(|| t.strip_prefix("const ")) else {
+            continue;
+        };
+        let Some((lhs, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        if lhs.split(':').next().unwrap_or(lhs).trim() != name {
+            continue;
+        }
+        let rhs = collapse_ws(rhs.trim().trim_end_matches(';'));
+        if rhs.is_empty() {
+            return None;
+        }
+        return Some(rhs);
+    }
+    None
+}
+
+/// Replace whole-identifier occurrences of `name`, leaving `xname` and `.name` alone.
+fn substitute_ident(expr: &str, name: &str, with: &str) -> String {
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    while i < expr.len() {
+        if expr[i..].starts_with(name) {
+            let before_ok = i == 0
+                || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.');
+            let after = i + name.len();
+            let after_ok =
+                after == b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+            if before_ok && after_ok {
+                out.push_str(with);
+                i = after;
+                continue;
+            }
+        }
+        let ch = expr[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn expr_calls(expr: &str, name: &str) -> bool {
@@ -3718,6 +3860,268 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    /// A read of a **call-derived** field makes the reading field call-derived too.
+    ///
+    /// The propagation rule tested `== Class::FixedPoint`, so a call-derived field read propagated
+    /// nothing. `Swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)` was
+    /// classified `exact` - a pure function of decoded events - while needing a contract read for
+    /// `decimals`. Four such fields on Uniswap V4, and a porter reading `exact` has no reason to pass
+    /// `--state-rpc`, after which every token amount is off by `10^decimals`: a wrong number rather
+    /// than a missing one (#1310).
+    #[test]
+    fn a_read_of_a_call_derived_field_propagates() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  amount0: BigDecimal!
+  logIndex: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function convertTokenToDecimal(raw: BigInt, decimals: BigInt): BigDecimal {
+  return raw.toBigDecimal().div(exponentToBigDecimal(decimals))
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.save()
+
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)
+  swap.logIndex = event.logIndex
+  swap.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Token", "decimals"),
+            Class::CallDerived,
+            "the premise: decimals is read from the contract"
+        );
+        assert_eq!(
+            class_of(&rows, "Swap", "amount0"),
+            Class::CallDerived,
+            "a field that needs `decimals` is not a pure function of decoded events: {}",
+            reason_of(&rows, "Swap", "amount0")
+        );
+
+        // The field beside it, reading only the event, is untouched - so the rule has not swallowed
+        // every write in a handler that happens to make a call somewhere.
+        assert_eq!(
+            class_of(&rows, "Swap", "logIndex"),
+            Class::Exact,
+            "an event-only field in the same handler stays exact"
+        );
+    }
+
+    /// The dependency usually arrives through a local, and that counts too.
+    ///
+    /// `pool.volumeToken0.plus(amount0Abs)` names no classified field. `amount0Abs` came from `amount0`,
+    /// which came from `convertTokenToDecimal(event.params.amount0, token0.decimals)`, so the total cannot
+    /// be computed without a contract read. Ten more fields on Uniswap V4 beyond the four direct ones
+    /// (#1310).
+    ///
+    /// The helper that resolves this had a bug worth remembering: it used `?` where it needed `continue`,
+    /// so it gave up on the first line of the body that was not a `let` and only ever resolved a local
+    /// declared first. That made the expansion a silent no-op, and I read the zero-field result as
+    /// evidence about the premise rather than about my own code.
+    #[test]
+    fn a_dependency_through_a_local_propagates() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+type Pool @entity {
+  id: ID!
+  volumeToken0: BigDecimal!
+  txCount: BigInt!
+  liquidity: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function convertTokenToDecimal(raw: BigInt, decimals: BigInt): BigDecimal {
+  return raw.toBigDecimal().div(exponentToBigDecimal(decimals))
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.save()
+
+  let pool = new Pool(event.params.pool.toHex())
+  let amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)
+  let amount0Abs = amount0.times(BigDecimal.fromString('-1'))
+  pool.volumeToken0 = pool.volumeToken0.plus(amount0Abs)
+  pool.txCount = pool.txCount.plus(ONE_BI)
+  pool.liquidity = pool.liquidity.plus(event.params.liquidityDelta)
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Pool", "volumeToken0"),
+            Class::CallDerived,
+            "two local hops to `decimals`: {}",
+            reason_of(&rows, "Pool", "volumeToken0")
+        );
+        // The two accumulators beside it depend on nothing but the event, and must not be swept along.
+        assert_eq!(
+            class_of(&rows, "Pool", "txCount"),
+            Class::Exact,
+            "a counter is a pure function of the events: {}",
+            reason_of(&rows, "Pool", "txCount")
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "liquidity"),
+            Class::Exact,
+            "a raw event delta is exact: {}",
+            reason_of(&rows, "Pool", "liquidity")
+        );
+    }
+
+    /// A field name that collides with a local name is not expanded as one.
+    ///
+    /// `bare_idents` returns `a` in `a.b` and not `b`, because `b` is a field access that
+    /// `expr_reads_field` already sees. Without that guard, a field called `rate` would be looked up as a
+    /// local, find an unrelated `let rate = ..` in the same body, and take that local's class - so a field
+    /// reading only exact state would be reported call-derived on the strength of a name collision.
+    ///
+    /// A mutation dropping the guard survived until this existed.
+    #[test]
+    fn a_field_name_colliding_with_a_local_is_not_expanded() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  rate: BigDecimal!
+  derived: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  doubled: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function findEthPerToken(t: Token): BigDecimal {
+  let other = Token.load(t.id)
+  return other.derived
+}
+
+export function handleInit(event: InitEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.rate = event.params.declaredRate.toBigDecimal()
+  token0.derived = findEthPerToken(token0)
+  token0.save()
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = Token.load(event.params.currency0.toHex())
+  // A local whose *name* is also a field name, bound to a fixed-point value. Expanding the field
+  // access `token0.rate` as if it were this local would make `pool.doubled` fixed point.
+  let rate = token0.derived
+  let pool = new Pool(event.params.pool.toHex())
+  pool.doubled = token0.rate.times(BigDecimal.fromString('2'))
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Token", "rate"),
+            Class::Exact,
+            "the premise: the *field* is written from the event"
+        );
+        assert_eq!(
+            class_of(&rows, "Token", "derived"),
+            Class::FixedPoint,
+            "and the local `rate` is bound to this, which is not exact"
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "doubled"),
+            Class::Exact,
+            "reads the exact field `token0.rate`; the fixed-point local `rate` in the same body must not \
+             lend it a class: {}",
+            reason_of(&rows, "Pool", "doubled")
+        );
+    }
+
+    /// The stronger class wins when a field reads both.
+    ///
+    /// `max` over the classes, not first-one-found: a field reading a call-derived *and* a fixed-point
+    /// value is fixed point, because that is the promise that cannot be kept.
+    #[test]
+    fn a_field_reading_both_takes_the_stronger_class() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+  derivedETH: BigDecimal!
+}
+type Pool @entity {
+  id: ID!
+  tvlUSD: BigDecimal!
+  scaled: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function findEthPerToken(token: Token): BigDecimal {
+  let other = Token.load(token.id)
+  return other.derivedETH
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.derivedETH = findEthPerToken(token0)
+  token0.save()
+
+  let pool = new Pool(event.params.pool.toHex())
+  pool.scaled = event.params.amount0.toBigDecimal().div(token0.decimals.toBigDecimal())
+  pool.tvlUSD = token0.decimals.toBigDecimal().times(token0.derivedETH)
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Pool", "scaled"),
+            Class::CallDerived,
+            "reads only the call-derived field: {}",
+            reason_of(&rows, "Pool", "scaled")
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "tvlUSD"),
+            Class::FixedPoint,
+            "reads both, so the stronger class wins: {}",
+            reason_of(&rows, "Pool", "tvlUSD")
+        );
     }
 
     #[test]
