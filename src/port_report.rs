@@ -3070,17 +3070,58 @@ pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> 
     if let Some(col) = event_column(&asg.expr) {
         return Some(col);
     }
-    if asg.field != "id" {
-        return None;
-    }
+    // **Not gated on `id` any more, and an entity reference resolves like any other alias.** A
+    // reference to another entity is that entity's id, which is the expression it was loaded with, and
+    // `local_root` already strips a trailing `.id` - so `swap.pool = pool.id` needs no special case,
+    // only permission to follow the chain for a field that is not called `id`.
+    //
+    // `tick.pool = poolId` is as much `event.params.id` as `tick.id = tickId` is; the old gate was
+    // narrower than the reasoning behind it. `plain_local_expr` already refuses a name bound more than
+    // once, so broadening this cannot silently pick the wrong binding.
     let ident = local_root(&asg.expr)?;
-    let arg = constructor_arg_for(&func.body, &ident)
-        .or_else(|| load_arg_for(&func.body, &ident))
-        .or_else(|| create_arg_for(&func.body, &ident))
-        // A local that aliases an event parameter rather than holding an entity (#1277).
-        .or_else(|| plain_local_expr(&func.body, &ident))?;
-    event_column(&arg)
+    event_column_through_aliases(&func.body, &ident)
 }
+
+/// The expression an entity local was built from, or the expression a plain local aliases.
+///
+/// `Entity.load(X)`, `new Entity(X)` and `Entity.create(X)` all name the entity's id in `X`; a local
+/// that holds no entity aliases its own right-hand side (#1277).
+fn entity_id_expr(body: &str, ident: &str) -> Option<String> {
+    constructor_arg_for(body, ident)
+        .or_else(|| load_arg_for(body, ident))
+        .or_else(|| create_arg_for(body, ident))
+        .or_else(|| plain_local_expr(body, ident))
+}
+
+/// Follow an alias chain to the event parameter at the end of it, if there is one.
+///
+/// **One hop is not enough, and that is not a corner case.** Uniswap V4's swap mapping writes
+/// `const poolId = event.params.poolId.toHexString()`, then `const pool = Pool.load(poolId)`, then
+/// `swap.pool = pool.id` - so the parameter is two aliases from the assignment, and resolving one hop
+/// recovered `Pool.token0` (loaded directly from a parameter) while leaving `Swap.pool` unanswerable.
+///
+/// Bounded and cycle-guarded: a malformed mapping must not spin here, and `plain_local_expr` already
+/// refuses a name bound more than once, so the chain is unambiguous at every step or it stops.
+fn event_column_through_aliases(body: &str, ident: &str) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut cur = ident.to_string();
+    for _ in 0..ALIAS_DEPTH {
+        if let Some(col) = event_column(&cur) {
+            return Some(col);
+        }
+        let root = local_root(&cur)?;
+        if seen.contains(&root) {
+            return None;
+        }
+        seen.push(root.clone());
+        cur = entity_id_expr(body, &root)?;
+    }
+    None
+}
+
+/// Alias hops followed before giving up. Three is the deepest the Uniswap V4 mappings need
+/// (`pool.id` -> `poolId` -> `event.params.poolId`); the rest is headroom, not a measurement.
+const ALIAS_DEPTH: usize = 8;
 
 /// The event/call handler that wrote this, or a handler that reaches this helper. Block handlers
 /// are never a table source.
@@ -3452,6 +3493,84 @@ export function handlePoolCreated(event: PoolCreated): void {
             assignment_event_column(pool_id, func).as_deref(),
             Some("pool")
         );
+    }
+
+    /// A foreign key is the referenced entity's id, which is the expression it was loaded with - and
+    /// that is **two aliases** away from the event parameter, not one.
+    ///
+    /// Uniswap V4's swap mapping writes `const poolId = event.params.poolId.toHexString()`, then
+    /// `const pool = Pool.load(poolId)`, then `swap.pool = pool.id`. Resolving a single hop recovered
+    /// `Pool.token0` (loaded straight from a parameter) and left `Swap.pool` unanswerable, which is why
+    /// the chain is followed rather than one step taken.
+    ///
+    /// Worth more than the column: S2 aggregates a `@derivedFrom` list off the **child's**
+    /// back-reference with no column on the parent, so resolving `Swap.pool` also makes `Pool.swaps`
+    /// answerable.
+    #[test]
+    fn a_foreign_key_resolves_through_an_alias_chain() {
+        let schema = r#"
+type Pool @entity { id: ID! }
+type Swap @entity { id: ID! pool: Pool! }
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  const poolId = event.params.poolId.toHexString()
+  const pool = Pool.load(poolId)
+  if (pool == null) { return }
+  let swap = new Swap(event.transaction.hash.toHexString())
+  swap.pool = pool.id
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/mappings/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").unwrap();
+        let fk = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "pool")
+            .expect("the foreign key assignment");
+        assert_eq!(
+            assignment_event_column(fk, func).as_deref(),
+            Some("poolId"),
+            "`pool.id` -> `Pool.load(poolId)` -> `event.params.poolId`"
+        );
+
+        // A chain that ends nowhere stays unresolved rather than guessing a column.
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  const pool = Pool.load(somethingElse())
+  let swap = new Swap('x')
+  swap.pool = pool.id
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/mappings/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").unwrap();
+        let fk = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "pool")
+            .expect("the foreign key assignment");
+        assert_eq!(assignment_event_column(fk, func), None);
+
+        // And a self-referential chain terminates instead of spinning.
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  const a = b
+  const b = a
+  let swap = new Swap('x')
+  swap.pool = a
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/mappings/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").unwrap();
+        let fk = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "pool")
+            .expect("the foreign key assignment");
+        assert_eq!(assignment_event_column(fk, func), None);
     }
 
     #[test]
