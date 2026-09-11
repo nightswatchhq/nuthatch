@@ -215,6 +215,7 @@ pub fn parse_with(
     let b = query.as_bytes();
     let mut c = Cursor {
         b,
+        s: query,
         i: 0,
         vars,
         defaults: BTreeMap::new(),
@@ -349,6 +350,9 @@ fn resolve_spreads(
 
 struct Cursor<'a> {
     b: &'a [u8],
+    /// The same text as `b`. Held so a string value can take a whole code point at a byte offset
+    /// without a length dispatch whose error arms no test could ever reach.
+    s: &'a str,
     i: usize,
     /// Values supplied with the request, then the operation header's declared defaults. Resolved at
     /// the value site rather than carried as a `Value::Var`, so nothing downstream of the parser can
@@ -375,6 +379,118 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+    /// A GraphQL string value, **decoded**.
+    ///
+    /// The previous version skipped over an escape and then took the raw byte slice, so `"a\"b"`
+    /// reached `sql_literal` as `a\"b` and `\n` as a backslash and an `n`. `sql_literal` only doubles
+    /// single quotes, so the generated `WHERE` compared against a value the client never wrote: a
+    /// wrong answer with no error, which is the one failure shape this endpoint must not have. It
+    /// also advanced twice for a trailing backslash, walking `self.i` past the end of the input, and
+    /// the slice that followed panicked in the request handler.
+    ///
+    /// `self.s` is the query text, so a byte offset the scanner has reached begins a whole code
+    /// point and the non-escape branch can simply take it.
+    fn string(&mut self) -> Result<String, Unsupported> {
+        if self.b[self.i..].starts_with(br#"""""#) {
+            // Refused rather than decoded: the dedent rules are a separate piece of work (#1288).
+            // The point of refusing is that the old path read `"""x"""` as an empty string and
+            // carried on, and a visible refusal beats a silent substitution every time.
+            return Err(Unsupported::Syntax(
+                "a block string (`\"\"\"`) as an argument value".into(),
+            ));
+        }
+        self.i += 1; // the opening quote
+        let mut out = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(Unsupported::Syntax("unterminated string".into()));
+            };
+            self.i += 1;
+            match c {
+                b'"' => return Ok(out),
+                // A single-quoted string may not span lines; that is what `"""` is for.
+                b'\n' | b'\r' => {
+                    return Err(Unsupported::Syntax("a line break inside a string".into()))
+                }
+                b'\\' => {
+                    let Some(e) = self.peek() else {
+                        return Err(Unsupported::Syntax("unterminated string".into()));
+                    };
+                    self.i += 1;
+                    out.push(match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.unicode_escape()?,
+                        other => {
+                            return Err(Unsupported::Syntax(format!(
+                                "`\\{}` is not a GraphQL string escape",
+                                other as char
+                            )))
+                        }
+                    });
+                }
+                _ => {
+                    let start = self.i - 1;
+                    let ch = self.s[start..]
+                        .chars()
+                        .next()
+                        .expect("a byte was read at `start`, so a code point begins there");
+                    self.i = start + ch.len_utf8();
+                    out.push(ch);
+                }
+            }
+        }
+    }
+
+    /// `\\uXXXX`, including the surrogate pair that carries anything above the BMP. A lone surrogate
+    /// is an error: it is not a character, and `char::from_u32` would refuse it anyway - better to
+    /// say which input was wrong than to answer with a replacement glyph.
+    fn unicode_escape(&mut self) -> Result<char, Unsupported> {
+        let hex4 = |c: &mut Self| -> Result<u32, Unsupported> {
+            let end = c.i + 4;
+            if end > c.b.len() {
+                return Err(Unsupported::Syntax("a truncated `\\u` escape".into()));
+            }
+            let s = std::str::from_utf8(&c.b[c.i..end])
+                .map_err(|_| Unsupported::Syntax("a malformed `\\u` escape".into()))?;
+            let v = u32::from_str_radix(s, 16)
+                .map_err(|_| Unsupported::Syntax(format!("`\\u{s}` is not four hex digits")))?;
+            c.i = end;
+            Ok(v)
+        };
+        let first = hex4(self)?;
+        let code = match first {
+            0xd800..=0xdbff => {
+                if self.peek() != Some(b'\\') || self.b.get(self.i + 1) != Some(&b'u') {
+                    return Err(Unsupported::Syntax(
+                        "a high surrogate with no low surrogate after it".into(),
+                    ));
+                }
+                self.i += 2;
+                let low = hex4(self)?;
+                if !(0xdc00..=0xdfff).contains(&low) {
+                    return Err(Unsupported::Syntax(
+                        "a high surrogate followed by something that is not a low surrogate".into(),
+                    ));
+                }
+                0x10000 + ((first - 0xd800) << 10) + (low - 0xdc00)
+            }
+            0xdc00..=0xdfff => {
+                return Err(Unsupported::Syntax("a lone low surrogate".into()));
+            }
+            v => v,
+        };
+        char::from_u32(code).ok_or_else(|| {
+            Unsupported::Syntax(format!("`\\u` escape {code:#x} is not a character"))
+        })
+    }
+
     fn ident(&mut self) -> Result<String, Unsupported> {
         let start = self.i;
         while self
@@ -580,19 +696,7 @@ impl<'a> Cursor<'a> {
     fn value(&mut self) -> Result<Value, Unsupported> {
         self.trivia();
         match self.peek() {
-            Some(b'"') => {
-                self.i += 1;
-                let start = self.i;
-                while self.peek().is_some_and(|c| c != b'"') {
-                    if self.peek() == Some(b'\\') {
-                        self.i += 1;
-                    }
-                    self.i += 1;
-                }
-                let s = String::from_utf8_lossy(&self.b[start..self.i]).into_owned();
-                self.i += 1;
-                Ok(Value::Str(s))
-            }
+            Some(b'"') => Ok(Value::Str(self.string()?)),
             Some(b'[') => {
                 self.i += 1;
                 let mut v = Vec::new();
@@ -1319,6 +1423,73 @@ type Swap @entity { id: ID! pool: Pool! }
 
     fn one(q: &str) -> RootField {
         parse(q).expect("parse").into_iter().next().expect("a root")
+    }
+
+    /// graph-node decodes GraphQL string escapes; this parser skipped over them and then took the
+    /// raw byte slice, so `"a\"b"` reached SQL as `a\"b` and `\n` as a backslash and an `n`. A
+    /// filter silently compares against a value the client did not ask for, which is the worst
+    /// shape this endpoint has.
+    #[test]
+    fn a_string_escape_reaches_sql_decoded() {
+        let cases: &[(&str, &str)] = &[
+            (r#"a\"b"#, "a\"b"),
+            (r#"a\\b"#, "a\\b"),
+            (r#"a\nb"#, "a\nb"),
+            (r#"a\tb"#, "a\tb"),
+            (r#"a\/b"#, "a/b"),
+            (r#"a\rb"#, "a\rb"),
+            (r#"a\bb"#, "a\u{8}b"),
+            (r#"a\fb"#, "a\u{c}b"),
+            (r#"Aé€"#, "A\u{e9}\u{20ac}"),
+            (r#"😀"#, "\u{1f600}"),
+            (r#"a\u0041b"#, "aAb"),
+            (r#"\u00e9"#, "\u{e9}"),
+            // A surrogate pair is how `\u` carries anything above the BMP.
+            (r#"\ud83d\ude00"#, "\u{1f600}"),
+        ];
+        for (literal, want) in cases {
+            let q = format!("{{ pools(where: {{ hooks: \"{literal}\" }}) {{ id }} }}");
+            let got = one(&q).args.get("where").cloned().expect("where");
+            let Value::Object(m) = got else {
+                panic!("where is not an object")
+            };
+            assert_eq!(
+                m.get("hooks"),
+                Some(&Value::Str((*want).to_string())),
+                "literal {literal:?} decoded wrong"
+            );
+        }
+    }
+
+    /// A malformed string must be a syntax error, not a panic and not a silent success. The escape
+    /// loop advanced twice for a trailing backslash, so `self.i` could pass the end of the input and
+    /// the slice that followed it indexed out of bounds - a panic in a request handler.
+    #[test]
+    fn a_malformed_string_is_refused_rather_than_crashing() {
+        for q in [
+            // The exact shape that indexed out of bounds: the backslash is the last byte, so the
+            // escape skip walked `self.i` to `len + 1`. Measured before the fix: "range end index 29
+            // out of range for slice of length 28", from a 28-byte request.
+            r#"{ pools(where: { hooks: "ab\"#,
+            r#"{ pools(where: { hooks: "ab\ "#,
+            r#"{ pools(where: { hooks: "a
+b" }) { id } }"#,
+            r#"{ pools(where: { hooks: """a""" }) { id } }"#,
+            r#"{ pools(where: { hooks: "\udc00 lone low" }) { id } }"#,
+            r#"{ pools(where: { hooks: "\ud83d\u0041 not a low" }) { id } }"#,
+            r#"{ pools(where: { hooks: "unterminated "#,
+            r#"{ pools(where: { hooks: "bad \q escape" }) { id } }"#,
+            r#"{ pools(where: { hooks: "\u00zz" }) { id } }"#,
+            // `\u` reads four bytes, and four bytes can land inside a code point. The first is
+            // valid UTF-8 that is not hex; the second splits `\u{20ac}` and is not UTF-8 at all.
+            "{ pools(where: { hooks: \"\\u00\u{e9}\" }) { id } }",
+            "{ pools(where: { hooks: \"\\u00\u{20ac}\" }) { id } }",
+            r#"{ pools(where: { hooks: "\u00" }) { id } }"#,
+            r#"{ pools(where: { hooks: "\ud83d only half" }) { id } }"#,
+        ] {
+            let r = parse(q);
+            assert!(r.is_err(), "{q:?} parsed as {r:?} instead of being refused");
+        }
     }
 
     #[test]
