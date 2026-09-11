@@ -358,6 +358,23 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     )
     .await
     .expect("spawn old");
+    // **Let the old version get ahead before the new one starts.**
+    //
+    // Both used to be spawned together and race from nothing, so the flip could legitimately fire with
+    // both heads at `None` - and `None >= None` holds, so the guarantee was asserted vacuously in the
+    // case that matters. A mutation replacing the catch-up condition with `true` survived: the endpoint
+    // would swap to a version behind the old one, which is exactly what this test exists to forbid, and
+    // nothing here could see it. With the old version at the tip first, that mutation reports
+    // `old: Some(5), new: None` and the assertion fails.
+    let old_store = old_rt.state.store.clone();
+    tokio::time::timeout(POLL_TIMEOUT, async {
+        while old_store.indexed_head().unwrap() != Some(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the old version should reach the tip before the new one is spawned");
+
     let new_rt = indexer::spawn_nest(
         tape.clone(),
         new_dir.path().to_path_buf(),
@@ -372,7 +389,6 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .await
     .expect("spawn new");
 
-    let old_store = old_rt.state.store.clone();
     let new_store = new_rt.state.store.clone();
     let new_state = new_rt.state; // handed to the flip
     let shared = serve::SharedNest::new(old_rt.state);
@@ -414,6 +430,13 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     assert!(
         heads.new >= heads.old,
         "the flip must never move the endpoint backwards: {heads:?}"
+    );
+    // Non-vacuous: the old version really was at the tip when the flip compared them, so `new >= old`
+    // above is a claim about two real heads rather than about two `None`s.
+    assert_eq!(
+        heads.old,
+        Some(5),
+        "the old version was at the tip before the new one spawned, so the flip must have seen it there: {heads:?}"
     );
 
     old_rt.ingest.abort();
