@@ -1274,6 +1274,39 @@ mod tests {
             "a field named `type` or `enum` is not a declaration"
         );
         assert!(s.enums.is_empty(), "nor is it an enum: {:?}", s.enums);
+
+        // A name that merely *ends* in `type` or `enum` is not a declaration, and this is the half two
+        // mutations survived without. `union my_type = A | B` puts `type ` one character after an
+        // underscore at the top level, where there is no block to skip and no line start to save us:
+        // a permissive boundary test matches there, then hunts for the next `{`, and swallows the real
+        // declaration's body whole.
+        let s = parse(
+            "union Footype = A | B\n\
+             union my_type = A | B\n\
+             union my_enum = A | B\n\
+             type Real @entity { id: ID! liquidity: BigInt! }\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = s.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Real"],
+            "a name ending in `type`/`enum` must not be read as a declaration"
+        );
+        assert_eq!(
+            s.entities[0]
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "liquidity"],
+            "and the real declaration's body must be intact, not swallowed"
+        );
+        assert!(
+            s.enums.is_empty(),
+            "`my_enum` is a union, not an enum: {:?}",
+            s.enums
+        );
     }
 
     /// `starts_decl` only tested for a line start and `match_brace` skipped `"…"` but not `"""…"""`,
