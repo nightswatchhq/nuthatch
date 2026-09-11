@@ -78,6 +78,14 @@ MAX_PRIOR_CHARS = 40_000
 # the model an unlabelled fragment.
 WHOLE_NOTE = "\n[pr-review: this diff was shortened to fit the review budget]\n"
 
+# A recorded fixture's diff section is replaced by a stub rather than shortened. Above this many
+# characters a fixture is a recording - a captured API response, a tape, a golden dump - and a
+# fragment of one is worse than none: the reviewer cannot read it, but it has enough text to reason
+# from, so it reports on contents it was never sent. That happened twice on #1282, about the same
+# field, while the prompt was already telling it not to. Hand-authored fixtures that encode behaviour
+# are far smaller than this and are sent whole.
+RECORDING_MIN_CHARS = 20_000
+
 # Marks our comments so a re-review can find its predecessors, and so a human scrolling a long PR
 # can tell the outside reader from the firm's own.
 MARKER = "<!-- pr-review:luna -->"
@@ -329,6 +337,35 @@ def render(review, model, elided):
     return "\n".join(lines)
 
 
+def stub_recordings(diff: str, min_chars: int = RECORDING_MIN_CHARS) -> tuple[str, list[tuple[str, int]]]:
+    """Replace each large recorded-fixture section with a stub naming it.
+
+    Runs before `budget_diff`, so the budget it frees goes to code. A recording is identified by
+    `fixtures/` in its path and a section over `min_chars`; the test for that is deliberately crude,
+    because the cost of getting it wrong in either direction is small and visible - a real fixture sent
+    whole costs budget, and a stubbed one is named in the prompt and in the rendered comment.
+
+    Returns the diff and, for each stubbed file, `(path, original_size)`.
+    """
+    sections = re.split(r"(?m)^(?=diff --git )", diff)
+    head, files = ("", sections) if sections[0].startswith("diff --git ") else (sections[0], sections[1:])
+    out, stubbed = [], []
+    for f in files:
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", f)
+        path = m.group(2) if m else "(unknown)"
+        if "fixtures/" not in path or len(f) < min_chars:
+            out.append(f)
+            continue
+        stubbed.append((path, len(f)))
+        first = f.split("\n", 1)[0]
+        out.append(
+            f"{first}\n"
+            f"[pr-review: {path} is a recorded fixture, {len(f):,} characters of diff. Its contents\n"
+            f" were NOT sent to you. Raise no finding about what it does or does not contain.]\n"
+        )
+    return (head + "".join(out), stubbed)
+
+
 def budget_diff(diff: str, budget: int) -> tuple[str, list[tuple[str, int, int]]]:
     """Fit a diff into `budget` characters by shortening its largest files.
 
@@ -470,6 +507,7 @@ def main():
     diff = args.diff.read_text(errors="replace")
     if not diff.strip():
         raise SystemExit("pr-review: the diff is empty - nothing to review")
+    diff, stubbed = stub_recordings(diff)
     diff, elided = budget_diff(diff, MAX_DIFF_CHARS)
     # Told to the **model**, not only to the human in the rendered comment. The inline markers can be
     # squeezed out at a small cap, and a reviewer that cannot tell a fragment from a whole file reports
@@ -481,6 +519,19 @@ def main():
         "shown is unknown, not absent: do not report a thing missing from one of them, and do not\n"
         "raise a finding whose evidence would be in the part you were not sent.\n"
         + "".join(f"  {name}: {kept:,} of {size:,} characters\n" for name, kept, size in elided)
+        + "\n"
+    )
+
+    # Named to the model as well, for the same reason `shortened_note` is: a reviewer that cannot tell
+    # "not sent" from "not there" reports the second when it saw the first.
+    recorded_note = (
+        ""
+        if not stubbed
+        else "These files are recorded fixtures - captured responses, tapes, golden dumps. Their contents\n"
+        "were replaced by a one-line stub and NOT sent to you. You cannot know what they contain, so\n"
+        "raise no finding that asserts anything about their contents, and do not treat a claim in the\n"
+        "PR body about them as unverified merely because you could not read them.\n"
+        + "".join(f"  {name}: {size:,} characters of diff, not sent\n" for name, size in stubbed)
         + "\n"
     )
 
@@ -523,6 +574,7 @@ def main():
         f"merge and is already on the default branch:\n{own_files or '(not supplied)'}\n\n"
         f"Your previous reviews of this pull request, oldest first:\n"
         f"{prior or '(none - this is your first pass)'}\n\n"
+        f"{recorded_note}"
         f"{shortened_note}"
         f"Diff:\n```diff\n{diff}\n```"
     )
