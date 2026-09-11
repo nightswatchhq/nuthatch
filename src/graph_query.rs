@@ -128,11 +128,21 @@ pub enum Unsupported {
     UnboundVariable(String),
     /// A `mutation` or `subscription`. A nest has neither.
     NotAQuery(String),
+    /// Several operations in one document and no `operationName` saying which to run.
+    OperationNameRequired,
+    /// An `operationName` no operation in the document carries.
+    OperationNotFound(String),
 }
 
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // graph-node's own wording, verbatim: `OperationNameRequired => write!(f, "Operation name
+            // required")` and `OperationNotFound(s) => write!(f, "Operation name not found `{}`", s)` in
+            // graph/src/data/query/error.rs:158. Both are attestable there, so both are a deterministic
+            // refusal rather than a transient one, and a client that matches on the text still matches.
+            Unsupported::OperationNameRequired => write!(f, "Operation name required"),
+            Unsupported::OperationNotFound(n) => write!(f, "Operation name not found `{n}`"),
             Unsupported::Syntax(w) => write!(f, "could not parse the operation: {w}"),
             Unsupported::UnknownRoot(n) => {
                 write!(f, "`{n}` is not a field of this subgraph's Query type")
@@ -222,6 +232,21 @@ pub fn parse_with(
     query: &str,
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<RootField>, Unsupported> {
+    parse_named(query, vars, None)
+}
+
+/// The same, selecting among several operations by the request's `operationName`.
+///
+/// A document may legally carry more than one operation, and every generated client sends
+/// `operationName` alongside the document whether or not it needs to - Apollo and urql both do, on
+/// every request. Refusing the whole document was a refusal of requests graph-node answers (Jules,
+/// #1282), so the selection follows it: one operation and no name runs that one, several and no name is
+/// `Operation name required`, and a name nothing carries is `Operation name not found`.
+pub fn parse_named(
+    query: &str,
+    vars: &BTreeMap<String, Value>,
+    operation_name: Option<&str>,
+) -> Result<Vec<RootField>, Unsupported> {
     let b = query.as_bytes();
     let mut c = Cursor {
         b,
@@ -234,7 +259,9 @@ pub fn parse_with(
     // and spreads are resolved once the whole document has been read - a fragment may legally be
     // defined after the operation that uses it.
     let mut fragments: BTreeMap<String, Vec<Sel>> = BTreeMap::new();
-    let mut operation: Option<Vec<Sel>> = None;
+    // Every operation, in document order, each with the name it declared. The shorthand `{ … }` and a
+    // `query` with no name are both anonymous.
+    let mut operations: Vec<(Option<String>, Vec<Sel>)> = Vec::new();
     loop {
         c.trivia();
         if c.peek().is_none() {
@@ -242,10 +269,7 @@ pub fn parse_with(
         }
         if c.peek() == Some(b'{') {
             // The anonymous shorthand operation.
-            if operation.is_some() {
-                return Err(Unsupported::Syntax("more than one operation".into()));
-            }
-            operation = Some(c.selection_set()?);
+            operations.push((None, c.selection_set()?));
             continue;
         }
         let kw = c.ident()?;
@@ -274,14 +298,11 @@ pub fn parse_with(
                 fragments.insert(name, body);
             }
             "query" => {
-                if operation.is_some() {
-                    return Err(Unsupported::Syntax("more than one operation".into()));
-                }
-                c.operation_tail()?;
+                let name = c.operation_tail()?;
                 if c.peek() != Some(b'{') {
                     return Err(Unsupported::Syntax("no selection set".into()));
                 }
-                operation = Some(c.selection_set()?);
+                operations.push((name, c.selection_set()?));
             }
             other @ ("mutation" | "subscription") => {
                 return Err(Unsupported::NotAQuery(other.to_string()))
@@ -293,8 +314,19 @@ pub fn parse_with(
             }
         }
     }
-    let Some(operation) = operation else {
-        return Err(Unsupported::Syntax("no selection set".into()));
+    let operation = match operation_name {
+        // A name the client asked for, matched exactly. An anonymous operation carries no name, so it is
+        // never what `operationName` selects, even when it is the only one in the document.
+        Some(want) => operations
+            .into_iter()
+            .find(|(n, _)| n.as_deref() == Some(want))
+            .map(|(_, sel)| sel)
+            .ok_or_else(|| Unsupported::OperationNotFound(want.to_string()))?,
+        None => match operations.len() {
+            0 => return Err(Unsupported::Syntax("no selection set".into())),
+            1 => operations.pop().expect("one operation").1,
+            _ => return Err(Unsupported::OperationNameRequired),
+        },
     };
     let roots = resolve_spreads(&operation, &fragments, &mut Vec::new())?;
     Ok(roots
@@ -597,14 +629,16 @@ impl<'a> Cursor<'a> {
     /// **Parsed rather than skipped to the first brace.** A variable definition may carry a default
     /// that is itself an object - `$w: Pool_filter = { id: "a" }` - and skipping to the first `{`
     /// lands inside it, so the whole operation then reads as garbage.
-    fn operation_tail(&mut self) -> Result<(), Unsupported> {
+    fn operation_tail(&mut self) -> Result<Option<String>, Unsupported> {
         self.trivia();
-        // An optional operation name.
+        // An optional operation name. **Kept**, because a document may carry several and the request's
+        // `operationName` says which one to run.
+        let mut name = None;
         if self
             .peek()
             .is_some_and(|c| c == b'_' || c.is_ascii_alphabetic())
         {
-            self.ident()?;
+            name = Some(self.ident()?);
             self.trivia();
         }
         if self.peek() == Some(b'(') {
@@ -618,7 +652,7 @@ impl<'a> Cursor<'a> {
                 "directives on an operation are not implemented yet".into(),
             ));
         }
-        Ok(())
+        Ok(name)
     }
     /// `($first: Int! = 10, $w: Pool_filter)`. Only the defaults are kept: the declared types are
     /// the client's assertion about its own values, and this compiler reads the values themselves.

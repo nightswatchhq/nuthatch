@@ -1549,6 +1549,14 @@ async fn graph_graphql(
         .and_then(|q| q.as_str())
         .unwrap_or_default()
         .to_string();
+    // **`operationName` is read, not ignored.** A document may carry several operations and every
+    // generated client sends the name of the one it wants; refusing the document outright refused
+    // requests graph-node answers (Jules on #1282). An empty or absent value means "no name given".
+    let operation_name = body
+        .get("operationName")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
     // `variables` is how every generated client passes its arguments. A value this dialect cannot
     // represent is left unbound rather than coerced, so the operation is refused by variable name.
     let vars: std::collections::BTreeMap<String, crate::graph_query::Value> = body
@@ -1587,7 +1595,7 @@ async fn graph_graphql(
     // `__schema` meant a filter value of `"__schema"` - a perfectly ordinary thing to store in a
     // `hooks` column - was answered with the schema document instead of rows (Jules on #1282). A root
     // field name is a structural fact and a string literal is not, so read the structure.
-    let roots = match crate::graph_query::parse_with(&query, &vars) {
+    let roots = match crate::graph_query::parse_named(&query, &vars, operation_name.as_deref()) {
         Ok(r) => r,
         Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
     };
@@ -5410,6 +5418,119 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}, {"id": "0xccc"}]),
             "variables from the request body must bind: {body}"
+        );
+    }
+
+    /// `operationName` selects among several operations in one document (Jules on #1282).
+    ///
+    /// The parser kept a single operation and refused the second, and the handler never read
+    /// `operationName` at all - so `{"query": "query A {…} query B {…}", "operationName": "B"}`, which
+    /// graph-node answers, came back refused. Asserted over HTTP because the finding was about the
+    /// handler rather than the parser: a parser test passes with the field still ignored.
+    #[tokio::test]
+    async fn the_request_operation_name_selects_among_several_operations() {
+        let (_d, state) = graph_fixture();
+        use tower::ServiceExt;
+        let post = |body: serde_json::Value, state: AppState| async move {
+            let res = router(SharedNest::new(state))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/graphql")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(res.into_body(), 4 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let two =
+            "query A { pool(id: \"0xaaa\") { hooks } } query B { pool(id: \"0xbbb\") { hooks } }";
+
+        // The named one runs, and it is the named one rather than the first.
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "B"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "`operationName` must select operation B: {body}"
+        );
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "A"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook"}),
+            "and A when A is asked for, so the answer is not simply the first operation: {body}"
+        );
+
+        // graph-node's two refusals, word for word (graph/src/data/query/error.rs:158).
+        let body = post(serde_json::json!({"query": two}), state.clone()).await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name required",
+            "several operations and no name is a named refusal: {body}"
+        );
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "C"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name not found `C`",
+            "a name nothing carries is a named refusal: {body}"
+        );
+
+        // One named operation and no `operationName` still runs: that is what a client sends when it has
+        // one query in the document, and it is the commonest request of all.
+        let body = post(
+            serde_json::json!({"query": "query Only { pool(id: \"0xaaa\") { hooks } }"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook"}),
+            "one named operation needs no name to be selected: {body}"
+        );
+
+        // An anonymous operation carries no name, so a name selects nothing - even as the only operation.
+        let body = post(
+            serde_json::json!({
+                "query": "{ pool(id: \"0xaaa\") { hooks } }",
+                "operationName": "A",
+            }),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name not found `A`",
+            "the shorthand operation is anonymous and a name must not match it: {body}"
+        );
+
+        // An empty string is how some clients spell "no name". It must not be looked up as a name.
+        let body = post(
+            serde_json::json!({
+                "query": "{ pool(id: \"0xbbb\") { hooks } }",
+                "operationName": "",
+            }),
+            state,
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "an empty `operationName` means no name given: {body}"
         );
     }
 

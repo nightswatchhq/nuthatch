@@ -204,7 +204,8 @@ after which the whole operation reads as garbage.
 | a fragment spread with no definition | treating it as nothing would silently drop every field it carried |
 | `orderBy` that traverses a relation (`token0__symbol`) | needs the same join as a nested selection |
 | `mutation`, `subscription` | a nest has no mappings, so it has nothing to mutate and nothing to stream |
-| more than one operation in a document | without an `operationName` there is no way to know which was meant |
+| more than one operation and no `operationName` | there is no way to know which was meant. `Operation name required`, graph-node's own wording |
+| an `operationName` no operation in the document carries | `Operation name not found `X``, likewise. An anonymous operation carries no name, so it is never what a name selects |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
 | an unbound `$name` | neither the request nor the header supplies a value. Dropping the argument would widen the filter |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
