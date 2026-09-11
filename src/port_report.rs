@@ -2236,14 +2236,140 @@ fn class_of_assignment(
     //
     // `max` keeps the ordering: a field reading both a call-derived and a fixed-point value takes the
     // stronger class, and a read of an *exact* field changes nothing.
+    //
+    // **Expanded through locals.** The dependency usually arrives by way of one:
+    //
+    // ```ts
+    // let amount0    = convertTokenToDecimal(event.params.amount0, token0.decimals)
+    // let amount0Abs = amount0.lt(ZERO_BD) ? amount0.times(MINUS_ONE) : amount0
+    // pool.volumeToken0 = pool.volumeToken0.plus(amount0Abs)
+    // ```
+    //
+    // The assignment names no classified field, so the direct test above sees nothing while the total
+    // still cannot be computed without `decimals`. Ten more fields on Uniswap V4 (#1310).
+    let expanded = expand_locals(&func.body, &asg.expr, LOCAL_DEPTH);
     for (ent, field) in &func.field_reads {
-        if expr_reads_field(&asg.expr, field) {
+        if expr_reads_field(&expanded, field) {
             if let Some((cl, _, _)) = field_class.get(&(ent.clone(), field.clone())) {
                 c = c.max(*cl);
             }
         }
     }
     c
+}
+
+/// How many hops of local substitution to follow. Uniswap's deepest price chain is three
+/// (`volumeUSD` <- `amountTotalUSDTracked` <- `getTrackedAmountUSD(..)` <- `derivedETH`); the bound is
+/// generous and terminates rather than guessing.
+const LOCAL_DEPTH: usize = 6;
+
+/// `expr` with bare locals replaced by what the body assigned them, to `depth` hops.
+///
+/// Substitution rather than analysis: the only question asked of the result is whether it *reads* a
+/// fixed-point field, and textual expansion answers that without a type system. Each local is expanded
+/// once - `seen` is both the cycle guard and the bound on growth - so a local reused five times does not
+/// multiply the string five times over.
+///
+/// Over-expanding is the safe direction here. If a local's contribution turns out not to matter, the
+/// field is called fixed point when it is exact: an under-promise, which costs a porter a hand-check. The
+/// reverse costs a promise of byte-for-byte output that cannot be kept.
+fn expand_locals(body: &str, expr: &str, depth: usize) -> String {
+    let mut out = expr.to_string();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..depth {
+        let mut grew = false;
+        for ident in bare_idents(&out) {
+            if seen.contains(&ident) {
+                continue;
+            }
+            let Some(rhs) = local_assignment(body, &ident) else {
+                continue;
+            };
+            seen.insert(ident.clone());
+            out = substitute_ident(&out, &ident, &format!("({rhs})"));
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
+/// Identifiers in an expression that are not a field access - `a` in `a.b`, not `b`.
+///
+/// A field access is already visible to `expr_reads_field`; it is the bare local that hides the chain.
+fn bare_idents(expr: &str) -> Vec<String> {
+    let b = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        // Not preceded by `.`, so it is a name rather than a field of something.
+        if start == 0 || b[start - 1] != b'.' {
+            out.push(expr[start..i].to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What `let <name> = ..` assigned, as written, or `None` if the body declares no such local.
+fn local_assignment(body: &str, name: &str) -> Option<String> {
+    for line in body.lines() {
+        let t = line.trim_start();
+        // `continue`, not `?`. An earlier version returned from the whole function here, so it only
+        // ever resolved a local declared on the body's first line - which made the expansion a no-op
+        // and cost a wrong diagnosis on #1309 before it was noticed.
+        let Some(rest) = t.strip_prefix("let ").or_else(|| t.strip_prefix("const ")) else {
+            continue;
+        };
+        let Some((lhs, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        if lhs.split(':').next().unwrap_or(lhs).trim() != name {
+            continue;
+        }
+        let rhs = collapse_ws(rhs.trim().trim_end_matches(';'));
+        if rhs.is_empty() {
+            return None;
+        }
+        return Some(rhs);
+    }
+    None
+}
+
+/// Replace whole-identifier occurrences of `name`, leaving `xname` and `.name` alone.
+fn substitute_ident(expr: &str, name: &str, with: &str) -> String {
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    while i < expr.len() {
+        if expr[i..].starts_with(name) {
+            let before_ok = i == 0
+                || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.');
+            let after = i + name.len();
+            let after_ok =
+                after == b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+            if before_ok && after_ok {
+                out.push_str(with);
+                i = after;
+                continue;
+            }
+        }
+        let ch = expr[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn expr_calls(expr: &str, name: &str) -> bool {
@@ -3797,6 +3923,79 @@ export function handleSwap(event: SwapEvent): void {
             class_of(&rows, "Swap", "logIndex"),
             Class::Exact,
             "an event-only field in the same handler stays exact"
+        );
+    }
+
+    /// The dependency usually arrives through a local, and that counts too.
+    ///
+    /// `pool.volumeToken0.plus(amount0Abs)` names no classified field. `amount0Abs` came from `amount0`,
+    /// which came from `convertTokenToDecimal(event.params.amount0, token0.decimals)`, so the total cannot
+    /// be computed without a contract read. Ten more fields on Uniswap V4 beyond the four direct ones
+    /// (#1310).
+    ///
+    /// The helper that resolves this had a bug worth remembering: it used `?` where it needed `continue`,
+    /// so it gave up on the first line of the body that was not a `let` and only ever resolved a local
+    /// declared first. That made the expansion a silent no-op, and I read the zero-field result as
+    /// evidence about the premise rather than about my own code.
+    #[test]
+    fn a_dependency_through_a_local_propagates() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  decimals: BigInt!
+}
+type Pool @entity {
+  id: ID!
+  volumeToken0: BigDecimal!
+  txCount: BigInt!
+  liquidity: BigInt!
+}
+"#;
+        let mapping = r#"
+export function fetchTokenDecimals(addr: Address): BigInt {
+  let contract = ERC20.bind(addr)
+  return contract.decimals()
+}
+
+export function convertTokenToDecimal(raw: BigInt, decimals: BigInt): BigDecimal {
+  return raw.toBigDecimal().div(exponentToBigDecimal(decimals))
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let token0 = new Token(event.params.currency0.toHex())
+  token0.decimals = fetchTokenDecimals(event.params.currency0)
+  token0.save()
+
+  let pool = new Pool(event.params.pool.toHex())
+  let amount0 = convertTokenToDecimal(event.params.amount0, token0.decimals)
+  let amount0Abs = amount0.times(BigDecimal.fromString('-1'))
+  pool.volumeToken0 = pool.volumeToken0.plus(amount0Abs)
+  pool.txCount = pool.txCount.plus(ONE_BI)
+  pool.liquidity = pool.liquidity.plus(event.params.liquidityDelta)
+  pool.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Pool", "volumeToken0"),
+            Class::CallDerived,
+            "two local hops to `decimals`: {}",
+            reason_of(&rows, "Pool", "volumeToken0")
+        );
+        // The two accumulators beside it depend on nothing but the event, and must not be swept along.
+        assert_eq!(
+            class_of(&rows, "Pool", "txCount"),
+            Class::Exact,
+            "a counter is a pure function of the events: {}",
+            reason_of(&rows, "Pool", "txCount")
+        );
+        assert_eq!(
+            class_of(&rows, "Pool", "liquidity"),
+            Class::Exact,
+            "a raw event delta is exact: {}",
+            reason_of(&rows, "Pool", "liquidity")
         );
     }
 
