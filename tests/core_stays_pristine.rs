@@ -183,7 +183,11 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
     let body = &handler[..handler.find("\n}\n").unwrap_or(handler.len())];
     assert!(
         body.contains("run_sql_query("),
-        "the Graph lane must read through `run_sql_query`, the same path `/sql` takes:\n{body}"
+        "the Graph lane must read through `run_sql_query`, the same path `/sql` takes, so it inherits \
+         RFC-0034 admission and the read-only attach rather than opening a second door.\n\nIf you moved \
+         the call behind a helper, that is fine: point this assertion at the helper and satisfy yourself \
+         the lane still goes through admission. If you replaced it, do not - one set of data underneath \
+         is the property this gate exists for.\n\n{body}"
     );
     for forbidden in [
         "begin_write",
