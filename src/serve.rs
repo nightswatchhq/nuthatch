@@ -5415,6 +5415,64 @@ mod tests {
 
     /// The introspection document a generated client actually sends is built from fragments, and the
     /// endpoint answers every root field of a mixed operation rather than the first it recognises.
+    /// The golden path serves in full on a nest that has never been ported, and the Graph routes say so.
+    ///
+    /// The serving half of `tests/core_stays_pristine.rs`, here because it has to bind the real router.
+    /// Chief's constraint, 2026-09-11: the default and golden path stay the delightful core, and the
+    /// Graph dialect is an optional lane. This asserts the lane is **inert** rather than merely unused -
+    /// a route that answers an empty success on an unported nest would look like a working endpoint
+    /// serving no data, which is the silent substitution this whole surface keeps producing.
+    #[tokio::test]
+    async fn the_core_serves_with_no_graph_schema_present() {
+        let (d, state) = graph_fixture();
+        // The fixture writes `graph/schema.graphql` so the dialect tests have something to read. The
+        // golden path must not need it, so take it away.
+        std::fs::remove_file(d.path().join("graph/schema.graphql")).expect("remove the schema");
+
+        use tower::ServiceExt;
+        // Every golden-path surface still answers.
+        for uri in [
+            "/",
+            "/health",
+            "/ready",
+            "/tables",
+            "/schema",
+            "/entities",
+            "/sql?q=SELECT%201",
+        ] {
+            let res = router(SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("request");
+            assert!(
+                res.status().is_success(),
+                "{uri} must serve on a nest that was never ported, got {}",
+                res.status()
+            );
+        }
+
+        // And the lane refuses by name rather than answering an empty success.
+        for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
+            let body = graph_ask(uri, "{ pools { id } }", state.clone()).await;
+            let msg = body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{uri} answered without an error: {body}"));
+            assert!(
+                msg.contains("carries no Graph schema") && msg.contains("port-emit"),
+                "{uri} must name the artefact and how to get one, got {msg:?}"
+            );
+            assert!(
+                body.get("data").is_none_or(|d| d.is_null()),
+                "{uri} must not answer data it cannot have: {body}"
+            );
+        }
+    }
+
     /// `_meta` is narrowed by the selection like every other root.
     ///
     /// It used to be inserted whole, so `{ _meta { block { number } } }` answered with `deployment`
