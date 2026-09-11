@@ -24,6 +24,10 @@ name = "nuthatch"
 path = "src/main.rs"
 
 [dependencies]
+# graph-node's own pluralisation, so a generated root field name matches it by construction rather
+# than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
+# BSD-2-Clause, already on deny.toml's allowlist, pure Rust - no effect on the static binary.
+Inflector = "0.11.3"
 nuthatch-decode = { path = "decode" }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"

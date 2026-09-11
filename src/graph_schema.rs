@@ -484,15 +484,19 @@ fn match_brace(text: &str, open: usize) -> Option<usize> {
 /// author's own, which is why the reference carries both `modifyLiquidities` (root) and
 /// `Transaction.modifyLiquiditys` (derived) for one entity.
 pub fn plural(name: &str) -> String {
-    let lower = lower_first(name);
-    let mut cs = lower.chars().rev();
-    match (cs.next(), cs.next()) {
-        (Some('y'), Some(prev)) if !"aeiou".contains(prev) => {
-            format!("{}ies", &lower[..lower.len() - 1])
-        }
-        (Some('s'), _) | (Some('x'), _) | (Some('z'), _) => format!("{lower}es"),
-        _ => format!("{lower}s"),
+    use inflector::Inflector;
+    // **graph-node's own function, not a rule reimplemented here.** `camel_cased_names`
+    // (`graph/src/data/graphql/ext.rs:360`) is `name.to_plural().to_camel_case()`, where `to_plural` is
+    // Inflector's full English ruleset - irregulars included. The four suffix cases this used to handle
+    // gave `matchs` for `Match` and `persons` for `Person`, and a wrong root field name is not a wrong
+    // value in one field: the client's whole query fails to validate before a row is read (Jules, #1282).
+    let singular = name.to_camel_case();
+    let mut plural = name.to_plural().to_camel_case();
+    // graph-node's own fallback for a name whose plural is itself, so the two root fields stay distinct.
+    if plural == singular {
+        plural.push_str("_collection");
     }
+    plural
 }
 
 /// The singular root field name: the entity name with a lower-cased first character.
@@ -501,6 +505,63 @@ pub fn lower_first(name: &str) -> String {
     match cs.next() {
         Some(c) => c.to_lowercase().collect::<String>() + cs.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod plural_tests {
+    use super::plural;
+
+    /// graph-node's pluralisation, measured rather than assumed.
+    ///
+    /// **Inflector's answers, not English's.** The contract is parity with graph-node, which calls
+    /// `to_plural` (`graph/src/data/graphql/ext.rs:360`), so `Person` is `persons` and `Child` is
+    /// `childs` - and those are *correct* here, because a client generated against the real subgraph
+    /// asked for them. I asserted `people` and `children` first and the crate was right both times.
+    ///
+    /// A wrong root field name is not a wrong value in one field: `{ matches { id } }` fails to validate
+    /// against a schema declaring `matchs`, so the whole query fails before a row is read (Jules, #1282).
+    #[test]
+    fn pluralisation_matches_graph_nodes_inflector() {
+        for (entity, want) in [
+            // Unchanged by the switch, and must not regress.
+            ("Pool", "pools"),
+            ("Swap", "swaps"),
+            ("PoolDayData", "poolDayDatas"),
+            ("Proxy", "proxies"),
+            // The suffix rule got these wrong: `matchs`, `analysises`, `statuses` only by luck.
+            ("Match", "matches"),
+            ("Analysis", "analyses"),
+            ("Status", "statuses"),
+            ("Box", "boxes"),
+            ("Index", "indexes"),
+            // Inflector is not a full irregular ruleset, and neither is graph-node.
+            ("Person", "persons"),
+            ("Child", "childs"),
+        ] {
+            assert_eq!(
+                plural(entity),
+                want,
+                "`{entity}` must pluralise the way graph-node does"
+            );
+        }
+    }
+
+    /// A name whose plural is itself gets graph-node's `_collection` suffix, so the two root fields stay
+    /// distinct rather than the plural shadowing the singular.
+    #[test]
+    fn a_name_that_is_its_own_plural_gets_the_collection_suffix() {
+        assert_eq!(
+            plural("Series"),
+            "series_collection",
+            "Inflector pluralises `Series` to itself, and graph-node appends `_collection` for exactly \
+             that case"
+        );
+        assert_ne!(
+            plural("Series"),
+            super::lower_first("Series"),
+            "or the plural root would shadow the singular one"
+        );
     }
 }
 
