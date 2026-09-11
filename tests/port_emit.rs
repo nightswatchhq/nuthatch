@@ -1400,6 +1400,7 @@ fn a_field_accumulated_by_two_tables_sums_both_arms() {
         r#"type Pool @entity {
   id: ID!
   totalFees: BigInt!
+  swapVolume: BigInt!
 }
 
 "#,
@@ -1440,6 +1441,7 @@ export function handlePoolSwap(event: Swap): void {
   let pool = new Pool(event.address.toHex())
   pool.id = event.address.toHex()
   pool.totalFees = pool.totalFees.plus(event.params.amount0)
+  pool.swapVolume = pool.swapVolume.plus(event.params.amount1)
   pool.save()
 }
 "#,
@@ -1484,11 +1486,25 @@ export function handlePoolSwap(event: Swap): void {
         "the outer aggregate sums across arms:\n{}",
         entity.sql
     );
-    // Both arms write the only field here, so nothing is zero-filled - but nothing may be NULL-filled
-    // either, and that is the property a NULL fill would break for a key present in one arm only.
+    // **`swapVolume` is written by the swap arm only**, so the `pool_created` arm has to fill it - and it
+    // must fill it with **zero**. `sum` skips NULLs, so a NULL fill makes the total NULL for any key that
+    // appears only in arms which do not write the field, where graph-node has 0. A mutation changing the
+    // fill to NULL survived until this fixture had a field that is actually zero-filled.
+    assert!(
+        entity
+            .sql
+            .contains("CAST(0 AS DECIMAL(38,0)) AS \"swapVolume\""),
+        "the arm that does not write `swapVolume` contributes zero:\n{}",
+        entity.sql
+    );
     assert!(
         !entity.sql.contains("CAST(NULL AS"),
-        "a missing contribution is zero, never NULL:\n{}",
+        "and never NULL - `sum` would skip it:\n{}",
+        entity.sql
+    );
+    assert!(
+        entity.sql.contains("sum(\"swapVolume\") AS \"swapVolume\""),
+        "both fields are folded outside:\n{}",
         entity.sql
     );
     assert!(
