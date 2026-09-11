@@ -2296,9 +2296,14 @@ fn expand_locals(body: &str, expr: &str, depth: usize) -> String {
     out
 }
 
-/// Identifiers in an expression that are not a field access - `a` in `a.b`, not `b`.
+/// Every identifier in an expression, as candidates for local substitution.
 ///
-/// A field access is already visible to `expr_reads_field`; it is the bare local that hides the chain.
+/// Deliberately **not** filtered to non-field-access positions. That filter was here and it was
+/// redundant: `substitute_ident` refuses to rewrite an identifier preceded by `.`, so a field name that
+/// collides with a local is never substituted whatever this returns. A mutation removing the filter
+/// survived, which is how the redundancy showed up - two guards for one property, only one of them
+/// reachable. `a_field_name_colliding_with_a_local_is_not_expanded` holds the property and
+/// `substitute_ident`'s boundary check is what enforces it.
 fn bare_idents(expr: &str) -> Vec<String> {
     let b = expr.as_bytes();
     let mut out = Vec::new();
@@ -2312,10 +2317,7 @@ fn bare_idents(expr: &str) -> Vec<String> {
         while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
             i += 1;
         }
-        // Not preceded by `.`, so it is a name rather than a field of something.
-        if start == 0 || b[start - 1] != b'.' {
-            out.push(expr[start..i].to_string());
-        }
+        out.push(expr[start..i].to_string());
     }
     out.sort();
     out.dedup();
