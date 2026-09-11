@@ -1642,14 +1642,38 @@ async fn graph_graphql(
                     .ok()
                     .flatten()
                     .and_then(|v| v.parse::<u64>().ok());
-                data.insert(
-                    root.key.clone(),
-                    serde_json::json!({
-                        "block": {"number": last},
-                        "deployment": s.nid.clone(),
-                        "hasIndexingErrors": false
+                // Rendered complete, then narrowed by the selection, exactly as `__schema` and
+                // `__type` are. It used to insert this object whole, so `{ _meta { block { number } } }`
+                // came back carrying `deployment` and `hasIndexingErrors` the client had not asked
+                // for and ignoring every alias. Probed against the live reference: graph-node returns
+                // only the selected fields, and honours an alias on the root, on a leaf and on the
+                // scalars. It does *not* honour one on `block` itself - `{ _meta { b: block { number } } }`
+                // answers `internal error resolving _Block_.block: expected prefetched result, but
+                // found nothing`, which is a graph-node defect rather than a contract. Projecting
+                // uniformly answers that correctly; no client can be relying on the error.
+                //
+                // `timestamp` is null because nothing stores a block's timestamp (#1289). `hash` and
+                // `parentHash` are real.
+                let meta = serde_json::json!({
+                    "block": {
+                        "number": last,
+                        "hash": last.and_then(|n| s.store.get_block_hash(n).ok().flatten()),
+                        "parentHash": last
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|n| s.store.get_block_hash(n).ok().flatten()),
+                        "timestamp": serde_json::Value::Null,
+                    },
+                    // `deployment` is `String!`. `nid` is `None` for a nest mounted by alias with no
+                    // content address (`MountTable::nest_dir`), and answering `null` against a
+                    // non-null field is a document a strict client rejects outright. The nest's own
+                    // name is the honest stand-in: a mismatch against an expected CID is then visible
+                    // rather than a schema violation.
+                    "deployment": s.nid.as_deref().map(|n| n.to_string()).unwrap_or_else(|| {
+                        s.nest_info["name"].as_str().unwrap_or("nuthatch").to_string()
                     }),
-                );
+                    "hasIndexingErrors": false
+                });
+                data.insert(root.key.clone(), project(&meta, &root.sel));
                 continue;
             }
             _ => {}
@@ -5202,8 +5226,11 @@ mod tests {
         )
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
-        // `_meta` reports the nest's own head, so give it one to report.
+        // `_meta` reports the nest's own head, so give it one to report - with the hash of the head
+        // and of its parent, which `_meta.block.hash` and `parentHash` are answered from.
         state.store.set_meta("last_block", "23456789").unwrap();
+        state.store.set_block_hash(23_456_789, "0xhead").unwrap();
+        state.store.set_block_hash(23_456_788, "0xparent").unwrap();
 
         (d, state)
     }
@@ -5388,6 +5415,87 @@ mod tests {
 
     /// The introspection document a generated client actually sends is built from fragments, and the
     /// endpoint answers every root field of a mixed operation rather than the first it recognises.
+    /// `_meta` is narrowed by the selection like every other root.
+    ///
+    /// It used to be inserted whole, so `{ _meta { block { number } } }` answered with `deployment`
+    /// and `hasIndexingErrors` attached and every alias ignored. Every expectation here was probed
+    /// against the live reference endpoint rather than read off the spec.
+    ///
+    /// The one deliberate divergence: graph-node cannot alias `block` itself -
+    /// `{ _meta { b: block { number } } }` answers `internal error resolving _Block_.block: expected
+    /// prefetched result, but found nothing`. Projecting uniformly answers it, which is strictly more
+    /// useful and which no client can be relying on the absence of.
+    #[tokio::test]
+    async fn the_meta_root_is_narrowed_to_the_selection() {
+        let (_d, state) = graph_fixture();
+        let ask = graph_ask;
+
+        // Narrow: exactly the one field, nothing else. The reference answers
+        // `{"_meta":{"block":{"number":25953333}}}` for this shape.
+        let body = ask("/graphql", "{ _meta { block { number } } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["_meta"],
+            serde_json::json!({"block": {"number": 23_456_789u64}}),
+            "_meta must carry only what was selected: {body}"
+        );
+
+        // Complete: every declared field of `_Meta_` and `_Block_`. `timestamp` is null because
+        // nothing stores one (#1289); the rest are real.
+        let body = ask(
+            "/graphql",
+            "{ _meta { block { number hash timestamp parentHash } deployment hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["_meta"]["block"],
+            serde_json::json!({
+                "number": 23_456_789u64,
+                "hash": "0xhead",
+                "timestamp": serde_json::Value::Null,
+                "parentHash": "0xparent",
+            }),
+            "the block must carry the head, its hash and its parent's: {body}"
+        );
+        assert_eq!(
+            body["data"]["_meta"]["hasIndexingErrors"],
+            serde_json::json!(false),
+            "a nest runs no mapping, so it has no indexing error: {body}"
+        );
+
+        // Aliases, at every depth. The reference honours the root, the leaf and the scalars.
+        let body = ask(
+            "/graphql",
+            "{ m: _meta { b: block { n: number h: hash } d: deployment e: hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["m"],
+            serde_json::json!({
+                "b": {"n": 23_456_789u64, "h": "0xhead"},
+                "d": body["data"]["m"]["d"].clone(),
+                "e": false,
+            }),
+            "every alias must become the response key: {body}"
+        );
+        // `deployment` is `String!`, and `nid` is `None` for a nest mounted by alias, so this is a
+        // real production shape rather than a fixture quirk. Null here is a document a strict client
+        // rejects before it reads a single row.
+        assert!(
+            body["data"]["m"]["d"].is_string(),
+            "`deployment` is `String!` and must never answer null: {body}"
+        );
+
+        // A field the type does not have answers null rather than leaking the whole object.
+        let body = ask("/graphql", "{ _meta { nonesuch } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["_meta"],
+            serde_json::json!({"nonesuch": serde_json::Value::Null}),
+            "an unknown selected field must not widen the answer: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn a_fragment_document_and_a_mixed_operation_answer_over_http() {
         let (d, state) = graph_fixture();
