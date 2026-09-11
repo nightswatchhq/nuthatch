@@ -116,6 +116,10 @@ pub enum Unsupported {
     NestedSelection(String),
     /// An argument this compiler does not implement.
     Argument(String),
+    /// A required argument the client did not supply. Distinct from `Argument`, which means "this
+    /// compiler does not implement it yet": a missing `id` on a singular root is the client's error
+    /// and graph-node rejects it rather than answering.
+    MissingArgument(String),
     /// A `where` operator this compiler does not implement. Named so the caller knows which.
     Operator(String),
     /// `block:` needs a block-ranged entity store, which the nest has not got (#1267).
@@ -142,6 +146,12 @@ impl fmt::Display for Unsupported {
                  join rather than an N+1 walk); select scalar fields meanwhile"
             ),
             Unsupported::Argument(a) => write!(f, "argument `{a}` is not implemented yet"),
+            // graph-node's own wording, probed against the live reference on 2026-09-11:
+            // `{ token { symbol } }` answers `No value provided for required argument: `id``.
+            // A client that surfaces this string should see the same one.
+            Unsupported::MissingArgument(a) => {
+                write!(f, "No value provided for required argument: `{a}`")
+            }
             Unsupported::UnboundVariable(v) => write!(
                 f,
                 "no value was supplied for variable `${v}`, and its definition declares no default"
@@ -1101,6 +1111,19 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             other => return Err(Unsupported::Argument(other.to_string())),
         }
     }
+    // **A singular root without `id` is an error, not the first row.**
+    //
+    // The generated schema declares `pool(id: ID!, ...)`, so a client validating against it is told
+    // the argument is required; `compile` only added the predicate when the argument was present and
+    // never checked that it was. `{ pool { id } }` therefore reached SQL as the pool view with
+    // `LIMIT 1` and answered an arbitrary row as though it were the one asked for - a wrong answer
+    // with no error, which is the one failure shape this endpoint must not have (Jules on #1282).
+    //
+    // Checked after the loop rather than inside it, because the loop only sees arguments that were
+    // supplied, and the defect is the absence of one.
+    if singular && !root.args.contains_key("id") {
+        return Err(Unsupported::MissingArgument("id".into()));
+    }
     if !wheres.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&wheres.join(" AND "));
@@ -1543,6 +1566,50 @@ type Swap @entity { id: ID! pool: Pool! }
                 Err(other) => panic!("{q:?} was refused as {other:?}, not a syntax error"),
             }
         }
+    }
+
+    /// A singular root without `id` is refused, in graph-node's words.
+    ///
+    /// The generated schema declares `pool(id: ID!, ...)`, so a client is told the argument is
+    /// required. `compile` added the predicate only when the argument was present and never checked
+    /// that it was, so `{ pool { id } }` lowered to the pool view with `LIMIT 1` and answered an
+    /// arbitrary row as though it were the one asked for (Jules on #1282).
+    ///
+    /// The wording is graph-node's, probed against the live reference: `{ token { symbol } }` answers
+    /// `No value provided for required argument: `id``. Asserted rather than `is_err()`, because the
+    /// compiler already had an `Argument` error reading "is not implemented yet" and a client reading
+    /// that would go looking for a missing feature instead of fixing its query.
+    #[test]
+    fn a_singular_root_without_an_id_is_refused() {
+        let err = compile(&schema(), &one("{ pool { id liquidity } }")).expect_err("must refuse");
+        assert_eq!(
+            err.to_string(),
+            "No value provided for required argument: `id`",
+            "graph-node's wording, not ours"
+        );
+
+        // The same root with an id still compiles, so the guard has not closed the door.
+        let c = compile(&schema(), &one(r#"{ pool(id: "0xaaa") { id } }"#)).expect("with an id");
+        assert!(
+            c.sql.contains("\"id\" = '0xaaa'"),
+            "the id must still become a predicate: {}",
+            c.sql
+        );
+
+        // A collection needs no id, and must not have acquired the requirement.
+        compile(&schema(), &one("{ pools { id } }")).expect("a collection needs no id");
+
+        // `where` is not a substitute: graph-node requires `id` on the singular root whatever else
+        // was supplied, so accepting this would be our invention rather than its behaviour.
+        let err = compile(
+            &schema(),
+            &one(r#"{ pool(where: { id: "0xaaa" }) { id } }"#),
+        )
+        .expect_err("`where` does not satisfy a required `id`");
+        assert_eq!(
+            err.to_string(),
+            "No value provided for required argument: `id`"
+        );
     }
 
     #[test]
