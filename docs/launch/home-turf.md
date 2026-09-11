@@ -33,8 +33,9 @@ decoded, with parity checks (`nuthatch check parity`) against the canonical sour
 most like this audience to kick the tyres on: does the decoded state match what you'd expect, and where
 does it drift?
 
-Honest about scope: Ethereum + Arbitrum + Base, events only, RPC polling today (in-process reth ExEx
-is designed and stubbed). `MIT OR Apache-2.0`, grant-funded public good - not a startup, no token, no phone-home,
+Honest about scope: nine EVM chains built in and any other with `--rpc`; events, declared `eth_call`s
+(pinned or one per event row) and verified IPFS documents; traces and state diffs need a node; RPC
+polling today (in-process reth ExEx is designed and stubbed). `MIT OR Apache-2.0`, grant-funded public good - not a startup, no token, no phone-home,
 and a public "what we'll never build" list.
 
 _(Optional, only if the operator has announced:) An operator in this ecosystem is preparing a hosted

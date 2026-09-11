@@ -595,10 +595,11 @@ World Chain (`480`) and Base Sepolia (`84532`) this way. The split is worth know
 
 | Command | Unlisted chain? |
 |---|---|
-| `dev`, `sql`, `bench`, `dev` | **yes** - chain-agnostic, falls back to defaults |
-| `init`, `add` | **no** - they refuse an unrecognised `--chain`/config chain with "unknown chain … cannot resolve ABIs" |
+| `dev`, `sql`, `bench` | **yes** - chain-agnostic, falls back to defaults |
+| `init`, `add` | **yes, with `--rpc`** - `--chain <any-name> --rpc <url>` reads the chain id from the endpoint; ABI resolution is still Sourcify/Etherscan-gated, so pass `--abi` for an unverified contract |
 
-So the working recipe is: scaffold nothing, write `nuthatch.toml` yourself, vendor the ABI, and run.
+So the working recipe is `nuthatch init 0x… --chain <name> --rpc <url> --abi ./abi.json`, or write
+`nuthatch.toml` yourself, vendor the ABI, and run.
 
 ```toml
 [nest]
