@@ -1185,6 +1185,7 @@ mod sealed_rows {
                 sol_type: (*sol).to_string(),
                 storage: (*storage).to_string(),
                 indexed: false,
+                components: Vec::new(),
             }),
         );
         TableSchema {

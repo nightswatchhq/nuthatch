@@ -639,6 +639,7 @@ mod tests {
                 sol_type: "address".into(),
                 storage: "address".into(),
                 indexed: true,
+                components: Vec::new(),
             }],
         }
     }
@@ -658,30 +659,35 @@ mod tests {
                     sol_type: "address".into(),
                     storage: "address".into(),
                     indexed: true,
+                    components: Vec::new(),
                 },
                 ColumnSchema {
                     name: "to".into(),
                     sol_type: "address".into(),
                     storage: "address".into(),
                     indexed: true,
+                    components: Vec::new(),
                 },
                 ColumnSchema {
                     name: "value".into(),
                     sol_type: "uint256".into(),
                     storage: "word32".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
                 ColumnSchema {
                     name: "enabled".into(),
                     sol_type: "bool".into(),
                     storage: "bool".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
                 ColumnSchema {
                     name: "block_number".into(),
                     sol_type: "implicit".into(),
                     storage: "u64".into(),
                     indexed: false,
+                    components: Vec::new(),
                 },
             ],
         }
@@ -763,6 +769,7 @@ mod tests {
                 sol_type: "uint128".into(),
                 storage: "word16".into(),
                 indexed: false,
+                components: Vec::new(),
             }],
         };
         let fg = derive_footguns(&table);

@@ -169,6 +169,7 @@ pub fn schema(decls: &[IpfsDecl], timestamps: bool) -> Vec<crate::registry::Tabl
                 sol_type: sol.to_string(),
                 storage: storage.to_string(),
                 indexed: false,
+                components: Vec::new(),
             };
             columns.push(own("cid", "string", "string"));
             columns.push(own("content", "string", "string"));

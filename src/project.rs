@@ -1965,6 +1965,7 @@ mod tests {
                 sol_type: "uint256".into(),
                 storage: "word32".into(),
                 indexed: false,
+                components: Vec::new(),
             }],
         }];
         scaffold_views(dir.path(), &schema).unwrap();
