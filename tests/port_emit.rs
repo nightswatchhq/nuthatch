@@ -2239,3 +2239,42 @@ export function handlePoolCreated(event: PoolCreated): void {
         "the emitted view must bind: {check:?}\n{sql}"
     );
 }
+
+/// A concatenation of literals alone is not a column-backed value.
+///
+/// `'a' + 'b'` is the same string on every row, so attributing it to the handler's triggering table would
+/// give an entity a view whose only content is a constant - one row with no event behind it, which is the
+/// placeholder shape #1277 removed. It has to be named, like any other unanswerable field.
+#[test]
+fn a_concatenation_of_literals_alone_is_not_a_column() {
+    let schema = r#"
+type Marker @entity {
+  id: ID!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let marker = new Marker('a' + '-' + 'b')
+  marker.id = 'a' + '-' + 'b'
+  marker.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Marker"),
+        "a literal-only id is not a row source: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .entities_without_views
+            .contains(&"Marker".to_string()),
+        "and it must be named rather than silently absent: {:?}",
+        result.entities_without_views
+    );
+    assert!(
+        !nest.path().join("views/20-marker.sql").exists(),
+        "no file either"
+    );
+}

@@ -3370,10 +3370,10 @@ pub(crate) fn expr_concat_parts(
     // event.logIndex)` is how three of Uniswap V4's event entities spell their primary key, and without
     // this it reads as an opaque call.
     let e = inline_single_return(&e, functions).unwrap_or(e);
+    // No "at least two pieces" rule: a single-hole template literal - `` `${x}` `` - is the same value as
+    // `x` and resolves to the same column, and refusing it would only mean one spelling answered and
+    // another did not. `split_concat` already refuses anything that is not a concatenation at all.
     let pieces = split_concat(&e)?;
-    if pieces.len() < 2 {
-        return None;
-    }
     let mut out = Vec::new();
     for piece in pieces {
         let t = piece.trim();
@@ -4643,6 +4643,72 @@ export function handleThird(event: SwapEvent): void {
                 asg.expr
             );
         }
+    }
+
+    /// A single-hole template literal is the value inside it.
+    #[test]
+    fn a_single_hole_template_literal_resolves_to_its_column() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = `${event.transaction.hash.toHexString()}`
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions).as_deref(),
+            Some([ConcatPart::Column("tx_hash".into())].as_slice()),
+            "one spelling of a value must not answer while another does not"
+        );
+    }
+
+    /// Arity must match, or an unsubstituted parameter resolves against the **caller's** locals.
+    ///
+    /// The wrong-key shape: the helper takes a separator it was not given, the caller happens to have a
+    /// local of that name bound to an event parameter, and the id silently becomes hash-plus-fee.
+    #[test]
+    fn a_helper_called_with_too_few_arguments_is_not_inlined() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function mkId(hash: Bytes, sep: string): string {
+  return `${hash.toHexString()}${sep}`
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let sep = event.params.fee
+  let swap = new Swap('x')
+  swap.id = mkId(event.transaction.hash)
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "`sep` was never passed, and the caller's local of that name is not what the helper meant"
+        );
     }
 
     /// A helper that does more than return is not a pure function of its arguments.
