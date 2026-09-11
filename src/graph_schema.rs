@@ -124,15 +124,6 @@ pub fn parse(text: &str) -> Result<Schema> {
     //
     // Ordinary strings are left alone on purpose: `@derivedFrom(field: "pool")` is one, and its
     // contents are load-bearing.
-    // Descriptions are neutralised before anything else looks at the text. A GraphQL block string is
-    // a legal place to write `type Fake @entity {`, and both `starts_decl` (line-start only) and
-    // `match_brace` (which skips `"…"` but not a block string) would have read that as syntax -
-    // inventing an entity, or matching the wrong closing brace (Jules on #1282). One pre-pass rather
-    // than three functions each learning about block strings, and byte offsets are preserved so every
-    // slice below still lines up.
-    //
-    // Ordinary strings are left alone on purpose: `@derivedFrom(field: "pool")` is one, and its
-    // contents are load-bearing.
     let blanked = blank_block_strings(text);
     let text: &str = &blanked;
     let mut out = Schema::default();
@@ -153,6 +144,20 @@ pub fn parse(text: &str) -> Result<Schema> {
             out.enums.insert(name, values);
             i = next.max(i + 1);
             continue;
+        }
+        // Anything else with a body gets skipped whole - `interface`, `input`, `union`, a `schema`
+        // block. `starts_decl` is a token test rather than a line test now, so without this a field
+        // named `type` or `enum` inside one of those blocks would read as a declaration. The arms
+        // above already consume their own bodies, so reaching a `{` here means the block belongs to a
+        // declaration this parser does not read.
+        if b[i] == b'{' {
+            match match_brace(text, i) {
+                Some(c) => {
+                    i = c + 1;
+                    continue;
+                }
+                None => bail!("unclosed block in schema.graphql"),
+            }
         }
         i += 1;
     }
@@ -187,12 +192,24 @@ fn resolve(ty: &mut FieldType, entities: &[String], enums: &[String]) {
 
 /// A declaration keyword at `i` that is not the tail of a longer identifier and sits at a line start
 /// (possibly after whitespace). Without the line-start test, `type` inside a description would match.
+/// Is `kw` a declaration keyword starting at `i`?
+///
+/// A token boundary, not a line start. This used to require that nothing but whitespace preceded `i`
+/// on the same physical line, so `type A @entity { id: ID! } type B @entity { id: ID! }` - legal
+/// GraphQL - parsed `A` and then never saw `B`: an entity, its roots, its filters and its object type
+/// all silently absent from the generated schema, and a client's query against `B` answering
+/// `UnknownRoot` (Jules on #1282). The caller only tests this at the top level, because it skips every
+/// braced block it does not recognise, so a field named `type` inside an `interface` or `input` cannot
+/// be mistaken for one.
 fn starts_decl(text: &str, i: usize, kw: &str) -> bool {
     if !text.is_char_boundary(i) || !text[i..].starts_with(kw) {
         return false;
     }
-    let before = text[..i].rsplit('\n').next().unwrap_or("");
-    before.trim().is_empty()
+    // Nothing, or something that cannot be part of a name. `}type B` is as legal as `} type B`.
+    text[..i]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
 }
 
 fn parse_entity(text: &str, start: usize) -> Result<(Option<Entity>, usize)> {
@@ -1201,6 +1218,64 @@ mod tests {
 
     /// A GraphQL block string is a legal place to write something that looks like a declaration.
     ///
+    /// A declaration boundary is lexical, not a line start.
+    ///
+    /// `type A @entity { id: ID! } type B @entity { id: ID! }` is legal GraphQL and the scan used to
+    /// parse `A`, resume inside the same line, and never see `B` - so an entity, its roots, its filters
+    /// and its object type were all absent from the generated schema and a client querying `B` got
+    /// `UnknownRoot`. The same omission with no error anywhere is what made the earlier line-oriented
+    /// field parser dangerous, and this is the outer half of it.
+    #[test]
+    fn declarations_sharing_a_line_are_all_seen() {
+        let s = parse(
+            "type A @entity { id: ID! name: String! } type B @entity { id: ID! } \
+             enum Dir { asc desc } enum Side { buy sell }",
+        )
+        .unwrap();
+        let names: Vec<&str> = s.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"], "both types must be read");
+        assert_eq!(
+            s.entities[0]
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"],
+            "and the first type's fields must survive the one-line form"
+        );
+        let mut enums: Vec<&str> = s.enums.keys().map(String::as_str).collect();
+        enums.sort();
+        assert_eq!(enums, vec!["Dir", "Side"], "both enums must be read");
+        assert_eq!(
+            s.enums.get("Dir").map(Vec::as_slice),
+            Some(["asc".to_string(), "desc".to_string()].as_slice())
+        );
+
+        // `}type B` with no space is as legal as `} type B`.
+        let s = parse("type A @entity { id: ID! }type B @entity { id: ID! }").unwrap();
+        assert_eq!(
+            s.entities.len(),
+            2,
+            "a missing space is not a declaration end"
+        );
+
+        // A token test rather than a line test would read `type` and `enum` inside a block this parser
+        // does not understand as declarations, so those blocks are skipped whole.
+        let s = parse(
+            "interface Named { type: String! enum: Int! }\n\
+             input Filter { type : String enum : Int }\n\
+             type Real @entity { id: ID! }\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = s.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Real"],
+            "a field named `type` or `enum` is not a declaration"
+        );
+        assert!(s.enums.is_empty(), "nor is it an enum: {:?}", s.enums);
+    }
+
     /// `starts_decl` only tested for a line start and `match_brace` skipped `"…"` but not `"""…"""`,
     /// so a description could invent an entity or send the brace matcher to the wrong closing brace.
     #[test]
