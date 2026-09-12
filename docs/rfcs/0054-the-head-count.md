@@ -69,7 +69,9 @@ whether the wording serves it." Three things non-negotiable 3 protects, read aga
    byte-for-byte as it does today.
 3. **Nobody is tracked.** This is the one the word "telemetry" is standing in for, and it is the one
    the design in §5 is built around: no install identifier, no nest identifier, no address, no path,
-   no hostname, no IP retained, no per-ping record at all - only tallies, and the tallies public.
+   no hostname, no per-ping record in the handler's store at all - only tallies, and the tallies
+   public. §5.5 says what "no IP retained" does and does not prove once a request has crossed a
+   network.
 
 **The proposed amendment**, verbatim, replacing the first two sentences of non-negotiable 3:
 
@@ -187,10 +189,12 @@ Exactly this, and `nuthatch count payload` prints exactly this, populated:
   and RFC-0053's sequencing, and it identifies nobody.
 
 Not present, and the RFC records why each was considered: the addresses (identify the nest, and
-often the operator), the directory name (a path), the hostname, any timestamp (the server takes
-arrival day in UTC and nothing finer), the RPC endpoints (identify a provider account), the number
-of contracts (a fingerprint at the tails), the user agent (reqwest's default is a version string;
-the request sets it to the literal `nuthatch-count/1`), and any HTTP header the server might log.
+often the operator), the directory name (a path), the hostname, any timestamp finer than the
+arrival day in UTC (the handler's store is day-grained and nothing finer), the RPC endpoints
+(identify a provider account), the number of contracts (a fingerprint at the tails), and any extra
+identifying header (reqwest's default User-Agent is a version string; the request sets it to the
+literal `nuthatch-count/1`). The handler has no path that stores headers; that is the checkable
+claim in §5.5, not a claim about ingress logs in front of the handler.
 
 ### 5.3 Asking, once, after the nest exists
 
@@ -215,8 +219,9 @@ https://count.nuthatch-indexer.com and nothing else, ever:
 
   {"v":1,"event":"init","version":"3.6.1","os":"linux","arch":"x86_64","chain":42161,"source":"addresses"}
 
-No identifier, no addresses, no IP kept. The totals are public at
-https://www.nuthatch-indexer.com/count. `nuthatch count off` reverses this.
+No identifier, no addresses. The handler stores no IP, header or body. The totals
+are public at https://www.nuthatch-indexer.com/count. `nuthatch count off` reverses
+this.
 
 Count me? [y/N]
 ```
@@ -253,22 +258,35 @@ asked_at = "2026-09-11"
 ### 5.5 The receiver
 
 A counter, not a service: a single HTTPS endpoint whose entire behaviour is *increment some
-tallies and return 204*. It keeps **no per-request record**. Concretely, per UTC day it holds one
-integer for each of: `counted` total; `init` total; `init` by `version`; `init` by `os`/`arch`;
-`init` by `chain`; `init` by `source`. Cardinality of the whole key space is a few hundred rows per
-day at most, forever bounded by the registry size and the release count.
+tallies and return 204*. The committed handler keeps **no per-request record**. Concretely, per UTC
+day the tally store holds one integer for each of: `counted` total; `init` total; `init` by
+`version`; `init` by `os`/`arch`; `init` by `chain`; `init` by `source`. Cardinality of the whole
+key space is a few hundred rows per day at most, forever bounded by the registry size and the
+release count.
 
-Not kept, and the receiver must be built so that it *cannot* keep them rather than merely does not:
-the request IP (dropped at the edge before the handler runs), any header, the request body after
-the tallies are incremented, any timestamp finer than the day.
+What this repository can prove, by reading the handler: it has no path that persists the request
+IP, any header, or the request body after the tallies are incremented, and it takes no timestamp
+finer than the day. That is the checkable claim. It is not a claim that no such metadata exists
+anywhere the request passed through.
 
-Implementation is a deployment choice. `nuthatch-indexer.com` is a static Astro site on Vercel
-(`nuthatch-frontend`), which is where `install.sh` is served from; the smallest thing that
-satisfies the above there is a Vercel function in front of a key-value counter store. The
-alternative is a one-file binary on the Helsinki box beside the Lodestar nests, which changes
-nothing in this section but is one more process someone runs; §11 carries the choice. The
-receiver's source is committed to this repository under `count/receiver/` so the claim in §5.2 -
-"nothing else, ever" - is checkable by reading forty lines, not by trusting us.
+Two deployments, and they are not equivalent on that last point.
+
+The path that has no platform-managed request log is a one-file binary on the Helsinki host,
+beside the Lodestar nests. Ingress is ours. Logging is specified: no access log and no request log
+of IP, headers, or bodies; retention of that metadata is none, because none is written. Process
+logs are operational only (start, stop, panic, tally-store errors). This is the deployment A5's
+logging half is written against.
+
+A Vercel function remains a possible place to put the *tally store*, because the site already
+lives there (`nuthatch-frontend`, which is where `install.sh` is served from) and a function in
+front of a key-value counter is the smallest thing that increments. A Vercel function sits behind
+provider-managed ingress and logging. The repository's handler cannot prove that the source IP,
+headers, or request record never exist in those logs, and this RFC does not claim they do not. The
+privacy and acceptance claims do not cover Vercel ingress logs.
+
+The receiver's source is committed to this repository under `count/receiver/` so the handler
+claim is checkable by reading forty lines, not by trusting us. §11 still carries the deployment
+choice; it no longer pretends the two are the same for logging.
 
 Is this the "hosted service" the out-of-scope list forbids? No, by the same reading `CLAUDE.md`
 gives at line 219: the list forbids *us* running a data service and billing for it. A counter that
@@ -338,9 +356,14 @@ Each criterion is written so that it can fail.
 - **A4 - the deletion test, mechanised.** A CI job on a branch that removes `src/count.rs`, the
   `Count` subcommand and the `maybe_ask` call must build and pass every test not tagged `count`.
   RFC-0046 §1's test is a paragraph; this one runs.
-- **A5 - the receiver holds nothing.** The receiver's storage after 1,000 synthetic pings from
-  1,000 distinct source IPs contains no value that varies with the IP, and its size is a function
-  of the distinct `(day, field)` keys only. A reviewer can dump it and see tallies.
+- **A5 - the committed handler stores none of the request.** Reading `count/receiver/` shows no
+  path that writes the request IP, any header, or the request body after the increment. After
+  1,000 synthetic pings from 1,000 distinct source IPs, the tally store contains no value that
+  varies with the IP, and its size is a function of the distinct `(day, field)` keys only. A
+  reviewer can dump it and see tallies. If the receiver is the Helsinki binary, it is configured
+  with no access or request log of IP, headers or bodies; process logs are operational only. A5
+  does not claim that a Vercel function's ingress logs are empty, and a Vercel deployment does
+  not satisfy the no-platform-log half.
 - **A6 - once.** Two consecutive `init`s on a TTY produce one prompt. `count forget` then `init`
   produces a second.
 - **A7 - the number exists.** Four weeks after S2 ships, `docs/count/latest.json` exists, has been
@@ -379,8 +402,10 @@ The RFC recommends yes with the amendment in §1, and records that a no closes i
   thing a careful reader would not mind - that is the whole reason §5.2 is so short.
 - **The receiver goes down.** Nobody notices, by §5.4. The tally has a gap and `docs/count/`
   shows it. Not a risk to any operator.
-- **The receiver is compromised.** An attacker gains tallies. There is nothing else to gain, by
-  A5, and that is the property to protect at every change to the receiver.
+- **The receiver is compromised.** An attacker gains tallies. There is nothing else in the
+  handler's store to gain, by A5, and that is the property to protect at every change to the
+  receiver. Compromise of a Vercel account is a different surface, which is why Helsinki is the
+  path with no platform-managed request log.
 - **Scope creep.** Named in §8. The concrete guard is that `v` is bumped by an RFC amendment, A3
   fails on any drift, and the prompt text is what people said yes to.
 - **The number is used dishonestly.** Floors get reported as counts. The README line in §5.6
@@ -418,8 +443,10 @@ The RFC recommends yes with the amendment in §1, and records that a no closes i
    single-purpose file the point, because a second thing needing a home should be its own decision?
    The RFC leans single-purpose and asks.
 2. Where the receiver runs: a Vercel function beside the static site, or a one-file binary on the
-   Helsinki box. Neither changes §5.5; the Vercel option has no process to keep alive and the
-   Helsinki option has no vendor in the trust chain.
+   Helsinki box. These are no longer equivalent for logging. Vercel is a possible place for the
+   tally store and has no process to keep alive; it does not satisfy A5's no-platform-log half,
+   because ingress logs are the provider's. Helsinki has a process someone runs, and is the
+   deployment whose logging we specify: no access or request log of IP, headers or bodies.
 3. Should `chain` be sent at all, or is `source` alone enough? The RFC keeps it because "which
    chains people actually create nests on" is the question RFC-0030/0031/0050/0051 answered by
    guessing; §5.2's registry-only rule is what makes it safe.
