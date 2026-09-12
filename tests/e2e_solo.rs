@@ -1142,6 +1142,12 @@ impl nuthatch::store::HotStore for HotScanFails {
     fn get_block_hash(&self, block: u64) -> anyhow::Result<Option<String>> {
         self.0.get_block_hash(block)
     }
+    fn set_block_timestamp(&self, block: u64, timestamp: u64) -> anyhow::Result<()> {
+        self.0.set_block_timestamp(block, timestamp)
+    }
+    fn get_block_timestamp(&self, block: u64) -> anyhow::Result<Option<u64>> {
+        self.0.get_block_timestamp(block)
+    }
     fn checkpoints_desc(&self) -> anyhow::Result<Vec<(u64, String)>> {
         self.0.checkpoints_desc()
     }

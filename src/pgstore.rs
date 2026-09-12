@@ -252,6 +252,28 @@ impl PgStore {
             Ok(())
         })
     }
+
+    fn block_record(&self, block: u64) -> Result<Option<(String, Option<u64>)>> {
+        Ok(self
+            .get_kv("blocks", &format!("{block:012}"))?
+            .map(|v| crate::store::decode_block_record(&v)))
+    }
+
+    fn write_block_record(
+        &self,
+        block: u64,
+        hash: Option<&str>,
+        timestamp: Option<u64>,
+    ) -> Result<()> {
+        let key = format!("{block:012}");
+        let (existing_hash, existing_ts) =
+            self.block_record(block)?.unwrap_or((String::new(), None));
+        let packed = crate::store::encode_block_record(
+            hash.unwrap_or(&existing_hash),
+            timestamp.or(existing_ts),
+        );
+        self.put_kv("blocks", &key, &packed)
+    }
 }
 
 /// Strip any password before a connection string reaches a log or an error message.
@@ -410,11 +432,22 @@ impl HotStore for PgStore {
     }
 
     fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
-        self.put_kv("blocks", &format!("{block:012}"), hash)
+        self.write_block_record(block, Some(hash), None)
     }
 
     fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
-        self.get_kv("blocks", &format!("{block:012}"))
+        Ok(self
+            .block_record(block)?
+            .map(|(h, _)| h)
+            .filter(|h| !h.is_empty()))
+    }
+
+    fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()> {
+        self.write_block_record(block, None, Some(timestamp))
+    }
+
+    fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>> {
+        Ok(self.block_record(block)?.and_then(|(_, ts)| ts))
     }
 
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
@@ -428,7 +461,9 @@ impl HotStore for PgStore {
                 .map(|r| {
                     let k: String = r.get(0);
                     let block: u64 = k.parse().context("corrupt block key")?;
-                    Ok((block, r.get::<_, String>(1)))
+                    let raw: String = r.get(1);
+                    let (hash, _) = crate::store::decode_block_record(&raw);
+                    Ok((block, hash))
                 })
                 .collect()
         })
@@ -460,11 +495,21 @@ impl HotStore for PgStore {
                 tx.execute(&ins, &[k, v])?;
             }
             if let Some((block, hash)) = &checkpoint {
+                let key = format!("{block:012}");
+                let existing: Option<String> = {
+                    let get = format!("SELECT value FROM \"{schema}\".blocks WHERE key = $1");
+                    tx.query_opt(&get, &[&key])?.map(|r| r.get::<_, String>(0))
+                };
+                let existing_ts = existing
+                    .as_deref()
+                    .and_then(|v| crate::store::decode_block_record(v).1);
+                let (h, packed_ts) = crate::store::decode_block_record(hash);
+                let packed = crate::store::encode_block_record(&h, packed_ts.or(existing_ts));
                 let sql = format!(
                     "INSERT INTO \"{schema}\".blocks (key, value) VALUES ($1, $2) \
                      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
                 );
-                tx.execute(&sql, &[&format!("{block:012}"), hash])?;
+                tx.execute(&sql, &[&key, &packed])?;
             }
             let meta = format!(
                 "INSERT INTO \"{schema}\".meta (key, value) VALUES ('last_block', $1) \

@@ -367,6 +367,10 @@ async fn ownership_fencing_behaves_identically_on_both_backends() {
             ("put_entity", s.put_entity("k", "{}").map(|_| ())),
             ("set_meta", s.set_meta("x", "y").map(|_| ())),
             ("set_block_hash", s.set_block_hash(1, "0xbb").map(|_| ())),
+            (
+                "set_block_timestamp",
+                s.set_block_timestamp(1, 1_700_000_000).map(|_| ()),
+            ),
             ("rollback_to", s.rollback_to(0).map(|_| ())),
             ("prune_range", s.prune_range(0, 10).map(|_| ())),
             ("outbox_push", s.outbox_push("{}").map(|_| ())),

@@ -5306,7 +5306,17 @@ impl NestIngest {
         // Fetch the window boundary's canonical hash for future reorg detection, then commit the whole
         // window - rows + annotations + the checkpoint + the `last_block` watermark - in one atomic txn.
         let checkpoint = match source.block_hash(to).await {
-            Ok(Some(hash)) => Some((to, hash)),
+            Ok(Some(hash)) => {
+                let ts = match timestamps.get(&to).copied() {
+                    Some(t) => Some(t),
+                    None => source
+                        .block_timestamps(&[to])
+                        .await
+                        .ok()
+                        .and_then(|m| m.get(&to).copied()),
+                };
+                Some((to, crate::store::encode_block_record(&hash, ts)))
+            }
             _ => None,
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
