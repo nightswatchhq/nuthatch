@@ -1149,7 +1149,16 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 )));
             }
             let col = format!("{alias}__{}", s.name);
-            cols.push(format!("{alias}.\"{}\" AS \"{col}\"", s.name));
+            // The wire type is the schema's, wherever the field is selected from. This loop emitted the
+            // child's column raw, so `{ pools { token0 { decimals } } }` answered a JSON number for a
+            // field graph-node sends as a string - the same defect as the top-level selection and the
+            // packed list, in the third of the three places a scalar reaches a client (Jules on #1282).
+            let expr = if wire_string_cast(&cf.ty) {
+                format!("CAST({alias}.\"{}\" AS VARCHAR)", s.name)
+            } else {
+                format!("{alias}.\"{}\"", s.name)
+            };
+            cols.push(format!("{expr} AS \"{col}\""));
             sub.push((s.key.clone(), col));
         }
         shape.push(Shape::Object {

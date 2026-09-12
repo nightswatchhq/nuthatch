@@ -5205,7 +5205,15 @@ mod tests {
                 "  token0: Token!\n",
                 "  swaps: [Swap!]! @derivedFrom(field: \"pool\")\n}\n",
                 "type Swap @entity { id: ID! pool: Pool! amount: BigInt! }\n",
-                "type Token @entity { id: ID! symbol: String! decimals: Int! }\n",
+                // `decimals` is `Int!` and stays a JSON number; `totalSupply` is `BigInt!` and must be a
+                // string. Both are here because the wire rule is per-scalar, and a fixture with only one
+                // of them cannot tell "casts everything" from "casts the right things".
+                //
+                // `totalSupply`'s value is small on purpose. The first version used 1e24, which exceeds
+                // DuckDB's `BIGINT` so the serialiser already rendered it as a string - and the mutation
+                // dropping the cast stayed green against it. A value that fits in an integer is the one
+                // that tells the cast from the storage type.
+                "type Token @entity { id: ID! symbol: String! decimals: Int! totalSupply: BigInt! }\n",
             ),
         )
         .unwrap();
@@ -5229,8 +5237,9 @@ mod tests {
             d.path().join("views/token.sql"),
             // `0xt2` exists but has nothing in its selected fields: that is the row that tells a
             // missing join apart from an all-null one.
-            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals \
-             UNION ALL SELECT '0xt2', NULL, NULL;\n",
+            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals, \
+             21000000 AS \"totalSupply\" \
+             UNION ALL SELECT '0xt2', NULL, NULL, NULL;\n",
         )
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
@@ -6088,19 +6097,24 @@ mod tests {
         // answer - an INNER JOIN would have dropped it silently.
         let body = ask(
             "/graphql",
-            "{ pools { id token0 { symbol decimals } } }",
+            "{ pools { id token0 { symbol decimals totalSupply } } }",
             state.clone(),
         )
         .await;
         assert_eq!(
             body["data"]["pools"],
             serde_json::json!([
-                {"id": "0xaaa", "token0": {"symbol": "WETH", "decimals": 18}},
+                // `decimals` is a number and `totalSupply` a string, from the same row: the wire rule is
+                // per-scalar, and a child field reaches the client through this join as much as through a
+                // top-level selection (Jules on #1282).
+                {"id": "0xaaa", "token0": {
+                    "symbol": "WETH", "decimals": 18, "totalSupply": "21000000",
+                }},
                 {"id": "0xbbb", "token0": null},
                 // `0xccc`'s token exists but its selected fields are all null. An object of nulls,
                 // not `null`: deciding presence from the selected values reported a real row as
                 // absent, which is why the join now carries the target's id as a marker.
-                {"id": "0xccc", "token0": {"symbol": null, "decimals": null}},
+                {"id": "0xccc", "token0": {"symbol": null, "decimals": null, "totalSupply": null}},
             ]),
             "a to-one traversal must nest, and a missing target must not drop the parent: {body}"
         );
