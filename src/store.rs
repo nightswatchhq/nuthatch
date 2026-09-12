@@ -848,15 +848,18 @@ impl Store {
         let mut seen = 0usize;
         for row in t.iter()? {
             let (_k, v) = row?;
+            out.source_bytes = out
+                .source_bytes
+                .checked_add(v.value().len() as u64)
+                .context("hot source byte count overflow")?;
+            if out.source_bytes > max_bytes {
+                anyhow::bail!("the unsealed tip needs {} source bytes, above this query's remaining {}-byte scan budget", out.source_bytes, max_bytes);
+            }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(v.value()) {
                 if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
                     seen += 1;
                     if seen > max_rows {
                         return Err(HotScanTooLarge { cap: max_rows }.into());
-                    }
-                    out.source_bytes = out.source_bytes.saturating_add(v.value().len() as u64);
-                    if out.source_bytes > max_bytes {
-                        anyhow::bail!("the unsealed tip needs {} source bytes, above this query's remaining {}-byte scan budget", out.source_bytes, max_bytes);
                     }
                     out.rows.entry(table.to_string()).or_default().push(json);
                 }

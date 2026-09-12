@@ -435,6 +435,10 @@ pub struct ColdScanEstimate {
 /// builds the same catalogue-backed base and authored views as the query path, then asks DuckDB
 /// for its physical plan without executing the statement.
 pub fn estimate_cold_scan(dir: &Path, sql: &str) -> Result<ColdScanEstimate> {
+    reject_with_prefixed_dml(sql)?;
+    reject_statement_stacking(sql)?;
+    reject_file_access(sql)?;
+    reject_replacement_scan(sql)?;
     let (conn, _spill) = open_locked_duckdb(dir).context("open DuckDB for byte estimate")?;
     let walked = reject_unknown_table_refs(&conn, sql)?;
     let Some((referenced, surveys)) = walked else {
@@ -462,7 +466,7 @@ pub fn estimate_cold_scan(dir: &Path, sql: &str) -> Result<ColdScanEstimate> {
         .context("cannot obtain the named query's physical plan")?;
     let plan: Value =
         serde_json::from_str(&plan).context("DuckDB returned a non-JSON physical plan")?;
-    let scans = parquet_scans(&plan);
+    let scans = parquet_scans(&plan)?;
     if scans == 0 {
         return Ok(ColdScanEstimate {
             bytes: 0,
@@ -512,15 +516,44 @@ pub fn estimate_cold_scan(dir: &Path, sql: &str) -> Result<ColdScanEstimate> {
     })
 }
 
-fn parquet_scans(plan: &Value) -> u64 {
-    match plan {
-        Value::Object(node) => {
-            let here = node.get("name").and_then(Value::as_str) == Some("READ_PARQUET");
-            u64::from(here) + node.values().map(parquet_scans).sum::<u64>()
+fn parquet_scans(plan: &Value) -> Result<u64> {
+    let nodes = plan.as_array().context("physical plan is not an array")?;
+    let mut scans = 0_u64;
+    for node in nodes {
+        let name = node
+            .get("name")
+            .and_then(Value::as_str)
+            .context("physical plan operator has no name")?;
+        // Unknown nodes and operators capable of repeated execution cannot silently contribute
+        // zero. In particular a recursive or correlated plan has no proven static scan count.
+        match name {
+            "READ_PARQUET"
+            | "PROJECTION"
+            | "FILTER"
+            | "HASH_JOIN"
+            | "HASH_GROUP_BY"
+            | "PERFECT_HASH_GROUP_BY"
+            | "UNGROUPED_AGGREGATE"
+            | "ORDER_BY"
+            | "TOP_N"
+            | "LIMIT"
+            | "STREAMING_LIMIT"
+            | "UNION"
+            | "WINDOW"
+            | "STREAMING_WINDOW"
+            | "DUMMY_SCAN"
+            | "EMPTY_RESULT" => {}
+            _ => bail!("cannot bound physical plan operator {name:?}"),
         }
-        Value::Array(nodes) => nodes.iter().map(parquet_scans).sum(),
-        _ => 0,
+        let children = node
+            .get("children")
+            .context("physical plan operator has no children")?;
+        scans = scans
+            .checked_add(parquet_scans(children)?)
+            .and_then(|n| n.checked_add(u64::from(name == "READ_PARQUET")))
+            .context("physical scan count overflow")?;
     }
+    Ok(scans)
 }
 
 /// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
@@ -3209,6 +3242,33 @@ template="pool"
             "self-join must not be deduplicated"
         );
         assert_eq!(twice.bytes, bytes * 2);
+    }
+
+    #[test]
+    fn cold_estimate_refuses_unaccounted_and_repeated_execution_operators() {
+        for name in [
+            "REC_CTE",
+            "NESTED_LOOP_JOIN",
+            "LEFT_DELIM_JOIN",
+            "FUTURE_SCAN",
+        ] {
+            let plan = serde_json::json!([{"name": name, "children": [
+                {"name": "READ_PARQUET", "children": [], "extra_info": {}}
+            ], "extra_info": {}}]);
+            let error = parquet_scans(&plan).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+        assert!(parquet_scans(&serde_json::json!({})).is_err());
+        assert!(parquet_scans(&serde_json::json!([{"name": "PROJECTION"}])).is_err());
+    }
+
+    #[test]
+    fn cold_estimate_refuses_stacked_sql_before_preparing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist.csv");
+        let sql = format!("SELECT 1; COPY (SELECT 2) TO '{}'", target.display());
+        assert!(estimate_cold_scan(dir.path(), &sql).is_err());
+        assert!(!target.exists());
     }
 
     #[test]

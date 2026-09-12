@@ -2216,6 +2216,7 @@ async fn run_sql_query(
     let memo = s
         .store
         .write_generation()
+        .filter(|_| cold_scan_bytes.is_none())
         .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
         .map(|generation| {
             let watermarks: std::collections::BTreeMap<String, u64> = s
@@ -2306,10 +2307,18 @@ async fn run_sql_query(
         let hot_budget = cold_scan_bytes
             .map(|cold| sql_max_named_scan_bytes.saturating_sub(cold))
             .unwrap_or(u64::MAX);
-        let (hot, tip_unavailable) = match store
-            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, hot_budget)
-        {
-            Ok(snapshot) => (snapshot.rows, false),
+        let hot_result = if cold_scan_bytes.is_some() {
+            store
+                .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, hot_budget)
+                .map(|snapshot| snapshot.rows)
+        } else {
+            store.hot_rows_by_table_bounded(sql_max_hot_rows)
+        };
+        let (hot, tip_unavailable) = match hot_result {
+            Ok(rows) => (rows, false),
+            // An admitted query must never recover from a refused or unreadable hot snapshot by
+            // executing against an incomplete cold-only relation.
+            Err(e) if cold_scan_bytes.is_some() => return Err(e),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
             // Same level as a segment read failure (#472): a hot store that will not scan is at least
             // as serious, and the fallback below must not be the only trace of it.
@@ -4470,6 +4479,34 @@ mod tests {
             Some(66),
             "lag computed across two chains is meaningless - it was ~463 million before this fix"
         );
+    }
+
+    #[tokio::test]
+    async fn named_scan_byte_refusal_never_serves_cold_only_or_a_memo_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_named_scan_bytes = 16;
+        state
+            .store
+            .put_entity(
+                "k1",
+                r#"{"table":"t","block_number":1,"payload":"too wide"}"#,
+            )
+            .unwrap();
+        // Warm the ordinary-query memo first. A hit must not evade admission either.
+        let warm = run_sql_query(state.clone(), "SELECT 1 AS answer".into(), None, None).await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        let refused = run_sql_query(state, "SELECT 1 AS answer".into(), None, Some(0)).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("scan budget"),
+            "{body}"
+        );
+        assert!(body.get("rows").is_none(), "{body}");
     }
 
     /// The `/sql` RAM guard (the "node owns resource safety" half of the CLAUDE.md division of
