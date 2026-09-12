@@ -6,9 +6,10 @@ refusal for the rest. Not a drop-in replacement - see the rescope note below and
 
 **Status:** **PARKED 2026-09-12 by Chief.** No further slices are to be started. What shipped stays
 shipped and supported - the compatibility surface is on main, tested, and documented in
-[what it is and what it is not](../graph-compatibility-what-it-is.md). What is parked is the *programme*:
-S3's entity history, S4's value contract decision, the S0 validator that was never built, and the
-remaining coverage grind.
+[what it is and what it is not](../graph-compatibility-what-it-is.md). Shipped: S0 (#1264, the
+comparison core, selection derivation and corpus runner), S1, S2, and the first slice of S3
+(`block.number_gte`). What is parked is the *programme*: remaining S3 (entity history), S4's value
+contract decision, and the remaining coverage grind.
 
 **The trigger to unpark**, so this is a decision rather than a drift: someone with a stopped subgraph
 whose queries fall inside the event-shaped surface, asking for it. Field coverage is not the trigger -
@@ -16,9 +17,8 @@ that was the mistake this programme made for three weeks. A named consumer is.
 
 Originally **accepted 2026-09-09 by Chief**, as the decision RFC-0044 §8 requires for new binary
 capability. It **overrides [RFC-0044](0044-the-subgraph-port-skill.md) §11's** "not a subgraph
-compatibility layer" non-goal, annotated there. Scope of the authorisation: S0 (#1264, the migration
-validator) is in the `resolute-robin` sprint; S1 to S4 (#1265 to #1268) are filed but wait on what S0
-measures, because S0 is the only slice that can falsify the rest.
+compatibility layer" non-goal, annotated there. S0 (#1264, the migration validator) ran and is on
+main; parking is of the rest.
 
 **Date:** 2026-09-09
 
@@ -130,7 +130,7 @@ The Uniswap V4 failure shape is the example. A mapping that returns early when t
 - **Partial** (#1266). Compiled for embedded DuckDB. **Postgres has no branch in `graph_query.rs` and nothing tests it.**
 - **Delivered.** `first`, `skip`, `orderBy`, `orderDirection`, Graph `where` operators, `and`, `or`, nested entity filters and the default ID-ascending order. Ordering on a big number compares numerically rather than as text (#1325). `orderBy` on a relation is refused by name.
 - **Partial** (#1267). `block: { number_gte: N }` is answered as the head precondition it is, needing no history at all (#1330). `{ number: N }` and `{ hash: … }` remain refused: the block-ranged entity history is not built.
-- **Not built.** The side-by-side migration validator (S0, #1264) was never written. Every coverage figure in this RFC comes from `port-emit`'s own accounting instead, which measures what the overlay answers rather than how it differs from a live reference.
+- **Delivered** (#1264). The side-by-side migration validator (S0): comparison core, selection derivation, and corpus runner. Coverage figures in this RFC still come from `port-emit`'s own accounting, which measures what the overlay answers rather than how it differs from a live reference.
 
 ## Non-goals
 
@@ -255,8 +255,9 @@ answers and only two are implemented. S4 (#1268) is the decision; until it is ta
 is converged" is a sentence with nothing behind it. **Outstanding - a decision, not code.**
 
 Explicitly **not** deliverables any more: byte-identical pricing analytics (ruled out by RFC-0038 §6a,
-not by effort); adoption by an unmodified analytics client; and the S0 migration validator, which was
-never built and whose job `port-emit`'s own coverage accounting has been doing less directly.
+not by effort); and adoption by an unmodified analytics client. S0 (#1264) shipped. D4 (query-level
+coverage against a real port) remains outstanding; `port-emit`'s field accounting is what the figures
+in this RFC used.
 
 ## Risks and evidence limits
 
