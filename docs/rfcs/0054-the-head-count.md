@@ -171,22 +171,46 @@ Go's telemetry made the same choice for the same reason and has lived with the s
 
 ### 5.2 The payload
 
-Exactly this, and `nuthatch count payload` prints exactly this, populated:
+One JSON object shape, two values of `event`. `nuthatch count payload` prints both, populated
+for this machine.
+
+An `init` event is exactly this:
 
 ```json
 {"v":1,"event":"init","version":"3.6.1","os":"linux","arch":"x86_64","chain":42161,"source":"addresses"}
 ```
 
+A `counted` event is the same object with `"event":"counted"`. `chain` and `source` are present
+on `counted` only when the ping is sent from `maybe_ask` after a successful `init`, and then they
+are the chain and source of that init, the same values the `init` event that follows will carry.
+They are **absent** (the keys are not in the JSON, not null) when the ping is sent from
+`count on`, which has no nest. The client does not invent one.
+
+A bare `count on` therefore sends:
+
+```json
+{"v":1,"event":"counted","version":"3.6.1","os":"linux","arch":"x86_64"}
+```
+
+The receiver increments `counted` total for that body. It does not increment per-chain or
+per-source tallies from a `counted` event, whether or not those keys are present; those
+breakdowns are `init`-only, per §5.5.
+
 - `v`: payload schema version. A change to the field set is a bump, is an RFC amendment, and re-asks
   nobody - a person who said yes to v1 said yes to a stated set of fields, and a new field is a new
   question. Until they are re-asked, the client sends v1.
-- `version`: the nuthatch version, from `CARGO_PKG_VERSION`.
-- `os`, `arch`: `std::env::consts::{OS, ARCH}`. Coarse; a dozen values between them.
-- `chain`: the chain id **only if it is in the built-in registry** (`src/chains.rs`); anything
-  else is sent as `0`. A custom chain id can be a fingerprint of one operator; a registry id cannot.
-- `source`: `addresses` | `from` | `subgraph` - the three arms at the top of `project::init`.
-  Which of them people actually use is the single most useful thing in the payload for RFC-0044's
-  and RFC-0053's sequencing, and it identifies nobody.
+- `event`: `init` | `counted`. Not a free string.
+- `version`: the nuthatch version, from `CARGO_PKG_VERSION`. Always present on both events.
+- `os`, `arch`: `std::env::consts::{OS, ARCH}`. Coarse; a dozen values between them. Always present
+  on both events.
+- `chain`: on `init`, always present: the chain id **only if it is in the built-in registry**
+  (`src/chains.rs`); anything else is sent as `0`. A custom chain id can be a fingerprint of one
+  operator; a registry id cannot. On `counted`, present only in the `maybe_ask` path, with the
+  same rule and the same value as the `init` that follows; absent on `count on`.
+- `source`: on `init`, always present: `addresses` | `from` | `subgraph` - the three arms at the
+  top of `project::init`. Which of them people actually use is the single most useful thing in the
+  payload for RFC-0044's and RFC-0053's sequencing, and it identifies nobody. On `counted`, the
+  same presence rule as `chain`.
 
 Not present, and the RFC records why each was considered: the addresses (identify the nest, and
 often the operator), the directory name (a path), the hostname, any timestamp finer than the
@@ -260,9 +284,10 @@ asked_at = "2026-09-11"
 A counter, not a service: a single HTTPS endpoint whose entire behaviour is *increment some
 tallies and return 204*. The committed handler keeps **no per-request record**. Concretely, per UTC
 day the tally store holds one integer for each of: `counted` total; `init` total; `init` by
-`version`; `init` by `os`/`arch`; `init` by `chain`; `init` by `source`. Cardinality of the whole
-key space is a few hundred rows per day at most, forever bounded by the registry size and the
-release count.
+`version`; `init` by `os`/`arch`; `init` by `chain`; `init` by `source`. A `counted` event
+increments `counted` total only. Per-chain and per-source keys on a `counted` body, if present,
+are not tallied. Cardinality of the whole key space is a few hundred rows per day at most,
+forever bounded by the registry size and the release count.
 
 What this repository can prove, by reading the handler: it has no path that persists the request
 IP, any header, or the request body after the tallies are incremented, and it takes no timestamp
@@ -309,24 +334,30 @@ floors."* Numbers over adjectives, and no adjective would survive the second sen
 
 ```
 nuthatch count            # status: on/off/never asked, config path, last payload shape
-nuthatch count on         # store yes; sends one `counted`
+nuthatch count on         # store yes; sends one `counted` with chain and source absent
 nuthatch count off        # store no; sends nothing, ever again
-nuthatch count payload    # print the exact v1 payload this machine would send, populated
+nuthatch count payload    # print both v1 objects this machine can send, populated
 nuthatch count forget     # delete the config file; the question may be asked again
 ```
 
 `on` from a non-TTY works (it is an explicit command, not a prompt), which is how an operator who
-manages fleets by script can opt a machine in deliberately. There is no `--count` flag on `init`
-and there will not be: a flag on the hot command invites the install script and every tutorial to
-add it, and the count should be a thing a person did on purpose.
+manages fleets by script can opt a machine in deliberately. It has no nest and does not look for
+one on disk, so the `counted` payload it sends is §5.2's bare object: `chain` and `source` are
+absent. There is no `--count` flag on `init` and there will not be: a flag on the hot command
+invites the install script and every tutorial to add it, and the count should be a thing a person
+did on purpose.
 
 ## 6. Implementation sketch
 
 One module, `src/count.rs`, ~200 lines including the prompt text and the config file:
 
 - `pub fn maybe_ask(kind: Source) -> ()` - called last in `project::init` on the success path only.
-  Checks §5.3's five conditions, asks, stores, and on yes calls `send(Event::Counted)` then
-  `send(Event::Init { source })`. On a stored yes, calls `send(Event::Init { source })` alone.
+  Checks §5.3's five conditions, asks, stores, and on yes calls
+  `send(Event::Counted { chain, source })` then `send(Event::Init { chain, source })`, both
+  populated from the init that just succeeded (same `chain` and `source` on both). On a stored
+  yes, calls `send(Event::Init { chain, source })` alone.
+- `count on` calls `send(Event::Counted { chain: None, source: None })`. Those `None`s serialise
+  as absent keys, not null, which is the bare object in §5.2.
 - `async fn send(ev: Event)` - builds §5.2's payload, posts under `timeout(2s)`, `debug!`s any
   error, returns `()`. Never `Result`. Nothing upstream can react to it.
 - `Answer::{load, store}` over the config path from §5.3.
@@ -350,9 +381,14 @@ Each criterion is written so that it can fail.
   `init`'s stdout, stderr, exit code and the resulting nest directory are byte-identical to a run
   with a stored no. Wall clock differs by at most the two-second ceiling.
 - **A3 - the payload is the payload.** A test serialises `Event::Init` for every registry chain and
-  every `Source` and asserts the key set is exactly `{v, version, os, arch, chain, source}` and
-  that a non-registry chain id serialises as `0`. This is the test that fails when someone adds a
-  field without an RFC amendment.
+  every `Source` and asserts the key set is exactly `{v, event, version, os, arch, chain, source}`,
+  `event` is `"init"`, and a non-registry chain id serialises as `0`. The same test serialises
+  `Event::Counted` twice: with `chain` and `source` unset, the key set is exactly
+  `{v, event, version, os, arch}`, `event` is `"counted"`, and `chain`/`source` are absent not
+  null; with the chain and source of a just-completed init, the key set is exactly
+  `{v, event, version, os, arch, chain, source}`, `event` is `"counted"`, and `chain`/`source`
+  match the `Init` that follows. This is the test that fails when someone adds a field without
+  an RFC amendment.
 - **A4 - the deletion test, mechanised.** A CI job on a branch that removes `src/count.rs`, the
   `Count` subcommand and the `maybe_ask` call must build and pass every test not tagged `count`.
   RFC-0046 §1's test is a paragraph; this one runs.
