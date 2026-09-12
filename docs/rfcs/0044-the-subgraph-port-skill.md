@@ -210,6 +210,13 @@ being judged.
   document of its own, so declining it here no longer declines it everywhere. Nothing else in §11
   moves, and RFC-0053 independently keeps AssemblyScript out of the indexing path and refuses to
   claim byte-for-byte parity for mapping-derived values.
+  **Rescoped 2026-09-12 after it was built and measured:** what RFC-0053 delivers is a *partial read
+  surface* - exact for a subgraph's event-shaped fields, a named refusal for the rest - and not the
+  impersonating endpoint this bullet rules out. On the pinned Uniswap V4 target it answers 70 of 184
+  fields the port report classifies exact, and because GraphQL refuses a whole query for one
+  unanswerable field, an analytics client cannot adopt it unmodified. This bullet's *instinct* was
+  therefore better than the override credited it for; what the override bought is a real and narrower
+  thing. See RFC-0053's Measured outcome.
 - **Not automatic.** The skill produces a nest and a report for a human to accept. It does not deploy.
 
 ## 12. Open questions

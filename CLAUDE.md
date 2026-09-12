@@ -185,7 +185,12 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >
 > **RFC-0053 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0053](docs/rfcs/0053-graph-subgraph-compatibility.md) on 2026-09-09, a Graph-dialect-to-SQL
-> compatibility surface so a caller adopts a nest by changing a GraphQL URL. It is **new binary
+> compatibility surface so a caller adopts a nest by changing a GraphQL URL. **Rescoped 2026-09-12:
+> that last clause did not survive contact with a measurement. What was built is a partial read
+> surface - exact for a subgraph's event-shaped fields, a named refusal for the rest - and an
+> analytics client cannot adopt it unmodified, because GraphQL refuses a whole query for one
+> unanswerable field. Do not describe this as a drop-in replacement anywhere; RFC-0053's Measured
+> outcome has the figures and the rescoped deliverables.** It is **new binary
 > capability**, which is exactly the case RFC-0044 §8 says must be decided here or not happen, and it
 > **overrides RFC-0044 §11's "not a subgraph compatibility layer" non-goal**, annotated in that RFC.
 > It sits outside the programme's original five and is now the sixth document in it.
