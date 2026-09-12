@@ -417,6 +417,112 @@ impl QueryOutput {
 /// Passed to the query path so the live tip is `UNION ALL`'d into each table's view (RFC-0013).
 pub type HotRows = std::collections::HashMap<String, Vec<Value>>;
 
+/// A conservative cold-read bound for a declared query (RFC-0048 item 1).
+///
+/// `bytes` is deliberately an upper bound. DuckDB's JSON physical plan tells us how many Parquet
+/// scan operators will run, but not which source paths belong to each operator. We therefore sum
+/// every catalogue segment reachable from the statement for *each* scan operator. That can
+/// overstate a query which scans different tables in different operators, but it cannot make a
+/// repeated scan look cheaper by deduplicating it. A shape we cannot bind or account for refuses
+/// instead of acquiring a fictional quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdScanEstimate {
+    pub bytes: u64,
+    pub scan_operators: u64,
+}
+
+/// Estimate the sealed Parquet source bytes a named query may read. This is host-side only: it
+/// builds the same catalogue-backed base and authored views as the query path, then asks DuckDB
+/// for its physical plan without executing the statement.
+pub fn estimate_cold_scan(dir: &Path, sql: &str) -> Result<ColdScanEstimate> {
+    let (conn, _spill) = open_locked_duckdb(dir).context("open DuckDB for byte estimate")?;
+    let walked = reject_unknown_table_refs(&conn, sql)?;
+    let Some((referenced, surveys)) = walked else {
+        bail!("cannot determine the tables this named query reaches")
+    };
+    if surveys {
+        bail!("cannot quote a query that surveys the catalogue")
+    }
+    let wanted = reachable_tables(&conn, dir, &referenced)
+        .context("cannot determine the base tables this named query reaches")?;
+    define_views(
+        &conn,
+        dir,
+        &HotRows::new(),
+        u64::MAX,
+        &Default::default(),
+        &[],
+        Some(&wanted),
+    )?;
+    define_nest_views(&conn, dir, Some(&wanted));
+    let plan: String = conn
+        .query_row(&format!("EXPLAIN (FORMAT JSON) {sql}"), [], |row| {
+            row.get(1)
+        })
+        .context("cannot obtain the named query's physical plan")?;
+    let plan: Value =
+        serde_json::from_str(&plan).context("DuckDB returned a non-JSON physical plan")?;
+    let scans = parquet_scans(&plan);
+    if scans == 0 {
+        return Ok(ColdScanEstimate {
+            bytes: 0,
+            scan_operators: 0,
+        });
+    }
+    let manifest =
+        crate::seal::load_manifest(dir).context("read segment catalogue for byte estimate")?;
+    let declared: std::collections::BTreeSet<String> = schema_columns(dir)
+        .into_iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    let authored: std::collections::BTreeSet<String> = nest_view_files(dir)
+        .into_iter()
+        .flat_map(|file| split_sql_statements(&file.sql).into_iter())
+        .filter_map(|statement| view_name(&statement))
+        .collect();
+    let mut source_bytes = 0_u64;
+    for table in wanted {
+        // A table without sealed segments is a hot-only relation. The following item accounts for
+        // hot bytes separately; this estimator must not pretend that it has a catalogue bound.
+        let Some(segments) = manifest.tables.get(&table) else {
+            // An event table that has not sealed yet has no cold half. Authored views are expanded
+            // above and contribute through their base tables. Every other relation (labels,
+            // offchain snapshots, catalogue functions) lacks this catalogue's accounting and must
+            // be refused rather than quoted as free.
+            if declared.contains(&table) || authored.contains(&table) {
+                continue;
+            }
+            bail!("cannot quote non-catalogue relation {table:?}");
+        };
+        for segment in segments {
+            let path = crate::seal::segment_path(dir, &segment.file, &segment.hash);
+            let len = std::fs::metadata(&path)
+                .with_context(|| format!("stat catalogue segment {}", path.display()))?
+                .len();
+            source_bytes = source_bytes
+                .checked_add(len)
+                .context("catalogue byte estimate overflow")?;
+        }
+    }
+    Ok(ColdScanEstimate {
+        bytes: source_bytes
+            .checked_mul(scans)
+            .context("catalogue byte estimate overflow")?,
+        scan_operators: scans,
+    })
+}
+
+fn parquet_scans(plan: &Value) -> u64 {
+    match plan {
+        Value::Object(node) => {
+            let here = node.get("name").and_then(Value::as_str) == Some("READ_PARQUET");
+            u64::from(here) + node.values().map(parquet_scans).sum::<u64>()
+        }
+        Value::Array(nodes) => nodes.iter().map(parquet_scans).sum(),
+        _ => 0,
+    }
+}
+
 /// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
 /// not bind, whether or not anybody has asked about them.
 ///
@@ -3070,6 +3176,39 @@ template="pool"
         assert_eq!(one["to"], Value::from("0xc"));
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
+    }
+
+    #[test]
+    fn cold_estimate_counts_each_physical_parquet_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![
+            r#"{"table":"t__transfer","from":"0xa","to":"0xb","value":"1","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &rows, 1, 1).unwrap();
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let segment = &manifest.tables["t__transfer"][0];
+        let bytes = std::fs::metadata(crate::seal::segment_path(
+            dir.path(),
+            &segment.file,
+            &segment.hash,
+        ))
+        .unwrap()
+        .len();
+
+        let once = estimate_cold_scan(dir.path(), r#"SELECT * FROM "t__transfer""#).unwrap();
+        assert_eq!(once.scan_operators, 1);
+        assert_eq!(once.bytes, bytes);
+
+        let twice = estimate_cold_scan(
+            dir.path(),
+            r#"SELECT * FROM "t__transfer" a JOIN "t__transfer" b ON a.log_index = b.log_index"#,
+        )
+        .unwrap();
+        assert_eq!(
+            twice.scan_operators, 2,
+            "self-join must not be deduplicated"
+        );
+        assert_eq!(twice.bytes, bytes * 2);
     }
 
     #[test]
