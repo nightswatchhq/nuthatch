@@ -185,7 +185,9 @@ pub async fn upgrade(
     let admin_enabled = admin_enabled(no_admin, &listen);
     let admin_token = admin_required_token(admin_enabled, &listen);
 
-    // Both versions index concurrently.
+    // Both versions index concurrently. Keep `source` and `old_dir` so a post-quiesce stall
+    // can restart the old writer against the still-open store.
+    let old_dir_restart = old_dir.clone();
     let old_rt = spawn_nest(
         source.clone(),
         old_dir,
@@ -199,7 +201,7 @@ pub async fn upgrade(
     )
     .await?;
     let new_rt = spawn_nest(
-        source,
+        source.clone(),
         new_dir,
         new_config,
         None,
@@ -207,7 +209,7 @@ pub async fn upgrade(
         concurrency,
         window,
         admin_enabled,
-        admin_token,
+        admin_token.clone(),
     )
     .await?;
 
@@ -246,7 +248,9 @@ pub async fn upgrade(
         let mut catchup_task = {
             let old_store = old_store.clone();
             let new_store = new_store.clone();
-            tokio::spawn(async move { await_catchup(&old_store, &new_store, UPGRADE_POLL).await })
+            tokio::spawn(async move {
+                await_catchup(&old_store, &new_store, UPGRADE_POLL, UPGRADE_STALL).await
+            })
         };
         // Both writers stay live until the new head reaches a snapshot of the old. Quiesce
         // only after that, so a stall leaves the old writer running (#1314).
@@ -288,16 +292,74 @@ pub async fn upgrade(
                         }
                     }
                     Err(UpgradeAbandon::AfterQuiesce) => {
-                        tracing::warn!(
-                            "abandoned the upgrade after stopping the old writer; serving the frozen \
-                             backing. Restart the previous binary to resume indexing"
-                        );
                         ingest_new.abort();
-                        join_task("serving", (&mut serve_task).await)
+                        // Restart only once the old task has actually gone; two writers on one
+                        // store is the fault.
+                        if ingest_old.is_finished() {
+                            match restart_old_writer(
+                                source.clone(),
+                                old_dir_restart,
+                                old_store.clone(),
+                                seal_direct,
+                                concurrency,
+                                window,
+                                admin_enabled,
+                                admin_token.clone(),
+                            )
+                            .await
+                            {
+                                Ok(restarted) => {
+                                    tracing::warn!(
+                                        "abandoned the upgrade after quiesce; restarted the old writer"
+                                    );
+                                    old_shared.swap(restarted.state);
+                                    ingest_old = restarted.ingest;
+                                    tokio::select! {
+                                        r = &mut serve_task => join_task("serving", r),
+                                        j = &mut ingest_old => join_task("old indexing", j),
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "abandoned the upgrade; could not restart the old writer"
+                                    );
+                                    join_task("serving", (&mut serve_task).await)
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "abandoned the upgrade; old ingest did not stop, so it was not restarted"
+                            );
+                            tokio::select! {
+                                r = &mut serve_task => join_task("serving", r),
+                                j = &mut ingest_old => join_task("old indexing", j),
+                            }
+                        }
                     }
                 },
-                Ok(Err(e)) => Err(e.context("hot-upgrade catch-up")),
-                Err(e) => Err(anyhow::anyhow!("catch-up task failed: {e}")),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "abandoned the upgrade; the old writer is still live and the endpoint keeps serving it"
+                    );
+                    ingest_new.abort();
+                    tokio::select! {
+                        r = &mut serve_task => join_task("serving", r),
+                        j = &mut ingest_old => join_task("old indexing", j),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "catch-up task failed; the old writer is still live and the endpoint keeps serving it"
+                    );
+                    ingest_new.abort();
+                    tokio::select! {
+                        r = &mut serve_task => join_task("serving", r),
+                        j = &mut ingest_old => join_task("old indexing", j),
+                    }
+                }
             },
         };
         serve_task.abort();
@@ -339,16 +401,37 @@ pub struct FlipHeads {
 }
 
 /// Poll until the new version's indexed head reaches the old version's. Does not swap.
+/// Fails after `stall` so a lagging new writer cannot hang the upgrade.
 pub async fn await_catchup(
     old_store: &dyn crate::store::HotStore,
     new_store: &dyn crate::store::HotStore,
     poll: std::time::Duration,
+    stall: std::time::Duration,
 ) -> Result<()> {
+    await_catchup_probe(
+        || Ok((old_store.indexed_head()?, new_store.indexed_head()?)),
+        poll,
+        stall,
+    )
+    .await
+}
+
+async fn await_catchup_probe(
+    mut probe: impl FnMut() -> Result<(Option<u64>, Option<u64>)>,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + stall;
     loop {
-        let old_head = old_store.indexed_head()?;
-        let new_head = new_store.indexed_head()?;
+        let (old_head, new_head) = probe()?;
         if crate::lifecycle::caught_up(new_head, old_head) {
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "new version did not reach old head {old_head:?} within {stall:?}; abandoned the \
+                 upgrade so the endpoint is not frozen"
+            );
         }
         tokio::time::sleep(poll).await;
     }
@@ -404,7 +487,7 @@ async fn wait_until_caught_up_probe(
 enum UpgradeAbandon {
     /// Old ingest is still running.
     BeforeQuiesce,
-    /// Old ingest is already dead; the served backing is frozen.
+    /// Old ingest is already dead; restart it rather than serving a frozen backing.
     AfterQuiesce,
 }
 
@@ -491,7 +574,7 @@ pub async fn await_catchup_and_flip(
     new_state: serve::AppState,
     poll: std::time::Duration,
 ) -> Result<FlipHeads> {
-    await_catchup(old_store, new_store, poll).await?;
+    await_catchup(old_store, new_store, poll, UPGRADE_STALL).await?;
     let old_head = old_store.indexed_head()?;
     let new_head = new_store.indexed_head()?;
     tracing::info!(
@@ -628,18 +711,69 @@ pub async fn spawn_nest(
     .await?;
     refuse_seal_direct_with_entities(seal_direct, &nest)?;
     // Kick off the indexing loop in the background; serve the API on this task.
-    let ingest = tokio::spawn(index_loop(
+    let ingest = spawn_ingest(source, nest, backfill, seal_direct, concurrency, window);
+    Ok(NestRuntime {
+        state,
+        ingest,
+        alert_worker,
+    })
+}
+
+fn spawn_ingest(
+    source: Arc<dyn Source>,
+    nest: NestIngest,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window: u64,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(index_loop(
         source,
         nest,
         backfill,
         seal_direct,
         concurrency,
         window,
-    ));
-    Ok(NestRuntime {
+    ))
+}
+
+struct RestartedWriter {
+    ingest: tokio::task::JoinHandle<Result<()>>,
+    state: serve::AppState,
+}
+
+/// Rebuild ingest against an already-open store. The previous task must have been joined first.
+#[allow(clippy::too_many_arguments)]
+async fn restart_old_writer(
+    source: Arc<dyn Source>,
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    seal_direct: bool,
+    concurrency: usize,
+    window_override: Option<u64>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+) -> Result<RestartedWriter> {
+    let config = Config::load(&dir)?;
+    let (nest, state, alert_worker, window) = build_nest(
+        &source,
+        dir,
+        &config,
+        window_override,
+        admin_enabled,
+        admin_token,
+        Some(store),
+        serve::new_sql_gate(),
+    )
+    .await?;
+    // The original delivery worker is still running.
+    if let Some(w) = alert_worker {
+        w.abort();
+    }
+    refuse_seal_direct_with_entities(seal_direct, &nest)?;
+    Ok(RestartedWriter {
+        ingest: spawn_ingest(source, nest, None, seal_direct, concurrency, window),
         state,
-        ingest,
-        alert_worker,
     })
 }
 
@@ -809,14 +943,7 @@ pub async fn spawn_nest_on_store(
     )
     .await?;
     refuse_seal_direct_with_entities(seal_direct, &nest)?;
-    let ingest = tokio::spawn(index_loop(
-        source,
-        nest,
-        backfill,
-        seal_direct,
-        concurrency,
-        window,
-    ));
+    let ingest = spawn_ingest(source, nest, backfill, seal_direct, concurrency, window);
     Ok(NestRuntime {
         state,
         ingest,
@@ -9624,6 +9751,57 @@ template = "pool"
             "a pre-quiesce stall must not stop the old writer"
         );
         old.abort();
+    }
+
+    #[tokio::test]
+    async fn await_catchup_fails_within_a_short_stall() {
+        let err = await_catchup_probe(
+            || Ok((Some(5), Some(3))),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not reach old head"),
+            "the operator needs the stall named: {msg}"
+        );
+        assert!(msg.contains("Some(5)"), "and the moving old head: {msg}");
+    }
+
+    #[tokio::test]
+    async fn restart_old_writer_leaves_a_running_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = build_blocks_nest_with_contract(
+            dir.path(),
+            "0x1111111111111111111111111111111111111111",
+        )
+        .await;
+        let store = nest.store.clone();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let mut ingest = spawn_ingest(source.clone(), nest, None, false, 1, 5);
+        quiesce_ingest(&mut ingest, std::time::Duration::from_secs(2))
+            .await
+            .expect("quiesce");
+        assert!(ingest.is_finished(), "premise: the old task has gone");
+        let restarted = restart_old_writer(
+            source,
+            dir.path().to_path_buf(),
+            store,
+            false,
+            1,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("restart");
+        assert!(
+            !restarted.ingest.is_finished(),
+            "a post-quiesce restart must leave a live writer"
+        );
+        restarted.ingest.abort();
     }
 
     /// COR-5: the fault raised for an over-cap single block must be **terminal**.

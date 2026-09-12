@@ -389,7 +389,12 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
 
     tokio::time::timeout(
         POLL_TIMEOUT,
-        indexer::await_catchup(&old_store, &new_store, Duration::from_millis(20)),
+        indexer::await_catchup(
+            &old_store,
+            &new_store,
+            Duration::from_millis(20),
+            POLL_TIMEOUT,
+        ),
     )
     .await
     .expect("catch-up timed out")
