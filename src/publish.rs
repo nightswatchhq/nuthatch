@@ -89,19 +89,10 @@ impl Mirror for FsMirror {
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
-        let current = self.get(key).await?;
-        match (expected, current.as_deref()) {
-            (None, Some(_)) => bail!(
-                "refusing to publish {key}: it already exists (another publisher holds this dataset)"
-            ),
-            (Some(exp), Some(got)) if exp != got => bail!(
-                "refusing to publish {key}: the remote catalogue changed since this run started"
-            ),
-            (Some(_), None) => bail!(
-                "refusing to publish {key}: expected an existing catalogue and found none"
-            ),
-            _ => self.put(key, bytes).await,
-        }
+        let lock = publication_lock(&format!("fs:{}", self.path(key).display()));
+        let _g = lock.lock().await;
+        cas_bytes(self.get(key).await?, expected, key)?;
+        self.put(key, bytes).await
     }
 
     async fn head_size(&self, key: &str) -> Result<Option<u64>> {
@@ -181,18 +172,65 @@ impl Mirror for ObjMirror {
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
-        let current = self.get(key).await?;
-        match (expected, current.as_deref()) {
-            (None, Some(_)) => bail!(
-                "refusing to publish {key}: it already exists (another publisher holds this dataset)"
-            ),
-            (Some(exp), Some(got)) if exp != got => bail!(
-                "refusing to publish {key}: the remote catalogue changed since this run started"
-            ),
-            (Some(_), None) => bail!(
-                "refusing to publish {key}: expected an existing catalogue and found none"
-            ),
-            _ => self.put(key, bytes).await,
+        use object_store::{ObjectStore as _, PutMode, PutOptions, UpdateVersion};
+        let lock = publication_lock(&format!("obj:{}:{key}", self.prefix));
+        let _g = lock.lock().await;
+        let loc = self.key(key);
+        match expected {
+            None => self
+                .inner
+                .put_opts(
+                    &loc,
+                    object_store::PutPayload::from(bytes.to_vec()),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..PutOptions::default()
+                    },
+                )
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::AlreadyExists { .. } => anyhow::anyhow!(
+                        "refusing to publish {key}: it already exists (another publisher holds this dataset)"
+                    ),
+                    other => anyhow::Error::new(other).context(key.to_string()),
+                })
+                .map(|_| ()),
+            Some(exp) => {
+                let got = self.inner.get(&loc).await.map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => anyhow::anyhow!(
+                        "refusing to publish {key}: expected an existing catalogue and found none"
+                    ),
+                    other => anyhow::Error::new(other).context(key.to_string()),
+                })?;
+                let etag = got.meta.e_tag.clone();
+                let version = got.meta.version.clone();
+                let body = got.bytes().await.context("reading catalogue for CAS")?;
+                if body.as_ref() != exp {
+                    bail!(
+                        "refusing to publish {key}: the remote catalogue changed since this run started"
+                    );
+                }
+                self.inner
+                    .put_opts(
+                        &loc,
+                        object_store::PutPayload::from(bytes.to_vec()),
+                        PutOptions {
+                            mode: PutMode::Update(UpdateVersion {
+                                e_tag: etag,
+                                version,
+                            }),
+                            ..PutOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        object_store::Error::Precondition { .. } => anyhow::anyhow!(
+                            "refusing to publish {key}: the remote catalogue changed since this run started"
+                        ),
+                        other => anyhow::Error::new(other).context(key.to_string()),
+                    })
+                    .map(|_| ())
+            }
         }
     }
 
@@ -203,6 +241,34 @@ impl Mirror for ObjMirror {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
         }
+    }
+}
+
+fn publication_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut map = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("publish locks");
+    map.entry(id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn cas_bytes(current: Option<Vec<u8>>, expected: Option<&[u8]>, key: &str) -> Result<()> {
+    match (expected, current.as_deref()) {
+        (None, Some(_)) => bail!(
+            "refusing to publish {key}: it already exists (another publisher holds this dataset)"
+        ),
+        (Some(exp), Some(got)) if exp != got => {
+            bail!("refusing to publish {key}: the remote catalogue changed since this run started")
+        }
+        (Some(_), None) => {
+            bail!("refusing to publish {key}: expected an existing catalogue and found none")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -732,6 +798,27 @@ abi = "abis/usdc.json"
         assert!(
             err.to_string().contains("changed"),
             "wanted a changed-catalogue refusal, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_put_if_does_not_regress_the_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = FsMirror {
+            root: dir.path().to_path_buf(),
+        };
+        m.put("manifest.json", b"old").await.unwrap();
+        let a = m.put_if("manifest.json", b"aaa", Some(b"old"));
+        let b = m.put_if("manifest.json", b"bbb", Some(b"old"));
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(
+            ra.is_ok() ^ rb.is_ok(),
+            "exactly one CAS should win, got {ra:?} {rb:?}"
+        );
+        let got = m.get("manifest.json").await.unwrap().unwrap();
+        assert!(
+            got == b"aaa" || got == b"bbb",
+            "winner must be one of the two new catalogues, got {got:?}"
         );
     }
 }
