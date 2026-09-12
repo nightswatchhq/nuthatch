@@ -349,7 +349,18 @@ path so no facilitator sits between a question and its answer.
 
 Only named queries (`sql = "allowlist"`) can be priced. The authorisation log is
 `authorisations.jsonl` beside the nest, and a nonce is spent per **payer**, so two buyers choosing
-the same nonce do not collide.
+the same nonce do not collide. An authorisation is recorded only once an answer exists to release,
+so a refused or failed query spends nothing.
+
+**The `402` carries a quote (RFC-0048).** The body's `quote` names the flat `ceiling`, the byte
+`bound` the statement planned to (Parquet scans, cold and hot source bytes, the tables charged) and
+the `snapshot` it was taken against: `catalogue_hash` (sha256 of `segments/manifest.json`),
+`sealed_through`, `hot_rows` and `hot_bytes`. Its `id` also rides in the challenge as
+`accepts[0].extra.nuthatchQuote`. A client that sends the id back in a `nuthatch-quote` header is held
+to that snapshot: if the catalogue or `sealed_through` has moved, the answer is `409` with a fresh
+quote and nothing is recorded. Without the header the request is served against the current snapshot
+at the same flat price. A statement that cannot be bounded, or whose bound exceeds the admission cap,
+is refused with `422` rather than quoted.
 
 **Settling.** `nuthatch settle --dir <nest> --exec <cmd>` hands each pending authorisation to `<cmd>`
 on stdin: exit 0 settled, 2 failed, anything else deferred. `--batch N` hands up to N at a time, one

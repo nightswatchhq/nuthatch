@@ -307,6 +307,10 @@ pub struct Metrics {
     http_requests: AtomicU64,
     sql_queries: AtomicU64,
     sql_rejections: AtomicU64,
+    /// Cumulative per [`NAMED_SCAN_BOUNDS`] entry, then `+Inf`.
+    named_scan_buckets: [AtomicU64; 7],
+    named_scan_bytes_sum: AtomicU64,
+    named_scan_refusals: AtomicU64,
     rpc_requests: AtomicU64,
     rpc_methods: Mutex<BTreeMap<String, u64>>,
     /// #807: process-global copy of the seal-direct pass, read by a solo `dev` `/ready`.
@@ -334,6 +338,10 @@ pub struct Metrics {
 const RPC_DURATION_BOUNDS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+/// Histogram bounds, in source bytes, for declared queries admitted under the scan cap (RFC-0048).
+/// Spaced so a spread of more than two orders of magnitude, Phase 0's exit benchmark, is legible.
+const NAMED_SCAN_BOUNDS: [u64; 6] = [4 << 10, 64 << 10, 1 << 20, 16 << 20, 256 << 20, 512 << 20];
 
 #[derive(Default)]
 struct EndpointStats {
@@ -363,6 +371,9 @@ impl Metrics {
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
+            named_scan_buckets: [const { AtomicU64::new(0) }; 7],
+            named_scan_bytes_sum: AtomicU64::new(0),
+            named_scan_refusals: AtomicU64::new(0),
             rpc_requests: AtomicU64::new(0),
             rpc_methods: Mutex::new(BTreeMap::new()),
             seal_direct_active: AtomicBool::new(false),
@@ -478,6 +489,19 @@ impl Metrics {
     }
     pub fn inc_sql_rejected(&self) {
         self.sql_rejections.fetch_add(1, Relaxed);
+    }
+    /// A declared query answered under the scan cap, with the source bytes it was admitted at.
+    pub fn observe_named_scan(&self, bytes: u64) {
+        self.named_scan_bytes_sum.fetch_add(bytes, Relaxed);
+        for (i, bound) in NAMED_SCAN_BOUNDS.iter().enumerate() {
+            if bytes <= *bound {
+                self.named_scan_buckets[i].fetch_add(1, Relaxed);
+            }
+        }
+        self.named_scan_buckets[NAMED_SCAN_BOUNDS.len()].fetch_add(1, Relaxed);
+    }
+    pub fn inc_named_scan_refused(&self) {
+        self.named_scan_refusals.fetch_add(1, Relaxed);
     }
     pub fn inc_rpc(&self) {
         self.rpc_requests.fetch_add(1, Relaxed);
@@ -691,6 +715,28 @@ impl Metrics {
             "nuthatch_sql_rejections_total",
             "Analytical /sql queries rejected (guard: timeout, too-large, over-capacity).",
             self.sql_rejections.load(Relaxed),
+        ));
+        s.push_str(
+            "# HELP nuthatch_named_scan_bytes Source-byte bound declared queries were answered under (RFC-0048).\n\
+             # TYPE nuthatch_named_scan_bytes histogram\n",
+        );
+        for (i, bound) in NAMED_SCAN_BOUNDS.iter().enumerate() {
+            s.push_str(&format!(
+                "nuthatch_named_scan_bytes_bucket{{le=\"{bound}\"}} {}\n",
+                self.named_scan_buckets[i].load(Relaxed)
+            ));
+        }
+        let admitted = self.named_scan_buckets[NAMED_SCAN_BOUNDS.len()].load(Relaxed);
+        s.push_str(&format!(
+            "nuthatch_named_scan_bytes_bucket{{le=\"+Inf\"}} {admitted}\n\
+             nuthatch_named_scan_bytes_sum {}\n\
+             nuthatch_named_scan_bytes_count {admitted}\n",
+            self.named_scan_bytes_sum.load(Relaxed)
+        ));
+        s.push_str(&counter(
+            "nuthatch_named_scan_refusals_total",
+            "Declared queries refused by scan admission: over the byte cap, unboundable, or a stale quote.",
+            self.named_scan_refusals.load(Relaxed),
         ));
         s.push_str(&counter(
             "nuthatch_sql_memo_hits_total",

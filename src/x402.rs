@@ -81,8 +81,20 @@ pub struct SellerConfig {
 
 /// The base64 JSON carried in a `payment-required` response header. This is the format the
 /// Lodestar buyer already consumes, not a second interpretation of the protocol.
-pub fn challenge_header(cfg: &SellerConfig, resource: &str, description: &str) -> String {
+///
+/// `quote_id` rides in `extra`, which x402 leaves to the seller, so a client that echoes the
+/// requirements it accepted carries the quote back without knowing anything about nuthatch.
+pub fn challenge_header(
+    cfg: &SellerConfig,
+    resource: &str,
+    description: &str,
+    quote_id: Option<&str>,
+) -> String {
     let chain = cfg.network.params();
+    let mut extra = json!({ "name": chain.asset_name, "version": chain.asset_version });
+    if let Some(id) = quote_id {
+        extra["nuthatchQuote"] = json!(id);
+    }
     let challenge = json!({
         "x402Version": 1,
         "error": "Payment required",
@@ -96,7 +108,7 @@ pub fn challenge_header(cfg: &SellerConfig, resource: &str, description: &str) -
             "maxTimeoutSeconds": 60,
             "resource": resource,
             "description": description,
-            "extra": { "name": chain.asset_name, "version": chain.asset_version },
+            "extra": extra,
         }],
     });
     base64::engine::general_purpose::STANDARD.encode(challenge.to_string())
@@ -818,7 +830,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Recording happens before a query runs. Without the nonce check, a caller can replay this
+    /// Recording happens before an answer is released. Without the nonce check, a caller can replay this
     /// one valid promise until the separate S3 settler notices, turning the RFC's one-query loss
     /// bound into an open tab.
     #[test]

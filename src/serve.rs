@@ -128,6 +128,9 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
 /// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
 pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
+/// Independent source-byte guard for declared queries. This is not a RAM conversion: it bounds
+/// bytes read from immutable segments plus the serialized hot snapshot before the statement runs.
+pub(crate) const SQL_MAX_NAMED_SCAN_BYTES: u64 = 512 * 1024 * 1024;
 /// Reject absurdly long query strings before they reach the planner.
 const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
@@ -185,6 +188,7 @@ pub struct AppState {
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
     /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
     pub sql_max_hot_rows: usize,
+    pub sql_max_named_scan_bytes: u64,
     /// This process owns **no cursor**: it serves a nest it does not index (`nuthatch serve`).
     ///
     /// `/ready`'s liveness terms are all about a cursor - has it polled recently, has `last_block`
@@ -2145,13 +2149,291 @@ async fn named_query(
         }
     };
     #[cfg(feature = "counter")]
+    let mut pin: Option<(Option<String>, u64)> = None;
+    #[cfg(not(feature = "counter"))]
+    let pin: Option<(Option<String>, u64)> = None;
+    #[cfg(feature = "counter")]
     if let Some(counter) = &s.counter {
         let resource = format!("/q/{name}");
-        if let Err(response) = crate::counter::admit(&s.dir, counter, &headers, &resource, &name) {
-            return *response;
+        if !crate::counter::payment_verifies(counter, &headers) {
+            // Unpaid: quote what the answer would read, or refuse a query that could not be served.
+            return match named_scan(&s, sql.clone(), None, false).await {
+                Ok(planned) => crate::counter::challenge(
+                    counter,
+                    &resource,
+                    &name,
+                    Some(&planned.quote(counter)),
+                ),
+                Err(failure) => named_failure(&s, failure, &sql),
+            };
+        }
+        if let Some(value) = headers.get(crate::counter::QUOTE_HEADER) {
+            match value.to_str().ok().and_then(crate::counter::parse_quote_id) {
+                Some(quoted) => pin = Some(quoted),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!("{} is not a quote id this node issues", crate::counter::QUOTE_HEADER),
+                        })),
+                    )
+                        .into_response()
+                }
+            }
         }
     }
-    run_sql_query(s, sql, None).await
+    let run = match named_scan(&s, sql.clone(), pin, true).await {
+        Ok(run) => run,
+        Err(failure) => {
+            #[cfg(feature = "counter")]
+            if let (Some(counter), NamedFailure::Query(e)) = (&s.counter, &failure) {
+                if let Some(crate::analytics::AdmissionRefusal::StaleCatalogue { .. }) =
+                    e.downcast_ref()
+                {
+                    crate::metrics::METRICS.inc_named_scan_refused();
+                    let fresh = named_scan(&s, sql.clone(), None, false)
+                        .await
+                        .ok()
+                        .map(|planned| planned.quote(counter));
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": e.to_string(), "quote": fresh })),
+                    )
+                        .into_response();
+                }
+            }
+            return named_failure(&s, failure, &sql);
+        }
+    };
+    #[cfg(feature = "counter")]
+    if let Some(counter) = &s.counter {
+        let resource = format!("/q/{name}");
+        // Nothing has been sent to the caller yet. Concurrent replays may compute, but the atomic
+        // nonce check lets only one record and release its answer.
+        if let Err(refusal) = crate::counter::admit(
+            &s.dir,
+            counter,
+            &headers,
+            &resource,
+            &name,
+            Some(&run.quote(counter)),
+        ) {
+            return *refusal;
+        }
+    }
+    if let Some(bound) = &run.out.scan_bound {
+        crate::metrics::METRICS
+            .observe_named_scan(bound.cold_bytes.saturating_add(bound.hot_bytes));
+    }
+    sql_response(&s, &run.out, &run.watermarks, run.provenance, false)
+}
+
+/// A declared query taken through RFC-0048 admission.
+struct NamedRun {
+    out: crate::analytics::QueryOutput,
+    watermarks: std::collections::BTreeMap<String, u64>,
+    provenance: (Option<u64>, u64),
+    /// The boundary the statement was planned against, which a quote names.
+    #[cfg_attr(not(feature = "counter"), allow(dead_code))]
+    sealed_through: u64,
+    #[cfg_attr(not(feature = "counter"), allow(dead_code))]
+    hot_rows: u64,
+}
+
+impl NamedRun {
+    #[cfg(feature = "counter")]
+    fn quote(&self, counter: &crate::counter::Config) -> serde_json::Value {
+        crate::counter::quote(
+            counter,
+            &self.out.scan_bound.clone().unwrap_or_default(),
+            self.sealed_through,
+            self.hot_rows,
+        )
+    }
+}
+
+enum NamedFailure {
+    Busy,
+    Query(anyhow::Error),
+    Task(String),
+}
+
+/// Copy the tip against the byte cap, then bound the plan on the connection that would run it. The
+/// cold reservation comes from this statement's last plan against the same catalogue: it only
+/// decides how much hot copying is worth attempting, because the plan that runs is bounded again.
+/// `execute: false` stops at the bound, which is what a quote is.
+async fn named_scan(
+    s: &AppState,
+    sql: String,
+    pin: Option<(Option<String>, u64)>,
+    execute: bool,
+) -> Result<NamedRun, NamedFailure> {
+    use crate::analytics::{AdmissionRefusal, NamedAdmission, QueryGuard, ScanBound};
+    let permit = Arc::clone(&s.sql_gate)
+        .try_acquire_owned()
+        .map_err(|_| NamedFailure::Busy)?;
+    crate::metrics::METRICS.inc_sql();
+    let dir = s.dir.clone();
+    let store = s.store.clone();
+    let tables = s.tables.clone();
+    let entities = s.entities.clone();
+    let cap = s.sql_max_named_scan_bytes;
+    let max_hot_rows = s.sql_max_hot_rows;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<NamedRun> {
+        let _permit = permit;
+        let started = std::time::Instant::now();
+        let catalogue_hash = crate::seal::catalogue_hash(&dir)?;
+        let reserved = crate::analytics::remembered_scan_bound(&dir, &sql, &catalogue_hash);
+        if let Some(bound) = reserved.as_ref().filter(|b| b.cold_bytes >= cap) {
+            return Err(AdmissionRefusal::OverCap(ScanBound {
+                hot_bytes: 0,
+                cap,
+                ..bound.clone()
+            })
+            .into());
+        }
+        let budget = cap - reserved.map(|b| b.cold_bytes).unwrap_or(0);
+        // No cold-only fallback: an admitted query never answers from an incomplete relation.
+        let snapshot = store.hot_rows_by_table_bounded_with_bytes(max_hot_rows, budget)?;
+        let mut hot = snapshot.rows;
+        let mut hot_rows = snapshot.source_rows;
+        let mut hot_bytes = snapshot.source_bytes;
+        let mut watermarks = std::collections::BTreeMap::new();
+        // Maintained relations are copied into the connection per request, so they spend the same
+        // budget as the tip.
+        for entity in entities.iter() {
+            if entity.unavailable().is_some() || entity.fault().is_some() {
+                continue;
+            }
+            let (rows, through) = entity.rows_as_json_with_watermark();
+            hot_rows += rows.len() as u64;
+            hot_bytes = rows
+                .iter()
+                .fold(hot_bytes, |sum, row| sum.saturating_add(json_len(row)));
+            if hot_bytes > budget {
+                return Err(crate::store::HotScanBudgetExceeded {
+                    source_bytes: hot_bytes,
+                    budget,
+                }
+                .into());
+            }
+            watermarks.insert(entity.name().to_string(), through);
+            hot.insert(entity.name().to_string(), rows);
+        }
+        let sealed_through = store.sealed_through();
+        if let Some((quoted_catalogue, quoted_sealed)) = &pin {
+            if *quoted_sealed != sealed_through || *quoted_catalogue != catalogue_hash {
+                return Err(AdmissionRefusal::StaleCatalogue {
+                    quoted: quoted_catalogue.clone(),
+                    current: catalogue_hash,
+                }
+                .into());
+            }
+        }
+        let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
+        if timeout.is_zero() {
+            anyhow::bail!(
+                "query exceeded the {}s time budget on the read-only SQL surface",
+                SQL_TIMEOUT.as_secs()
+            );
+        }
+        let admission = NamedAdmission {
+            cap,
+            hot_bytes,
+            pinned_catalogue: pin.map(|(catalogue, _)| catalogue),
+            execute,
+        };
+        let out = crate::analytics::query_named(
+            &dir,
+            &sql,
+            QueryGuard {
+                timeout,
+                max_rows: SQL_MAX_ROWS,
+            },
+            &hot,
+            sealed_through,
+            &tables,
+            &admission,
+        )?;
+        let as_of = store
+            .get_meta("last_block")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok());
+        Ok(NamedRun {
+            out,
+            watermarks,
+            provenance: (as_of, store.sealed_through()),
+            sealed_through,
+            hot_rows,
+        })
+    })
+    .await
+    .map_err(|e| NamedFailure::Task(e.to_string()))?
+    .map_err(NamedFailure::Query)
+}
+
+fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::response::Response {
+    use crate::analytics::AdmissionRefusal;
+    use crate::metrics::METRICS;
+    let e = match failure {
+        NamedFailure::Busy => {
+            METRICS.inc_sql_rejected();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+            )
+                .into_response();
+        }
+        NamedFailure::Task(e) => return error(e),
+        NamedFailure::Query(e) => e,
+    };
+    if let Some(refusal) = e.downcast_ref::<AdmissionRefusal>() {
+        METRICS.inc_sql_rejected();
+        METRICS.inc_named_scan_refused();
+        let (status, bound) = match refusal {
+            AdmissionRefusal::OverCap(bound) => (StatusCode::UNPROCESSABLE_ENTITY, Some(bound)),
+            AdmissionRefusal::Unboundable(_) => (StatusCode::UNPROCESSABLE_ENTITY, None),
+            AdmissionRefusal::StaleCatalogue { .. } => (StatusCode::CONFLICT, None),
+        };
+        return (
+            status,
+            Json(json!({ "error": refusal.to_string(), "bound": bound })),
+        )
+            .into_response();
+    }
+    if let Some(over) = e.downcast_ref::<crate::store::HotScanBudgetExceeded>() {
+        METRICS.inc_sql_rejected();
+        METRICS.inc_named_scan_refused();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": over.to_string(),
+                "hot_source_bytes": over.source_bytes,
+                "budget": over.budget,
+                "cap": s.sql_max_named_scan_bytes,
+            })),
+        )
+            .into_response();
+    }
+    sql_error_response(s, e, sql)
+}
+
+/// Serialized length of a row without building the string.
+fn json_len(value: &serde_json::Value) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
@@ -2375,36 +2657,38 @@ async fn run_sql_query(
             }
             sql_response(&s, &out, &watermarks, provenance, false)
         }
-        // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
-        // the node is refusing to spend the memory - so a caller should retry later or narrow to
-        // sealed data, not rewrite their SQL.
-        Ok(Err(e)) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => {
-            METRICS.inc_sql_rejected();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": format!("{e}"),
-                    "sealed_through": s.store.sealed_through(),
-                })),
-            )
-                .into_response()
-        }
-        Ok(Err(e)) => {
-            // A guard rejection (timeout / interrupt) or a bad query - counted as a rejection.
-            METRICS.inc_sql_rejected();
-            // Errors as prompts (RFC-0016 §3): classify the failure against the schema and append an
-            // actionable hint so an agent (or the REPL user) self-corrects in one round-trip. The raw
-            // engine message is preserved but path-scrubbed (SEC review) - DuckDB embeds absolute
-            // segment paths, which would leak the on-disk layout; the useful table/column detail stays.
-            let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-            let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, &q.q, &s.tables) {
-                Some(hint) => format!("{raw}\n\nhint: {hint}"),
-                None => raw,
-            };
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
-        }
+        Ok(Err(e)) => sql_error_response(&s, e, &q.q),
         Err(e) => error(format!("{e}")),
     }
+}
+
+fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::response::Response {
+    use crate::metrics::METRICS;
+    METRICS.inc_sql_rejected();
+    // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
+    // the node is refusing to spend the memory - so a caller should retry later or narrow to
+    // sealed data, not rewrite their SQL.
+    if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": format!("{e}"),
+                "sealed_through": s.store.sealed_through(),
+            })),
+        )
+            .into_response();
+    }
+    // A guard rejection (timeout / interrupt) or a bad query - counted as a rejection.
+    // Errors as prompts (RFC-0016 §3): classify the failure against the schema and append an
+    // actionable hint so an agent (or the REPL user) self-corrects in one round-trip. The raw
+    // engine message is preserved but path-scrubbed (SEC review) - DuckDB embeds absolute
+    // segment paths, which would leak the on-disk layout; the useful table/column detail stays.
+    let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
+    let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, sql, &s.tables) {
+        Some(hint) => format!("{raw}\n\nhint: {hint}"),
+        None => raw,
+    };
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
 /// `GET /explain?q=…` - validate a query without executing it (RFC-0016 §3): bind it (catching
@@ -3305,6 +3589,7 @@ mod tests {
             cursorless: false,
             freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
+            sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
             surface: Arc::new(crate::allowlist::Surface::default()),
             #[cfg(feature = "counter")]
             counter: None,
@@ -4452,6 +4737,288 @@ mod tests {
             v["lag_blocks"].as_u64(),
             Some(66),
             "lag computed across two chains is meaningless - it was ~463 million before this fix"
+        );
+    }
+
+    fn named_surface(sql: &str) -> Arc<crate::allowlist::Surface> {
+        Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "answer".into(),
+                sql: sql.into(),
+                params: Default::default(),
+            }],
+        })
+    }
+
+    fn named_request(headers: &[(&str, &str)]) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder().uri("/q/answer");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(axum::body::Body::empty()).unwrap()
+    }
+
+    async fn call_named(
+        app: &axum::Router,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_named_query_over_its_scan_budget_is_refused_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_named_scan_bytes = 16;
+        state
+            .store
+            .put_entity(
+                "k1",
+                r#"{"table":"t","block_number":1,"payload":"too wide"}"#,
+            )
+            .unwrap();
+        // Warm the ordinary-query memo with the same statement. A hit must not evade admission.
+        let warm = run_sql_query(state.clone(), "SELECT 1 AS answer".into(), None).await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        state.surface = named_surface("SELECT 1 AS answer");
+        let app = router(SharedNest::new(state));
+        let (status, _, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("scan budget"),
+            "{body}"
+        );
+        assert_eq!(body["budget"], 16, "{body}");
+        assert!(body.get("rows").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_named_query_that_cannot_be_bounded_is_refused_before_it_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        for block in 1..=3 {
+            state
+                .store
+                .put_entity(
+                    &format!("{block:012}-000000"),
+                    &format!(r#"{{"table":"t","block_number":{block}}}"#),
+                )
+                .unwrap();
+        }
+        state.surface = named_surface(
+            "SELECT error('evaluated') FROM t a WHERE a.block_number = \
+             (SELECT max(b.block_number) FROM t b WHERE b.block_number < a.block_number)",
+        );
+        let app = router(SharedNest::new(state));
+        let (status, _, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("DELIM") && !error.contains("evaluated"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintained_relation_rows_spend_the_named_scan_budget() {
+        use crate::entity_expr::Expr;
+        use crate::entity_plan::{Agg, Plan, Source};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Transfer","inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let reg = crate::registry::DecodeRegistry::build(vec![crate::registry::ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let plan = Plan {
+            left: Source {
+                table: "usdc__transfer".into(),
+                columns: vec!["to".into(), "value".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+        let columns = vec!["to".to_string(), "sum_value".to_string()];
+        let entity =
+            crate::entity_view::EntityView::start("e", &plan, &columns, &reg, 1_000, false)
+                .unwrap();
+        let row = |to: &str, v: i128| {
+            crate::entity_row::Row(vec![
+                crate::entity_row::Scalar::Str(to.into()),
+                crate::entity_row::Scalar::Int(v),
+            ])
+        };
+        entity.apply(
+            crate::entity_view::Batch {
+                left: vec![(row("0xa", 1), 1), (row("0xb", 2), 1)],
+                right: Vec::new(),
+            },
+            10,
+        );
+        entity.flush();
+        let (rows, _) = entity.rows_as_json_with_watermark();
+        assert_eq!(rows.len(), 2);
+        let bytes: u64 = rows.iter().map(json_len).sum();
+        state.entities = Arc::new(vec![entity]);
+        state.surface = named_surface("SELECT count(*) AS n FROM e");
+
+        state.sql_max_named_scan_bytes = bytes;
+        let app = router(SharedNest::new(state.clone()));
+        let (status, _, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["n"], 2, "{body}");
+
+        state.sql_max_named_scan_bytes = bytes - 1;
+        let app = router(SharedNest::new(state));
+        let (status, _, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["hot_source_bytes"], bytes, "{body}");
+    }
+
+    #[cfg(feature = "counter")]
+    #[tokio::test]
+    async fn an_unpaid_named_query_is_quoted_with_the_bound_it_planned_to() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let row = r#"{"table":"t","block_number":1,"v":"1"}"#;
+        state.store.put_entity("k1", row).unwrap();
+        state.surface = named_surface("SELECT count(*) AS n FROM t");
+        let (config, _) = crate::counter::x402::tests::payment_for_http_test();
+        let price = config.price.clone();
+        state.counter = Some(Arc::new(config));
+        let app = router(SharedNest::new(state));
+
+        let (status, headers, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        let quote = &body["quote"];
+        assert_eq!(quote["id"], "none.0", "{body}");
+        assert_eq!(quote["tier"], "flat");
+        assert_eq!(quote["ceiling"]["amount"], price.as_str());
+        assert_eq!(quote["bound"]["hot_bytes"], row.len() as u64, "{body}");
+        assert_eq!(quote["bound"]["cold_bytes"], 0, "{body}");
+        assert_eq!(quote["snapshot"]["hot_rows"], 1, "{body}");
+        assert_eq!(quote["snapshot"]["catalogue_hash"], serde_json::Value::Null);
+        assert_eq!(quote["admission_cap_bytes"], SQL_MAX_NAMED_SCAN_BYTES);
+        let header = headers["payment-required"].to_str().unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(header)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge["accepts"][0]["extra"]["nuthatchQuote"], "none.0");
+        assert!(!dir.path().join("authorisations.jsonl").exists());
+    }
+
+    #[cfg(feature = "counter")]
+    #[tokio::test]
+    async fn a_paid_named_query_is_held_to_the_quote_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        state
+            .store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        state.surface = named_surface("SELECT count(*) AS n FROM t");
+        let (config, payment) = crate::counter::x402::tests::payment_for_http_test();
+        state.counter = Some(Arc::new(config));
+        let app = router(SharedNest::new(state));
+        let log = dir.path().join("authorisations.jsonl");
+        let quoted = |id: &str| {
+            named_request(&[
+                ("Payment-Signature", payment.as_str()),
+                (crate::counter::QUOTE_HEADER, id),
+            ])
+        };
+
+        let (status, _, body) = call_named(&app, quoted("none.7")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["quote"]["id"], "none.0",
+            "a stale quote is answered with a fresh one"
+        );
+        assert!(!log.exists(), "a refused answer records nothing");
+
+        let (status, _, body) = call_named(&app, quoted("not-a-quote")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(!log.exists());
+
+        let (status, _, body) = call_named(&app, quoted("none.0")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["n"], 1, "{body}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(feature = "counter")]
+    #[tokio::test]
+    async fn refused_paid_query_keeps_its_authorisation_for_a_successful_retry() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_named_scan_bytes = 1;
+        state
+            .store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        state.surface = named_surface("SELECT 1 AS answer");
+        let (config, payment) = crate::counter::x402::tests::payment_for_http_test();
+        state.counter = Some(Arc::new(config));
+        let request = || named_request(&[("Payment-Signature", payment.as_str())]);
+        let refused = router(SharedNest::new(state.clone()))
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!dir.path().join("authorisations.jsonl").exists());
+        state.sql_max_named_scan_bytes = SQL_MAX_NAMED_SCAN_BYTES;
+        let app = router(SharedNest::new(state));
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert_eq!(statuses.iter().filter(|&&s| s == StatusCode::OK).count(), 1);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|&&s| s == StatusCode::PAYMENT_REQUIRED)
+                .count(),
+            1
+        );
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("authorisations.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
     }
 

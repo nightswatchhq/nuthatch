@@ -632,6 +632,28 @@ pub fn read_table_rows_by_segment(
 }
 
 /// Load the segment catalogue (empty if none yet).
+/// The catalogue, with the sha256 of the exact bytes it was parsed from (RFC-0048 §3). `None` when
+/// nothing has sealed.
+pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)> {
+    match std::fs::read(manifest_path(dir)) {
+        Ok(raw) => Ok((
+            serde_json::from_slice(&raw).context("corrupt segments manifest")?,
+            Some(hex::encode(Sha256::digest(&raw))),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Manifest::default(), None)),
+        Err(e) => Err(e).context("failed to read manifest"),
+    }
+}
+
+/// [`load_manifest_with_hash`]'s hash alone.
+pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
+    match std::fs::read(manifest_path(dir)) {
+        Ok(raw) => Ok(Some(hex::encode(Sha256::digest(&raw)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("failed to read manifest"),
+    }
+}
+
 pub fn load_manifest(dir: &Path) -> Result<Manifest> {
     let path = manifest_path(dir);
     match std::fs::read_to_string(&path) {

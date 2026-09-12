@@ -376,6 +376,45 @@ impl HotStore for PgStore {
         })
     }
 
+    fn hot_rows_by_table_bounded_with_bytes(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<crate::store::HotRowsSnapshot> {
+        let count_sql = format!("SELECT count(*) FROM \"{}\".entities", self.schema);
+        let sql = format!(
+            "SELECT value FROM \"{}\".entities ORDER BY key",
+            self.schema
+        );
+        self.conn.with(move |c| {
+            let total = c.query_one(&count_sql, &[])?.get::<_, i64>(0) as usize;
+            if total > max_rows {
+                return Err(HotScanTooLarge { cap: max_rows }.into());
+            }
+            let mut out = crate::store::HotRowsSnapshot::default();
+            for row in c.query(&sql, &[])? {
+                let raw: String = row.get(0);
+                out.source_rows += 1;
+                out.source_bytes = out.source_bytes.saturating_add(raw.len() as u64);
+                if out.source_bytes > max_bytes {
+                    return Err(crate::store::HotScanBudgetExceeded {
+                        source_bytes: out.source_bytes,
+                        budget: max_bytes,
+                    }
+                    .into());
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                out.rows.entry(t.to_string()).or_default().push(v);
+            }
+            Ok(out)
+        })
+    }
+
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         let (lo, hi) = (format!("{from:012}-000000"), format!("{to:012}-999999"));
         let sql = format!(
