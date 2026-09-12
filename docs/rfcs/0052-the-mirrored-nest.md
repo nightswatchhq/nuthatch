@@ -1,11 +1,12 @@
 # RFC-0052: The mirrored nest - publishing the sealed directory to object storage for external engines
 
-- Status: **Draft. Design only.** Proposed as the delivery half of RFC-0047: that RFC makes the
-  sealed directory a contract; this one makes the contract reachable over a network. Every slice
-  is additive - no query-syntax change, no segment-format change, no new source of truth. The
-  freeze question is §9.
-- Author: Pete (drafted 2026-09-09 with Claude). Items marked `[VERIFY]` were not checked against
-  the tree and must be before a slice runs.
+- Status: **Draft. Design only.** S0 (#1258) answered 2026-09-12 against the tree; remaining
+  slices wait. Proposed as the delivery half of RFC-0047: that RFC makes the sealed directory a
+  contract; this one makes the contract reachable over a network. Every slice is additive - no
+  query-syntax change, no segment-format change, no new source of truth. The freeze question is
+  §9.
+- Author: Pete (drafted 2026-09-09). S0 filled the `[VERIFY]` items that gate S1; remaining
+  `[VERIFY]` marks (schema.json shape, Dune namespace) stay in §10.
 - Date: 2026-09-09
 - Origin: a board research report, "Integrating nuthatch with Dune Analytics" (2026-09-08),
   which ranked a row-insert sink into Dune's table API as the highest-value integration. §1
@@ -79,12 +80,15 @@ this RFC pulls from Dune.
 Read against the tree, the same way RFC-0047 §1 did.
 
 **The store abstraction exists.** RFC-0019 §1 shipped `BundleStore` with `FsStore` and an
-`object_store`-backed `ObjectStore` (S3/MinIO/R2/GCS), configured by `AWS_*` env (`AWS_ENDPOINT`
+`object_store`-backed `ObjStore` (S3/MinIO/R2/GCS), configured by `AWS_*` env (`AWS_ENDPOINT`
 for non-AWS), on by default since 2026-07-28, verified live against Hetzner Object Storage. It
-stores immutable blobs by content address and a thin index of movable pointers. That is the
-shape of a mirror already; it currently holds *inputs* (bundles). `[VERIFY]` whether the trait
-is general enough to put a second kind of blob through, or whether the publisher wants its own
-thin wrapper over `object_store` and shares only the credential plumbing.
+stores immutable blobs by content address and a thin index of movable pointers. **S0: do not
+reuse the trait.** `BundleStore` (`src/distribution.rs`) is `put_blob`/`get_blob` of a whole
+`Vec<u8>` under `blobs/<hash>.bundle`, plus `set_ref`/`get_ref` for registry pointers. A
+mirror needs streamed Parquet puts, HEAD, checksum-on-put, and `PutMode::Update` on
+`manifest.json` at `<dataset>/<table>/<hash>.parquet`. Share `ObjStore::from_locator` and the
+`AWS_*` lowercasing; write a thin `object_store` wrapper for the publisher. Credential
+plumbing is kind (a). The blob registry stays the blob registry.
 
 **The catalogue is the commit point.** `seal.rs::save_manifest` writes `segments/manifest.json.tmp`,
 fsyncs, renames. A file not named by the catalogue is not a sealed segment. A named file that is
@@ -111,10 +115,12 @@ inherits the rule and the gauge naming.
 
 **Two catalogue behaviours constrain the mirror.** `provisional: true` marks a segment with fewer
 than 1,000 rows at the cut that "the next seal will fold". The catalogue appends, and a later
-seal of an earlier range can sit after a newer one. `[VERIFY]` whether a fold or a re-seal ever
-*removes* an entry from the catalogue. §3.2 assumes the catalogue is append-only for
-non-provisional segments; if that is false the append-only mirror is unsound and §3.2's
-tombstone alternative is required, not optional.
+seal of an earlier range can sit after a newer one. **S0: a non-provisional entry is never
+removed.** The only `segments.remove` in the tree is `src/seal.rs` folding a `provisional:
+true` row into the next cut (test: "A final segment is never reopened"). `save_manifest` is
+tmp + fsync + rename and does not edit the list. `prune.rs` deletes unmounted trees and
+unreferenced parquet, never a surviving catalogue entry. v1 does not need generations or
+tombstones. A future compaction RFC still cannot delete in place.
 
 ## §2 - Goals and non-goals
 
@@ -186,8 +192,13 @@ either: a dataset is one chain.
 **Keyed by data identity, not by NID.** RFC-0033 slice 5 gave a nest a data identity beside its
 package identity so that a cosmetic edit moves the NID and adopts the existing dataset. The
 mirror must not fork on a comment change. The prefix is the data identity; `publish.json` carries
-the current NID and bundle hash for provenance. `[VERIFY]` the exact name and format of the data
-identity in the tree and whether a solo nest exposes it before first mount.
+the current NID and bundle hash for provenance. **S0:** `blob::Manifest::data_identity()` is
+SHA-256 of domain `nuthatch-data-identity-v1\0` plus `schema_version`, `registry_hash`, and
+every authored file that `affects_data`, encoded as 64 lowercase hex characters. It is not a
+file on disk. A solo `nuthatch dev` nest has `AppState.nid = None` and is not identity-keyed
+(`PreparedDataset::without_nid`); the publisher still computes the prefix with
+`blob::build_manifest(dir, None)?.data_identity()` from the project directory, no mount
+required.
 
 ### 3.2 - What is published: catalogued, non-provisional, append-only
 
@@ -202,10 +213,9 @@ The publisher's unit is a **catalogue entry**, never a file it found on disk. Ru
 3. An entry is never removed from the mirror. The mirror inherits the catalogue's append-only
    property.
 
-That third rule is why §1's `[VERIFY]` matters. If the local catalogue can drop a
-non-provisional entry (a re-seal that supersedes an earlier range, a future compaction), an
-append-only mirror serves stale files to globbing engines forever. Two acceptable resolutions,
-neither in v1:
+S0 closed the catalogue question: a non-provisional entry is not dropped. If a future
+compaction RFC ever does drop one, an append-only mirror would serve stale files to globbing
+engines forever. Two acceptable resolutions, neither in v1:
 
 - **Generations.** A catalogue that drops entries publishes under `<dataset>/gen-<n>/…` and
   `publish.json` names the live generation; old generations are left in place (or removed by an
@@ -333,7 +343,7 @@ diff against it, not a second spec:
 ### 3.7 - Configuration, credentials, and the boundary
 
 ```toml
-# operator config - roost.toml, or nuthatch.toml for a solo nest
+# operator config - mounts.toml for a roost, never nuthatch.toml
 [publish]
 target      = "s3://my-bucket/nuthatch"   # or "/mnt/mirror" for FsStore; absent = never publish
 interval    = "60s"
@@ -344,10 +354,12 @@ tables      = ["*"]                        # or an explicit list
 - **Absent means off.** No `[publish]`, no task, no client constructed, no DNS lookup. The
   no-phone-home rule is satisfied by absence, not by a flag.
 - **Credentials are kind (a), RFC-0019 §3.** `AWS_*` env, the bucket's own auth, never in
-  `nuthatch.toml`, never in a bundle. `[VERIFY]` that `[publish]` in `nuthatch.toml` is excluded
-  from the NID hash; if it is not, the target is deployment config and must move to `roost.toml`
-  / a CLI flag so that "where I mirror to" cannot change a nest's identity or leak into a
-  published bundle.
+  `nuthatch.toml`, never in a bundle. **S0: `[publish]` is not excluded from the NID.**
+  `blob.rs` hashes every authored file except `nuthatch.redb`, `segments`, `.git`, `.DS_Store`.
+  `nuthatch.toml` is in that set and in `data_identity()`. Putting the target there would fork
+  both identities. The table lives in `mounts.toml` (per mount) or on the CLI
+  (`--publish-target`, same pattern as `--state-rpc` / `--ipfs`). A solo nest has no
+  `mounts.toml`, so the flag is the solo path.
 - **Minimal IAM, and it is a feature.** The publisher needs `PutObject`, `GetObject`,
   `HeadObject`, `ListBucket` on the prefix. It does not need `DeleteObject`, and the docs
   recommend not granting it: a credential that cannot delete makes the mirror immutable by
@@ -391,9 +403,8 @@ retries.* It follows from four existing facts and one new rule:
    `catalogue_sha256` names the `manifest.json` the reader has; the catalogue-first publication
    order makes a mismatched envelope stale rather than ahead.
 
-The one assumption is the `[VERIFY]` in §1: that a non-provisional entry is never removed from
-the local catalogue. If it can be, rule 5 fails for globbing readers and §3.2's generations
-become mandatory in v1.
+S0: a non-provisional entry is never removed from the local catalogue. Rule 5 holds for v1.
+A future compaction RFC that drops entries must take §3.2's generations path before it ships.
 
 ## §5 - Consumer recipes (the acceptance targets, not documentation)
 
@@ -464,7 +475,7 @@ producer contract, not to the consumer's import path. Datashare is the opposite 
 
 | Slice | Delivers | Fails if |
 | --- | --- | --- |
-| S0 - verify | The §1 `[VERIFY]` items answered in the tree: catalogue append-only for non-provisional entries; data identity available to a solo nest; `[publish]` outside the NID; `BundleStore` reuse or wrapper | Any answer that forces §3.2 generations into v1 changes S1's layout before it is written |
+| S0 - verify | The §1 items answered in the tree (2026-09-12, #1258): catalogue is append-only for non-provisional entries; `data_identity()` is 64 hex and computable on a solo nest; `[publish]` is *not* outside the NID so it moves to `mounts.toml` / `--publish-target`; `BundleStore` is a wrapper over `object_store`, not the trait | Generations in v1: the catalogue answer did not force them |
 | S1 - `publish sync` | Reconciler over `FsStore` and S3 (MinIO in CI); §3.1 layout; §3.3 protocol; `verify` | After `sync`, remote `manifest.json` is not byte-equal to local; or for any table, DuckDB `count(*)` and `sum(c_dec)` over `s3://…/<table>/*.parquet` differ from the local sealed rows; or a second `sync` performs any put other than `publish.json` |
 | S2 - continuous | Seal-triggered wake-up + interval in `dev` and `serve`; per-mount prefixes in a roost; dead-letter; metrics | Publish lag exceeds one seal plus one interval on a live nest; or RFC-0004's backfill harness measures ingestion throughput outside noise while publishing to a MinIO throttled to 1 MB/s; or a seal is observed waiting on a put |
 | S3 - contract | `publish.json`, `schema.json`, *Reading a published nest*, resolver `s3://` branch; Trino container test | Trino over the prefix returns different counts or `sum` from local DuckDB on a nest with a drifted table; or the page and `seal.rs` disagree (same red-test rule as `reading-segments.md`) |
@@ -502,7 +513,6 @@ is on by default in a roost, per RFC-0047 §2.4's refusal rule.
 
 ## §10 - Unresolved questions
 
-- The §1 `[VERIFY]` on catalogue removals. Everything in §3.2 turns on it.
 - Whether `publish.json` should be signed with the RFC-0008 audit key, so a consumer can verify
   the publisher and not only the bytes.
 - Whether a roost should publish one prefix per mount (this RFC) or one per data identity
