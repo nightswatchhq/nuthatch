@@ -907,6 +907,50 @@ fn text_match(suffix: &str) -> Option<(bool, bool, TextShape)> {
 /// Deliberately the comparison set and not the text set. `_contains`, `_starts_with` and the
 /// `_nocase` family lower to `LIKE` with escaping that wants its own slice and its own tests; until
 /// then they are refused by name, which a caller can act on.
+/// A sort key that orders a canonical decimal string **numerically**, at any precision.
+///
+/// A nest stores every big number as canonical text (`analytics.rs:2253`: columns are `UBIGINT`,
+/// everything else is text), so `ORDER BY b."value"` compared strings: `9000351` ranked above
+/// `60000353` because `'9' > '6'`. Text order agrees with numeric order only while every value has the
+/// same digit count, which is why it survives a fixture and not a real pool (#1325).
+///
+/// **`TRY_CAST(.. AS DECIMAL(38,0))` is the wrong fix.** A `uint256` reaches 78 digits, so the cast is
+/// NULL past 38 and a row does not merely sort oddly - it disappears from a filter it satisfies.
+/// Trading a wrong order for a missing row is not an improvement.
+///
+/// So the key is built from the text, and it is exact at any precision:
+///
+/// - a leading `'0'` for negatives and `'1'` for the rest, so sign dominates;
+/// - the integer part's digit count, zero-padded, so magnitude dominates within a sign. Negatives carry
+///   `100000 - length`, because a longer magnitude is a *smaller* number;
+/// - then the digits with the point removed, which compares left-aligned and so compares numerically
+///   once the integer lengths match. Negatives take the nines complement, which reverses that order.
+///
+/// The cast means it works whether the column is text or a real integer, and it works under `DESC`
+/// because it is one key rather than several. It assumes canonical text - no leading zeros, no trailing
+/// zeros past the point - which is what both the decode registry and graph-node's `normalized()` produce.
+fn numeric_sort_key(expr: &str) -> String {
+    let v = format!("CAST({expr} AS VARCHAR)");
+    // Written as one line: a raw-string continuation leaves runs of spaces in the emitted SQL.
+    [
+        format!("CASE WHEN {v} LIKE '-%'"),
+        format!("THEN '0' || lpad(CAST(100000 - length(split_part(substr({v}, 2), '.', 1)) AS VARCHAR), 6, '0')"),
+        format!("|| translate(replace(substr({v}, 2), '.', ''), '0123456789', '9876543210')"),
+        format!("ELSE '1' || lpad(CAST(length(split_part({v}, '.', 1)) AS VARCHAR), 6, '0')"),
+        format!("|| replace({v}, '.', '') END"),
+    ]
+    .join(" ")
+}
+
+/// Whether this field's values must be compared through [`numeric_sort_key`] rather than directly.
+///
+/// The same set as [`wire_string_cast`], and not by coincidence: a scalar graph-node sends as a string is
+/// one a nest stores as text, so the scalars whose wire type needs a cast are exactly those whose
+/// ordering needs a key. `Int` is a real integer column on both sides and orders itself.
+fn needs_numeric_key(ty: &graph_schema::FieldType) -> bool {
+    wire_string_cast(ty)
+}
+
 fn comparison(suffix: &str) -> Option<&'static str> {
     Some(match suffix {
         "" => "=",
@@ -1293,7 +1337,20 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 ))
             }
         };
-        sql.push_str(&format!(" ORDER BY {BASE}.\"{order_field}\" {dir}"));
+        // Ordered by the numeric key where the field is a big number, so `orderBy: value` does not rank
+        // `9000351` above `60000353` (#1325).
+        let order_expr = format!("{BASE}.\"{order_field}\"");
+        let order_expr = if ent
+            .fields
+            .iter()
+            .find(|x| x.name == order_field)
+            .is_some_and(|f| needs_numeric_key(&f.ty))
+        {
+            numeric_sort_key(&order_expr)
+        } else {
+            order_expr
+        };
+        sql.push_str(&format!(" ORDER BY {order_expr} {dir}"));
 
         // graph-node's defaults, taken from the recorded reference: first = 100, skip = 0, and
         // §Query semantics caps first at 1000.
@@ -1539,6 +1596,22 @@ fn lower_predicate(
                     let lit = v
                         .sql_literal()
                         .ok_or_else(|| Unsupported::Argument(format!("`{key}` has no literal")))?;
+                    // **An ordering comparison on a big number compares keys, not text.** `value_gt: "250"`
+                    // was `b."value" > '250'`, which excludes `9000351` because `'9' > '2'` is the only
+                    // thing being asked. Equality and inequality are left alone: canonical text compares
+                    // equal exactly when the numbers do.
+                    //
+                    // The literal goes through the *same* expression rather than a key built in Rust, so
+                    // the two cannot drift - one rule, one implementation.
+                    if needs_numeric_key(&f.ty)
+                        && matches!(*suffix, "_gt" | "_gte" | "_lt" | "_lte")
+                    {
+                        return Ok(format!(
+                            "{} {op} {}",
+                            numeric_sort_key(&col),
+                            numeric_sort_key(&lit)
+                        ));
+                    }
                     Ok(format!("{col} {op} {lit}"))
                 }
                 None => Err(Unsupported::Operator(key.to_string())),
@@ -1567,6 +1640,31 @@ fn resolve_root(schema: &Schema, name: &str) -> Result<(String, bool), Unsupport
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The numeric sort key abbreviated to `KEY(<inner>)`, so an exact-SQL assertion stays readable.
+    ///
+    /// The key is four hundred characters of `CASE`, and three of these tests are about *which arguments
+    /// reach the SQL* rather than about the key's own shape. Abbreviating keeps them exact on the thing
+    /// they are for; that the key orders numerically is asserted against DuckDB in
+    /// `the_numeric_key_orders_by_value_not_by_text`, which is where it belongs.
+    fn compact(sql: &str) -> String {
+        let mut out = sql.to_string();
+        while let Some(at) = out.find("CASE WHEN CAST(") {
+            let Some(end) = out[at..]
+                .find("'.', '') END")
+                .map(|e| at + e + "'.', '') END".len())
+            else {
+                break;
+            };
+            let inner = {
+                let head = &out[at + "CASE WHEN CAST(".len()..];
+                let stop = head.find(" AS VARCHAR)").expect("a cast");
+                head[..stop].to_string()
+            };
+            out.replace_range(at..end, &format!("KEY({inner})"));
+        }
+        out
+    }
 
     fn schema() -> Schema {
         graph_schema::parse(
@@ -1834,8 +1932,8 @@ type Swap @entity { id: ID! pool: Pool! }
         )
         .unwrap();
         assert_eq!(
-            c.sql,
-            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND b."liquidity" > 100 ORDER BY b."liquidity" DESC LIMIT 5 OFFSET 10"#
+            compact(&c.sql),
+            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND KEY(b."liquidity") > KEY(100) ORDER BY KEY(b."liquidity") DESC LIMIT 5 OFFSET 10"#
         );
     }
 
@@ -2174,7 +2272,11 @@ type Swap @entity { id: ID! pool: Pool! }
             "{}",
             c.sql
         );
-        assert!(c.sql.contains(r#"b."liquidity" > '1'"#), "{}", c.sql);
+        assert!(
+            compact(&c.sql).contains(r#"KEY(b."liquidity") > KEY('1')"#),
+            "{}",
+            compact(&c.sql)
+        );
 
         // Conditions inside one filter object are ANDed, as `where` itself is.
         let c = compile(
@@ -2350,7 +2452,11 @@ type Swap @entity { id: ID! pool: Pool! }
             ),
         )
         .unwrap();
-        assert!(c.sql.contains(r#"b."liquidity" > '1'"#), "{}", c.sql);
+        assert!(
+            compact(&c.sql).contains(r#"KEY(b."liquidity") > KEY('1')"#),
+            "{}",
+            compact(&c.sql)
+        );
         assert!(
             c.sql.contains(r#"n0."symbol" LIKE '%ET%' ESCAPE '\'"#),
             "the child's text operator is lowered against the child: {}",
@@ -2415,8 +2521,8 @@ type Swap @entity { id: ID! pool: Pool! }
         let roots = parse_with(q, &vars).expect("a client operation parses");
         let c = compile(&schema(), &roots[0]).expect("and lowers");
         assert_eq!(
-            c.sql,
-            r#"SELECT b."id" FROM "pool" b WHERE b."liquidity" > '5' ORDER BY b."id" ASC LIMIT 3 OFFSET 0"#,
+            compact(&c.sql),
+            r#"SELECT b."id" FROM "pool" b WHERE KEY(b."liquidity") > KEY('5') ORDER BY b."id" ASC LIMIT 3 OFFSET 0"#,
             "the supplied variable and the header default both reach the SQL"
         );
 

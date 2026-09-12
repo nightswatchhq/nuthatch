@@ -23,6 +23,14 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The overlay a port writes: a Graph schema and a view per entity. Hand-written here rather than
 /// generated, because what is under test is the serving path, not `port-emit`.
 fn write_graph_overlay(dir: &std::path::Path) {
+    write_overlay(dir, false)
+}
+
+/// `signed` negates the value on even blocks, which is what an `int256` event parameter produces and what
+/// the numeric key's sign handling exists for. No ERC-20 transfer amount is negative, so the only way to
+/// get a signed `BigInt` column out of this fixture is to put one in the view - which is exactly where a
+/// real port would carry it.
+fn write_overlay(dir: &std::path::Path, signed: bool) {
     std::fs::create_dir_all(dir.join("graph")).unwrap();
     std::fs::write(
         dir.join("graph/schema.graphql"),
@@ -40,17 +48,24 @@ type Transfer @entity {
     std::fs::create_dir_all(dir.join("views")).unwrap();
     // `id` is the entity key the store already uses - block and log index - so a GraphQL `id` is a real
     // identity rather than something invented for this test.
+    let value_expr = if signed {
+        "CASE WHEN block_number % 2 = 0 THEN '-' || CAST(\"value\" AS VARCHAR) ELSE CAST(\"value\" AS VARCHAR) END"
+    } else {
+        "\"value\""
+    };
     std::fs::write(
         dir.join("views/20-transfer.sql"),
         // **Numeric columns, as a generated view writes them.** Casting `value` to VARCHAR here made
         // `orderBy: value` lexicographic and ranked 9000351 above 60000353; the string the wire needs is
         // the query lane's job, not the view's.
-        "CREATE VIEW transfer AS SELECT \
-           CAST(block_number AS VARCHAR) || '-' || CAST(log_index AS VARCHAR) AS \"id\", \
-           \"from\" AS \"from\", \"to\" AS \"to\", \
-           \"value\" AS \"value\", \
-           block_number AS \"blockNumber\" \
-         FROM usdc__transfer;",
+        format!(
+            "CREATE VIEW transfer AS SELECT \
+             CAST(block_number AS VARCHAR) || '-' || CAST(log_index AS VARCHAR) AS \"id\", \
+             \"from\" AS \"from\", \"to\" AS \"to\", \
+             {value_expr} AS \"value\", \
+             block_number AS \"blockNumber\" \
+             FROM usdc__transfer;"
+        ),
     )
     .unwrap();
 }
@@ -295,6 +310,204 @@ async fn a_graphql_query_is_answered_over_genuinely_indexed_data() {
     assert_eq!(
         body["data"]["_meta"]["block"]["number"], 60,
         "`_meta` must report the head the indexer reached: {body}"
+    );
+
+    server.abort();
+    ingest.abort();
+    if let Some(w) = alert_worker {
+        w.abort();
+    }
+}
+
+/// **#1325: `orderBy` on a `BigInt` orders by the number, not by the text.**
+///
+/// A nest stores every big number as canonical text (`analytics.rs:2253`), so `ORDER BY b."value"`
+/// compared strings and ranked `9000351` above `60000353` because `'9' > '6'`. Text order agrees with
+/// numeric order only while every value has the same digit count, which is why the fixture above uses
+/// nine-digit values deliberately and why this one must not.
+///
+/// Over indexed data rather than a literal `SELECT`, because the defect is about what the column
+/// actually holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordering_and_filtering_a_big_number_is_numeric_not_lexicographic() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    // Signed, so the key's sign handling is exercised. An `int256` event parameter is negative half the
+    // time - Uniswap V3's `amount0` and `liquidityNet` both are - and the nines complement that orders
+    // negatives correctly is otherwise untested: the mutation removing it survived against a fixture of
+    // non-negative values.
+    write_overlay(dir.path(), true);
+
+    let tape = Arc::new(TapeSource::new());
+    let a1 = account(1);
+    let a2 = account(2);
+    // **Magnitudes that differ.** 7, 90, 800, … up to 12 digits, plus one that no `DECIMAL(38,0)` could
+    // hold - the cast that looks like the obvious fix is NULL past 38 digits, and a row that vanishes
+    // from a filter it satisfies is worse than one that sorts oddly.
+    let values: Vec<u128> = vec![
+        7,
+        90,
+        800,
+        9_000_351,
+        60_000_353,
+        123_456_789_012,
+        340_282_366_920_938_463_463_374_607_431_768_211_455, // 2^128 - 1, 39 digits
+        // Blocks 8 and 10 are both negated and both three digits, so the *complement* decides between
+        // them rather than the length. Without two negatives of one length the complement term is never
+        // reached, and the mutation removing it survived.
+        555,
+        1,
+        444,
+    ];
+    for (i, v) in values.iter().enumerate() {
+        let b = i as u64 + 1;
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), *v)],
+            ),
+        );
+    }
+    tape.advance_tip_to(values.len() as u64);
+    tape.advance_finalized_to(values.len() as u64);
+
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let ingest = rt.ingest;
+    let alert_worker = rt.alert_worker;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(rt.state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // One transfer per block, so the head is the row count.
+    let head = values.len().to_string();
+    let start = std::time::Instant::now();
+    let mut last = String::new();
+    while start.elapsed() < POLL_TIMEOUT {
+        if let Ok(v) = client.get(&base).send().await {
+            if let Ok(v) = v.json::<serde_json::Value>().await {
+                last = v["last_block"].as_str().unwrap_or_default().to_string();
+                if last == head {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        last, head,
+        "every value must be indexed before anything is ordered"
+    );
+
+    let gql = |q: serde_json::Value| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/graphql"))
+                .json(&q)
+                .send()
+                .await
+                .expect("post")
+                .json::<serde_json::Value>()
+                .await
+                .expect("json")
+        }
+    };
+    let listed = |body: &serde_json::Value| -> Vec<String> {
+        body["data"]["transfers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an array: {body}"))
+            .iter()
+            .map(|r| r["value"].as_str().expect("a value string").to_string())
+            .collect()
+    };
+
+    let body = gql(serde_json::json!({
+        "query": "{ transfers(orderBy: value, first: 1000) { value } }"
+    }))
+    .await;
+    // The view negates even blocks, so `values[i]` is negative when `i + 1` is even. Sorted as numbers,
+    // by hand, because sorting them with the rule under test would assert nothing.
+    let signed: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if (i as u64 + 1).is_multiple_of(2) {
+                format!("-{v}")
+            } else {
+                v.to_string()
+            }
+        })
+        .collect();
+    let mut want = signed.clone();
+    want.sort_by_key(|v| match v.strip_prefix('-') {
+        // Negative: more digits is smaller, and within a length the larger magnitude is smaller.
+        Some(mag) => (
+            0i32,
+            -(mag.len() as i32),
+            std::cmp::Reverse(mag.to_string()),
+            String::new(),
+        ),
+        None => (
+            1,
+            v.len() as i32,
+            std::cmp::Reverse(String::new()),
+            v.clone(),
+        ),
+    });
+    assert_eq!(
+        listed(&body),
+        want,
+        "ascending by `value` must be numeric: text order puts 90 above 800 and 9000351 above \
+         60000353"
+    );
+
+    let body = gql(serde_json::json!({
+        "query": "{ transfers(orderBy: value, orderDirection: desc, first: 1000) { value } }"
+    }))
+    .await;
+    let mut desc = want.clone();
+    desc.reverse();
+    assert_eq!(listed(&body), desc, "and descending is its exact reverse");
+
+    // A filter agrees with the order. `_gte` on `800` keeps everything from 800 up - text comparison
+    // keeps only `800`, `9000351` and `90`, and drops the two largest values entirely.
+    let body = gql(serde_json::json!({
+        "query": "{ transfers(where: { value_gte: \"800\" }, orderBy: value, first: 1000) { value } }"
+    }))
+    .await;
+    // Every non-negative value of three digits or more. The negatives are all below 800 by definition,
+    // and a text comparison would keep some of them and drop the two largest positives.
+    let want_gte: Vec<String> = want
+        .iter()
+        .filter(|v| !v.starts_with('-') && v.len() >= 3)
+        .cloned()
+        .collect();
+    assert_eq!(
+        listed(&body),
+        want_gte,
+        "`value_gte` must keep every value at or above 800 - the 39-digit one included, every \
+         negative excluded"
     );
 
     server.abort();

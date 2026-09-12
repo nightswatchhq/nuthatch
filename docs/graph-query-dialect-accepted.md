@@ -21,6 +21,26 @@ Every refusal below names the thing refused, so a caller can act on it.
 | `pool(id: "0x…") { … }` | the same with `WHERE "id" = '0x…' LIMIT 1`, answered as an object |
 | `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
 
+### Numeric ordering and comparison
+
+A nest stores every big number as canonical text (`analytics.rs:2253`: columns are `UBIGINT`, everything
+else is text), so `ORDER BY "value"` compares **strings**. Text order agrees with numeric order only while
+every value has the same digit count, so `9000351` ranked above `60000353` and a `value_gt` dropped rows it
+should have kept (#1325).
+
+`orderBy` and the four ordering comparisons - `_gt`, `_gte`, `_lt`, `_lte` - on a `BigInt`, `BigDecimal` or
+`Int8` field therefore compare a **key** rather than the column: a sign character, the integer part's digit
+count zero-padded, then the digits with the point removed, with negatives carrying an inverted length and
+the nines complement. It is exact at any precision, works under `DESC` because it is one key, and works
+whether the column is text or a real integer.
+
+`TRY_CAST(.. AS DECIMAL(38,0))` is the obvious fix and the wrong one: a `uint256` reaches 78 digits, so the
+cast is NULL past 38 and a row does not sort oddly - it **disappears** from a filter it satisfies.
+
+Equality, `_not`, `_in` and `_not_in` compare the column directly: canonical text compares equal exactly
+when the numbers do. The key assumes canonical text - no leading zeros, nothing trailing the point - which
+is what the decode registry and graph-node's `normalized()` both produce.
+
 ### Scalar wire types
 
 graph-node maps every stored value to a GraphQL value in `graph/src/data/store/mod.rs:554`, and only one
