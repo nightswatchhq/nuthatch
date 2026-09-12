@@ -18,6 +18,14 @@
 //! rounds once, correctly, so it agrees with the reference on four of the five pools measured and is
 //! one ulp *more accurate* on the fifth. That is a divergence to declare and bound, not to reproduce:
 //! RFC-0053 forbids silently approximating a value, not being right.
+//!
+//! **Nothing calls this yet, and that is deliberate rather than forgotten.** The S2 query lane projects
+//! stored values and does no arithmetic, so there is no division to render; this is the library S4's value
+//! contract (#1268) needs, written against the recorded reference while that reference was in hand. An
+//! uncalled module is an uncalled module, though: the scale bug Jules found on #1282 lived here for as
+//! long as it did because no caller would have shown it, and the test that should have caught it used
+//! `1 / 8`, which never reaches the carry branch. Anything added here needs a test that exercises the
+//! branch rather than the function.
 
 use num_bigint::{BigInt, Sign};
 
@@ -64,15 +72,23 @@ pub fn div_to_string(num: &BigInt, den: &BigInt) -> Option<String> {
 
     // `scaled` is the quotient times 10^shift, with one guard digit. Round it off, half-even.
     let (rounded, carried) = round_off_last(&scaled);
-    // A carry can widen the number to 35 digits - `9.99…9` rounding to `10.0…0` - and then one more
-    // digit comes off the end.
-    let (mantissa, extra) = if digits(rounded.magnitude()) > SIGNIFICANT_DIGITS as i64 {
+    // A carry can widen the number to 35 digits - `9.99…9` rounding to `10.0…0` - and then one more digit
+    // comes off the end. **The scale comes down with it.** `mantissa` is now the quotient times
+    // `10^(shift-2)` rather than `10^(shift-1)`, so dropping a digit without dropping the exponent
+    // rendered the value a tenth of itself - and the test that would have caught it used `1 / 8`, which
+    // rounds to 34 digits without carrying and never reaches here (Jules on #1282).
+    let (mantissa, widened) = if digits(rounded.magnitude()) > SIGNIFICANT_DIGITS as i64 {
         (&rounded / BigInt::from(10u8), 1)
     } else {
         (rounded, 0)
     };
-    let _ = carried;
-    let scale = shift - 1 + extra;
+    // `carried` says the rounding went up; `widened` says it went up *into another digit*. Only the second
+    // moves the point, and a carry from `…8` to `…9` does not.
+    debug_assert!(
+        widened == 0 || carried,
+        "the mantissa cannot widen without the rounding having carried"
+    );
+    let scale = shift - 1 - widened;
     Some(render(&mantissa, scale, negative))
 }
 
@@ -234,6 +250,25 @@ mod tests {
         assert_eq!(
             exact, 4,
             "four of the five recorded pools must match byte for byte"
+        );
+    }
+
+    /// A carry that widens the mantissa to 35 digits (Jules on #1282).
+    ///
+    /// `(2*10^34 - 1) / (2*10^34)` is `0.9999…975`: the guard-digit quotient is `10^35 - 5`, whose last
+    /// digit is exactly half, and half-to-even carries it to `10^34` - one digit too wide. One digit then
+    /// comes off the mantissa, and the scale has to come **down** with it, not up.
+    ///
+    /// Jules's own example, `1 / 8`, does not reach this branch: its quotient rounds to 34 digits without
+    /// carrying, which is why `significant_digits_and_shape` already asserted `0.125` and passed.
+    #[test]
+    fn a_carry_that_widens_the_mantissa_keeps_the_value() {
+        let den = BigInt::from(2u8) * pow10(34);
+        let num = &den - BigInt::from(1u8);
+        assert_eq!(
+            div_to_string(&num, &den).unwrap(),
+            "1",
+            "0.9999…975 to 34 significant digits is 1, not a hundredth of it"
         );
     }
 
