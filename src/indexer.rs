@@ -293,43 +293,37 @@ pub async fn upgrade(
                     }
                     Err(UpgradeAbandon::AfterQuiesce) => {
                         ingest_new.abort();
-                        // Restart only once the old task has actually gone; two writers on one
-                        // store is the fault.
-                        if ingest_old.is_finished() {
-                            match restart_old_writer(
-                                source.clone(),
-                                old_dir_restart,
-                                old_store.clone(),
-                                seal_direct,
-                                concurrency,
-                                window,
-                                admin_enabled,
-                                admin_token.clone(),
-                            )
-                            .await
-                            {
-                                Ok(restarted) => {
-                                    tracing::warn!(
-                                        "abandoned the upgrade after quiesce; restarted the old writer"
-                                    );
-                                    old_shared.swap(restarted.state);
-                                    ingest_old = restarted.ingest;
-                                    tokio::select! {
-                                        r = &mut serve_task => join_task("serving", r),
-                                        j = &mut ingest_old => join_task("old indexing", j),
-                                    }
+                        match restart_old_writer(
+                            source.clone(),
+                            old_dir_restart,
+                            old_store.clone(),
+                            seal_direct,
+                            concurrency,
+                            window,
+                            admin_enabled,
+                            admin_token.clone(),
+                        )
+                        .await
+                        {
+                            Ok(restarted) => {
+                                tracing::warn!(
+                                    "abandoned the upgrade after quiesce; restarted the old writer"
+                                );
+                                old_shared.swap(restarted.state);
+                                ingest_old = restarted.ingest;
+                                tokio::select! {
+                                    r = &mut serve_task => join_task("serving", r),
+                                    j = &mut ingest_old => join_task("old indexing", j),
                                 }
-                                Err(e) => Err(restart_or_exit(e)),
                             }
-                        } else {
-                            tracing::warn!(
-                                "abandoned the upgrade; old ingest did not stop, so it was not restarted"
-                            );
-                            tokio::select! {
-                                r = &mut serve_task => join_task("serving", r),
-                                j = &mut ingest_old => join_task("old indexing", j),
-                            }
+                            Err(e) => Err(restart_or_exit(e)),
                         }
+                    }
+                    Err(UpgradeAbandon::QuiesceTimeout) => {
+                        ingest_new.abort();
+                        Err(anyhow::anyhow!(
+                            "old ingest did not stop after abort; failing the upgrade"
+                        ))
                     }
                 },
                 Ok(Err(e)) => {
@@ -476,18 +470,25 @@ async fn wait_until_caught_up_probe(
     }
 }
 
-/// A compatible upgrade that did not flip. Serving continues on the old SharedNest.
+/// A compatible upgrade that did not flip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpgradeAbandon {
-    /// Old ingest is still running.
+    /// Old ingest is still running; keep serving it.
     BeforeQuiesce,
-    /// Old ingest is already dead; restart it rather than serving a frozen backing.
+    /// Old ingest is gone; restart it rather than serving a frozen backing.
     AfterQuiesce,
+    /// Quiesce abort did not join in time; fail the upgrade.
+    QuiesceTimeout,
 }
 
 impl UpgradeAbandon {
     #[cfg(test)]
     fn old_writer_live(self) -> bool {
+        matches!(self, Self::BeforeQuiesce)
+    }
+
+    #[cfg(test)]
+    fn keep_serving(self) -> bool {
         matches!(self, Self::BeforeQuiesce)
     }
 }
@@ -527,7 +528,7 @@ async fn wait_live_then_quiesce(
     let head = abandon_or_head(wait, false)?;
     quiesce_ingest(ingest_old, quiesce_for).await.map_err(|e| {
         tracing::warn!(error = %e, "old ingest did not stop after abort");
-        UpgradeAbandon::AfterQuiesce
+        UpgradeAbandon::QuiesceTimeout
     })?;
     Ok(head)
 }
@@ -9750,6 +9751,44 @@ template = "pool"
             "a pre-quiesce stall must not stop the old writer"
         );
         old.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_quiesce_fails_the_upgrade() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut old = tokio::spawn({
+            let started = started.clone();
+            async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            }
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let abandon = wait_live_then_quiesce(
+            &mut old,
+            || Ok(Some(5)),
+            Some(5),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("quiesce must time out");
+        assert_eq!(abandon, UpgradeAbandon::QuiesceTimeout);
+        assert!(
+            !abandon.keep_serving(),
+            "must not keep serving a backing whose writer was aborted"
+        );
+    }
+
+    #[test]
+    fn a_quiesce_timeout_does_not_keep_serving() {
+        assert!(!UpgradeAbandon::QuiesceTimeout.keep_serving());
+        assert!(!UpgradeAbandon::AfterQuiesce.keep_serving());
+        assert!(UpgradeAbandon::BeforeQuiesce.keep_serving());
     }
 
     #[tokio::test]
