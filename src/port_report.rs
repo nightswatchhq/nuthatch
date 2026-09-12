@@ -2530,7 +2530,21 @@ fn bound_contract_locals(body: &str) -> BTreeSet<String> {
 fn is_id_of_call(expr: &str, callee: &str) -> bool {
     let e = collapse_ws(expr);
     let e = e.trim();
-    e.starts_with(&format!("{callee}(")) && e.ends_with(".id")
+    // **The call's own closing paren, not the end of the string.** A prefix-and-suffix test accepted
+    // `findToken(id).id.owner.id`, whose value is not the returned entity's id at all, and the exemption
+    // was granted on the strength of the two ends matching (Jules, #1298). Stripping `callee` as a whole
+    // identifier also stops `findTokenOrCreate(..)` reading as `findToken`.
+    if !e.starts_with(callee) {
+        return false;
+    }
+    // No separate "is the next character a paren" check: `match_paren` refuses unless the byte at `open`
+    // is one, so `findTokenOrCreate(..)` against `findToken` fails there. The mutation removing such a
+    // check stayed green, which is how it got noticed.
+    let open = callee.len();
+    let Some(close) = match_paren(e, open) else {
+        return false;
+    };
+    &e[close + 1..] == ".id"
 }
 
 /// Is the id of every entity this function can return demonstrably free of a contract read?
@@ -5662,6 +5676,40 @@ export function handleTokensTraded(event: TokensTraded): void {
             Class::Exact,
             "an argument that reads no contract keeps the exemption: {}",
             reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// The `.id` exemption is for a call and `.id`, nothing else (Jules, #1298).
+    ///
+    /// A prefix-and-suffix test accepted anything starting with the call and ending in `.id`, so
+    /// `findToken(id).id.owner.id` - whose value is some other entity's id - carried the exemption on the
+    /// strength of its two ends.
+    #[test]
+    fn the_id_exemption_needs_the_whole_expression() {
+        assert!(is_id_of_call("findToken(id).id", "findToken"));
+        assert!(
+            is_id_of_call("findToken(f(a, b)).id", "findToken"),
+            "a nested call inside the arguments is still one call"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).id.owner.id", "findToken"),
+            "the value is the owner's id, not the returned entity's"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).id.toHexString()", "findToken"),
+            "anything taken off the id is no longer the id"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).symbol", "findToken"),
+            "another field of the returned entity is not its id"
+        );
+        assert!(
+            !is_id_of_call("findTokenOrCreate(id).id", "findToken"),
+            "the callee has to be the whole name"
+        );
+        assert!(
+            !is_id_of_call("wrap(findToken(id)).id", "findToken"),
+            "the call has to be the head of the expression"
         );
     }
 
