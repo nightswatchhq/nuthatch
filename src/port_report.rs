@@ -3643,6 +3643,14 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
     }
     // Assigned from an event, every time, and at least once at the body's top level so that it happens
     // on every path rather than only the one an `if` took.
+    // **A returned row escapes, so freshness exempts nothing here.**
+    // `assignment_reaches_every_stored_row` lets a terminator before the assignment pass when the receiver
+    // is `new`, because a row this function never saved is not a stored row. That argument is about rows
+    // *this* function stores, and it does not hold for one it hands back: `let transaction = new
+    // Transaction(id); if (event.skip) return transaction; transaction.timestamp = ..` returns a row with
+    // the field unset, and the caller saves it (Jules, #1316). So any terminator before the assignment
+    // refuses, fresh or not.
+    let body_lines: Vec<&str> = helper.body.lines().collect();
     let mut col = None;
     let mut unconditional = false;
     for asg in &helper.assignments {
@@ -3656,7 +3664,14 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
         if col.as_ref().is_some_and(|prev| prev != &c) {
             return None;
         }
-        unconditional |= assignment_reaches_every_stored_row(helper, asg);
+        let idx = asg
+            .citation
+            .line
+            .checked_sub(helper.body_start_line)
+            .unwrap_or(usize::MAX);
+        let escapes_unset =
+            idx >= body_lines.len() || body_lines[..idx].iter().any(|l| aborts_the_handler(l));
+        unconditional |= !escapes_unset && assignment_reaches_every_stored_row(helper, asg);
         col = Some(c);
     }
     if unconditional {
@@ -4824,6 +4839,55 @@ export function handleSwap(event: SwapEvent): void {
             expr_concat_parts(&asg.expr, func, &mappings.functions),
             None,
             "`sep` was never passed, and the caller's local of that name is not what the helper meant"
+        );
+    }
+
+    /// A **fresh** row returned before its assignment still reaches the caller unset (Jules, #1316).
+    ///
+    /// The freshness exemption is about rows a function *stores*: one it never saved is not a stored row,
+    /// so a terminator before the assignment leaves nothing behind. A returned row is the other case - it
+    /// escapes, and the caller saves it - so the exemption must not apply on that path.
+    #[test]
+    fn a_fresh_row_returned_before_its_assignment_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  if (event.logIndex.equals(BigInt.zero())) {
+    return transaction
+  }
+  transaction.timestamp = event.block.timestamp
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the early-return path hands the caller a row whose timestamp was never set"
         );
     }
 
