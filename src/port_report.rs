@@ -2241,12 +2241,34 @@ fn class_of_assignment(
         return Class::Unreachable;
     }
     let mut c = Class::Exact;
-    if expr_has_contract_call(&asg.expr) {
+    // **A contract bound to a local counts too.** `expr_has_contract_call` only sees a bind, an
+    // `ethereum.call` or a `try_` in the expression it is given, and the commonest shape puts the bind on
+    // its own line - `let contract = ERC20.bind(id)` then `token.symbol = contract.symbol()`. That RHS
+    // carried no marker and the field classified exact, promising byte-for-byte output for a contract
+    // call with the call printed in the report's own Why column (#1296).
+    if expr_reads_contract(&asg.expr, &bound_contract_locals(&func.body)) {
         c = Class::CallDerived;
     }
     for callee in &func.calls {
         if expr_calls(&asg.expr, callee) {
             if let Some(cc) = fn_class.get(callee) {
+                // **`f(x).id` is `x`, whatever else `f` read.**
+                //
+                // The rule applied here is "does the callee read contract state". The rule that belongs
+                // is "does *this field's value* depend on contract state", and for the id of an entity the
+                // callee keyed by one of its own arguments the answer is no - the contract reads populate
+                // sibling fields of that entity, not this one. Carbon's
+                // `newTrade.sourceToken = findOrCreateToken(event.params.sourceToken, ..).id` is the case,
+                // and `newTrade.trader` two lines above it - the identical shape through a helper that
+                // happens to make no call - is the proof the old rule was accidental (#1294).
+                if *cc == Class::CallDerived
+                    && is_id_of_call(&asg.expr, callee)
+                    && functions
+                        .get(callee)
+                        .is_some_and(|c| returned_id_is_contract_free(c, functions))
+                {
+                    continue;
+                }
                 c = c.max(*cc);
             }
         }
@@ -2359,7 +2381,10 @@ fn bare_idents(expr: &str) -> Vec<String> {
 
 /// What `let <name> = ..` assigned, as written, or `None` if the body declares no such local.
 fn local_assignment(body: &str, name: &str) -> Option<String> {
-    for line in body.lines() {
+    // Joined, so a declaration a formatter wrapped is read whole. Reading `let key =` on its own recorded
+    // an **empty** right-hand side, which then looked contract-free (Jules, #1298).
+    for line in join_wrapped_declarations(body) {
+        let line = line.as_str();
         let t = line.trim_start();
         // `continue`, not `?`. An earlier version returned from the whole function here, so it only
         // ever resolved a local declared on the body's first line - which made the expansion a no-op
@@ -2447,6 +2472,318 @@ fn expr_reads_field(expr: &str, field: &str) -> bool {
     }
     false
 }
+
+/// Does this expression read a contract, directly or through a local bound earlier in the body?
+fn expr_reads_contract(expr: &str, bound: &BTreeSet<String>) -> bool {
+    expr_has_contract_call(expr) || bound.iter().any(|v| calls_method_on(expr, v))
+}
+
+/// Is `v.<method>(` present in `expr`, with `v` a whole identifier?
+///
+/// A method call, not a mention: `contract.symbol()` is a read, `contract` passed as an argument is not,
+/// and `myContract.x()` must not match a bound local called `contract`.
+fn calls_method_on(expr: &str, v: &str) -> bool {
+    let b = expr.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = expr[from..].find(v) {
+        let at = from + rel;
+        from = at + v.len();
+        let before_ok = at == 0
+            || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_' || b[at - 1] == b'.');
+        if !before_ok || !expr[from..].starts_with('.') {
+            continue;
+        }
+        let after = &expr[from + 1..];
+        let method: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !method.is_empty() && after[method.len()..].starts_with('(') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Locals bound to a contract in this body: `let c = ERC20Contract.bind(addr)`.
+///
+/// `expr_has_contract_call` only sees a bind, an `ethereum.call` or a `try_` **in the expression it is
+/// given**. The commonest shape puts the bind on its own line and the read on another, so
+/// `token.symbol = contract.symbol()` contained no marker and classified exact - promising byte-for-byte
+/// output for a contract call, with the call printed in the report's own Why column (#1296). Every
+/// Uniswap fixture this was built against wrote `contract.try_symbol()` inline, so no test could see it.
+fn bound_contract_locals(body: &str) -> BTreeSet<String> {
+    let declared = |t: &str| {
+        let rest = t
+            .trim_start()
+            .strip_prefix("let ")
+            .or_else(|| t.trim_start().strip_prefix("const "))?;
+        let (name, rhs) = rest.split_once('=')?;
+        // `let c: ERC20Contract = ..` carries a type annotation.
+        let name = name.split(':').next().unwrap_or(name).trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then(|| {
+            (
+                name.to_string(),
+                // **No comment stripping here.** `parse_functions` strips the whole source before any
+                // `FunctionInfo` exists, so a body never carries one and a second stripper on this
+                // right-hand side is a guard that cannot fire - the mutation removing it stayed green,
+                // which is how I found out. `a_body_carries_no_comments` holds the property this relies
+                // on (Jules, #1298).
+                rhs.trim().trim_end_matches(';').trim().to_string(),
+            )
+        })
+    };
+    // **Statements, not lines.** A declaration that wraps - `let contract =\n  ERC20.bind(id)` - put the
+    // bind on a line with no `let`, so the local went unrecorded and a later `contract.symbol()` read as
+    // an ordinary method call (Jules, #1298). Prettier wraps a long bind exactly that way.
+    let joined = join_wrapped_declarations(body);
+    let mut out = BTreeSet::new();
+    for line in &joined {
+        if let Some((name, rhs)) = declared(line) {
+            if rhs.contains(".bind(") {
+                out.insert(name);
+            }
+        }
+    }
+    // **An alias of a bound contract is a bound contract.** `let c = ERC20.bind(id); let alias = c` left
+    // `alias` unrecorded, so `alias.symbol()` read as an ordinary method call and the field stayed exact
+    // (Jules, #1298).
+    //
+    // One forward pass, not a fixed point: a local cannot be used before it is declared, so source order
+    // is dependency order and a chain of copies is already in it. A loop here was unfalsifiable - the
+    // mutation reducing it to one pass stayed green, because no valid mapping can need the second.
+    for line in &joined {
+        if let Some((name, rhs)) = declared(line) {
+            if out.contains(&rhs) {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// The body's lines, with a wrapped declaration joined onto one.
+///
+/// A line whose trimmed form ends with `=`, `(` or `,` is continued on the next: those are the three ways
+/// a formatter breaks a declaration, and joining them is what lets a line-shaped rule see the whole
+/// statement. Nothing else is merged, so a line-oriented caller still sees ordinary statements one apiece.
+fn join_wrapped_declarations(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if !pending.is_empty() {
+            pending.push(' ');
+            pending.push_str(t);
+        } else {
+            pending = t.to_string();
+        }
+        if pending.ends_with('=') || pending.ends_with('(') || pending.ends_with(',') {
+            continue;
+        }
+        out.push(std::mem::take(&mut pending));
+    }
+    if !pending.is_empty() {
+        out.push(pending);
+    }
+    out
+}
+
+/// Is the assignment exactly `callee(..).id`?
+///
+/// The call has to be the whole receiver and `.id` the whole of what is taken off it. Anything further
+/// is left alone (`f(x).id.toHex()`, `f(x).symbol`, a call nested inside a larger expression), because
+/// then the value is no longer simply the entity's id.
+fn is_id_of_call(expr: &str, callee: &str) -> bool {
+    let e = collapse_ws(expr);
+    let e = e.trim();
+    // **The call's own closing paren, not the end of the string.** A prefix-and-suffix test accepted
+    // `findToken(id).id.owner.id`, whose value is not the returned entity's id at all, and the exemption
+    // was granted on the strength of the two ends matching (Jules, #1298). Stripping `callee` as a whole
+    // identifier also stops `findTokenOrCreate(..)` reading as `findToken`.
+    if !e.starts_with(callee) {
+        return false;
+    }
+    // No separate "is the next character a paren" check: `match_paren` refuses unless the byte at `open`
+    // is one, so `findTokenOrCreate(..)` against `findToken` fails there. The mutation removing such a
+    // check stayed green, which is how it got noticed.
+    let open = callee.len();
+    let Some(close) = match_paren(e, open) else {
+        return false;
+    };
+    &e[close + 1..] == ".id"
+}
+
+/// Is the id of every entity this function can return demonstrably free of a contract read?
+///
+/// Tied to the **returned** entity, and unresolvable is a refusal rather than a pass. A body-wide scan
+/// let an unrelated `new Audit(id)` vouch for a returned `new Token(contract.canonical(id))`, exempting a
+/// field whose value does come off a contract (Jules on #1298) - the over-promising direction, which
+/// #1296 was also about.
+///
+/// A constant id is as exempt as a parameter one: neither depends on contract state, which is the only
+/// question the class turns on. An earlier version also required at least one id to be a bare parameter,
+/// which added nothing the class needed and would have rejected a perfectly reproducible constant.
+fn returned_id_is_contract_free(
+    callee: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> bool {
+    match returned_entity_id_exprs(callee, functions, RETURN_DEPTH) {
+        Some(ids) if !ids.is_empty() => {
+            let bound = bound_contract_locals(&callee.body);
+            !ids.iter().any(|e| expr_reads_contract(e, &bound))
+        }
+        _ => false,
+    }
+}
+
+/// The id expression of every entity this function can return, or `None` if any return path cannot be
+/// resolved.
+fn returned_entity_id_exprs(
+    callee: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for r in return_exprs(&callee.body) {
+        let e = collapse_ws(&r);
+        let e = e.trim();
+        if let Some(id) = constructed_or_loaded_id(e) {
+            out.push(resolve_local_chain(&callee.body, &callee.param_names, &id)?);
+            continue;
+        }
+        // `return <local>`: whatever that local was constructed or loaded with.
+        if !e.is_empty() && e.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let id = constructor_arg_for(&callee.body, e)
+                .or_else(|| load_arg_for(&callee.body, e))
+                .or_else(|| create_arg_for(&callee.body, e))?;
+            out.push(resolve_local_chain(&callee.body, &callee.param_names, &id)?);
+            continue;
+        }
+        // `return <helper>(..)`: the helper's own return paths.
+        let name: String = e
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && e[name.len()..].starts_with('(') {
+            let inner = functions.get(&name)?;
+            // **The helper's return, in the caller's terms.** Recursing and taking the inner expressions
+            // verbatim loses the provenance this whole function exists to track: `makeToken(key) { return
+            // new Token(key) }` called as `makeToken(contract.canonical(id))` yielded `key`, which the
+            // caller then checked against *its* locals, found contract-free, and granted the `.id`
+            // exemption to a value that came straight off a contract call (Jules, #1298).
+            let args = take_paren_list(e, name.len());
+            // Arity must match, or a parameter survives unsubstituted and resolves against whatever the
+            // caller happens to have bound under that name.
+            if args.len() != inner.param_names.len() {
+                return None;
+            }
+            // **Checked in the context it was written.** `returned_id_is_contract_free` tests the
+            // expressions against the *outer* function's bound locals, so
+            // `makeToken(id) { let c = ERC20.bind(id); return new Token(c.canonical(id)) }` handed back
+            // `c.canonical(id)` - a name the outer body never binds - and it read as an ordinary method
+            // call on nothing in particular (Jules, #1298). The inner body is where `c` means a contract,
+            // so that is where the question gets asked.
+            let inner_bound = bound_contract_locals(&inner.body);
+            for expr in returned_entity_id_exprs(inner, functions, depth - 1)? {
+                if expr_reads_contract(&expr, &inner_bound) {
+                    return None;
+                }
+                let mut in_callers_terms = expr;
+                for (param, arg) in inner.param_names.iter().zip(&args) {
+                    in_callers_terms = substitute_ident(&in_callers_terms, param, arg.trim());
+                }
+                out.push(in_callers_terms);
+            }
+            continue;
+        }
+        return None;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `new Entity(<id>)` or `Entity.load(<id>)` at the head of an expression, giving `<id>`.
+fn constructed_or_loaded_id(e: &str) -> Option<String> {
+    if let Some(rest) = e.strip_prefix("new ") {
+        let mut k = 0usize;
+        let rest = rest.trim_start();
+        let ident: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        k += ident.len();
+        if !ident.is_empty() && rest[k..].starts_with('(') {
+            return Some(collapse_ws(&take_expr(rest, k + 1)));
+        }
+        return None;
+    }
+    let ident: String = e
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if !ident.is_empty() && e[ident.len()..].starts_with(".load(") {
+        return Some(collapse_ws(&take_expr(e, ident.len() + ".load(".len())));
+    }
+    None
+}
+
+/// Follow a bare local to the expression it ultimately came from, or `None` if it cannot be followed.
+///
+/// **Transitive, and `None` is a refusal.** This resolved one step, so
+/// `let key = contract.canonical(id); let finalKey = key; return new Token(finalKey)` resolved `finalKey`
+/// to `key`, stopped, and `key` looked contract-free on its face - granting the `.id` exemption to an id
+/// that did come off a contract (Jules on #1298). A chain longer than `ALIAS_DEPTH`, a cycle, or an
+/// identifier that is neither a local nor a parameter all return `None`, and the caller treats that as
+/// unresolved rather than as safe.
+fn resolve_local_chain(body: &str, params: &[String], expr: &str) -> Option<String> {
+    let mut e = expr.trim().to_string();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..ALIAS_DEPTH {
+        if e.is_empty() || !e.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            // No longer a bare local: this is the expression the id came from.
+            return Some(e);
+        }
+        if !seen.insert(e.clone()) {
+            // `let a = b; let b = a;` - terminate rather than spin, and refuse.
+            return None;
+        }
+        let mut next: Option<String> = None;
+        // The same joined representation as `bound_contract_locals` and `local_assignment`: one reading of
+        // what a declaration is, or the three disagree on a wrapped one.
+        for line in join_wrapped_declarations(body) {
+            let line = line.as_str();
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("let ").or_else(|| t.strip_prefix("const ")) else {
+                continue;
+            };
+            let Some((name, rhs)) = rest.split_once('=') else {
+                continue;
+            };
+            if name.split(':').next().unwrap_or(name).trim() == e {
+                next = Some(collapse_ws(rhs.trim().trim_end_matches(';')));
+                break;
+            }
+        }
+        match next {
+            Some(n) => e = n,
+            // Not declared as a local. A **parameter** is a legitimate terminus: `Token.load(id)` with
+            // `id` a parameter means the id *is* the caller's argument, which is the exempt case and the
+            // whole point of the rule. Anything else - an import, a module constant we cannot see - is
+            // unresolved, and the caller must not assume it is contract-free.
+            None if params.iter().any(|p| p == &e) => return Some(e),
+            None => return None,
+        }
+    }
+    // Deeper than the bound. Unresolved, which refuses rather than guesses.
+    None
+}
+
+/// How far to follow `return <helper>(..)` before giving up. A chain deeper than this is unresolvable,
+/// which refuses the exemption rather than guessing at it.
+const RETURN_DEPTH: usize = 4;
 
 fn expr_has_contract_call(expr: &str) -> bool {
     expr.contains(".bind(") || expr.contains("ethereum.call(") || expr.contains(".try_")
@@ -6543,5 +6880,782 @@ type Swap @entity {
         let row = rows.iter().find(|r| r.field == "amount0").unwrap();
         assert_eq!(row.citation.file, "src/core.ts");
         assert_eq!(row.citation.line, 3);
+    }
+    /// A contract bound to a local, read on a later line, is a contract read.
+    ///
+    /// `expr_has_contract_call` only looks at the expression it is given, and the commonest shape puts
+    /// the `bind` on its own line:
+    ///
+    /// ```ts
+    /// let contract = ERC20Contract.bind(id)
+    /// token.symbol = contract.symbol()
+    /// ```
+    ///
+    /// So the RHS carried no marker and the field classified **exact** - a promise of byte-for-byte
+    /// output, with the contract call printed in the report's own Why column. Every Uniswap fixture
+    /// wrote `contract.try_symbol()` inline, so no test could see it. Carbon read 95 exact and 0
+    /// call-derived when the truth was 92 and 3 (#1296).
+    #[test]
+    fn a_read_through_a_bound_contract_local_is_call_derived() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+  createdAt: BigInt!
+  label: String!
+  other: String!
+}
+"#;
+        let mapping = r#"
+function describe(id: Address): Wrapper {
+  return new Wrapper(id)
+}
+
+export function handleCreated(event: TokenCreated): void {
+  let contract = ERC20Contract.bind(event.params.token)
+  let notAContract = describe(event.params.token)
+  let myContract = describe(event.params.token)
+  let token = new Token(event.params.token.toHex())
+  token.symbol = contract.symbol()
+  token.createdAt = event.block.timestamp
+  token.label = notAContract.label()
+  token.other = myContract.other()
+  token.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        assert_eq!(
+            class_of(&rows, "Token", "symbol"),
+            Class::CallDerived,
+            "a read off a bound contract is a contract read: {}",
+            reason_of(&rows, "Token", "symbol")
+        );
+        // #1242: the citation is the line that decided the class, which is the `bind`.
+        assert!(
+            reason_of(&rows, "Token", "symbol").contains("contract state"),
+            "{}",
+            reason_of(&rows, "Token", "symbol")
+        );
+
+        // The rule must not swallow every method call on every local.
+        assert_eq!(
+            class_of(&rows, "Token", "label"),
+            Class::Exact,
+            "`notAContract` is not bound to a contract: {}",
+            reason_of(&rows, "Token", "label")
+        );
+        // And a bound local named `contract` must not match `myContract`, which merely ends in it.
+        assert_eq!(
+            class_of(&rows, "Token", "other"),
+            Class::Exact,
+            "`myContract` is a different identifier from `contract`: {}",
+            reason_of(&rows, "Token", "other")
+        );
+        assert_eq!(class_of(&rows, "Token", "createdAt"), Class::Exact);
+    }
+
+    /// `f(x).id` is `x`, whatever `f` reads from a contract.
+    ///
+    /// `bancorprotocol/carbon-subgraph` - the pinned drop-in target (#1284) - writes
+    /// `newTrade.sourceToken = findOrCreateToken(event.params.sourceToken, ...).id`, and
+    /// `findOrCreateToken` loads or constructs its `Token` from that same argument. The contract reads
+    /// inside it populate `symbol`, `name` and `decimals`: sibling fields of a different entity. They
+    /// have no bearing on this field's value.
+    ///
+    /// The classifier applied *does the callee read contract state* when the rule is *does this field's
+    /// value depend on contract state*, and called both token references call-derived. That the rule was
+    /// accidental rather than intended is visible in the same handler: `newTrade.trader` is the identical
+    /// shape through `findOrCreateUser`, and classifies exact only because that helper makes no call
+    /// (#1294).
+    #[test]
+    fn the_id_of_an_entity_constructed_from_an_argument_is_exact() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  sourceToken: Token!
+  trader: User!
+  feeAmount: BigInt!
+}
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+type User @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+function createERC20Token(id: Address, timestamp: BigInt): Token {
+  let contract = ERC20Contract.bind(id)
+  let token = new Token(id)
+  token.symbol = contract.symbol()
+  token.save()
+  return token
+}
+
+export function findOrCreateToken(id: Address, timestamp: BigInt): Token {
+  let token = Token.load(id)
+  if (token != null) {
+    return token
+  }
+  return createERC20Token(id, timestamp)
+}
+
+export function findOrCreateUser(id: Address, timestamp: BigInt): User {
+  let user = new User(id)
+  user.save()
+  return user
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.trader = findOrCreateUser(event.params.trader, event.block.timestamp).id
+  newTrade.sourceToken = findOrCreateToken(
+    event.params.sourceToken,
+    event.block.timestamp
+  ).id
+  newTrade.feeAmount = event.params.tradingFeeAmount
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+
+        // The field under test, and the control that already passed for the wrong reason.
+        assert_eq!(
+            class_of(&rows, "Trade", "sourceToken"),
+            Class::Exact,
+            "`findOrCreateToken(x).id` is `x`: {}",
+            reason_of(&rows, "Trade", "sourceToken")
+        );
+        assert_eq!(
+            class_of(&rows, "Trade", "trader"),
+            Class::Exact,
+            "the identical shape through a helper that makes no call"
+        );
+        assert_eq!(class_of(&rows, "Trade", "feeAmount"), Class::Exact);
+
+        // And the sibling the contract read actually decides is still call-derived, so the fix has not
+        // simply stopped the rule firing.
+        assert_eq!(
+            class_of(&rows, "Token", "symbol"),
+            Class::CallDerived,
+            "the field the contract read does decide must keep its class"
+        );
+    }
+
+    /// The other half: a returned entity whose id is **not** an argument stays call-derived.
+    ///
+    /// Without this the fix would be "stop inheriting on `.id`", which would promise byte-identical
+    /// output for a value read off a contract.
+    #[test]
+    fn the_id_of_an_entity_keyed_by_a_contract_read_stays_call_derived() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  pool: Pool!
+}
+type Pool @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreatePool(addr: Address): Pool {
+  let contract = Factory.bind(addr)
+  let pool = new Pool(contract.getPool(addr).toHex())
+  pool.save()
+  return pool
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.pool = findOrCreatePool(event.params.pool).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "pool"),
+            Class::CallDerived,
+            "the id itself came off a contract: {}",
+            reason_of(&rows, "Trade", "pool")
+        );
+    }
+
+    /// A callee that keys by a parameter on one branch and by a **contract read** on another stays
+    /// call-derived.
+    ///
+    /// The disqualifying test used `expr_has_contract_call`, which cannot see a contract bound to a local
+    /// on an earlier line - the same blindness as #1296 - so a mutation removing it survived. The id rule
+    /// and the class rule now ask the same question.
+    #[test]
+    fn a_callee_that_keys_by_a_contract_read_on_any_branch_stays_call_derived() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let token = Token.load(id)
+  if (token != null) {
+    return token
+  }
+  let contract = Registry.bind(id)
+  return new Token(contract.canonical(id))
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "one branch keys the entity by a contract read, so the id is not the argument: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A helper's return is provenance only once it is put in the caller's terms (Jules, #1298).
+    ///
+    /// ```ts
+    /// function makeToken(key: string): Token { return new Token(key) }
+    /// function findToken(id: Address): Token { return makeToken(contract.canonical(id)) }
+    /// trade.token = findToken(event.params.sourceToken).id
+    /// ```
+    ///
+    /// Recursing into `makeToken` and taking its return expressions verbatim yielded `key`. Checked
+    /// against `findToken`'s own locals that looks contract-free, so the `.id` exemption was granted to an
+    /// id that came straight off `contract.canonical(..)`.
+    #[test]
+    fn a_helpers_return_carries_the_callers_arguments() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(key: string): Token {
+  return new Token(key)
+}
+
+export function findToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  return makeToken(contract.canonical(id))
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id the helper returns is `contract.canonical(id)`, whatever the inner function calls \
+             its parameter: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // The same shape with a contract-free argument is still exact, so the rule is about provenance
+        // rather than about there being a helper call at all.
+        let clean = mapping.replace("contract.canonical(id)", "id.toHexString()");
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "an argument that reads no contract keeps the exemption: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// The `.id` exemption is for a call and `.id`, nothing else (Jules, #1298).
+    ///
+    /// A prefix-and-suffix test accepted anything starting with the call and ending in `.id`, so
+    /// `findToken(id).id.owner.id` - whose value is some other entity's id - carried the exemption on the
+    /// strength of its two ends.
+    #[test]
+    fn the_id_exemption_needs_the_whole_expression() {
+        assert!(is_id_of_call("findToken(id).id", "findToken"));
+        assert!(
+            is_id_of_call("findToken(f(a, b)).id", "findToken"),
+            "a nested call inside the arguments is still one call"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).id.owner.id", "findToken"),
+            "the value is the owner's id, not the returned entity's"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).id.toHexString()", "findToken"),
+            "anything taken off the id is no longer the id"
+        );
+        assert!(
+            !is_id_of_call("findToken(id).symbol", "findToken"),
+            "another field of the returned entity is not its id"
+        );
+        assert!(
+            !is_id_of_call("findTokenOrCreate(id).id", "findToken"),
+            "the callee has to be the whole name"
+        );
+        assert!(
+            !is_id_of_call("wrap(findToken(id)).id", "findToken"),
+            "the call has to be the head of the expression"
+        );
+    }
+
+    /// A wrapped declaration resolves whole through the alias chain too (Jules, #1298).
+    ///
+    /// ```ts
+    /// let key =
+    ///   contract.canonical(id)
+    /// let finalKey = key
+    /// return new Token(finalKey)
+    /// ```
+    ///
+    /// `resolve_local_chain` read raw lines, so `let key =` recorded an **empty** right-hand side and the
+    /// contract read vanished - the id then looked contract-free and carried the `.id` exemption. Three
+    /// rules here read declarations and they now share one representation of what a declaration is.
+    #[test]
+    fn a_wrapped_declaration_resolves_through_the_alias_chain() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  let key =
+    contract.canonical(id)
+  let finalKey = key
+  return new Token(finalKey)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id is `contract.canonical(id)` however the declaration was wrapped: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // Wrapped and contract-free is still exact, so this is about the read and not about the wrapping.
+        let clean = mapping.replace("contract.canonical(id)", "id.toHexString()");
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "a wrapped declaration of a contract-free id keeps the exemption: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A parsed body carries no comments, which is what several rules here quietly rely on.
+    ///
+    /// `parse_functions` strips the source before building any `FunctionInfo`, so every line-oriented rule
+    /// in this module - alias matching, the terminator scan, brace depth - sees code only. Asserted rather
+    /// than assumed, because a reviewer reasonably read `bound_contract_locals` as vulnerable to a
+    /// trailing comment and the answer is not visible from that function.
+    #[test]
+    fn a_body_carries_no_comments() {
+        let mapping = r#"
+export function handleTransfer(event: Transfer): void {
+  let c = ERC20.bind(event.params.token) // a trailing comment
+  /* and a block one */
+  let alias = c // another
+  alias.symbol()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(
+            "type Token @entity { id: ID! }
+",
+            "src/token.ts",
+            mapping,
+        );
+        let body = &mappings
+            .functions
+            .get("handleTransfer")
+            .expect("handler")
+            .body;
+        assert!(
+            !body.contains("//") && !body.contains("/*"),
+            "a comment reached a function body, and every line rule in this module assumes none do:\n\
+             {body}"
+        );
+    }
+
+    /// An alias of a bound contract is a bound contract (Jules, #1298).
+    ///
+    /// `bound_contract_locals` recorded only the name assigned directly from `.bind(`, so
+    /// `let c = ERC20.bind(id); let alias = c` left `alias` unrecorded and `alias.symbol()` read as an
+    /// ordinary method call on nothing in particular.
+    #[test]
+    fn an_alias_of_a_bound_contract_is_still_a_contract() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        // Two hops, so a one-step alias rule would still miss the second.
+        let mapping = r#"
+export function handleTransfer(event: Transfer): void {
+  let c =
+    ERC20.bind(event.params.token)
+  let alias = c // keep this handle
+  let second = alias
+  let token = new Token(event.params.token.toHexString())
+  token.symbol = second.symbol()
+  token.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "symbol"),
+            Class::CallDerived,
+            "a copy of a bound contract still reads the contract: {}",
+            reason_of(&rows, "Token", "symbol")
+        );
+    }
+
+    /// The inner helper's own contract binding travels with its return (Jules, #1298).
+    ///
+    /// ```ts
+    /// function makeToken(id: Address): Token {
+    ///   let c = ERC20.bind(id)
+    ///   return new Token(c.canonical(id))
+    /// }
+    /// function findToken(id: Address): Token { return makeToken(id) }
+    /// ```
+    ///
+    /// Substituting the arguments produced `c.canonical(id)` in the *outer* context, where nothing binds
+    /// `c` - so it read as an ordinary method call and the `.id` exemption was granted to an id that comes
+    /// off contract state. The inner body is where `c` means a contract, so that is where it is asked.
+    #[test]
+    fn an_inner_helpers_contract_binding_is_not_lost_in_the_caller() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(id: Address): Token {
+  let c = ERC20.bind(id)
+  return new Token(c.canonical(id))
+}
+
+export function findToken(id: Address): Token {
+  return makeToken(id)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id is `c.canonical(id)` and `c` is a bound contract, two calls down: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // The same nesting without the contract read stays exact, so this is about provenance rather than
+        // about the depth of the call chain.
+        let clean = mapping.replace(
+            "let c = ERC20.bind(id)
+  return new Token(c.canonical(id))",
+            "return new Token(id.toHexString())",
+        );
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "two hops through contract-free helpers keep the exemption: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A helper called with too few arguments leaves a parameter that resolves against the caller.
+    ///
+    /// `makeToken(key, salt)` returns `new Token(salt)`. Called with one argument, `salt` survives
+    /// substitution and is then looked up in the *caller*, which happens to bind a contract-free local of
+    /// that name - so an id that is really the helper's own second parameter reads as exact.
+    #[test]
+    fn a_helper_called_with_too_few_arguments_keeps_no_provenance() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(key: string, salt: string): Token {
+  return new Token(salt)
+}
+
+export function findToken(id: Address): Token {
+  let salt = id.toHexString()
+  let contract = Registry.bind(id)
+  return makeToken(contract.canonical(id))
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "`salt` was never passed, and the caller's local of that name is not what the helper meant: \
+             {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// An unrelated parameter-keyed entity must not vouch for the one the function returns.
+    ///
+    /// Jules's counterexample on #1298, verbatim: the helper constructs `new Audit(id)` - parameter-keyed
+    /// and contract-free - binds a contract, puts the read in a local, and returns `new Token(key)`. The
+    /// body-wide scan saw `"id"` among the ids and granted the exemption, so `helper(x).id` reported exact
+    /// for a value that does come off a contract.
+    ///
+    /// Two things it needs: the ids have to come from the **returned** entity, and a bare local id has to
+    /// be resolved to what it holds, or `key` looks contract-free on its face.
+    #[test]
+    fn an_unrelated_parameter_keyed_entity_does_not_vouch_for_the_returned_one() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+type Audit @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let audit = new Audit(id)
+  audit.save()
+  let contract = Registry.bind(id)
+  let key = contract.canonical(id)
+  return new Token(key)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the returned Token's id came off a contract, whatever the Audit's id did: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A return path the resolver cannot follow refuses the exemption rather than guessing.
+    #[test]
+    fn an_unresolvable_return_path_refuses_the_exemption() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  return tokenFromSomewhereElse(contract, id)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "an unknown helper is unresolvable, so the exemption must not apply: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// An alias chain is followed to its end, not one step.
+    ///
+    /// Jules's second counterexample on #1298, verbatim: `let key = contract.canonical(id)` then
+    /// `let finalKey = key` then `return new Token(finalKey)`. Resolving one step gave `key`, which reads
+    /// as contract-free on its face, so the `.id` exemption was granted to an id that did come off a
+    /// contract. The resolver now follows the chain to `contract.canonical(id)`.
+    #[test]
+    fn an_alias_chain_is_followed_to_its_end() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  let key = contract.canonical(id)
+  let finalKey = key
+  return new Token(finalKey)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "two aliases from the contract read, and it is still a contract read: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A cycle terminates and refuses, rather than spinning.
+    #[test]
+    fn an_alias_cycle_refuses_the_exemption() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let a = b
+  let b = a
+  return new Token(a)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        // The class itself is not the point - terminating is. `findOrCreateToken` makes no contract call
+        // here, so the field is exact either way; what must not happen is a hang.
+        let _ = class_of(&rows, "Trade", "token");
+    }
+
+    /// A name that is neither a local nor a parameter refuses the exemption.
+    ///
+    /// `new Token(SOME_MODULE_CONST)` is very likely contract-free, and we cannot see the declaration to
+    /// know it. Refusing under-promises, which costs a porter a hand-check; granting it on a guess would
+    /// promise byte-for-byte output for an id we never resolved. A mutation treating an unresolved name as
+    /// the resolved expression survived until this existed.
+    #[test]
+    fn an_unresolvable_name_refuses_the_exemption() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  contract.touch(id)
+  return new Token(SOME_MODULE_CONST)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&schema, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id was never resolved, so the callee's class stands: {}",
+            reason_of(&rows, "Trade", "token")
+        );
     }
 }
