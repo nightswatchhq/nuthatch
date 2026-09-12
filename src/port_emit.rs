@@ -297,6 +297,18 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     );
     std::fs::write(nest.join("README.md"), &readme)
         .with_context(|| format!("write {}/README.md", nest.display()))?;
+    // The subgraph's own schema, kept in the nest so `serve` can generate graph-node's type system
+    // from it (RFC-0053 S1, #1265). Copied rather than referenced: a nest is meant to be movable, and
+    // a compatibility endpoint that depends on the subgraph source tree still being on the same disk
+    // is not.
+    let graph_dir = nest.join("graph");
+    std::fs::create_dir_all(&graph_dir)
+        .with_context(|| format!("create {}", graph_dir.display()))?;
+    std::fs::copy(
+        subgraph.join("schema.graphql"),
+        graph_dir.join("schema.graphql"),
+    )
+    .with_context(|| format!("copy schema.graphql into {}", graph_dir.display()))?;
 
     Ok(EmitResult {
         calls: emitted_calls,

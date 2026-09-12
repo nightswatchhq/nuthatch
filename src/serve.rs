@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::stream;
@@ -291,6 +291,11 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/metrics", get(metrics_handler))
             .route("/tables", get(tables))
             .route("/schema", get(schema_doc))
+            // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
+            // the subgraph URL form so a client's existing URL needs only its host changed.
+            .route("/graphql", post(graph_graphql))
+            .route("/subgraphs/id/{id}", post(graph_graphql))
+            .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
             .route("/entities", get(entities))
             .route("/entity/{id}", get(entity))
@@ -1523,6 +1528,331 @@ struct TableQuery {
 /// authored **meaning** from `semantic.toml`, the derived **footguns**, and live **coverage** (the
 /// hot/cold seam as numbers). Assembled per call from this running nest - the MCP `schema` tool
 /// relays it, so an agent reads *this* nest's data model, not a static string. Plain text.
+/// The Graph-compatible GraphQL surface (RFC-0053 S1 #1265, S2 #1266).
+///
+/// Three things behind one path. **Introspection** first, because a generated client fetches the
+/// schema and validates against it before it will send anything useful. **`_meta`**, answered from
+/// the nest's own head rather than compiled, since a nest runs no mapping and so has no indexing
+/// error to report. Everything else goes through [`crate::graph_query`], which lowers what it can
+/// lower exactly and **refuses the rest by name in the Graph error envelope** - a client can read an
+/// envelope, and a dropped `where` clause returns more rows than were asked for.
+///
+/// The generated schema comes from `graph/schema.graphql` in the nest, written there by `port-emit`.
+/// A nest that was not produced from a subgraph has no such file and this endpoint says so rather
+/// than inventing a schema.
+async fn graph_graphql(
+    State(s): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let query = body
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // **`operationName` is read, not ignored.** A document may carry several operations and every
+    // generated client sends the name of the one it wants; refusing the document outright refused
+    // requests graph-node answers (Jules on #1282). An empty or absent value means "no name given".
+    let operation_name = body
+        .get("operationName")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    // `variables` is how every generated client passes its arguments. A value this dialect cannot
+    // represent is left unbound rather than coerced, so the operation is refused by variable name.
+    let vars: std::collections::BTreeMap<String, crate::graph_query::Value> = body
+        .get("variables")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                // **A supplied null is bound, not dropped.** `filter_map` used to discard it, so a
+                // variable the client did set re-surfaced as `unbound variable` - a refusal naming the
+                // wrong cause, and one a client cannot act on (Jules on #1282). `from_json` now carries
+                // null through as `Value::Null`, and the lowering refuses it by name.
+                .filter_map(|(k, v)| {
+                    crate::graph_query::Value::from_json(v).map(|v| (k.clone(), v))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let path = s.dir.join("graph").join("schema.graphql");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"errors":[{"message":
+                "this nest carries no Graph schema; run `nuthatch port-emit` against the \
+                 subgraph source to write graph/schema.graphql"}]})),
+        );
+    };
+    let schema = match crate::graph_schema::parse(&text) {
+        Ok(sc) => sc,
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"errors":[{"message":
+                    format!("graph/schema.graphql does not parse: {e}")}]})),
+            )
+        }
+    };
+
+    // The operation is parsed **before** anything is routed. Deciding by searching the raw text for
+    // `__schema` meant a filter value of `"__schema"` - a perfectly ordinary thing to store in a
+    // `hooks` column - was answered with the schema document instead of rows (Jules on #1282). A root
+    // field name is a structural fact and a string literal is not, so read the structure.
+    let roots = match crate::graph_query::parse_named(&query, &vars, operation_name.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+    };
+    let mut data = serde_json::Map::new();
+    // Rendered at most once, and only if a root asks for it.
+    let mut doc: Option<serde_json::Value> = None;
+    // **Every root field is answered.** Routing on `any(… == "__schema")` and returning early meant
+    // `{ __schema { queryType { name } } pools { id } }` came back without `pools` at all - a field
+    // the operation asked for, silently missing from the response (Jules on #1282). Introspection is
+    // not an exclusive mode, it is two more root fields.
+    for root in &roots {
+        match root.name.as_str() {
+            // The introspection surface a generated client fetches before it sends anything useful.
+            // `render` produces `{"__schema": …}`, so the inner value is what belongs under the key.
+            "__schema" => {
+                let d =
+                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
+                data.insert(root.key.clone(), project(&d["__schema"], &root.sel));
+                continue;
+            }
+            // The other standard introspection operation. The name comes from the parsed argument,
+            // and one the schema does not declare is `null` rather than an error - that is what
+            // introspection says, and a client uses it to test whether a type exists.
+            "__type" => {
+                let d =
+                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
+                let found = root
+                    .args
+                    .get("name")
+                    .and_then(|v| match v {
+                        crate::graph_query::Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .and_then(|want| {
+                        d["__schema"]["types"]
+                            .as_array()?
+                            .iter()
+                            .find(|t| t["name"].as_str() == Some(want.as_str()))
+                            .cloned()
+                    })
+                    .map(|t| project(&t, &root.sel));
+                data.insert(root.key.clone(), found.unwrap_or(serde_json::Value::Null));
+                continue;
+            }
+            // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
+            // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no
+            // handler that could have aborted.
+            "_meta" => {
+                let last = s
+                    .store
+                    .get_meta("last_block")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok());
+                // Rendered complete, then narrowed by the selection, exactly as `__schema` and
+                // `__type` are. It used to insert this object whole, so `{ _meta { block { number } } }`
+                // came back carrying `deployment` and `hasIndexingErrors` the client had not asked
+                // for and ignoring every alias. Probed against the live reference: graph-node returns
+                // only the selected fields, and honours an alias on the root, on a leaf and on the
+                // scalars. It does *not* honour one on `block` itself - `{ _meta { b: block { number } } }`
+                // answers `internal error resolving _Block_.block: expected prefetched result, but
+                // found nothing`, which is a graph-node defect rather than a contract. Projecting
+                // uniformly answers that correctly; no client can be relying on the error.
+                //
+                // `timestamp` is null because nothing stores a block's timestamp (#1289). `hash` and
+                // `parentHash` are real.
+                let meta = serde_json::json!({
+                    "block": {
+                        "number": last,
+                        "hash": last.and_then(|n| s.store.get_block_hash(n).ok().flatten()),
+                        "parentHash": last
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|n| s.store.get_block_hash(n).ok().flatten()),
+                        "timestamp": serde_json::Value::Null,
+                    },
+                    // `deployment` is `String!`. `nid` is `None` for a nest mounted by alias with no
+                    // content address (`MountTable::nest_dir`), and answering `null` against a
+                    // non-null field is a document a strict client rejects outright. The nest's own
+                    // name is the honest stand-in: a mismatch against an expected CID is then visible
+                    // rather than a schema violation.
+                    "deployment": s.nid.as_deref().map(|n| n.to_string()).unwrap_or_else(|| {
+                        s.nest_info["name"].as_str().unwrap_or("nuthatch").to_string()
+                    }),
+                    "hasIndexingErrors": false
+                });
+                data.insert(root.key.clone(), project(&meta, &root.sel));
+                continue;
+            }
+            _ => {}
+        }
+        let compiled = match crate::graph_query::compile(&schema, root) {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+        };
+        match graph_rows(&s, &compiled).await {
+            Ok(rows) => {
+                let shaped: Result<Vec<serde_json::Value>, String> =
+                    rows.iter().map(|r| graph_shape(&compiled, r)).collect();
+                let shaped = match shaped {
+                    Ok(v) => v,
+                    Err(e) => return (StatusCode::OK, Json(gql_error(&e))),
+                };
+                let value = if compiled.singular {
+                    shaped.into_iter().next().unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Array(shaped)
+                };
+                data.insert(root.key.clone(), value);
+            }
+            Err(msg) => return (StatusCode::OK, Json(gql_error(&msg))),
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"data": data})))
+}
+
+/// Narrow a rendered value to exactly the fields a selection asked for.
+///
+/// A GraphQL response carries the selected fields and no others. The introspection branches used to hand
+/// back the whole rendered document whatever was selected, so `{ __schema { types { name } } }` came back
+/// with all eight keys of every type (Jules on #1282). Harmless to the clients that ignore extras, wrong
+/// for any that do not, and trivially avoidable now the parser hands over a resolved selection tree.
+///
+/// A selected field the document does not carry becomes `null` rather than being dropped: a client that
+/// asked for a key should find it there.
+///
+/// Arguments on an introspection field are ignored on purpose. The only one a client sends is
+/// `includeDeprecated`, and a generated subgraph schema deprecates nothing, so both values answer the
+/// same list.
+fn project(value: &serde_json::Value, sel: &[crate::graph_query::Selection]) -> serde_json::Value {
+    if sel.is_empty() {
+        return value.clone();
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(|v| project(v, sel)).collect())
+        }
+        serde_json::Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for s in sel {
+                let v = o.get(&s.name).cloned().unwrap_or(serde_json::Value::Null);
+                out.insert(s.key.clone(), project(&v, &s.sub));
+            }
+            serde_json::Value::Object(out)
+        }
+        // A scalar with a sub-selection is not a legal query; pass it through rather than invent an
+        // object for it.
+        _ => value.clone(),
+    }
+}
+
+/// Build one response object from one SQL row.
+///
+/// A relation traversal is flattened into the row by the join that lowered it, so `token0 { symbol }`
+/// arrives as a column called `j0__symbol` and has to be put back under `token0`. Only
+/// [`crate::graph_query::Compiled::shape`] knows that mapping.
+///
+/// A to-one reference whose target row is missing comes back as all-null from the `LEFT JOIN`, and the
+/// relation is then `null` rather than an object of nulls - which is what graph-node answers, and the
+/// difference a client can actually see.
+fn graph_shape(
+    compiled: &crate::graph_query::Compiled,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    use crate::graph_query::Shape;
+    let mut out = serde_json::Map::new();
+    for sh in &compiled.shape {
+        match sh {
+            // `key` is what the caller asked to see it under, `col` is where it arrives. They differ
+            // when an alias was written - `{ p: pools { n: id } }`.
+            Shape::Scalar { key, col } => {
+                out.insert(
+                    key.clone(),
+                    row.get(col).cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+            // A `@derivedFrom` list arrives as one JSON array in one column.
+            Shape::List { key, col } => {
+                let v = row.get(col);
+                let list = match v {
+                    // Already parsed: the row serialiser may hand back a DuckDB `json` column as a
+                    // value rather than a string. Both are accepted rather than one assumed.
+                    Some(serde_json::Value::Array(a)) => serde_json::Value::Array(a.clone()),
+                    Some(serde_json::Value::String(t)) => match serde_json::from_str(t) {
+                        Ok(serde_json::Value::Array(a)) => serde_json::Value::Array(a),
+                        // Not an array and not parseable is a bug in the SQL this module wrote, not
+                        // something to paper over with `[]` - a caller told an empty list is
+                        // indistinguishable from one told the truth.
+                        _ => return Err(format!("`{key}` did not come back as a JSON array: {t}")),
+                    },
+                    // `coalesce(…, '[]')` means this cannot be null, so null is also a bug.
+                    other => return Err(format!("`{key}` is missing from the row: {other:?}")),
+                };
+                out.insert(key.clone(), list);
+            }
+            Shape::Object {
+                key,
+                marker,
+                fields,
+            } => {
+                let mut inner = serde_json::Map::new();
+                for (sub_key, col) in fields {
+                    let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
+                    inner.insert(sub_key.clone(), v);
+                }
+                // The marker is the target's id, so it is non-null exactly when the `LEFT JOIN` found a
+                // row. Deciding from the *selected* values instead answered `null` for a relation that
+                // existed but whose selected fields were all null - a real object reported as absent.
+                let present = row.get(marker).is_some_and(|v| !v.is_null());
+                out.insert(
+                    key.clone(),
+                    if present {
+                        serde_json::Value::Object(inner)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
+/// every refusal here returns `200` with this body rather than a 4xx.
+fn gql_error(message: &str) -> serde_json::Value {
+    serde_json::json!({"errors":[{"message": message}]})
+}
+
+/// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
+/// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
+async fn graph_rows(
+    s: &AppState,
+    compiled: &crate::graph_query::Compiled,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    let resp = run_sql_query(s.clone(), compiled.sql.clone(), None).await;
+    let body = axum::body::to_bytes(resp.into_response().into_body(), 64 << 20)
+        .await
+        .map_err(|e| format!("reading the query result: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("decoding the query result: {e}"))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(v.get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_object().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default())
+}
+
 async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
     let sem = crate::semantic::load(&s.dir).ok().flatten();
     if let Some(sem) = &sem {
@@ -4863,5 +5193,1123 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON challenge");
         assert_eq!(body["accepts"][0]["amount"], "1000");
         assert_eq!(body["accepts"][0]["network"], "eip155:84532");
+    }
+    /// The nest every Graph-endpoint test below talks to: a schema, three views, and a head.
+    ///
+    /// Shared because these tests were one 421-line function with thirty assertions, and a Rust test
+    /// stops at its **first** failure - so a mutation breaking an early assertion hid every later one,
+    /// and three different mutations all reported the same line. Split so each lands on its own test.
+    fn graph_fixture() -> (tempfile::TempDir, AppState) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("graph")).unwrap();
+        std::fs::write(
+            d.path().join("graph/schema.graphql"),
+            concat!(
+                "type Pool @entity {\n  id: ID!\n  liquidity: BigInt!\n  hooks: String!\n",
+                "  token0: Token!\n",
+                "  swaps: [Swap!]! @derivedFrom(field: \"pool\")\n}\n",
+                "type Swap @entity { id: ID! pool: Pool! amount: BigInt! }\n",
+                // `decimals` is `Int!` and stays a JSON number; `totalSupply` is `BigInt!` and must be a
+                // string. Both are here because the wire rule is per-scalar, and a fixture with only one
+                // of them cannot tell "casts everything" from "casts the right things".
+                //
+                // `totalSupply`'s value is small on purpose. The first version used 1e24, which exceeds
+                // DuckDB's `BIGINT` so the serialiser already rendered it as a string - and the mutation
+                // dropping the cast stayed green against it. A value that fits in an integer is the one
+                // that tells the cast from the storage type.
+                "type Token @entity { id: ID! symbol: String! decimals: Int! totalSupply: BigInt! }\n",
+            ),
+        )
+        .unwrap();
+        // A view named for the entity, so the compiled SQL has something to read: this test is the
+        // whole user story end to end, GraphQL in over HTTP and an entity row out.
+        std::fs::create_dir_all(d.path().join("views")).unwrap();
+        std::fs::write(
+            d.path().join("views/pool.sql"),
+            "CREATE VIEW pool AS SELECT '0xaaa' AS id, 42 AS liquidity, '0xhook' AS hooks, '0xt1' AS token0 \
+             UNION ALL SELECT '0xbbb', 7, '0xhook2', '0xmissing' \
+             UNION ALL SELECT '0xccc', 99, '0xhook3', '0xt2';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("views/swap.sql"),
+            "CREATE VIEW swap AS SELECT 's2' AS id, '0xaaa' AS pool, 7 AS amount \
+             UNION ALL SELECT 's1', '0xaaa', 5;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("views/token.sql"),
+            // `0xt2` exists but has nothing in its selected fields: that is the row that tells a
+            // missing join apart from an all-null one.
+            "CREATE VIEW token AS SELECT '0xt1' AS id, 'WETH' AS symbol, 18 AS decimals, \
+             21000000 AS \"totalSupply\" \
+             UNION ALL SELECT '0xt2', NULL, NULL, NULL;\n",
+        )
+        .unwrap();
+        let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        // `_meta` reports the nest's own head, so give it one to report - with the hash of the head
+        // and of its parent, which `_meta.block.hash` and `parentHash` are answered from.
+        state.store.set_meta("last_block", "23456789").unwrap();
+        state.store.set_block_hash(23_456_789, "0xhead").unwrap();
+        state.store.set_block_hash(23_456_788, "0xparent").unwrap();
+
+        (d, state)
+    }
+
+    /// POST one GraphQL operation and decode the envelope.
+    async fn graph_ask(uri: &str, q: &str, st: AppState) -> serde_json::Value {
+        use tower::ServiceExt;
+        let res = router(SharedNest::new(st))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "query": q }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// RFC-0053 S1 (#1265): a client can introspect a nest over HTTP.
+    ///
+    /// This is the assertion that moves the compatibility surface from "generated" to "reachable".
+    /// The renderer is diffed against a real graph-node in `tests/graph_schema_golden.rs`; this one
+    /// proves a client can actually fetch it, at the subgraph URL shape as well as the plain one, and
+    /// that anything which is not introspection is refused inside the Graph error envelope rather
+    /// than as a bare status a client cannot read.
+    #[tokio::test]
+    async fn a_client_can_introspect_the_nest_over_http() {
+        // Two requests below are built inline rather than through `graph_ask`, because they carry a
+        // `variables` object the helper does not take.
+        use tower::ServiceExt;
+
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
+        for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
+            // The query asks for what this test goes on to read: the response is now projected to the
+            // selection, so relying on unselected keys arriving anyway would be relying on a bug.
+            let body = ask(
+                uri,
+                "{ __schema { types { name fields { name } } } }",
+                state.clone(),
+            )
+            .await;
+            let types = body["data"]["__schema"]["types"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{uri} returned no types: {body}"));
+            let names: Vec<&str> = types.iter().filter_map(|t| t["name"].as_str()).collect();
+            for want in [
+                "Pool",
+                "Pool_filter",
+                "Pool_orderBy",
+                "Query",
+                "BigInt",
+                "_Meta_",
+            ] {
+                assert!(
+                    names.contains(&want),
+                    "{uri}: {want} missing from {names:?}"
+                );
+            }
+            let query = types.iter().find(|t| t["name"] == "Query").unwrap();
+            let roots: Vec<&str> = query["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|f| f["name"].as_str())
+                .collect();
+            assert!(
+                roots.contains(&"pool") && roots.contains(&"pools") && roots.contains(&"_meta"),
+                "{uri}: root fields were {roots:?}"
+            );
+        }
+
+        // `_meta` is answered from the nest's own head and needs no view.
+        let body = graph_ask(
+            "/graphql",
+            "{ _meta { block { number } hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["_meta"]["hasIndexingErrors"],
+            serde_json::json!(false),
+            "a nest runs no mapping, so it has no indexing error to report: {body}"
+        );
+        // The head is the nest's real one. Asserted because a client uses `_meta.block.number` to
+        // decide whether the endpoint is caught up, and a hardcoded null reads as "never indexed".
+        assert_eq!(
+            body["data"]["_meta"]["block"]["number"],
+            serde_json::json!(23_456_789u64),
+            "_meta must report the nest's own head: {body}"
+        );
+
+        // An entity query compiles and answers (S2, #1266). Two rows, in id order, so this sees a
+        // dropped ORDER BY as well as a dropped row.
+        //
+        // `liquidity` is a **string**. This assertion read `42` until the end-to-end test over indexed
+        // data caught it: graph-node sends `BigInt` as `q::Value::String`
+        // (`graph/src/data/store/mod.rs:568`), so a JSON number here is a value a client cannot hold
+        // above 2^53 and parses differently below it.
+        let body = ask("/graphql", "{ pools { id liquidity } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                {"id": "0xaaa", "liquidity": "42"},
+                {"id": "0xbbb", "liquidity": "7"},
+                {"id": "0xccc", "liquidity": "99"},
+            ]),
+            "a plain collection must answer rows from the nest's view: {body}"
+        );
+
+        // And the arguments are not decoration: `first` bounds, `where` filters, and a singular
+        // root takes one. Each of these silently returning the unfiltered set is the failure mode
+        // that makes a drop-in endpoint worse than no endpoint.
+        let body = ask("/graphql", "{ pools(first: 1) { id } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "first: 1 must return one row: {body}"
+        );
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { liquidity_lt: "10" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xbbb"}]),
+            "a where filter must actually filter: {body}"
+        );
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pool(id: "0xbbb") { hooks } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "a singular root must answer one object, not a list: {body}"
+        );
+
+        // A client-shaped request: a named operation with variables, passed in the request body's
+        // `variables` object rather than inlined in the query. Asserted over HTTP because the
+        // parser test cannot see whether the handler actually reads that field.
+        let res = router(SharedNest::new(state.clone()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "query": "query Pools($n: Int!, $min: BigInt!) \
+                                      { pools(first: $n, where: { liquidity_gt: $min }) { id } }",
+                            "variables": { "n": 5, "min": "10" },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 4 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // Both bound variables show: `liquidity_gt: 10` excludes `0xbbb` at 7 and keeps the two above
+        // it, and `first: 5` is wide enough not to be what trimmed the list.
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}, {"id": "0xccc"}]),
+            "variables from the request body must bind: {body}"
+        );
+    }
+
+    /// `null` is refused by name, from a literal and from a variable alike (Jules on #1282).
+    ///
+    /// The literal used to parse as the enum `null` and compile to `hooks = 'null'`, which matches rows
+    /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows. The
+    /// variable used to be dropped by `filter_map` and re-surfaced as `unbound variable`, which is a
+    /// refusal naming the wrong cause.
+    #[tokio::test]
+    async fn a_null_filter_value_is_refused_by_name() {
+        let (_d, state) = graph_fixture();
+
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { hooks: null }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("`hooks` was given `null`"),
+            "a null literal must be named, not compared as a string: {body}"
+        );
+        assert!(
+            body["data"].is_null(),
+            "and it must not answer rows: {body}"
+        );
+
+        // The same value through `variables`, which is how a generated client sends it.
+        use tower::ServiceExt;
+        let res = router(SharedNest::new(state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "query": "query P($h: Bytes) { pools(where: { hooks: $h }) { id } }",
+                            "variables": { "h": serde_json::Value::Null },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 4 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("`hooks` was given `null`"),
+            "a supplied null must be bound and named, not reported as unbound: {body}"
+        );
+    }
+
+    /// `operationName` selects among several operations in one document (Jules on #1282).
+    ///
+    /// The parser kept a single operation and refused the second, and the handler never read
+    /// `operationName` at all - so `{"query": "query A {…} query B {…}", "operationName": "B"}`, which
+    /// graph-node answers, came back refused. Asserted over HTTP because the finding was about the
+    /// handler rather than the parser: a parser test passes with the field still ignored.
+    #[tokio::test]
+    async fn the_request_operation_name_selects_among_several_operations() {
+        let (_d, state) = graph_fixture();
+        use tower::ServiceExt;
+        let post = |body: serde_json::Value, state: AppState| async move {
+            let res = router(SharedNest::new(state))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/graphql")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(res.into_body(), 4 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let two =
+            "query A { pool(id: \"0xaaa\") { hooks } } query B { pool(id: \"0xbbb\") { hooks } }";
+
+        // The named one runs, and it is the named one rather than the first.
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "B"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "`operationName` must select operation B: {body}"
+        );
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "A"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook"}),
+            "and A when A is asked for, so the answer is not simply the first operation: {body}"
+        );
+
+        // graph-node's two refusals, word for word (graph/src/data/query/error.rs:158).
+        let body = post(serde_json::json!({"query": two}), state.clone()).await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name required",
+            "several operations and no name is a named refusal: {body}"
+        );
+        let body = post(
+            serde_json::json!({"query": two, "operationName": "C"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name not found `C`",
+            "a name nothing carries is a named refusal: {body}"
+        );
+
+        // One named operation and no `operationName` still runs: that is what a client sends when it has
+        // one query in the document, and it is the commonest request of all.
+        let body = post(
+            serde_json::json!({"query": "query Only { pool(id: \"0xaaa\") { hooks } }"}),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook"}),
+            "one named operation needs no name to be selected: {body}"
+        );
+
+        // An anonymous operation carries no name, so a name selects nothing - even as the only operation.
+        let body = post(
+            serde_json::json!({
+                "query": "{ pool(id: \"0xaaa\") { hooks } }",
+                "operationName": "A",
+            }),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"], "Operation name not found `A`",
+            "the shorthand operation is anonymous and a name must not match it: {body}"
+        );
+
+        // An empty string is how some clients spell "no name". It must not be looked up as a name.
+        let body = post(
+            serde_json::json!({
+                "query": "{ pool(id: \"0xbbb\") { hooks } }",
+                "operationName": "",
+            }),
+            state,
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pool"],
+            serde_json::json!({"hooks": "0xhook2"}),
+            "an empty `operationName` means no name given: {body}"
+        );
+    }
+
+    /// The introspection document a generated client actually sends is built from fragments, and the
+    /// endpoint answers every root field of a mixed operation rather than the first it recognises.
+    /// The golden path serves in full on a nest that has never been ported, and the Graph routes say so.
+    ///
+    /// The serving half of `tests/core_stays_pristine.rs`, here because it has to bind the real router.
+    /// Chief's constraint, 2026-09-11: the default and golden path stay the delightful core, and the
+    /// Graph dialect is an optional lane. This asserts the lane is **inert** rather than merely unused -
+    /// a route that answers an empty success on an unported nest would look like a working endpoint
+    /// serving no data, which is the silent substitution this whole surface keeps producing.
+    #[tokio::test]
+    async fn the_core_serves_with_no_graph_schema_present() {
+        let (d, state) = graph_fixture();
+        // The fixture writes `graph/schema.graphql` so the dialect tests have something to read. The
+        // golden path must not need it, so take it away.
+        std::fs::remove_file(d.path().join("graph/schema.graphql")).expect("remove the schema");
+
+        use tower::ServiceExt;
+        // Every golden-path surface still answers.
+        for uri in [
+            "/",
+            "/health",
+            "/ready",
+            "/tables",
+            "/schema",
+            "/entities",
+            "/sql?q=SELECT%201",
+        ] {
+            let res = router(SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("request");
+            assert!(
+                res.status().is_success(),
+                "{uri} must serve on a nest that was never ported, got {}",
+                res.status()
+            );
+        }
+
+        // And the lane refuses by name rather than answering an empty success.
+        for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
+            let body = graph_ask(uri, "{ pools { id } }", state.clone()).await;
+            let msg = body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{uri} answered without an error: {body}"));
+            assert!(
+                msg.contains("carries no Graph schema") && msg.contains("port-emit"),
+                "{uri} must name the artefact and how to get one, got {msg:?}"
+            );
+            assert!(
+                body.get("data").is_none_or(|d| d.is_null()),
+                "{uri} must not answer data it cannot have: {body}"
+            );
+        }
+    }
+
+    /// `_meta` is narrowed by the selection like every other root.
+    ///
+    /// It used to be inserted whole, so `{ _meta { block { number } } }` answered with `deployment`
+    /// and `hasIndexingErrors` attached and every alias ignored. Every expectation here was probed
+    /// against the live reference endpoint rather than read off the spec.
+    ///
+    /// The one deliberate divergence: graph-node cannot alias `block` itself -
+    /// `{ _meta { b: block { number } } }` answers `internal error resolving _Block_.block: expected
+    /// prefetched result, but found nothing`. Projecting uniformly answers it, which is strictly more
+    /// useful and which no client can be relying on the absence of.
+    #[tokio::test]
+    async fn the_meta_root_is_narrowed_to_the_selection() {
+        let (_d, state) = graph_fixture();
+        let ask = graph_ask;
+
+        // Narrow: exactly the one field, nothing else. The reference answers
+        // `{"_meta":{"block":{"number":25953333}}}` for this shape.
+        let body = ask("/graphql", "{ _meta { block { number } } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["_meta"],
+            serde_json::json!({"block": {"number": 23_456_789u64}}),
+            "_meta must carry only what was selected: {body}"
+        );
+
+        // Complete: every declared field of `_Meta_` and `_Block_`. `timestamp` is null because
+        // nothing stores one (#1289); the rest are real.
+        let body = graph_ask(
+            "/graphql",
+            "{ _meta { block { number hash timestamp parentHash } deployment hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["_meta"]["block"],
+            serde_json::json!({
+                "number": 23_456_789u64,
+                "hash": "0xhead",
+                "timestamp": serde_json::Value::Null,
+                "parentHash": "0xparent",
+            }),
+            "the block must carry the head, its hash and its parent's: {body}"
+        );
+        assert_eq!(
+            body["data"]["_meta"]["hasIndexingErrors"],
+            serde_json::json!(false),
+            "a nest runs no mapping, so it has no indexing error: {body}"
+        );
+
+        // Aliases, at every depth. The reference honours the root, the leaf and the scalars.
+        let body = graph_ask(
+            "/graphql",
+            "{ m: _meta { b: block { n: number h: hash } d: deployment e: hasIndexingErrors } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["m"],
+            serde_json::json!({
+                "b": {"n": 23_456_789u64, "h": "0xhead"},
+                "d": body["data"]["m"]["d"].clone(),
+                "e": false,
+            }),
+            "every alias must become the response key: {body}"
+        );
+        // `deployment` is `String!`, and `nid` is `None` for a nest mounted by alias, so this is a
+        // real production shape rather than a fixture quirk. Null here is a document a strict client
+        // rejects before it reads a single row.
+        assert!(
+            body["data"]["m"]["d"].is_string(),
+            "`deployment` is `String!` and must never answer null: {body}"
+        );
+
+        // A field the type does not have answers null rather than leaking the whole object.
+        let body = ask("/graphql", "{ _meta { nonesuch } }", state.clone()).await;
+        assert_eq!(
+            body["data"]["_meta"],
+            serde_json::json!({"nonesuch": serde_json::Value::Null}),
+            "an unknown selected field must not widen the answer: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fragment_document_and_a_mixed_operation_answer_over_http() {
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
+
+        // The introspection document a generated client actually sends, fragments and all. Refusing
+        // fragments refused the one request that has to work before any other can: a client will not
+        // send a useful query until it has validated against the schema it fetched this way.
+        let body = graph_ask(
+            "/graphql",
+            r#"query IntrospectionQuery {
+                 __schema {
+                   queryType { name }
+                   types { ...FullType }
+                 }
+               }
+               fragment FullType on __Type {
+                 kind
+                 name
+                 fields(includeDeprecated: true) { name }
+               }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["errors"].is_null(),
+            "a fragment-based introspection document must not be refused: {body}"
+        );
+        let names: Vec<&str> = body["data"]["__schema"]["types"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no types: {body}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for want in ["Pool", "Pool_filter", "Token", "_Meta_", "_Log_"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+
+        // A response carries the selected fields and no others. The introspection branches used to hand
+        // back the whole rendered document whatever was asked for, so a client selecting `name` received
+        // all eight keys of every type.
+        let body = ask("/graphql", "{ __schema { types { name } } }", state.clone()).await;
+        let first = body["data"]["__schema"]["types"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("no types: {body}"));
+        assert_eq!(
+            first.keys().cloned().collect::<Vec<_>>(),
+            ["name"],
+            "a projected response carries only what was selected"
+        );
+        let top = body["data"]["__schema"].as_object().unwrap();
+        assert_eq!(
+            top.keys().cloned().collect::<Vec<_>>(),
+            ["types"],
+            "including at the `__schema` level"
+        );
+
+        // A selected field the document does not carry is `null`, not absent: a client that asked for a
+        // key should find it there.
+        let body = graph_ask(
+            "/graphql",
+            "{ __schema { types { name nope } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__schema"]["types"][0],
+            serde_json::json!({"name": "String", "nope": null}),
+            "an unknown selected key is null rather than missing: {body}"
+        );
+
+        // An alias on an introspection field answers under the alias, and projection follows it down.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ s: __schema { t: types { n: name } } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["s"]["t"][0],
+            serde_json::json!({"n": "String"}),
+            "aliases survive projection at every level: {body}"
+        );
+
+        // `__type` is projected too.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __type(name: "Pool") { name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__type"],
+            serde_json::json!({"name": "Pool"}),
+            "{body}"
+        );
+
+        // Introspection is not an exclusive mode, it is two more root fields. Returning early on the
+        // first one meant a mixed operation came back without its data fields at all - present in the
+        // request, silently missing from the response.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __schema { queryType { name } } __type(name: "Pool") { name } _meta { hasIndexingErrors } pools(first: 1) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__schema"]["queryType"]["name"], "Query",
+            "the schema root still answers in a mixed operation: {body}"
+        );
+        assert_eq!(body["data"]["__type"]["name"], "Pool", "{body}");
+        assert_eq!(body["data"]["_meta"]["hasIndexingErrors"], false, "{body}");
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "and so does the data root, which used to be dropped entirely: {body}"
+        );
+
+        // Introspection is chosen from the parsed root field name, not by searching the text. A
+        // filter value that happens to read `__schema` is an ordinary string, and answering it with
+        // the schema document loses the caller's query entirely (Jules on #1282).
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { hooks: "__schema" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["data"]["__schema"].is_null(),
+            "a string literal must not route to introspection: {body}"
+        );
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([]),
+            "it must run as the filter it is, and no pool has that hook: {body}"
+        );
+    }
+
+    /// The **canonical introspection document**, sent verbatim from the recording fixture, answered with
+    /// the same shape graph-node answers it with.
+    ///
+    /// This is the end of the argument about whether a generated client can consume our introspection
+    /// response. The query is the one graphql-js emits - `FullType`, `InputValue`, `TypeRef`, fragment
+    /// spreads and all - and the assertion is that for every type the reference carries, our response
+    /// carries the same keys, with the same keys on every field, argument and enum value. Not "the keys we
+    /// thought to emit", and not "the keys the other tests happen to read": the reference's own.
+    ///
+    /// **This test deliberately does not cover projection**, and a mutation that stops projecting leaves
+    /// it green. The canonical document selects every key, so narrowing the response to that selection
+    /// yields the same document either way. Projection is covered where it can be seen - narrow
+    /// selections, in `a_fragment_document_and_a_mixed_operation_answer_over_http`. Two tests, two
+    /// properties: this one says the document is *complete*, that one says it is *no wider than asked*.
+    #[tokio::test]
+    async fn the_canonical_introspection_document_answers_with_the_references_shape() {
+        // The **recorded Uniswap V4 schema**, not the small fixture nest: the reference document was
+        // recorded from that deployment, so anything else is comparing two different schemas. No views
+        // are needed - this test only introspects.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("graph")).unwrap();
+        std::fs::write(
+            d.path().join("graph/schema.graphql"),
+            include_str!("../tests/fixtures/graph-node/uniswap-v4-schema.graphql"),
+        )
+        .unwrap();
+        let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        let query: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph-node/introspection-query.gql.json"
+        ))
+        .expect("the recording query parses");
+        let query = query["query"].as_str().expect("a query string");
+        let body = graph_ask("/graphql", query, state).await;
+        assert!(
+            body["errors"].is_null(),
+            "the canonical document must not be refused: {}",
+            serde_json::to_string(&body["errors"]).unwrap_or_default()
+        );
+
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph-node/graph-node-introspection-uniswap-v4.json"
+        ))
+        .expect("the recorded reference parses");
+        // **Values, not key sets.** Projection inserts `null` for any selected key, so the response's
+        // keys always equal the selection and comparing them through this path is vacuous by
+        // construction - my first attempt at this test passed with the normalisation pass removed *and*
+        // with projection removed. Compare what the keys contain.
+        let ours: std::collections::BTreeMap<String, serde_json::Value> = body["data"]["__schema"]
+            ["types"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no types: {body}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|n| (n.to_string(), t.clone())))
+            .collect();
+        let mut compared = 0;
+        for t in reference["__schema"]["types"].as_array().unwrap() {
+            let name = t["name"].as_str().unwrap_or_default();
+            if name.starts_with("__") {
+                continue; // the meta-schema, which a nest does not model
+            }
+            let Some(m) = ours.get(name) else { continue };
+            // `description` is a **declared divergence**: graph-node carries the schema author's doc
+            // comments there, they are not part of the contract a client validates against, and this
+            // renderer emits the key with `null`. The key's *presence* is what a client needs and is
+            // asserted at the render level by the golden test; its text is not reproduced.
+            for key in ["kind", "interfaces", "possibleTypes"] {
+                assert_eq!(m[key], t[key], "{name}.{key}");
+            }
+            for list in ["fields", "inputFields", "enumValues"] {
+                assert_eq!(
+                    m[list].is_null(),
+                    t[list].is_null(),
+                    "{name}.{list}: null on one side only"
+                );
+                let (Some(a), Some(b)) = (t[list].as_array(), m[list].as_array()) else {
+                    continue;
+                };
+                // **By name, not by position.** Declaration order is not something a client depends on,
+                // and zipping the two lists positionally compared unrelated entries - it reported a
+                // field with 35 arguments against one with 5.
+                let by_name = |l: &[serde_json::Value]| -> std::collections::BTreeMap<String, serde_json::Value> {
+                    l.iter()
+                        .filter_map(|e| e["name"].as_str().map(|n| (n.to_string(), e.clone())))
+                        .collect()
+                };
+                let (ra, ma) = (by_name(a), by_name(b));
+                assert_eq!(
+                    ra.keys().collect::<Vec<_>>(),
+                    ma.keys().collect::<Vec<_>>(),
+                    "{name}.{list} names"
+                );
+                for (entry, x) in &ra {
+                    let y = &ma[entry];
+                    for key in ["name", "isDeprecated", "deprecationReason", "type"] {
+                        if x.get(key).is_none() {
+                            continue; // not a key this list's entries carry
+                        }
+                        assert_eq!(y[key], x[key], "{name}.{list}.{entry}.{key}");
+                    }
+                    if let Some(xa) = x["args"].as_array() {
+                        let ya = y["args"]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("{name}.{list}.{entry} has no args"));
+                        let (rg, mg) = (by_name(xa), by_name(ya));
+                        assert_eq!(
+                            rg.keys().collect::<Vec<_>>(),
+                            mg.keys().collect::<Vec<_>>(),
+                            "{name}.{list}.{entry} argument names"
+                        );
+                        for (arg, p) in &rg {
+                            for key in ["name", "type", "defaultValue"] {
+                                assert_eq!(
+                                    mg[arg][key], p[key],
+                                    "{name}.{list}.{entry}({arg}).{key}"
+                                );
+                            }
+                        }
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        // A floor, so this cannot pass by comparing nothing: 19 entities contribute an object, a filter
+        // and an orderBy enum each.
+        assert!(compared >= 500, "only {compared} entries compared");
+
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v["__schema"]["directives"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mine = serde_json::json!({"__schema": body["data"]["__schema"].clone()});
+        assert_eq!(
+            names(&mine),
+            names(&reference),
+            "the directives a client reads"
+        );
+    }
+
+    /// `__type`, the traversals, the text operators and every refusal, each in the Graph envelope.
+    #[tokio::test]
+    async fn the_graph_endpoint_answers_types_traversals_and_refusals() {
+        let (d, state) = graph_fixture();
+        let _ = &d;
+        let ask = graph_ask;
+
+        // Aliases, over HTTP: the handler routes on the schema field name and answers under the
+        // caller's key. That split matters for the introspection roots too, which are routed by name.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ s: __schema { queryType { name } } m: _meta { hasIndexingErrors }
+                 p: pools(first: 1) { n: id t: token0 { sym: symbol } } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(body["data"]["s"]["queryType"]["name"], "Query", "{body}");
+        assert_eq!(body["data"]["m"]["hasIndexingErrors"], false, "{body}");
+        assert_eq!(
+            body["data"]["p"],
+            serde_json::json!([{"n": "0xaaa", "t": {"sym": "WETH"}}]),
+            "an aliased entity root, scalar and traversal all answer under their keys: {body}"
+        );
+        assert!(
+            body["data"]["__schema"].is_null() && body["data"]["pools"].is_null(),
+            "nothing answers under the unaliased name: {body}"
+        );
+
+        // `__type` is the other standard introspection operation, and it has to answer under
+        // `__type`. It used to fall into the `__schema` branch and return the whole schema document
+        // under the wrong key, which is an invalid response to the query that was asked.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __type(name: "Pool") { kind name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["__type"]["name"], "Pool",
+            "__type must answer under __type: {body}"
+        );
+        assert_eq!(
+            body["data"]["__type"]["kind"], "OBJECT",
+            "an entity is an OBJECT, not a SCALAR: {body}"
+        );
+        assert!(
+            body["data"]["__schema"].is_null(),
+            "asking for __type must not return the whole schema: {body}"
+        );
+        // A name the schema does not declare is `null` rather than an error - that is what
+        // introspection says, and a client uses it to test whether a type exists.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __type(name: "Nope") { name } }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["data"]["__type"].is_null() && body["errors"].is_null(),
+            "an undeclared type is null, not an error: {body}"
+        );
+
+        // A `@derivedFrom` list, aggregated into one JSON column and read back as an array. `0xbbb`
+        // has no swaps, so it must answer `[]` - DuckDB's `list()` over zero rows is NULL, which
+        // would have served null for a field the schema types `[Swap!]!`.
+        //
+        // `amount` is a **string**, for the same reason a top-level `BigInt` is: this asserted `5` until
+        // the wire-type rule reached the packed struct, which is the second test on this branch found to
+        // have the wrong type pinned.
+        // **An alias inside an aggregated list answers under the alias.** The packed struct keyed by the
+        // field name rather than the selection key, so `sid: id` came back as `id` - a key the client never
+        // asked for, in the one place the root-level alias test could not see (Jules on #1282).
+        let body = graph_ask(
+            "/graphql",
+            "{ pools { id swaps { sid: id amt: amount } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"][0]["swaps"],
+            serde_json::json!([{"sid": "s1", "amt": "5"}, {"sid": "s2", "amt": "7"}]),
+            "a child alias must survive the aggregation: {body}"
+        );
+
+        // **`orderBy` on a relation is refused.** graph-node's generated enum includes every field of the
+        // entity, `@derivedFrom` lists among them, so this is a value the schema advertises and the parent
+        // view has no column for - `ORDER BY b."swaps"` either failed in DuckDB or sorted by a JSON
+        // aggregate (Jules on #1282).
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(orderBy: swaps) { id } }",
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("orderBy `swaps`") && msg.contains("relation"),
+            "ordering by a relation must be refused by name: {body}"
+        );
+
+        let body = graph_ask(
+            "/graphql",
+            "{ pools { id swaps { id amount } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                {"id": "0xaaa", "swaps": [{"id": "s1", "amount": "5"}, {"id": "s2", "amount": "7"}]},
+                {"id": "0xbbb", "swaps": []},
+                {"id": "0xccc", "swaps": []},
+            ]),
+            "a derived list must nest, in child id order, and be [] when empty: {body}"
+        );
+
+        // The canonical shape: a relation traversal, lowered to a LEFT JOIN and put back under the
+        // field name it was asked for. `0xbbb` points at a token that is not there, so its relation
+        // must be `null` rather than an object of nulls, and the pool itself must still be in the
+        // answer - an INNER JOIN would have dropped it silently.
+        let body = graph_ask(
+            "/graphql",
+            "{ pools { id token0 { symbol decimals totalSupply } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([
+                // `decimals` is a number and `totalSupply` a string, from the same row: the wire rule is
+                // per-scalar, and a child field reaches the client through this join as much as through a
+                // top-level selection (Jules on #1282).
+                {"id": "0xaaa", "token0": {
+                    "symbol": "WETH", "decimals": 18, "totalSupply": "21000000",
+                }},
+                {"id": "0xbbb", "token0": null},
+                // `0xccc`'s token exists but its selected fields are all null. An object of nulls,
+                // not `null`: deciding presence from the selected values reported a real row as
+                // absent, which is why the join now carries the target's id as a marker.
+                {"id": "0xccc", "token0": {"symbol": null, "decimals": null, "totalSupply": null}},
+            ]),
+            "a to-one traversal must nest, and a missing target must not drop the parent: {body}"
+        );
+
+        // An unlowerable operation is refused **in the Graph envelope** rather than as a bare
+        // status a client cannot read.
+        let body = ask("/graphql", "{ nope { id } }", state.clone()).await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("nope")),
+            "an unknown root must be refused by name in the envelope: {body}"
+        );
+        assert!(
+            !body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("introspection only"),
+            "the S2 refusal should be gone now that the compiler exists: {body}"
+        );
+
+        // A text operator filters for real over HTTP, through DuckDB's own `LIKE`.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { hooks_contains: "hook2" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xbbb"}]),
+            "_contains must match the one pool whose hooks contain it: {body}"
+        );
+        // And the caller's own `%` is data: no pool's hooks contain a literal percent sign, so a
+        // pattern that was not escaped would match everything instead of nothing.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { hooks_contains: "%" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([]),
+            "an unescaped wildcard would have matched every row: {body}"
+        );
+
+        // A nested relation filter, through DuckDB's own EXISTS. `0xaaa`'s token0 is WETH and
+        // `0xbbb` points at a token that is not there, so exactly one pool can match.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "a nested relation filter must filter on the child: {body}"
+        );
+        // And a child condition nothing satisfies returns nothing, rather than ignoring the clause -
+        // which is the failure that makes a dropped filter worse than an error.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { token0_: { symbol: "NOPE" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        assert_eq!(body["data"]["pools"], serde_json::json!([]), "{body}");
+
+        // A nested filter across a list relation is refused by name, with the reason, rather than as
+        // an unknown field.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { swaps_: { id: "s1" } }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("swaps_") && msg.contains("child-existence"),
+            "the refusal must name the field and the reason: {body}"
+        );
+
+        // An operator the *schema* does not declare for that field's type is still refused by name,
+        // because a dropped filter returns more rows than were asked for.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { liquidity_contains: "ab" }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("liquidity_contains"),
+            "an unlowerable operator must be named: {body}"
+        );
+
+        // And `block:` says why rather than answering as of head while implying otherwise.
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(block: { number: 1 }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1267"),
+            "time travel must name the issue that tracks it: {body}"
+        );
+
+        // A nest with no Graph schema says so rather than inventing one.
+        let bare = tempfile::tempdir().unwrap();
+        let body = graph_ask(
+            "/graphql",
+            "{ __schema { types { name } } }",
+            test_state(bare.path(), SQL_MAX_CONCURRENCY),
+        )
+        .await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no Graph schema"),
+            "a nest without graph/schema.graphql must say so, got {body}"
+        );
     }
 }

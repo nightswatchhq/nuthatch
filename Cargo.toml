@@ -24,6 +24,10 @@ name = "nuthatch"
 path = "src/main.rs"
 
 [dependencies]
+# graph-node's own pluralisation, so a generated root field name matches it by construction rather
+# than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
+# BSD-2-Clause, already on deny.toml's allowlist, pure Rust - no effect on the static binary.
+Inflector = "0.11.3"
 nuthatch-decode = { path = "decode" }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
@@ -47,6 +51,10 @@ toml = "0.8"
 redb = "2"
 arrow = { version = "58", features = ["ipc"] }
 parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+# Already in the tree via parquet and arrow-buffer; declared directly so `graph_decimal` can name it.
+# graph-node computes its own `BigDecimal` on this crate, and the prices a subgraph stores need an
+# integer wider than any fixed-width type: `sqrtPriceX96^2` reaches 2^384.
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
