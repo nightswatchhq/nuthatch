@@ -223,6 +223,15 @@ impl std::fmt::Display for HotScanTooLarge {
 
 impl std::error::Error for HotScanTooLarge {}
 
+/// One consistent hot-store read for an analytical query. `source_bytes` is the length of the
+/// serialized redb values that will be parsed into DuckDB, not a JSON re-encoding or a resident-RAM
+/// estimate (RFC-0048 S2).
+#[derive(Debug, Default)]
+pub struct HotRowsSnapshot {
+    pub rows: HashMap<String, Vec<serde_json::Value>>,
+    pub source_bytes: u64,
+}
+
 /// The hot store, behind a trait (RFC-0022 slice 1).
 ///
 /// Everything above finality lives here: decoded rows, the ingest cursor, block-hash checkpoints for
@@ -274,6 +283,16 @@ pub trait HotStore: Send + Sync {
         &self,
         max_rows: usize,
     ) -> Result<HashMap<String, Vec<serde_json::Value>>>;
+    /// As `hot_rows_by_table_bounded`, while accounting the bytes the query will materialise.
+    /// Backends that cannot give a byte-exact snapshot must refuse paid/admitted execution rather
+    /// than substitute a representation-dependent approximation.
+    fn hot_rows_by_table_bounded_with_bytes(
+        &self,
+        _max_rows: usize,
+        _max_bytes: u64,
+    ) -> Result<HotRowsSnapshot> {
+        anyhow::bail!("this hot-store backend cannot report a byte-exact query snapshot")
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>>;
 
@@ -812,10 +831,20 @@ impl Store {
         &self,
         max_rows: usize,
     ) -> Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
+        Ok(self
+            .hot_rows_by_table_bounded_with_bytes(max_rows, u64::MAX)?
+            .rows)
+    }
+
+    /// The bounded analytical snapshot, counted from the exact redb values before parsing.
+    pub fn hot_rows_by_table_bounded_with_bytes(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<HotRowsSnapshot> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
-        let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> =
-            std::collections::HashMap::new();
+        let mut out = HotRowsSnapshot::default();
         let mut seen = 0usize;
         for row in t.iter()? {
             let (_k, v) = row?;
@@ -825,7 +854,11 @@ impl Store {
                     if seen > max_rows {
                         return Err(HotScanTooLarge { cap: max_rows }.into());
                     }
-                    out.entry(table.to_string()).or_default().push(json);
+                    out.source_bytes = out.source_bytes.saturating_add(v.value().len() as u64);
+                    if out.source_bytes > max_bytes {
+                        anyhow::bail!("the unsealed tip needs {} source bytes, above this query's remaining {}-byte scan budget", out.source_bytes, max_bytes);
+                    }
+                    out.rows.entry(table.to_string()).or_default().push(json);
                 }
             }
         }
@@ -1215,6 +1248,13 @@ impl HotStore for Store {
     ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
         Store::hot_rows_by_table_bounded(self, max_rows)
     }
+    fn hot_rows_by_table_bounded_with_bytes(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<HotRowsSnapshot> {
+        Store::hot_rows_by_table_bounded_with_bytes(self, max_rows, max_bytes)
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         Store::entities_in_range(self, from, to)
     }
@@ -1446,6 +1486,13 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     ) -> Result<HashMap<String, Vec<serde_json::Value>>> {
         (**self).hot_rows_by_table_bounded(max_rows)
     }
+    fn hot_rows_by_table_bounded_with_bytes(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<HotRowsSnapshot> {
+        (**self).hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         (**self).entities_in_range(from, to)
     }
@@ -1559,6 +1606,22 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_snapshot_counts_the_serialized_values_it_will_materialise() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("hot.redb")).unwrap();
+        let row = r#"{"table":"t","block_number":1,"log_index":0,"value":"abc"}"#;
+        store.put_entity("000000000001-000000", row).unwrap();
+        let snapshot = store
+            .hot_rows_by_table_bounded_with_bytes(1, row.len() as u64)
+            .unwrap();
+        assert_eq!(snapshot.source_bytes, row.len() as u64);
+        assert_eq!(snapshot.rows["t"].len(), 1);
+        assert!(store
+            .hot_rows_by_table_bounded_with_bytes(1, row.len() as u64 - 1)
+            .is_err());
+    }
     use proptest::prelude::*;
 
     /// The memo's fence (#1186): even at rest, `None` while a commit is in flight, and one commit

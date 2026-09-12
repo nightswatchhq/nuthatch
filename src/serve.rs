@@ -128,6 +128,9 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
 /// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
 pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
+/// Independent source-byte guard for declared queries. This is not a RAM conversion: it bounds
+/// bytes read from immutable segments plus the serialized hot snapshot before the statement runs.
+pub(crate) const SQL_MAX_NAMED_SCAN_BYTES: u64 = 512 * 1024 * 1024;
 /// Reject absurdly long query strings before they reach the planner.
 const SQL_MAX_QUERY_LEN: usize = 16 * 1024;
 
@@ -185,6 +188,7 @@ pub struct AppState {
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
     /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
     pub sql_max_hot_rows: usize,
+    pub sql_max_named_scan_bytes: u64,
     /// This process owns **no cursor**: it serves a nest it does not index (`nuthatch serve`).
     ///
     /// `/ready`'s liveness terms are all about a cursor - has it polled recently, has `last_block`
@@ -1866,7 +1870,7 @@ async fn graph_rows(
     s: &AppState,
     compiled: &crate::graph_query::Compiled,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
-    let resp = run_sql_query(s.clone(), compiled.sql.clone(), None).await;
+    let resp = run_sql_query(s.clone(), compiled.sql.clone(), None, None).await;
     let body = axum::body::to_bytes(resp.into_response().into_body(), 64 << 20)
         .await
         .map_err(|e| format!("reading the query result: {e}"))?;
@@ -2151,7 +2155,12 @@ async fn named_query(
             return *response;
         }
     }
-    run_sql_query(s, sql, None).await
+    let cold = match crate::analytics::estimate_cold_scan(&s.dir, &sql) {
+        Ok(bound) if bound.bytes < s.sql_max_named_scan_bytes => bound.bytes,
+        Ok(bound) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("named query's cold scan bound {} bytes reaches the {}-byte admission cap", bound.bytes, s.sql_max_named_scan_bytes)}))).into_response(),
+        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cannot admit named query: {e:#}")}))).into_response(),
+    };
+    run_sql_query(s, sql, None, Some(cold)).await
 }
 
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
@@ -2177,7 +2186,7 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
         )
             .into_response();
     }
-    run_sql_query(s, q.q, q.max_rows).await
+    run_sql_query(s, q.q, q.max_rows, None).await
 }
 
 /// Execute SQL and shape the response - shared by `/sql` (caller-supplied text, only when the
@@ -2189,6 +2198,7 @@ async fn run_sql_query(
     s: AppState,
     sql_text: String,
     requested_max_rows: Option<usize>,
+    cold_scan_bytes: Option<u64>,
 ) -> axum::response::Response {
     use crate::metrics::METRICS;
     let q = SqlQuery {
@@ -2281,6 +2291,7 @@ async fn run_sql_query(
     let sql = q.q.clone();
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
+    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
     // The live, registry-derived schema - every table the config declares, whether or not it has
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
@@ -2292,8 +2303,13 @@ async fn run_sql_query(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
-            Ok(hot) => (hot, false),
+        let hot_budget = cold_scan_bytes
+            .map(|cold| sql_max_named_scan_bytes.saturating_sub(cold))
+            .unwrap_or(u64::MAX);
+        let (hot, tip_unavailable) = match store
+            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, hot_budget)
+        {
+            Ok(snapshot) => (snapshot.rows, false),
             Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
             // Same level as a segment read failure (#472): a hot store that will not scan is at least
             // as serious, and the fallback below must not be the only trace of it.
@@ -3305,6 +3321,7 @@ mod tests {
             cursorless: false,
             freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
+            sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
             surface: Arc::new(crate::allowlist::Surface::default()),
             #[cfg(feature = "counter")]
             counter: None,
