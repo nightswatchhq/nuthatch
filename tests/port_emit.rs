@@ -2317,11 +2317,13 @@ type Pool @entity {
 /// is a missing number; projecting the literal for a row that never got it is a wrong one.
 #[test]
 fn a_conditionally_assigned_constant_is_not_answered_with_its_literal() {
+    // **A branch that does not construct the receiver.** The creation guard is the other case and is
+    // answered, because a row that skipped it was created by an earlier execution of the same branch
+    // (#1326); this one leaves an existing row exactly as it was.
     let mapping = r#"
 export function handlePoolCreated(event: PoolCreated): void {
   let pool = Pool.load(event.params.pool.toHexString())
-  if (pool === null) {
-    pool = new Pool(event.params.pool.toHexString())
+  if (event.params.tickSpacing > 0) {
     pool.collectedFeesUSD = ZERO_BD
   }
   pool.plain = event.params.fee
@@ -2518,4 +2520,161 @@ export function handlePoolCreated(event: PoolCreated): void {{
             "`{terminator}` can end the handler before the assignment:\n{sql}"
         );
     }
+}
+
+/// **The creation guard is answered** (#1326).
+///
+/// ```ts
+/// let pool = Pool.load(id)
+/// if (pool === null) {
+///   pool = new Pool(id)
+///   pool.collectedFeesUSD = ZERO_BD
+/// }
+/// ```
+///
+/// The commonest shape in subgraph-land - load, guard on null, construct, initialise every field - and
+/// the brace-depth rule refused all of it. A row that skipped the branch was created by an earlier
+/// execution of that same branch, so it holds what the branch put there. Uniswap V4 writes
+/// `Token.totalValueLockedUSDUntracked` this way, and refusing it cost a field whose value genuinely is
+/// always zero.
+#[test]
+fn a_constant_set_where_the_row_is_created_is_answered() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    pool = new Pool(event.params.pool.toHexString())
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "every row that exists came through the branch that created it:\n{sql}"
+    );
+}
+
+/// A terminator between the construction and the assignment abandons a row nothing saved.
+///
+/// Uniswap V4's real shape: construct `token0`, fetch its decimals, `return` if they are null, then set
+/// the constants. My first version of the creation-guard rule refused on that `return` and so measured
+/// zero - the very field it was written for. The save-ordering rule already carries this: no
+/// `<recv>.save()` precedes the assignment, so a terminator before it leaves nothing stored.
+#[test]
+fn a_terminator_before_any_save_abandons_the_row_rather_than_leaving_it_unassigned() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    pool = new Pool(event.params.pool.toHexString())
+    if (event.params.tickSpacing > 0) {
+      return
+    }
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "nothing saved the row before the handler left, so no stored row lacks the value:\n{sql}"
+    );
+}
+
+/// A block that does not construct the receiver is not a creation guard, however it is spelled.
+#[test]
+fn a_block_that_constructs_a_different_local_is_not_a_creation_guard() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    let other = new Pool(event.block.hash.toHexString())
+    other.save()
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "`other` being constructed says nothing about the row `pool` holds:\n{sql}"
+    );
+}
+
+/// The **innermost** block decides, not any enclosing one.
+///
+/// The row is created in the outer guard, but the constant is set only inside a further branch. Taking the
+/// outermost enclosing block would find the construction and answer; the innermost one does not construct,
+/// and a creation that skipped the inner branch set nothing.
+#[test]
+fn a_branch_nested_inside_the_creation_guard_is_not_itself_one() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    pool = new Pool(event.params.pool.toHexString())
+    if (event.params.tickSpacing > 0) {
+      pool.collectedFeesUSD = ZERO_BD
+    }
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a creation that took the other branch set nothing:\n{sql}"
+    );
+}
+
+/// A construction nested **inside** a further branch is not the block's creation (Jules on #1326).
+///
+/// ```ts
+/// if (a) {
+///   if (b) { pool = new Pool(id) }
+///   pool.collectedFeesUSD = ZERO_BD      // runs when a holds and b does not
+/// }
+/// ```
+///
+/// Scanning the whole block for a `new` found one and answered the field. On the path where `a` holds and
+/// `b` does not, an existing row is assigned - and a row created by some earlier call that also took
+/// `b`-false was saved without it.
+#[test]
+fn a_construction_nested_in_a_further_branch_is_not_the_creation() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (event.params.tickSpacing > 0) {
+    if (event.params.fee > 0) {
+      pool = new Pool(event.params.pool.toHexString())
+    }
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the assignment runs on a path the construction does not:\n{sql}"
+    );
 }
