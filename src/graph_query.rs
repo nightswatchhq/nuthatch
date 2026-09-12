@@ -63,6 +63,14 @@ pub enum Value {
     Enum(String),
     List(Vec<Value>),
     Object(BTreeMap<String, Value>),
+    /// The literal `null`, or a `variables` entry that is JSON null.
+    ///
+    /// Carried rather than dropped, and refused rather than lowered. It used to fall through the enum
+    /// branch of the parser, so `where: { hooks: null }` compiled to `hooks = 'null'` and matched rows
+    /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows, which
+    /// is the one thing this module may not do. From the variables side it was dropped by `filter_map`
+    /// and re-surfaced as "unbound variable", which is a refusal for the wrong reason (Jules, #1282).
+    Null,
 }
 
 impl Value {
@@ -84,7 +92,7 @@ impl Value {
                     .map(|(k, v)| Value::from_json(v).map(|v| (k.clone(), v)))
                     .collect::<Option<_>>()?,
             ),
-            serde_json::Value::Null => return None,
+            serde_json::Value::Null => Value::Null,
         })
     }
     /// The SQL literal for this value. Strings are single-quoted with internal quotes doubled; there
@@ -94,7 +102,9 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) | Value::Enum(s) => format!("'{}'", s.replace('\'', "''")),
-            Value::List(_) | Value::Object(_) => return None,
+            // SQL `NULL` is not what GraphQL null means in a filter, and guessing which it meant is
+            // exactly the approximation this module refuses. The caller names it instead.
+            Value::Null | Value::List(_) | Value::Object(_) => return None,
         })
     }
 }
@@ -132,6 +142,9 @@ pub enum Unsupported {
     OperationNameRequired,
     /// An `operationName` no operation in the document carries.
     OperationNotFound(String),
+    /// A `null` where this dialect has no lowering for one. Named rather than guessed at: in a filter it
+    /// could mean `IS NULL`, or the absence of the condition, and the two select different rows.
+    NullValue(String),
 }
 
 impl fmt::Display for Unsupported {
@@ -143,6 +156,11 @@ impl fmt::Display for Unsupported {
             // refusal rather than a transient one, and a client that matches on the text still matches.
             Unsupported::OperationNameRequired => write!(f, "Operation name required"),
             Unsupported::OperationNotFound(n) => write!(f, "Operation name not found `{n}`"),
+            Unsupported::NullValue(w) => write!(
+                f,
+                "`{w}` was given `null`, which this dialect does not lower yet - in a filter it could \
+                 mean `IS NULL` or no condition at all, and those select different rows"
+            ),
             Unsupported::Syntax(w) => write!(f, "could not parse the operation: {w}"),
             Unsupported::UnknownRoot(n) => {
                 write!(f, "`{n}` is not a field of this subgraph's Query type")
@@ -825,6 +843,9 @@ impl<'a> Cursor<'a> {
                 Ok(match w.as_str() {
                     "true" => Value::Bool(true),
                     "false" => Value::Bool(false),
+                    // `null` is a GraphQL literal, not an enum value. Reading it as one compiled
+                    // `hooks: null` into a comparison with the string `'null'` (Jules, #1282).
+                    "null" => Value::Null,
                     _ => Value::Enum(w),
                 })
             }
@@ -1188,6 +1209,9 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             // subgraph indexing errors to report either way.
             "subgraphError" => {}
             "id" if singular => {
+                if matches!(value, Value::Null) {
+                    return Err(Unsupported::NullValue("id".into()));
+                }
                 let lit = value
                     .sql_literal()
                     .ok_or_else(|| Unsupported::Argument("id must be a string".into()))?;
@@ -1506,6 +1530,12 @@ fn lower_predicate(
             }
             s => match comparison(s) {
                 Some(op) => {
+                    // Named separately from "has no literal", which reads as a shape this dialect has not
+                    // implemented. A `null` is a value the client deliberately supplied and there is more
+                    // than one thing it could mean, so it gets its own refusal (Jules, #1282).
+                    if matches!(v, Value::Null) {
+                        return Err(Unsupported::NullValue(key.to_string()));
+                    }
                     let lit = v
                         .sql_literal()
                         .ok_or_else(|| Unsupported::Argument(format!("`{key}` has no literal")))?;

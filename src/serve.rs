@@ -1564,6 +1564,10 @@ async fn graph_graphql(
         .and_then(|v| v.as_object())
         .map(|o| {
             o.iter()
+                // **A supplied null is bound, not dropped.** `filter_map` used to discard it, so a
+                // variable the client did set re-surfaced as `unbound variable` - a refusal naming the
+                // wrong cause, and one a client cannot act on (Jules on #1282). `from_json` now carries
+                // null through as `Value::Null`, and the lowering refuses it by name.
                 .filter_map(|(k, v)| {
                     crate::graph_query::Value::from_json(v).map(|v| (k.clone(), v))
                 })
@@ -5330,7 +5334,7 @@ mod tests {
         }
 
         // `_meta` is answered from the nest's own head and needs no view.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ _meta { block { number } hasIndexingErrors } }",
             state.clone(),
@@ -5376,7 +5380,7 @@ mod tests {
             serde_json::json!([{"id": "0xaaa"}]),
             "first: 1 must return one row: {body}"
         );
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { liquidity_lt: "10" }) { id } }"#,
             state.clone(),
@@ -5387,7 +5391,7 @@ mod tests {
             serde_json::json!([{"id": "0xbbb"}]),
             "a where filter must actually filter: {body}"
         );
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pool(id: "0xbbb") { hooks } }"#,
             state.clone(),
@@ -5432,6 +5436,70 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}, {"id": "0xccc"}]),
             "variables from the request body must bind: {body}"
+        );
+    }
+
+    /// `null` is refused by name, from a literal and from a variable alike (Jules on #1282).
+    ///
+    /// The literal used to parse as the enum `null` and compile to `hooks = 'null'`, which matches rows
+    /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows. The
+    /// variable used to be dropped by `filter_map` and re-surfaced as `unbound variable`, which is a
+    /// refusal naming the wrong cause.
+    #[tokio::test]
+    async fn a_null_filter_value_is_refused_by_name() {
+        let (_d, state) = graph_fixture();
+
+        let body = graph_ask(
+            "/graphql",
+            r#"{ pools(where: { hooks: null }) { id } }"#,
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("`hooks` was given `null`"),
+            "a null literal must be named, not compared as a string: {body}"
+        );
+        assert!(
+            body["data"].is_null(),
+            "and it must not answer rows: {body}"
+        );
+
+        // The same value through `variables`, which is how a generated client sends it.
+        use tower::ServiceExt;
+        let res = router(SharedNest::new(state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "query": "query P($h: Bytes) { pools(where: { hooks: $h }) { id } }",
+                            "variables": { "h": serde_json::Value::Null },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 4 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("`hooks` was given `null`"),
+            "a supplied null must be bound and named, not reported as unbound: {body}"
         );
     }
 
@@ -5634,7 +5702,7 @@ mod tests {
 
         // Complete: every declared field of `_Meta_` and `_Block_`. `timestamp` is null because
         // nothing stores one (#1289); the rest are real.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ _meta { block { number hash timestamp parentHash } deployment hasIndexingErrors } }",
             state.clone(),
@@ -5657,7 +5725,7 @@ mod tests {
         );
 
         // Aliases, at every depth. The reference honours the root, the leaf and the scalars.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ m: _meta { b: block { n: number h: hash } d: deployment e: hasIndexingErrors } }",
             state.clone(),
@@ -5698,7 +5766,7 @@ mod tests {
         // The introspection document a generated client actually sends, fragments and all. Refusing
         // fragments refused the one request that has to work before any other can: a client will not
         // send a useful query until it has validated against the schema it fetched this way.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"query IntrospectionQuery {
                  __schema {
@@ -5749,7 +5817,7 @@ mod tests {
 
         // A selected field the document does not carry is `null`, not absent: a client that asked for a
         // key should find it there.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ __schema { types { name nope } } }",
             state.clone(),
@@ -5762,7 +5830,7 @@ mod tests {
         );
 
         // An alias on an introspection field answers under the alias, and projection follows it down.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ s: __schema { t: types { n: name } } }"#,
             state.clone(),
@@ -5775,7 +5843,7 @@ mod tests {
         );
 
         // `__type` is projected too.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ __type(name: "Pool") { name } }"#,
             state.clone(),
@@ -5790,7 +5858,7 @@ mod tests {
         // Introspection is not an exclusive mode, it is two more root fields. Returning early on the
         // first one meant a mixed operation came back without its data fields at all - present in the
         // request, silently missing from the response.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ __schema { queryType { name } } __type(name: "Pool") { name } _meta { hasIndexingErrors } pools(first: 1) { id } }"#,
             state.clone(),
@@ -5811,7 +5879,7 @@ mod tests {
         // Introspection is chosen from the parsed root field name, not by searching the text. A
         // filter value that happens to read `__schema` is an ordinary string, and answering it with
         // the schema document loses the caller's query entirely (Jules on #1282).
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { hooks: "__schema" }) { id } }"#,
             state.clone(),
@@ -5981,7 +6049,7 @@ mod tests {
 
         // Aliases, over HTTP: the handler routes on the schema field name and answers under the
         // caller's key. That split matters for the introspection roots too, which are routed by name.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ s: __schema { queryType { name } } m: _meta { hasIndexingErrors }
                  p: pools(first: 1) { n: id t: token0 { sym: symbol } } }"#,
@@ -6003,7 +6071,7 @@ mod tests {
         // `__type` is the other standard introspection operation, and it has to answer under
         // `__type`. It used to fall into the `__schema` branch and return the whole schema document
         // under the wrong key, which is an invalid response to the query that was asked.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ __type(name: "Pool") { kind name } }"#,
             state.clone(),
@@ -6023,7 +6091,7 @@ mod tests {
         );
         // A name the schema does not declare is `null` rather than an error - that is what
         // introspection says, and a client uses it to test whether a type exists.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ __type(name: "Nope") { name } }"#,
             state.clone(),
@@ -6044,7 +6112,7 @@ mod tests {
         // **An alias inside an aggregated list answers under the alias.** The packed struct keyed by the
         // field name rather than the selection key, so `sid: id` came back as `id` - a key the client never
         // asked for, in the one place the root-level alias test could not see (Jules on #1282).
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ pools { id swaps { sid: id amt: amount } } }",
             state.clone(),
@@ -6060,7 +6128,7 @@ mod tests {
         // entity, `@derivedFrom` lists among them, so this is a value the schema advertises and the parent
         // view has no column for - `ORDER BY b."swaps"` either failed in DuckDB or sorted by a JSON
         // aggregate (Jules on #1282).
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ pools(orderBy: swaps) { id } }",
             state.clone(),
@@ -6075,7 +6143,7 @@ mod tests {
             "ordering by a relation must be refused by name: {body}"
         );
 
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ pools { id swaps { id amount } } }",
             state.clone(),
@@ -6095,7 +6163,7 @@ mod tests {
         // field name it was asked for. `0xbbb` points at a token that is not there, so its relation
         // must be `null` rather than an object of nulls, and the pool itself must still be in the
         // answer - an INNER JOIN would have dropped it silently.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ pools { id token0 { symbol decimals totalSupply } } }",
             state.clone(),
@@ -6137,7 +6205,7 @@ mod tests {
         );
 
         // A text operator filters for real over HTTP, through DuckDB's own `LIKE`.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { hooks_contains: "hook2" }) { id } }"#,
             state.clone(),
@@ -6150,7 +6218,7 @@ mod tests {
         );
         // And the caller's own `%` is data: no pool's hooks contain a literal percent sign, so a
         // pattern that was not escaped would match everything instead of nothing.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { hooks_contains: "%" }) { id } }"#,
             state.clone(),
@@ -6164,7 +6232,7 @@ mod tests {
 
         // A nested relation filter, through DuckDB's own EXISTS. `0xaaa`'s token0 is WETH and
         // `0xbbb` points at a token that is not there, so exactly one pool can match.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
             state.clone(),
@@ -6177,7 +6245,7 @@ mod tests {
         );
         // And a child condition nothing satisfies returns nothing, rather than ignoring the clause -
         // which is the failure that makes a dropped filter worse than an error.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { token0_: { symbol: "NOPE" } }) { id } }"#,
             state.clone(),
@@ -6187,7 +6255,7 @@ mod tests {
 
         // A nested filter across a list relation is refused by name, with the reason, rather than as
         // an unknown field.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { swaps_: { id: "s1" } }) { id } }"#,
             state.clone(),
@@ -6201,7 +6269,7 @@ mod tests {
 
         // An operator the *schema* does not declare for that field's type is still refused by name,
         // because a dropped filter returns more rows than were asked for.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { liquidity_contains: "ab" }) { id } }"#,
             state.clone(),
@@ -6214,7 +6282,7 @@ mod tests {
         );
 
         // And `block:` says why rather than answering as of head while implying otherwise.
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ pools(block: { number: 1 }) { id } }",
             state.clone(),
@@ -6230,7 +6298,7 @@ mod tests {
 
         // A nest with no Graph schema says so rather than inventing one.
         let bare = tempfile::tempdir().unwrap();
-        let body = ask(
+        let body = graph_ask(
             "/graphql",
             "{ __schema { types { name } } }",
             test_state(bare.path(), SQL_MAX_CONCURRENCY),

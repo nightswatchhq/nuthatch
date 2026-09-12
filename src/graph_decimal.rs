@@ -253,6 +253,38 @@ mod tests {
         );
     }
 
+    /// Negative quotients round in magnitude, because the sign never reaches the rounding (Jules, #1282).
+    ///
+    /// `div_to_string` takes `num.magnitude()` and `den.magnitude()` and carries `negative` to `render`,
+    /// so `round_off_last` only ever sees a non-negative value and its `q + 1` is always away from zero.
+    /// The branch where that would move a negative *towards* zero is unreachable - but the only negative
+    /// case tested was `-1 / 4`, which is exact and rounds nothing, so nothing said so.
+    #[test]
+    fn a_negative_quotient_rounds_in_magnitude() {
+        // Inexact: the 34th significant digit is a 6 rounded up by a 6 behind it.
+        assert_eq!(
+            div_to_string(&BigInt::from(-1i8), &BigInt::from(6u8)).unwrap(),
+            format!("-0.1{}7", "6".repeat(32)),
+            "the magnitude must round up, which is away from zero"
+        );
+        // The same magnitude as the positive case, sign apart.
+        let pos = div_to_string(&BigInt::from(1u8), &BigInt::from(6u8)).unwrap();
+        let neg = div_to_string(&BigInt::from(-1i8), &BigInt::from(6u8)).unwrap();
+        assert_eq!(
+            neg,
+            format!("-{pos}"),
+            "a sign carried separately cannot change the digits"
+        );
+        // Half-even, and the carry that widens, on the negative side too.
+        let den = BigInt::from(2u8) * pow10(34);
+        let num = -(&den - BigInt::from(1u8));
+        assert_eq!(
+            div_to_string(&num, &den).unwrap(),
+            "-1",
+            "the carry path is sign-agnostic for the same reason"
+        );
+    }
+
     /// A carry that widens the mantissa to 35 digits (Jules on #1282).
     ///
     /// `(2*10^34 - 1) / (2*10^34)` is `0.9999…975`: the guard-digit quotient is `10^35 - 5`, whose last

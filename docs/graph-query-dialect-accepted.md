@@ -229,6 +229,7 @@ after which the whole operation reads as garbage.
 | an `operationName` no operation in the document carries | `Operation name not found `X``, likewise. An anonymous operation carries no name, so it is never what a name selects |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
 | an unbound `$name` | neither the request nor the header supplies a value. Dropping the argument would widen the filter |
+| a `null` filter value, as a literal or through `variables` | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
 
 ## What S2 is done when
