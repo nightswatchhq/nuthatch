@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub struct SyncReport {
     pub skipped: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PublishEnvelope {
     layout_version: u32,
     nuthatch_version: String,
@@ -125,7 +125,7 @@ impl ObjMirror {
         use object_store::path::Path as ObjPath;
         if let Some(rest) = locator.strip_prefix("memory://") {
             return Ok(Self {
-                inner: std::sync::Arc::new(object_store::memory::InMemory::new()),
+                inner: memory_store(locator),
                 prefix: ObjPath::from(rest.trim_start_matches('/')),
             });
         }
@@ -181,40 +181,19 @@ impl Mirror for ObjMirror {
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
-        use object_store::{ObjectStore as _, PutMode, PutOptions, UpdateVersion};
-        let loc = self.key(key);
-        let mode = match expected {
-            None => PutMode::Create,
-            Some(_) => {
-                let meta = self
-                    .inner
-                    .head(&loc)
-                    .await
-                    .with_context(|| format!("heading {key} for conditional put"))?;
-                PutMode::Update(UpdateVersion {
-                    e_tag: meta.e_tag,
-                    version: meta.version,
-                })
-            }
-        };
-        self.inner
-            .put_opts(
-                &loc,
-                object_store::PutPayload::from(bytes.to_vec()),
-                PutOptions {
-                    mode,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => anyhow::anyhow!(
-                    "refusing to publish {key}: another publisher holds this dataset"
-                ),
-                other => anyhow::Error::new(other).context(key.to_string()),
-            })?;
-        Ok(())
+        let current = self.get(key).await?;
+        match (expected, current.as_deref()) {
+            (None, Some(_)) => bail!(
+                "refusing to publish {key}: it already exists (another publisher holds this dataset)"
+            ),
+            (Some(exp), Some(got)) if exp != got => bail!(
+                "refusing to publish {key}: the remote catalogue changed since this run started"
+            ),
+            (Some(_), None) => bail!(
+                "refusing to publish {key}: expected an existing catalogue and found none"
+            ),
+            _ => self.put(key, bytes).await,
+        }
     }
 
     async fn head_size(&self, key: &str) -> Result<Option<u64>> {
@@ -225,6 +204,21 @@ impl Mirror for ObjMirror {
             Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
         }
     }
+}
+
+#[cfg(feature = "object-store")]
+fn memory_store(locator: &str) -> std::sync::Arc<dyn object_store::ObjectStore> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static STORES: OnceLock<Mutex<HashMap<String, Arc<object_store::memory::InMemory>>>> =
+        OnceLock::new();
+    let mut map = STORES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("memory publish store");
+    map.entry(locator.to_string())
+        .or_insert_with(|| Arc::new(object_store::memory::InMemory::new()))
+        .clone()
 }
 
 fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
@@ -423,7 +417,7 @@ pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport>
     })
 }
 
-/// HEAD every non-provisional remote file. `--deep` re-hashes against the local bytes.
+/// HEAD every published file. `--deep` re-hashes parquet against the local bytes.
 pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
     let local = seal::load_manifest(dir)?;
     let (data_identity, _, _, _) = identity_of(dir)?;
@@ -437,6 +431,29 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
         .context("reading local catalogue")?;
     if remote_bytes != local_bytes {
         bail!("remote catalogue is not byte-identical to local");
+    }
+    let env_bytes = mirror
+        .get(&prefix("publish.json"))
+        .await?
+        .context("remote publish.json missing")?;
+    let env: PublishEnvelope =
+        serde_json::from_slice(&env_bytes).context("corrupt remote publish.json")?;
+    let cat_sha = sha256_hex(&local_bytes);
+    if env.catalogue_sha256 != cat_sha {
+        bail!("publish.json catalogue_sha256 does not match the catalogue");
+    }
+    if let Ok(local_schema) = std::fs::read(dir.join("schema.json")) {
+        let remote_schema = mirror
+            .get(&prefix("schema.json"))
+            .await?
+            .context("remote schema.json missing")?;
+        if remote_schema != local_schema {
+            bail!("schema.json does not match local");
+        }
+        let schema_sha = sha256_hex(&local_schema);
+        if env.schema_sha256.as_deref() != Some(schema_sha.as_str()) {
+            bail!("publish.json schema_sha256 does not match schema.json");
+        }
     }
     for (table, seg) in want_entries(&local) {
         let key = prefix(&parquet_key(&table, &seg.hash));
@@ -661,6 +678,60 @@ abi = "abis/usdc.json"
         assert!(
             std::fs::read_dir(mirror.path()).unwrap().next().is_none(),
             "dry-run must not create the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_if_publish_json_is_gone() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let report = sync(nest.path(), target, false).await.unwrap();
+        std::fs::remove_file(mirror.path().join(&report.dataset).join("publish.json")).unwrap();
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("publish.json"),
+            "wanted a publish.json failure, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_if_schema_json_is_gone() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let report = sync(nest.path(), target, false).await.unwrap();
+        std::fs::remove_file(mirror.path().join(&report.dataset).join("schema.json")).unwrap();
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("schema.json"),
+            "wanted a schema.json failure, got {err}"
+        );
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn a_second_memory_sync_only_puts_publish_json() {
+        let nest = sealed_nest();
+        let target = "memory://s1-idempotent";
+        sync(nest.path(), target, false).await.unwrap();
+        let second = sync(nest.path(), target, false).await.unwrap();
+        assert_eq!(second.uploaded, vec!["publish.json".to_string()]);
+        verify(nest.path(), target, true).await.unwrap();
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn object_store_put_if_refuses_a_replaced_catalogue() {
+        let m = ObjMirror::from_locator("memory://s1-put-if").unwrap();
+        m.put("manifest.json", b"old").await.unwrap();
+        let err = m
+            .put_if("manifest.json", b"new", Some(b"stale"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed"),
+            "wanted a changed-catalogue refusal, got {err}"
         );
     }
 }
