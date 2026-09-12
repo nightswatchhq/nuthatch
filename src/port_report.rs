@@ -3745,6 +3745,16 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
     if governed_by_a_braceless_header(&lines, idx) {
         return false;
     }
+    // **A loaded row already exists, and needs no save to keep its old value.** That is why "every save
+    // comes after the assignment" is not enough on its own (Jules, #1316): with
+    // `let pool = Pool.load(id)!; if (event.skip) return; pool.f = ZERO_BD; pool.save()`, the early return
+    // leaves a stored row that never saw the assignment. A row bound by `new` has nothing stored yet, so a
+    // return before the save genuinely stores nothing - Uniswap V4's `handleInitialize` does
+    // `const pool = new Pool(poolId)` and then returns twice on null decimals, leaving no `Pool` behind.
+    let fresh = local_entity_binding(&func.body, &asg.receiver).is_some_and(|(_, fresh)| fresh);
+    if !fresh && lines[..idx].iter().any(|l| is_return_statement(l)) {
+        return false;
+    }
     // Every save of this receiver, after the assignment, and at least one.
     let needle = format!("{}.save()", asg.receiver);
     let mut saves = 0usize;
@@ -3758,6 +3768,14 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
         saves += 1;
     }
     saves > 0
+}
+
+/// Whether a line is a `return`, as a statement rather than as part of an identifier.
+fn is_return_statement(line: &str) -> bool {
+    let t = line.trim();
+    t == "return"
+        || t.strip_prefix("return")
+            .is_some_and(|r| r.starts_with([' ', ';']))
 }
 
 /// Whether the statement on `idx` is the body of a conditional or loop that opened no block.

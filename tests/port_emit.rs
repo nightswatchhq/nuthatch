@@ -2464,3 +2464,31 @@ export function handlePoolCreated(event: PoolCreated): void {
         "whether the caller saved this row after the write is not visible here:\n{sql}"
     );
 }
+
+/// A **loaded** row already exists, and needs no save to keep its old value (Jules on #1316).
+///
+/// `let pool = Pool.load(id)!; if (event.skip) return; pool.collectedFeesUSD = ZERO_BD; pool.save()` has
+/// every save after the assignment, so the persistence rule alone accepts it - and on the early-return
+/// path the stored row never saw the assignment. The `new` case two tests up must stay accepted, because
+/// a row that was never saved is not a row.
+#[test]
+fn a_loaded_receiver_with_an_early_return_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the returning path leaves a stored row that never saw the assignment:\n{sql}"
+    );
+}
