@@ -66,7 +66,18 @@ pub fn drain_batched(dir: &Path, submit: &dyn Submit, batch: usize) -> Result<Dr
             Err(e) => return Err(e).with_context(|| format!("stat {}", pending_path.display())),
         }
     };
-    let mut completed = std::collections::BTreeSet::new();
+    // Only the settler replaces the queue and the counter only appends to it, so the replacement is
+    // this run's deferred rows, written as their outcomes arrive, followed by whatever the counter
+    // appended past the snapshot. Nothing proportional to the queue is held in memory.
+    let tmp = pending_path.with_extension("jsonl.tmp");
+    let mut kept = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?,
+    );
     let mut report = DrainReport::default();
     let batch = batch.max(1);
     let mut chunk = Vec::with_capacity(batch);
@@ -82,19 +93,19 @@ pub fn drain_batched(dir: &Path, submit: &dyn Submit, batch: usize) -> Result<Dr
             // finalise that result. Calling the operator command a second time would be a second
             // attempt to move the same money.
             match recorded_outcome(dir, &row)? {
-                Some(outcome) => journal(dir, &row, outcome, true, &mut report, &mut completed)?,
+                Some(outcome) => journal(dir, &row, outcome, true, &mut report, &mut kept)?,
                 None => chunk.push(row),
             }
             if chunk.len() == batch {
-                submit_chunk(dir, submit, &mut chunk, &mut report, &mut completed)?;
+                submit_chunk(dir, submit, &mut chunk, &mut report, &mut kept)?;
             }
         }
     }
-    submit_chunk(dir, submit, &mut chunk, &mut report, &mut completed)?;
-    // New payments may have arrived while the external command ran. Rewrite under the same
-    // cross-process lock as the server's append, removing only rows completed by this run.
+    submit_chunk(dir, submit, &mut chunk, &mut report, &mut kept)?;
+    // New payments may have arrived while the external command ran. Take them under the same
+    // cross-process lock as the server's append.
     let _guard = crate::counter::lock_queue(dir)?;
-    report.remaining = rewrite_without(&pending_path, &completed)?;
+    finish_queue(&pending_path, &tmp, kept, snapshot, &mut report)?;
     Ok(report)
 }
 
@@ -103,7 +114,7 @@ fn submit_chunk(
     submit: &dyn Submit,
     chunk: &mut Vec<serde_json::Value>,
     report: &mut DrainReport,
-    completed: &mut std::collections::BTreeSet<[String; 3]>,
+    kept: &mut std::io::BufWriter<std::fs::File>,
 ) -> Result<()> {
     if chunk.is_empty() {
         return Ok(());
@@ -113,7 +124,7 @@ fn submit_chunk(
         let outcome = outcomes
             .next()
             .unwrap_or_else(|| Outcome::Deferred("the submitter returned no outcome".into()));
-        journal(dir, &row, outcome, false, report, completed)?;
+        journal(dir, &row, outcome, false, report, kept)?;
     }
     Ok(())
 }
@@ -124,11 +135,13 @@ fn journal(
     outcome: Outcome,
     was_recorded: bool,
     report: &mut DrainReport,
-    completed: &mut std::collections::BTreeSet<[String; 3]>,
+    kept: &mut std::io::BufWriter<std::fs::File>,
 ) -> Result<()> {
     let (result, detail) = match outcome {
         Outcome::Deferred(_) => {
             report.deferred += 1;
+            report.remaining += 1;
+            writeln!(kept, "{row}").context("write the replacement queue")?;
             return Ok(());
         }
         Outcome::Settled => ("settled", String::new()),
@@ -144,7 +157,6 @@ fn journal(
     } else {
         report.failed += 1;
     }
-    completed.insert(authorisation_key(row));
     Ok(())
 }
 
@@ -405,54 +417,45 @@ fn parse_row(path: &Path, line: std::io::Result<String>) -> Result<Option<serde_
     Ok(Some(row))
 }
 
-/// Stream the queue into its replacement without the `completed` rows, returning how many remain.
-fn rewrite_without(
+/// Append the queue past `snapshot` to the replacement and install it. A crash before the rename
+/// leaves the old queue, whose completed rows the journals finalise on the next run.
+fn finish_queue(
     path: &Path,
-    completed: &std::collections::BTreeSet<[String; 3]>,
-) -> Result<u64> {
-    let file = match std::fs::File::open(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+    tmp: &Path,
+    mut kept: std::io::BufWriter<std::fs::File>,
+    snapshot: u64,
+    report: &mut DrainReport,
+) -> Result<()> {
+    match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        Ok(f) => f,
-    };
-    let tmp = path.with_extension("jsonl.tmp");
-    let mut kept = 0_u64;
-    {
-        let mut out = std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)
-                .with_context(|| format!("write {}", tmp.display()))?,
-        );
-        for line in std::io::BufReader::new(file).lines() {
-            let Some(row) = parse_row(path, line)? else {
-                continue;
-            };
-            if completed.contains(&authorisation_key(&row)) {
-                continue;
+        Ok(mut file) => {
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(snapshot))
+                .with_context(|| format!("seek {}", path.display()))?;
+            for line in std::io::BufReader::new(file).lines() {
+                let Some(row) = parse_row(path, line)? else {
+                    continue;
+                };
+                writeln!(kept, "{row}").with_context(|| format!("write {}", tmp.display()))?;
+                report.remaining += 1;
             }
-            writeln!(out, "{row}").with_context(|| format!("write {}", tmp.display()))?;
-            kept += 1;
         }
-        out.into_inner()
-            .map_err(|e| e.into_error())
-            .and_then(|f| f.sync_data())
-            .with_context(|| format!("sync {}", tmp.display()))?;
     }
-    if kept == 0 {
-        std::fs::remove_file(&tmp).with_context(|| format!("remove {}", tmp.display()))?;
+    kept.into_inner()
+        .map_err(|e| e.into_error())
+        .and_then(|f| f.sync_data())
+        .with_context(|| format!("sync {}", tmp.display()))?;
+    if report.remaining == 0 {
+        std::fs::remove_file(tmp).with_context(|| format!("remove {}", tmp.display()))?;
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
         }
     } else {
-        std::fs::rename(&tmp, path).with_context(|| format!("rename {}", tmp.display()))?;
+        std::fs::rename(tmp, path).with_context(|| format!("rename {}", tmp.display()))?;
     }
-    sync_parent(path)?;
-    Ok(kept)
+    sync_parent(path)
 }
 
 fn append_jsonl(path: &Path, row: &serde_json::Value) -> Result<()> {
