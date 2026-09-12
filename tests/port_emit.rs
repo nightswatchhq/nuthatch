@@ -2018,3 +2018,504 @@ export function handlePoolCreated(event: PoolCreated): void {
             .collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1313: a field the mappings only ever set to a constant.
+// ---------------------------------------------------------------------------------------------
+
+/// Ten of Uniswap V4's forty-four initialiser-reported fields are this shape: `pool.collectedFeesUSD
+/// = ZERO_BD` at creation and nothing in any mapping ever touches it again. Searching for a decoded
+/// column finds none, and the field was reported unanswered - a missing number where the exact one
+/// is known and is zero.
+const CONSTANT_SCHEMA: &str = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+  collectedFeesUSD: BigDecimal!
+}
+"#;
+
+const CONSTANT_MAPPING: &str = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+
+#[test]
+fn a_field_the_mappings_only_ever_set_to_a_constant_is_projected_as_that_constant() {
+    let (nest, result) = emitted_nest(CONSTANT_SCHEMA, CONSTANT_MAPPING);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "the constant must be projected as its literal:\n{sql}"
+    );
+    assert!(
+        view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "and listed, so the generated check projects it and coverage counts it: {:?}",
+        view.exact_fields
+    );
+    assert!(
+        !result
+            .skipped_fields
+            .iter()
+            .any(|s| s.name().contains("collectedFeesUSD")),
+        "a field answered exactly must not also be named unanswered: {:?}",
+        result
+            .skipped_fields
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+    );
+    // Projected once, in the outer select. A per-arm literal needs a presence marker that is `TRUE`
+    // unconditionally, and a guard that cannot fail is worse than no guard: it reads as one.
+    assert_eq!(
+        sql.matches("AS \"collectedFeesUSD\"").count(),
+        1,
+        "the literal belongs in one place:\n{sql}"
+    );
+    assert!(
+        !sql.contains("__present__collectedFeesUSD"),
+        "and needs no presence marker, having no arm that could omit it:\n{sql}"
+    );
+
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}
+
+#[test]
+fn a_field_assigned_two_different_constants_is_not_constant() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+export function handleOther(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.collectedFeesUSD = ONE_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a field that is 0 on one path and 1 on another is not constant, and guessing either is a \
+         wrong number rather than a missing one:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}
+
+#[test]
+fn a_field_also_assigned_a_real_value_is_not_constant() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.collectedFeesUSD = event.params.tickSpacing
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("0 AS \"collectedFeesUSD\""),
+        "initialised to zero and later assigned a decoded value is not a constant - freezing it at \
+         zero is the worst outcome available here:\n{sql}"
+    );
+    assert!(
+        sql.contains("last(\"collectedFeesUSD\""),
+        "it resolves through its column like any other field:\n{sql}"
+    );
+}
+
+#[test]
+fn a_constant_on_an_entity_with_no_column_is_named_rather_than_claimed() {
+    let (_nest, result) = emitted_nest(NO_COLUMN_SCHEMA, NO_COLUMN_MAPPING);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Bundle"),
+        "a constant is not a row source, so `Bundle` still gets no view: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    let named = result
+        .skipped_fields
+        .iter()
+        .find(|s| s.name() == "Bundle.ethPriceUSD")
+        .unwrap_or_else(|| {
+            panic!(
+                "the constant must be named unanswered, not silently dropped: {:?}",
+                result
+                    .skipped_fields
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        named.why.contains("no row"),
+        "and the reason must say why a known value is still unanswered: {}",
+        named.why
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1313 limit 3: a composed id reaches a SQL expression rather than a column.
+// ---------------------------------------------------------------------------------------------
+
+/// Five of Uniswap V4's event entities key on the transaction hash and the log index. Without the `id`
+/// the emitted view cannot fold on the entity at all, so the cost of a missing composed key is every
+/// other field on that view, not only the key.
+#[test]
+fn a_composed_id_is_emitted_as_a_concatenation() {
+    let schema = r#"
+type Swap @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let swap = new Swap(eventId(event.transaction.hash, event.logIndex))
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.plain = event.params.fee
+  swap.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Swap").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        sql.contains(
+            "CAST(\"tx_hash\" AS VARCHAR) || '-' || CAST(\"log_index\" AS VARCHAR) AS \"id\""
+        ),
+        "the composed id must be emitted as the concatenation of its parts:\n{sql}"
+    );
+    assert!(
+        view.exact_fields.contains(&"id".to_string()),
+        "and be listed: {:?}",
+        view.exact_fields
+    );
+    // With an `id` the view folds, which is what the key is worth beyond itself.
+    assert!(
+        sql.contains("GROUP BY \"id\""),
+        "an answerable id must re-enable the fold:\n{sql}"
+    );
+
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+    });
+    assert!(
+        check.is_ok(),
+        "the emitted view must bind: {check:?}\n{sql}"
+    );
+}
+
+/// A concatenation of literals alone is not a column-backed value.
+///
+/// `'a' + 'b'` is the same string on every row, so attributing it to the handler's triggering table would
+/// give an entity a view whose only content is a constant - one row with no event behind it, which is the
+/// placeholder shape #1277 removed. It has to be named, like any other unanswerable field.
+#[test]
+fn a_concatenation_of_literals_alone_is_not_a_column() {
+    let schema = r#"
+type Marker @entity {
+  id: ID!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let marker = new Marker('a' + '-' + 'b')
+  marker.id = 'a' + '-' + 'b'
+  marker.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+
+    assert!(
+        result.views.iter().all(|v| v.entity != "Marker"),
+        "a literal-only id is not a row source: {:?}",
+        result.views.iter().map(|v| &v.entity).collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .entities_without_views
+            .contains(&"Marker".to_string()),
+        "and it must be named rather than silently absent: {:?}",
+        result.entities_without_views
+    );
+    assert!(
+        !nest.path().join("views/20-marker.sql").exists(),
+        "no file either"
+    );
+}
+
+/// A **nullable** field assigned only a literal may still hold nothing.
+///
+/// Every assignment agreeing on one literal means no row holds a different number. It does not mean every
+/// row holds one: a row created by a handler that never touches the field keeps whatever the store had,
+/// which for a nullable field is null. graph-node refuses to save a row whose *non-nullable* field is
+/// unset, and that is the whole argument for answering every row with one literal (Jules on #1316).
+#[test]
+fn a_nullable_constant_field_is_not_answered_with_its_literal() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+  collectedFeesUSD: BigDecimal
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, CONSTANT_MAPPING);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a nullable field may be null on a row no handler wrote, and null is not 0:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}
+
+/// A field assigned the literal only inside a branch is not that literal on the rows that took the other
+/// one.
+///
+/// Jules's case on #1316, and the real shape: Uniswap V4 sets `Token.totalValueLockedUSDUntracked` inside
+/// `if (token0 === null)`, so this refusal costs a field whose value genuinely is always zero. Losing it
+/// is a missing number; projecting the literal for a row that never got it is a wrong one.
+#[test]
+fn a_conditionally_assigned_constant_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (pool === null) {
+    pool = new Pool(event.params.pool.toHexString())
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the branch gives the literal to the rows that took it and leaves the rest as they were:\n{sql}"
+    );
+    assert!(
+        !view.exact_fields.contains(&"collectedFeesUSD".to_string()),
+        "nor may it be listed as answered: {:?}",
+        view.exact_fields
+    );
+}
+
+/// A braceless conditional is conditional (Jules on #1316).
+///
+/// `if (cond) pool.collectedFeesUSD = ZERO_BD` sits at brace depth zero, so a depth test alone reads it
+/// as unconditional and projects zero for the rows that took the other branch.
+#[test]
+fn a_braceless_conditional_constant_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  if (event.params.tickSpacing > 0)
+    pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "no brace does not make a conditional unconditional:\n{sql}"
+    );
+
+    // The same thing on one line, which is the shape where the header and the assignment share a line and
+    // the check has to look at the assignment's own text rather than the line above it.
+    let one_line = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  if (event.params.tickSpacing > 0) pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, one_line);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "nor on one line:\n{sql}"
+    );
+}
+
+/// A row already saved before the assignment can be stored without it (Jules on #1316).
+///
+/// The early-`return` case, stated the way that makes it decidable: a `return` before the *save* stores
+/// nothing and leaves no row missing the field, but a `save()` before the assignment persists a row that
+/// the assignment had not reached yet.
+#[test]
+fn a_constant_assigned_after_a_save_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.save()
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "a row stored before the assignment never got it:\n{sql}"
+    );
+}
+
+/// A `return` *before* the save leaves no row at all, so it does not make the assignment conditional.
+///
+/// Uniswap V4's `handleInitialize` returns three times - a skip list and two null-decimal bails - before
+/// `pool.save()`. Refusing on any earlier `return` would cost all six of `Pool`'s initialiser constants
+/// for paths that store nothing.
+#[test]
+fn a_return_before_the_save_does_not_make_a_constant_conditional() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        sql.contains("0 AS \"collectedFeesUSD\""),
+        "a path that stores no row cannot leave one missing the field:\n{sql}"
+    );
+}
+
+/// A function that never saves hands the row to its caller, and the value then depends on a path this
+/// cannot see (Jules on #1316: `if (event.skip) return transaction; transaction.timestamp = ..`).
+#[test]
+fn a_constant_in_a_function_that_never_saves_is_not_answered() {
+    let mapping = r#"
+export function initPool(event: PoolCreated, pool: Pool): void {
+  pool.collectedFeesUSD = ZERO_BD
+}
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.params.pool.toHexString())
+  pool.plain = event.params.fee
+  initPool(event, pool)
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "whether the caller saved this row after the write is not visible here:\n{sql}"
+    );
+}
+
+/// A **loaded** row already exists, and needs no save to keep its old value (Jules on #1316).
+///
+/// `let pool = Pool.load(id)!; if (event.skip) return; pool.collectedFeesUSD = ZERO_BD; pool.save()` has
+/// every save after the assignment, so the persistence rule alone accepts it - and on the early-return
+/// path the stored row never saw the assignment. The `new` case two tests up must stay accepted, because
+/// a row that was never saved is not a row.
+#[test]
+fn a_loaded_receiver_with_an_early_return_is_not_answered_with_its_literal() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (event.params.tickSpacing > 0) {
+    return
+  }
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the returning path leaves a stored row that never saw the assignment:\n{sql}"
+    );
+
+    // `return` is not the only way out. AssemblyScript's `assert` throws on a false condition, and a throw
+    // is a deterministic error whose block graph-node discards - so the loaded row keeps what an earlier
+    // block stored, having never reached the assignment (Jules on #1316).
+    for terminator in [
+        "assert(event.params.tickSpacing > 0)",
+        "throw new Error('no')",
+    ] {
+        let aborting = format!(
+            r#"
+export function handlePoolCreated(event: PoolCreated): void {{
+  let pool = Pool.load(event.params.pool.toHexString())
+  {terminator}
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}}
+"#
+        );
+        let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, &aborting);
+        let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+        let sql = select_sql(&view.sql);
+        assert!(
+            !sql.contains("AS \"collectedFeesUSD\""),
+            "`{terminator}` can end the handler before the assignment:\n{sql}"
+        );
+    }
+}

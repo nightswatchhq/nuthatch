@@ -893,6 +893,67 @@ fn skip_reason(report_reason: &str) -> String {
     }
 }
 
+/// The constant a field is **always** assigned, if every assignment to it in every mapping is the same
+/// literal.
+///
+/// `pool.collectedFeesToken0 = ZERO_BD` and nothing ever touches it again, so the field is zero for the
+/// life of the subgraph and the view's answer is the literal. Ten fields on Uniswap V4 were reported as
+/// having no column, which is true and unhelpful: there is no column because there is no variation
+/// (#1313).
+///
+/// **Every assignment, for this entity and field, across all mappings.** Missing one would freeze a total
+/// that really grows - a wrong number rather than a missing one, and the worst outcome available here. A
+/// field assigned two different constants in different branches is not constant and gets nothing.
+fn always_constant(
+    entity: &str,
+    field: &str,
+    non_null: bool,
+    mappings: &crate::port_report::Mappings,
+) -> Option<String> {
+    // **Non-nullable, or a row may hold nothing rather than the literal.** Every assignment agreeing on
+    // one literal means no row holds a *different* number, but it does not mean every row holds one: a row
+    // created by a handler that never touches the field keeps whatever the store had, which for a nullable
+    // field is null. graph-node refuses to save a row whose non-nullable field is unset, so on a
+    // non-nullable field the subgraph itself guarantees every stored row was given a value - and the only
+    // value anything writes is this literal (Jules, #1316).
+    if !non_null {
+        return None;
+    }
+    // No "was anything assigned at all" flag: a non-literal assignment returns below, so `seen` is
+    // `Some` exactly when every assignment was the same literal and there was at least one.
+    let mut seen: Option<String> = None;
+    for func in mappings.functions.values() {
+        for asg in &func.assignments {
+            if asg.entity != entity || asg.field != field {
+                continue;
+            }
+            let lit = constant_literal(&asg.expr)?;
+            // **On every path through the function that writes it.** An assignment inside an `if` gives the
+            // literal to the rows that took that branch and leaves the rest as they were; a view projecting
+            // the literal for all of them answers a number the subgraph never stored (Jules, #1316). Paired
+            // with the non-null check above, which covers rows no handler wrote at all.
+            if !crate::port_report::assignment_reaches_every_stored_row(func, asg) {
+                return None;
+            }
+            match &seen {
+                Some(prev) if prev != &lit => return None,
+                _ => seen = Some(lit),
+            }
+        }
+    }
+    seen
+}
+
+/// A subgraph's zero and one conventions, as SQL. Nothing else: an unrecognised constant yields no
+/// literal, so the field is reported as unanswered rather than guessed at.
+fn constant_literal(expr: &str) -> Option<String> {
+    match expr.trim() {
+        "ZERO_BI" | "ZERO_BD" | "BigInt.zero()" | "BigDecimal.zero()" => Some("0".into()),
+        "ONE_BI" | "ONE_BD" => Some("1".into()),
+        _ => None,
+    }
+}
+
 fn view_for_entity(
     entity: &str,
     fields: &[&crate::port_report::FieldRow],
@@ -903,8 +964,12 @@ fn view_for_entity(
 ) -> ViewDraft {
     let view_name = to_alias(entity);
     let mut comments = Vec::new();
-    // field → table → column. One field may be written from several triggering tables.
+    // field → table → **SQL expression**. One field may be written from several triggering tables, and
+    // what answers it is not always a bare column: a composed id is a concatenation of two of them. A
+    // plain column is stored already quoted, so what the arms render is unchanged for it.
     let mut selects: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    // Fields with no column because they have no variation; projected as literals beside the rest.
+    let mut constants: BTreeMap<String, String> = BTreeMap::new();
     let mut skipped = Vec::new();
 
     for f in fields {
@@ -922,6 +987,17 @@ fn view_for_entity(
                 to_alias(&f.entity),
                 f.reason.replace('\n', " ")
             ));
+            continue;
+        }
+        // **A field the mappings only ever set to a constant is that constant.** Checked before the
+        // column search, because there is no column to find: `pool.collectedFeesToken0 = ZERO_BD` and
+        // nothing ever touches it again (#1313).
+        if let Some(lit) = always_constant(&f.entity, &f.field, f.non_null, mappings) {
+            comments.push(format!(
+                "-- `{}.{}` exact, and constant: every mapping assigns {} - {}:{}",
+                f.entity, f.field, lit, f.citation.file, f.citation.line
+            ));
+            constants.insert(f.field.clone(), lit);
             continue;
         }
         let tables = map_exact_field_tables(f, mappings, config, schema);
@@ -970,7 +1046,10 @@ fn view_for_entity(
     // `every_emitted_view_projects_exactly_the_fields_it_lists` holds the invariant.
     //
     // Sorted, because `selects` is a `BTreeMap`. Nothing downstream depends on schema order.
-    let exact_fields: Vec<String> = selects.keys().cloned().collect();
+    // Constants are answered fields too, so they belong in the list the generated check projects and the
+    // coverage figure counts. `every_emitted_view_projects_exactly_the_fields_it_lists` is what would catch
+    // this being forgotten.
+    let exact_fields: Vec<String> = selects.keys().chain(constants.keys()).cloned().collect();
 
     let mut sql = String::new();
     sql.push_str(&format!(
@@ -1000,16 +1079,37 @@ fn view_for_entity(
         // was no promised column to name, so those rows asserted nothing at all while reading as
         // `binds: true`. With no such view emitted, every row of `port_views.sql` names real
         // columns and the binder is a gate for all of them.
+        // **A constant needs a row to ride on.** With no table there is no row source, so a field that is
+        // always zero is still unanswerable here - there is nothing to project it from. Named rather than
+        // left in `exact_fields`, which would claim a field for a view that does not exist: the #1248 shape
+        // this early return was written to prevent.
+        for (field, lit) in &constants {
+            skipped.push(SkippedField {
+                entity: entity.to_string(),
+                field: field.clone(),
+                citation: Citation {
+                    file: "schema.graphql".into(),
+                    line: 0,
+                },
+                why: format!(
+                    "is always {lit}, but no field of `{entity}` reaches a column, so there is no row to \
+                     project it from"
+                ),
+            });
+        }
         return ViewDraft {
             sql,
-            exact_fields,
+            exact_fields: exact_fields
+                .into_iter()
+                .filter(|f| !constants.contains_key(f))
+                .collect(),
             skipped,
         };
     }
 
     sql.push_str(&format!(
         "CREATE VIEW \"{view_name}\" AS\n{}\n",
-        exact_select_sql(&selects)
+        exact_select_sql(&selects, &constants)
     ));
     ViewDraft {
         sql,
@@ -1032,7 +1132,10 @@ const PRESENT: &str = "__present__";
 /// tell it from a genuine one. A nullable entity field cleared by a later event kept its old value
 /// for good, and the view called that exact. The marker says which arm actually carried the field,
 /// so a real NULL wins the fold and a structural one still does not.
-fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> String {
+fn exact_select_sql(
+    selects: &BTreeMap<String, BTreeMap<String, String>>,
+    constants: &BTreeMap<String, String>,
+) -> String {
     let mut tables = BTreeSet::new();
     for by_table in selects.values() {
         tables.extend(by_table.keys().cloned());
@@ -1046,8 +1149,8 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
                 .iter()
                 .flat_map(
                     |field| match selects.get(*field).and_then(|m| m.get(table)) {
-                        Some(col) => [
-                            format!("  \"{col}\" AS \"{field}\""),
+                        Some(expr) => [
+                            format!("  {expr} AS \"{field}\""),
                             format!("  TRUE AS \"{PRESENT}{field}\""),
                         ],
                         None => [
@@ -1057,6 +1160,14 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
                     },
                 )
                 .collect();
+            // A constant has no column and no arm of its own: with nothing to fold it is projected once
+            // by the caller below. Inside an arm it would need a presence marker that is `TRUE`
+            // unconditionally, which is a guard that cannot fail.
+            if !fold {
+                for (field, lit) in constants {
+                    cols.push(format!("  {lit} AS \"{field}\""));
+                }
+            }
             if fold {
                 cols.push("  \"block_number\"".into());
                 cols.push("  \"log_index\"".into());
@@ -1068,7 +1179,7 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
     if !fold {
         return format!("{inner};");
     }
-    let outer: Vec<String> = fields
+    let mut outer: Vec<String> = fields
         .iter()
         .map(|field| {
             if *field == "id" {
@@ -1080,6 +1191,11 @@ fn exact_select_sql(selects: &BTreeMap<String, BTreeMap<String, String>>) -> Str
             }
         })
         .collect();
+    // The literal, once. Every row of every arm would carry the same value, so there is nothing for
+    // `last()` to choose between and no arm that could fail to carry it.
+    for (field, lit) in constants {
+        outer.push(format!("  {lit} AS \"{field}\""));
+    }
     format!(
         "SELECT\n{}\nFROM (\n{}\n)\nGROUP BY \"id\";",
         outer.join(",\n"),
@@ -1225,22 +1341,70 @@ fn map_exact_field_tables(
             if asg.entity != field.entity || asg.field != field.field {
                 continue;
             }
-            let Some(col) = assignment_event_column(asg, func) else {
-                continue;
+            // A bare column first, then a composition of them. Order matters only for clarity: a single
+            // value is not a concatenation, and `expr_concat_parts` refuses one.
+            let simple = assignment_event_column(asg, func, &mappings.functions);
+            let composed = if simple.is_none() {
+                crate::port_report::expr_concat_parts(&asg.expr, func, &mappings.functions)
+            } else {
+                None
             };
+            if simple.is_none() && composed.is_none() {
+                continue;
+            }
             let Some(handler) = event_handler_for(func, mappings) else {
                 continue;
             };
             let Some(table) = table_for_handler(&handler.name, mappings, config) else {
                 continue;
             };
-            let Some(col) = resolve_column(&table, &col, schema) else {
-                continue;
+            let expr = match (simple, composed) {
+                (Some(col), _) => match resolve_column(&table, &col, schema) {
+                    Some(c) => format!("\"{c}\""),
+                    None => continue,
+                },
+                (None, Some(parts)) => match concat_sql(&parts, &table, schema) {
+                    Some(sql) => sql,
+                    None => continue,
+                },
+                (None, None) => continue,
             };
-            out.entry(table).or_insert(col);
+            out.entry(table).or_insert(expr);
         }
     }
     out
+}
+
+/// A composed value as SQL: `"tx_hash" || '-' || CAST("log_index" AS VARCHAR)`.
+///
+/// Every column is cast to text, because the pieces are being concatenated into a string id and DuckDB's
+/// `||` on a non-text operand is not the same expression. A literal is escaped by doubling its quotes, so
+/// a separator containing one cannot end the literal early.
+///
+/// `None` if any column does not resolve against this table, so a key with a missing piece is never
+/// emitted - that would be a different key, which is a wrong row rather than a missing one.
+fn concat_sql(
+    parts: &[crate::port_report::ConcatPart],
+    table: &str,
+    schema: &[nuthatch_decode::registry::TableSchema],
+) -> Option<String> {
+    use crate::port_report::ConcatPart;
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        out.push(match part {
+            ConcatPart::Literal(text) => format!("'{}'", text.replace('\'', "''")),
+            ConcatPart::Column(col) => {
+                let c = resolve_column(table, col, schema)?;
+                format!("CAST(\"{c}\" AS VARCHAR)")
+            }
+        });
+    }
+    // A concatenation of literals only is not a column-backed value; it would be the same string on every
+    // row, which is `always_constant`'s job and not reached through here.
+    if !parts.iter().any(|p| matches!(p, ConcatPart::Column(_))) {
+        return None;
+    }
+    Some(out.join(" || "))
 }
 
 /// A table that writes other Exact fields still needs an id column so UNION ALL can fold
@@ -1265,7 +1429,10 @@ fn fill_id_columns(
             continue;
         }
         if let Some(col) = id_column_for_table(entity, &table, mappings, config) {
-            selects.entry("id".into()).or_default().insert(table, col);
+            selects
+                .entry("id".into())
+                .or_default()
+                .insert(table, format!("\"{col}\""));
         }
     }
 }
@@ -1321,7 +1488,9 @@ fn id_column_for_table(
         if t != table {
             continue;
         }
-        if let Some(col) = crate::port_report::entity_id_event_column(entity, func) {
+        if let Some(col) =
+            crate::port_report::entity_id_event_column(entity, func, &mappings.functions)
+        {
             return Some(col);
         }
     }
@@ -1504,7 +1673,7 @@ mod tests {
         put(&mut selects, "id", "factory__token_updated", "token");
         put(&mut selects, "symbol", "factory__pool_created", "sym");
         put(&mut selects, "name", "factory__token_updated", "name");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1584,10 +1753,12 @@ mod tests {
         table: &str,
         col: &str,
     ) {
+        // Takes a column name and stores the expression for it, so these cases read as they did before
+        // the map started carrying expressions.
         selects
             .entry(field.into())
             .or_default()
-            .insert(table.into(), col.into());
+            .insert(table.into(), format!("\"{col}\""));
     }
 
     #[test]
@@ -1597,7 +1768,7 @@ mod tests {
         put(&mut selects, "id", "factory__token_updated", "token");
         put(&mut selects, "symbol", "factory__pool_created", "token0");
         put(&mut selects, "name", "factory__token_updated", "name");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
         assert!(sql.contains("UNION ALL"), "{sql}");
         assert!(sql.contains("GROUP BY \"id\""), "{sql}");
         assert!(
@@ -1624,7 +1795,7 @@ mod tests {
         let mut selects = BTreeMap::new();
         put(&mut selects, "id", "factory__pool_created", "token0");
         put(&mut selects, "symbol", "factory__pool_created", "token0");
-        let sql = exact_select_sql(&selects);
+        let sql = exact_select_sql(&selects, &BTreeMap::new());
         assert!(!sql.contains("UNION ALL"), "{sql}");
         assert!(!sql.contains("NULL AS"), "{sql}");
         assert!(sql.contains("GROUP BY \"id\""), "{sql}");

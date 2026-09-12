@@ -57,6 +57,9 @@ pub struct FieldRow {
     pub class: Class,
     pub citation: Citation,
     pub reason: String,
+    /// Declared `T!` rather than `T`. The emitter needs it to decide whether a single literal can answer
+    /// for every row (#1316).
+    pub non_null: bool,
 }
 
 impl FieldRow {
@@ -214,6 +217,10 @@ struct SchemaField {
     name: String,
     line: usize,
     derived_from: Option<String>,
+    /// `BigDecimal!` rather than `BigDecimal`. Load-bearing for the constant case: graph-node refuses to
+    /// save a row whose non-nullable field is unset, so a non-nullable field has a value on every stored
+    /// row - which is what lets a single literal answer for all of them.
+    non_null: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -361,7 +368,18 @@ fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
         // body, so the two overlap on that first line. The old per-line loop had the same overlap
         // (`start_line + offset + 1`) and reported every schema field one line below itself.
         let line = start_line + line_of(body, *at) - 1;
-        flush_field(&mut fields, Some((name.clone(), line)), &dirs);
+        // The declared type, between the `:` and the end of this field's segment or its first directive.
+        let ty = segment
+            .split_once(':')
+            .map(|(_, rest)| rest.split('@').next().unwrap_or(rest))
+            .map(|t| t.split('#').next().unwrap_or(t).trim().to_string())
+            .unwrap_or_default();
+        flush_field(
+            &mut fields,
+            Some((name.clone(), line)),
+            &dirs,
+            ty.ends_with('!'),
+        );
     }
     fields
 }
@@ -426,7 +444,12 @@ fn field_starts(body: &str) -> Vec<(String, usize)> {
     out
 }
 
-fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, dirs: &str) {
+fn flush_field(
+    fields: &mut Vec<SchemaField>,
+    pending: Option<(String, usize)>,
+    dirs: &str,
+    non_null: bool,
+) {
     let Some((name, line)) = pending else {
         return;
     };
@@ -438,6 +461,7 @@ fn flush_field(fields: &mut Vec<SchemaField>, pending: Option<(String, usize)>, 
         name,
         line,
         derived_from,
+        non_null,
     });
 }
 
@@ -2076,12 +2100,21 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
 
     let mut rows: Vec<FieldRow> = field_class
         .into_iter()
-        .map(|((entity, field), (class, citation, reason))| FieldRow {
-            entity,
-            field,
-            class,
-            citation,
-            reason,
+        .map(|((entity, field), (class, citation, reason))| {
+            let non_null = schema
+                .entities
+                .iter()
+                .find(|e| e.name == entity)
+                .and_then(|e| e.fields.iter().find(|f| f.name == field))
+                .is_some_and(|f| f.non_null);
+            FieldRow {
+                entity,
+                field,
+                class,
+                citation,
+                reason,
+                non_null,
+            }
         })
         .collect();
     rows.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.field.cmp(&b.field)));
@@ -3169,10 +3202,14 @@ fn string_literal(expr: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn entity_id_event_column(entity: &str, func: &FunctionInfo) -> Option<String> {
+pub(crate) fn entity_id_event_column(
+    entity: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<String> {
     for asg in &func.assignments {
         if asg.entity == entity && asg.field == "id" {
-            if let Some(col) = assignment_event_column(asg, func) {
+            if let Some(col) = assignment_event_column(asg, func, functions) {
                 return Some(col);
             }
         }
@@ -3272,7 +3309,35 @@ pub(crate) fn accumulation(asg: &Assignment) -> Option<Accumulation> {
     None
 }
 
-pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> Option<String> {
+pub(crate) fn assignment_event_column(
+    asg: &Assignment,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<String> {
+    expr_event_column(&asg.expr, func, functions)
+}
+
+/// The same ladder, on an expression rather than a whole assignment.
+///
+/// Split out so a *part* of a composed expression can be resolved the same way the whole of a simple one
+/// is: `transaction.id + '-' + event.logIndex.toString()` is two of these and a literal, and resolving
+/// the parts by a second, simpler rule would be a second set of answers to maintain.
+pub(crate) fn expr_event_column(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<String> {
+    let asg = &Assignment {
+        receiver: String::new(),
+        entity: String::new(),
+        field: String::new(),
+        citation: Citation {
+            file: String::new(),
+            line: 0,
+        },
+        expr: expr.to_string(),
+        receiver_is_entity: false,
+    };
     if let Some(col) = event_column(&asg.expr) {
         return Some(col);
     }
@@ -3284,8 +3349,510 @@ pub(crate) fn assignment_event_column(asg: &Assignment, func: &FunctionInfo) -> 
     // `tick.pool = poolId` is as much `event.params.id` as `tick.id = tickId` is; the old gate was
     // narrower than the reasoning behind it. `plain_local_expr` already refuses a name bound more than
     // once, so broadening this cannot silently pick the wrong binding.
-    let ident = local_root(&asg.expr)?;
-    event_column_through_aliases(&func.body, &ident)
+    if let Some(ident) = local_root(&asg.expr) {
+        if let Some(col) = event_column_through_aliases(&func.body, &ident) {
+            return Some(col);
+        }
+    }
+    // **A one-hop read of another entity's field, when that field is this event's own value.**
+    //
+    // ```ts
+    // const transaction = loadTransaction(event)   // sets transaction.timestamp = event.block.timestamp
+    // swap.timestamp = transaction.timestamp       // so this *is* `block_timestamp`, on this row
+    // ```
+    //
+    // `local_root` strips a trailing `.id` and nothing else, so this reached no column and 15 fields on
+    // Uniswap V4 were reported as having none (#1313).
+    //
+    // **Only when the field is written from the event in this handler or a helper it calls.** That is the
+    // whole safety condition: `loadTransaction` overwrites `timestamp` from the current event before
+    // returning, so the value is this event's. A field written only in a *different* handler -
+    // `poolDayData.open = pool.token0Price`, where the price was set when the pool was initialised - is a
+    // read of stored state and needs a join to that entity as of this block, not a column. Those stay
+    // unresolved here rather than being answered with the wrong row's value.
+    entity_field_event_column(&asg.expr, func, functions)
+}
+
+/// One piece of a composed expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConcatPart {
+    /// A string literal, as written. Quoting for SQL is the emitter's job.
+    Literal(String),
+    /// An event column name, to be resolved against the triggering table.
+    Column(String),
+}
+
+/// A composed value: `transaction.id + '-' + event.logIndex.toString()`, or the template literal
+/// `` `${transactionHash.toHexString()}-${logIndex.toString()}` `` that `eventId` returns.
+///
+/// This is the commonest id shape a subgraph writes - an event entity's primary key is almost always the
+/// transaction hash and the log index with a separator - and seven entities on Uniswap V4 had **no `id`
+/// at all** because of it. An id is not one field among many: without it the emitted view cannot fold on
+/// the entity, so a missing `id` costs every other field on that view its `last()`.
+///
+/// **All or nothing.** One part that resolves to neither a literal nor a column and the whole expression
+/// is unresolved, because a composed key with a piece missing is a different key, and a different key is
+/// a wrong row rather than a missing one.
+pub(crate) fn expr_concat_parts(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<Vec<ConcatPart>> {
+    let e = collapse_ws(expr).trim().to_string();
+    // A call to a one-line helper is the expression it returns. `eventId(event.transaction.hash,
+    // event.logIndex)` is how three of Uniswap V4's event entities spell their primary key, and without
+    // this it reads as an opaque call.
+    let e = inline_single_return(&e, functions).unwrap_or(e);
+    // No "at least two pieces" rule: a single-hole template literal - `` `${x}` `` - is the same value as
+    // `x` and resolves to the same column, and refusing it would only mean one spelling answered and
+    // another did not. `split_concat` already refuses anything that is not a concatenation at all.
+    let pieces = split_concat(&e)?;
+    let mut out = Vec::new();
+    for piece in pieces {
+        let t = piece.trim();
+        if let Some(lit) = plain_string_literal(t) {
+            out.push(ConcatPart::Literal(lit));
+            continue;
+        }
+        out.push(ConcatPart::Column(expr_event_column(t, func, functions)?));
+    }
+    Some(out)
+}
+
+/// A call to a helper whose whole body is one `return`, as that expression with the arguments in place.
+///
+/// **One statement only.** A helper that does anything else - a branch, a load, a `save` - is not a pure
+/// function of its arguments, and substituting its return expression would drop whatever else it did. One
+/// `return` and nothing else is the case where the substitution is the whole meaning of the call.
+///
+/// Arity must match exactly. A defaulted parameter would leave an unsubstituted name behind, which would
+/// then resolve against the *caller's* locals if one happened to share the name.
+fn inline_single_return(expr: &str, functions: &BTreeMap<String, FunctionInfo>) -> Option<String> {
+    let open = expr.find('(')?;
+    let name = expr[..open].trim();
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+        return None;
+    }
+    // The call has to be the whole expression, not the head of a larger one.
+    if match_paren(expr, open)? != expr.len() - 1 {
+        return None;
+    }
+    let f = functions.get(name)?;
+    let args = take_paren_list(expr, open);
+    if args.len() != f.param_names.len() {
+        return None;
+    }
+    let mut body = String::new();
+    for line in f.body.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        if !body.is_empty() {
+            return None;
+        }
+        body = t.to_string();
+    }
+    let mut ret = body.strip_prefix("return ")?.trim().to_string();
+    ret = ret.trim_end_matches(';').trim().to_string();
+    for (param, arg) in f.param_names.iter().zip(&args) {
+        ret = substitute_ident(&ret, param, arg.trim());
+    }
+    Some(ret)
+}
+
+/// The pieces of a `+` chain, or of a template literal's text and `${…}` holes.
+///
+/// Returns `None` for anything that is not a concatenation, so a caller cannot mistake a single value for
+/// a one-piece chain. Quotes, parentheses and brackets are tracked, so a `+` inside a literal or inside a
+/// call's arguments does not split - `a + f(x + 1)` is two pieces, not three.
+fn split_concat(e: &str) -> Option<Vec<String>> {
+    if let Some(inner) = e
+        .strip_prefix('`')
+        .and_then(|r| r.strip_suffix('`'))
+        .filter(|_| e.len() >= 2)
+    {
+        return Some(template_pieces(inner));
+    }
+    let b = e.as_bytes();
+    let (mut depth, mut quote, mut start) = (0i32, None::<u8>, 0usize);
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'+' if depth == 0 => {
+                    out.push(e[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.push(e[start..].to_string());
+    Some(out)
+}
+
+/// A template literal's literal runs and its `${…}` expressions, in order.
+fn template_pieces(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = inner;
+    while let Some(at) = rest.find("${") {
+        if at > 0 {
+            out.push(format!("'{}'", &rest[..at]));
+        }
+        let after = &rest[at + 2..];
+        let mut depth = 1i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(after[..end].to_string());
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    if !rest.is_empty() {
+        out.push(format!("'{rest}'"));
+    }
+    out
+}
+
+/// The text of a single- or double-quoted literal, with no escapes in it.
+///
+/// An escape is refused rather than interpreted: the emitter puts this text into SQL, and guessing what
+/// `\n` meant in AssemblyScript would put a different separator in the key.
+fn plain_string_literal(t: &str) -> Option<String> {
+    for q in ['\'', '"'] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            let inner = &t[1..t.len() - 1];
+            if inner.contains(q) || inner.contains('\\') {
+                return None;
+            }
+            return Some(inner.to_string());
+        }
+    }
+    None
+}
+
+/// `local.field` resolved to an event column, when a reachable function writes that field from the event.
+///
+/// `functions` is searched only through `func.calls` - this handler and the helpers it calls - because a
+/// write in an unrelated handler is a different event's value.
+fn entity_field_event_column(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> Option<String> {
+    let e = collapse_ws(&strip_converters(expr));
+    let e = e.trim();
+    let (recv, field) = e.rsplit_once('.')?;
+    if field.is_empty()
+        || !field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !recv.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || recv.is_empty()
+    {
+        return None;
+    }
+    // **This body only, and only a receiver bound fresh in it.**
+    //
+    // The first version of this took the handler plus every function it calls, matched a local by name
+    // and entity type, and accepted an event assignment from any of those bodies. Jules found the
+    // counter-example on #1316: a handler that does `let transaction = Transaction.load(id)`, calls a
+    // helper that happens to bind its own local of the same name and entity and writes
+    // `transaction.timestamp = event.block.timestamp`, and the read resolves to `block_timestamp`
+    // while the handler's receiver still holds whatever an earlier block stored. A name and a type are
+    // not a value flow.
+    //
+    // So: the binding must be `new Entity(..)` in this body, which is the one case where nothing was
+    // read back from the store, and the assignment must be in this body too. A `load()`ed receiver
+    // carries an earlier block's value and is refused; the helper-return shape needs the returned
+    // value tracked through the call and is not this change.
+    if let Some((entity, fresh)) = local_entity_binding(&func.body, recv) {
+        if !fresh {
+            return None;
+        }
+        // **Every** assignment to this receiver's field, not every assignment to that entity's field.
+        // A second local of the same entity is a different row, and its assignment says nothing about
+        // this one (Jules, #1316). And every one of them, not the first that happens to be an event
+        // column: one later assignment from anything else and the value at the read is not this event's.
+        let mut col = None;
+        for asg in &func.assignments {
+            if asg.field != field || asg.entity != entity || asg.receiver != recv {
+                continue;
+            }
+            col = Some(event_column(&asg.expr)?);
+        }
+        return col;
+    }
+    // The receiver is the return value of a helper this body calls: `const transaction =
+    // loadTransaction(event)`. That is the common shape and it is followable, because the entity comes
+    // from the helper's own binding rather than from a name that matched.
+    let rhs = local_assignment(&func.body, recv)?;
+    // No "does this body call it" check: `rhs` is the local's own right-hand side, taken from this body,
+    // so a bare identifier before `(` is one `collect_calls` has already seen. A method call keeps its
+    // dot and matches no function name.
+    let callee = rhs.split('(').next()?.trim();
+    returned_field_event_column(functions.get(callee)?, field)
+}
+
+/// The event column a field of the entity a helper returns is known to hold, on every path out of it.
+///
+/// `loadTransaction` is the shape: load by the transaction hash, `new` it if absent, then set
+/// `timestamp` from `event.block.timestamp` before returning. The value is this event's whether or not
+/// the row already existed, and that is what makes the caller's `transaction.timestamp` exact.
+fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<String> {
+    let var = returned_local(&helper.body)?;
+    let (entity, _) = local_entity_binding(&helper.body, &var)?;
+    // `id` is never assigned: it is the argument the row was bound with. Every binding of that local has
+    // to carry the same argument, because a `load` on one path and a `new` on another each set it.
+    if field == "id" {
+        let args = binding_arguments(&helper.body, &var);
+        let first = args.first()?;
+        // Every binding, agreeing. One `new` on its own is as sound as a `load` and a `new` that carry the
+        // same argument; two that disagree mean the id depends on which path ran.
+        if args.iter().any(|a| a != first) {
+            return None;
+        }
+        return event_column(first);
+    }
+    // Assigned from an event, every time, and at least once at the body's top level so that it happens
+    // on every path rather than only the one an `if` took.
+    // **A returned row escapes, so freshness exempts nothing here.**
+    // `assignment_reaches_every_stored_row` lets a terminator before the assignment pass when the receiver
+    // is `new`, because a row this function never saved is not a stored row. That argument is about rows
+    // *this* function stores, and it does not hold for one it hands back: `let transaction = new
+    // Transaction(id); if (event.skip) return transaction; transaction.timestamp = ..` returns a row with
+    // the field unset, and the caller saves it (Jules, #1316). So any terminator before the assignment
+    // refuses, fresh or not.
+    let body_lines: Vec<&str> = helper.body.lines().collect();
+    let mut col = None;
+    let mut unconditional = false;
+    for asg in &helper.assignments {
+        // The returned local, by name. A helper may load and return `transaction` while also creating an
+        // unrelated `other` of the same entity and writing `other.timestamp` from the event; matching on
+        // the entity alone reported that as the returned row's value (Jules, #1316).
+        if asg.field != field || asg.entity != entity || asg.receiver != var {
+            continue;
+        }
+        let c = event_column(&asg.expr)?;
+        if col.as_ref().is_some_and(|prev| prev != &c) {
+            return None;
+        }
+        let idx = asg
+            .citation
+            .line
+            .checked_sub(helper.body_start_line)
+            .unwrap_or(usize::MAX);
+        let escapes_unset =
+            idx >= body_lines.len() || body_lines[..idx].iter().any(|l| aborts_the_handler(l));
+        unconditional |= !escapes_unset && assignment_reaches_every_stored_row(helper, asg);
+        col = Some(c);
+    }
+    if unconditional {
+        col
+    } else {
+        None
+    }
+}
+
+/// The local a function returns, from `return x` or `return x as Entity`.
+fn returned_local(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("return ") else {
+            continue;
+        };
+        let v = rest.trim().trim_end_matches(';').trim();
+        let v = v.split(" as ").next().unwrap_or(v).trim();
+        if !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Every argument a local was bound with, across `new Entity(..)` and `Entity.load(..)` alike.
+fn binding_arguments(body: &str, var: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut i = 0usize;
+    while i < body.len() {
+        let hit = match_let_new(body, i)
+            .or_else(|| match_bare_new(body, i))
+            .or_else(|| match_let_create(body, i))
+            .or_else(|| match_let_load(body, i));
+        if let Some((v, _ent, open)) = hit {
+            if v == var {
+                if let Some(a) = take_paren_list(body, open).into_iter().next() {
+                    args.push(collapse_ws(&strip_converters(&a)).trim().to_string());
+                }
+            }
+            i = open.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    args
+}
+
+/// Whether every **stored** row of the receiver carries what this assignment wrote.
+///
+/// Brace depth alone is not path coverage, and Jules was right about both ways it fails on #1316: an
+/// earlier `return` skips a depth-zero assignment, and `if (cond) pool.f = ZERO` sits at depth zero
+/// while being conditional. What closes it is not control-flow analysis but **persistence**:
+///
+/// - a row only exists once something saves it, so an early `return` before the save stores nothing and
+///   leaves no row missing the field. Uniswap V4's `handleInitialize` returns three times before
+///   `pool.save()`, and none of those paths leaves a `Pool` behind;
+/// - a row *can* be stored without the field if a `save()` runs before the assignment. So every
+///   `<recv>.save()` in this body has to come after it, and there has to be at least one - a function
+///   that never saves hands the row to its caller, and the value then depends on a path this cannot see.
+///
+/// Still requires depth zero and refuses a braceless control header, because those say the assignment
+/// did not run at all on some path that did reach the save.
+pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Assignment) -> bool {
+    let Some(idx) = asg.citation.line.checked_sub(func.body_start_line) else {
+        return false;
+    };
+    let lines: Vec<&str> = func.body.lines().collect();
+    if idx >= lines.len() {
+        return false;
+    }
+    let mut depth = 0i32;
+    for line in &lines[..idx] {
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    // `if (cond) pool.f = ZERO` on one line, or the header on the line above with no brace opened.
+    if governed_by_a_braceless_header(&lines, idx) {
+        return false;
+    }
+    // **A loaded row already exists, and needs no save to keep its old value.** That is why "every save
+    // comes after the assignment" is not enough on its own (Jules, #1316): with
+    // `let pool = Pool.load(id)!; if (event.skip) return; pool.f = ZERO_BD; pool.save()`, the early return
+    // leaves a stored row that never saw the assignment. A row bound by `new` has nothing stored yet, so a
+    // return before the save genuinely stores nothing - Uniswap V4's `handleInitialize` does
+    // `const pool = new Pool(poolId)` and then returns twice on null decimals, leaving no `Pool` behind.
+    let fresh = local_entity_binding(&func.body, &asg.receiver).is_some_and(|(_, fresh)| fresh);
+    if !fresh && lines[..idx].iter().any(|l| aborts_the_handler(l)) {
+        return false;
+    }
+    // Every save of this receiver, after the assignment, and at least one.
+    let needle = format!("{}.save()", asg.receiver);
+    let mut saves = 0usize;
+    for (n, line) in lines.iter().enumerate() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        if n <= idx {
+            return false;
+        }
+        saves += 1;
+    }
+    saves > 0
+}
+
+/// Whether a line can end the handler before the next statement runs.
+///
+/// `return` is the obvious one. `assert(..)` and `throw` are the others (Jules, #1316): AssemblyScript's
+/// `assert` throws on a false condition, and a throw is a deterministic error whose block graph-node
+/// discards - so a row loaded from an earlier block keeps what that block stored, having never reached the
+/// assignment. Textual, and deliberately so: this is a guard on what the classifier may claim, and a
+/// terminator it cannot recognise has to read as one it cannot rule out.
+fn aborts_the_handler(line: &str) -> bool {
+    let t = line.trim();
+    let keyword = |k: &str| {
+        t == k
+            || t.strip_prefix(k)
+                .is_some_and(|r| r.starts_with([' ', ';', '(']))
+    };
+    keyword("return") || keyword("throw") || keyword("assert")
+}
+
+/// Whether the statement on `idx` is the body of a conditional or loop that opened no block.
+fn governed_by_a_braceless_header(lines: &[&str], idx: usize) -> bool {
+    const HEADS: [&str; 4] = ["if", "for", "while", "else"];
+    let is_head = |t: &str| {
+        HEADS.iter().any(|h| {
+            t == *h
+                || t.strip_prefix(h).is_some_and(|r| r.starts_with([' ', '(']))
+                || t.strip_prefix("} ")
+                    .is_some_and(|r| r == *h || r.starts_with(&format!("{h} ")))
+        })
+    };
+    let own = lines[idx].trim();
+    if is_head(own) {
+        return true;
+    }
+    // The nearest statement above, skipping blanks and line comments.
+    for prev in lines[..idx].iter().rev() {
+        let t = prev.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        return is_head(t) && !t.ends_with('{');
+    }
+    false
+}
+
+/// The entity a local holds, and whether it was bound fresh rather than read back from the store.
+///
+/// `new Entity(..)` and `Entity.create(..)` are fresh: every field of that row is whatever this
+/// invocation puts there. `Entity.load(..)` is not - the row already existed, written by some earlier
+/// block, so its fields are stored state.
+fn local_entity_binding(body: &str, var: &str) -> Option<(String, bool)> {
+    let mut i = 0usize;
+    while i < body.len() {
+        let fresh = match_let_new(body, i)
+            .or_else(|| match_bare_new(body, i))
+            .or_else(|| match_let_create(body, i));
+        let hit = match fresh {
+            Some((v, ent, next)) => Some((v, ent, next, true)),
+            None => match_let_load(body, i).map(|(v, ent, next)| (v, ent, next, false)),
+        };
+        if let Some((v, ent, next, fresh)) = hit {
+            if v == var {
+                return Some((ent, fresh));
+            }
+            i = next.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The expression an entity local was built from, or the expression a plain local aliases.
@@ -3687,7 +4254,7 @@ export function handlePoolCreated(event: PoolCreated): void {
             .find(|a| a.entity == "Token" && a.field == "id")
             .expect("constructor id");
         assert_eq!(
-            assignment_event_column(token_id, func).as_deref(),
+            assignment_event_column(token_id, func, &mappings.functions).as_deref(),
             Some("token0")
         );
         let pool_id = func
@@ -3696,7 +4263,7 @@ export function handlePoolCreated(event: PoolCreated): void {
             .find(|a| a.entity == "Pool" && a.field == "id")
             .expect("pool constructor id");
         assert_eq!(
-            assignment_event_column(pool_id, func).as_deref(),
+            assignment_event_column(pool_id, func, &mappings.functions).as_deref(),
             Some("pool")
         );
     }
@@ -3736,7 +4303,7 @@ export function handleSwap(event: SwapEvent): void {
             .find(|a| a.entity == "Swap" && a.field == "pool")
             .expect("the foreign key assignment");
         assert_eq!(
-            assignment_event_column(fk, func).as_deref(),
+            assignment_event_column(fk, func, &mappings.functions).as_deref(),
             Some("poolId"),
             "`pool.id` -> `Pool.load(poolId)` -> `event.params.poolId`"
         );
@@ -3757,7 +4324,7 @@ export function handleSwap(event: SwapEvent): void {
             .iter()
             .find(|a| a.entity == "Swap" && a.field == "pool")
             .expect("the foreign key assignment");
-        assert_eq!(assignment_event_column(fk, func), None);
+        assert_eq!(assignment_event_column(fk, func, &mappings.functions), None);
 
         // And a self-referential chain terminates instead of spinning.
         let mapping = r#"
@@ -3776,7 +4343,7 @@ export function handleSwap(event: SwapEvent): void {
             .iter()
             .find(|a| a.entity == "Swap" && a.field == "pool")
             .expect("the foreign key assignment");
-        assert_eq!(assignment_event_column(fk, func), None);
+        assert_eq!(assignment_event_column(fk, func, &mappings.functions), None);
     }
 
     #[test]
@@ -3924,6 +4491,743 @@ export function handlePoolCreated(event: PoolCreated): void {
         let rows = classify(&schema, &mappings);
         assert_eq!(class_of(&rows, "Token", "symbol"), Class::CallDerived);
         assert!(reason_of(&rows, "Token", "symbol").contains("contract state"));
+    }
+
+    /// A one-hop read of another entity's field resolves to this row's column.
+    ///
+    /// ```ts
+    /// const transaction = loadTransaction(event)   // sets transaction.timestamp = event.block.timestamp
+    /// swap.timestamp = transaction.timestamp       // so this *is* `block_timestamp`, on this row
+    /// ```
+    ///
+    /// `local_root` strips a trailing `.id` and nothing else, so this reached no column and ten fields on
+    /// Uniswap V4 - `timestamp` and `transaction` across five event entities - were reported as having
+    /// none (#1313).
+    #[test]
+    fn a_one_hop_read_of_an_entity_field_resolves_to_a_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  transaction.timestamp = event.block.timestamp
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions).as_deref(),
+            Some("block_timestamp"),
+            "the helper writes it from this event, so it is this row's column"
+        );
+        let rows = classify(&schema, &mappings);
+        assert_eq!(class_of(&rows, "Swap", "timestamp"), Class::Exact);
+    }
+
+    /// A helper's same-named local is a different binding (Jules, #1316).
+    ///
+    /// ```ts
+    /// const transaction = Transaction.load(id)   // an earlier block wrote this row
+    /// touch(event)                               // binds its own `transaction`, sets it from the event
+    /// swap.timestamp = transaction.timestamp     // still the earlier block's value
+    /// ```
+    ///
+    /// The first version of the one-hop read matched the receiver by variable name and entity type across
+    /// the handler and every function it called, so the helper's assignment answered for the handler's
+    /// receiver. A name and a type are not a value flow.
+    #[test]
+    fn a_helpers_same_named_local_does_not_answer_for_a_loaded_receiver() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function touch(event: ethereum.Event): void {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  transaction.timestamp = event.block.timestamp
+  transaction.save()
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  touch(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "a loaded receiver holds whatever an earlier block stored, whatever a helper called its own \
+             local"
+        );
+    }
+
+    /// A field the helper sets on only one path out is not the event's value on the other.
+    ///
+    /// `loadTransaction` is exact because it overwrites `timestamp` *after* the `if`. Move that line
+    /// inside the branch and the already-existing row keeps the timestamp of the block that created it.
+    #[test]
+    fn a_field_the_helper_sets_on_one_path_only_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let conditional = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  if (transaction === null) {
+    transaction = new Transaction(event.transaction.hash.toHex())
+    transaction.timestamp = event.block.timestamp
+  }
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", conditional);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "set inside the `if`, so a row that already existed keeps the older block's timestamp"
+        );
+
+        // The same helper with that line after the branch is the real `loadTransaction`, and it is exact.
+        let unconditional = conditional.replace(
+            "    transaction = new Transaction(event.transaction.hash.toHex())\n    transaction.timestamp = event.block.timestamp\n  }",
+            "    transaction = new Transaction(event.transaction.hash.toHex())\n  }\n  transaction.timestamp = event.block.timestamp",
+        );
+        assert_ne!(unconditional, conditional, "the fixture edit must apply");
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", &unconditional);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions).as_deref(),
+            Some("block_timestamp"),
+            "overwritten on every path out, so the caller's read is this event's value"
+        );
+    }
+
+    /// A loaded receiver in the handler itself is stored state, whatever the handler later writes.
+    ///
+    /// The assignment list carries no order relative to the read, so `pool.x` read before
+    /// `pool.x = event.params.v` and read after it look the same from here. Refusing a loaded receiver
+    /// outright is what makes that unanswerable rather than a coin toss.
+    #[test]
+    fn a_loaded_receiver_in_the_handler_is_not_this_events_value() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  tick: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  tick: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let pool = Pool.load(event.address.toHex())
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.tick = pool.tick
+  pool.tick = event.params.tick
+  pool.save()
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/pool.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "tick")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the read happens before the write, and nothing here can tell that from the other order"
+        );
+    }
+
+    /// A composed id: the transaction hash and the log index with a separator.
+    ///
+    /// The commonest primary key a subgraph writes, and seven entities on Uniswap V4 had **no `id` at
+    /// all** because of it - which costs every other field on those views its `last()` fold, not just the
+    /// id.
+    #[test]
+    fn a_composed_id_resolves_to_its_parts() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+}
+type Swap @entity {
+  id: ID!
+}
+"#;
+        // Three spellings of one key: a `+` chain through a loaded entity's id, a template literal, and a
+        // call to a helper that returns one.
+        let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHexString())
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(transaction.id + '-' + event.logIndex.toString())
+  swap.id = transaction.id + '-' + event.logIndex.toString()
+  swap.save()
+}
+
+export function handleOther(event: SwapEvent): void {
+  let swap = new Swap(eventId(event.transaction.hash, event.logIndex))
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.save()
+}
+
+export function handleThird(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = `${event.transaction.hash.toHexString()}-${event.logIndex.toString()}`
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let want = vec![
+            ConcatPart::Column("tx_hash".into()),
+            ConcatPart::Literal("-".into()),
+            ConcatPart::Column("log_index".into()),
+        ];
+        for handler in ["handleSwap", "handleOther", "handleThird"] {
+            let func = mappings.functions.get(handler).expect(handler);
+            let asg = func
+                .assignments
+                .iter()
+                .find(|a| a.entity == "Swap" && a.field == "id")
+                .unwrap_or_else(|| panic!("{handler} must assign Swap.id"));
+            assert_eq!(
+                expr_concat_parts(&asg.expr, func, &mappings.functions).as_deref(),
+                Some(want.as_slice()),
+                "{handler}: `{}` must resolve to the hash, the separator and the log index",
+                asg.expr
+            );
+        }
+    }
+
+    /// A single-hole template literal is the value inside it.
+    #[test]
+    fn a_single_hole_template_literal_resolves_to_its_column() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = `${event.transaction.hash.toHexString()}`
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions).as_deref(),
+            Some([ConcatPart::Column("tx_hash".into())].as_slice()),
+            "one spelling of a value must not answer while another does not"
+        );
+    }
+
+    /// Arity must match, or an unsubstituted parameter resolves against the **caller's** locals.
+    ///
+    /// The wrong-key shape: the helper takes a separator it was not given, the caller happens to have a
+    /// local of that name bound to an event parameter, and the id silently becomes hash-plus-fee.
+    #[test]
+    fn a_helper_called_with_too_few_arguments_is_not_inlined() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function mkId(hash: Bytes, sep: string): string {
+  return `${hash.toHexString()}${sep}`
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let sep = event.params.fee
+  let swap = new Swap('x')
+  swap.id = mkId(event.transaction.hash)
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "`sep` was never passed, and the caller's local of that name is not what the helper meant"
+        );
+    }
+
+    /// A **fresh** row returned before its assignment still reaches the caller unset (Jules, #1316).
+    ///
+    /// The freshness exemption is about rows a function *stores*: one it never saved is not a stored row,
+    /// so a terminator before the assignment leaves nothing behind. A returned row is the other case - it
+    /// escapes, and the caller saves it - so the exemption must not apply on that path.
+    #[test]
+    fn a_fresh_row_returned_before_its_assignment_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  if (event.logIndex.equals(BigInt.zero())) {
+    return transaction
+  }
+  transaction.timestamp = event.block.timestamp
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the early-return path hands the caller a row whose timestamp was never set"
+        );
+    }
+
+    /// A helper that does more than return is not a pure function of its arguments.
+    #[test]
+    fn a_helper_that_does_more_than_return_is_not_inlined() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function eventId(transactionHash: Bytes, logIndex: BigInt): string {
+  log.info('making an id', [])
+  return `${transactionHash.toHexString()}-${logIndex.toString()}`
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let swap = new Swap('x')
+  swap.id = eventId(event.transaction.hash, event.logIndex)
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "substituting the return would drop whatever else the helper did"
+        );
+    }
+
+    /// One unresolved piece refuses the whole key.
+    #[test]
+    fn a_composed_id_with_an_unresolved_piece_resolves_to_nothing() {
+        let schema = r#"
+type Swap @entity {
+  id: ID!
+}
+"#;
+        // `whatever` is bound to a contract call, so it is no part of a key a column can answer.
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let whatever = contract.someValue()
+  let swap = new Swap('x')
+  swap.id = event.transaction.hash.toHexString() + '-' + whatever
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/swap.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "id")
+            .expect("the assignment");
+        assert_eq!(
+            expr_concat_parts(&asg.expr, func, &mappings.functions),
+            None,
+            "a key missing a piece is a different key, which is a wrong row rather than a missing one"
+        );
+    }
+
+    /// Another local of the same entity is a different row (Jules, #1316).
+    ///
+    /// ```ts
+    /// let transaction = Transaction.load(id)        // returned, and still stored state
+    /// let other = new Transaction(otherId)
+    /// other.timestamp = event.block.timestamp       // says nothing about `transaction`
+    /// return transaction
+    /// ```
+    ///
+    /// The scan matched on entity and field, so `other`'s assignment answered for the row the helper
+    /// actually returns.
+    #[test]
+    fn another_local_of_the_same_entity_does_not_answer_for_the_returned_row() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  let other = new Transaction(event.block.hash.toHex())
+  other.timestamp = event.block.timestamp
+  other.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the returned row is the loaded one, and nothing wrote its timestamp in this invocation"
+        );
+    }
+
+    /// A second local of the same entity in the handler is a different row too.
+    #[test]
+    fn another_local_of_the_same_entity_does_not_answer_in_the_handler() {
+        let schema = r#"
+type Tick @entity {
+  id: ID!
+  liquidityNet: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  liquidityNet: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let upper = new Tick(event.params.upper.toString())
+  let lower = new Tick(event.params.lower.toString())
+  lower.liquidityNet = event.params.liquidity
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.liquidityNet = upper.liquidityNet
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/pool.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "liquidityNet")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "`lower` was written and `upper` was read, and they are not the same row"
+        );
+    }
+
+    /// A helper whose returned row is bound with two different ids has no one id.
+    #[test]
+    fn a_returned_row_bound_with_two_different_ids_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+}
+type Swap @entity {
+  id: ID!
+  transaction: Transaction!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = Transaction.load(event.transaction.hash.toHex())
+  if (transaction === null) {
+    transaction = new Transaction(event.block.hash.toHex())
+  }
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.transaction = transaction.id
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "transaction")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "the transaction hash on one path and the block hash on the other is not one column"
+        );
+    }
+
+    /// A helper that writes the field from two different columns has no one answer for it.
+    ///
+    /// The last write wins at runtime. Nothing here knows which line ran last, so the honest answer is
+    /// none rather than whichever the scan reached first.
+    #[test]
+    fn a_field_written_from_two_different_columns_reaches_no_column() {
+        let schema = r#"
+type Transaction @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  timestamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function loadTransaction(event: ethereum.Event): Transaction {
+  let transaction = new Transaction(event.transaction.hash.toHex())
+  transaction.timestamp = event.block.timestamp
+  transaction.timestamp = event.block.number
+  transaction.save()
+  return transaction
+}
+
+export function handleSwap(event: SwapEvent): void {
+  let transaction = loadTransaction(event)
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.timestamp = transaction.timestamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "timestamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "two columns for one field is not one column"
+        );
+    }
+
+    /// A field written only in a **different** handler is not this row's value.
+    ///
+    /// `poolDayData.open = pool.token0Price`, where the price was set when the pool was initialised. The
+    /// value is reproducible in principle but it needs a join to that entity as of this block, not a
+    /// column - and answering with a column would be answering from the wrong row.
+    #[test]
+    fn a_read_of_another_handlers_state_resolves_to_no_column() {
+        let schema = r#"
+type Pool @entity {
+  id: ID!
+  token0Price: BigDecimal!
+}
+type PoolDayData @entity {
+  id: ID!
+  open: BigDecimal!
+}
+"#;
+        let mapping = r#"
+export function handleInitialize(event: Initialize): void {
+  let pool = new Pool(event.params.id.toHex())
+  pool.token0Price = event.params.price
+  pool.save()
+}
+
+export function updatePoolDayData(event: Swap): void {
+  let pool = Pool.load(event.params.id.toHex())!
+  let poolDayData = new PoolDayData(event.params.id.toHex())
+  poolDayData.open = pool.token0Price
+  poolDayData.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings
+            .functions
+            .get("updatePoolDayData")
+            .expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "PoolDayData" && a.field == "open")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "`handleInitialize` is not reachable from here, so its column is a different event's"
+        );
+    }
+
+    /// The receiver's **entity** has to match, not only the field name.
+    ///
+    /// Two unrelated entities with a `timestamp` would otherwise answer for each other, and the column
+    /// would be right only by luck. Tightening this dropped one of eleven gained fields on Uniswap V4,
+    /// which is to say it removed a genuine false positive.
+    #[test]
+    fn a_same_named_field_on_another_entity_does_not_answer() {
+        let schema = r#"
+type Receipt @entity {
+  id: ID!
+  stamp: BigInt!
+}
+type Swap @entity {
+  id: ID!
+  stamp: BigInt!
+}
+type Other @entity {
+  id: ID!
+  stamp: BigInt!
+}
+"#;
+        let mapping = r#"
+export function handleSwap(event: SwapEvent): void {
+  let other = new Other(event.params.pool.toHex())
+  other.stamp = event.block.timestamp
+  other.save()
+
+  let receipt = new Receipt(event.transaction.hash.toHex())
+  let swap = new Swap(event.transaction.hash.toHex())
+  swap.stamp = receipt.stamp
+  swap.save()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let func = mappings.functions.get("handleSwap").expect("handler");
+        let asg = func
+            .assignments
+            .iter()
+            .find(|a| a.entity == "Swap" && a.field == "stamp")
+            .expect("the assignment");
+        assert_eq!(
+            assignment_event_column(asg, func, &mappings.functions),
+            None,
+            "`Other.stamp` is written from the event, but `receipt` is not an `Other`"
+        );
     }
 
     /// A read of a **call-derived** field makes the reading field call-derived too.
