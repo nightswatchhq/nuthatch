@@ -239,7 +239,7 @@ impl Mirror for ObjMirror {
     async fn head_size(&self, key: &str) -> Result<Option<u64>> {
         use object_store::ObjectStore as _;
         match self.inner.head(&self.key(key)).await {
-            Ok(m) => Ok(Some(m.size as u64)),
+            Ok(m) => Ok(Some(m.size)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
         }
@@ -275,6 +275,7 @@ fn fs_exclusive_lock(path: &Path) -> Result<FsExclusiveLock> {
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
