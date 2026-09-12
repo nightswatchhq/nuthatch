@@ -902,6 +902,14 @@ pub struct InitArgs {
     #[arg(long, default_value = ".")]
     pub dir: String,
 
+    /// Deployment start block per address, in the same order as the addresses (comma-separated).
+    /// Skips the RPC probe for that address. An empty entry still probes.
+    ///
+    /// Use this when the probe 429s or the endpoint prunes state: without it, a failed probe
+    /// silently backfills a recent window instead of the contract's history.
+    #[arg(long, value_delimiter = ',', value_name = "BLOCK")]
+    pub start_block: Vec<String>,
+
     /// Don't index block timestamps: drop the implicit `block_timestamp` column from every table.
     ///
     /// Fetching timestamps is roughly 85% of backfill wall clock (RFC-0029 §4) because they arrive
@@ -937,6 +945,11 @@ pub struct AddArgs {
     /// hatch as `init --abi`.
     #[arg(long, value_delimiter = ',')]
     pub abi: Vec<String>,
+
+    /// Deployment start block per address, in the same order as the addresses (comma-separated).
+    /// Same shape as `init --start-block`.
+    #[arg(long, value_delimiter = ',', value_name = "BLOCK")]
+    pub start_block: Vec<String>,
 
     /// The nest directory to grow (must contain a nuthatch.toml). Defaults to the current directory.
     #[arg(long, default_value = ".")]

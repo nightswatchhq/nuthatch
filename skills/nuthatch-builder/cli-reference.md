@@ -15,6 +15,7 @@ Add another contract to an existing nest - resolve its ABI and grow the config, 
 - `<ADDRESSES>` - One or more contract addresses to add to the nest, e.g. 0xC02a…6Cc2 (WETH)
 - `--alias <ALIAS>` - Optional aliases, one per address in order (comma-separated). When omitted, the alias is the contract name from the ABI (`DelegationManager` → `delegation_manager`), falling back to the next free c<N> slot only when no usable name is present
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; an empty entry resolves that address normally). Same proxy escape hatch as `init --abi`
+- `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Same shape as `init --start-block`
 - `--dir <DIR>` - The nest directory to grow (must contain a nuthatch.toml). Defaults to the current directory
 - `--rpc <RPC>` - Use only these RPC URL(s) for ABI/deploy-block resolution (repeatable). Point at your own node to avoid public-RPC limits
 
@@ -145,6 +146,7 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--chain <CHAIN>` - Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known chain for the contract's bytecode and picks the one it lives on - you rarely need to say
 - `--rpc <RPC>` - Use only these RPC URL(s) (repeatable). They are written to the nest's `rpc_urls` and used for ABI/deploy-block resolution during init. Point at your own node to avoid public-RPC limits
 - `--dir <DIR>` - Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the nest's own name)
+- `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Skips the RPC probe for that address. An empty entry still probes
 - `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
 
 ## `nuthatch labels`

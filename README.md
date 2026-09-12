@@ -222,8 +222,9 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   own. Same treatment on `/sql`, the MCP `sql` tool and the `nuthatch sql` REPL.
 - **Hot + cold in one surface.** Queries span the live unsealed tip (redb) *and* sealed history
   (Parquet), transparently - you never think about the boundary.
-- **Big-int friendly.** `uint256` values are exact text; each also gets a `{col}_dec` DECIMAL view, so
-  `SUM(value_dec)` just works.
+- **Big-int friendly.** `uint256` values are exact text; amounts that fit in 38 digits also get a
+  `{col}_dec` DECIMAL view, so `SUM(value_dec)` works. Ids, nonces and hashes stay on the raw column:
+  `_dec` is NULL for a full-width uint256.
 - **AI-native.** A Model Context Protocol server is compiled in (`nuthatch mcp`) - point Claude (or any
   MCP client) at your indexer and ask your contract's data in plain English, fully offline.
 

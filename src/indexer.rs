@@ -108,6 +108,10 @@ fn join_task(what: &str, joined: Result<Result<()>, tokio::task::JoinError>) -> 
 
 /// Poll interval for the hot-upgrade catch-up check.
 const UPGRADE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long to wait for the old ingest task to actually die after abort (#1314).
+const UPGRADE_QUIESCE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on waiting for the new version to reach the frozen old head after quiesce (#1314).
+const UPGRADE_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `nuthatch nest upgrade` (RFC-0020 slice 2b): hot-upgrade a running nest to a **compatible** new
 /// version with zero downtime. Classify old→new; a *breaking* change is refused (it needs a new
@@ -239,37 +243,45 @@ pub async fn upgrade(
             let shared = old_shared.clone();
             tokio::spawn(async move { serve::run_shared(&listen, shared).await })
         };
-        let mut flip_task = {
-            let shared = old_shared.clone();
+        let mut catchup_task = {
             let old_store = old_store.clone();
             let new_store = new_store.clone();
-            tokio::spawn(async move {
-                await_catchup_and_flip(&shared, &old_store, &new_store, new_state, UPGRADE_POLL)
-                    .await
-            })
+            tokio::spawn(async move { await_catchup(&old_store, &new_store, UPGRADE_POLL).await })
         };
-        // Phase 1 - old + new both live. Any task dying fails loudly (C1). The flip completing → phase 2.
+        // Phase 1 - both live until roughly caught up. Then stop the old writer *before* the swap
+        // so the catchup target is a constant and the endpoint cannot move backwards (#1314).
         let r = tokio::select! {
             r = &mut serve_task => join_task("serving", r),
             j = &mut ingest_old => join_task("old indexing", j),
             j = &mut ingest_new => join_task("new indexing", j),
-            f = &mut flip_task => match f {
+            c = &mut catchup_task => match c {
                 Ok(Ok(())) => {
-                    tracing::info!("hot-upgrade flip complete - retiring the old version's indexer");
-                    // The old indexer is now intentionally retired; its cancellation is NOT a failure.
-                    ingest_old.abort();
-                    // Phase 2 - only the new version + serving remain.
+                    quiesce_ingest(&mut ingest_old, UPGRADE_QUIESCE).await?;
+                    let old_head = old_store.indexed_head()?;
+                    let new_head = wait_until_caught_up(
+                        &new_store,
+                        old_head,
+                        UPGRADE_POLL,
+                        UPGRADE_STALL,
+                    )
+                    .await?;
+                    tracing::info!(
+                        ?old_head,
+                        ?new_head,
+                        "new version caught the quiesced old head - hot-swapping the served backing (RFC-0020)"
+                    );
+                    old_shared.swap(new_state);
                     tokio::select! {
                         r = &mut serve_task => join_task("serving", r),
                         j = &mut ingest_new => join_task("new indexing", j),
                     }
                 }
-                Ok(Err(e)) => Err(e.context("hot-upgrade flip")),
-                Err(e) => Err(anyhow::anyhow!("flip task failed: {e}")),
+                Ok(Err(e)) => Err(e.context("hot-upgrade catch-up")),
+                Err(e) => Err(anyhow::anyhow!("catch-up task failed: {e}")),
             },
         };
         serve_task.abort();
-        flip_task.abort();
+        catchup_task.abort();
         r
     };
 
@@ -298,31 +310,99 @@ pub struct NestRuntime {
     pub alert_worker: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Poll until the new version's indexed head reaches the old version's, then **atomically flip** the
-/// served backing to the new version (RFC-0020 slice 2b, the compatible hot-swap). Old and new indexers
-/// run concurrently until this returns; the caller aborts the old ingest afterwards. `poll` bounds how
-/// often the two heads are compared.
-pub async fn await_catchup_and_flip(
-    shared: &serve::SharedNest,
+/// The two heads at the instant the flip swapped. The old writer is quiesced first, so they
+/// describe the swap (#1314).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlipHeads {
+    pub old: Option<u64>,
+    pub new: Option<u64>,
+}
+
+/// Poll until the new version's indexed head reaches the old version's. Does not swap.
+pub async fn await_catchup(
     old_store: &dyn crate::store::HotStore,
     new_store: &dyn crate::store::HotStore,
-    new_state: serve::AppState,
     poll: std::time::Duration,
 ) -> Result<()> {
     loop {
         let old_head = old_store.indexed_head()?;
         let new_head = new_store.indexed_head()?;
         if crate::lifecycle::caught_up(new_head, old_head) {
-            tracing::info!(
-                ?old_head,
-                ?new_head,
-                "new version caught up - hot-swapping the served backing (RFC-0020)"
-            );
-            shared.swap(new_state);
             return Ok(());
         }
         tokio::time::sleep(poll).await;
     }
+}
+
+/// Abort `handle` and wait until the task is actually gone. `JoinHandle::abort` only requests
+/// cancellation (#1314).
+pub async fn quiesce_ingest(
+    handle: &mut tokio::task::JoinHandle<Result<()>>,
+    join_for: std::time::Duration,
+) -> Result<()> {
+    handle.abort();
+    match tokio::time::timeout(join_for, &mut *handle).await {
+        Ok(_) => Ok(()),
+        Err(_) => anyhow::bail!("old ingest did not stop within {join_for:?}"),
+    }
+}
+
+/// Wait until `new_store` is at least `old_head`, or fail after `stall`.
+pub async fn wait_until_caught_up(
+    new_store: &dyn crate::store::HotStore,
+    old_head: Option<u64>,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+) -> Result<Option<u64>> {
+    wait_until_caught_up_probe(|| new_store.indexed_head(), old_head, poll, stall).await
+}
+
+async fn wait_until_caught_up_probe(
+    mut probe: impl FnMut() -> Result<Option<u64>>,
+    old_head: Option<u64>,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+) -> Result<Option<u64>> {
+    let deadline = std::time::Instant::now() + stall;
+    loop {
+        let new_head = probe()?;
+        if crate::lifecycle::caught_up(new_head, old_head) {
+            return Ok(new_head);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "new version did not reach old head {old_head:?} within {stall:?} after the old \
+                 writer was stopped; abandoned the upgrade so the endpoint is not frozen. Restart \
+                 the previous binary to keep serving, and retry the upgrade when the new version \
+                 can catch up"
+            );
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Test helper: catch up and swap while both writers are still live. Production uses
+/// [`await_catchup`] + [`quiesce_ingest`] + [`wait_until_caught_up`].
+pub async fn await_catchup_and_flip(
+    shared: &serve::SharedNest,
+    old_store: &dyn crate::store::HotStore,
+    new_store: &dyn crate::store::HotStore,
+    new_state: serve::AppState,
+    poll: std::time::Duration,
+) -> Result<FlipHeads> {
+    await_catchup(old_store, new_store, poll).await?;
+    let old_head = old_store.indexed_head()?;
+    let new_head = new_store.indexed_head()?;
+    tracing::info!(
+        ?old_head,
+        ?new_head,
+        "new version caught up - hot-swapping the served backing (RFC-0020)"
+    );
+    shared.swap(new_state);
+    Ok(FlipHeads {
+        old: old_head,
+        new: new_head,
+    })
 }
 
 /// Run the indexing pipeline against any `Source` and serve the API - the source-agnostic entry both
@@ -3305,23 +3385,21 @@ pub async fn backfill_direct(
 /// [`chunker::is_result_too_large`] answers "is this narrowable at all". This answers the question the
 /// call sites actually have, which includes `from..=to`, and the two differ in exactly one case.
 ///
-/// A **pool-wide 429** is escalated to `Narrowable` by RFC-0028 §3d, on the argument that narrowing is
-/// also less load and so the escalation is benign even when the cause was really pacing. That argument
-/// is sound while there is range left to narrow, and **spent the moment there is not**: a single block
-/// cannot be split, the provider never said the result was too large, and no width we can ask for will
-/// change the answer.
-///
-/// Returning `false` there is the whole fix (#916). It does not need new retry machinery, because each
-/// of these call sites already has the correct handler sitting in its next arm - warn, back off, retry
-/// the same width - written for exactly this case and commented "a 429 or a 403". The escalation was
-/// routing a throttle *past* its own handler and into
-/// `block N alone exceeds the provider's getLogs result cap`, which was never true, and which sends the
-/// reader off to buy a bigger provider when the remedy is to slow down.
-///
-/// Measured: `nuthatch-dips` on the Lodestar box, two free endpoints, `NRestarts` climbing about twice
-/// an hour under `Restart=always`.
-fn narrowing_can_help(err: &anyhow::Error, from: u64, to: u64) -> bool {
-    chunker::is_result_too_large(err) && !(from >= to && crate::rpc::escalated_from_rate_limit(err))
+/// A **pool-wide 429** is classified `Narrowable` by RFC-0028 §3d, on the argument that narrowing is
+/// also less load. That argument is false on a quota-limited pool: each retry is another request
+/// against the same sliding quota (#1297). #916 stopped the abort at a single block; this stops the
+/// shrink at every width. A throttle wants time, not a smaller range.
+fn narrowing_can_help(err: &anyhow::Error, _from: u64, _to: u64) -> bool {
+    chunker::is_result_too_large(err) && !crate::rpc::escalated_from_rate_limit(err)
+}
+
+/// Speculative split is for failures we could not classify (RFC-0028 §3b). A classified throttle
+/// must not take this path: splitting it spends the quota (#1297).
+fn speculative_split_ok(err: &anyhow::Error) -> bool {
+    matches!(
+        crate::rpc::class_of(err),
+        None | Some(crate::rpc::FailureClass::Transient)
+    )
 }
 
 /// The error context when a single block's logs exceed a provider's `getLogs` result cap - it can't be
@@ -3455,7 +3533,8 @@ fn fetch_logs_splitting_tracking<'a>(
                 Ok(left)
             }
             // Unclassifiable, but the window spans more than one block and we have a split to spend.
-            Err(e) if speculative && from < to => {
+            // A classified throttle is not unclassifiable (#1297).
+            Err(e) if speculative && from < to && speculative_split_ok(&e) => {
                 let mid = from + (to - from) / 2;
                 tracing::debug!(
                     "getLogs {from}..={to} failed unclassifiably ({e:#}); splitting speculatively"
@@ -9217,26 +9296,20 @@ template = "pool"
         })
     }
 
-    /// **#916.** At the floor - one block, nothing left to narrow - a throttle and a size cap must
-    /// part company. Anywhere above the floor they must not, or the fix has quietly repealed
-    /// RFC-0028 §3d instead of bounding it.
-    ///
-    /// The third assertion is the one that stops this being a disable-the-feature patch: with range
-    /// still available, a pool-wide 429 is *still* narrowable, exactly as the RFC intends.
+    /// **#916 and #1297.** A throttle and a size cap must part company at every width.
     #[test]
-    fn a_throttle_stops_being_narrowable_only_at_the_floor() {
+    fn a_throttle_is_never_narrowable() {
         assert!(
             narrowing_can_help(&real_cap(), 100, 100),
-            "a real size cap at a single block is still a cap - the block genuinely will not fit"
+            "a real size cap at a single block is still a cap"
         );
         assert!(
             !narrowing_can_help(&pool_wide_429(), 100, 100),
-            "a pool-wide 429 at a single block has nothing left to narrow: calling it a cap is the \
-             false diagnosis that killed nuthatch-dips"
+            "a pool-wide 429 at a single block has nothing left to narrow"
         );
         assert!(
-            narrowing_can_help(&pool_wide_429(), 100, 200),
-            "with range still to spend, RFC-0028 §3d stands: narrowing is also less load"
+            !narrowing_can_help(&pool_wide_429(), 100, 200),
+            "a pool-wide 429 over a range is still a throttle"
         );
         assert!(
             narrowing_can_help(&real_cap(), 100, 200),
@@ -9286,6 +9359,112 @@ template = "pool"
             msg.contains("rate-limited"),
             "and the true cause must survive to the operator: {msg}"
         );
+    }
+
+    /// #1297. A quota-limited pool 429s every width. Splitting that is more requests against the
+    /// same quota. The splitter must fail the original window.
+    #[tokio::test]
+    async fn a_throttled_range_is_not_split() {
+        struct CountedThrottle {
+            calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        }
+        #[async_trait::async_trait]
+        impl Source for CountedThrottle {
+            async fn tip(&self) -> Result<u64> {
+                Ok(200)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                self.calls.lock().unwrap().push((from, to));
+                Err(pool_wide_429())
+            }
+            async fn block_timestamps(
+                &self,
+                b: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(b.iter().map(|&x| (x, x * 1000)).collect())
+            }
+        }
+        let src = CountedThrottle {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let filter = crate::source::LogFilter::new(&[], &["0xdead".into()]).unwrap();
+        let err = fetch_logs_splitting(&src, &filter, 100, 174)
+            .await
+            .expect_err("a throttled range must still fail");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("alone exceeds"),
+            "must not walk a throttle to a single-block cap: {msg}"
+        );
+        let calls = src.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(100, 174)],
+            "splitting a 429 is another request against the same quota: {calls:?}"
+        );
+    }
+
+    /// #1314. Abort without awaiting leaves the task running. Drop runs once the task is gone.
+    #[tokio::test]
+    async fn quiesce_waits_until_the_task_is_gone() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = tokio::spawn({
+            let dropped = dropped.clone();
+            let started = started.clone();
+            async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _g = Guard(dropped);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        quiesce_ingest(&mut handle, std::time::Duration::from_secs(2))
+            .await
+            .expect("quiesce");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "Drop must have run: abort without awaiting leaves the writer alive"
+        );
+    }
+
+    /// #1314 stall policy.
+    #[tokio::test]
+    async fn a_stalled_new_version_fails_the_upgrade_rather_than_freezing() {
+        let err = wait_until_caught_up_probe(
+            || Ok(Some(3)),
+            Some(5),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not reach old head"),
+            "the operator needs the stall named: {msg}"
+        );
+        assert!(msg.contains("Some(5)"), "and the frozen head: {msg}");
     }
 
     /// COR-5: the fault raised for an over-cap single block must be **terminal**.

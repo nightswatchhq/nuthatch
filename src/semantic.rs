@@ -523,7 +523,7 @@ pub fn compose(
         }
         if !fg.overflows_dec.is_empty() {
             out.push_str(&format!(
-                "    ⚠ wide columns (>128-bit) whose `_dec` OVERFLOWS to NULL above 38 digits - use `CAST(col AS DOUBLE)` for math (e.g. sqrtPriceX96): {}\n",
+                "    ⚠ wide columns (>128-bit) whose `_dec` is NULL above 38 digits - amounts that fit can use `_dec`; ids, nonces and hashes stay on the raw column: {}\n",
                 fg.overflows_dec.join(", ")
             ));
         }
@@ -698,7 +698,7 @@ mod tests {
         let fg = derive_footguns(&transfer_table());
         assert_eq!(fg.reserved_words, vec!["from", "to"]);
         assert_eq!(fg.big_ints, vec!["value"]);
-        // `value` is a word32 (uint256), so it also overflows DECIMAL(38,0) - flag it for CAST-to-DOUBLE.
+        // `value` is a word32 (uint256), so it also overflows DECIMAL(38,0).
         assert_eq!(fg.overflows_dec, vec!["value"]);
         assert_eq!(fg.bools, vec!["enabled"]);
     }

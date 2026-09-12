@@ -133,20 +133,11 @@ impl std::error::Error for ClassifiedError {}
 /// rate limit (RFC-0028 §3d).
 ///
 /// One endpoint returning 429 says we asked too often. *Every* endpoint returning 429 for the same
-/// request says something about the request. Narrowing is the right response either way - a smaller
-/// window is both a smaller result set and less load.
+/// request used to be treated as evidence about the request, so the caller narrowed. On a
+/// quota-limited pool that is the wrong evidence: each retry spends the same sliding quota (#1297).
 ///
-/// **That last argument has a floor, and the original wording of this comment did not** (#916). It
-/// said the escalation "cannot make a genuine pacing problem worse". It can: narrowing is only
-/// costless while there is range left to narrow. At a single block there is none, and the escalated
-/// verdict then walks a throttle into `block N alone exceeds the provider's getLogs result cap` - a
-/// diagnosis that was never true, on a nest that only needed to wait. Measured on two free endpoints:
-/// a nest crash-looping about twice an hour under `Restart=always`.
-///
-/// The escalation is kept, because the reasoning above holds everywhere it can be acted on. It now
-/// carries `escalated_from_rate_limit: true` so the one caller that knows the range has run out can
-/// tell this apart from a provider actually refusing a result size, and fall through to the
-/// warn-back-off-retry that a throttle wants. See `indexer::narrowing_can_help`.
+/// The classification is still raised so a caller can see that every endpoint agreed. Acting on it
+/// by shrinking is `indexer::narrowing_can_help`, which returns false for this flag at every width.
 ///
 /// Requires at least two attempts: with a single-endpoint pool "every endpoint" is one endpoint, and a
 /// lone 429 is much more likely to be pacing.
