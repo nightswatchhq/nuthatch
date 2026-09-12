@@ -110,7 +110,7 @@ fn join_task(what: &str, joined: Result<Result<()>, tokio::task::JoinError>) -> 
 const UPGRADE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long to wait for the old ingest task to actually die after abort (#1314).
 const UPGRADE_QUIESCE: std::time::Duration = std::time::Duration::from_secs(5);
-/// Bound on waiting for the new version to reach the frozen old head after quiesce (#1314).
+/// Bound on waiting for the new version to reach a snapshot of the old head (#1314).
 const UPGRADE_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `nuthatch nest upgrade` (RFC-0020 slice 2b): hot-upgrade a running nest to a **compatible** new
@@ -248,34 +248,54 @@ pub async fn upgrade(
             let new_store = new_store.clone();
             tokio::spawn(async move { await_catchup(&old_store, &new_store, UPGRADE_POLL).await })
         };
-        // Phase 1 - both live until roughly caught up. Then stop the old writer *before* the swap
-        // so the catchup target is a constant and the endpoint cannot move backwards (#1314).
+        // Both writers stay live until the new head reaches a snapshot of the old. Quiesce
+        // only after that, so a stall leaves the old writer running (#1314).
         let r = tokio::select! {
             r = &mut serve_task => join_task("serving", r),
             j = &mut ingest_old => join_task("old indexing", j),
             j = &mut ingest_new => join_task("new indexing", j),
             c = &mut catchup_task => match c {
-                Ok(Ok(())) => {
-                    quiesce_ingest(&mut ingest_old, UPGRADE_QUIESCE).await?;
-                    let old_head = old_store.indexed_head()?;
-                    let new_head = wait_until_caught_up(
-                        &new_store,
-                        old_head,
-                        UPGRADE_POLL,
-                        UPGRADE_STALL,
-                    )
-                    .await?;
-                    tracing::info!(
-                        ?old_head,
-                        ?new_head,
-                        "new version caught the quiesced old head - hot-swapping the served backing (RFC-0020)"
-                    );
-                    old_shared.swap(new_state);
-                    tokio::select! {
-                        r = &mut serve_task => join_task("serving", r),
-                        j = &mut ingest_new => join_task("new indexing", j),
+                Ok(Ok(())) => match prove_and_quiesce_for_flip(
+                    &mut ingest_old,
+                    old_store.as_ref(),
+                    new_store.as_ref(),
+                    UPGRADE_POLL,
+                    UPGRADE_STALL,
+                    UPGRADE_QUIESCE,
+                )
+                .await
+                {
+                    Ok((old_head, new_head)) => {
+                        tracing::info!(
+                            ?old_head,
+                            ?new_head,
+                            "new version caught the quiesced old head - hot-swapping the served backing (RFC-0020)"
+                        );
+                        old_shared.swap(new_state);
+                        tokio::select! {
+                            r = &mut serve_task => join_task("serving", r),
+                            j = &mut ingest_new => join_task("new indexing", j),
+                        }
                     }
-                }
+                    Err(UpgradeAbandon::BeforeQuiesce) => {
+                        tracing::warn!(
+                            "abandoned the upgrade; the old writer is still live and the endpoint keeps serving it"
+                        );
+                        ingest_new.abort();
+                        tokio::select! {
+                            r = &mut serve_task => join_task("serving", r),
+                            j = &mut ingest_old => join_task("old indexing", j),
+                        }
+                    }
+                    Err(UpgradeAbandon::AfterQuiesce) => {
+                        tracing::warn!(
+                            "abandoned the upgrade after stopping the old writer; serving the frozen \
+                             backing. Restart the previous binary to resume indexing"
+                        );
+                        ingest_new.abort();
+                        join_task("serving", (&mut serve_task).await)
+                    }
+                },
                 Ok(Err(e)) => Err(e.context("hot-upgrade catch-up")),
                 Err(e) => Err(anyhow::anyhow!("catch-up task failed: {e}")),
             },
@@ -371,18 +391,99 @@ async fn wait_until_caught_up_probe(
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "new version did not reach old head {old_head:?} within {stall:?} after the old \
-                 writer was stopped; abandoned the upgrade so the endpoint is not frozen. Restart \
-                 the previous binary to keep serving, and retry the upgrade when the new version \
-                 can catch up"
+                "new version did not reach old head {old_head:?} within {stall:?}; abandoned the \
+                 upgrade so the endpoint is not frozen"
             );
         }
         tokio::time::sleep(poll).await;
     }
 }
 
+/// A compatible upgrade that did not flip. Serving continues on the old SharedNest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeAbandon {
+    /// Old ingest is still running.
+    BeforeQuiesce,
+    /// Old ingest is already dead; the served backing is frozen.
+    AfterQuiesce,
+}
+
+impl UpgradeAbandon {
+    #[cfg(test)]
+    fn old_writer_live(self) -> bool {
+        matches!(self, Self::BeforeQuiesce)
+    }
+}
+
+/// Map a catch-up wait onto the flip head, or abandon. `quiesced` is whether the old writer
+/// has already been stopped.
+fn abandon_or_head(
+    wait: Result<Option<u64>>,
+    quiesced: bool,
+) -> Result<Option<u64>, UpgradeAbandon> {
+    wait.map_err(|e| {
+        tracing::warn!(error = %e, quiesced, "new version did not reach the catch-up target");
+        if quiesced {
+            UpgradeAbandon::AfterQuiesce
+        } else {
+            UpgradeAbandon::BeforeQuiesce
+        }
+    })
+}
+
+/// Wait for `probe` to reach `snapshot` while `ingest_old` is still running, then quiesce.
+/// A stall must not call quiesce: the old writer is still the live backing.
+async fn wait_live_then_quiesce(
+    ingest_old: &mut tokio::task::JoinHandle<Result<()>>,
+    probe: impl FnMut() -> Result<Option<u64>>,
+    snapshot: Option<u64>,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+    quiesce_for: std::time::Duration,
+) -> Result<Option<u64>, UpgradeAbandon> {
+    let wait = wait_until_caught_up_probe(probe, snapshot, poll, stall).await;
+    let head = abandon_or_head(wait, false)?;
+    quiesce_ingest(ingest_old, quiesce_for).await.map_err(|e| {
+        tracing::warn!(error = %e, "old ingest did not stop after abort");
+        UpgradeAbandon::AfterQuiesce
+    })?;
+    Ok(head)
+}
+
+/// After phase-1 catch-up: prove against a live snapshot, quiesce only if that wait succeeds,
+/// then catch any remaining delta on the frozen head.
+async fn prove_and_quiesce_for_flip(
+    ingest_old: &mut tokio::task::JoinHandle<Result<()>>,
+    old_store: &dyn crate::store::HotStore,
+    new_store: &dyn crate::store::HotStore,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+    quiesce_for: std::time::Duration,
+) -> Result<(Option<u64>, Option<u64>), UpgradeAbandon> {
+    let snapshot = old_store.indexed_head().map_err(|e| {
+        tracing::warn!(error = %e, "could not read the live old head");
+        UpgradeAbandon::BeforeQuiesce
+    })?;
+    wait_live_then_quiesce(
+        ingest_old,
+        || new_store.indexed_head(),
+        snapshot,
+        poll,
+        stall,
+        quiesce_for,
+    )
+    .await?;
+    let frozen = old_store.indexed_head().map_err(|e| {
+        tracing::warn!(error = %e, "could not read the frozen old head");
+        UpgradeAbandon::AfterQuiesce
+    })?;
+    let wait = wait_until_caught_up(new_store, frozen, poll, stall).await;
+    let new_head = abandon_or_head(wait, true)?;
+    Ok((frozen, new_head))
+}
+
 /// Test helper: catch up and swap while both writers are still live. Production uses
-/// [`await_catchup`] + [`quiesce_ingest`] + [`wait_until_caught_up`].
+/// [`await_catchup`] then a live-snapshot wait, [`quiesce_ingest`], and [`wait_until_caught_up`].
 pub async fn await_catchup_and_flip(
     shared: &serve::SharedNest,
     old_store: &dyn crate::store::HotStore,
@@ -9465,6 +9566,64 @@ template = "pool"
             "the operator needs the stall named: {msg}"
         );
         assert!(msg.contains("Some(5)"), "and the frozen head: {msg}");
+    }
+
+    #[test]
+    fn a_stalled_wait_before_quiesce_abandons_with_the_old_writer_live() {
+        let wait: Result<Option<u64>> = Err(anyhow::anyhow!("did not reach old head Some(5)"));
+        let abandon = abandon_or_head(wait, false).expect_err("must abandon");
+        assert_eq!(abandon, UpgradeAbandon::BeforeQuiesce);
+        assert!(abandon.old_writer_live());
+    }
+
+    #[test]
+    fn a_stalled_wait_after_quiesce_abandons_with_the_old_writer_stopped() {
+        let wait: Result<Option<u64>> = Err(anyhow::anyhow!("did not reach old head Some(5)"));
+        let abandon = abandon_or_head(wait, true).expect_err("must abandon");
+        assert_eq!(abandon, UpgradeAbandon::AfterQuiesce);
+        assert!(!abandon.old_writer_live());
+    }
+
+    #[test]
+    fn a_successful_wait_is_the_flip_head() {
+        assert_eq!(abandon_or_head(Ok(Some(7)), false).unwrap(), Some(7));
+        assert_eq!(abandon_or_head(Ok(Some(7)), true).unwrap(), Some(7));
+    }
+
+    /// A stall against the live snapshot must not quiesce: the old writer stays the live backing.
+    #[tokio::test]
+    async fn a_stall_before_quiesce_leaves_the_old_writer_running() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut old = tokio::spawn({
+            let started = started.clone();
+            async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let abandon = wait_live_then_quiesce(
+            &mut old,
+            || Ok(Some(3)),
+            Some(5),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("must abandon");
+        assert_eq!(abandon, UpgradeAbandon::BeforeQuiesce);
+        assert!(
+            !old.is_finished(),
+            "a pre-quiesce stall must not stop the old writer"
+        );
+        old.abort();
     }
 
     /// COR-5: the fault raised for an over-cap single block must be **terminal**.
