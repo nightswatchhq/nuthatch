@@ -33,9 +33,18 @@ pub fn from_nest(dir: &Path, config: &Config) -> Result<DecodeRegistry> {
             .with_context(|| format!("reading ABI {}", abi_path.display()))?;
         let abi: JsonAbi = serde_json::from_str(&raw)
             .with_context(|| format!("parsing ABI {}", abi_path.display()))?;
+        let address = parse_address_local(&c.address)?;
+        // A parse that always returns zero used to hang the mutants job: indexer tests wait for a
+        // head that never moves (#1281).
+        if address.is_zero() {
+            return Err(anyhow!(
+                "contract `{}` is the zero address, which is not a contract nuthatch will index",
+                c.alias
+            ));
+        }
         specs.push(ContractSpec {
             alias: c.alias.clone(),
-            address: parse_address_local(&c.address)?,
+            address,
             abi,
             events: c.events.clone(),
         });
@@ -56,4 +65,24 @@ pub fn from_nest(dir: &Path, config: &Config) -> Result<DecodeRegistry> {
     Ok(DecodeRegistry::build_with_templates(specs, templates)?
         .with_timestamps(config.nest.block_timestamps)
         .with_blocks(config.extract.blocks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_address_local_returns_the_decoded_bytes() {
+        let a = parse_address_local("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+        assert_ne!(a, Address::ZERO);
+        assert_eq!(
+            a.as_slice(),
+            &hex::decode("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_address_local_rejects_a_short_hex() {
+        assert!(parse_address_local("0xabc").is_err());
+    }
 }
