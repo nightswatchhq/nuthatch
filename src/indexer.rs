@@ -319,13 +319,7 @@ pub async fn upgrade(
                                         j = &mut ingest_old => join_task("old indexing", j),
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "abandoned the upgrade; could not restart the old writer"
-                                    );
-                                    join_task("serving", (&mut serve_task).await)
-                                }
+                                Err(e) => Err(restart_or_exit(e)),
                             }
                         } else {
                             tracing::warn!(
@@ -496,6 +490,11 @@ impl UpgradeAbandon {
     fn old_writer_live(self) -> bool {
         matches!(self, Self::BeforeQuiesce)
     }
+}
+
+/// A post-quiesce restart failure is fatal: serving the frozen backing is not an option.
+fn restart_or_exit(err: anyhow::Error) -> anyhow::Error {
+    err.context("could not restart the old writer after a stalled upgrade")
 }
 
 /// Map a catch-up wait onto the flip head, or abandon. `quiesced` is whether the old writer
@@ -9802,6 +9801,17 @@ template = "pool"
             "a post-quiesce restart must leave a live writer"
         );
         restarted.ingest.abort();
+    }
+
+    #[test]
+    fn a_failed_restart_after_quiesce_is_an_upgrade_error() {
+        let err = restart_or_exit(anyhow::anyhow!("store locked"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not restart the old writer after a stalled upgrade"),
+            "must not keep serving the frozen backing: {msg}"
+        );
+        assert!(msg.contains("store locked"), "and the cause: {msg}");
     }
 
     /// COR-5: the fault raised for an over-cap single block must be **terminal**.
