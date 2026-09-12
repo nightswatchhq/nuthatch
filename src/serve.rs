@@ -2284,7 +2284,7 @@ async fn named_scan(
         let started = std::time::Instant::now();
         let catalogue_hash = crate::seal::catalogue_hash(&dir)?;
         let reserved = crate::analytics::remembered_scan_bound(&dir, &sql, &catalogue_hash);
-        if let Some(bound) = reserved.as_ref().filter(|b| b.cold_bytes >= cap) {
+        if let Some(bound) = reserved.as_ref().filter(|b| b.cold_bytes > cap) {
             return Err(AdmissionRefusal::OverCap(ScanBound {
                 hot_bytes: 0,
                 cap,

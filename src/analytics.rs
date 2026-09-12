@@ -1188,9 +1188,7 @@ fn attempt(
                 &defined,
             )?;
             remember_scan_bound(dir, sql, &bound);
-            if bound.cold_bytes >= admission.cap
-                || bound.cold_bytes.saturating_add(bound.hot_bytes) > admission.cap
-            {
+            if bound.cold_bytes.saturating_add(bound.hot_bytes) > admission.cap {
                 return Err(AdmissionRefusal::OverCap(bound).into());
             }
             Ok(bound)
@@ -3583,10 +3581,12 @@ template="pool"
         let ran = named(dir.path(), tripwire, u64::MAX, 0, true, None).unwrap_err();
         assert!(format!("{ran:#}").contains("evaluated"), "{ran:#}");
 
-        match refusal(named(dir.path(), tripwire, small, 0, true, None)) {
-            AdmissionRefusal::OverCap(b) => assert_eq!((b.cold_bytes, b.cap), (small, small)),
+        match refusal(named(dir.path(), tripwire, small - 1, 0, true, None)) {
+            AdmissionRefusal::OverCap(b) => assert_eq!((b.cold_bytes, b.cap), (small, small - 1)),
             other => panic!("{other}"),
         }
+        // Exactly at the cap is admitted, cold or hot alike.
+        assert!(named(dir.path(), tripwire, small, 0, false, None).is_ok());
         // The hot copy spends the same budget: under the cap alone, over it together.
         match refusal(named(dir.path(), tripwire, small + 10, 11, true, None)) {
             AdmissionRefusal::OverCap(b) => assert_eq!(b.hot_bytes, 11),
