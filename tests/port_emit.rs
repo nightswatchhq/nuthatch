@@ -2491,4 +2491,31 @@ export function handlePoolCreated(event: PoolCreated): void {
         !sql.contains("AS \"collectedFeesUSD\""),
         "the returning path leaves a stored row that never saw the assignment:\n{sql}"
     );
+
+    // `return` is not the only way out. AssemblyScript's `assert` throws on a false condition, and a throw
+    // is a deterministic error whose block graph-node discards - so the loaded row keeps what an earlier
+    // block stored, having never reached the assignment (Jules on #1316).
+    for terminator in [
+        "assert(event.params.tickSpacing > 0)",
+        "throw new Error('no')",
+    ] {
+        let aborting = format!(
+            r#"
+export function handlePoolCreated(event: PoolCreated): void {{
+  let pool = Pool.load(event.params.pool.toHexString())
+  {terminator}
+  pool.plain = event.params.fee
+  pool.collectedFeesUSD = ZERO_BD
+  pool.save()
+}}
+"#
+        );
+        let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, &aborting);
+        let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+        let sql = select_sql(&view.sql);
+        assert!(
+            !sql.contains("AS \"collectedFeesUSD\""),
+            "`{terminator}` can end the handler before the assignment:\n{sql}"
+        );
+    }
 }

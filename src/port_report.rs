@@ -3752,7 +3752,7 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
     // return before the save genuinely stores nothing - Uniswap V4's `handleInitialize` does
     // `const pool = new Pool(poolId)` and then returns twice on null decimals, leaving no `Pool` behind.
     let fresh = local_entity_binding(&func.body, &asg.receiver).is_some_and(|(_, fresh)| fresh);
-    if !fresh && lines[..idx].iter().any(|l| is_return_statement(l)) {
+    if !fresh && lines[..idx].iter().any(|l| aborts_the_handler(l)) {
         return false;
     }
     // Every save of this receiver, after the assignment, and at least one.
@@ -3770,12 +3770,21 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
     saves > 0
 }
 
-/// Whether a line is a `return`, as a statement rather than as part of an identifier.
-fn is_return_statement(line: &str) -> bool {
+/// Whether a line can end the handler before the next statement runs.
+///
+/// `return` is the obvious one. `assert(..)` and `throw` are the others (Jules, #1316): AssemblyScript's
+/// `assert` throws on a false condition, and a throw is a deterministic error whose block graph-node
+/// discards - so a row loaded from an earlier block keeps what that block stored, having never reached the
+/// assignment. Textual, and deliberately so: this is a guard on what the classifier may claim, and a
+/// terminator it cannot recognise has to read as one it cannot rule out.
+fn aborts_the_handler(line: &str) -> bool {
     let t = line.trim();
-    t == "return"
-        || t.strip_prefix("return")
-            .is_some_and(|r| r.starts_with([' ', ';']))
+    let keyword = |k: &str| {
+        t == k
+            || t.strip_prefix(k)
+                .is_some_and(|r| r.starts_with([' ', ';', '(']))
+    };
+    keyword("return") || keyword("throw") || keyword("assert")
 }
 
 /// Whether the statement on `idx` is the body of a conditional or loop that opened no block.
