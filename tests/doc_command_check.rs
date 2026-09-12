@@ -40,10 +40,9 @@ fn repo_root() -> PathBuf {
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "docs/rfcs/0052-the-mirrored-nest.md",
-        "publish",
-        4,
-        "RFC-0052 proposes the not-yet-shipped `nuthatch publish` command family; it is a dated \
-         design contract, not executable operator guidance",
+        "status",
+        1,
+        "RFC-0052 S4's `nuthatch publish status`; S1 ships sync and verify only",
     ),
     (
         "docs/rfcs/0052-the-mirrored-nest.md",

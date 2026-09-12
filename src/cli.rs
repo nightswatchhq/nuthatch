@@ -105,6 +105,8 @@ pub enum Command {
     Transform(TransformArgs),
     /// Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1).
     Offchain(OffchainArgs),
+    /// Mirror sealed segments to an object-store prefix (RFC-0052).
+    Publish(PublishArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -240,6 +242,46 @@ pub struct OffchainDropArgs {
     /// Nest directory containing the offchain namespace.
     #[arg(long, default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Args)]
+pub struct PublishArgs {
+    #[command(subcommand)]
+    pub what: PublishWhat,
+}
+
+#[derive(Subcommand)]
+pub enum PublishWhat {
+    /// Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1).
+    Sync(PublishSyncArgs),
+    /// HEAD every published file against the local catalogue.
+    Verify(PublishVerifyArgs),
+}
+
+#[derive(Args)]
+pub struct PublishSyncArgs {
+    /// Filesystem path, `s3://bucket/prefix`, or `memory://…` (tests). Never `nuthatch.toml`.
+    #[arg(long)]
+    pub target: String,
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Print the plan and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct PublishVerifyArgs {
+    /// The prefix `publish sync` wrote to.
+    #[arg(long)]
+    pub target: String,
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Re-download and re-hash every object.
+    #[arg(long)]
+    pub deep: bool,
 }
 
 #[derive(Args)]

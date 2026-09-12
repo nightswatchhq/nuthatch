@@ -12,7 +12,7 @@
 
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
-    lists, mcp, offchain, pack, project, runtime, screen, store, transform,
+    lists, mcp, offchain, pack, project, publish, runtime, screen, store, transform,
 };
 
 use anyhow::{Context, Result};
@@ -155,6 +155,14 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&args.file),
                 &args.table,
             ),
+        },
+        cli::Command::Publish(args) => match args.what {
+            cli::PublishWhat::Sync(a) => {
+                publish::run_sync(std::path::Path::new(&a.dir), &a.target, a.dry_run).await
+            }
+            cli::PublishWhat::Verify(a) => {
+                publish::run_verify(std::path::Path::new(&a.dir), &a.target, a.deep).await
+            }
         },
         cli::Command::Mcp(args) => {
             if args.print_config {

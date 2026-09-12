@@ -33,6 +33,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "metadata",
             "transform",
             "offchain",
+            "publish",
             "nest",
             "migrate",
             "prune",

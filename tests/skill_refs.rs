@@ -303,6 +303,12 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "the generated offchain provenance manifest, written by the tool and not authored",
     ),
     (
+        // RFC-0052. `PublishEnvelope` is `publish.json`, written by `nuthatch publish sync`.
+        // The operator names a `--target`; they never author this file.
+        "src/publish.rs",
+        "the generated publish.json envelope, written by the tool and not authored",
+    ),
+    (
         // Not serde's `Deserialize` at all - this is rkyv's, required by `dbsp::DBData` so an entity
         // circuit can archive its own row type (#870). Nothing here is ever read from a nest's TOML.
         // The gate matches on the derive *name*, which cannot tell the two apart; classifying it is

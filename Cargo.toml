@@ -71,6 +71,7 @@ getrandom = "0.3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 anyhow = "1"
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hex = "0.4"
