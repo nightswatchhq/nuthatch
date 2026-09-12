@@ -701,19 +701,21 @@ abi = "abis/usdc.json"
         dir
     }
 
-    fn duck_count(glob: &str) -> i64 {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        let sql = format!("SELECT count(*) FROM read_parquet('{glob}', union_by_name=true)");
-        conn.query_row(&sql, [], |r| r.get(0)).unwrap()
-    }
-
-    fn duck_sum_dec(glob: &str) -> String {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        let sql = format!(
-            "SELECT CAST(sum(TRY_CAST(value AS DECIMAL(38,0))) AS VARCHAR) \
-             FROM read_parquet('{glob}', union_by_name=true)"
-        );
-        conn.query_row(&sql, [], |r| r.get::<_, String>(0)).unwrap()
+    fn parquet_rows(dir: &Path) -> i64 {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        fn walk(p: &Path, acc: &mut i64) {
+            if p.is_dir() {
+                for e in std::fs::read_dir(p).unwrap() {
+                    walk(&e.unwrap().path(), acc);
+                }
+            } else if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+                let r = SerializedFileReader::new(std::fs::File::open(p).unwrap()).unwrap();
+                *acc += r.metadata().file_metadata().num_rows();
+            }
+        }
+        let mut n = 0;
+        walk(dir, &mut n);
+        n
     }
 
     #[tokio::test]
@@ -733,21 +735,11 @@ abi = "abis/usdc.json"
             std::fs::read(mirror.path().join(&report.dataset).join(MANIFEST_FILE)).unwrap();
         assert_eq!(remote, local, "remote catalogue must be the local bytes");
 
-        let local_glob = nest
-            .path()
-            .join(seal::SEGMENTS_DIR)
-            .join("*.parquet")
-            .display()
-            .to_string();
-        let remote_glob = mirror
-            .path()
-            .join(&report.dataset)
-            .join("usdc__transfer")
-            .join("*.parquet")
-            .display()
-            .to_string();
-        assert_eq!(duck_count(&local_glob), duck_count(&remote_glob));
-        assert_eq!(duck_sum_dec(&local_glob), duck_sum_dec(&remote_glob));
+        assert_eq!(
+            parquet_rows(&nest.path().join(seal::SEGMENTS_DIR)),
+            parquet_rows(&mirror.path().join(&report.dataset)),
+            "mirrored parquet must carry the same rows as the sealed directory"
+        );
     }
 
     #[tokio::test]
