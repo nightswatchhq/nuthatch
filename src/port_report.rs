@@ -2576,7 +2576,17 @@ fn returned_entity_id_exprs(
             if args.len() != inner.param_names.len() {
                 return None;
             }
+            // **Checked in the context it was written.** `returned_id_is_contract_free` tests the
+            // expressions against the *outer* function's bound locals, so
+            // `makeToken(id) { let c = ERC20.bind(id); return new Token(c.canonical(id)) }` handed back
+            // `c.canonical(id)` - a name the outer body never binds - and it read as an ordinary method
+            // call on nothing in particular (Jules, #1298). The inner body is where `c` means a contract,
+            // so that is where the question gets asked.
+            let inner_bound = bound_contract_locals(&inner.body);
             for expr in returned_entity_id_exprs(inner, functions, depth - 1)? {
+                if expr_reads_contract(&expr, &inner_bound) {
+                    return None;
+                }
                 let mut in_callers_terms = expr;
                 for (param, arg) in inner.param_names.iter().zip(&args) {
                     in_callers_terms = substitute_ident(&in_callers_terms, param, arg.trim());
@@ -5627,6 +5637,73 @@ export function handleTokensTraded(event: TokensTraded): void {
             class_of(&rows, "Trade", "token"),
             Class::Exact,
             "an argument that reads no contract keeps the exemption: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// The inner helper's own contract binding travels with its return (Jules, #1298).
+    ///
+    /// ```ts
+    /// function makeToken(id: Address): Token {
+    ///   let c = ERC20.bind(id)
+    ///   return new Token(c.canonical(id))
+    /// }
+    /// function findToken(id: Address): Token { return makeToken(id) }
+    /// ```
+    ///
+    /// Substituting the arguments produced `c.canonical(id)` in the *outer* context, where nothing binds
+    /// `c` - so it read as an ordinary method call and the `.id` exemption was granted to an id that comes
+    /// off contract state. The inner body is where `c` means a contract, so that is where it is asked.
+    #[test]
+    fn an_inner_helpers_contract_binding_is_not_lost_in_the_caller() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(id: Address): Token {
+  let c = ERC20.bind(id)
+  return new Token(c.canonical(id))
+}
+
+export function findToken(id: Address): Token {
+  return makeToken(id)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id is `c.canonical(id)` and `c` is a bound contract, two calls down: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // The same nesting without the contract read stays exact, so this is about provenance rather than
+        // about the depth of the call chain.
+        let clean = mapping.replace(
+            "let c = ERC20.bind(id)
+  return new Token(c.canonical(id))",
+            "return new Token(id.toHexString())",
+        );
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "two hops through contract-free helpers keep the exemption: {}",
             reason_of(&rows, "Trade", "token")
         );
     }
