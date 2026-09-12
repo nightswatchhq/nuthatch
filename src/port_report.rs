@@ -2477,22 +2477,41 @@ fn calls_method_on(expr: &str, v: &str) -> bool {
 /// output for a contract call, with the call printed in the report's own Why column (#1296). Every
 /// Uniswap fixture this was built against wrote `contract.try_symbol()` inline, so no test could see it.
 fn bound_contract_locals(body: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for line in body.lines() {
-        let t = line.trim_start();
-        let Some(rest) = t.strip_prefix("let ").or_else(|| t.strip_prefix("const ")) else {
-            continue;
-        };
-        let Some((name, rhs)) = rest.split_once('=') else {
-            continue;
-        };
-        if !rhs.contains(".bind(") {
-            continue;
-        }
+    let declared = |t: &str| {
+        let rest = t
+            .trim_start()
+            .strip_prefix("let ")
+            .or_else(|| t.trim_start().strip_prefix("const "))?;
+        let (name, rhs) = rest.split_once('=')?;
         // `let c: ERC20Contract = ..` carries a type annotation.
         let name = name.split(':').next().unwrap_or(name).trim();
-        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            out.insert(name.to_string());
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then(|| {
+            (
+                name.to_string(),
+                rhs.trim().trim_end_matches(';').trim().to_string(),
+            )
+        })
+    };
+    let mut out = BTreeSet::new();
+    for line in body.lines() {
+        if let Some((name, rhs)) = declared(line) {
+            if rhs.contains(".bind(") {
+                out.insert(name);
+            }
+        }
+    }
+    // **An alias of a bound contract is a bound contract.** `let c = ERC20.bind(id); let alias = c` left
+    // `alias` unrecorded, so `alias.symbol()` read as an ordinary method call and the field stayed exact
+    // (Jules, #1298).
+    //
+    // One forward pass, not a fixed point: a local cannot be used before it is declared, so source order
+    // is dependency order and a chain of copies is already in it. A loop here was unfalsifiable - the
+    // mutation reducing it to one pass stayed green, because no valid mapping can need the second.
+    for line in body.lines() {
+        if let Some((name, rhs)) = declared(line) {
+            if out.contains(&rhs) {
+                out.insert(name);
+            }
         }
     }
     out
@@ -5638,6 +5657,40 @@ export function handleTokensTraded(event: TokensTraded): void {
             Class::Exact,
             "an argument that reads no contract keeps the exemption: {}",
             reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// An alias of a bound contract is a bound contract (Jules, #1298).
+    ///
+    /// `bound_contract_locals` recorded only the name assigned directly from `.bind(`, so
+    /// `let c = ERC20.bind(id); let alias = c` left `alias` unrecorded and `alias.symbol()` read as an
+    /// ordinary method call on nothing in particular.
+    #[test]
+    fn an_alias_of_a_bound_contract_is_still_a_contract() {
+        let schema = r#"
+type Token @entity {
+  id: ID!
+  symbol: String!
+}
+"#;
+        // Two hops, so a one-step alias rule would still miss the second.
+        let mapping = r#"
+export function handleTransfer(event: Transfer): void {
+  let c = ERC20.bind(event.params.token)
+  let alias = c
+  let second = alias
+  let token = new Token(event.params.token.toHexString())
+  token.symbol = second.symbol()
+  token.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/token.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Token", "symbol"),
+            Class::CallDerived,
+            "a copy of a bound contract still reads the contract: {}",
+            reason_of(&rows, "Token", "symbol")
         );
     }
 
