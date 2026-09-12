@@ -359,6 +359,15 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with `--features postgres-store`. Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
 
+## `nuthatch settle`
+
+Drain recorded authorisations and settle them (RFC-0046 S3)
+
+- `--dir <DIR>` - Nest directory holding `authorisations.jsonl`
+- `--dry-run` - Print the pending queue and write nothing
+- `--exec <EXEC>` - Command that receives one authorisation JSON on stdin. Exit 0 settled, 2 failed, anything else deferred (row stays pending). Must reconcile retries by network/payer/nonce: a crash can occur after external settlement but before the local outcome journal is synced
+- `--batch <BATCH>` - Hand `--exec` up to this many authorisations per invocation, one JSON line each; it prints one outcome line per row it settled or failed, and an unreported row stays pending
+
 ## `nuthatch sql`
 
 Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table

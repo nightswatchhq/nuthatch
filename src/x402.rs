@@ -134,6 +134,8 @@ pub enum Refusal {
     /// `s` above n/2. See [`SECP256K1_HALF_N`].
     MalleableSignature,
     AlreadyUsed,
+    /// The back office recorded a failed settlement for this payer (RFC-0046 §5.3).
+    UnreliablePayer,
     RecordFailed,
 }
 
@@ -162,6 +164,9 @@ impl std::fmt::Display for Refusal {
                 write!(f, "signature does not match the stated payer")
             }
             Self::AlreadyUsed => write!(f, "authorisation nonce has already been used"),
+            Self::UnreliablePayer => {
+                write!(f, "this payer's previous authorisation did not settle")
+            }
             Self::RecordFailed => write!(f, "could not record authorisation"),
         }
     }
@@ -367,7 +372,7 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_sol_types::{eip712_domain, sol, SolStruct};
     use k256::ecdsa::SigningKey;
@@ -401,6 +406,24 @@ mod tests {
             pay_to: address!("0x1111111111111111111111111111111111111111"),
             price_base_units: U256::from(1000u64),
         }
+    }
+
+    pub(crate) fn payment_for_http_test() -> (super::super::Config, String) {
+        let seller = cfg();
+        let (_, payer) = payer();
+        let mut auth = default_auth(payer, &seller);
+        let now = super::super::now();
+        auth.valid_after = U256::from(now.saturating_sub(60));
+        auth.valid_before = U256::from(now + 600);
+        let header = sign_authorization(&seller, &auth);
+        (
+            super::super::Config {
+                price: seller.price_base_units.to_string(),
+                recipient: seller.pay_to.to_string(),
+                network: super::super::Network::Testnet,
+            },
+            header,
+        )
     }
 
     struct Auth {

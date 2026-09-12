@@ -172,6 +172,17 @@ async fn main() -> Result<()> {
                 mcp::serve(args.url).await
             }
         }
+        cli::Command::Settle(args) => {
+            #[cfg(feature = "counter")]
+            {
+                nuthatch::settle::run(args)
+            }
+            #[cfg(not(feature = "counter"))]
+            {
+                let _ = args;
+                anyhow::bail!("nuthatch settle needs a build with --features counter")
+            }
+        }
         cli::Command::Check(args) => check::check(args),
         cli::Command::Schema(args) => project::regen(args),
         cli::Command::Bench(args) => match args.what {

@@ -90,6 +90,9 @@ pub mod screen;
 pub mod seal;
 pub mod semantic;
 pub mod serve;
+/// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.
+#[cfg(feature = "counter")]
+pub mod settle;
 pub mod skill;
 pub mod source;
 pub mod sql_errors;
