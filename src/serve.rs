@@ -6028,6 +6028,44 @@ mod tests {
         // A `@derivedFrom` list, aggregated into one JSON column and read back as an array. `0xbbb`
         // has no swaps, so it must answer `[]` - DuckDB's `list()` over zero rows is NULL, which
         // would have served null for a field the schema types `[Swap!]!`.
+        //
+        // `amount` is a **string**, for the same reason a top-level `BigInt` is: this asserted `5` until
+        // the wire-type rule reached the packed struct, which is the second test on this branch found to
+        // have the wrong type pinned.
+        // **An alias inside an aggregated list answers under the alias.** The packed struct keyed by the
+        // field name rather than the selection key, so `sid: id` came back as `id` - a key the client never
+        // asked for, in the one place the root-level alias test could not see (Jules on #1282).
+        let body = ask(
+            "/graphql",
+            "{ pools { id swaps { sid: id amt: amount } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"][0]["swaps"],
+            serde_json::json!([{"sid": "s1", "amt": "5"}, {"sid": "s2", "amt": "7"}]),
+            "a child alias must survive the aggregation: {body}"
+        );
+
+        // **`orderBy` on a relation is refused.** graph-node's generated enum includes every field of the
+        // entity, `@derivedFrom` lists among them, so this is a value the schema advertises and the parent
+        // view has no column for - `ORDER BY b."swaps"` either failed in DuckDB or sorted by a JSON
+        // aggregate (Jules on #1282).
+        let body = ask(
+            "/graphql",
+            "{ pools(orderBy: swaps) { id } }",
+            state.clone(),
+        )
+        .await;
+        let msg = body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("orderBy `swaps`") && msg.contains("relation"),
+            "ordering by a relation must be refused by name: {body}"
+        );
+
         let body = ask(
             "/graphql",
             "{ pools { id swaps { id amount } } }",
@@ -6037,7 +6075,7 @@ mod tests {
         assert_eq!(
             body["data"]["pools"],
             serde_json::json!([
-                {"id": "0xaaa", "swaps": [{"id": "s1", "amount": 5}, {"id": "s2", "amount": 7}]},
+                {"id": "0xaaa", "swaps": [{"id": "s1", "amount": "5"}, {"id": "s2", "amount": "7"}]},
                 {"id": "0xbbb", "swaps": []},
                 {"id": "0xccc", "swaps": []},
             ]),

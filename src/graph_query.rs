@@ -1066,7 +1066,18 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                         sub.name
                     )));
                 }
-                packed.push(format!("\"{}\" := {alias}.\"{}\"", sub.name, sub.name));
+                // **Keyed by the alias, valued from the field.** This packed `sub.name` on both sides, so
+                // `{ pools { swaps { sid: id } } }` answered under `id` - a key the client never asked for,
+                // inside a list where its own alias test could not see it (Jules, #1282).
+                //
+                // Cast on the same rule as a top-level scalar: a `BigInt` packed raw is a JSON number
+                // inside the array, which is the wire-type defect one level down.
+                let value = if wire_string_cast(&cf.ty) {
+                    format!("CAST({alias}.\"{}\" AS VARCHAR)", sub.name)
+                } else {
+                    format!("{alias}.\"{}\"", sub.name)
+                };
+                packed.push(format!("\"{}\" := {value}", sub.key));
             }
             let col = format!("{alias}__{}", sel.name);
             // `to_json(list(…))` rather than a bare `LIST` of `STRUCT`, so the column arrives as a
@@ -1214,11 +1225,25 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                          not lower yet"
                     )));
                 }
-                if !ent.fields.iter().any(|x| &x.name == f) {
+                let Some(field) = ent.fields.iter().find(|x| &x.name == f) else {
                     return Err(Unsupported::UnknownField {
                         entity: entity.clone(),
                         field: f.clone(),
                     });
+                };
+                // **Declared is not stored.** graph-node's generated `orderBy` enum includes every field
+                // of the entity, `@derivedFrom` lists among them, so `orderBy: swaps` is a value the
+                // schema advertises and the parent view has no column for. Emitting `ORDER BY b."swaps"`
+                // sent it to DuckDB to fail, or - worse, once the same query selects the list - sorted the
+                // rows by a JSON aggregate (Jules, #1282). Ordering by a relation is the same join a
+                // traversal needs, and it is refused for the same reason.
+                if field.derived_from.is_some()
+                    || matches!(field.ty, graph_schema::FieldType::List(_))
+                    || field.ty.entity_name().is_some()
+                {
+                    return Err(Unsupported::Argument(format!(
+                        "orderBy `{f}` is a relation rather than a stored value, which needs the join                          this slice does not lower yet"
+                    )));
                 }
                 f.clone()
             }
