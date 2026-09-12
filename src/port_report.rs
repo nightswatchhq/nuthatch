@@ -2565,7 +2565,24 @@ fn returned_entity_id_exprs(
             .collect();
         if !name.is_empty() && e[name.len()..].starts_with('(') {
             let inner = functions.get(&name)?;
-            out.extend(returned_entity_id_exprs(inner, functions, depth - 1)?);
+            // **The helper's return, in the caller's terms.** Recursing and taking the inner expressions
+            // verbatim loses the provenance this whole function exists to track: `makeToken(key) { return
+            // new Token(key) }` called as `makeToken(contract.canonical(id))` yielded `key`, which the
+            // caller then checked against *its* locals, found contract-free, and granted the `.id`
+            // exemption to a value that came straight off a contract call (Jules, #1298).
+            let args = take_paren_list(e, name.len());
+            // Arity must match, or a parameter survives unsubstituted and resolves against whatever the
+            // caller happens to have bound under that name.
+            if args.len() != inner.param_names.len() {
+                return None;
+            }
+            for expr in returned_entity_id_exprs(inner, functions, depth - 1)? {
+                let mut in_callers_terms = expr;
+                for (param, arg) in inner.param_names.iter().zip(&args) {
+                    in_callers_terms = substitute_ident(&in_callers_terms, param, arg.trim());
+                }
+                out.push(in_callers_terms);
+            }
             continue;
         }
         return None;
@@ -5548,6 +5565,112 @@ export function handleTokensTraded(event: TokensTraded): void {
             class_of(&rows, "Trade", "token"),
             Class::CallDerived,
             "one branch keys the entity by a contract read, so the id is not the argument: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A helper's return is provenance only once it is put in the caller's terms (Jules, #1298).
+    ///
+    /// ```ts
+    /// function makeToken(key: string): Token { return new Token(key) }
+    /// function findToken(id: Address): Token { return makeToken(contract.canonical(id)) }
+    /// trade.token = findToken(event.params.sourceToken).id
+    /// ```
+    ///
+    /// Recursing into `makeToken` and taking its return expressions verbatim yielded `key`. Checked
+    /// against `findToken`'s own locals that looks contract-free, so the `.id` exemption was granted to an
+    /// id that came straight off `contract.canonical(..)`.
+    #[test]
+    fn a_helpers_return_carries_the_callers_arguments() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(key: string): Token {
+  return new Token(key)
+}
+
+export function findToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  return makeToken(contract.canonical(id))
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id the helper returns is `contract.canonical(id)`, whatever the inner function calls \
+             its parameter: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // The same shape with a contract-free argument is still exact, so the rule is about provenance
+        // rather than about there being a helper call at all.
+        let clean = mapping.replace("contract.canonical(id)", "id.toHexString()");
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "an argument that reads no contract keeps the exemption: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+    }
+
+    /// A helper called with too few arguments leaves a parameter that resolves against the caller.
+    ///
+    /// `makeToken(key, salt)` returns `new Token(salt)`. Called with one argument, `salt` survives
+    /// substitution and is then looked up in the *caller*, which happens to bind a contract-free local of
+    /// that name - so an id that is really the helper's own second parameter reads as exact.
+    #[test]
+    fn a_helper_called_with_too_few_arguments_keeps_no_provenance() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function makeToken(key: string, salt: string): Token {
+  return new Token(salt)
+}
+
+export function findToken(id: Address): Token {
+  let salt = id.toHexString()
+  let contract = Registry.bind(id)
+  return makeToken(contract.canonical(id))
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "`salt` was never passed, and the caller's local of that name is not what the helper meant: \
+             {}",
             reason_of(&rows, "Trade", "token")
         );
     }
