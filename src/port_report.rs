@@ -3784,10 +3784,12 @@ pub(crate) fn assignment_reaches_every_stored_row(
         let Some((open, close)) = enclosing_block(&lines, idx) else {
             return false;
         };
-        if !lines[open..idx]
-            .iter()
-            .any(|l| constructs(l, &asg.receiver))
-        {
+        // **At the block's own level, not merely somewhere inside it.** Scanning the whole block counted a
+        // construction nested in a further branch: `if (a) { if (b) { pool = new Pool(id) }
+        // pool.collectedFeesUSD = ZERO_BD }` assigns without constructing whenever `a` holds and `b` does
+        // not, and an existing row is then saved without the field (Jules, #1326). A construction that
+        // shares the assignment's level runs on every path that reaches it.
+        if !constructed_at_this_level(&lines, open, idx, &asg.receiver) {
             return false;
         }
         // **No terminator check between the construction and the assignment**, though the first version
@@ -3849,6 +3851,29 @@ fn enclosing_block(lines: &[&str], idx: usize) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Whether `var` is constructed at the top level of the block opening on `open`, before `idx`.
+///
+/// Relative depth, so a construction inside a nested branch of that block does not count: it runs on some
+/// paths to the assignment and not others, which is the whole distinction.
+fn constructed_at_this_level(lines: &[&str], open: usize, idx: usize, var: &str) -> bool {
+    let mut rel = 0i32;
+    for (n, line) in lines.iter().enumerate().take(idx).skip(open) {
+        if n > open && rel == 0 && constructs(line, var) {
+            return true;
+        }
+        for c in line.chars() {
+            match c {
+                '{' => rel += 1,
+                '}' => rel -= 1,
+                _ => {}
+            }
+        }
+        // The block's own body sits one brace in; anything deeper is a nested branch.
+        rel -= i32::from(n == open);
+    }
+    false
 }
 
 /// Whether this line binds `var` with `new Entity(..)`, with or without a declaration keyword.

@@ -2642,3 +2642,39 @@ export function handlePoolCreated(event: PoolCreated): void {
         "a creation that took the other branch set nothing:\n{sql}"
     );
 }
+
+/// A construction nested **inside** a further branch is not the block's creation (Jules on #1326).
+///
+/// ```ts
+/// if (a) {
+///   if (b) { pool = new Pool(id) }
+///   pool.collectedFeesUSD = ZERO_BD      // runs when a holds and b does not
+/// }
+/// ```
+///
+/// Scanning the whole block for a `new` found one and answered the field. On the path where `a` holds and
+/// `b` does not, an existing row is assigned - and a row created by some earlier call that also took
+/// `b`-false was saved without it.
+#[test]
+fn a_construction_nested_in_a_further_branch_is_not_the_creation() {
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = Pool.load(event.params.pool.toHexString())
+  if (event.params.tickSpacing > 0) {
+    if (event.params.fee > 0) {
+      pool = new Pool(event.params.pool.toHexString())
+    }
+    pool.collectedFeesUSD = ZERO_BD
+  }
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(CONSTANT_SCHEMA, mapping);
+    let view = result.views.iter().find(|v| v.entity == "Pool").unwrap();
+    let sql = select_sql(&view.sql);
+    assert!(
+        !sql.contains("AS \"collectedFeesUSD\""),
+        "the assignment runs on a path the construction does not:\n{sql}"
+    );
+}
