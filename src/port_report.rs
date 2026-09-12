@@ -2348,7 +2348,10 @@ fn bare_idents(expr: &str) -> Vec<String> {
 
 /// What `let <name> = ..` assigned, as written, or `None` if the body declares no such local.
 fn local_assignment(body: &str, name: &str) -> Option<String> {
-    for line in body.lines() {
+    // Joined, so a declaration a formatter wrapped is read whole. Reading `let key =` on its own recorded
+    // an **empty** right-hand side, which then looked contract-free (Jules, #1298).
+    for line in join_wrapped_declarations(body) {
+        let line = line.as_str();
         let t = line.trim_start();
         // `continue`, not `?`. An earlier version returned from the whole function here, so it only
         // ever resolved a local declared on the body's first line - which made the expansion a no-op
@@ -2715,7 +2718,10 @@ fn resolve_local_chain(body: &str, params: &[String], expr: &str) -> Option<Stri
             return None;
         }
         let mut next: Option<String> = None;
-        for line in body.lines() {
+        // The same joined representation as `bound_contract_locals` and `local_assignment`: one reading of
+        // what a declaration is, or the three disagree on a wrapped one.
+        for line in join_wrapped_declarations(body) {
+            let line = line.as_str();
             let t = line.trim_start();
             let Some(rest) = t.strip_prefix("let ").or_else(|| t.strip_prefix("const ")) else {
                 continue;
@@ -5741,6 +5747,66 @@ export function handleTokensTraded(event: TokensTraded): void {
         assert!(
             !is_id_of_call("wrap(findToken(id)).id", "findToken"),
             "the call has to be the head of the expression"
+        );
+    }
+
+    /// A wrapped declaration resolves whole through the alias chain too (Jules, #1298).
+    ///
+    /// ```ts
+    /// let key =
+    ///   contract.canonical(id)
+    /// let finalKey = key
+    /// return new Token(finalKey)
+    /// ```
+    ///
+    /// `resolve_local_chain` read raw lines, so `let key =` recorded an **empty** right-hand side and the
+    /// contract read vanished - the id then looked contract-free and carried the `.id` exemption. Three
+    /// rules here read declarations and they now share one representation of what a declaration is.
+    #[test]
+    fn a_wrapped_declaration_resolves_through_the_alias_chain() {
+        let schema = r#"
+type Trade @entity {
+  id: ID!
+  token: Token!
+}
+type Token @entity {
+  id: ID!
+}
+"#;
+        let mapping = r#"
+export function findOrCreateToken(id: Address): Token {
+  let contract = Registry.bind(id)
+  let key =
+    contract.canonical(id)
+  let finalKey = key
+  return new Token(finalKey)
+}
+
+export function handleTokensTraded(event: TokensTraded): void {
+  let newTrade = new Trade(event.transaction.hash.toHex())
+  newTrade.token = findOrCreateToken(event.params.sourceToken).id
+  newTrade.save()
+}
+"#;
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", mapping);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::CallDerived,
+            "the id is `contract.canonical(id)` however the declaration was wrapped: {}",
+            reason_of(&rows, "Trade", "token")
+        );
+
+        // Wrapped and contract-free is still exact, so this is about the read and not about the wrapping.
+        let clean = mapping.replace("contract.canonical(id)", "id.toHexString()");
+        assert_ne!(clean, mapping, "the fixture edit must apply");
+        let (parsed, mappings) = schema_and_mappings(schema, "src/utils.ts", &clean);
+        let rows = classify(&parsed, &mappings);
+        assert_eq!(
+            class_of(&rows, "Trade", "token"),
+            Class::Exact,
+            "a wrapped declaration of a contract-free id keeps the exemption: {}",
+            reason_of(&rows, "Trade", "token")
         );
     }
 
