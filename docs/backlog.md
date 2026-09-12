@@ -56,7 +56,7 @@ The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-fo
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
 remain afterwards as provenance. The current sprint is
-[`mighty-moorhen`](sprint-mighty-moorhen.md). A sprint label on any other closed issue is historical;
+[`brisk-brambling`](sprint-brisk-brambling.md). A sprint label on any other closed issue is historical;
 do not use it to infer that work remains. The [documentation guide](README.md) separates the live
 sprint from the dated records.
 

@@ -163,11 +163,9 @@ pub struct Column {
     pub indexed: bool,
     /// A tuple's components, in ABI order, when the ABI names them.
     ///
-    /// A tuple is stored as a positional JSON array (`dynsol_to_json`), so without these the names the
-    /// ABI declares are lost and a consumer has to know the field order to read the column at all
-    /// (#1304). Recorded here so the view layer can expose one named column per component without
-    /// touching stored data - sealed segments keep their arrays, and an ABI whose components change
-    /// produces a differently-named view rather than a silently reinterpreted index.
+    /// A fully-named tuple is stored as a JSON object keyed by those names (#1304). A tuple the ABI
+    /// leaves unnamed stays a positional array. Sealed history is not re-decoded: an ABI whose
+    /// components change is a new nest.
     ///
     /// Empty for everything that is not a tuple, and for a tuple whose components the ABI leaves
     /// unnamed: no name is invented.
@@ -1176,6 +1174,15 @@ pub fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
             return Value::Hash32(w.0);
         }
     }
+    if let DynSolValue::Tuple(items) = dv {
+        if !col.components.is_empty() && col.components.len() == items.len() {
+            let mut obj = serde_json::Map::new();
+            for (c, item) in col.components.iter().zip(items) {
+                obj.insert(c.name.clone(), dynsol_to_json(item));
+            }
+            return Value::Json(Json::Object(obj).to_string());
+        }
+    }
     match dv {
         DynSolValue::Address(a) => Value::Address(a.into_array()),
         DynSolValue::Bool(b) => Value::Bool(*b),
@@ -1955,10 +1962,8 @@ mod tests {
 
     /// A tuple column records the component names the ABI declares.
     ///
-    /// The tuple is stored as a positional JSON array, so without these the names are lost and a
-    /// consumer has to know the ABI's field order to read the column at all. On the pinned drop-in target
-    /// that was 12 of 60 unanswered fields, every one of them a pure function of a decoded event
-    /// (#1304).
+    /// A fully-named tuple is stored as a JSON object keyed by those names (#1304). On the pinned
+    /// Uniswap-V4-shaped target that was 12 of 60 unanswered fields, every one a decoded event param.
     ///
     /// Two refusals are asserted alongside, because inventing a name is worse than having none:
     /// an unnamed component yields nothing, and a component that is itself a tuple keeps its positional
@@ -2023,7 +2028,7 @@ mod tests {
                     storage: "u64".into()
                 },
             ],
-            "order matters: the JSON array is positional, so index 2 must be `A`"
+            "order is still ABI order: object keys come from this list, index 2 is `A`"
         );
 
         // A non-tuple carries none.
@@ -2047,6 +2052,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("inner", "tuple"), ("tail", "uint256")]
         );
+    }
+
+    /// A fully-named tuple decodes as a JSON object, not a positional array (#1304).
+    #[test]
+    fn a_named_tuple_decodes_as_a_json_object() {
+        const ABI: &str = r#"[
+          {"type":"event","name":"Made","anonymous":false,"inputs":[
+            {"name":"order","type":"tuple","indexed":false,"components":[
+              {"name":"y","type":"uint256"},
+              {"name":"z","type":"uint256"}
+            ]}
+          ]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("t", USDC, ABI)]).unwrap();
+        let dec = reg
+            .tables()
+            .into_iter()
+            .find(|d| d.table.ends_with("made"))
+            .expect("Made");
+        let topic0 = format!("0x{}", hex::encode(dec.topic0));
+        let y = "00".repeat(31) + "01";
+        let z = "00".repeat(31) + "02";
+        let data = format!("0x{y}{z}");
+        let row = reg
+            .decode(&log(USDC, &[&topic0], &data, 1, 0))
+            .unwrap()
+            .expect("topic0 and address match");
+        let Value::Json(raw) = &row.params[0].1 else {
+            panic!("order must be Json, got {:?}", row.params[0].1);
+        };
+        let obj: Json = serde_json::from_str(raw).unwrap();
+        assert!(obj.is_object(), "named tuple must be an object, got {obj}");
+        assert_eq!(obj["y"], json!("1"));
+        assert_eq!(obj["z"], json!("2"));
     }
 
     /// `schema.json` is byte-identical for a nest with no tuple column.
