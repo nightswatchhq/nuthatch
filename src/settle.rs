@@ -56,40 +56,66 @@ pub fn drain_batched(dir: &Path, submit: &dyn Submit, batch: usize) -> Result<Dr
         .try_lock()
         .context("another settler is already running")?;
     let pending_path = dir.join(LOG);
-    let pending = {
+    // The counter appends whole lines under the queue lock, so a length taken under it ends on a
+    // line boundary. Rows appended after it wait for the next run.
+    let snapshot = {
         let _guard = crate::counter::lock_queue(dir)?;
-        read_jsonl(&pending_path)?
+        match std::fs::metadata(&pending_path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", pending_path.display())),
+        }
     };
     let mut completed = std::collections::BTreeSet::new();
     let mut report = DrainReport::default();
-    let mut unsubmitted = Vec::new();
-    for row in pending {
-        // `spent.jsonl` is an outcome journal as well as the counter's compact replay set. If a
-        // prior run reached the durable journal but crashed before rewriting the pending queue,
-        // finalise that result. Calling the operator command a second time would be a second
-        // attempt to move the same money.
-        match recorded_outcome(dir, &row)? {
-            Some(outcome) => journal(dir, &row, outcome, true, &mut report, &mut completed)?,
-            None => unsubmitted.push(row),
+    let batch = batch.max(1);
+    let mut chunk = Vec::with_capacity(batch);
+    if snapshot > 0 {
+        let file = std::fs::File::open(&pending_path)
+            .with_context(|| format!("read {}", pending_path.display()))?;
+        for line in std::io::BufReader::new(std::io::Read::take(file, snapshot)).lines() {
+            let Some(row) = parse_row(&pending_path, line)? else {
+                continue;
+            };
+            // `spent.jsonl` is an outcome journal as well as the counter's compact replay set. If a
+            // prior run reached the durable journal but crashed before rewriting the pending queue,
+            // finalise that result. Calling the operator command a second time would be a second
+            // attempt to move the same money.
+            match recorded_outcome(dir, &row)? {
+                Some(outcome) => journal(dir, &row, outcome, true, &mut report, &mut completed)?,
+                None => chunk.push(row),
+            }
+            if chunk.len() == batch {
+                submit_chunk(dir, submit, &mut chunk, &mut report, &mut completed)?;
+            }
         }
     }
-    for chunk in unsubmitted.chunks(batch.max(1)) {
-        let mut outcomes = submit.submit_batch(chunk).into_iter();
-        for row in chunk {
-            let outcome = outcomes
-                .next()
-                .unwrap_or_else(|| Outcome::Deferred("the submitter returned no outcome".into()));
-            journal(dir, row, outcome, false, &mut report, &mut completed)?;
-        }
-    }
-    // New payments may have arrived while the external command ran. Re-read under the same
-    // cross-process lock as the server's append and remove only rows completed by this run.
+    submit_chunk(dir, submit, &mut chunk, &mut report, &mut completed)?;
+    // New payments may have arrived while the external command ran. Rewrite under the same
+    // cross-process lock as the server's append, removing only rows completed by this run.
     let _guard = crate::counter::lock_queue(dir)?;
-    let mut kept = read_jsonl(&pending_path)?;
-    kept.retain(|row| !completed.contains(&authorisation_key(row)));
-    write_jsonl(&pending_path, &kept)?;
-    report.remaining = kept.len() as u64;
+    report.remaining = rewrite_without(&pending_path, &completed)?;
     Ok(report)
+}
+
+fn submit_chunk(
+    dir: &Path,
+    submit: &dyn Submit,
+    chunk: &mut Vec<serde_json::Value>,
+    report: &mut DrainReport,
+    completed: &mut std::collections::BTreeSet<[String; 3]>,
+) -> Result<()> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let mut outcomes = submit.submit_batch(chunk).into_iter();
+    for row in chunk.drain(..) {
+        let outcome = outcomes
+            .next()
+            .unwrap_or_else(|| Outcome::Deferred("the submitter returned no outcome".into()));
+        journal(dir, &row, outcome, false, report, completed)?;
+    }
+    Ok(())
 }
 
 fn journal(
@@ -361,19 +387,72 @@ fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>> {
     };
     let mut out = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // This is a money queue, not an opportunistic event feed. Skipping a corrupt line would
-        // quietly forget an authorisation the nest has already honoured. Stop and let the
-        // operator repair the file instead.
-        let row =
-            serde_json::from_str(&line).with_context(|| format!("parse {}", path.display()))?;
-        validate_row(&row).with_context(|| format!("validate {}", path.display()))?;
-        out.push(row);
+        out.extend(parse_row(path, line)?);
     }
     Ok(out)
+}
+
+fn parse_row(path: &Path, line: std::io::Result<String>) -> Result<Option<serde_json::Value>> {
+    let line = line.with_context(|| format!("read {}", path.display()))?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    // This is a money queue, not an opportunistic event feed. Skipping a corrupt line would
+    // quietly forget an authorisation the nest has already honoured. Stop and let the
+    // operator repair the file instead.
+    let row = serde_json::from_str(&line).with_context(|| format!("parse {}", path.display()))?;
+    validate_row(&row).with_context(|| format!("validate {}", path.display()))?;
+    Ok(Some(row))
+}
+
+/// Stream the queue into its replacement without the `completed` rows, returning how many remain.
+fn rewrite_without(
+    path: &Path,
+    completed: &std::collections::BTreeSet<[String; 3]>,
+) -> Result<u64> {
+    let file = match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        Ok(f) => f,
+    };
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut kept = 0_u64;
+    {
+        let mut out = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("write {}", tmp.display()))?,
+        );
+        for line in std::io::BufReader::new(file).lines() {
+            let Some(row) = parse_row(path, line)? else {
+                continue;
+            };
+            if completed.contains(&authorisation_key(&row)) {
+                continue;
+            }
+            writeln!(out, "{row}").with_context(|| format!("write {}", tmp.display()))?;
+            kept += 1;
+        }
+        out.into_inner()
+            .map_err(|e| e.into_error())
+            .and_then(|f| f.sync_data())
+            .with_context(|| format!("sync {}", tmp.display()))?;
+    }
+    if kept == 0 {
+        std::fs::remove_file(&tmp).with_context(|| format!("remove {}", tmp.display()))?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+        }
+    } else {
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {}", tmp.display()))?;
+    }
+    sync_parent(path)?;
+    Ok(kept)
 }
 
 fn append_jsonl(path: &Path, row: &serde_json::Value) -> Result<()> {
@@ -396,6 +475,7 @@ fn append_jsonl(path: &Path, row: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn write_jsonl(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
     if rows.is_empty() {
         match std::fs::remove_file(path) {
