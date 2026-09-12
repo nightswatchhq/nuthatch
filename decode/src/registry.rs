@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::rpc::Log;
 
@@ -394,13 +394,17 @@ pub struct EventDecoder {
 /// A tuple's named components, in ABI order, or empty when the ABI names none of them.
 ///
 /// All-or-nothing on purpose: a partially-named tuple would give some components a name and others an
-/// index, and a view mixing the two is harder to read than one that is honestly positional. No name is
-/// ever invented.
+/// index, and a view mixing the two is harder to read than one that is honestly positional. Duplicate
+/// names are the same refusal: an object cannot carry two values on one key. No name is ever invented.
 ///
 /// One level only. A component that is itself a tuple keeps its positional JSON, and says so by carrying
 /// `sol_type: "tuple"` with no components of its own.
 pub fn tuple_components(components: &[alloy_json_abi::Param]) -> Vec<Component> {
     if components.is_empty() || components.iter().any(|c| c.name.is_empty()) {
+        return Vec::new();
+    }
+    let mut seen = HashSet::with_capacity(components.len());
+    if !components.iter().all(|c| seen.insert(c.name.as_str())) {
         return Vec::new();
     }
     components
@@ -1176,11 +1180,15 @@ pub fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
     }
     if let DynSolValue::Tuple(items) = dv {
         if !col.components.is_empty() && col.components.len() == items.len() {
-            let mut obj = serde_json::Map::new();
-            for (c, item) in col.components.iter().zip(items) {
-                obj.insert(c.name.clone(), dynsol_to_json(item));
+            let mut names = HashSet::with_capacity(col.components.len());
+            // Duplicate keys would overwrite; fall back to the positional array.
+            if col.components.iter().all(|c| names.insert(c.name.as_str())) {
+                let mut obj = serde_json::Map::new();
+                for (c, item) in col.components.iter().zip(items) {
+                    obj.insert(c.name.clone(), dynsol_to_json(item));
+                }
+                return Value::Json(Json::Object(obj).to_string());
             }
-            return Value::Json(Json::Object(obj).to_string());
         }
     }
     match dv {
@@ -1985,6 +1993,12 @@ mod tests {
               {"name":"","type":"uint256"}
             ]}
           ]},
+          {"type":"event","name":"Duped","anonymous":false,"inputs":[
+            {"name":"pair","type":"tuple","indexed":false,"components":[
+              {"name":"x","type":"uint256"},
+              {"name":"x","type":"uint256"}
+            ]}
+          ]},
           {"type":"event","name":"Nested","anonymous":false,"inputs":[
             {"name":"outer","type":"tuple","indexed":false,"components":[
               {"name":"inner","type":"tuple","components":[{"name":"leaf","type":"uint256"}]},
@@ -2040,6 +2054,10 @@ mod tests {
             col("unnamed", "pair").components.is_empty(),
             "a tuple with an unnamed component must not be half-named"
         );
+        assert!(
+            col("duped", "pair").components.is_empty(),
+            "duplicate component names cannot be object keys"
+        );
 
         // One level. A component that is itself a tuple is named but keeps its own positional JSON,
         // which it says by carrying `sol_type: "tuple"` and no components of its own.
@@ -2086,6 +2104,41 @@ mod tests {
         assert!(obj.is_object(), "named tuple must be an object, got {obj}");
         assert_eq!(obj["y"], json!("1"));
         assert_eq!(obj["z"], json!("2"));
+    }
+
+    /// Duplicate component names cannot be object keys; the value stays a positional array.
+    #[test]
+    fn a_tuple_with_duplicate_names_decodes_as_an_array() {
+        const ABI: &str = r#"[
+          {"type":"event","name":"Made","anonymous":false,"inputs":[
+            {"name":"order","type":"tuple","indexed":false,"components":[
+              {"name":"y","type":"uint256"},
+              {"name":"y","type":"uint256"}
+            ]}
+          ]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("t", USDC, ABI)]).unwrap();
+        let dec = reg
+            .tables()
+            .into_iter()
+            .find(|d| d.table.ends_with("made"))
+            .expect("Made");
+        let topic0 = format!("0x{}", hex::encode(dec.topic0));
+        let y1 = "00".repeat(31) + "01";
+        let y2 = "00".repeat(31) + "02";
+        let row = reg
+            .decode(&log(USDC, &[&topic0], &format!("0x{y1}{y2}"), 1, 0))
+            .unwrap()
+            .expect("topic0 and address match");
+        let Value::Json(raw) = &row.params[0].1 else {
+            panic!("order must be Json, got {:?}", row.params[0].1);
+        };
+        let arr: Json = serde_json::from_str(raw).unwrap();
+        assert!(
+            arr.is_array(),
+            "duplicate names must stay an array, got {arr}"
+        );
+        assert_eq!(arr, json!(["1", "2"]));
     }
 
     /// `schema.json` is byte-identical for a nest with no tuple column.
