@@ -345,7 +345,7 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     }
     tape.advance_tip_to(5);
 
-    let old_rt = indexer::spawn_nest(
+    let mut old_rt = indexer::spawn_nest(
         tape.clone(),
         old_dir.path().to_path_buf(),
         old_cfg,
@@ -358,6 +358,15 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     )
     .await
     .expect("spawn old");
+    let old_store = old_rt.state.store.clone();
+    tokio::time::timeout(POLL_TIMEOUT, async {
+        while old_store.indexed_head().unwrap() != Some(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the old version should reach the tip before the new one is spawned");
+
     let new_rt = indexer::spawn_nest(
         tape.clone(),
         new_dir.path().to_path_buf(),
@@ -372,52 +381,49 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .await
     .expect("spawn new");
 
-    let old_store = old_rt.state.store.clone();
     let new_store = new_rt.state.store.clone();
-    let new_state = new_rt.state; // handed to the flip
+    let new_state = new_rt.state;
     let shared = serve::SharedNest::new(old_rt.state);
 
-    // Before the flip, the endpoint is backed by the OLD version.
     assert_eq!(shared.current().dir.as_path(), old_dir.path());
 
-    // Concurrent re-index + atomic flip: returns once the new version has caught up to the old.
     tokio::time::timeout(
         POLL_TIMEOUT,
-        indexer::await_catchup_and_flip(
-            &shared,
+        indexer::await_catchup(
             &old_store,
             &new_store,
-            new_state,
             Duration::from_millis(20),
+            POLL_TIMEOUT,
         ),
     )
     .await
-    .expect("flip timed out")
-    .expect("flip");
+    .expect("catch-up timed out")
+    .expect("catch-up");
 
-    // After the flip, the SAME endpoint is now backed by the NEW version.
+    indexer::quiesce_ingest(&mut old_rt.ingest, Duration::from_secs(2))
+        .await
+        .expect("quiesce old writer");
+    let frozen = old_store.indexed_head().unwrap();
+    assert_eq!(frozen, Some(5), "old version was at the tip before quiesce");
+
+    let new_head = tokio::time::timeout(
+        POLL_TIMEOUT,
+        indexer::wait_until_caught_up(&new_store, frozen, Duration::from_millis(20), POLL_TIMEOUT),
+    )
+    .await
+    .expect("flip wait timed out")
+    .expect("flip wait");
+    shared.swap(new_state);
+
     assert_eq!(shared.current().dir.as_path(), new_dir.path());
-
-    // **The guarantee the flip actually makes** (issue #162): at the moment it swaps, the new version
-    // is at least as far along as the old - so no consumer sees the endpoint go backwards. It does
-    // *not* promise the new version has reached the tip.
-    //
-    // **Measure it at that moment, not afterwards.** `await_catchup_and_flip` returns when the two are
-    // level, but *both indexers keep running* - so reading the heads after it returns lets the old
-    // version race ahead again, and the comparison then fails for a reason the flip never claimed. It
-    // did exactly that on main (`new=Some(2) old=Some(5)`): a bug in the observation, not in the flip.
-    //
-    // Stopping the old indexer first makes the measurement match the guarantee. An earlier fix here
-    // relaxed `== Some(5)` to `>=`, which was right about the head value and still measured at the
-    // wrong time.
-    old_rt.ingest.abort();
-    let (new_head, old_head) = (
-        new_store.indexed_head().unwrap(),
-        old_store.indexed_head().unwrap(),
-    );
     assert!(
-        new_head >= old_head,
-        "the flip must never move the endpoint backwards: new={new_head:?} old={old_head:?}"
+        new_head >= frozen,
+        "the flip must never move the endpoint backwards: new={new_head:?} old={frozen:?}"
+    );
+    assert_eq!(
+        old_store.indexed_head().unwrap(),
+        frozen,
+        "quiesced old writer must not have advanced between catch-up and swap"
     );
 
     // Separately: left alone, the new version does reach the tip. Polled rather than asserted

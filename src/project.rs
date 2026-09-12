@@ -56,9 +56,11 @@ pub async fn init(args: InitArgs) -> Result<()> {
     let tip = rpc.block_number().await.ok();
 
     let overrides = resolve_abi_overrides(&args.abi, addresses.len())?;
+    let start_blocks = resolve_start_blocks(&args.start_block, addresses.len())?;
 
     let mut contracts = Vec::with_capacity(addresses.len());
     let mut aliases: Vec<String> = Vec::with_capacity(addresses.len());
+    let mut undetected: Vec<String> = Vec::new();
     let used: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, address) in addresses.iter().enumerate() {
         let (abi_json, implementation, contract_name) = match &overrides[i] {
@@ -92,19 +94,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
         )
         .with_context(|| format!("failed to write {abi_path}"))?;
 
-        let start_block = match tip {
-            Some(tip) => match detect_deploy_block(&rpc, address, tip).await {
-                Ok(b) => {
-                    println!("  ✓ deployed at block {b}");
-                    Some(b)
-                }
-                Err(e) => {
-                    println!("  · deployment block undetected ({e:#}); backfill starts from a tip offset");
-                    None
-                }
-            },
-            None => None,
-        };
+        let start_block =
+            resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
         report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
 
@@ -184,6 +175,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
     println!();
     println!("next:  nuthatch dev{}", dir_hint(&args.dir));
     println!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
+    print_undetected_start_blocks(&undetected);
     Ok(())
 }
 
@@ -237,8 +229,10 @@ pub async fn add(args: AddArgs) -> Result<()> {
         .with_context(|| format!("cannot create {}", dir.join("abis").display()))?;
 
     let overrides = resolve_abi_overrides(&args.abi, new_addresses.len())?;
+    let start_blocks = resolve_start_blocks(&args.start_block, new_addresses.len())?;
 
     let mut new_aliases: Vec<String> = Vec::with_capacity(new_addresses.len());
+    let mut undetected: Vec<String> = Vec::new();
     for (i, address) in new_addresses.iter().enumerate() {
         let (abi_json, implementation, contract_name) = match &overrides[i] {
             Some(path) => {
@@ -273,19 +267,8 @@ pub async fn add(args: AddArgs) -> Result<()> {
         )
         .with_context(|| format!("failed to write {abi_path}"))?;
 
-        let start_block = match tip {
-            Some(tip) => match detect_deploy_block(&rpc, address, tip).await {
-                Ok(b) => {
-                    println!("  ✓ deployed at block {b}");
-                    Some(b)
-                }
-                Err(e) => {
-                    println!("  · deployment block undetected ({e:#}); backfill starts from a tip offset");
-                    None
-                }
-            },
-            None => None,
-        };
+        let start_block =
+            resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
         report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
 
@@ -318,6 +301,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
         "next:  nuthatch dev{}   (backfills the new contract(s) from deployment)",
         dir_hint(&args.dir)
     );
+    print_undetected_start_blocks(&undetected);
     Ok(())
 }
 
@@ -915,7 +899,8 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
          --\n\
          -- Footguns (see the builder skill's views.md):\n\
          --   • reserved-word columns like \"from\"/\"to\" must be double-quoted\n\
-         --   • big-int columns are exact text - use the `<col>_dec` companion for SUM/AVG/compare\n\
+         --   • big-int amounts use `<col>_dec` for SUM/AVG; ids, nonces and hashes stay on the raw column\n\
+         --     (`_dec` is NULL for a full-width uint256)\n\
          --\n\
          -- Example over this nest's `{table}` table:\n\
          --\n\
@@ -1388,6 +1373,76 @@ fn resolve_abi_overrides(provided: &[String], n: usize) -> Result<Vec<Option<Str
             }
         })
         .collect())
+}
+
+/// `--start-block` in address order. Empty entry means probe. Same shape as `--abi`.
+fn resolve_start_blocks(provided: &[String], n: usize) -> Result<Vec<Option<u64>>> {
+    if provided.is_empty() {
+        return Ok(vec![None; n]);
+    }
+    if provided.len() != n {
+        bail!(
+            "{} --start-block value(s) for {n} address(es) - provide one per address (an empty \
+             entry still probes) or none at all",
+            provided.len()
+        );
+    }
+    provided
+        .iter()
+        .map(|p| {
+            let t = p.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<u64>()
+                    .map(Some)
+                    .with_context(|| format!("--start-block '{p}' is not a block number"))
+            }
+        })
+        .collect()
+}
+
+async fn resolve_contract_start(
+    rpc: &RpcClient,
+    address: &str,
+    tip: Option<u64>,
+    provided: Option<u64>,
+    undetected: &mut Vec<String>,
+) -> Option<u64> {
+    if let Some(b) = provided {
+        println!("  ✓ start block {b} (--start-block)");
+        return Some(b);
+    }
+    let tip = tip?;
+    match detect_deploy_block(rpc, address, tip).await {
+        Ok(b) => {
+            println!("  ✓ deployed at block {b}");
+            Some(b)
+        }
+        Err(e) => {
+            println!("  · deployment block undetected ({e:#})");
+            undetected.push(address.to_string());
+            None
+        }
+    }
+}
+
+fn print_undetected_start_blocks(undetected: &[String]) {
+    if undetected.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "⚠ deployment block undetected for {} contract(s):",
+        undetected.len()
+    );
+    for a in undetected {
+        println!("    {a}");
+    }
+    println!("  this nest will backfill a recent window, not those contracts' history.");
+    println!(
+        "  re-run with --start-block <n,...> in the same order as the addresses, then `nuthatch dev`."
+    );
 }
 
 /// Read and validate a local ABI file. Parsed as a `JsonAbi` before it is accepted so a wrong file
@@ -1989,6 +2044,17 @@ mod tests {
     }
 
     #[test]
+    fn start_blocks_are_positional_like_abi_overrides() {
+        assert_eq!(resolve_start_blocks(&[], 2).unwrap(), vec![None, None]);
+        assert_eq!(
+            resolve_start_blocks(&["100".into(), "".into(), "200".into()], 3).unwrap(),
+            vec![Some(100), None, Some(200)]
+        );
+        assert!(resolve_start_blocks(&["100".into()], 2).is_err());
+        assert!(resolve_start_blocks(&["nope".into()], 1).is_err());
+    }
+
+    #[test]
     fn eip1967_impl_extraction() {
         assert!(impl_from_slot(
             "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -2523,6 +2589,7 @@ dataSources:
             ipfs: vec![format!("{gateway}/ipfslike/")],
             alias: vec![],
             abi: vec![],
+            start_block: vec![],
             chain: None,
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),

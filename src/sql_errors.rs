@@ -111,10 +111,19 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         for t in schema {
             for bc in derive_footguns(t).big_ints {
                 if mentions_in_aggregate(query, &bc) {
-                    return Some(format!(
-                        "`{bc}` is an exact-text big integer (uint/int > 64-bit); use `{bc}_dec` for \
-                         SUM/AVG/comparisons, not the raw column."
-                    ));
+                    let overflows = derive_footguns(t).overflows_dec.iter().any(|c| c == &bc);
+                    return Some(if overflows {
+                        format!(
+                            "`{bc}` is an exact-text big integer (uint/int > 64-bit). For amounts \
+                             that fit in 38 digits, use `{bc}_dec`. For ids, nonces and hashes \
+                             `{bc}_dec` is NULL - use the raw `{bc}` column."
+                        )
+                    } else {
+                        format!(
+                            "`{bc}` is an exact-text big integer (uint/int > 64-bit); use `{bc}_dec` for \
+                             SUM/AVG/comparisons, not the raw column."
+                        )
+                    });
                 }
             }
         }
@@ -555,6 +564,10 @@ mod tests {
             "Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'.";
         let hint = enrich(raw, "SELECT sum(value) FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("value_dec"), "points at value_dec");
+        assert!(
+            hint.contains("ids, nonces"),
+            "uint256 value overflows decimal: {hint}"
+        );
     }
 
     /// #539: the issue's own repro, `COALESCE(enabled, false)`, against DuckDB's real message -

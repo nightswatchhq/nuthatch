@@ -260,7 +260,8 @@ fn render_prompt(name: &str, args: &Value) -> Option<Value> {
             let c = args.get("claim").and_then(Value::as_str).unwrap_or("<the claim>");
             format!(
                 "Independently verify this claim: \"{c}\". Call `schema` first (mind the footguns - \
-                 big-int columns need their `_dec` companion), write the SQL from scratch with `sql`, \
+                 big-int *amounts* use the `_dec` companion; ids, nonces and hashes stay on the raw \
+                 column because `_dec` is NULL for a full-width uint256), write the SQL from scratch with `sql`, \
                  and report the result *with* its provenance stamp (as-of block, sealed_through) so it \
                  is citable. If your first query errors, use the returned hint to correct it."
             )
