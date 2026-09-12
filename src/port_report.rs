@@ -2488,6 +2488,11 @@ fn bound_contract_locals(body: &str) -> BTreeSet<String> {
         (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then(|| {
             (
                 name.to_string(),
+                // **No comment stripping here.** `parse_functions` strips the whole source before any
+                // `FunctionInfo` exists, so a body never carries one and a second stripper on this
+                // right-hand side is a guard that cannot fire - the mutation removing it stayed green,
+                // which is how I found out. `a_body_carries_no_comments` holds the property this relies
+                // on (Jules, #1298).
                 rhs.trim().trim_end_matches(';').trim().to_string(),
             )
         })
@@ -5660,6 +5665,40 @@ export function handleTokensTraded(event: TokensTraded): void {
         );
     }
 
+    /// A parsed body carries no comments, which is what several rules here quietly rely on.
+    ///
+    /// `parse_functions` strips the source before building any `FunctionInfo`, so every line-oriented rule
+    /// in this module - alias matching, the terminator scan, brace depth - sees code only. Asserted rather
+    /// than assumed, because a reviewer reasonably read `bound_contract_locals` as vulnerable to a
+    /// trailing comment and the answer is not visible from that function.
+    #[test]
+    fn a_body_carries_no_comments() {
+        let mapping = r#"
+export function handleTransfer(event: Transfer): void {
+  let c = ERC20.bind(event.params.token) // a trailing comment
+  /* and a block one */
+  let alias = c // another
+  alias.symbol()
+}
+"#;
+        let (_schema, mappings) = schema_and_mappings(
+            "type Token @entity { id: ID! }
+",
+            "src/token.ts",
+            mapping,
+        );
+        let body = &mappings
+            .functions
+            .get("handleTransfer")
+            .expect("handler")
+            .body;
+        assert!(
+            !body.contains("//") && !body.contains("/*"),
+            "a comment reached a function body, and every line rule in this module assumes none do:\n\
+             {body}"
+        );
+    }
+
     /// An alias of a bound contract is a bound contract (Jules, #1298).
     ///
     /// `bound_contract_locals` recorded only the name assigned directly from `.bind(`, so
@@ -5677,7 +5716,7 @@ type Token @entity {
         let mapping = r#"
 export function handleTransfer(event: Transfer): void {
   let c = ERC20.bind(event.params.token)
-  let alias = c
+  let alias = c // keep this handle
   let second = alias
   let token = new Token(event.params.token.toHexString())
   token.symbol = second.symbol()
