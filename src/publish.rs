@@ -89,8 +89,10 @@ impl Mirror for FsMirror {
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
-        let lock = publication_lock(&format!("fs:{}", self.path(key).display()));
+        let path = self.path(key);
+        let lock = publication_lock(&format!("fs:{}", path.display()));
         let _g = lock.lock().await;
+        let _cross = fs_exclusive_lock(&path)?;
         cas_bytes(self.get(key).await?, expected, key)?;
         self.put(key, bytes).await
     }
@@ -255,6 +257,37 @@ fn publication_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     map.entry(id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Exclusive `flock` on `path.lock`, so two `nuthatch publish sync` processes cannot
+/// both pass the catalogue CAS. Dropping the file releases the lock.
+struct FsExclusiveLock {
+    _file: std::fs::File,
+}
+
+fn fs_exclusive_lock(path: &Path) -> Result<FsExclusiveLock> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            bail!("flock {} failed", lock_path.display());
+        }
+    }
+    Ok(FsExclusiveLock { _file: file })
 }
 
 fn cas_bytes(current: Option<Vec<u8>>, expected: Option<&[u8]>, key: &str) -> Result<()> {
