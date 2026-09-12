@@ -134,6 +134,8 @@ pub enum Refusal {
     /// `s` above n/2. See [`SECP256K1_HALF_N`].
     MalleableSignature,
     AlreadyUsed,
+    /// The back office recorded a failed settlement for this payer (RFC-0046 §5.3).
+    UnreliablePayer,
     RecordFailed,
 }
 
@@ -162,6 +164,9 @@ impl std::fmt::Display for Refusal {
                 write!(f, "signature does not match the stated payer")
             }
             Self::AlreadyUsed => write!(f, "authorisation nonce has already been used"),
+            Self::UnreliablePayer => {
+                write!(f, "this payer's previous authorisation did not settle")
+            }
             Self::RecordFailed => write!(f, "could not record authorisation"),
         }
     }
