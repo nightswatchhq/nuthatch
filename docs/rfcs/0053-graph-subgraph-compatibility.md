@@ -4,7 +4,17 @@
 refusal for the rest. Not a drop-in replacement - see the rescope note below and
 [Measured outcome](#measured-outcome).*
 
-**Status:** **Accepted 2026-09-09 by Chief**, as the decision RFC-0044 §8 requires for new binary
+**Status:** **PARKED 2026-09-12 by Chief.** No further slices are to be started. What shipped stays
+shipped and supported - the compatibility surface is on main, tested, and documented in
+[what it is and what it is not](../graph-compatibility-what-it-is.md). What is parked is the *programme*:
+S3's entity history, S4's value contract decision, the S0 validator that was never built, and the
+remaining coverage grind.
+
+**The trigger to unpark**, so this is a decision rather than a drift: someone with a stopped subgraph
+whose queries fall inside the event-shaped surface, asking for it. Field coverage is not the trigger -
+that was the mistake this programme made for three weeks. A named consumer is.
+
+Originally **accepted 2026-09-09 by Chief**, as the decision RFC-0044 §8 requires for new binary
 capability. It **overrides [RFC-0044](0044-the-subgraph-port-skill.md) §11's** "not a subgraph
 compatibility layer" non-goal, annotated there. Scope of the authorisation: S0 (#1264, the migration
 validator) is in the `resolute-robin` sprint; S1 to S4 (#1265 to #1268) are filed but wait on what S0
