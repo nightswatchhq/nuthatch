@@ -2497,8 +2497,12 @@ fn bound_contract_locals(body: &str) -> BTreeSet<String> {
             )
         })
     };
+    // **Statements, not lines.** A declaration that wraps - `let contract =\n  ERC20.bind(id)` - put the
+    // bind on a line with no `let`, so the local went unrecorded and a later `contract.symbol()` read as
+    // an ordinary method call (Jules, #1298). Prettier wraps a long bind exactly that way.
+    let joined = join_wrapped_declarations(body);
     let mut out = BTreeSet::new();
-    for line in body.lines() {
+    for line in &joined {
         if let Some((name, rhs)) = declared(line) {
             if rhs.contains(".bind(") {
                 out.insert(name);
@@ -2512,12 +2516,39 @@ fn bound_contract_locals(body: &str) -> BTreeSet<String> {
     // One forward pass, not a fixed point: a local cannot be used before it is declared, so source order
     // is dependency order and a chain of copies is already in it. A loop here was unfalsifiable - the
     // mutation reducing it to one pass stayed green, because no valid mapping can need the second.
-    for line in body.lines() {
+    for line in &joined {
         if let Some((name, rhs)) = declared(line) {
             if out.contains(&rhs) {
                 out.insert(name);
             }
         }
+    }
+    out
+}
+
+/// The body's lines, with a wrapped declaration joined onto one.
+///
+/// A line whose trimmed form ends with `=`, `(` or `,` is continued on the next: those are the three ways
+/// a formatter breaks a declaration, and joining them is what lets a line-shaped rule see the whole
+/// statement. Nothing else is merged, so a line-oriented caller still sees ordinary statements one apiece.
+fn join_wrapped_declarations(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if !pending.is_empty() {
+            pending.push(' ');
+            pending.push_str(t);
+        } else {
+            pending = t.to_string();
+        }
+        if pending.ends_with('=') || pending.ends_with('(') || pending.ends_with(',') {
+            continue;
+        }
+        out.push(std::mem::take(&mut pending));
+    }
+    if !pending.is_empty() {
+        out.push(pending);
     }
     out
 }
@@ -5763,7 +5794,8 @@ type Token @entity {
         // Two hops, so a one-step alias rule would still miss the second.
         let mapping = r#"
 export function handleTransfer(event: Transfer): void {
-  let c = ERC20.bind(event.params.token)
+  let c =
+    ERC20.bind(event.params.token)
   let alias = c // keep this handle
   let second = alias
   let token = new Token(event.params.token.toHexString())
