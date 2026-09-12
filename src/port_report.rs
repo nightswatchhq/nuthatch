@@ -3671,7 +3671,7 @@ fn returned_field_event_column(helper: &FunctionInfo, field: &str) -> Option<Str
             .unwrap_or(usize::MAX);
         let escapes_unset =
             idx >= body_lines.len() || body_lines[..idx].iter().any(|l| aborts_the_handler(l));
-        unconditional |= !escapes_unset && assignment_reaches_every_stored_row(helper, asg);
+        unconditional |= !escapes_unset && assignment_reaches_every_stored_row(helper, asg, false);
         col = Some(c);
     }
     if unconditional {
@@ -3735,7 +3735,11 @@ fn binding_arguments(body: &str, var: &str) -> Vec<String> {
 ///
 /// Still requires depth zero and refuses a braceless control header, because those say the assignment
 /// did not run at all on some path that did reach the save.
-pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Assignment) -> bool {
+pub(crate) fn assignment_reaches_every_stored_row(
+    func: &FunctionInfo,
+    asg: &Assignment,
+    same_on_every_path: bool,
+) -> bool {
     let Some(idx) = asg.citation.line.checked_sub(func.body_start_line) else {
         return false;
     };
@@ -3753,8 +3757,46 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
             }
         }
     }
+    // **Inside a block is fine when the block is the one that creates the row** (#1326).
+    //
+    // ```ts
+    // let token0 = Token.load(id)
+    // if (token0 === null) {
+    //   token0 = new Token(id)
+    //   token0.totalValueLockedUSDUntracked = ZERO_BD   // every Token that exists came through here
+    // }
+    // ```
+    //
+    // This is the commonest shape in subgraph-land - load, guard on null, construct, initialise every
+    // field - and the depth test refused all of it. A row that skipped the branch was created by an
+    // earlier execution of the same branch, so it holds what the branch put there; the depth rule was
+    // asking whether *this* invocation assigned it, which is the wrong question.
     if depth != 0 {
-        return false;
+        // **Only when the value does not depend on which invocation ran.** The creation guard's argument
+        // is that a row which skipped the branch was created by an earlier execution of it, so it holds
+        // what the branch put there. For a literal that is the same value. For an **event column** it is
+        // an *earlier event's* value, and reading it now is stale - `loadTransaction` setting
+        // `transaction.timestamp` inside its null guard is exactly that, and a caller reading it back is
+        // not reading this event's timestamp.
+        if !same_on_every_path {
+            return false;
+        }
+        let Some((open, close)) = enclosing_block(&lines, idx) else {
+            return false;
+        };
+        if !lines[open..idx]
+            .iter()
+            .any(|l| constructs(l, &asg.receiver))
+        {
+            return false;
+        }
+        // **No terminator check between the construction and the assignment**, though the first version
+        // had one and it cost the field this change exists for. Uniswap V4 constructs `token0`, fetches
+        // its decimals and returns if they are null - before the constants. That `return` abandons a row
+        // nothing saved, because the save-ordering rule below already establishes that no
+        // `<recv>.save()` precedes the assignment. A terminator before it therefore cannot leave a
+        // *stored* row unassigned, and refusing on one asks a question already answered.
+        let _ = close;
     }
     // `if (cond) pool.f = ZERO` on one line, or the header on the line above with no brace opened.
     if governed_by_a_braceless_header(&lines, idx) {
@@ -3766,8 +3808,11 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
     // leaves a stored row that never saw the assignment. A row bound by `new` has nothing stored yet, so a
     // return before the save genuinely stores nothing - Uniswap V4's `handleInitialize` does
     // `const pool = new Pool(poolId)` and then returns twice on null decimals, leaving no `Pool` behind.
+    // Skipped inside a creation guard: the block itself constructs the row, so an earlier terminator
+    // abandoned an invocation that created nothing rather than leaving a row unassigned.
+    let in_creation_guard = depth != 0;
     let fresh = local_entity_binding(&func.body, &asg.receiver).is_some_and(|(_, fresh)| fresh);
-    if !fresh && lines[..idx].iter().any(|l| aborts_the_handler(l)) {
+    if !in_creation_guard && !fresh && lines[..idx].iter().any(|l| aborts_the_handler(l)) {
         return false;
     }
     // Every save of this receiver, after the assignment, and at least one.
@@ -3783,6 +3828,42 @@ pub(crate) fn assignment_reaches_every_stored_row(func: &FunctionInfo, asg: &Ass
         saves += 1;
     }
     saves > 0
+}
+
+/// The line range of the innermost block containing `idx`, as `[open_line, close_line)`.
+fn enclosing_block(lines: &[&str], idx: usize) -> Option<(usize, usize)> {
+    // The open-brace stack is the depth; a separate counter would only restate its length.
+    let mut opens: Vec<usize> = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        for c in line.chars() {
+            match c {
+                '{' => opens.push(n),
+                '}' => {
+                    let open = opens.pop()?;
+                    if n >= idx && open <= idx {
+                        return Some((open, n));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Whether this line binds `var` with `new Entity(..)`, with or without a declaration keyword.
+fn constructs(line: &str, var: &str) -> bool {
+    let t = line.trim();
+    let rest = t
+        .strip_prefix("let ")
+        .or_else(|| t.strip_prefix("const "))
+        .or_else(|| t.strip_prefix("var "))
+        .unwrap_or(t);
+    rest.strip_prefix(var)
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('='))
+        .map(str::trim_start)
+        .is_some_and(|r| r.starts_with("new "))
 }
 
 /// Whether a line can end the handler before the next statement runs.

@@ -944,7 +944,7 @@ fn always_constant(
             // literal to the rows that took that branch and leaves the rest as they were; a view projecting
             // the literal for all of them answers a number the subgraph never stored (Jules, #1316). Paired
             // with the non-null check above, which covers rows no handler wrote at all.
-            if !crate::port_report::assignment_reaches_every_stored_row(func, asg) {
+            if !crate::port_report::assignment_reaches_every_stored_row(func, asg, true) {
                 return None;
             }
             match &seen {
