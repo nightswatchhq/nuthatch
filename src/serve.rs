@@ -1664,8 +1664,8 @@ async fn graph_graphql(
                 // found nothing`, which is a graph-node defect rather than a contract. Projecting
                 // uniformly answers that correctly; no client can be relying on the error.
                 //
-                // `timestamp` is null because nothing stores a block's timestamp (#1289). `hash` and
-                // `parentHash` are real.
+                // `hash` and `parentHash` from the checkpoint table; `timestamp` from the same
+                // record once ingestion has stored it (#1289).
                 let meta = serde_json::json!({
                     "block": {
                         "number": last,
@@ -1673,7 +1673,8 @@ async fn graph_graphql(
                         "parentHash": last
                             .and_then(|n| n.checked_sub(1))
                             .and_then(|n| s.store.get_block_hash(n).ok().flatten()),
-                        "timestamp": serde_json::Value::Null,
+                        "timestamp": last
+                            .and_then(|n| s.store.get_block_timestamp(n).ok().flatten()),
                     },
                     // `deployment` is `String!`. `nid` is `None` for a nest mounted by alias with no
                     // content address (`MountTable::nest_dir`), and answering `null` against a
@@ -5279,9 +5280,13 @@ mod tests {
         .unwrap();
         let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
         // `_meta` reports the nest's own head, so give it one to report - with the hash of the head
-        // and of its parent, which `_meta.block.hash` and `parentHash` are answered from.
+        // and of its parent, and the head's timestamp, which `_meta.block` is answered from.
         state.store.set_meta("last_block", "23456789").unwrap();
         state.store.set_block_hash(23_456_789, "0xhead").unwrap();
+        state
+            .store
+            .set_block_timestamp(23_456_789, 1_700_000_000)
+            .unwrap();
         state.store.set_block_hash(23_456_788, "0xparent").unwrap();
 
         (d, state)
@@ -5823,8 +5828,8 @@ mod tests {
             "_meta must carry only what was selected: {body}"
         );
 
-        // Complete: every declared field of `_Meta_` and `_Block_`. `timestamp` is null because
-        // nothing stores one (#1289); the rest are real.
+        // Complete: every declared field of `_Meta_` and `_Block_`. The timestamp is the fixture
+        // head's, not `is_some()` (#1289).
         let body = graph_ask(
             "/graphql",
             "{ _meta { block { number hash timestamp parentHash } deployment hasIndexingErrors } }",
@@ -5836,7 +5841,7 @@ mod tests {
             serde_json::json!({
                 "number": 23_456_789u64,
                 "hash": "0xhead",
-                "timestamp": serde_json::Value::Null,
+                "timestamp": 1_700_000_000u64,
                 "parentHash": "0xparent",
             }),
             "the block must carry the head, its hash and its parent's: {body}"

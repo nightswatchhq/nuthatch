@@ -109,7 +109,24 @@ fn builder() -> Builder {
 const ENTITIES: TableDefinition<&str, &str> = TableDefinition::new("entities");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// Block-hash checkpoints (block -> canonical hash we indexed against), for reorg detection.
+/// The value is `hash`, or `hash\tunix_seconds` once a timestamp is known (#1289).
 const BLOCKS: TableDefinition<&str, &str> = TableDefinition::new("blocks");
+
+/// A tab cannot appear in a block hash, so a hash-only value from before #1289 still round-trips.
+pub(crate) fn encode_block_record(hash: &str, timestamp: Option<u64>) -> String {
+    match timestamp {
+        Some(ts) => format!("{hash}\t{ts}"),
+        None => hash.to_string(),
+    }
+}
+
+pub(crate) fn decode_block_record(value: &str) -> (String, Option<u64>) {
+    match value.split_once('\t') {
+        Some((h, t)) => (h.to_string(), t.parse().ok()),
+        None => (value.to_string(), None),
+    }
+}
+
 /// Durable alert-delivery outbox (RFC-0008 C5): monotonic seq -> pending-delivery JSON. Survives
 /// restart, so at-least-once delivery holds across a process bounce.
 const OUTBOX: TableDefinition<&str, &str> = TableDefinition::new("outbox");
@@ -267,6 +284,8 @@ pub trait HotStore: Send + Sync {
     fn sealed_through(&self) -> u64;
     fn set_block_hash(&self, block: u64, hash: &str) -> Result<()>;
     fn get_block_hash(&self, block: u64) -> Result<Option<String>>;
+    fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()>;
+    fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>>;
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>>;
 
     // ---- mutation windows (the atomic ones) --------------------------------------------------
@@ -637,7 +656,13 @@ impl Store {
             }
             if let Some((block, hash)) = checkpoint {
                 let mut b = wtx.open_table(BLOCKS)?;
-                b.insert(Self::block_key(block).as_str(), hash)?;
+                let key = Self::block_key(block);
+                let existing_ts = b
+                    .get(key.as_str())?
+                    .and_then(|v| decode_block_record(v.value()).1);
+                let (h, packed_ts) = decode_block_record(hash);
+                let packed = encode_block_record(&h, packed_ts.or(existing_ts));
+                b.insert(key.as_str(), packed.as_str())?;
             }
             let mut m = wtx.open_table(META)?;
             m.insert("last_block", last_block.to_string().as_str())?;
@@ -840,22 +865,54 @@ impl Store {
     }
 
     /// Record the canonical hash we indexed a block against (a reorg checkpoint).
+    /// Keeps a timestamp already stored for this block, so a later hash-only pin cannot drop it.
     pub fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
+        self.write_block_record(block, Some(hash), None)
+    }
+
+    pub fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
+        Ok(self
+            .block_record(block)?
+            .map(|(h, _)| h)
+            .filter(|h| !h.is_empty()))
+    }
+
+    pub fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()> {
+        self.write_block_record(block, None, Some(timestamp))
+    }
+
+    pub fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>> {
+        Ok(self.block_record(block)?.and_then(|(_, ts)| ts))
+    }
+
+    fn block_record(&self, block: u64) -> Result<Option<(String, Option<u64>)>> {
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(BLOCKS)?;
+        Ok(t.get(Self::block_key(block).as_str())?
+            .map(|v| decode_block_record(v.value())))
+    }
+
+    fn write_block_record(
+        &self,
+        block: u64,
+        hash: Option<&str>,
+        timestamp: Option<u64>,
+    ) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
         {
             let mut t = wtx.open_table(BLOCKS)?;
-            t.insert(Self::block_key(block).as_str(), hash)?;
+            let key = Self::block_key(block);
+            let (existing_hash, existing_ts) = t
+                .get(key.as_str())?
+                .map(|v| decode_block_record(v.value()))
+                .unwrap_or((String::new(), None));
+            let packed =
+                encode_block_record(hash.unwrap_or(&existing_hash), timestamp.or(existing_ts));
+            t.insert(key.as_str(), packed.as_str())?;
         }
         self.commit(wtx)?;
         Ok(())
-    }
-
-    pub fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
-        let t = rtx.open_table(BLOCKS)?;
-        Ok(t.get(Self::block_key(block).as_str())?
-            .map(|v| v.value().to_string()))
     }
 
     /// The highest block this nest has indexed - the catch-up signal a hot upgrade polls (RFC-0020
@@ -879,7 +936,8 @@ impl Store {
         for row in t.iter()?.rev() {
             let (k, v) = row?;
             let block: u64 = k.value().parse().context("corrupt block key")?;
-            out.push((block, v.value().to_string()));
+            let (hash, _) = decode_block_record(v.value());
+            out.push((block, hash));
         }
         Ok(out)
     }
@@ -1181,6 +1239,12 @@ impl HotStore for Store {
     fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
         Store::get_block_hash(self, block)
     }
+    fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()> {
+        Store::set_block_timestamp(self, block, timestamp)
+    }
+    fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>> {
+        Store::get_block_timestamp(self, block)
+    }
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
         Store::checkpoints_desc(self)
     }
@@ -1405,6 +1469,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
         (**self).get_block_hash(block)
+    }
+    fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()> {
+        (**self).set_block_timestamp(block, timestamp)
+    }
+    fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>> {
+        (**self).get_block_timestamp(block)
     }
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
         (**self).checkpoints_desc()
@@ -1746,6 +1816,30 @@ mod tests {
         assert_eq!(store.count().unwrap(), 5); // blocks 10 + 11
         assert!(store.get_block_hash(12).unwrap().is_none());
         assert_eq!(store.get_block_hash(11).unwrap().as_deref(), Some("h11"));
+    }
+
+    #[test]
+    fn a_block_record_keeps_hash_and_timestamp() {
+        let (store, _d) = temp_store();
+        store.set_block_hash(12, "0xabc").unwrap();
+        assert_eq!(store.get_block_hash(12).unwrap().as_deref(), Some("0xabc"));
+        assert_eq!(store.get_block_timestamp(12).unwrap(), None);
+
+        store.set_block_timestamp(12, 1_700_000_000).unwrap();
+        assert_eq!(store.get_block_hash(12).unwrap().as_deref(), Some("0xabc"));
+        assert_eq!(store.get_block_timestamp(12).unwrap(), Some(1_700_000_000));
+
+        store.set_block_hash(12, "0xdef").unwrap();
+        assert_eq!(store.get_block_hash(12).unwrap().as_deref(), Some("0xdef"));
+        assert_eq!(store.get_block_timestamp(12).unwrap(), Some(1_700_000_000));
+
+        store.commit_window(&[], Some((12, "0xghi")), 12).unwrap();
+        assert_eq!(store.get_block_hash(12).unwrap().as_deref(), Some("0xghi"));
+        assert_eq!(
+            store.get_block_timestamp(12).unwrap(),
+            Some(1_700_000_000),
+            "a hash-only commit must not drop the timestamp"
+        );
     }
 
     #[test]

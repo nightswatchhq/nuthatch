@@ -151,6 +151,10 @@ fn every_mutating_path_is_fenced() {
     is_fenced(a.put_entity("k", "{}").map(|_| ()), "put_entity");
     is_fenced(a.set_meta("last_block", "0").map(|_| ()), "set_meta");
     is_fenced(a.set_block_hash(1, "0xbb").map(|_| ()), "set_block_hash");
+    is_fenced(
+        a.set_block_timestamp(1, 1_700_000_000).map(|_| ()),
+        "set_block_timestamp",
+    );
     is_fenced(a.rollback_to(0), "rollback_to");
     is_fenced(
         a.rollback_to_and_set_meta(0, "k", "v"),
