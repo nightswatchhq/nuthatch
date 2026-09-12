@@ -13,6 +13,14 @@ not to infer work that remains.
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
 
+## Porting a subgraph
+
+- [The Graph compatibility surface: what it is, and what it is not](graph-compatibility-what-it-is.md) -
+  **read this first.** Whether a nest can serve your client, and why a coverage percentage overstates it.
+- [The accepted query dialect](graph-query-dialect-accepted.md) - every shape that compiles, every
+  refusal and its reason.
+- [Schema generation rules](graph-schema-generation-rules.md) - how the Graph-shaped schema is derived.
+
 ## Operating and verifying nuthatch
 
 - [Production readiness](prod-readiness.md)

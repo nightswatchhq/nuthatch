@@ -288,7 +288,11 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     // says `exact 205` - a promise about the mapping, not about this overlay. A porter reading it had
     // every reason to believe the nest answered 205 fields (#1277).
     let readme = format!(
-        "{report_text}\n## Overlay coverage\n\n{}\n\nThe class counts above describe the *mapping*: \
+        "{report_text}\n## Overlay coverage\n\n{}\n\n**Before migrating anything, check your own \
+         queries' fields against the unanswered list below.** One unanswerable field refuses a whole \
+         GraphQL query - there is no partial answer - so the percentage here is an upper bound on how \
+         many of your queries work, and a loose one. `docs/graph-compatibility-what-it-is.md` says what \
+         this surface is and is not.\n\nThe class counts above describe the *mapping*: \
          a field is `exact` when it is a pure function of decoded events, which is a claim about what \
          is reproducible in principle. This line describes *this overlay*: what it actually answers. \
          A field counted unanswered is named with its reason in the `-- NOT IN THIS VIEW` comments of \
