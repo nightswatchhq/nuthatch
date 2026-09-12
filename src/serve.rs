@@ -1694,6 +1694,37 @@ async fn graph_graphql(
             Ok(c) => c,
             Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
         };
+        // **`block: { number_gte: N }` is a precondition on the head**, checked here because the head is
+        // runtime state the compiler cannot see. graph-node answers on the latest block when the
+        // deployment has reached `N` and refuses otherwise, and its refusal is quoted rather than
+        // paraphrased: `DeploymentState::block_queryable` in `graph/src/data/subgraph/mod.rs:1362`.
+        //
+        // A nest with no head has indexed nothing, so it has not reached any block: reported as 0, which
+        // is what the message then says.
+        if let Some(min) = compiled.min_block {
+            let head = s
+                .store
+                .get_meta("last_block")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if head < min {
+                let id = s.nid.as_deref().map(str::to_string).unwrap_or_else(|| {
+                    s.nest_info["name"]
+                        .as_str()
+                        .unwrap_or("nuthatch")
+                        .to_string()
+                });
+                return (
+                    StatusCode::OK,
+                    Json(gql_error(&format!(
+                        "subgraph {id} has only indexed up to block number {head} and data for block \
+                         number {min} is therefore not yet available"
+                    ))),
+                );
+            }
+        }
         match graph_rows(&s, &compiled).await {
             Ok(rows) => {
                 let shaped: Result<Vec<serde_json::Value>, String> =
@@ -5436,6 +5467,98 @@ mod tests {
             body["data"]["pools"],
             serde_json::json!([{"id": "0xaaa"}, {"id": "0xccc"}]),
             "variables from the request body must bind: {body}"
+        );
+    }
+
+    /// `block: { number_gte: N }` is answered, not refused (RFC-0053 S3, #1267).
+    ///
+    /// It is the argument a client sends for read-your-writes: *"execute on the latest block only if the
+    /// subgraph has progressed to or past the minimum block number"* (graph-node,
+    /// `graph/src/schema/api.rs:1189`). That is a precondition on the head, not a request for a past
+    /// state, so a nest can answer it exactly with no history stored - and refusing it refused a query
+    /// graph-node answers.
+    ///
+    /// `number` and `hash` are real time travel and stay refused.
+    #[tokio::test]
+    async fn a_block_number_gte_within_the_head_is_answered() {
+        let (_d, state) = graph_fixture();
+        // The fixture's head is 23,456,789.
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(where: { id: \"0xaaa\" }, block: { number_gte: 1000 }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "a head past the minimum answers on the latest block: {body}"
+        );
+
+        // The boundary: exactly the head is "progressed to", which the wording makes inclusive.
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(where: { id: \"0xaaa\" }, block: { number_gte: 23456789 }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["pools"],
+            serde_json::json!([{"id": "0xaaa"}]),
+            "`to or past` includes the head itself: {body}"
+        );
+
+        // One past it is refused, in graph-node's own words
+        // (`DeploymentState::block_queryable`, graph/src/data/subgraph/mod.rs:1362).
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(block: { number_gte: 23456790 }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "subgraph t has only indexed up to block number 23456789 and data for block number \
+             23456790 is therefore not yet available",
+            "the refusal is graph-node's, word for word: {body}"
+        );
+        assert!(body["data"].is_null(), "and it answers no rows: {body}");
+
+        // Real time travel stays refused, and by its own name rather than this one.
+        for arg in [
+            "block: { number: 100 }",
+            "block: { hash: \"0xabc\" }",
+            "block: { number_gte: 1000, number: 100 }",
+        ] {
+            let body = graph_ask(
+                "/graphql",
+                &format!("{{ pools({arg}) {{ id }} }}"),
+                state.clone(),
+            )
+            .await;
+            let msg = body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                msg.contains("block-ranged"),
+                "`{arg}` needs a block-ranged store and must say so: {body}"
+            );
+        }
+
+        // A negative is not a block, and `Int` lets a client send one.
+        let body = graph_ask(
+            "/graphql",
+            "{ pools(block: { number_gte: -1 }) { id } }",
+            state,
+        )
+        .await;
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must not be negative"),
+            "a negative minimum is named: {body}"
         );
     }
 
