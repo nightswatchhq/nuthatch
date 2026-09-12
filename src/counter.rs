@@ -239,6 +239,24 @@ pub fn admit(
     resource: &str,
     description: &str,
 ) -> Result<(), Box<axum::response::Response>> {
+    preflight(cfg, headers, resource, description)?;
+    let header = headers
+        .get("Payment-Signature")
+        .and_then(|v| v.to_str().ok())
+        .expect("preflight checked the payment header");
+    verify_and_record(dir, cfg, header, now())
+        .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
+    Ok(())
+}
+
+/// Reject missing or invalid signatures before spending query resources. This does not consume
+/// the nonce: `admit` rechecks and durably records it only once there is an answer to return.
+pub fn preflight(
+    cfg: &Config,
+    headers: &HeaderMap,
+    resource: &str,
+    description: &str,
+) -> Result<(), Box<axum::response::Response>> {
     let seller = cfg
         .seller()
         .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
@@ -248,11 +266,8 @@ pub fn admit(
     else {
         return Err(Box::new(challenge(cfg, resource, description)));
     };
-    verify_and_record(dir, cfg, header, now())
+    x402::verify_payment(&seller, header, now())
         .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
-    // `seller` is constructed before receipt verification, so an invalid operator config cannot
-    // issue a challenge that promises a payment the verifier will not accept.
-    let _ = seller;
     Ok(())
 }
 

@@ -15,17 +15,22 @@ premature. The code is on topic branches, not evidence that the default branch h
 - Unknown physical operators and operators capable of rescanning are refused. The previous walker
   counted only `READ_PARQUET` and silently ignored everything else.
 - The estimator applies the statement-stacking and filesystem-access guards before preparing SQL.
+- Preliminary named-query planning runs in a blocking task while holding the cursor's SQL permit.
+- The counter now verifies signatures before query work and records only after a successful
+  response has been computed, before releasing it. The HTTP regression refuses an oversized
+  request without a log entry, retries the same authorisation successfully, then refuses its
+  replay. Execution errors also leave the authorisation unconsumed. Concurrent replays may spend
+  query resources, but only one can pass the final nonce check and receive an answer.
 
 ## Outstanding acceptance gaps
 
-- Payment is currently recorded before admission. Rejected requests must not consume authorisations.
 - The preliminary estimator opens a separate connection with no hot rows. Execution needs a bound
   from its own connection after bounded hot materialisation, with the same catalogue and settings.
 - The estimator must bind the exact catalogue snapshot and account for scans per source, including
   supported non-chain relations. Multiplying all reachable bytes by scan count is not the specified
   per-operator candidate-segment accounting.
 - Quote catalogue retention, expiry, snapshot hashes and retry semantics are not implemented.
-- Named-query planning must run under the cursor concurrency gate and wall-clock deadline.
+- Named-query planning still needs the wall-clock deadline to cover its entire operation.
 - The 512 MiB threshold has no workload measurement supporting it. The RFC explicitly requires one.
 - Maintained entity copies need explicit accounting within admission.
 - The settler requires a concurrency/crash audit: queue replacement can race a serving process

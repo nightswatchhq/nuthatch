@@ -2151,16 +2151,50 @@ async fn named_query(
     #[cfg(feature = "counter")]
     if let Some(counter) = &s.counter {
         let resource = format!("/q/{name}");
-        if let Err(response) = crate::counter::admit(&s.dir, counter, &headers, &resource, &name) {
+        if let Err(response) = crate::counter::preflight(counter, &headers, &resource, &name) {
             return *response;
         }
     }
-    let cold = match crate::analytics::estimate_cold_scan(&s.dir, &sql) {
+    let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "server busy: too many concurrent SQL queries"})),
+            )
+                .into_response()
+        }
+    };
+    let estimate_dir = s.dir.clone();
+    let estimate_sql = sql.clone();
+    let estimate = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::analytics::estimate_cold_scan(&estimate_dir, &estimate_sql)
+    })
+    .await;
+    let estimate = match estimate {
+        Ok(estimate) => estimate,
+        Err(e) => return error(format!("named query planning task failed: {e}")),
+    };
+    let cold = match estimate {
         Ok(bound) if bound.bytes < s.sql_max_named_scan_bytes => bound.bytes,
         Ok(bound) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("named query's cold scan bound {} bytes reaches the {}-byte admission cap", bound.bytes, s.sql_max_named_scan_bytes)}))).into_response(),
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cannot admit named query: {e:#}")}))).into_response(),
     };
-    run_sql_query(s, sql, None, Some(cold)).await
+    let response = run_sql_query(s.clone(), sql, None, Some(cold)).await;
+    #[cfg(feature = "counter")]
+    if response.status().is_success() {
+        if let Some(counter) = &s.counter {
+            let resource = format!("/q/{name}");
+            // Nothing has been sent to the caller yet. Concurrent replays may compute, but the
+            // atomic nonce check permits only one to record and release its answer.
+            if let Err(refusal) = crate::counter::admit(&s.dir, counter, &headers, &resource, &name)
+            {
+                return *refusal;
+            }
+        }
+    }
+    response
 }
 
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
@@ -4507,6 +4541,66 @@ mod tests {
             "{body}"
         );
         assert!(body.get("rows").is_none(), "{body}");
+    }
+
+    #[cfg(feature = "counter")]
+    #[tokio::test]
+    async fn refused_paid_query_keeps_its_authorisation_for_a_successful_retry() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_named_scan_bytes = 1;
+        state
+            .store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        state.surface = Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "answer".into(),
+                sql: "SELECT 1 AS answer".into(),
+                params: Default::default(),
+            }],
+        });
+        let (config, payment) = crate::counter::x402::tests::payment_for_http_test();
+        state.counter = Some(Arc::new(config));
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/q/answer")
+                .header("Payment-Signature", &payment)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let refused = router(SharedNest::new(state.clone()))
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(!dir.path().join("authorisations.jsonl").exists());
+        state.sql_max_named_scan_bytes = SQL_MAX_NAMED_SCAN_BYTES;
+        let app = router(SharedNest::new(state));
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert_eq!(statuses.iter().filter(|&&s| s == StatusCode::OK).count(), 1);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|&&s| s == StatusCode::PAYMENT_REQUIRED)
+                .count(),
+            1
+        );
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("authorisations.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     /// The `/sql` RAM guard (the "node owns resource safety" half of the CLAUDE.md division of

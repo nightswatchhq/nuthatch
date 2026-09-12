@@ -372,7 +372,7 @@ pub fn verify_payment(cfg: &SellerConfig, header_value: &str, now: u64) -> Verif
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_sol_types::{eip712_domain, sol, SolStruct};
     use k256::ecdsa::SigningKey;
@@ -406,6 +406,24 @@ mod tests {
             pay_to: address!("0x1111111111111111111111111111111111111111"),
             price_base_units: U256::from(1000u64),
         }
+    }
+
+    pub(crate) fn payment_for_http_test() -> (super::super::Config, String) {
+        let seller = cfg();
+        let (_, payer) = payer();
+        let mut auth = default_auth(payer, &seller);
+        let now = super::super::now();
+        auth.valid_after = U256::from(now.saturating_sub(60));
+        auth.valid_before = U256::from(now + 600);
+        let header = sign_authorization(&seller, &auth);
+        (
+            super::super::Config {
+                price: seller.price_base_units.to_string(),
+                recipient: seller.pay_to.to_string(),
+                network: super::super::Network::Testnet,
+            },
+            header,
+        )
     }
 
     struct Auth {
@@ -800,7 +818,7 @@ mod tests {
         );
     }
 
-    /// Recording happens before a query runs. Without the nonce check, a caller can replay this
+    /// Recording happens before an answer is released. Without the nonce check, a caller can replay this
     /// one valid promise until the separate S3 settler notices, turning the RFC's one-query loss
     /// bound into an open tab.
     #[test]
