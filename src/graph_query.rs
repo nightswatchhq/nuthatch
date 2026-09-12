@@ -907,7 +907,7 @@ fn text_match(suffix: &str) -> Option<(bool, bool, TextShape)> {
 /// Deliberately the comparison set and not the text set. `_contains`, `_starts_with` and the
 /// `_nocase` family lower to `LIKE` with escaping that wants its own slice and its own tests; until
 /// then they are refused by name, which a caller can act on.
-/// A sort key that orders a canonical decimal string **numerically**, at any precision.
+/// A sort key that orders a canonical decimal string **numerically**.
 ///
 /// A nest stores every big number as canonical text (`analytics.rs:2253`: columns are `UBIGINT`,
 /// everything else is text), so `ORDER BY b."value"` compared strings: `9000351` ranked above
@@ -929,6 +929,11 @@ fn text_match(suffix: &str) -> Option<(bool, bool, TextShape)> {
 /// The cast means it works whether the column is text or a real integer, and it works under `DESC`
 /// because it is one key rather than several. It assumes canonical text - no leading zeros, no trailing
 /// zeros past the point - which is what both the decode registry and graph-node's `normalized()` produce.
+///
+/// **Bounded, not unbounded.** The length term is six padded digits, so the key is exact for an integer
+/// part up to 99,999 digits and wrong above it. A `uint256` is 78 and a `BigInt` in practice is an EVM
+/// word, so the bound is four orders of magnitude clear of anything a mapping can store - but "at any
+/// precision" was an overclaim, and the number is written here rather than left to be rediscovered.
 fn numeric_sort_key(expr: &str) -> String {
     let v = format!("CAST({expr} AS VARCHAR)");
     // Written as one line: a raw-string continuation leaves runs of spaces in the emitted SQL.

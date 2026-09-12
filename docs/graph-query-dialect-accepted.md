@@ -31,8 +31,9 @@ should have kept (#1325).
 `orderBy` and the four ordering comparisons - `_gt`, `_gte`, `_lt`, `_lte` - on a `BigInt`, `BigDecimal` or
 `Int8` field therefore compare a **key** rather than the column: a sign character, the integer part's digit
 count zero-padded, then the digits with the point removed, with negatives carrying an inverted length and
-the nines complement. It is exact at any precision, works under `DESC` because it is one key, and works
-whether the column is text or a real integer.
+the nines complement. It works under `DESC` because it is one key, works whether the
+column is text or a real integer, and is exact for an integer part up to 99,999 digits - the width of the
+length term. A `uint256` is 78.
 
 `TRY_CAST(.. AS DECIMAL(38,0))` is the obvious fix and the wrong one: a `uint256` reaches 78 digits, so the
 cast is NULL past 38 and a row does not sort oddly - it **disappears** from a filter it satisfies.
