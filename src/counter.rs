@@ -28,6 +28,19 @@ pub(crate) const SPENT: &str = "spent.jsonl";
 /// Per-payer settled/failed record. A failed row is why the nest stops serving that payer.
 pub(crate) const PAYERS: &str = "payers.jsonl";
 
+/// Stable lock inode shared by the server and settler. Never unlink it: queue replacement must
+/// not let another process lock a different inode for the same logical queue.
+pub(crate) fn lock_queue(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("authorisations.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// Operator-owned mount configuration. The price is USDC base units, as a string so TOML cannot
 /// round a 256-bit amount before the verifier sees it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +172,7 @@ pub fn verify_and_record(
     let _guard = AUTHORISATION_LOG
         .lock()
         .expect("authorisation log lock poisoned");
+    let _file_guard = lock_queue(dir).map_err(|_| x402::Refusal::RecordFailed)?;
     let path = dir.join(LOG);
     // **Keyed by (payment domain, payer, nonce), and streamed rather than slurped.**
     //

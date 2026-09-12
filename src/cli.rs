@@ -259,7 +259,8 @@ pub struct SettleArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Command that receives one authorisation JSON on stdin. Exit 0 settled, 2 failed, anything
-    /// else deferred (row stays pending).
+    /// else deferred (row stays pending). Must reconcile retries by network/payer/nonce: a crash
+    /// can occur after external settlement but before the local outcome journal is synced.
     #[arg(long)]
     pub exec: Option<String>,
 }

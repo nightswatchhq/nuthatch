@@ -16,6 +16,10 @@ premature. The code is on topic branches, not evidence that the default branch h
   counted only `READ_PARQUET` and silently ignored everything else.
 - The estimator applies the statement-stacking and filesystem-access guards before preparing SQL.
 - Preliminary named-query planning runs in a blocking task while holding the cursor's SQL permit.
+- Queue append and replacement share a stable file lock. Settlement holds a separate single-settler
+  lock, releases the queue lock during external execution, then re-reads and removes only completed
+  authorisations. A regression records a real signed payment during submission and proves it survives
+  replacement and remains replay-protected. Another verifies exclusion of a second settler.
 - The counter now verifies signatures before query work and records only after a successful
   response has been computed, before releasing it. The HTTP regression refuses an oversized
   request without a log entry, retries the same authorisation successfully, then refuses its
@@ -33,8 +37,9 @@ premature. The code is on topic branches, not evidence that the default branch h
 - Named-query planning still needs the wall-clock deadline to cover its entire operation.
 - The 512 MiB threshold has no workload measurement supporting it. The RFC explicitly requires one.
 - Maintained entity copies need explicit accounting within admission.
-- The settler requires a concurrency/crash audit: queue replacement can race a serving process
-  appending authorisations, and an external submission can finish before its outcome is journalled.
+- External submission can finish before its outcome is journalled. The `--exec` contract now
+  explicitly requires idempotent reconciliation by network/payer/nonce. A real operator adapter and
+  process-crash validation of that contract remain unverified.
 
 Passing existing analytics and serving tests does not prove these requirements. Each needs direct
 evidence before the sprint issues can be closed again.

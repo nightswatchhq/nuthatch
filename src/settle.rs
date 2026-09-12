@@ -36,9 +36,21 @@ pub struct DrainReport {
 /// Drain pending authorisations. Settled and failed rows leave the pending log and land in
 /// `spent.jsonl` so the nest still refuses the nonce. Deferred rows stay pending.
 pub fn drain(dir: &Path, submit: &dyn Submit) -> Result<DrainReport> {
+    let settler_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("settler.lock"))?;
+    settler_lock
+        .try_lock()
+        .context("another settler is already running")?;
     let pending_path = dir.join(LOG);
-    let pending = read_jsonl(&pending_path)?;
-    let mut kept = Vec::new();
+    let pending = {
+        let _guard = crate::counter::lock_queue(dir)?;
+        read_jsonl(&pending_path)?
+    };
+    let mut completed = std::collections::BTreeSet::new();
     let mut report = DrainReport::default();
     for row in pending {
         // `spent.jsonl` is an outcome journal as well as the counter's compact replay set. If a
@@ -51,30 +63,46 @@ pub fn drain(dir: &Path, submit: &dyn Submit) -> Result<DrainReport> {
         match outcome {
             Outcome::Deferred(_) => {
                 report.deferred += 1;
-                kept.push(row);
             }
             Outcome::Settled => {
+                let _guard = crate::counter::lock_queue(dir)?;
                 if !was_recorded {
                     append_jsonl(&dir.join(SPENT), &spent_row(&row, "settled", ""))?;
                 }
                 append_jsonl(&dir.join(PAYERS), &payer_row(&row, "settled", ""))?;
                 report.settled += 1;
+                completed.insert(authorisation_key(&row));
             }
             Outcome::Failed(detail) => {
+                let _guard = crate::counter::lock_queue(dir)?;
                 if !was_recorded {
                     append_jsonl(&dir.join(SPENT), &spent_row(&row, "failed", &detail))?;
                 }
                 append_jsonl(&dir.join(PAYERS), &payer_row(&row, "failed", &detail))?;
                 report.failed += 1;
+                completed.insert(authorisation_key(&row));
             }
         }
     }
+    // New payments may have arrived while the external command ran. Re-read under the same
+    // cross-process lock as the server's append and remove only rows completed by this run.
+    let _guard = crate::counter::lock_queue(dir)?;
+    let mut kept = read_jsonl(&pending_path)?;
+    kept.retain(|row| !completed.contains(&authorisation_key(row)));
     write_jsonl(&pending_path, &kept)?;
     report.remaining = kept.len() as u64;
     Ok(report)
 }
 
+fn authorisation_key(row: &serde_json::Value) -> [String; 3] {
+    ["network", "payer", "nonce"]
+        .map(|key| row[key].as_str().expect("validated pending row").to_owned())
+}
+
 /// `--exec`: stdin is one pending row. Exit 0 settled, 2 failed, anything else deferred.
+/// The command must be idempotent by `(network, payer, nonce)`: a process can die after external
+/// settlement succeeds but before its local journal write. On retry the command must reconcile
+/// that authorisation's prior transaction and return its outcome, without submitting a new debit.
 pub struct ExecSubmit {
     pub command: String,
 }
@@ -93,7 +121,11 @@ impl Submit for ExecSubmit {
             Err(e) => return Outcome::Deferred(format!("spawn: {e}")),
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = writeln!(stdin, "{row}");
+            if let Err(error) = writeln!(stdin, "{row}") {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Outcome::Deferred(format!("write authorisation to exec: {error}"));
+            }
         }
         match child.wait_with_output() {
             Ok(out) if out.status.success() => Outcome::Settled,
@@ -389,18 +421,18 @@ mod tests {
     #[test]
     fn exec_exit_codes_are_the_three_outcomes() {
         let ok = ExecSubmit {
-            command: "exit 0".into(),
+            command: "cat >/dev/null; exit 0".into(),
         };
         assert_eq!(ok.submit(&row("0xaa", "0x01")), Outcome::Settled);
         let no = ExecSubmit {
-            command: "echo insufficient >&2; exit 2".into(),
+            command: "cat >/dev/null; echo insufficient >&2; exit 2".into(),
         };
         match no.submit(&row("0xaa", "0x01")) {
             Outcome::Failed(d) => assert!(d.contains("insufficient"), "{d}"),
             other => panic!("{other:?}"),
         }
         let miss = ExecSubmit {
-            command: "exit 7".into(),
+            command: "cat >/dev/null; exit 7".into(),
         };
         match miss.submit(&row("0xaa", "0x01")) {
             Outcome::Deferred(d) => assert!(d.contains("7"), "{d}"),
@@ -452,5 +484,50 @@ mod tests {
         .unwrap();
         assert_eq!(report.settled, 1);
         assert!(!dir.path().join(LOG).exists());
+    }
+
+    #[test]
+    fn payment_recorded_while_settling_survives_queue_replacement() {
+        struct ConcurrentSale<'a>(&'a Path);
+        impl Submit for ConcurrentSale<'_> {
+            fn submit(&self, _: &serde_json::Value) -> Outcome {
+                let (config, header) = crate::counter::x402::tests::payment_for_http_test();
+                crate::counter::verify_and_record(self.0, &config, &header, crate::counter::now())
+                    .unwrap();
+                Outcome::Settled
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(&dir.path().join(LOG), &[row("old-payer", "old-nonce")]).unwrap();
+        let report = drain(dir.path(), &ConcurrentSale(dir.path())).unwrap();
+        assert_eq!(report.settled, 1);
+        assert_eq!(report.remaining, 1);
+        let pending = read_jsonl(&dir.path().join(LOG)).unwrap();
+        assert_ne!(pending[0]["payer"], "old-payer");
+        let (config, header) = crate::counter::x402::tests::payment_for_http_test();
+        assert_eq!(
+            crate::counter::verify_and_record(dir.path(), &config, &header, crate::counter::now()),
+            Err(crate::counter::x402::Refusal::AlreadyUsed)
+        );
+    }
+
+    #[test]
+    fn a_second_settler_cannot_submit_the_same_queue() {
+        struct SecondSettler<'a>(&'a Path);
+        impl Submit for SecondSettler<'_> {
+            fn submit(&self, _: &serde_json::Value) -> Outcome {
+                let err = drain(self.0, self).unwrap_err();
+                assert!(err.to_string().contains("another settler"), "{err:#}");
+                Outcome::Settled
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(&dir.path().join(LOG), &[row("payer", "nonce")]).unwrap();
+        assert_eq!(
+            drain(dir.path(), &SecondSettler(dir.path()))
+                .unwrap()
+                .settled,
+            1
+        );
     }
 }
