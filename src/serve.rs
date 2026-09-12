@@ -2283,6 +2283,21 @@ async fn named_scan(
         let _permit = permit;
         let started = std::time::Instant::now();
         let catalogue_hash = crate::seal::catalogue_hash(&dir)?;
+        // A stale quote answers 409 before a budget can refuse it, and is checked again after the
+        // copy, because the boundary the query runs against is read only then.
+        let stale = |sealed_through: u64| {
+            pin.as_ref()
+                .filter(|(catalogue, sealed)| {
+                    *sealed != sealed_through || *catalogue != catalogue_hash
+                })
+                .map(|(catalogue, _)| AdmissionRefusal::StaleCatalogue {
+                    quoted: catalogue.clone(),
+                    current: catalogue_hash.clone(),
+                })
+        };
+        if let Some(refusal) = stale(store.sealed_through()) {
+            return Err(refusal.into());
+        }
         let reserved = crate::analytics::remembered_scan_bound(&dir, &sql, &catalogue_hash);
         if let Some(bound) = reserved.as_ref().filter(|b| b.cold_bytes > cap) {
             return Err(AdmissionRefusal::OverCap(ScanBound {
@@ -2321,14 +2336,8 @@ async fn named_scan(
             hot.insert(entity.name().to_string(), rows);
         }
         let sealed_through = store.sealed_through();
-        if let Some((quoted_catalogue, quoted_sealed)) = &pin {
-            if *quoted_sealed != sealed_through || *quoted_catalogue != catalogue_hash {
-                return Err(AdmissionRefusal::StaleCatalogue {
-                    quoted: quoted_catalogue.clone(),
-                    current: catalogue_hash,
-                }
-                .into());
-            }
+        if let Some(refusal) = stale(sealed_through) {
+            return Err(refusal.into());
         }
         let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
         if timeout.is_zero() {
@@ -4973,6 +4982,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["rows"][0]["n"], 1, "{body}");
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        // Staleness outranks the budget: a tip too wide to copy still answers 409, not 422.
+        let tight = tempfile::tempdir().unwrap();
+        let mut state = test_state(tight.path(), SQL_MAX_CONCURRENCY);
+        state
+            .store
+            .put_entity("k1", r#"{"table":"t","block_number":1}"#)
+            .unwrap();
+        state.surface = named_surface("SELECT count(*) AS n FROM t");
+        state.sql_max_named_scan_bytes = 1;
+        let (config, _) = crate::counter::x402::tests::payment_for_http_test();
+        state.counter = Some(Arc::new(config));
+        let app = router(SharedNest::new(state));
+        let (status, _, body) = call_named(&app, quoted("none.7")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
     }
 
     #[cfg(feature = "counter")]
