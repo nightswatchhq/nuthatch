@@ -363,16 +363,21 @@ fn want_entries(manifest: &Manifest) -> Vec<(String, &Segment)> {
     out
 }
 
-fn remote_have(remote: &Manifest) -> BTreeSet<(String, String)> {
-    remote
-        .tables
-        .iter()
-        .flat_map(|(t, segs)| {
-            segs.iter()
-                .filter(|s| !s.provisional)
-                .map(move |s| (t.clone(), s.hash.clone()))
-        })
-        .collect()
+async fn remote_present(
+    mirror: &dyn Mirror,
+    prefix: &str,
+    remote: &Manifest,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut have = BTreeSet::new();
+    for (table, segs) in &remote.tables {
+        for s in segs.iter().filter(|s| !s.provisional) {
+            let key = format!("{prefix}/{}", parquet_key(table, &s.hash));
+            if mirror.head_size(&key).await?.is_some() {
+                have.insert((table.clone(), s.hash.clone()));
+            }
+        }
+    }
+    Ok(have)
 }
 
 fn identity_of(dir: &Path) -> Result<(String, String, String, u64)> {
@@ -427,7 +432,7 @@ pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport>
         Some(b) => serde_json::from_slice(b).context("corrupt remote catalogue")?,
         None => Manifest::default(),
     };
-    let have = remote_have(&remote);
+    let have = remote_present(mirror.as_ref(), &data_identity, &remote).await?;
     let want = want_entries(&local);
     let skipped = want
         .iter()
@@ -742,6 +747,28 @@ abi = "abis/usdc.json"
             .to_string();
         assert_eq!(duck_count(&local_glob), duck_count(&remote_glob));
         assert_eq!(duck_sum_dec(&local_glob), duck_sum_dec(&remote_glob));
+    }
+
+    #[tokio::test]
+    async fn a_second_sync_reuploads_a_deleted_segment() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let first = sync(nest.path(), target, false).await.unwrap();
+        let parquet = first
+            .uploaded
+            .iter()
+            .find(|k| k.ends_with(".parquet"))
+            .expect("first sync uploaded parquet")
+            .clone();
+        std::fs::remove_file(mirror.path().join(&first.dataset).join(&parquet)).unwrap();
+        let second = sync(nest.path(), target, false).await.unwrap();
+        assert!(
+            second.uploaded.iter().any(|k| k == &parquet),
+            "missing object must be put again, got {:?}",
+            second.uploaded
+        );
+        verify(nest.path(), target, false).await.unwrap();
     }
 
     #[tokio::test]
