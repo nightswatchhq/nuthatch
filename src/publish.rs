@@ -519,7 +519,7 @@ pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport>
 /// HEAD every published file. `--deep` re-hashes parquet against the local bytes.
 pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
     let local = seal::load_manifest(dir)?;
-    let (data_identity, _, _, _) = identity_of(dir)?;
+    let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
     let prefix = |k: &str| format!("{data_identity}/{k}");
     let remote_bytes = mirror
@@ -537,6 +537,33 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
         .context("remote publish.json missing")?;
     let env: PublishEnvelope =
         serde_json::from_slice(&env_bytes).context("corrupt remote publish.json")?;
+    let want = want_entries(&local);
+    let sealed_through = want.iter().map(|(_, s)| s.to_block).max();
+    let tables: Vec<String> = local.tables.keys().cloned().collect();
+    if env.layout_version != 1 {
+        bail!(
+            "publish.json layout_version is {}, expected 1",
+            env.layout_version
+        );
+    }
+    if env.data_identity != data_identity {
+        bail!("publish.json data_identity does not match this nest");
+    }
+    if env.nid != nid {
+        bail!("publish.json nid does not match this nest");
+    }
+    if env.bundle_hash != bundle_hash {
+        bail!("publish.json bundle_hash does not match this nest");
+    }
+    if env.chain_id != chain_id {
+        bail!("publish.json chain_id does not match this nest");
+    }
+    if env.sealed_through != sealed_through {
+        bail!("publish.json sealed_through does not match the local catalogue");
+    }
+    if env.tables != tables {
+        bail!("publish.json tables do not match the local catalogue");
+    }
     let cat_sha = sha256_hex(&local_bytes);
     if env.catalogue_sha256 != cat_sha {
         bail!("publish.json catalogue_sha256 does not match the catalogue");
@@ -791,6 +818,24 @@ abi = "abis/usdc.json"
         assert!(
             err.to_string().contains("publish.json"),
             "wanted a publish.json failure, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_if_the_envelope_nid_is_wrong() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let report = sync(nest.path(), target, false).await.unwrap();
+        let path = mirror.path().join(&report.dataset).join("publish.json");
+        let mut env: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        env["nid"] = serde_json::json!("0".repeat(64));
+        std::fs::write(&path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("nid"),
+            "wanted an nid failure, got {err}"
         );
     }
 
