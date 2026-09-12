@@ -2646,6 +2646,16 @@ mod tests {
     async fn per_item_error_server(
         err_json: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        per_item_error_server_with_pause(err_json, std::time::Duration::ZERO).await
+    }
+
+    /// `pause` holds each response so a `try_join!` sibling can get its request out before the
+    /// winner's descent completes and cancels it. Zero for tests that only fire one request.
+    #[cfg(test)]
+    async fn per_item_error_server_with_pause(
+        err_json: &'static str,
+        pause: std::time::Duration,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let seen = std::sync::Arc::new(AtomicUsize::new(0));
@@ -2667,6 +2677,9 @@ mod tests {
                         return;
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
+                    if !pause.is_zero() {
+                        tokio::time::sleep(pause).await;
+                    }
                     let it: Vec<String> = (0..items)
                         .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"error":{err_json}}}"#))
                         .collect();
@@ -2738,8 +2751,9 @@ mod tests {
         use super::RpcClient;
         use std::sync::atomic::Ordering;
 
-        let (url, seen) = per_item_error_server(
+        let (url, seen) = per_item_error_server_with_pause(
             r#"{"code":-32602,"message":"query returned more than 10000 results"}"#,
+            std::time::Duration::from_millis(20),
         )
         .await;
         let c = RpcClient::new(vec![url]).unwrap();
@@ -2771,11 +2785,10 @@ mod tests {
         // count at all: `fmt · clippy · test` is a required context, so it reddens `main` at random.
         //
         // **The floor is 5, not 4 (#738).** 4 is the sequential count: width-8 plus the winning
-        // half's 4 → 2 → 1 descent without the sibling ever being polled. Because `try_join!`
-        // polls both futures from the first await, the losing half always issues at least its own
-        // width-4 request before the winner's `Err` propagates - making the true minimum
-        // 1 + 3 + 1 = 5. Measured on dev box at f0e2ca3: `parallel: true` → 7 (20/20);
-        // `parallel: false` (reverts #728) → 4 (20/20). The floor of 4 admitted the regression.
+        // half's 4 → 2 → 1 descent without the sibling ever being polled. `try_join!` polls both
+        // futures, but under a loaded test runtime the winner's whole 4 → 2 → 1 can finish before
+        // the sibling's first request leaves the socket (#1283). The mock pauses 20 ms per response
+        // so that cannot happen here; without the pause, 4 showed up in a full parallel suite.
         // The ceiling is what the note on `batch_is_narrowable` gets wrong: a per-item
         // failure is an HTTP 200, so the retry loop breaks on its first attempt and each level costs
         // **one** request, not `TIMESTAMP_ATTEMPTS`. Were that wrong, the count would be a multiple
