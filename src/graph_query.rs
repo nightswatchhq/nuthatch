@@ -1005,6 +1005,14 @@ pub struct Compiled {
     pub entity: String,
     /// `true` for a singular root (`pool`), which returns one object rather than a list.
     pub singular: bool,
+    /// `block: { number_gte: N }` - the head this query requires before it may be answered.
+    ///
+    /// Not a time-travel target. graph-node's own description: *"the query will be executed on the latest
+    /// block **only if** the subgraph has progressed to or past the minimum block number"*
+    /// (`graph/src/schema/api.rs:1189`). So it is a precondition on the head, not a request for a past
+    /// state, and a nest can answer it exactly without storing any history. The comparison is the
+    /// handler's, because the head is runtime state the compiler cannot see.
+    pub min_block: Option<u64>,
 }
 
 /// Compile one root field against the generated schema.
@@ -1250,10 +1258,34 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
     let view = crate::subgraph_import::to_alias(&entity);
     let mut sql = format!("SELECT {select} FROM \"{view}\" {BASE}{joins}");
     let mut wheres: Vec<String> = Vec::new();
+    let mut min_block: Option<u64> = None;
 
     for (name, value) in &root.args {
         match name.as_str() {
-            "block" => return Err(Unsupported::TimeTravel),
+            // `number_gte` is a precondition on the head rather than a past state, so it is answerable
+            // exactly. `number` and `hash` are real time travel and stay refused (#1267).
+            "block" => {
+                let Value::Object(m) = value else {
+                    return Err(Unsupported::Argument("`block` must be an object".into()));
+                };
+                let mut keys: Vec<&str> = m.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                match keys.as_slice() {
+                    ["number_gte"] => {
+                        let Some(Value::Int(n)) = m.get("number_gte") else {
+                            return Err(Unsupported::Argument(
+                                "`block.number_gte` must be an integer".into(),
+                            ));
+                        };
+                        // Negative is not a block. graph-node types it `Int`, so the parser accepts one.
+                        let n = u64::try_from(*n).map_err(|_| {
+                            Unsupported::Argument("`block.number_gte` must not be negative".into())
+                        })?;
+                        min_block = Some(n);
+                    }
+                    _ => return Err(Unsupported::TimeTravel),
+                }
+            }
             // Accepted and ignored on purpose: it selects an error policy, and a nest has no
             // subgraph indexing errors to report either way.
             "subgraphError" => {}
@@ -1396,6 +1428,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         shape,
         entity,
         singular,
+        min_block,
     })
 }
 

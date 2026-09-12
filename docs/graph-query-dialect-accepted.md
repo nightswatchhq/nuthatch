@@ -19,6 +19,7 @@ Every refusal below names the thing refused, so a caller can act on it.
 |---|---|
 | `pools { … }` | `SELECT … FROM "pool" ORDER BY "id" ASC LIMIT 100 OFFSET 0` |
 | `pool(id: "0x…") { … }` | the same with `WHERE "id" = '0x…' LIMIT 1`, answered as an object |
+| `pools(block: { number_gte: N }) { … }` | answered on the latest block when the nest's head has reached `N`, else graph-node's own refusal. Not time travel: *"the query will be executed on the latest block **only if** the subgraph has progressed to or past the minimum block number"* (`graph/src/schema/api.rs:1189`), which a nest satisfies exactly with no history stored |
 | `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
 
 ### Numeric ordering and comparison
@@ -236,7 +237,8 @@ after which the whole operation reads as garbage.
 
 | refused | why it is not approximated |
 |---|---|
-| `block:` / `block_gte:` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right |
+| `block: { number: N }`, `block: { hash: … }` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right. `number_gte` is **not** in this row - see above |
+| a `block` object carrying anything besides `number_gte` alone | `{ number_gte: N, number: M }` names two different requirements and only one of them is answerable |
 | arguments on a traversed field (`swaps(first: 5)`) | the relation would need its own `LIMIT`, and a dropped `first` there returns every related row. Refused **before** any traversal is lowered: the guard once sat after the aggregation branch, so this compiled with the argument silently gone |
 | a **stored** list of entity ids (`Token.whitelistPools`, no `@derivedFrom`) | a different shape needing `unnest`, not the aggregation below, and using the wrong one would answer with the wrong join |
 | a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
