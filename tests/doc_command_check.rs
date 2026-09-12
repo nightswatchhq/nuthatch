@@ -171,6 +171,20 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0024 proposes `nuthatch state-cache clear` for the L3 call-result cache; not a shipped \
          subcommand. Two mentions (lines ~175, ~255)",
     ),
+    (
+        "docs/rfcs/0054-the-head-count.md",
+        "count",
+        7,
+        "RFC-0054 proposes the not-yet-shipped `nuthatch count` command family; it is a dated \
+         design contract, not executable operator guidance",
+    ),
+    (
+        "docs/rfcs/0054-the-head-count.md",
+        "has",
+        1,
+        "RFC-0054's opt-in prompt is product copy that opens `nuthatch has no idea how many people \
+         use it`; the fence is a prompt, not a subcommand",
+    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.
