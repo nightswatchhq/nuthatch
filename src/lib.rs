@@ -76,6 +76,7 @@ pub mod port_report;
 pub mod progress;
 pub mod project;
 pub mod prune;
+pub mod publish;
 pub mod recipes;
 /// The reconcile loop for scaled mode (RFC-0022 §2/§3): plan in, leases out.
 #[cfg(feature = "postgres-store")]

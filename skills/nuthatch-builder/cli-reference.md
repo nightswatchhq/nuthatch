@@ -294,6 +294,27 @@ Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
 - `--dir <DIR>` - The directory to prune: a 2.0 one with a `mounts.toml`. A pre-2.0 directory is refused with a pointer to `nuthatch migrate` - nothing is reclaimable until its data is keyed by nid
 - `--yes` - Actually delete. Without this, prune only reports what it would remove
 
+## `nuthatch publish`
+
+Mirror sealed segments to an object-store prefix (RFC-0052)
+
+
+## `nuthatch publish sync`
+
+Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1)
+
+- `--target <TARGET>` - Filesystem path, `s3://bucket/prefix`, or `memory://…` (tests). Never `nuthatch.toml`
+- `--dir <DIR>` - Nest directory
+- `--dry-run` - Print the plan and write nothing
+
+## `nuthatch publish verify`
+
+HEAD every published file against the local catalogue
+
+- `--target <TARGET>` - The prefix `publish sync` wrote to
+- `--dir <DIR>` - Nest directory
+- `--deep` - Re-download and re-hash every object
+
 ## `nuthatch recipe`
 
 Derive-first recipes (RFC-0023): add a view that computes a read (e.g. `total_supply`) from indexed events instead of fetching it with an `eth_call`. No archive node, deterministic, free
