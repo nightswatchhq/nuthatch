@@ -3433,7 +3433,16 @@ impl DirectExtras<'_> {
     ) -> Result<()> {
         if let Some(creg) = self.call_registry {
             rows.extend(
-                decode_top_level_calls(source, creg, addresses, from, to, timestamps).await?,
+                decode_top_level_calls(
+                    source,
+                    creg,
+                    addresses,
+                    from,
+                    to,
+                    timestamps,
+                    call_body_concurrency(),
+                )
+                .await?,
             );
         }
         if let Some(gate) = self.ipfs {
@@ -3472,25 +3481,86 @@ async fn decode_top_level_calls(
     from: u64,
     to: u64,
     timestamps: bool,
+    fanout: usize,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    use futures::stream::StreamExt;
     let mut call_rows = Vec::new();
     let want: Vec<u64> = (from..=to).collect();
     // Fetched and decoded a chunk at a time. Every full body of a 20,000-block Gnosis window held at
     // once reached 2.3 GB with nothing committed (measured 2026-09-13), past the per-cursor budget.
     for chunk in want.chunks(TOP_LEVEL_BODY_CHUNK) {
-        let bodies = retry_transient(
-            &format!("block bodies for {} block(s)", chunk.len()),
-            BACKFILL_RETRY_BASE,
-            || async { source.block_bodies(chunk).await },
-        )
-        .await?;
+        // Collected before streaming, as `RpcClient::blocks_with` does: a closure building the future
+        // inside the stream is not provably `Send` to the spawned ingest task.
+        let fetches: Vec<_> = chunk
+            .chunks(TOP_LEVEL_BODY_BATCH)
+            .map(|batch| fetch_body_batch(source, batch))
+            .collect();
+        let batches: Vec<Result<std::collections::HashMap<u64, serde_json::Value>>> =
+            futures::stream::iter(fetches)
+                .buffered(fanout.max(1))
+                .collect()
+                .await;
+        let mut bodies = std::collections::HashMap::with_capacity(chunk.len());
+        for batch in batches {
+            bodies.extend(batch?);
+        }
         decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
     }
     Ok(call_rows)
 }
 
+async fn fetch_body_batch(
+    source: &dyn Source,
+    batch: &[u64],
+) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+    retry_transient(
+        &format!("block bodies for {} block(s)", batch.len()),
+        BACKFILL_RETRY_BASE,
+        || async { source.block_bodies(batch).await },
+    )
+    .await
+}
+
 /// Blocks of full bodies held at once while decoding top-level calls.
 const TOP_LEVEL_BODY_CHUNK: usize = 200;
+
+/// Blocks per `eth_getBlockByNumber` batch within a chunk.
+const TOP_LEVEL_BODY_BATCH: usize = 20;
+
+/// Body batches in flight at once. Measured on rpc.gnosischain.com (2026-09-13), 20-body batches:
+/// 34 blocks/s serially, 114 at four, 145 at eight.
+pub const CALL_BODY_CONCURRENCY: usize = 4;
+
+/// A chunk holds ten batches, so more would buy nothing.
+pub const CALL_BODY_CONCURRENCY_CEILING: usize = TOP_LEVEL_BODY_CHUNK / TOP_LEVEL_BODY_BATCH;
+
+/// [`CALL_BODY_CONCURRENCY`] unless `NUTHATCH_CALL_BODY_CONCURRENCY` overrides, read once. Composes
+/// with `--concurrency` on the seal-direct path, where each window fetches its own bodies.
+pub fn call_body_concurrency() -> usize {
+    static FANOUT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FANOUT.get_or_init(|| match std::env::var("NUTHATCH_CALL_BODY_CONCURRENCY") {
+        Err(_) => CALL_BODY_CONCURRENCY,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = CALL_BODY_CONCURRENCY,
+                    "NUTHATCH_CALL_BODY_CONCURRENCY is not a positive integer; using the default"
+                );
+                CALL_BODY_CONCURRENCY
+            }
+            Ok(n) if n > CALL_BODY_CONCURRENCY_CEILING => {
+                tracing::warn!(
+                    requested = n,
+                    ceiling = CALL_BODY_CONCURRENCY_CEILING,
+                    "NUTHATCH_CALL_BODY_CONCURRENCY above the ceiling; clamping"
+                );
+                CALL_BODY_CONCURRENCY_CEILING
+            }
+            Ok(n) => n,
+        },
+    })
+}
 
 fn decode_bodies(
     creg: &crate::calldata::CallRegistry,
@@ -5768,6 +5838,7 @@ impl NestIngest {
                     next,
                     to,
                     self.registry.timestamps(),
+                    call_body_concurrency(),
                 )
                 .await?;
             }
@@ -11187,19 +11258,88 @@ template = "pool"
             posts: PostSource(vec![(3, qos_post(&cid)), (19_876, qos_post(&cid))]),
             widest: std::sync::atomic::AtomicUsize::new(0),
         };
-        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true)
+        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true, 4)
             .await
             .unwrap();
         assert_eq!(
             source.widest.load(std::sync::atomic::Ordering::SeqCst),
-            TOP_LEVEL_BODY_CHUNK,
-            "a window must be fetched a chunk of bodies at a time"
+            TOP_LEVEL_BODY_BATCH,
+            "a window must be fetched a batch of bodies at a time"
         );
         assert_eq!(
             rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
             [3, 19_876],
             "chunking must not lose a call at either end of the window"
         );
+    }
+
+    /// Bodies came one 200-block batch at a time, 77.6 blocks/s on rpc.gnosischain.com against the
+    /// 145 the endpoint serves to eight parallel batches (2026-09-13). The batches in a chunk overlap
+    /// now, up to the fan-out and never past it, and the calls still come back in chain order.
+    #[tokio::test]
+    async fn top_level_call_bodies_are_fetched_in_parallel_batches() {
+        struct InFlight {
+            posts: PostSource,
+            now: std::sync::atomic::AtomicUsize,
+            peak: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Source for InFlight {
+            async fn tip(&self) -> Result<u64> {
+                self.posts.tip().await
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                self.posts.block_hash(n).await
+            }
+            async fn logs(
+                &self,
+                f: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                self.posts.logs(f, from, to).await
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = self.now.fetch_add(1, SeqCst) + 1;
+                self.peak.fetch_max(now, SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.now.fetch_sub(1, SeqCst);
+                self.posts.block_bodies(blocks).await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let cid = crate::cid::cid_v0_for(b"one post");
+        for fanout in [1, 4] {
+            let source = InFlight {
+                posts: PostSource(vec![
+                    (17, qos_post(&cid)),
+                    (95, qos_post(&cid)),
+                    (388, qos_post(&cid)),
+                ]),
+                now: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let rows = decode_top_level_calls(&source, &creg, &[], 0, 399, true, fanout)
+                .await
+                .unwrap();
+            assert_eq!(
+                source.peak.load(std::sync::atomic::Ordering::SeqCst),
+                fanout,
+                "body batches in flight must reach the fan-out and not pass it"
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
+                [17, 95, 388],
+                "overlapping batches must still decode in chain order"
+            );
+        }
     }
 
     /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
