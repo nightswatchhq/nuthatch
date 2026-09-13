@@ -26,9 +26,11 @@ nuthatch init 0xUSDC 0xWETH --alias usdc,weth
 nuthatch add 0xDAI --alias dai        # resolves the ABI, appends to nuthatch.toml, regenerates artifacts
 ```
 
-`add` never re-detects the chain (a nest is one chain) and refuses an address already present. The next
-`dev` backfills the new contract from its own deployment block; the existing ones resume from their
-cursor.
+`add` never re-detects the chain (a nest is one chain) and refuses an address already present. It
+changes the nest's decode registry, so the next `dev` on an existing store **refuses to start** rather
+than resume: the stored rows were decoded under the old registry. Re-index to adopt it. Moving
+`nuthatch.redb` and `segments/` aside works; on a nest that is serving, build a copy to tip on a spare
+port, compare it, then swap the directories, which keeps the outage to a restart.
 
 ## Fast backfill of a long history
 
