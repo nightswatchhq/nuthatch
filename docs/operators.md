@@ -910,6 +910,11 @@ Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operabl
 `nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined),
 `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
 
+A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
+`nuthatch_publish_sealed_through` (what the published catalogue covers),
+`nuthatch_publish_lag_blocks` (sealed locally, not yet published), `nuthatch_publish_pending_segments`,
+`nuthatch_publish_bytes_total`, `nuthatch_publish_errors_total` and `nuthatch_publish_dead_letter`.
+
 Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,
 `nuthatch_transform_effectful`.
 
@@ -925,6 +930,7 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
 | **Query rejections spiking** | `rate(nuthatch_sql_rejections_total)` | a caller hammering the guards; a gateway job |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
+| **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 
 ### Health versus readiness
 
@@ -1037,6 +1043,19 @@ hot store costs a re-index of the unsealed window, not history.
 schema, ordering, and the 256-bit encoding (canonical decimal text in `Utf8`; `_dec` / `_overflow`
 are DuckDB view columns, not Parquet). Point another engine at the same files. Do not glob
 `segments/*.parquet`, and do not expect a narrowed numeric type in the file.
+
+**Mirroring sealed data to a bucket (RFC-0052).** `nuthatch publish sync --target <dir or
+s3://bucket/prefix>` copies every non-provisional segment and the catalogue under
+`<target>/<data identity>/`, then writes `publish.json`; a second run uploads only what changed.
+`dev` and `serve` do it continuously with `--publish-target`: a pass at start, one after every seal,
+and one every `--publish-interval` (60 s) otherwise, with `--publish-parallelism` uploads in flight
+(2). The publisher runs on its own thread, so a slow or unreachable bucket delays the mirror and never
+a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. It needs
+`PutObject`, `GetObject`, `HeadObject` and `ListBucket` on the prefix and not `DeleteObject`, which is
+worth withholding: a credential that cannot delete keeps the mirror append-only by policy. Five
+consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries tenfold
+until one succeeds. A runtime directory publishes per mount rather than per process, and refuses
+`--publish-target`.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 
