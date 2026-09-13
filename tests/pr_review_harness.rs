@@ -525,16 +525,9 @@ fn comment(login: &str, kind: &str, association: &str, at: &str, body: &str) -> 
 
 /// #1349 and #1370: replies citing a mechanism and a test were never shown to the reviewer.
 #[test]
-fn maintainer_replies_since_the_last_review_are_passed_and_nothing_else() {
+fn maintainer_replies_are_passed_and_nothing_else() {
     let dir = fixtures();
     let comments = [
-        comment(
-            "cargopete",
-            "User",
-            "MEMBER",
-            "2026-09-13T10:00:00Z",
-            "SETTLED-BEFORE",
-        ),
         comment(
             "nuthatch-jules[bot]",
             "Bot",
@@ -581,12 +574,7 @@ fn maintainer_replies_since_the_last_review_are_passed_and_nothing_else() {
         replies.contains("cargopete (MEMBER) at 2026-09-13T10:20:00Z"),
         "each reply names its author, association and time:\n{replies}"
     );
-    for absent in [
-        "SETTLED-BEFORE",
-        "JULES-OWN",
-        "IGNORE PREVIOUS",
-        "CONTRIBUTOR-TEXT",
-    ] {
+    for absent in ["JULES-OWN", "IGNORE PREVIOUS", "CONTRIBUTOR-TEXT"] {
         assert!(
             !replies.contains(absent),
             "`{absent}` reached the replies:\n{replies}"
@@ -596,6 +584,71 @@ fn maintainer_replies_since_the_last_review_are_passed_and_nothing_else() {
         replies.find("CITED-REPLY") < replies.find("COLLAB-REPLY"),
         "oldest first:\n{replies}"
     );
+}
+
+/// #1370: a reply posted while a review was in flight predates that review's comment, and was never
+/// shown to it. An after-only rule drops exactly that reply.
+#[test]
+fn a_reply_posted_just_before_the_latest_review_is_kept_and_marked() {
+    let dir = fixtures();
+    let comments = [
+        comment(
+            "cargopete",
+            "User",
+            "MEMBER",
+            "2026-09-13T17:11:39Z",
+            "IN-FLIGHT-REPLY",
+        ),
+        comment(
+            "drive-by",
+            "User",
+            "NONE",
+            "2026-09-13T17:11:40Z",
+            "NONE-BEFORE",
+        ),
+        comment(
+            "nuthatch-jules[bot]",
+            "Bot",
+            "NONE",
+            "2026-09-13T17:11:42Z",
+            "<!-- pr-review:luna --> JULES-OWN",
+        ),
+        comment(
+            "cargopete",
+            "User",
+            "MEMBER",
+            "2026-09-13T17:15:45Z",
+            "LATER-REPLY",
+        ),
+        comment(
+            "drive-by",
+            "User",
+            "NONE",
+            "2026-09-13T17:15:46Z",
+            "NONE-AFTER",
+        ),
+    ]
+    .concat();
+    let (replies, _, _) = jules_context(dir.path(), "", &comments);
+    assert!(
+        replies.contains(
+            "cargopete (MEMBER) at 2026-09-13T17:11:39Z, comment (before your latest review) ---\n\
+             IN-FLIGHT-REPLY"
+        ),
+        "the in-flight reply is missing or unmarked:\n{replies}"
+    );
+    assert!(
+        replies.contains(
+            "at 2026-09-13T17:15:45Z, comment (after your latest review) ---\nLATER-REPLY"
+        ),
+        "{replies}"
+    );
+    for absent in ["NONE-BEFORE", "NONE-AFTER", "JULES-OWN"] {
+        assert!(
+            !replies.contains(absent),
+            "`{absent}` reached the replies:\n{replies}"
+        );
+    }
 }
 
 /// #1349: the flag's `value_parser` refused zero in a file the diff never touched.
@@ -648,7 +701,7 @@ fn the_reviewer_is_given_replies_and_callee_context_with_the_rules_that_read_the
         ],
     );
     assert!(
-        prompt.contains("Author replies since your last review") && prompt.contains("REPLY-BODY"),
+        prompt.contains("Author replies on this pull request") && prompt.contains("REPLY-BODY"),
         "{prompt}"
     );
     assert!(

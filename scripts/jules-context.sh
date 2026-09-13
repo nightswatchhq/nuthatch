@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# What Jules cannot get from a diff: maintainers' replies since her last review, and the base
+# What Jules cannot get from a diff: maintainers' replies on the pull request, and the base
 # branch's bodies of the functions the diff calls or names (one hop).
 #
 # Runs with secrets on pull_request_target, in the default-branch checkout. Everything from the pull
@@ -50,6 +50,8 @@ trap 'rm -rf "$tmp"' EXIT
 [ -n "$comments" ] && [ -r "$comments" ] || comments=/dev/null
 [ -n "$review_comments" ] && [ -r "$review_comments" ] || review_comments=/dev/null
 
+# Every reply, marked before or after her latest review, not only those after it: a reply posted
+# while a review is in flight predates that review's comment and was never shown to it (#1370).
 jq -nj --slurpfile issue "$comments" --slurpfile review "$review_comments" \
   --arg login "$JULES_LOGIN" --arg marker "$MARKER" --argjson cap "$MAX_REPLIES_CHARS" '
   ([$issue[] | select(.user.login == $login and .user.type == "Bot"
@@ -58,10 +60,12 @@ jq -nj --slurpfile issue "$comments" --slurpfile review "$review_comments" \
       ($review[] | . + {where: "review comment on \(.path // "?"):\(.line // .original_line // 0)"}) ]
   | map(select(.author_association == "OWNER" or .author_association == "MEMBER"
                or .author_association == "COLLABORATOR")
-        | select(.user.login != $login)
-        | select($since == null or .created_at > $since))
+        | select(.user.login != $login))
   | sort_by(.created_at, .id)
-  | map("--- \(.user.login) (\(.author_association)) at \(.created_at), \(.where) ---\n\(.body // "")\n")
+  | map((if $since == null then "no review of yours yet"
+         elif .created_at > $since then "after your latest review"
+         else "before your latest review" end) as $when
+        | "--- \(.user.login) (\(.author_association)) at \(.created_at), \(.where) (\($when)) ---\n\(.body // "")\n")
   | reverse
   | reduce .[] as $e ({kept: [], used: 0, dropped: 0, full: false};
       if .full then .dropped += 1
