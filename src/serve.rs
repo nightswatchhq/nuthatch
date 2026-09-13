@@ -128,6 +128,12 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
 /// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
 pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
+
+/// Bytes of stored row JSON a `/sql` or `/explain` will copy from the hot tip, beside the row cap.
+/// Rows are parsed per request, and typed rows from IPFS documents measured about 4.1 KB each once
+/// parsed (2026-09-13): 850,879 of them grew the heap 3.36 GB in one request. Past this the request is
+/// refused with `503`, never answered from sealed data alone.
+pub(crate) const SQL_MAX_HOT_BYTES: u64 = 64 * 1024 * 1024;
 /// Independent source-byte guard for declared queries. This is not a RAM conversion: it bounds
 /// bytes read from immutable segments plus the serialized hot snapshot before the statement runs.
 pub(crate) const SQL_MAX_NAMED_SCAN_BYTES: u64 = 512 * 1024 * 1024;
@@ -188,6 +194,8 @@ pub struct AppState {
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
     /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
     pub sql_max_hot_rows: usize,
+    /// [`SQL_MAX_HOT_BYTES`] in production; lowered by tests.
+    pub sql_max_hot_bytes: u64,
     pub sql_max_named_scan_bytes: u64,
     /// This process owns **no cursor**: it serves a nest it does not index (`nuthatch serve`).
     ///
@@ -2588,6 +2596,7 @@ async fn run_sql_query(
     let sql = q.q.clone();
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
+    let sql_max_hot_bytes = s.sql_max_hot_bytes;
     // The live, registry-derived schema - every table the config declares, whether or not it has
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
@@ -2599,9 +2608,18 @@ async fn run_sql_query(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
+        let (hot, tip_unavailable) = match store
+            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
+            .map(|snapshot| snapshot.rows)
+        {
             Ok(hot) => (hot, false),
-            Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
+            Err(e)
+                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
+                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+                        .is_some() =>
+            {
+                return Err(e)
+            }
             // Same level as a segment read failure (#472): a hot store that will not scan is at least
             // as serious, and the fallback below must not be the only trace of it.
             Err(e) => {
@@ -2703,6 +2721,18 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         )
             .into_response();
     }
+    if let Some(over) = e.downcast_ref::<crate::store::HotScanBudgetExceeded>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": over.to_string(),
+                "hot_source_bytes": over.source_bytes,
+                "budget": over.budget,
+                "sealed_through": s.store.sealed_through(),
+            })),
+        )
+            .into_response();
+    }
     // A guard rejection (timeout / interrupt) or a bad query - counted as a rejection.
     // Errors as prompts (RFC-0016 §3): classify the failure against the schema and append an
     // actionable hint so an agent (or the REPL user) self-corrects in one round-trip. The raw
@@ -2751,6 +2781,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let probe = format!("SELECT * FROM ({}) AS _explain LIMIT 0", q.q);
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
+    let sql_max_hot_bytes = s.sql_max_hot_bytes;
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -2761,9 +2792,18 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let (hot, tip_unavailable) = match store.hot_rows_by_table_bounded(sql_max_hot_rows) {
+        let (hot, tip_unavailable) = match store
+            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
+            .map(|snapshot| snapshot.rows)
+        {
             Ok(hot) => (hot, false),
-            Err(e) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => return Err(e),
+            Err(e)
+                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
+                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+                        .is_some() =>
+            {
+                return Err(e)
+            }
             // Same level as a segment read failure (#472): a hot store that will not scan is at
             // least as serious, and the fallback below must not be the only trace of it - #528.
             Err(e) => {
@@ -2824,6 +2864,25 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "error": format!("{e}"),
+                    "sealed_through": s.store.sealed_through(),
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e))
+            if e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+                .is_some() =>
+        {
+            METRICS.inc_sql_rejected();
+            let over = e
+                .downcast_ref::<crate::store::HotScanBudgetExceeded>()
+                .expect("matched by the guard");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": over.to_string(),
+                    "hot_source_bytes": over.source_bytes,
+                    "budget": over.budget,
                     "sealed_through": s.store.sealed_through(),
                 })),
             )
@@ -3615,6 +3674,7 @@ mod tests {
             seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
+            sql_max_hot_bytes: SQL_MAX_HOT_BYTES,
             sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
             surface: Arc::new(crate::allowlist::Surface::default()),
             #[cfg(feature = "counter")]
@@ -5219,6 +5279,49 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A typed-rows QoS nest held 850,879 rows hot behind outstanding documents, under the two-million
+    /// row cap, and one `/sql` parsed all of them: 3.36 GB. The byte cap refuses before parsing past it,
+    /// on both handlers, and says how much was there.
+    #[tokio::test]
+    async fn a_hot_tip_over_the_byte_cap_is_refused_by_sql_and_explain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_max_hot_bytes = 64;
+        for b in 1..=3u64 {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b, "pad": "x".repeat(40)}).to_string(),
+                )
+                .unwrap();
+        }
+        let q = || {
+            Query(SqlQuery {
+                q: "SELECT 1 AS n".into(),
+                max_rows: None,
+            })
+        };
+        for (name, resp) in [
+            ("/sql", sql(State(state.clone()), q()).await.into_response()),
+            (
+                "/explain",
+                explain(State(state.clone()), q()).await.into_response(),
+            ),
+        ] {
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["budget"], json!(64), "{name} body: {v}");
+            assert!(
+                v["hot_source_bytes"].as_u64().unwrap() > 64,
+                "{name} body: {v}"
+            );
+        }
     }
 
     /// #378: an over-budget tip is refused by both `/sql` and `/explain`, not just by the store layer
