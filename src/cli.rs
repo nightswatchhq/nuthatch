@@ -867,6 +867,11 @@ pub struct BackfillBenchArgs {
     /// quietly invents data is worse than no rig.
     #[arg(long, conflicts_with_all = ["record", "rpc", "state_rpc"])]
     pub replay: Option<String>,
+
+    /// Publish each run's sealed segments to this target while it indexes (RFC-0052 S2), so the
+    /// report measures ingestion with a mirror uploading beside it. Each run gets its own prefix.
+    #[arg(long, value_name = "URL", conflicts_with = "keep")]
+    pub publish_target: Option<String>,
 }
 
 #[derive(Args)]

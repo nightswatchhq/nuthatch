@@ -203,6 +203,9 @@ impl NestMetrics {
     pub fn publish_errors(&self) -> u64 {
         self.publish_errors.load(Relaxed)
     }
+    pub fn publish_bytes(&self) -> u64 {
+        self.publish_bytes.load(Relaxed)
+    }
     pub fn publish_dead_letter(&self) -> bool {
         self.publish_dead_letter.load(Relaxed)
     }
