@@ -206,6 +206,9 @@ pub struct AppState {
     /// **Not a new flag.** `serve_role` already knows - its own comment says "No `Source` is ever
     /// polled on this role" - it simply never told this endpoint.
     pub cursorless: bool,
+    /// The chain's `seal_span` (#1199). `/ready` calls a tip seal stalled only once a span cut is
+    /// overdue in blocks, not merely because a sparse nest has been quiet for hours (#1341).
+    pub seal_span: u64,
     /// The cursor's freshness dial (RFC-0040), so `/ready` can say how stale the nest is meant to be
     /// and scale its stall thresholds to the interval rather than reporting a five-minute cursor
     /// stalled at ninety seconds.
@@ -963,12 +966,12 @@ const READINESS_SEAL_STALL_SECS: u64 = 900;
 /// How long the **tip path's** seal may go without advancing the watermark before `/ready` calls it
 /// stalled (#1199).
 ///
-/// Twelve hours, and chain-independent on purpose. Every `chains::Chain::seal_span` is sized to
-/// about six hours of that chain's block time, so a healthy nest cuts a segment at least that often
-/// whatever the chain - the bound is written as a block span, but the guarantee it buys is a
-/// duration, and this is the surface where that duration is spent. Twice the span leaves room for a
-/// finality boundary that sulks for a while, or a poll interval an operator has widened under
-/// RFC-0040, without calling a working nest dead.
+/// Twelve hours. Every *registered* chain's `seal_span` is sized to about six hours of its block
+/// time, so on those a healthy nest cuts a segment at least that often, and twice the span leaves
+/// room for a finality boundary that sulks or a poll interval widened under RFC-0040. An unregistered
+/// chain gets `chains::DEFAULT_SEAL_SPAN`, which is no particular duration (36 hours on Sepolia), so
+/// this clock is necessary but not sufficient: `nest_readiness` also requires the seal lag to exceed
+/// twice the span before it calls the seal stalled (#1341).
 ///
 /// **Not `READINESS_SEAL_STALL_SECS` (15 minutes).** That one judges an *active bulk backfill*,
 /// which has work in hand and is never legitimately idle. A tip-path seal waits for finality and for
@@ -1245,16 +1248,21 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     // nest whose *ordinary* sealing had stopped answered `ready: true` indefinitely - measured at
     // 739,192 blocks behind on a cursor that was sitting at tip.
     //
-    // Three guards, and each earns its place:
+    // Four guards, and each earns its place:
     // - `!s.cursorless`, because a frozen archive seals nothing by design (#1025);
     // - `!seal_direct_active`, because that pass owns the clock and `seal_stalled` already judges it;
     // - `last > sealed`, the analogue of `wedged`'s `lag > 0`. A seal caught up to the cursor has
     //   nothing to do and stops stamping, exactly as a cursor at tip stops stamping `last_progress`.
     //   Without it, a fixed-range nest (`end_block`) whose range has completed and sealed reports
-    //   unready for ever - the same trap the `wedged` guard exists to avoid.
+    //   unready for ever - the same trap the `wedged` guard exists to avoid;
+    // - a seal lag past twice the span. A sparse nest's only seal is the span cut, which is not due
+    //   until the frontier is a whole span past the watermark, so quiet hours alone are not a stall.
+    //   On Sepolia's default span that cut is 36 hours away, and the clock alone called a healthy
+    //   nest dead for two thirds of every cycle (#1341).
     let tip_seal_stalled = !s.cursorless
         && !seal_direct_active
         && last > sealed
+        && last.saturating_sub(sealed) > s.seal_span.saturating_mul(2)
         && seal_direct_stalled(
             last_seal_progress,
             started_at,
@@ -3603,6 +3611,7 @@ mod tests {
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(Semaphore::new(permits)),
             cursorless: false,
+            seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
@@ -4265,6 +4274,56 @@ mod tests {
             "the backfill term must stay false: no pass was ever running, and conflating the two \
              is what hid this"
         );
+    }
+
+    /// #1341: a sparse nest whose only seal is the span cut is not stalled for being quiet. Numbers
+    /// measured on `hackathon-arcaidia-v2-sepolia`, 3.6.1: 5,974 blocks behind, 62,848 s since a seal,
+    /// and `/ready` said 503 for a nest serving every row.
+    #[tokio::test]
+    async fn a_sparse_nest_short_of_its_span_cut_is_not_stalled() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "sparse-tip-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+        let span = crate::chains::DEFAULT_SEAL_SPAN;
+        let tip = 11_694_278;
+        let handle = METRICS.nest(name);
+        handle.set_tip(tip);
+        handle.set_last_block(tip);
+        handle.mark_poll_ok();
+        let status_at = |sealed: u64| {
+            let now = crate::metrics::now_unix();
+            handle.set_sealed_through(sealed);
+            handle.set_last_progress_for_test(now);
+            handle.set_last_seal_progress_for_test(now.saturating_sub(62_848));
+            let router = router.clone();
+            async move {
+                let (code, body) = get(router, &format!("/{name}/ready")).await;
+                (
+                    code,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            }
+        };
+
+        let (code, json) = status_at(11_688_304).await;
+        assert_eq!(code, StatusCode::OK, "{json}");
+        assert_eq!(json["tip_seal_stalled"], json!(false), "{json}");
+
+        let (code, json) = status_at(tip - 2 * span).await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "exactly twice the span is not yet overdue: {json}"
+        );
+
+        let (code, json) = status_at(tip - 2 * span - 1).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["tip_seal_stalled"], json!(true), "{json}");
     }
 
     /// The half that must not regress, and the one that would take a healthy nest down.
