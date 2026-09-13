@@ -277,3 +277,4 @@ schema. Changing them is a writer-config decision and is not implied by this pag
 - The rest of the versioned catalogue (`sort_order`, `logical_type`, stats): #1223. `manifest_version`
   and `writer_profile` shipped ahead of it and are documented above.
 - A physical-type change for 256-bit values: #1222.
+- A mirror in object storage or another directory: [Reading a published nest](reading-published-nest.md).
