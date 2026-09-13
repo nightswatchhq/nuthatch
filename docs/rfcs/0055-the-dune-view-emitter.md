@@ -109,9 +109,42 @@ documented for third-party tables at all; Spellbook's licence and what that perm
 
 ## §4 - How the models meet the data
 
-`[pending brief 7]` Which public mechanisms make a Parquet prefix queryable in DuneSQL, whether any reads
-in place, and their limits. The emitter's models reference a `--source` the operator supplies; this
-section states which public path, if any, produces one.
+**There is no public way to point Dune at a Parquet prefix.** Brief 7 found no external table, no bucket
+connection and no way to attach a catalog on any plan. Parquet is not an accepted upload format
+anywhere in the docs. Every documented route copies rows into Dune-managed storage ([Trino Connector
+Overview](https://docs.dune.com/api-reference/connectors/trino/overview.md), [Upload
+Data](https://docs.dune.com/web-app/upload-data.md), read 2026-09-13). The only public mention of
+object storage going into Dune is the sales-led [Dune for chains](https://dune.com/dune-for-chains)
+offer, which this RFC does not rely on. Datashare and S3 Export go the other way.
+
+So RFC-0052's mirror does not reach Dune by itself. **The one public route is a sidecar**, RFC-0052 §8's
+row-insert follow-on. It creates one table per nuthatch table with `POST /v1/uploads` (10 credits each),
+watches the published `manifest.json`, and appends each new segment's rows as NDJSON through
+`POST /v1/uploads/:namespace/:table/insert`. Each insert is atomic, at most 1.2 GB, and billed at
+3 credits per GB with a minimum of 1 credit per request ([Insert
+Data](https://docs.dune.com/api-reference/tables/endpoint/uploads-insert.md),
+[Billing](https://docs.dune.com/api-reference/overview/billing.md)).
+
+The per-request minimum makes cadence the price. One insert per table every five minutes is about 8,640
+credits a month per table; hourly is about 720. That is arithmetic on those two pages, not a published
+figure. Storage is capped at 100 MB on Free, 1 GB on Analyst and 15 GB on Plus, and uploaded data is
+public unless the operator is on Enterprise ([How Credits
+Work](https://docs.dune.com/resources/credits-billing/how-credits-work.md)).
+
+What this means for the emitter:
+
+- **The models read the sidecar's tables, not the mirror.** Their source is `dune.<namespace>.<table>`,
+  the create API's `full_name` form ([List Uploaded
+  Tables](https://docs.dune.com/api-reference/tables/endpoint/uploads-list.md)), and `--source` names
+  the namespace because it is the operator's, not the nest's.
+- **The models assume the sidecar loads every column as `varchar`**, except the four `UInt64` counters,
+  and cast at query time. The column types `create` accepts are not published. `varchar` is the one
+  choice the docs support, and it keeps the exact-text contract intact across the upload.
+- **The emitter is useful without Dune too.** It emits correct DuneSQL for anyone holding the rows,
+  whether through the sidecar or a private arrangement. It does not claim a Dune integration by
+  existing.
+- **The sidecar is a prerequisite for S4 and is not this RFC.** It is a few hundred lines outside the
+  binary (RFC-0052 §8) and needs its own acceptance.
 
 ## §5 - What it refuses
 
@@ -153,8 +186,20 @@ parsers rather than new ones.
 | S1 - per-table models | `nuthatch emit dune`, §3 casts, §5 refusals, the golden test | the golden output changes between two runs, or a `StorageKind` variant has no row |
 | S2 - descriptions | table and column descriptions and grain from `semantic.toml` in the output | a description in `semantic.toml` is missing from the emitted model |
 | S3 - authored views | the subset of `views/*.sql` that translates exactly, the rest named | a translated view returns a different result from the DuckDB original on the fixture |
-| S4 - recorded run | the emitted models run against a real published nest in Dune, recorded | a model is listed as working that was never run |
+| S4 - recorded run | the emitted models run in Dune over a real nest's rows, loaded by the RFC-0052 §8 sidecar, and recorded; blocked until that sidecar exists (§4) | a model is listed as working that was never run |
 
 ## §9 - Unresolved
 
-`[pending briefs 7 and 8]`
+Ingestion, from brief 7. None of these is publicly documented, and each blocks S4 until answered by a
+real run:
+
+1. The column types `POST /v1/uploads` accepts, and whether `uint256`, `int256` or `varbinary` are among
+   them. §4 assumes `varchar` for that reason.
+2. Whether an NDJSON insert can omit a nullable column, and whether an uploaded table can gain one.
+   A nest's columns can drift between seals (`reading-segments.md` §Ordering), so the sidecar may need
+   a new table per column set.
+3. The upsert endpoint named in the March 2026 changelog: its path, key semantics and cost.
+4. Which credit rule is enforced. Billing says 3 credits per GB with a 1-credit minimum; the older
+   Tables Overview still describes data points per credit.
+
+`[pending brief 8]` Type-map and convention gaps.

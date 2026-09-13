@@ -449,8 +449,10 @@ schemaEvolutionMode => 'addNewColumns')`; `try_cast(c AS DECIMAL(38,0))`.
 **Dune, the ingestion side.** What the Data Foundation pipeline needs from a third-party
 producer is a stable prefix of Parquet, a catalogue to know what is complete, and no reorgs to
 handle. This RFC produces exactly that and stops. How Dune registers such a prefix into a
-namespace is Dune's mechanism, to be confirmed internally (`[VERIFY]`); the RFC commits to the
-producer contract, not to the consumer's import path. Datashare is the opposite direction
+namespace was left as `[VERIFY]`. Public sources answer it (RFC-0055 §4, read 2026-09-13): there is no
+public way to register an object-storage prefix or read Parquet in place. The public route is copying
+rows in through the uploads create and insert API, which is §8's row-insert sidecar. The RFC still
+commits to the producer contract, not to the consumer's import path. Datashare is the opposite direction
 (Dune → warehouses) and is not relevant.
 
 ## §6 - Drawbacks
