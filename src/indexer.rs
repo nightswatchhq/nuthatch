@@ -13612,8 +13612,9 @@ template="pool"
     /// (the real DataEdge ABI has none, so no call rows), resolving before calls are decoded (no
     /// document), ignoring `json_match` (both documents in each table), and not counting what could not be read.
     ///
-    /// The stub serves 300 KiB, past the single-block limit, so the real CID is accepted unverified.
-    /// That is what the live 1.7 MB payloads get too, and the row has to say so.
+    /// The stub serves 300 KiB that the real CIDs do not name, so neither document is proven and
+    /// neither becomes a row. Each declaration still fetches exactly its own topic's CID once, which
+    /// the unverified count shows: ignoring `json_match` would make it four, resolving too early zero.
     #[tokio::test]
     async fn a_call_tables_json_payload_resolves_the_document_it_names() {
         const EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
@@ -13731,8 +13732,8 @@ template="pool"
         );
         assert_eq!(
             resolver.step().await.unwrap(),
-            0,
-            "both documents resolve in one pass"
+            2,
+            "a document nothing proved is retried, not stored and not forgotten"
         );
         drop(resolver);
         drop(nest);
@@ -13759,33 +13760,20 @@ template="pool"
                 .all(|v| v["tx_from"] == "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce"),
             "a call row must name the publisher that sent it"
         );
-        for (table, cid) in [
-            (
-                "qos_indexer_payload",
-                "QmdhcVTpSjmCBvqgL9m6nazRs23XBEbJ6zygojVAqib7oa",
-            ),
-            (
-                "qos_query_payload",
-                "QmcySPs9y7a4wGYxCtbdNrt9kjryce9iYguRVe6GdKvZw5",
-            ),
-        ] {
-            let docs: Vec<&serde_json::Value> =
-                rows.iter().filter(|v| v["table"] == table).collect();
-            let cids: Vec<&serde_json::Value> = docs.iter().map(|v| &v["cid"]).collect();
-            assert_eq!(
-                cids,
-                [cid],
-                "{table} wants only the document its own topic names"
-            );
-            assert_eq!(
-                docs[0]["verified"], false,
-                "a multi-block document cannot be proven from its bytes and must not claim it was"
-            );
-        }
+        assert!(
+            !rows
+                .iter()
+                .any(|v| v["table"] == "qos_indexer_payload" || v["table"] == "qos_query_payload"),
+            "a document nothing proved must not become a row: {rows:?}"
+        );
+        let metrics = crate::metrics::METRICS.nest("qos-oracle-n1");
         assert_eq!(
-            crate::metrics::METRICS
-                .nest("qos-oracle-n1")
-                .ipfs_unreadable(),
+            metrics.ipfs_unverified(),
+            2,
+            "each declaration fetches only the document its own topic names, once"
+        );
+        assert_eq!(
+            metrics.ipfs_unreadable(),
             2,
             "the post whose payload is not JSON is unreadable to both declarations, and counted"
         );

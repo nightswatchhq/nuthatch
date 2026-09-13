@@ -240,15 +240,14 @@ impl Gate {
         Ok(None)
     }
 
+    /// Only a proven document reaches here, so every row says `verified = true`; rows an older build
+    /// stored unverified keep `false` until the nest is re-indexed.
     fn document_row(&self, p: &Planned, content: &str, timestamps: bool) -> DecodedRow {
-        // `fetch_ipfs` returns only a body that verified, or one too large for single-block
-        // re-encoding that it accepted unverified. The row records which.
-        let verified = content.len() <= 256 * 1024;
         crate::ipfs::to_row(
             &self.decls[p.decl].name,
             &p.cid,
             content,
-            verified,
+            true,
             p.slot,
             &BlockCtx {
                 number: p.block,
@@ -298,9 +297,37 @@ impl Policy {
     }
 }
 
+/// A body fetched that nothing could prove against its CID. It is retried like any other failure,
+/// because a gateway that serves the blocks may answer next time.
+#[derive(Debug)]
+struct Unproven(String);
+
+impl std::fmt::Display for Unproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fetched but not proven: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unproven {}
+
 async fn fetch(cid: &str, gateways: &[String]) -> Result<String> {
-    crate::subgraph_import::fetch_ipfs(cid, gateways, crate::subgraph_import::Origin::Manifest)
-        .await
+    use crate::subgraph_import::{fetch_ipfs_proven, Fetched, Origin, Proof};
+    match fetch_ipfs_proven(cid, gateways, Origin::Manifest).await? {
+        Fetched {
+            body,
+            proof: Proof::Verified,
+        } => Ok(body),
+        Fetched {
+            proof: Proof::Unproven(why),
+            ..
+        } => Err(Unproven(why).into()),
+    }
+}
+
+/// A document over the byte, block or depth cap is the same size from every gateway, so retrying it
+/// cannot help.
+fn is_over_cap(e: &anyhow::Error) -> bool {
+    e.is::<crate::cid::OverCap>()
 }
 
 struct Work {
@@ -447,8 +474,15 @@ impl Resolver {
                     let Some(w) = self.work.get_mut(&key) else {
                         continue;
                     };
+                    if e.is::<Unproven>() {
+                        self.metrics.add_ipfs_unverified(1);
+                    }
+                    let over_cap = is_over_cap(&e);
+                    if over_cap {
+                        self.metrics.add_ipfs_oversize(1);
+                    }
                     w.failures += 1;
-                    if w.failures >= self.policy.attempts {
+                    if over_cap || w.failures >= self.policy.attempts {
                         tracing::warn!(
                             "ipfs: gave up on {} (block {}) after {} failed fetches: {e:#}. Its range \
                              seals without it (nuthatch_nest_ipfs_given_up_total)",
@@ -541,7 +575,7 @@ pub async fn resolve_inline(
                     Ok(content) => return (p, Some(content)),
                     Err(e) => {
                         failures += 1;
-                        if failures >= policy.attempts {
+                        if is_over_cap(&e) || failures >= policy.attempts {
                             tracing::warn!(
                                 "ipfs: gave up on {} (block {}) after {failures} failed fetches: {e:#}",
                                 p.cid,
