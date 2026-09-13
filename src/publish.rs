@@ -170,9 +170,49 @@ impl Mirror for ObjMirror {
         Ok(())
     }
 
+    /// Streams `src` in [`PART_BUFFER`] parts, one in flight, so an upload holds one part and never
+    /// the segment (RFC-0052 §3.4's `publish_headroom`).
     async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
-        let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
-        self.put(key, &bytes).await
+        use object_store::ObjectStore as _;
+        use std::io::Read as _;
+        let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
+            let mut part = Vec::with_capacity(PART_BUFFER);
+            file.take(PART_BUFFER as u64)
+                .read_to_end(&mut part)
+                .with_context(|| format!("reading {}", src.display()))?;
+            Ok(part)
+        };
+        let mut file =
+            std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
+        let first = read(&mut file)?;
+        if first.len() < PART_BUFFER {
+            return self.put(key, &first).await;
+        }
+        let loc = self.key(key);
+        let mut upload = self
+            .inner
+            .put_multipart(&loc)
+            .await
+            .with_context(|| format!("starting upload of {key}"))?;
+        let mut part = first;
+        while !part.is_empty() {
+            let sent = upload.put_part(part.into()).await;
+            let next = sent
+                .map_err(anyhow::Error::from)
+                .and_then(|()| read(&mut file));
+            match next {
+                Ok(p) => part = p,
+                Err(e) => {
+                    let _ = upload.abort().await;
+                    return Err(e.context(format!("uploading {key}")));
+                }
+            }
+        }
+        upload
+            .complete()
+            .await
+            .with_context(|| format!("completing upload of {key}"))?;
+        Ok(())
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
@@ -688,6 +728,8 @@ pub async fn run_verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
 
 /// Objects uploaded at once when nobody said otherwise (RFC-0052 §3.4).
 pub const DEFAULT_PARALLELISM: usize = 2;
+/// The most of one segment an object-store upload holds at once.
+pub const PART_BUFFER: usize = 8 * 1024 * 1024;
 /// Consecutive failures on one object before the mirror reports itself dead-lettered.
 const DEAD_LETTER_AFTER: u32 = 5;
 /// Where a failure outside any one object's upload is counted.
@@ -861,6 +903,125 @@ mod tests {
     use crate::registry::{DecodedRow, Value as DecodedValue};
     use crate::seal::{seal_range, test_set_table_floor};
     use serde_json::json;
+
+    #[cfg(feature = "object-store")]
+    mod largest {
+        use futures::stream::BoxStream;
+        use object_store::path::Path;
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+            PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+
+        /// An in-memory store that remembers the largest payload any single request carried.
+        #[derive(Debug, Default)]
+        pub struct Largest {
+            pub inner: object_store::memory::InMemory,
+            pub most: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for Largest {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Largest")
+            }
+        }
+
+        #[derive(Debug)]
+        struct Parts(Box<dyn MultipartUpload>, Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl MultipartUpload for Parts {
+            fn put_part(&mut self, data: PutPayload) -> UploadPart {
+                self.1.fetch_max(data.content_length(), SeqCst);
+                self.0.put_part(data)
+            }
+            async fn complete(&mut self) -> Result<PutResult> {
+                self.0.complete().await
+            }
+            async fn abort(&mut self) -> Result<()> {
+                self.0.abort().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for Largest {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> Result<PutResult> {
+                self.most.fetch_max(payload.content_length(), SeqCst);
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOptions,
+            ) -> Result<Box<dyn MultipartUpload>> {
+                let upload = self.inner.put_multipart_opts(location, opts).await?;
+                Ok(Box::new(Parts(upload, self.most.clone())))
+            }
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+            async fn delete(&self, location: &Path) -> Result<()> {
+                self.inner.delete(location).await
+            }
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+                self.inner.copy(from, to).await
+            }
+            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+        }
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn an_object_store_upload_never_holds_more_than_one_part() {
+        use object_store::ObjectStore as _;
+        let store = std::sync::Arc::new(largest::Largest::default());
+        let mirror = ObjMirror {
+            inner: store.clone(),
+            prefix: object_store::path::Path::from("mirror"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("segment.parquet");
+        let bytes: Vec<u8> = (0..(PART_BUFFER * 5 / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&src, &bytes).unwrap();
+
+        mirror.put_file("t/segment.parquet", &src).await.unwrap();
+
+        let got = store
+            .inner
+            .get(&object_store::path::Path::from("mirror/t/segment.parquet"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(
+            got.as_ref() == bytes.as_slice(),
+            "the object differs from the file"
+        );
+        let most = store.most.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            most <= PART_BUFFER,
+            "one request carried {most} bytes of a {} byte file",
+            bytes.len()
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::time::Duration;
 
