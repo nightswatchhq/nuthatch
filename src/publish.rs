@@ -1114,13 +1114,20 @@ mod tests {
     }
 
     #[test]
-    fn an_object_that_uploads_starts_counting_again() {
+    fn an_object_absent_from_a_failed_pass_starts_counting_again() {
         let mut failures = Failures::default();
         for _ in 1..DEAD_LETTER_AFTER {
             failures.failed(&refused(&["a"]));
         }
+        // Every missing object is attempted on each pass, so a pass that failed only `b` uploaded `a`.
         failures.failed(&refused(&["b"]));
+        assert_eq!(
+            failures.0.get("a"),
+            None,
+            "a kept its count through the pass that uploaded it"
+        );
         failures.failed(&refused(&["a"]));
+        assert_eq!(failures.0.get("a"), Some(&1));
         assert!(!failures.dead());
     }
 
