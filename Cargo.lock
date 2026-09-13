@@ -4253,6 +4253,7 @@ dependencies = [
  "hex",
  "k256",
  "libc",
+ "md-5 0.10.6",
  "num-bigint",
  "nuthatch-decode",
  "object_store",

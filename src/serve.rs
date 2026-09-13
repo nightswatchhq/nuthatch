@@ -1463,6 +1463,7 @@ fn summary_value(s: &AppState) -> Value {
         "velocity_buckets": s.velocity.entries(),
         "alert_outbox": s.store.outbox_len(),
         "tables": s.tables.len(),
+        "publish": publish_summary(s),
         "views": ["balances (IVM)", "exposure (IVM)", "velocity (IVM)"],
         "endpoints": [
             "/health",
@@ -1476,6 +1477,27 @@ fn summary_value(s: &AppState) -> Value {
             "/exposure/{address}",
             "/flags?kind=threshold|velocity",
         ],
+    })
+}
+
+/// The admin row for a nest that mirrors itself (RFC-0052 §3.8), `null` for one that does not.
+fn publish_summary(s: &AppState) -> Value {
+    // The publisher reports under the nest's configured name, which `nest_info` carries.
+    let Some(m) = s.nest_info["name"]
+        .as_str()
+        .and_then(|name| crate::metrics::METRICS.nest_if_known(name))
+    else {
+        return Value::Null;
+    };
+    let Some(target) = m.publish_target() else {
+        return Value::Null;
+    };
+    json!({
+        "target": target,
+        "sealed_through": m.publish_sealed_through(),
+        "lag_blocks": m.publish_lag_blocks(),
+        "last_success_unixtime": (m.publish_last_success() != 0).then(|| m.publish_last_success()),
+        "dead_letter": m.publish_dead_letter(),
     })
 }
 
@@ -5427,6 +5449,30 @@ mod tests {
             ADMIN_HTML.contains("tip_unavailable"),
             "admin UI renders the lost-tip caveat (#472)"
         );
+        assert!(
+            ADMIN_HTML.contains("s.publish") && ADMIN_HTML.contains("last_success_unixtime"),
+            "admin UI renders the publish row (RFC-0052 §3.8)"
+        );
+    }
+
+    #[test]
+    fn the_status_summary_carries_a_publish_row_only_for_a_publishing_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.nest_info = Arc::new(json!({ "name": "admin-publish-row" }));
+        assert!(summary_value(&state)["publish"].is_null());
+
+        let m = crate::metrics::METRICS.nest("admin-publish-row");
+        m.set_publish_enabled("s3://bucket/mirror");
+        assert!(summary_value(&state)["publish"]["last_success_unixtime"].is_null());
+        m.publish_succeeded(Some(12));
+
+        let row = &summary_value(&state)["publish"];
+        assert_eq!(row["target"], "s3://bucket/mirror");
+        assert_eq!(row["sealed_through"], 12);
+        assert!(row["lag_blocks"].is_u64(), "{row}");
+        assert!(row["last_success_unixtime"].as_u64().unwrap() > 0, "{row}");
+        assert_eq!(row["dead_letter"], false);
     }
 
     #[tokio::test]
