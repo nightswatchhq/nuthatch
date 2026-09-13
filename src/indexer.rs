@@ -81,6 +81,14 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             concurrency
         );
     }
+    let publish = args
+        .publish_target
+        .clone()
+        .map(|target| crate::publish::Settings {
+            target,
+            interval: args.publish_interval,
+            parallelism: args.publish_parallelism as usize,
+        });
     run(
         source,
         dir,
@@ -91,6 +99,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         concurrency,
         args.window,
         args.no_admin,
+        publish,
     )
     .await
 }
@@ -603,12 +612,16 @@ pub async fn run(
     concurrency: usize,
     window_override: Option<u64>,
     no_admin: bool,
+    publish: Option<crate::publish::Settings>,
 ) -> Result<()> {
     // Admin UI (RFC-0010 Part A): on by default on localhost. Off-localhost it needs an explicit token
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
     // bind); `--no-admin` removes it entirely. Computed here since it depends on the process's `listen`.
     let admin_enabled = admin_enabled(no_admin, &listen);
     let admin_token = admin_required_token(admin_enabled, &listen);
+    let publisher = publish
+        .map(|settings| crate::publish::spawn(dir.clone(), config.nest.name.clone(), settings))
+        .transpose()?;
     let NestRuntime {
         state,
         mut ingest,
@@ -641,6 +654,7 @@ pub async fn run(
     if let Some(w) = alert_worker {
         w.abort();
     }
+    drop(publisher);
     result
 }
 
@@ -2897,6 +2911,21 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
         );
     }
 
+    let _publisher = args
+        .publish_target
+        .clone()
+        .map(|target| {
+            crate::publish::spawn(
+                dir.clone(),
+                config.nest.name.clone(),
+                crate::publish::Settings {
+                    target,
+                    interval: args.publish_interval,
+                    parallelism: args.publish_parallelism as usize,
+                },
+            )
+        })
+        .transpose()?;
     serve::run(&args.listen, state).await
 }
 

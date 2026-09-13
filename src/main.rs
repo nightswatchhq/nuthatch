@@ -92,6 +92,12 @@ async fn main() -> Result<()> {
             if dir.join(nuthatch::runtime::MOUNTS_FILE).exists()
                 || dir.join(nuthatch::runtime::LEGACY_ROOST_FILE).exists()
             {
+                if args.publish_target.is_some() {
+                    anyhow::bail!(
+                        "--publish-target mirrors a single nest; a runtime directory publishes per \
+                         mount, from a `[publish]` table in mounts.toml (RFC-0052 S2)"
+                    );
+                }
                 runtime::dev(
                     dir,
                     args.listen,

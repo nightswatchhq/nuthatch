@@ -22,6 +22,13 @@ pub static METRICS: Metrics = Metrics::new();
 pub struct NestMetrics {
     last_block: AtomicU64,
     sealed_through: AtomicU64,
+    /// RFC-0052 S2: set once this nest mirrors itself, so only publishing nests render the series.
+    publish_enabled: AtomicBool,
+    publish_sealed_through: AtomicU64,
+    publish_pending: AtomicU64,
+    publish_bytes: AtomicU64,
+    publish_errors: AtomicU64,
+    publish_dead_letter: AtomicBool,
     /// The tip of **this nest's chain**, and when its cursor last polled successfully.
     ///
     /// Duplicated per nest rather than kept only process-globally because a multichain runtime runs one
@@ -169,6 +176,35 @@ impl NestMetrics {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
         METRICS.set_sealed_through(v);
+    }
+    pub fn set_publish_enabled(&self) {
+        self.publish_enabled.store(true, Relaxed);
+    }
+    pub fn set_publish_pending(&self, segments: u64) {
+        self.publish_pending.store(segments, Relaxed);
+    }
+    pub fn publish_uploaded(&self, bytes: u64) {
+        let _ = self
+            .publish_pending
+            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1)));
+        self.publish_bytes.fetch_add(bytes, Relaxed);
+    }
+    pub fn publish_succeeded(&self, sealed_through: Option<u64>) {
+        if let Some(block) = sealed_through {
+            self.publish_sealed_through.store(block, Relaxed);
+        }
+        self.publish_pending.store(0, Relaxed);
+        self.publish_dead_letter.store(false, Relaxed);
+    }
+    pub fn publish_failed(&self, dead_letter: bool) {
+        self.publish_errors.fetch_add(1, Relaxed);
+        self.publish_dead_letter.store(dead_letter, Relaxed);
+    }
+    pub fn publish_errors(&self) -> u64 {
+        self.publish_errors.load(Relaxed)
+    }
+    pub fn publish_dead_letter(&self) -> bool {
+        self.publish_dead_letter.load(Relaxed)
     }
     pub fn add_rows_decoded(&self, n: u64) {
         self.rows_decoded.fetch_add(n, Relaxed);
@@ -952,6 +988,61 @@ impl Metrics {
                 "gauge",
                 &|m| m.fetch_window.load(Relaxed),
             );
+            // RFC-0052 S2. Only publishing nests carry these, so an unmirrored nest does not grow a
+            // column of zeros that reads like a mirror that is caught up.
+            let publishing: Vec<_> = per
+                .iter()
+                .filter(|(_, m)| m.publish_enabled.load(Relaxed))
+                .collect();
+            if !publishing.is_empty() {
+                let mut series =
+                    |name: &str, help: &str, typ: &str, get: &dyn Fn(&NestMetrics) -> u64| {
+                        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {typ}\n"));
+                        for (nest, m) in &publishing {
+                            s.push_str(&format!("{name}{{nest=\"{nest}\"}} {}\n", get(m)));
+                        }
+                    };
+                series(
+                    "nuthatch_publish_sealed_through",
+                    "Highest block the published catalogue covers (RFC-0052).",
+                    "gauge",
+                    &|m| m.publish_sealed_through.load(Relaxed),
+                );
+                series(
+                    "nuthatch_publish_lag_blocks",
+                    "Blocks sealed locally and not yet published.",
+                    "gauge",
+                    &|m| {
+                        m.sealed_through
+                            .load(Relaxed)
+                            .saturating_sub(m.publish_sealed_through.load(Relaxed))
+                    },
+                );
+                series(
+                    "nuthatch_publish_pending_segments",
+                    "Segments the current publishing pass has still to upload.",
+                    "gauge",
+                    &|m| m.publish_pending.load(Relaxed),
+                );
+                series(
+                    "nuthatch_publish_bytes_total",
+                    "Segment bytes uploaded since start.",
+                    "counter",
+                    &|m| m.publish_bytes.load(Relaxed),
+                );
+                series(
+                    "nuthatch_publish_errors_total",
+                    "Publishing passes that failed since start.",
+                    "counter",
+                    &|m| m.publish_errors.load(Relaxed),
+                );
+                series(
+                    "nuthatch_publish_dead_letter",
+                    "1 once the same object has failed repeatedly; clears on the next success.",
+                    "gauge",
+                    &|m| u64::from(m.publish_dead_letter.load(Relaxed)),
+                );
+            }
         }
         s
     }
