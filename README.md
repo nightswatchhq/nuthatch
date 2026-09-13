@@ -454,7 +454,9 @@ who need more - none of it in the way of the happy path:
   sync --target s3://bucket/prefix` copies a nest's sealed Parquet segments, its catalogue and a
   provenance envelope to any S3-compatible bucket or a directory, and `dev --publish-target` keeps
   the mirror current as segments seal, uploading in streamed parts so ingestion does not wait on the
-  bucket. The mirror is keyed by the nest's data identity, so a cosmetic edit does not fork it.
+  bucket. The mirror is keyed by the nest's data identity, not its NID: an edit that moves the NID but not
+  the data identity, which is the cosmetic case "Safe upgrades" below describes, keeps publishing to
+  the same dataset, and any edit that changes what is decoded forks a new one.
   `publish status` says what is still to upload, `publish verify` checks every object against the
   local segment (`--deep` re-downloads and re-hashes), and `doctor --publish` puts the mirror in a
   health check. Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
