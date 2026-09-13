@@ -808,8 +808,10 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
                 let expected = s3_etag(&src)?;
                 if !remote.eq_ignore_ascii_case(&expected) {
                     bail!(
-                        "{key} has ETag {remote} but the local segment's bytes give {expected}: \
-                         the object was replaced, or the bucket encrypts with KMS (check with --deep)"
+                        "{key} has ETag {remote} but the local segment gives {expected}: either its \
+                         bytes differ from the local segment or the store's ETag is not \
+                         content-derived (SSE-KMS and some S3-compatible stores), and \
+                         `nuthatch publish verify --deep` tells them apart"
                     );
                 }
             }
@@ -1903,6 +1905,16 @@ abi = "abis/usdc.json"
             tags: Tags,
         }
 
+        impl S3Etags {
+            /// Answers HEAD for `location` with `tag`, leaving the bytes alone, as SSE-KMS does.
+            pub fn set_tag(&self, location: &str, tag: &str) {
+                self.tags
+                    .lock()
+                    .unwrap()
+                    .insert(Path::from(location), tag.to_string());
+            }
+        }
+
         impl std::fmt::Display for S3Etags {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(f, "S3Etags")
@@ -2049,9 +2061,38 @@ abi = "abis/usdc.json"
         let err = verify(nest.path(), target, false).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(&key) && msg.contains("was replaced"),
+            msg.contains(&key) && msg.contains("bytes differ"),
             "wanted a content mismatch naming {key}, got {err:#}"
         );
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn shallow_verify_fails_closed_on_an_etag_that_is_not_content_derived() {
+        let nest = sealed_nest();
+        let store = std::sync::Arc::new(s3_etags::S3Etags::default());
+        let target = "memory://s4-opaque-etag";
+        memory_stores()
+            .lock()
+            .unwrap()
+            .insert(target.to_string(), store.clone());
+        let report = sync(nest.path(), target, false).await.unwrap();
+        let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
+        // MD5-shaped and quoted like S3's, but derived from nothing in the object.
+        store.set_tag(
+            &format!("s4-opaque-etag/{key}"),
+            "5f2b51ca2fdc5baa31ec02e002f69aec",
+        );
+
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&key) && msg.contains("--deep"),
+            "wanted a failure naming {key} and pointing at --deep, got {err:#}"
+        );
+        verify(nest.path(), target, true)
+            .await
+            .expect("the bytes are unchanged, so the failure was the ETag");
     }
 
     #[cfg(feature = "object-store")]
@@ -2094,7 +2135,7 @@ abi = "abis/usdc.json"
         let err = verify(nest.path(), target, false).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(&key) && msg.contains("was replaced"),
+            msg.contains(&key) && msg.contains("bytes differ"),
             "wanted a content mismatch naming {key}, got {err:#}"
         );
     }
