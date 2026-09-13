@@ -775,6 +775,11 @@ impl Drop for Publisher {
 /// Start mirroring `dir`, reporting under `nest`. The reconciler owns a thread and a runtime, so a
 /// slow or blocking store never holds a worker the ingestion loop needs; a seal only signals it.
 pub fn spawn(dir: PathBuf, nest: String, settings: Settings) -> Result<Publisher> {
+    // A zero interval makes `reconcile` sync in a loop. The CLI and `[mounts.publish]` refuse it
+    // already; this holds for every caller that builds `Settings` itself.
+    if settings.interval.is_zero() {
+        bail!("publish interval must be longer than zero");
+    }
     open_mirror(&settings.target)?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -997,6 +1002,27 @@ mod tests {
             interval,
             parallelism,
         }
+    }
+
+    #[test]
+    fn a_zero_interval_never_starts_a_publisher() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let err = spawn(
+            nest.path().to_path_buf(),
+            "publish-zero".into(),
+            settings(target, Duration::ZERO, 2),
+        )
+        .err()
+        .expect("a zero interval started a publisher");
+        assert!(err.to_string().contains("longer than zero"), "{err}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            std::fs::read_dir(mirror.path()).unwrap().count(),
+            0,
+            "a refused publisher still wrote to its target"
+        );
     }
 
     #[tokio::test]
